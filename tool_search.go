@@ -26,7 +26,8 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, args map[string]string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			args := parseArgs(rawArgs)
 		sess := a.getSession(sid)
 		if sess == nil {
 			return "error: no session"

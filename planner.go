@@ -4,23 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
-
-const planPrompt = `Analyze the user's request. Reply with ONLY a JSON object, no other text:
-{
-  "clear": true/false,       // is the request clear enough to act on?
-  "choices": [],             // if not clear: up to 2 interpretations as short strings
-  "question": "",            // if not clear: what to ask the user
-  "complexity": "simple",    // "simple" or "complex"
-  "steps": ["step1", ...]   // brief plan of action
-}
-
-Rules:
-- "simple": single file read/edit, short answer, quick lookup
-- "complex": multi-file changes, architecture decisions, debugging, refactoring
-- If the request is ambiguous, set clear=false and provide up to 2 choices
-- Keep steps brief (1 line each)`
 
 type planResult struct {
 	Clear      bool     `json:"clear"`
@@ -30,42 +17,58 @@ type planResult struct {
 	Steps      []string `json:"steps"`
 }
 
+func (a *agent) loadPlanPrompt(sid SessionId) string {
+	return a.loadPromptFile(sid, "PLAN.md")
+}
+
 // planAndRoute analyzes the user's request, asks for clarification if needed,
-// and returns which LLM connection to use for execution.
-func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string) (*LLMConnection, error) {
-	fast := a.settings.LLM("fast")
-	if fast == nil {
-		return nil, fmt.Errorf("no 'fast' connection in .codehalter/settings.toml")
+// shows the plan, and asks the user to confirm before execution.
+// Returns the LLM connection, the approved plan steps (if any), and an error.
+func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string) (*LLMConnection, []string, []ToolUse, error) {
+	thinking := a.settings.LLM("thinking")
+	if thinking == nil {
+		return nil, nil, nil, fmt.Errorf("no 'thinking' connection in .codehalter/settings.toml")
 	}
 
-	// In discussion mode, always use fast — no planning needed.
-	a.mu.Lock()
-	mode := a.mode
-	a.mu.Unlock()
-	if mode == "discussion" {
-		return fast, nil
+	planPrompt := a.loadPlanPrompt(sid)
+	if planPrompt == "" {
+		return thinking, nil, nil, nil
 	}
 
-	// Ask fast to plan.
-	messages := []llmMessage{{Role: "user", Content: planPrompt + "\n\nUser request: " + userText}}
-	response, _, err := a.llmRequest(ctx, "", fast, messages)
+	// Build planner prompt with AGENT.md rules and project context.
+	sess := a.getSession(sid)
+	var prompt strings.Builder
+	if sess != nil {
+		if agentMD, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", "AGENT.md")); err == nil {
+			prompt.Write(agentMD)
+			prompt.WriteString("\n\n")
+		}
+	}
+	prompt.WriteString(planPrompt)
+	if sess != nil {
+		projCtx := buildProjectContext(sess.Cwd, a.fileCache)
+		if projCtx != "" {
+			prompt.WriteString("\n\n")
+			prompt.WriteString(projCtx)
+		}
+	}
+	prompt.WriteString("\n\nUser request: ")
+	prompt.WriteString(userText)
+
+	// Ask thinking to plan with read-only tools available.
+	messages := []llmMessage{{Role: "user", Content: prompt.String()}}
+	planRes, err := a.runToolLoop(ctx, sid, thinking, messages, true)
 	if err != nil {
-		return fast, nil
+		return thinking, nil, planRes.ToolUses, nil
 	}
+	response := planRes.Text
 
-	// Parse the JSON response.
-	response = strings.TrimSpace(response)
-	response = strings.TrimPrefix(response, "```json")
-	response = strings.TrimPrefix(response, "```")
-	response = strings.TrimSuffix(response, "```")
-	response = strings.TrimSpace(response)
+	response = trimJSON(response)
 
 	var plan planResult
 	if err := json.Unmarshal([]byte(response), &plan); err != nil {
-		return fast, nil
+		return thinking, nil, planRes.ToolUses, nil
 	}
-
-	sess := a.getSession(sid)
 
 	// If the request is unclear, ask the user.
 	if !plan.Clear && len(plan.Choices) > 0 {
@@ -84,7 +87,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 				sess.AddAssistant(question + "\n(choices: " + strings.Join(plan.Choices, ", ") + ")\nUser aborted.")
 				_ = sess.Save()
 			}
-			return nil, fmt.Errorf("user aborted")
+			return nil, nil, planRes.ToolUses, fmt.Errorf("user aborted")
 		}
 
 		if sess != nil {
@@ -94,7 +97,75 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Understood: "+choice+"\n")))
 	}
 
-	// Show the plan.
+	// Show the plan and ask for confirmation.
+	if len(plan.Steps) > 0 {
+		var planText strings.Builder
+		planText.WriteString("Plan:\n")
+		for i, step := range plan.Steps {
+			fmt.Fprintf(&planText, "%d. %s\n", i+1, step)
+		}
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(planText.String())))
+
+		tcId := a.StartToolCall(ctx, sid, "Execute this plan?", "think", nil)
+		ok, err := a.conn.AskYesNo(ctx, sid, tcId, "Execute", "Cancel")
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf("User chose: %v", ok))})
+
+		if err != nil || !ok {
+			if sess != nil {
+				sess.AddAssistant(planText.String() + "\nUser declined execution.")
+				_ = sess.Save()
+			}
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Cancelled.\n")))
+			return nil, nil, planRes.ToolUses, fmt.Errorf("user declined execution")
+		}
+	}
+
+	return thinking, plan.Steps, planRes.ToolUses, nil
+}
+
+// planForSubagent is like planAndRoute but auto-approves without user interaction.
+func (a *agent) planForSubagent(ctx context.Context, sid SessionId, instructions string) (*LLMConnection, []string, []ToolUse, error) {
+	thinking := a.settings.LLM("thinking")
+	if thinking == nil {
+		return nil, nil, nil, fmt.Errorf("no 'thinking' connection")
+	}
+
+	planPrompt := a.loadPlanPrompt(sid)
+	if planPrompt == "" {
+		return thinking, nil, nil, nil
+	}
+
+	sess := a.getSession(sid)
+	var prompt strings.Builder
+	if sess != nil {
+		if agentMD, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", "AGENT.md")); err == nil {
+			prompt.Write(agentMD)
+			prompt.WriteString("\n\n")
+		}
+	}
+	prompt.WriteString(planPrompt)
+	if sess != nil {
+		projCtx := buildProjectContext(sess.Cwd, a.fileCache)
+		if projCtx != "" {
+			prompt.WriteString("\n\n")
+			prompt.WriteString(projCtx)
+		}
+	}
+	prompt.WriteString("\n\nUser request: ")
+	prompt.WriteString(instructions)
+
+	messages := []llmMessage{{Role: "user", Content: prompt.String()}}
+	planRes, err := a.runToolLoop(ctx, sid, thinking, messages, true)
+	if err != nil {
+		return thinking, nil, planRes.ToolUses, nil
+	}
+
+	var plan planResult
+	if err := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan); err != nil {
+		return thinking, nil, planRes.ToolUses, nil
+	}
+
+	// Auto-approve — show the plan but don't ask.
 	if len(plan.Steps) > 0 {
 		var planText strings.Builder
 		planText.WriteString("Plan:\n")
@@ -104,12 +175,5 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(planText.String())))
 	}
 
-	// Route based on complexity.
-	if plan.Complexity == "complex" {
-		if thinking := a.settings.LLM("thinking"); thinking != nil {
-			return thinking, nil
-		}
-	}
-
-	return fast, nil
+	return thinking, plan.Steps, planRes.ToolUses, nil
 }

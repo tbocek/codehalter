@@ -8,18 +8,20 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/BurntSushi/toml"
 )
 
 const (
-	maxPreviewLines = 50
+	maxPreviewLines = 100
 	maxPreviewBytes = maxPreviewLines * 200
 
-	fileSummaryPrompt = "Summarize this file in one sentence, max 20 words. Reply with only the summary, nothing else.\n\n"
 )
 
 type FileCache struct {
+	mu    sync.Mutex                `toml:"-"`
 	Files map[string]FileCacheEntry `toml:"files"`
 }
 
@@ -33,13 +35,13 @@ func cachePath(cwd string) string {
 	return filepath.Join(cwd, sessionDir, "cache.toml")
 }
 
-func loadFileCache(cwd string) FileCache {
+func loadFileCache(cwd string) *FileCache {
 	var c FileCache
 	_, _ = toml.DecodeFile(cachePath(cwd), &c)
 	if c.Files == nil {
 		c.Files = make(map[string]FileCacheEntry)
 	}
-	return c
+	return &c
 }
 
 func (c *FileCache) Save(cwd string) error {
@@ -174,12 +176,9 @@ func readPreview(cwd, rel string) string {
 
 // summarizeStaleFiles summarizes stale files in chunks and updates the cache.
 func (a *agent) summarizeStaleFiles(ctx context.Context, cwd string, cache *FileCache, staleFiles []string, sid SessionId) error {
-	conn := a.settings.LLM("summary")
+	conn := a.settings.SummaryLLM()
 	if conn == nil {
-		conn = a.settings.LLM("fast") // fallback
-	}
-	if conn == nil {
-		return fmt.Errorf("no 'summary' or 'fast' LLM connection configured")
+		return fmt.Errorf("no 'summary' or 'thinking' LLM connection configured")
 	}
 
 	// Filter to text files only, mark binary.
@@ -201,17 +200,21 @@ func (a *agent) summarizeStaleFiles(ctx context.Context, cwd string, cache *File
 	}
 
 	total := len(toSummarize)
-	ok, failed := 0, 0
-	for i, rel := range toSummarize {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexing %d/%d: %s\n", i+1, total, rel))))
-		if a.summarizeFile(ctx, cwd, cache, conn, rel) == "ok" {
-			ok++
-		} else {
-			failed++
-		}
-	}
+	var okCount, failedCount atomic.Int32
+	var doneCount atomic.Int32
 
-	fmt.Fprintf(os.Stderr, "filecache: done. ok=%d failed=%d total=%d\n", ok, failed, total)
+	parallel(total, func(i int) {
+		rel := toSummarize[i]
+		n := doneCount.Add(1)
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexing %d/%d: %s\n", n, total, rel))))
+		if a.summarizeFile(ctx, cwd, cache, conn, rel) == "ok" {
+			okCount.Add(1)
+		} else {
+			failedCount.Add(1)
+		}
+	})
+
+	fmt.Fprintf(os.Stderr, "filecache: done. ok=%d failed=%d total=%d\n", okCount.Load(), failedCount.Load(), total)
 	return cache.Save(cwd)
 }
 
@@ -222,7 +225,8 @@ func (a *agent) summarizeFile(ctx context.Context, cwd string, cache *FileCache,
 		return "failed"
 	}
 
-	prompt := fileSummaryPrompt + fmt.Sprintf("=== %s ===\n%s", rel, preview)
+	summaryPrompt := loadSummaryPrompt(cwd)
+	prompt := summaryPrompt + fmt.Sprintf("=== %s ===\n%s", rel, preview)
 	messages := []llmMessage{{Role: "user", Content: prompt}}
 	text, err := a.llmSimple(ctx, conn, messages)
 	if err != nil {
@@ -244,14 +248,24 @@ func (a *agent) summarizeFile(ctx context.Context, cwd string, cache *FileCache,
 	}
 
 	if summary != "" {
+		cache.mu.Lock()
 		if entry, ok := cache.Files[rel]; ok {
 			entry.Summary = summary
 			cache.Files[rel] = entry
-			return "ok"
 		}
+		cache.mu.Unlock()
+		return "ok"
 	}
 
 	return "failed"
+}
+
+func loadSummaryPrompt(cwd string) string {
+	data, err := os.ReadFile(filepath.Join(cwd, ".codehalter", "SUMMARY.md"))
+	if err != nil {
+		return ""
+	}
+	return string(data) + "\n\n"
 }
 
 // buildProjectContext returns the project structure with summaries,

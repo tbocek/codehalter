@@ -1,6 +1,6 @@
 # Codehalter
 
-An [ACP](https://spec.anthropic.com/acp)-compatible AI coding agent that connects [Zed](https://zed.dev) to any OpenAI-compatible LLM server (llama.cpp, Ollama, vLLM, etc.). Runs entirely on your machine.
+An [ACP](https://spec.anthropic.com/acp)-compatible AI coding agent that connects [Zed](https://zed.dev) to any OpenAI-compatible LLM server (llama.cpp, Ollama, vLLM, etc.). Runs entirely on your machine. Designed for small to medium sized repositories.
 
 ## Features
 
@@ -12,7 +12,7 @@ An [ACP](https://spec.anthropic.com/acp)-compatible AI coding agent that connect
 - **Project indexing** — builds file summaries on session start so the LLM has project-wide context
 - **Planning** — analyzes each request for clarity and complexity, routes to the appropriate model, and asks for clarification when needed
 - **Two modes** — *discussion* (read-only) and *execution* (read/write with user approval for changes)
-- **Configurable LLM endpoints** — point different roles (fast, thinking, summary) at different models or servers
+- **Configurable LLM endpoints** — point different roles (thinking, summary) at different models or servers
 
 ## Prerequisites
 
@@ -57,7 +57,7 @@ Each connection has a role:
 | Name | Purpose |
 |------|---------|
 | `thinking` | Used for complex requests that need deeper reasoning |
-| `summary` | Used for history compression (falls back to `fast`) |
+| `summary` | Used for history compression |
 
 ### Agent behavior
 
@@ -106,22 +106,3 @@ Open the agent panel (`Cmd+?` / `Ctrl+?`), click `+`, and select "Codehalter".
 4. The LLM runs an agentic loop — calling tools, reading results, and iterating until the task is complete
 5. File edits are shown as diffs and require user approval before writing
 6. Conversation history is persisted to `.codehalter/` and compressed when it grows large
-
-## Project structure
-
-```
-main.go          Entry point, Agent interface implementation
-acp.go           Anthropic Codegen Protocol types and connection handling
-jsonrpc.go       JSON-RPC 2.0 transport over stdio
-llm.go           LLM streaming and agentic tool loop
-planner.go       Request analysis and model routing
-tools.go         Tool registry and execution framework
-tool_files.go    File operations (read, write, edit, list)
-tool_search.go   Text search across project files
-tool_runner.go   Task runner discovery and execution
-tool_ask.go      User interaction (questions, permissions)
-session.go       Session persistence (TOML)
-history.go       Conversation compression and context management
-filecache.go     Project file indexing and summarization
-settings.go      Configuration loading
-```

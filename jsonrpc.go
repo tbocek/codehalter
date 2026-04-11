@@ -229,7 +229,11 @@ func (c *Connection) serve() {
 		}
 
 		c.log.Debug("received", "method", req.Method, "raw", string(line))
-		go c.handler(ctx, &req)
+		if req.Method == "session/prompt" {
+			go c.handler(ctx, &req)
+		} else {
+			c.handler(ctx, &req)
+		}
 	}
 }
 

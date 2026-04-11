@@ -1,0 +1,25 @@
+Review what you just did. Only check for hard errors — not style or completeness.
+
+If NO files were changed (no edit_file or write_file was used), skip verification and return:
+{"success": true}
+
+If files WERE changed:
+1. If a test, verify, lint, or check task is available via run_task, run it.
+2. If run_task produced errors, investigate the root cause.
+3. Use read_file to verify your edits are syntactically correct.
+
+Do NOT flag style issues, incomplete explanations, or missing context.
+Do NOT repeat web searches or tool calls already performed.
+Only flag issues that cause builds to break, tests to fail, or incorrect file content.
+
+Reply with ONLY a JSON object, no other text:
+{
+  "success": true/false,
+  "issues": ["issue1", ...],
+  "fix_steps": ["step1", ...]
+}
+
+If success is true, leave issues and fix_steps empty.
+If success is false:
+- "issues": what is broken (build errors, test failures, wrong edits)
+- "fix_steps": concrete steps to fix it

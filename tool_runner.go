@@ -67,7 +67,8 @@ func (a *agent) discoverRunners(cwd string) {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, args map[string]string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			args := parseArgs(rawArgs)
 		task := args["task"]
 		parts := strings.SplitN(task, ":", 2)
 		if len(parts) != 2 {
@@ -115,10 +116,10 @@ func (a *agent) discoverRunners(cwd string) {
 		result := string(output)
 		if err != nil {
 			result += "\nexit: " + err.Error()
-			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
-			return result
 		}
 
+		// Show output in chat so the user can see it.
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("\n```\n$ "+task+"\n"+result+"```\n")))
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
 		return result
 	}})

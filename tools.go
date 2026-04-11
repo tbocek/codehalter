@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -36,8 +37,8 @@ func (a *agent) resolvePath(sid SessionId, path string) (string, error) {
 
 type Tool struct {
 	Def      map[string]any
-	ReadOnly bool // safe to use in discussion mode
-	Execute  func(ctx context.Context, a *agent, sid SessionId, args map[string]string) string
+	ReadOnly bool // non-destructive, safe to use during planning
+	Execute  func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string
 }
 
 var registeredTools []Tool
@@ -46,10 +47,28 @@ func RegisterTool(t Tool) {
 	registeredTools = append(registeredTools, t)
 }
 
-func llmToolDefinitions(readOnly bool) []map[string]any {
+type toolFilter struct {
+	readOnly bool
+	include  map[string]bool // non-ReadOnly tools to include anyway
+	exclude  map[string]bool // tools to exclude
+}
+
+func llmToolDefinitions(readOnly bool, extraTools ...string) []map[string]any {
+	return llmToolDefinitionsFiltered(toolFilter{
+		readOnly: readOnly,
+		include:  toSet(extraTools),
+	})
+}
+
+func llmToolDefinitionsFiltered(f toolFilter) []map[string]any {
 	var defs []map[string]any
 	for _, t := range registeredTools {
-		if readOnly && !t.ReadOnly {
+		fn, _ := t.Def["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if f.exclude[name] {
+			continue
+		}
+		if f.readOnly && !t.ReadOnly && !f.include[name] {
 			continue
 		}
 		defs = append(defs, t.Def)
@@ -57,21 +76,31 @@ func llmToolDefinitions(readOnly bool) []map[string]any {
 	return defs
 }
 
-func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) string {
+// parseArgs extracts string arguments from raw JSON. For simple string params.
+func parseArgs(rawArgs string) map[string]string {
 	var args map[string]string
-	_ = json.Unmarshal([]byte(tc.Function.Arguments), &args)
+	_ = json.Unmarshal([]byte(rawArgs), &args)
+	if args == nil {
+		args = make(map[string]string)
+	}
+	return args
+}
 
-	a.mu.Lock()
-	mode := a.mode
-	a.mu.Unlock()
+func toSet(s []string) map[string]bool {
+	m := make(map[string]bool, len(s))
+	for _, v := range s {
+		m[v] = true
+	}
+	return m
+}
+
+func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) string {
+	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 
 	for _, t := range registeredTools {
 		fn, _ := t.Def["function"].(map[string]any)
 		if fn["name"] == tc.Function.Name {
-			if mode == "discussion" && !t.ReadOnly {
-				return fmt.Sprintf("tool %s is not available in discussion mode", tc.Function.Name)
-			}
-			return t.Execute(ctx, a, sid, args)
+			return t.Execute(ctx, a, sid, tc.Function.Arguments)
 		}
 	}
 	return fmt.Sprintf("unknown tool: %s", tc.Function.Name)

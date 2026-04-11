@@ -66,7 +66,8 @@ type (
 		Cwd       string    `json:"cwd"`
 	}
 	LoadSessionResponse struct {
-		Modes *SessionModeState `json:"modes,omitempty"`
+		SessionId SessionId        `json:"sessionId,omitempty"`
+		Modes     *SessionModeState `json:"modes,omitempty"`
 	}
 
 	ListSessionsRequest struct {

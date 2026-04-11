@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"log/slog"
 	"os"
@@ -10,18 +11,45 @@ import (
 	"sync"
 )
 
+//go:embed AGENT.md.example
+var defaultAgentMD string
+
+//go:embed PLAN.md.example
+var defaultPlanMD string
+
+//go:embed SUMMARY.md.example
+var defaultSummaryMD string
+
+//go:embed VERIFY.md.example
+var defaultVerifyMD string
+
+// ensureDefaults copies embedded default files into .codehalter/ if they don't exist.
+func ensureDefaults(cwd string) {
+	dir := filepath.Join(cwd, ".codehalter")
+	os.MkdirAll(dir, 0o755)
+	for _, f := range []struct{ name, content string }{
+		{"AGENT.md", defaultAgentMD},
+		{"PLAN.md", defaultPlanMD},
+		{"SUMMARY.md", defaultSummaryMD},
+		{"VERIFY.md", defaultVerifyMD},
+	} {
+		path := filepath.Join(dir, f.name)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			os.WriteFile(path, []byte(f.content), 0o644)
+		}
+	}
+}
+
 // agent implements acp.Agent.
 type agent struct {
 	conn     *AgentSideConnection
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	sessions map[SessionId]*Session
-	mode           string
 	settings       Settings
-	allowWrites    string // "", "turn"
 	runners        []taskRunner
 	pendingRefs    []CodeRef
-	fileCache      FileCache
+	fileCache      *FileCache
 	indexDone      chan struct{}
 }
 
@@ -44,6 +72,7 @@ func (a *agent) getSession(id SessionId) *Session {
 func (a *agent) putSession(s *Session) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	slog.Info("putSession", "sid", s.ID)
 	a.sessions[s.ID] = s
 }
 
@@ -76,10 +105,12 @@ func (a *agent) Authenticate(_ context.Context, _ AuthenticateRequest) (Authenti
 
 func (a *agent) initSession(cwd string, s *Session) {
 	a.putSession(s)
+	ensureDefaults(cwd)
 	if settings, err := loadSettings(cwd); err == nil {
 		a.settings = settings
 	}
 	a.discoverRunners(cwd)
+	a.registerSubagentTool()
 }
 
 func (a *agent) startIndexing(sid SessionId, cwd string) {
@@ -112,19 +143,25 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 	}
 	a.initSession(cwd, s)
 	a.startIndexing(s.ID, cwd)
-	return NewSessionResponse{SessionId: s.ID, Modes: modeState(a.mode)}, nil
+	return NewSessionResponse{SessionId: s.ID, Modes: nil}, nil
 }
 
 func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
 	cwd := cwdOrDefault(req.Cwd)
 	s, err := loadSession(cwd, req.SessionId)
 	if err != nil {
+		if os.IsNotExist(err) {
+			s = newSessionWithID(cwd, req.SessionId)
+			a.initSession(cwd, s)
+			a.startIndexing(s.ID, cwd)
+			return LoadSessionResponse{Modes: nil}, nil
+		}
 		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
 	}
 	a.initSession(cwd, s)
 	a.replayHistory(ctx, req.SessionId, s)
 	a.startIndexing(s.ID, cwd)
-	return LoadSessionResponse{Modes: modeState(a.mode)}, nil
+	return LoadSessionResponse{Modes: nil}, nil
 }
 
 func (a *agent) replayHistory(ctx context.Context, sid SessionId, s *Session) {
@@ -157,26 +194,12 @@ func (a *agent) ListSessions(_ context.Context, req ListSessionsRequest) (ListSe
 	return ListSessionsResponse{Sessions: sessions}, nil
 }
 
-var availableModes = []SessionMode{
-	{Id: "discussion", Name: "Discussion", Description: "Discuss and explore ideas"},
-	{Id: "execution", Name: "Execution", Description: "Execute tasks and make changes"},
-}
-
-func modeState(current string) *SessionModeState {
-	return &SessionModeState{
-		CurrentModeId:  current,
-		AvailableModes: availableModes,
-	}
-}
 
 func (a *agent) SetSessionConfigOption(_ context.Context, req SetSessionConfigOptionRequest) (SetSessionConfigOptionResponse, error) {
 	return SetSessionConfigOptionResponse{ConfigOptions: []SessionConfigOption{}}, nil
 }
 
 func (a *agent) SetSessionMode(_ context.Context, req SetSessionModeRequest) (SetSessionModeResponse, error) {
-	a.mu.Lock()
-	a.mode = string(req.ModeId)
-	a.mu.Unlock()
 	return SetSessionModeResponse{}, nil
 }
 
@@ -194,10 +217,10 @@ func (a *agent) Cancel(_ context.Context, _ CancelNotification) {
 
 func (a *agent) refreshFileCache(ctx context.Context, cwd string, sid SessionId) {
 	a.fileCache = loadFileCache(cwd)
-	stale := updateFileCache(cwd, &a.fileCache)
+	stale := updateFileCache(cwd, a.fileCache)
 	if len(stale) > 0 {
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexing %d files...\n", len(stale)))))
-		if err := a.summarizeStaleFiles(ctx, cwd, &a.fileCache, stale, sid); err != nil {
+		if err := a.summarizeStaleFiles(ctx, cwd, a.fileCache, stale, sid); err != nil {
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
 		} else {
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexed %d files.\n", len(stale)))))
@@ -211,27 +234,16 @@ func (a *agent) systemPrompt(sid SessionId) (string, error) {
 		return "", fmt.Errorf("no session found")
 	}
 
-	a.mu.Lock()
-	mode := a.mode
-	a.mu.Unlock()
-
 	var b strings.Builder
 
-	// Try AGENT.md, then AGENTS.md.
-	content, err := os.ReadFile(filepath.Join(sess.Cwd, "AGENT.md"))
-	if err != nil {
-		content, err = os.ReadFile(filepath.Join(sess.Cwd, "AGENTS.md"))
-	}
-	if err != nil {
-		b.WriteString("⚠ No AGENT.md found — no system prompt context will be used.\n\n")
-	} else {
+	content, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", "AGENT.md"))
+	if err == nil {
 		b.Write(content)
 		b.WriteString("\n\n")
 	}
 
-	b.WriteString("Project directory: " + sess.Cwd + "\n")
-	b.WriteString("Current mode: " + mode + "\n\n")
-	b.WriteString(buildProjectContext(sess.Cwd, &a.fileCache))
+	b.WriteString("Project directory: " + sess.Cwd + "\n\n")
+	b.WriteString(buildProjectContext(sess.Cwd, a.fileCache))
 
 	return b.String(), nil
 }
@@ -249,7 +261,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	ctx, cancel := context.WithCancel(ctx)
 	a.mu.Lock()
 	a.cancel = cancel
-	a.allowWrites = ""
 	a.mu.Unlock()
 	defer cancel()
 
@@ -276,44 +287,104 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		go a.generateTitle(context.Background(), sess, userText)
 	}
 
-	// Plan and route to the right LLM.
-	// Planner stores its own messages (clarification, abort) in the session.
-	conn, err := a.planAndRoute(ctx, req.SessionId, userText)
-	if err != nil {
-		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
-		return PromptResponse{StopReason: StopReasonEndTurn}, nil
-	}
+	// Plan → Execute → Verify cycle with retry.
+	const maxRetryCycles = 3
+	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
-	// Build context. AGENT.md on first message, project structure on every message.
-	// Neither is stored in session history.
-	content := userText
-	if isFirstMessage {
-		sysPrompt, err := a.systemPrompt(req.SessionId)
+	originalUserText := userText
+	var result toolLoopResult
+
+	for cycle := 0; cycle < maxRetryCycles; cycle++ {
+		if cycle > 0 {
+			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(fmt.Sprintf("\n⚠ Retrying (attempt %d/%d)...\n", cycle+1, maxRetryCycles))))
+		}
+
+		// Plan.
+		conn, planSteps, planToolUses, err := a.planAndRoute(ctx, req.SessionId, userText)
+		if err != nil {
+			if sess != nil && len(planToolUses) > 0 {
+				sess.AddAssistantWithTools("❌ "+err.Error(), planToolUses)
+				_ = sess.Save()
+			}
+			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
+			return PromptResponse{StopReason: StopReasonEndTurn}, nil
+		}
+
+		// Build execution content.
+		content := userText
+		if len(planSteps) > 0 {
+			var planCtx strings.Builder
+			planCtx.WriteString("The user approved this plan. Follow these steps exactly:\n")
+			for i, step := range planSteps {
+				fmt.Fprintf(&planCtx, "%d. %s\n", i+1, step)
+			}
+			if len(planToolUses) > 0 {
+				planCtx.WriteString("\nDuring planning, these tools were already called (do NOT repeat them):\n")
+				for _, tu := range planToolUses {
+					fmt.Fprintf(&planCtx, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 500))
+				}
+			}
+			planCtx.WriteString("\nUser request: ")
+			planCtx.WriteString(userText)
+			content = planCtx.String()
+		}
+		if isFirstMessage && cycle == 0 {
+			sysPrompt, err := a.systemPrompt(req.SessionId)
+			if err != nil {
+				return a.replyError(ctx, req.SessionId, err.Error()), nil
+			}
+			content = sysPrompt + "\n---\n" + content
+		} else if sess != nil {
+			projCtx := buildProjectContext(sess.Cwd, a.fileCache)
+			if projCtx != "" {
+				content = projCtx + "\n---\n" + content
+			}
+		}
+
+		// Build message history.
+		var messages []llmMessage
+		if sess != nil {
+			messages = a.buildLLMHistory(sess, originalUserText)
+		}
+		messages = append(messages, llmMessage{Role: "user", Content: content})
+
+		// Execute.
+		result, err = a.runToolLoop(ctx, req.SessionId, conn, messages, false)
 		if err != nil {
 			return a.replyError(ctx, req.SessionId, err.Error()), nil
 		}
-		content = sysPrompt + "\n---\n" + userText
-	} else if sess != nil {
-		projCtx := buildProjectContext(sess.Cwd, &a.fileCache)
-		if projCtx != "" {
-			content = projCtx + "\n---\n" + userText
+
+		// Verify.
+		var vr *verifyResult
+		result, vr, err = a.verify(ctx, req.SessionId, conn, messages, result, userText, planSteps)
+		if err != nil {
+			return a.replyError(ctx, req.SessionId, err.Error()), nil
 		}
+
+		// If verification passed or no fix steps, we're done.
+		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
+			break
+		}
+
+		// Verification failed with fix steps — retry with new context.
+		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(
+			fmt.Sprintf("⚠ Verification failed. Fix steps:\n%s\n", strings.Join(vr.FixSteps, "\n")),
+		)))
+		userText = fmt.Sprintf("Previous attempt failed.\nIssues: %s\nFix steps: %s\n\nOriginal request: %s",
+			strings.Join(vr.Issues, "; "),
+			strings.Join(vr.FixSteps, "; "),
+			originalUserText)
 	}
 
-	// Build message history for the LLM.
-	var messages []llmMessage
-	if sess != nil {
-		messages = a.buildLLMHistory(sess, userText)
-	}
-	messages = append(messages, llmMessage{Role: "user", Content: content})
+	if sess != nil && result.Text != "" {
+		fullResponse := result.Text
 
-	response, err := a.runToolLoop(ctx, req.SessionId, conn, messages)
-	if err != nil {
-		return a.replyError(ctx, req.SessionId, err.Error()), nil
-	}
-
-	if sess != nil && response != "" {
-		sess.AddAssistant(response)
+		// Update the last assistant message with the final text.
+		if len(sess.Messages) > 0 && sess.Messages[len(sess.Messages)-1].Role == "assistant" {
+			sess.Messages[len(sess.Messages)-1].Content = fullResponse
+		} else {
+			sess.AddAssistant(fullResponse)
+		}
 		_ = sess.Save()
 		a.compressHistory(ctx, sess)
 	}
@@ -321,10 +392,42 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	return PromptResponse{StopReason: StopReasonEndTurn}, nil
 }
 
-func main() {
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+func (a *agent) loadPromptFile(sid SessionId, filename string) string {
+	sess := a.getSession(sid)
+	if sess != nil {
+		if data, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", filename)); err == nil {
+			return string(data)
+		}
+	}
+	return ""
+}
 
-	a := &agent{sessions: make(map[SessionId]*Session), mode: "discussion"}
+func truncate(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
+}
+
+
+func main() {
+	logFile, _ := os.OpenFile("/tmp/codehalter_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if logFile != nil {
+		defer logFile.Close()
+	}
+	// Stderr gets all logs (DEBUG+), file gets INFO+ only.
+	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
+	if logFile != nil {
+		fileHandler := slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelInfo})
+		log := slog.New(stderrHandler)
+		slog.SetDefault(slog.New(fileHandler))
+		_ = log // stderr logger used by jsonrpc via the passed log param
+	} else {
+		slog.SetDefault(slog.New(stderrHandler))
+	}
+	log := slog.New(stderrHandler)
+
+	a := &agent{sessions: make(map[SessionId]*Session)}
 	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin, log)
 	a.conn = conn
 

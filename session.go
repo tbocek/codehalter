@@ -14,8 +14,15 @@ import (
 const sessionDir = ".codehalter"
 
 type Message struct {
-	Role    string `toml:"role"`
-	Content string `toml:"content"`
+	Role      string        `toml:"role"`
+	Content   string        `toml:"content"`
+	ToolUses  []ToolUse     `toml:"tool_uses,omitempty"`
+}
+
+type ToolUse struct {
+	Name   string `toml:"name"`
+	Input  string `toml:"input"`
+	Output string `toml:"output"`
 }
 
 type Session struct {
@@ -23,6 +30,8 @@ type Session struct {
 	Cwd       string         `toml:"cwd"`
 	Title     string         `toml:"title"`
 	CreatedAt time.Time      `toml:"created_at"`
+	Depth     int            `toml:"depth,omitempty"`
+	ParentID  SessionId      `toml:"parent_id,omitempty"`
 	History   []HistoryLevel `toml:"history"`
 	Messages  []Message      `toml:"messages"`
 	filePath  string
@@ -43,6 +52,20 @@ func loadSession(cwd string, id SessionId) (*Session, error) {
 }
 
 
+func newSessionWithID(cwd string, id SessionId) *Session {
+	os.MkdirAll(filepath.Join(cwd, sessionDir), 0755)
+	filename := fmt.Sprintf("session_%s.toml", id)
+	path := filepath.Join(cwd, sessionDir, filename)
+	s := &Session{
+		ID:        id,
+		Cwd:       cwd,
+		CreatedAt: time.Now(),
+		filePath:  path,
+	}
+	_ = s.Save()
+	return s
+}
+
 func newSession(cwd string) (*Session, error) {
 	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0755); err != nil {
 		return nil, fmt.Errorf("creating session dir: %w", err)
@@ -62,12 +85,42 @@ func newSession(cwd string) (*Session, error) {
 	return s, s.Save()
 }
 
+func newSubagentSession(cwd string, parentID SessionId, index, depth int) *Session {
+	os.MkdirAll(filepath.Join(cwd, sessionDir), 0755)
+	id := SessionId(fmt.Sprintf("sub_%s_%d", parentID, index))
+	filename := fmt.Sprintf("session_%s.toml", id)
+	path := filepath.Join(cwd, sessionDir, filename)
+	s := &Session{
+		ID:        id,
+		Cwd:       cwd,
+		Depth:     depth,
+		ParentID:  parentID,
+		CreatedAt: time.Now(),
+		filePath:  path,
+	}
+	_ = s.Save()
+	return s
+}
+
 func (s *Session) AddUser(text string) {
 	s.Messages = append(s.Messages, Message{Role: "user", Content: text})
 }
 
 func (s *Session) AddAssistant(text string) {
 	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text})
+}
+
+func (s *Session) AddAssistantWithTools(text string, tools []ToolUse) {
+	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text, ToolUses: tools})
+}
+
+// AppendToolUse adds a tool use to the last assistant message, creating one if needed.
+func (s *Session) AppendToolUse(tu ToolUse) {
+	if len(s.Messages) == 0 || s.Messages[len(s.Messages)-1].Role != "assistant" {
+		s.Messages = append(s.Messages, Message{Role: "assistant"})
+	}
+	last := &s.Messages[len(s.Messages)-1]
+	last.ToolUses = append(last.ToolUses, tu)
 }
 
 func (s *Session) Save() error {
@@ -92,6 +145,10 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 	var sessions []SessionInfo
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), "session_") || !strings.HasSuffix(e.Name(), ".toml") {
+			continue
+		}
+		// Skip subagent sessions.
+		if strings.HasPrefix(e.Name(), "session_sub_") {
 			continue
 		}
 		info, err := e.Info()

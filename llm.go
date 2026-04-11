@@ -10,13 +10,15 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 )
 
 // LLM message types for the OpenAI API.
 
 type llmMessage struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
+	Content    string     `json:"content"`
 	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
@@ -55,6 +57,10 @@ func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []l
 	}
 
 	body, _ := json.Marshal(reqBody)
+	if f, err := os.OpenFile("/tmp/codehalter_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
+		fmt.Fprintf(f, "\n=== %s ===\n%s\n", time.Now().Format(time.RFC3339), string(body))
+		f.Close()
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", conn.URL, bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err
@@ -128,33 +134,71 @@ func (a *agent) llmSimple(ctx context.Context, conn *LLMConnection, messages []l
 	return text, err
 }
 
-// llmRequest sends a request with tools, streams text to Zed.
-func (a *agent) llmRequest(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage) (string, []toolCall, error) {
-	a.mu.Lock()
-	readOnly := a.mode == "discussion"
-	a.mu.Unlock()
 
-	return a.llmStream(ctx, conn, messages, llmToolDefinitions(readOnly), func(token string) {
-		if sid != "" {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(token)))
-		}
-	})
+const maxToolLoopIterations = 20
+
+const maxParallel = 10
+
+// parallel runs fn for each index [0, n) with up to maxParallel goroutines.
+func parallel(n int, fn func(i int)) {
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxParallel)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			fn(i)
+		}(i)
+	}
+	wg.Wait()
 }
 
-const maxToolLoopIterations = 10
+// trimJSON strips markdown code fences from LLM JSON responses.
+func trimJSON(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
+}
 
 // runToolLoop runs the agentic tool loop: send to LLM, execute tool calls, repeat.
-func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage) (string, error) {
+// If readOnly is true, only read-only tools are sent and tokens are not streamed to Zed.
+type toolLoopResult struct {
+	Text     string
+	ToolUses []ToolUse
+}
+
+func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, readOnly bool) (toolLoopResult, error) {
+	return a.runToolLoopFiltered(ctx, sid, conn, messages, toolFilter{readOnly: readOnly})
+}
+
+func (a *agent) runToolLoopFiltered(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter) (toolLoopResult, error) {
+	tools := llmToolDefinitionsFiltered(filter)
+	var on onToken
+	if !filter.readOnly {
+		on = func(token string) {
+			if sid != "" {
+				a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(token)))
+			}
+		}
+	}
+
+	var res toolLoopResult
 	var allText strings.Builder
 	for i := 0; i < maxToolLoopIterations; i++ {
-		text, calls, err := a.llmRequest(ctx, sid, conn, messages)
+		text, calls, err := a.llmStream(ctx, conn, messages, tools, on)
 		if err != nil {
-			return allText.String(), err
+			res.Text = allText.String()
+			return res, err
 		}
 		allText.WriteString(text)
 
 		if len(calls) == 0 {
-			return allText.String(), nil
+			res.Text = allText.String()
+			return res, nil
 		}
 
 		messages = append(messages, llmMessage{
@@ -165,6 +209,18 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 
 		for _, tc := range calls {
 			result := a.executeTool(ctx, sid, tc)
+			tu := ToolUse{
+				Name:   tc.Function.Name,
+				Input:  tc.Function.Arguments,
+				Output: result,
+			}
+			res.ToolUses = append(res.ToolUses, tu)
+
+			// Save incrementally so tool results survive crashes.
+			if sess := a.getSession(sid); sess != nil {
+				sess.AppendToolUse(tu)
+				_ = sess.Save()
+			}
 			messages = append(messages, llmMessage{
 				Role:       "tool",
 				Content:    result,
@@ -172,5 +228,6 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 			})
 		}
 	}
-	return allText.String(), fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
+	res.Text = allText.String()
+	return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
 }

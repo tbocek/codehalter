@@ -64,3 +64,11 @@ func (s *Settings) LLM(name string) *LLMConnection {
 	}
 	return nil
 }
+
+// SummaryLLM returns the summary connection, falling back to thinking.
+func (s *Settings) SummaryLLM() *LLMConnection {
+	if c := s.LLM("summary"); c != nil {
+		return c
+	}
+	return s.LLM("thinking")
+}

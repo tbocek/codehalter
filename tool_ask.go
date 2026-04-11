@@ -18,7 +18,8 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, args map[string]string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			args := parseArgs(rawArgs)
 		question, yesLabel, noLabel := args["question"], args["yes_label"], args["no_label"]
 		tcId := a.StartToolCall(ctx, sid, question, "think", nil)
 		ok, err := a.conn.AskYesNo(ctx, sid, tcId, yesLabel, noLabel)
@@ -84,18 +85,6 @@ func (a *AgentSideConnection) AskChoice(ctx context.Context, sid SessionId, tool
 	choice, err := a.requestPermission(ctx, sid, toolCallId, options)
 	if err != nil {
 		return "abort", err
-	}
-	return choice, nil
-}
-
-func (a *AgentSideConnection) AskWritePermission(ctx context.Context, sid SessionId, toolCallId string) (string, error) {
-	choice, err := a.requestPermission(ctx, sid, toolCallId, []permissionOption{
-		{OptionId: "allow_once", Name: "Allow once", Kind: "allow_once"},
-		{OptionId: "allow_turn", Name: "Allow for this prompt", Kind: "allow_always"},
-		{OptionId: "reject", Name: "Reject", Kind: "reject_once"},
-	})
-	if err != nil {
-		return "reject", err
 	}
 	return choice, nil
 }

@@ -55,18 +55,15 @@ func estimateMessagesTokens(msgs []Message) int {
 
 // compressHistory checks if the raw message buffer exceeds the budget,
 // and if so, summarizes older messages into cascading summary levels.
-// Uses the "fast" LLM connection for summarization.
+// Uses the "summary" LLM connection for summarization.
 func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	if estimateMessagesTokens(sess.Messages) <= rawBufferTokens {
 		return
 	}
 
-	conn := a.settings.LLM("summary")
+	conn := a.settings.SummaryLLM()
 	if conn == nil {
-		conn = a.settings.LLM("fast")
-	}
-	if conn == nil {
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot compress history: no 'summary' or 'fast' LLM connection\n")))
+		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot compress history: no 'summary' or 'thinking' LLM connection\n")))
 		return
 	}
 
@@ -147,9 +144,9 @@ func (a *agent) summarize(ctx context.Context, conn *LLMConnection, text string,
 
 // generateTitle asks the LLM to create a short title from the first user message.
 func (a *agent) generateTitle(ctx context.Context, sess *Session, userText string) {
-	conn := a.settings.LLM("fast")
+	conn := a.settings.LLM("thinking")
 	if conn == nil {
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot generate title: no 'fast' LLM connection\n")))
+		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot generate title: no 'thinking' LLM connection\n")))
 		return
 	}
 	messages := []llmMessage{{Role: "user", Content: titlePrompt + "\n\n" + userText}}
@@ -181,7 +178,7 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 	if len(sess.History) == 0 {
 		return
 	}
-	conn := a.settings.LLM("fast")
+	conn := a.settings.LLM("thinking")
 	if conn == nil {
 		return // already warned in compressHistory
 	}
@@ -344,9 +341,20 @@ func (a *agent) buildLLMHistory(sess *Session, currentContent string) []llmMessa
 		if m.Role == "user" && m.Content == currentContent {
 			continue
 		}
+		content := m.Content
+		// Append tool use summaries so the LLM knows what was done.
+		if len(m.ToolUses) > 0 {
+			var buf strings.Builder
+			buf.WriteString(content)
+			buf.WriteString("\n\n[Tool calls performed:]\n")
+			for _, tu := range m.ToolUses {
+				fmt.Fprintf(&buf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 200))
+			}
+			content = buf.String()
+		}
 		messages = append(messages, llmMessage{
 			Role:    m.Role,
-			Content: m.Content,
+			Content: content,
 		})
 	}
 

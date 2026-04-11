@@ -48,7 +48,8 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, args map[string]string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			args := parseArgs(rawArgs)
 		sess := a.getSession(sid)
 		if sess == nil {
 			return "error: no session"
@@ -84,7 +85,8 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, args map[string]string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
 			return "error: " + err.Error()
@@ -110,7 +112,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "write_file",
-			"description": "Write content to a file in the project. The user will be asked to approve the change.",
+			"description": "Write content to a file in the project.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path", "content"},
@@ -120,19 +122,29 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, args map[string]string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
 			return "error: " + err.Error()
 		}
 		newContent := args["content"]
-		tcId := a.StartToolCall(ctx, sid, "Editing "+path, "edit", []ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, "Writing "+path, "edit", []ToolCallLocation{{Path: path}})
 
 		oldContent, _ := fsRead(a.conn.RPC(), ctx, sid, path)
 
+		if err := fsWrite(a.conn.RPC(), ctx, sid, path, newContent); err != nil {
+			a.FailToolCall(ctx, sid, tcId, err.Error())
+			return "error writing file: " + err.Error()
+		}
+
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &oldContent, newContent)})
 
-		return approveAndWrite(ctx, a, sid, tcId, path, newContent)
+		a.mu.Lock()
+		a.pendingRefs = append(a.pendingRefs, MakeFileRef(path))
+		a.mu.Unlock()
+
+		return "file written successfully"
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -150,7 +162,8 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, args map[string]string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
 			return "error: " + err.Error()
@@ -177,44 +190,22 @@ func init() {
 		}
 
 		newContent := strings.Replace(content, oldText, newText, 1)
+
+		if err := fsWrite(a.conn.RPC(), ctx, sid, path, newContent); err != nil {
+			a.FailToolCall(ctx, sid, tcId, err.Error())
+			return "error writing file: " + err.Error()
+		}
+
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
 
-		return approveAndWrite(ctx, a, sid, tcId, path, newContent)
+		a.mu.Lock()
+		a.pendingRefs = append(a.pendingRefs, MakeFileRef(path))
+		a.mu.Unlock()
+
+		return "file written successfully"
 	}})
 }
 
-// approveAndWrite handles the permission prompt and file write, shared by write_file and edit_file.
-func approveAndWrite(ctx context.Context, a *agent, sid SessionId, tcId, path, newContent string) string {
-	a.mu.Lock()
-	allowed := a.allowWrites
-	a.mu.Unlock()
-
-	if allowed == "" {
-		choice, err := a.conn.AskWritePermission(ctx, sid, tcId)
-		if err != nil {
-			return "error asking user: " + err.Error()
-		}
-		switch choice {
-		case "reject":
-			return "user rejected the changes"
-		case "allow_turn":
-			a.mu.Lock()
-			a.allowWrites = "turn"
-			a.mu.Unlock()
-		}
-	}
-
-	if err := fsWrite(a.conn.RPC(), ctx, sid, path, newContent); err != nil {
-		return "error writing file: " + err.Error()
-	}
-
-	// Record a code ref for history tracking.
-	a.mu.Lock()
-	a.pendingRefs = append(a.pendingRefs, MakeFileRef(path))
-	a.mu.Unlock()
-
-	return "file written successfully"
-}
 
 func fsReadRange(c *Connection, ctx context.Context, sid SessionId, path, line, limit string) (string, error) {
 	type req struct {
