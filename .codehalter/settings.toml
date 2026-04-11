@@ -1,0 +1,9 @@
+[[llmconnections]]
+name = "thinking"
+url = "http://localhost:8080/v1/chat/completions"
+model = "qwen3"
+
+[[llmconnections]]
+name = "fast"
+url = "http://localhost:8080/v1/chat/completions"
+model = "qwen3-fast"
