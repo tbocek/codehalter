@@ -436,6 +436,20 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	var conn *LLMConnection
 	planInput := userText
 
+	// Pre-planning verification.
+	if thinkingConn := a.settings.LLM("thinking"); thinkingConn != nil {
+		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Running pre-planning verification...\n\n")))
+		vr, err := a.preVerify(ctx, req.SessionId, thinkingConn, userText)
+		if err == nil && vr != nil && !vr.Success {
+			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(fmt.Sprintf("⚠ Pre-planning check found issues:\n%s\n\n", strings.Join(vr.Issues, "\n")))))
+			planInput = fmt.Sprintf("The project is currently in a broken state:\nIssues: %s\n\nOriginal request: %s", strings.Join(vr.Issues, "; "), userText)
+		} else if err != nil {
+			slog.Error("preVerify failed", "error", err)
+		} else {
+			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Project state verified.\n\n")))
+		}
+	}
+
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		a.sendPhase(ctx, req.SessionId, 0, false)
 		c, planSteps, planToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)

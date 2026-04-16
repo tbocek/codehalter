@@ -15,6 +15,38 @@ type verifyResult struct {
 
 const maxVerifyAttempts = 2
 
+// preVerify performs a read-only check of the project state using VERIFY.md
+// before planning begins. Returns the verification result if issues were found.
+func (a *agent) preVerify(ctx context.Context, sid SessionId, conn *LLMConnection, userText string) (*verifyResult, error) {
+	verifyPrompt := a.loadPromptFile(sid, "VERIFY.md")
+	if verifyPrompt == "" {
+		return &verifyResult{Success: true}, nil
+	}
+
+	var prompt strings.Builder
+	prompt.WriteString(verifyPrompt)
+	prompt.WriteString("\n\nUser request: ")
+	prompt.WriteString(userText)
+	prompt.WriteString("\n\nPerform a pre-planning check to see if the current project state is broken or has issues related to this request. Return JSON.")
+
+	messages := []llmMessage{{Role: "user", Content: prompt.String()}}
+	verifyRes, err := a.runToolLoopFiltered(ctx, sid, conn, messages, toolFilter{
+		readOnly: true,
+		include:  map[string]bool{"run_task": true},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	trimmed := trimJSON(verifyRes.Text)
+	var result verifyResult
+	if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
 // verify runs a self-check after execution. If the LLM finds issues, it gets
 // another chance to fix them. Returns the final result and the verify outcome.
 func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, res toolLoopResult, userText string, planSteps []string) (toolLoopResult, *verifyResult, error) {
