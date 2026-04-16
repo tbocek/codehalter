@@ -26,7 +26,9 @@ type AgentCapabilities struct {
 	SessionCapabilities *SessionCapabilities `json:"sessionCapabilities,omitempty"`
 }
 
-type PromptCapabilities struct{}
+type PromptCapabilities struct {
+	Image bool `json:"image,omitempty"`
+}
 
 type SessionCapabilities struct {
 	List *SessionListCapabilities `json:"list,omitempty"`
@@ -35,7 +37,9 @@ type SessionCapabilities struct {
 type SessionListCapabilities struct{}
 
 type (
-	InitializeRequest  struct{ ProtocolVersion ProtocolVersion `json:"protocolVersion"` }
+	InitializeRequest struct {
+		ProtocolVersion ProtocolVersion `json:"protocolVersion"`
+	}
 	InitializeResponse struct {
 		ProtocolVersion   ProtocolVersion   `json:"protocolVersion"`
 		AgentCapabilities AgentCapabilities `json:"agentCapabilities"`
@@ -46,7 +50,9 @@ type (
 	AuthenticateRequest  struct{}
 	AuthenticateResponse struct{}
 
-	NewSessionRequest  struct{ Cwd string `json:"cwd,omitempty"` }
+	NewSessionRequest struct {
+		Cwd string `json:"cwd,omitempty"`
+	}
 	NewSessionResponse struct {
 		SessionId SessionId         `json:"sessionId"`
 		Modes     *SessionModeState `json:"modes,omitempty"`
@@ -58,15 +64,17 @@ type (
 	}
 	SetSessionModeResponse struct{}
 
-	SetSessionModelRequest  struct{ SessionId SessionId `json:"sessionId"` }
+	SetSessionModelRequest struct {
+		SessionId SessionId `json:"sessionId"`
+	}
 	SetSessionModelResponse struct{}
 
-	LoadSessionRequest  struct {
+	LoadSessionRequest struct {
 		SessionId SessionId `json:"sessionId"`
 		Cwd       string    `json:"cwd"`
 	}
 	LoadSessionResponse struct {
-		SessionId SessionId        `json:"sessionId,omitempty"`
+		SessionId SessionId         `json:"sessionId,omitempty"`
 		Modes     *SessionModeState `json:"modes,omitempty"`
 	}
 
@@ -88,19 +96,23 @@ type (
 		ConfigOptions []SessionConfigOption `json:"configOptions"`
 	}
 
-	CancelNotification struct{ SessionId SessionId `json:"sessionId"` }
+	CancelNotification struct {
+		SessionId SessionId `json:"sessionId"`
+	}
 
 	PromptRequest struct {
 		SessionId SessionId      `json:"sessionId"`
 		Content   []ContentBlock `json:"prompt"`
 	}
-	PromptResponse struct{ StopReason StopReason `json:"stopReason,omitempty"` }
+	PromptResponse struct {
+		StopReason StopReason `json:"stopReason,omitempty"`
+	}
 )
 
 // Session modes.
 
 type SessionModeState struct {
-	CurrentModeId string        `json:"currentModeId"`
+	CurrentModeId  string        `json:"currentModeId"`
 	AvailableModes []SessionMode `json:"availableModes"`
 }
 
@@ -113,11 +125,11 @@ type SessionMode struct {
 // Session config options (dropdown selectors in client UI).
 
 type SessionConfigOption struct {
-	Type         string                     `json:"type"`
-	Id           string                     `json:"id"`
-	Name         string                     `json:"name"`
-	Description  string                     `json:"description,omitempty"`
-	CurrentValue string                     `json:"currentValue"`
+	Type         string                      `json:"type"`
+	Id           string                      `json:"id"`
+	Name         string                      `json:"name"`
+	Description  string                      `json:"description,omitempty"`
+	CurrentValue string                      `json:"currentValue"`
 	Options      []SessionConfigSelectOption `json:"options"`
 }
 
@@ -129,34 +141,57 @@ type SessionConfigSelectOption struct {
 
 // Content blocks — union type, serialised flat (not wrapped).
 
-type ContentBlock struct{ Text *ContentBlockText }
+type ContentBlock struct {
+	Text  *ContentBlockText
+	Image *ContentBlockImage
+}
 
 type ContentBlockText struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
 }
 
+type ContentBlockImage struct {
+	Type     string `json:"type"`
+	MimeType string `json:"mimeType"`
+	Data     string `json:"data"` // base64-encoded image data
+}
+
 func (b ContentBlock) MarshalJSON() ([]byte, error) {
 	if b.Text != nil {
 		return json.Marshal(b.Text)
+	}
+	if b.Image != nil {
+		return json.Marshal(b.Image)
 	}
 	return []byte("null"), nil
 }
 
 func (b *ContentBlock) UnmarshalJSON(data []byte) error {
-	var probe struct{ Type string `json:"type"` }
+	var probe struct {
+		Type string `json:"type"`
+	}
 	if err := json.Unmarshal(data, &probe); err != nil {
 		return err
 	}
-	if probe.Type == "text" {
+	switch probe.Type {
+	case "text":
 		b.Text = &ContentBlockText{}
 		return json.Unmarshal(data, b.Text)
+	case "image":
+		b.Image = &ContentBlockImage{}
+		return json.Unmarshal(data, b.Image)
+	default:
+		return nil
 	}
-	return nil
 }
 
 func TextBlock(text string) ContentBlock {
 	return ContentBlock{Text: &ContentBlockText{Type: "text", Text: text}}
+}
+
+func ImageBlock(mimeType, data string) ContentBlock {
+	return ContentBlock{Image: &ContentBlockImage{Type: "image", MimeType: mimeType, Data: data}}
 }
 
 // Session update (agent -> client notification).
@@ -216,7 +251,6 @@ type Agent interface {
 	Prompt(context.Context, PromptRequest) (PromptResponse, error)
 }
 
-
 // AgentSideConnection routes ACP methods over a JSON-RPC connection.
 
 type AgentSideConnection struct {
@@ -231,7 +265,7 @@ func NewAgentSideConnection(agent Agent, w io.Writer, r io.Reader, log *slog.Log
 }
 
 func (a *AgentSideConnection) Done() <-chan struct{} { return a.conn.Done() }
-func (a *AgentSideConnection) RPC() *Connection    { return a.conn }
+func (a *AgentSideConnection) RPC() *Connection      { return a.conn }
 
 func (a *AgentSideConnection) SessionUpdate(ctx context.Context, n SessionNotification) error {
 	return a.conn.SendNotification("session/update", n)

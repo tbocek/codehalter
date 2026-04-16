@@ -18,7 +18,7 @@ import (
 
 type llmMessage struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content"`
+	Content    any        `json:"content"`
 	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
@@ -133,7 +133,6 @@ func (a *agent) llmSimple(ctx context.Context, conn *LLMConnection, messages []l
 	fmt.Fprintln(os.Stderr)
 	return text, err
 }
-
 
 const maxToolLoopIterations = 20
 

@@ -10,14 +10,14 @@ import (
 )
 
 const (
-	rawBufferTokens    = 10000
-	summaryBudget      = 5000
-	charsPerToken      = 4
-	roleTokenOverhead  = 4
-	summaryWordRatio   = 3.0 / 4.0
-	maxTitleLen        = 60
-	titleFallbackLen   = 50
-	wholeFileEndLine   = 999999
+	rawBufferTokens   = 10000
+	summaryBudget     = 5000
+	charsPerToken     = 4
+	roleTokenOverhead = 4
+	summaryWordRatio  = 3.0 / 4.0
+	maxTitleLen       = 60
+	titleFallbackLen  = 50
+	wholeFileEndLine  = 999999
 
 	summarizePrompt = "Summarize this conversation concisely. Preserve key decisions and file paths. Do NOT include source code verbatim — instead reference the file path and describe what was changed. Drop pleasantries and redundant detail."
 	titlePrompt     = "Generate a very short title (max 6 words) for this conversation. Reply with only the title, nothing else."
@@ -342,6 +342,10 @@ func (a *agent) buildLLMHistory(sess *Session, currentContent string) []llmMessa
 			continue
 		}
 		content := m.Content
+		// Mention images in the message content so the LLM knows they exist.
+		if len(m.Images) > 0 {
+			content = fmt.Sprintf("%s\n\n[Images: %d attached]", content, len(m.Images))
+		}
 		// Append tool use summaries so the LLM knows what was done.
 		if len(m.ToolUses) > 0 {
 			var buf strings.Builder

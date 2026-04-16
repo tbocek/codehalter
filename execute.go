@@ -22,7 +22,9 @@ func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessag
 	if executeMD := a.loadPromptFile(sid, "EXECUTE.md"); executeMD != "" && len(messages) > 0 {
 		last := len(messages) - 1
 		if messages[last].Role == "user" {
-			messages[last].Content = executeMD + "\n\n---\n\n" + messages[last].Content
+			if content, ok := messages[last].Content.(string); ok {
+				messages[last].Content = executeMD + "\n\n---\n\n" + content
+			}
 		}
 	}
 	exclude := map[string]bool{"web_search": true, "web_read": true}

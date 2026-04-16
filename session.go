@@ -14,9 +14,15 @@ import (
 const sessionDir = ".codehalter"
 
 type Message struct {
-	Role      string        `toml:"role"`
-	Content   string        `toml:"content"`
-	ToolUses  []ToolUse     `toml:"tool_uses,omitempty"`
+	Role     string      `toml:"role"`
+	Content  string      `toml:"content"`
+	Images   []ImageData `toml:"images,omitempty"`
+	ToolUses []ToolUse   `toml:"tool_uses,omitempty"`
+}
+
+type ImageData struct {
+	MimeType string `toml:"mime_type"`
+	Data     string `toml:"data"` // base64-encoded
 }
 
 type ToolUse struct {
@@ -50,7 +56,6 @@ func loadSession(cwd string, id SessionId) (*Session, error) {
 	s.filePath = path
 	return &s, nil
 }
-
 
 func newSessionWithID(cwd string, id SessionId) *Session {
 	os.MkdirAll(filepath.Join(cwd, sessionDir), 0755)
@@ -106,6 +111,10 @@ func (s *Session) AddUser(text string) {
 	s.Messages = append(s.Messages, Message{Role: "user", Content: text})
 }
 
+func (s *Session) AddUserWithImages(text string, images []ImageData) {
+	s.Messages = append(s.Messages, Message{Role: "user", Content: text, Images: images})
+}
+
 func (s *Session) AddAssistant(text string) {
 	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text})
 }
@@ -159,7 +168,9 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 		id = strings.TrimSuffix(id, ".toml")
 
 		// Read title from file.
-		var header struct{ Title string `toml:"title"` }
+		var header struct {
+			Title string `toml:"title"`
+		}
 		_, _ = toml.DecodeFile(filepath.Join(dir, e.Name()), &header)
 
 		sessions = append(sessions, SessionInfo{

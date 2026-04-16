@@ -46,15 +46,15 @@ func ensureDefaults(cwd string) {
 
 // agent implements acp.Agent.
 type agent struct {
-	conn     *AgentSideConnection
-	mu       sync.Mutex
-	cancel   context.CancelFunc
-	sessions map[SessionId]*Session
-	settings       Settings
-	runners        []taskRunner
-	pendingRefs    []CodeRef
-	fileCache      *FileCache
-	indexDone      chan struct{}
+	conn        *AgentSideConnection
+	mu          sync.Mutex
+	cancel      context.CancelFunc
+	sessions    map[SessionId]*Session
+	settings    Settings
+	runners     []taskRunner
+	pendingRefs []CodeRef
+	fileCache   *FileCache
+	indexDone   chan struct{}
 }
 
 var _ Agent = (*agent)(nil)
@@ -109,7 +109,7 @@ func (a *agent) Initialize(_ context.Context, req InitializeRequest) (Initialize
 		ProtocolVersion: ProtocolVersionNumber,
 		AgentCapabilities: AgentCapabilities{
 			LoadSession:        true,
-			PromptCapabilities: PromptCapabilities{},
+			PromptCapabilities: PromptCapabilities{Image: true},
 			SessionCapabilities: &SessionCapabilities{
 				List: &SessionListCapabilities{},
 			},
@@ -201,6 +201,9 @@ func (a *agent) replayHistory(ctx context.Context, sid SessionId, s *Session) {
 		}
 		if m.Role == "user" {
 			a.sendUpdate(ctx, sid, UserMessageChunk(TextBlock(m.Content)))
+			for _, img := range m.Images {
+				a.sendUpdate(ctx, sid, UserMessageChunk(ImageBlock(img.MimeType, img.Data)))
+			}
 		} else {
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(m.Content)))
 		}
@@ -218,7 +221,6 @@ func (a *agent) ListSessions(_ context.Context, req ListSessionsRequest) (ListSe
 	}
 	return ListSessionsResponse{Sessions: sessions}, nil
 }
-
 
 func (a *agent) SetSessionConfigOption(_ context.Context, req SetSessionConfigOptionRequest) (SetSessionConfigOptionResponse, error) {
 	return SetSessionConfigOptionResponse{ConfigOptions: []SessionConfigOption{}}, nil
@@ -291,11 +293,18 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	a.waitForIndex()
 
-	// Extract user text.
+	// Extract user text and images from prompt blocks.
 	var userText string
+	var images []ImageData
 	for _, block := range req.Content {
 		if block.Text != nil {
 			userText += block.Text.Text
+		}
+		if block.Image != nil {
+			images = append(images, ImageData{
+				MimeType: block.Image.MimeType,
+				Data:     block.Image.Data,
+			})
 		}
 	}
 
@@ -303,7 +312,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	sess := a.getSession(req.SessionId)
 	isFirstMessage := sess != nil && len(sess.Messages) == 0 && len(sess.History) == 0
 	if sess != nil {
-		sess.AddUser(userText)
+		if len(images) > 0 {
+			sess.AddUserWithImages(userText, images)
+		} else {
+			sess.AddUser(userText)
+		}
 		_ = sess.Save()
 	}
 
@@ -376,7 +389,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		if sess != nil {
 			messages = a.buildLLMHistory(sess, originalUserText)
 		}
-		messages = append(messages, llmMessage{Role: "user", Content: content})
+		messages = append(messages, a.buildUserMessage(content, images))
 
 		// Execute.
 		a.sendPhase(ctx, req.SessionId, 1, false)
@@ -425,6 +438,27 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	return PromptResponse{StopReason: StopReasonEndTurn}, nil
 }
 
+func (a *agent) buildUserMessage(content string, images []ImageData) llmMessage {
+	if len(images) == 0 {
+		return llmMessage{Role: "user", Content: content}
+	}
+	// Build OpenAI-style content array with text and image blocks.
+	var parts []any
+	parts = append(parts, map[string]any{
+		"type": "text",
+		"text": content,
+	})
+	for _, img := range images {
+		parts = append(parts, map[string]any{
+			"type": "image_url",
+			"image_url": map[string]string{
+				"url": fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data),
+			},
+		})
+	}
+	return llmMessage{Role: "user", Content: parts}
+}
+
 func (a *agent) loadPromptFile(sid SessionId, filename string) string {
 	sess := a.getSession(sid)
 	if sess != nil {
@@ -441,7 +475,6 @@ func truncate(s string, maxLen int) string {
 	}
 	return s
 }
-
 
 func main() {
 	logFile, _ := os.OpenFile("/tmp/codehalter_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
