@@ -156,13 +156,13 @@ func (a *agent) runSubagent(ctx context.Context, parentSid SessionId, subSess *S
 
 	messages := []llmMessage{{Role: "user", Content: content}}
 
-	// Exclude launch_subagent if at max depth.
-	filter := toolFilter{readOnly: false}
+	// Exclude launch_subagent if at max depth. Web tools are excluded by execute().
+	var extraExclude []string
 	if subSess.Depth >= maxSubagentDepth {
-		filter.exclude = map[string]bool{"launch_subagent": true}
+		extraExclude = append(extraExclude, "launch_subagent")
 	}
 
-	result, err := a.runToolLoopFiltered(ctx, uiSid, conn, messages, filter)
+	result, err := a.execute(ctx, uiSid, messages, extraExclude...)
 	if err != nil {
 		return result.Text, err
 	}

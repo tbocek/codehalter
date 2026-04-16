@@ -184,6 +184,23 @@ func UserMessageChunk(content ContentBlock) SessionUpdate {
 	return messageChunk{Kind: "user_message_chunk", Content: content}
 }
 
+// Plan update — shown by the client as a checklist.
+
+type PlanEntry struct {
+	Content  string `json:"content"`
+	Priority string `json:"priority"`
+	Status   string `json:"status"`
+}
+
+type planUpdate struct {
+	Kind    string      `json:"sessionUpdate"`
+	Entries []PlanEntry `json:"entries"`
+}
+
+func PlanUpdate(entries []PlanEntry) SessionUpdate {
+	return planUpdate{Kind: "plan", Entries: entries}
+}
+
 // Agent is the interface an ACP agent must implement.
 
 type Agent interface {

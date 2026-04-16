@@ -17,6 +17,9 @@ var defaultAgentMD string
 //go:embed PLAN.md.example
 var defaultPlanMD string
 
+//go:embed EXECUTE.md.example
+var defaultExecuteMD string
+
 //go:embed SUMMARY.md.example
 var defaultSummaryMD string
 
@@ -30,6 +33,7 @@ func ensureDefaults(cwd string) {
 	for _, f := range []struct{ name, content string }{
 		{"AGENT.md", defaultAgentMD},
 		{"PLAN.md", defaultPlanMD},
+		{"EXECUTE.md", defaultExecuteMD},
 		{"SUMMARY.md", defaultSummaryMD},
 		{"VERIFY.md", defaultVerifyMD},
 	} {
@@ -80,6 +84,26 @@ func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) 
 	_ = a.conn.SessionUpdate(ctx, SessionNotification{SessionId: sid, Update: u})
 }
 
+// phaseNames are the three pipeline stages shown to the client as a plan.
+var phaseNames = []string{"Planning", "Executing", "Verifying"}
+
+// sendPhase emits a plan update reflecting the current pipeline stage.
+// phase is the index of the stage currently in progress; done=true marks all stages completed.
+func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bool) {
+	entries := make([]PlanEntry, len(phaseNames))
+	for i, name := range phaseNames {
+		status := "pending"
+		switch {
+		case done || i < phase:
+			status = "completed"
+		case i == phase:
+			status = "in_progress"
+		}
+		entries[i] = PlanEntry{Content: name, Priority: "medium", Status: status}
+	}
+	a.sendUpdate(ctx, sid, PlanUpdate(entries))
+}
+
 func (a *agent) Initialize(_ context.Context, req InitializeRequest) (InitializeResponse, error) {
 	return InitializeResponse{
 		ProtocolVersion: ProtocolVersionNumber,
@@ -125,6 +149,7 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ No settings.toml found\n")))
 		}
 
+		a.ensureGitignore(ctx, cwd, sid)
 		a.refreshFileCache(ctx, cwd, sid)
 	}()
 }
@@ -300,6 +325,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 
 		// Plan.
+		a.sendPhase(ctx, req.SessionId, 0, false)
 		conn, planSteps, planToolUses, err := a.planAndRoute(ctx, req.SessionId, userText)
 		if err != nil {
 			if sess != nil && len(planToolUses) > 0 {
@@ -310,13 +336,17 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			return PromptResponse{StopReason: StopReasonEndTurn}, nil
 		}
 
-		// Build execution content.
+		// Build execution content. Always include plan tool uses so that
+		// information retrieved during planning (e.g. web_search results) is
+		// carried into execution, where web tools are unavailable.
 		content := userText
-		if len(planSteps) > 0 {
+		if len(planSteps) > 0 || len(planToolUses) > 0 {
 			var planCtx strings.Builder
-			planCtx.WriteString("The user approved this plan. Follow these steps exactly:\n")
-			for i, step := range planSteps {
-				fmt.Fprintf(&planCtx, "%d. %s\n", i+1, step)
+			if len(planSteps) > 0 {
+				planCtx.WriteString("The user approved this plan. Follow these steps exactly:\n")
+				for i, step := range planSteps {
+					fmt.Fprintf(&planCtx, "%d. %s\n", i+1, step)
+				}
 			}
 			if len(planToolUses) > 0 {
 				planCtx.WriteString("\nDuring planning, these tools were already called (do NOT repeat them):\n")
@@ -349,12 +379,14 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		messages = append(messages, llmMessage{Role: "user", Content: content})
 
 		// Execute.
-		result, err = a.runToolLoop(ctx, req.SessionId, conn, messages, false)
+		a.sendPhase(ctx, req.SessionId, 1, false)
+		result, err = a.execute(ctx, req.SessionId, messages)
 		if err != nil {
 			return a.replyError(ctx, req.SessionId, err.Error()), nil
 		}
 
 		// Verify.
+		a.sendPhase(ctx, req.SessionId, 2, false)
 		var vr *verifyResult
 		result, vr, err = a.verify(ctx, req.SessionId, conn, messages, result, userText, planSteps)
 		if err != nil {
@@ -363,6 +395,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 		// If verification passed or no fix steps, we're done.
 		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
+			a.sendPhase(ctx, req.SessionId, 2, true)
 			break
 		}
 
