@@ -35,7 +35,7 @@ func (a *agent) registerSubagentTool() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "launch_subagent",
-			"description": "Launch one or more subagents to work on independent subtasks in parallel. Each subagent gets its own plan/execute/verify cycle with access to all project tools. You SHOULD use this when the plan has 2+ independent steps that don't depend on each other (e.g. searching for two different things, editing unrelated files, researching while coding).",
+			"description": "Launch one or more subagents to work on independent subtasks in parallel. Each subagent gets its own plan/execute/verify cycle with access to the project's code tools. Use this when the plan has 2+ independent steps that don't depend on each other (e.g. searching for two different things, editing unrelated files, researching while coding). IMPORTANT: subagents cannot talk to the user — they cannot ask clarifying questions or request confirmation. Only launch a subagent when the task is unambiguous and self-contained. If you would need to ask the user anything to complete the task, do it yourself instead.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"tasks"},
@@ -86,11 +86,18 @@ func (a *agent) registerSubagentTool() {
 			task := tasks[i]
 			subSess := newSubagentSession(sess.Cwd, sid, i, sess.Depth+1)
 			ag.putSession(subSess)
+			defer ag.deleteSession(subSess.ID)
 
-			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Starting: %s\n", i+1, truncate(task.Instructions, 100)))))
+			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Starting: %s\n\n", i+1, truncate(task.Instructions, 100)))))
 
-			// Use parent session ID for UI so Zed can show updates/permissions.
-			result, err := ag.runSubagent(ctx, sid, subSess, task, sid)
+			// All internal plan/execute/verify calls use the subagent's own
+			// session id. That keeps plan steps, tool uses, and assistant
+			// output in subSess.toml — and because Zed does not know about
+			// that session id, every session/update notification the tool
+			// loop emits is silently dropped. The subagent therefore runs
+			// without polluting the parent conversation; we surface only the
+			// final result (via the tool return value below) to the parent.
+			result, err := ag.runSubagent(ctx, subSess, task)
 
 			mu.Lock()
 			if err != nil {
@@ -100,7 +107,7 @@ func (a *agent) registerSubagentTool() {
 			}
 			mu.Unlock()
 
-			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Done\n", i+1))))
+			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Done\n\n", i+1))))
 		})
 
 		// Format results.
@@ -118,9 +125,14 @@ func (a *agent) registerSubagentTool() {
 	}})
 }
 
-// runSubagent executes a full plan→execute→verify cycle for a subagent task.
-func (a *agent) runSubagent(ctx context.Context, parentSid SessionId, subSess *Session, task subagentTask, uiSid SessionId) (string, error) {
-	// Build the instruction with optional context.
+// runSubagent executes a full plan→execute→verify cycle against subSess. All
+// internal calls use subSess.ID so tool uses, plan steps, and assistant text
+// are saved there (not in the parent). UI updates emitted by the tool loop
+// target subSess.ID too and are dropped by the client since it has never been
+// announced — only the returned result string flows back to the parent.
+func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
+	sid := subSess.ID
+
 	instructions := task.Instructions
 	if task.Context != "" {
 		instructions = "Context:\n" + task.Context + "\n\nTask:\n" + task.Instructions
@@ -130,12 +142,11 @@ func (a *agent) runSubagent(ctx context.Context, parentSid SessionId, subSess *S
 	_ = subSess.Save()
 
 	// Plan (auto-approve).
-	conn, planSteps, _, err := a.planForSubagent(ctx, uiSid, instructions)
+	conn, planSteps, _, err := a.planForSubagent(ctx, sid, instructions)
 	if err != nil {
 		return "", err
 	}
 
-	// Build execution content.
 	content := instructions
 	if len(planSteps) > 0 {
 		var planCtx strings.Builder
@@ -148,34 +159,39 @@ func (a *agent) runSubagent(ctx context.Context, parentSid SessionId, subSess *S
 		content = planCtx.String()
 	}
 
-	// Add system prompt.
-	sysPrompt, err := a.systemPrompt(subSess.ID)
+	sysPrompt, err := a.systemPrompt(sid)
 	if err == nil && sysPrompt != "" {
 		content = sysPrompt + "\n---\n" + content
 	}
 
 	messages := []llmMessage{{Role: "user", Content: content}}
 
-	// Exclude launch_subagent if at max depth. Web tools are excluded by execute().
-	var extraExclude []string
+	// Subagents can't interact with the user (UI is dropped), so ask_user
+	// would hang. launch_subagent is excluded at max depth to bound recursion.
+	extraExclude := []string{"ask_user"}
 	if subSess.Depth >= maxSubagentDepth {
 		extraExclude = append(extraExclude, "launch_subagent")
 	}
 
-	result, err := a.execute(ctx, uiSid, messages, extraExclude...)
+	result, err := a.execute(ctx, sid, messages, extraExclude...)
 	if err != nil {
 		return result.Text, err
 	}
 
-	// Verify.
-	result, _, err = a.verify(ctx, uiSid, conn, messages, result, instructions, planSteps)
+	result, _, err = a.verify(ctx, sid, conn, messages, result, instructions, planSteps)
 	if err != nil {
 		return result.Text, err
 	}
 
-	// Save subagent session.
+	// The tool loop incrementally appends tool uses to the last assistant
+	// message via AppendToolUse; here we just set that message's Content to
+	// the final text (or add a new assistant message if none exists).
 	if result.Text != "" {
-		subSess.AddAssistantWithTools(result.Text, result.ToolUses)
+		if n := len(subSess.Messages); n > 0 && subSess.Messages[n-1].Role == "assistant" {
+			subSess.Messages[n-1].Content = result.Text
+		} else {
+			subSess.AddAssistantWithTools(result.Text, result.ToolUses)
+		}
 		_ = subSess.Save()
 	}
 

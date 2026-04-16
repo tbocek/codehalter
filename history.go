@@ -301,19 +301,20 @@ func mergeRefs(a, b []CodeRef) []CodeRef {
 	return result
 }
 
-// buildLLMHistory constructs the message array for the LLM, including
-// summarized history from older levels and recent raw messages.
-func (a *agent) buildLLMHistory(sess *Session, currentContent string) []llmMessage {
+// buildLLMHistory constructs the LLM message array from the session's stored
+// history and messages. Messages are read 1:1 from TOML — project context and
+// file-cache summaries are NOT stored and must be injected by the caller onto
+// the current user message. skipIdx is the index in sess.Messages of the
+// current user message; the caller appends it separately with the injected
+// context.
+func (a *agent) buildLLMHistory(sess *Session, skipIdx int) []llmMessage {
 	var messages []llmMessage
 
-	// Add summary levels (oldest first) with invalidation notes.
 	if len(sess.History) > 0 {
 		var historyBuf strings.Builder
 		historyBuf.WriteString("[Conversation history - most recent decisions take priority]\n\n")
 
-		// Check for stale code references.
-		invalidations := checkInvalidRefs(sess.History)
-		if len(invalidations) > 0 {
+		if invalidations := checkInvalidRefs(sess.History); len(invalidations) > 0 {
 			historyBuf.WriteString("[Code changes since last discussed]\n")
 			for _, note := range invalidations {
 				historyBuf.WriteString(note + "\n")
@@ -325,42 +326,55 @@ func (a *agent) buildLLMHistory(sess *Session, currentContent string) []llmMessa
 			h := sess.History[i]
 			fmt.Fprintf(&historyBuf, "[Summary level %d]:\n%s\n\n", h.Level, h.Content)
 		}
-		messages = append(messages, llmMessage{
-			Role:    "user",
-			Content: historyBuf.String(),
-		})
+		messages = append(messages, llmMessage{Role: "user", Content: historyBuf.String()})
 		messages = append(messages, llmMessage{
 			Role:    "assistant",
 			Content: "I've reviewed the conversation history. I'll prioritize the most recent decisions and context.",
 		})
 	}
 
-	// Add recent raw messages (excluding the current one which is last).
-	for _, m := range sess.Messages {
-		// Skip the current message — it'll be added separately with context.
-		if m.Role == "user" && m.Content == currentContent {
+	for i, m := range sess.Messages {
+		if i == skipIdx {
 			continue
 		}
-		content := m.Content
-		// Mention images in the message content so the LLM knows they exist.
-		if len(m.Images) > 0 {
-			content = fmt.Sprintf("%s\n\n[Images: %d attached]", content, len(m.Images))
-		}
-		// Append tool use summaries so the LLM knows what was done.
-		if len(m.ToolUses) > 0 {
-			var buf strings.Builder
-			buf.WriteString(content)
-			buf.WriteString("\n\n[Tool calls performed:]\n")
-			for _, tu := range m.ToolUses {
-				fmt.Fprintf(&buf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 200))
-			}
-			content = buf.String()
-		}
-		messages = append(messages, llmMessage{
-			Role:    m.Role,
-			Content: content,
-		})
+		messages = append(messages, a.historyMessage(m))
 	}
 
 	return messages
+}
+
+// historyMessage converts a stored Message to an llmMessage. Images pass
+// through as OpenAI-style content blocks when the current LLM supports them;
+// otherwise they're mentioned as text so the assistant knows they existed.
+// Tool uses are summarized inline so the assistant knows what was already done.
+func (a *agent) historyMessage(m Message) llmMessage {
+	text := m.Content
+	if len(m.ToolUses) > 0 {
+		var buf strings.Builder
+		buf.WriteString(text)
+		buf.WriteString("\n\n[Tool calls performed:]\n")
+		for _, tu := range m.ToolUses {
+			fmt.Fprintf(&buf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 200))
+		}
+		text = buf.String()
+	}
+
+	if len(m.Images) == 0 {
+		return llmMessage{Role: m.Role, Content: text}
+	}
+	if !a.imagesSupported {
+		text = fmt.Sprintf("%s\n\n[Images: %d attached]", text, len(m.Images))
+		return llmMessage{Role: m.Role, Content: text}
+	}
+
+	parts := []any{map[string]any{"type": "text", "text": text}}
+	for _, img := range m.Images {
+		parts = append(parts, map[string]any{
+			"type": "image_url",
+			"image_url": map[string]string{
+				"url": fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data),
+			},
+		})
+	}
+	return llmMessage{Role: m.Role, Content: parts}
 }

@@ -47,6 +47,21 @@ func loadSettings(cwd string) (Settings, error) {
 	return Settings{}, fmt.Errorf("no settings.toml found (checked %s and ~/.config/codehalter/settings.toml)", projectPath)
 }
 
+// loadGlobalSettings reads only the user-level settings at
+// ~/.config/codehalter/settings.toml. Unlike loadSettings it never touches the
+// project directory, so it is safe to call before a session (and a cwd) exist.
+func loadGlobalSettings() (Settings, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return Settings{}, err
+	}
+	globalPath := filepath.Join(home, ".config", "codehalter", "settings.toml")
+	if _, err := os.Stat(globalPath); err != nil {
+		return Settings{}, fmt.Errorf("no global settings.toml at %s", globalPath)
+	}
+	return decodeSettings(globalPath)
+}
+
 func decodeSettings(path string) (Settings, error) {
 	var s Settings
 	if _, err := toml.DecodeFile(path, &s); err != nil {

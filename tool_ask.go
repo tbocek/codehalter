@@ -2,6 +2,39 @@ package main
 
 import "context"
 
+// askYesNoAuto asks the user in interactive mode; in autopilot mode it returns
+// defaultYes immediately and sends a chat note so the user sees what was
+// auto-answered. Callers are still responsible for completing the tool call
+// they opened (typically via CompleteToolCall with a short note).
+func (a *agent) askYesNoAuto(ctx context.Context, sid SessionId, tcId, yesLabel, noLabel string, defaultYes bool) (bool, error) {
+	if a.isAutopilot() {
+		chosen := noLabel
+		if defaultYes {
+			chosen = yesLabel
+		}
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("[autopilot] "+chosen+"\n\n")))
+		return defaultYes, nil
+	}
+	return a.conn.AskYesNo(ctx, sid, tcId, yesLabel, noLabel)
+}
+
+// askChoiceAuto asks the user in interactive mode; in autopilot it returns
+// choices[defaultIdx] (or choices[0] if out of range, or "abort" if empty).
+func (a *agent) askChoiceAuto(ctx context.Context, sid SessionId, tcId string, choices []string, defaultIdx int) (string, error) {
+	if a.isAutopilot() {
+		if len(choices) == 0 {
+			return "abort", nil
+		}
+		idx := defaultIdx
+		if idx < 0 || idx >= len(choices) {
+			idx = 0
+		}
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("[autopilot] "+choices[idx]+"\n\n")))
+		return choices[idx], nil
+	}
+	return a.conn.AskChoice(ctx, sid, tcId, choices)
+}
+
 func init() {
 	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
 		"type": "function",
@@ -22,7 +55,7 @@ func init() {
 			args := parseArgs(rawArgs)
 		question, yesLabel, noLabel := args["question"], args["yes_label"], args["no_label"]
 		tcId := a.StartToolCall(ctx, sid, question, "think", nil)
-		ok, err := a.conn.AskYesNo(ctx, sid, tcId, yesLabel, noLabel)
+		ok, err := a.askYesNoAuto(ctx, sid, tcId, yesLabel, noLabel, true)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error()

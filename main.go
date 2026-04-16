@@ -46,15 +46,46 @@ func ensureDefaults(cwd string) {
 
 // agent implements acp.Agent.
 type agent struct {
-	conn        *AgentSideConnection
-	mu          sync.Mutex
-	cancel      context.CancelFunc
-	sessions    map[SessionId]*Session
-	settings    Settings
-	runners     []taskRunner
-	pendingRefs []CodeRef
-	fileCache   *FileCache
-	indexDone   chan struct{}
+	conn            *AgentSideConnection
+	mu              sync.Mutex
+	cancel          context.CancelFunc
+	sessions        map[SessionId]*Session
+	settings        Settings
+	runners         []taskRunner
+	pendingRefs     []CodeRef
+	fileCache       *FileCache
+	indexDone       chan struct{}
+	imagesSupported bool
+	probedConnKey   string
+	mode            string // "interactive" | "autopilot"
+}
+
+const (
+	modeInteractive = "interactive"
+	modeAutopilot   = "autopilot"
+)
+
+// sessionModes is the mode state advertised to the client on session
+// create/load. The client uses this to render the mode selector.
+func (a *agent) sessionModes() *SessionModeState {
+	current := a.mode
+	if current == "" {
+		current = modeInteractive
+	}
+	return &SessionModeState{
+		CurrentModeId: current,
+		AvailableModes: []SessionMode{
+			{Id: modeInteractive, Name: "Interactive", Description: "Ask the user before non-trivial actions"},
+			{Id: modeAutopilot, Name: "Autopilot", Description: "Auto-answer prompts — no user interruption"},
+		},
+	}
+}
+
+// isAutopilot reports whether questions should be auto-answered.
+func (a *agent) isAutopilot() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.mode == modeAutopilot
 }
 
 var _ Agent = (*agent)(nil)
@@ -80,36 +111,50 @@ func (a *agent) putSession(s *Session) {
 	a.sessions[s.ID] = s
 }
 
+func (a *agent) deleteSession(id SessionId) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	delete(a.sessions, id)
+}
+
 func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) {
 	_ = a.conn.SessionUpdate(ctx, SessionNotification{SessionId: sid, Update: u})
 }
 
-// phaseNames are the three pipeline stages shown to the client as a plan.
+// phaseNames are the pipeline stages; only the current one is shown to the
+// client at a time (the plan UI updates in place as phases progress).
 var phaseNames = []string{"Planning", "Executing", "Verifying"}
 
-// sendPhase emits a plan update reflecting the current pipeline stage.
-// phase is the index of the stage currently in progress; done=true marks all stages completed.
+// sendPhase emits a plan update with a single entry for the current stage,
+// replacing any previous entry. When done=true it marks the last stage
+// completed so the client renders the pipeline as finished.
 func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bool) {
-	entries := make([]PlanEntry, len(phaseNames))
-	for i, name := range phaseNames {
-		status := "pending"
-		switch {
-		case done || i < phase:
-			status = "completed"
-		case i == phase:
-			status = "in_progress"
-		}
-		entries[i] = PlanEntry{Content: name, Priority: "medium", Status: status}
+	var entry PlanEntry
+	if done {
+		entry = PlanEntry{Content: phaseNames[len(phaseNames)-1], Priority: "medium", Status: "completed"}
+	} else {
+		entry = PlanEntry{Content: phaseNames[phase], Priority: "medium", Status: "in_progress"}
 	}
-	a.sendUpdate(ctx, sid, PlanUpdate(entries))
+	a.sendUpdate(ctx, sid, PlanUpdate([]PlanEntry{entry}))
 }
 
-func (a *agent) Initialize(_ context.Context, req InitializeRequest) (InitializeResponse, error) {
+func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
+	// Detect image support by probing the execute/thinking LLM with a tiny
+	// image. We load the global settings only here — project-local settings
+	// live under a cwd we do not yet have. If project-local settings override
+	// the LLM later, startIndexing will re-probe and update the flag.
+	if gs, err := loadGlobalSettings(); err == nil {
+		a.settings = gs
+		if conn := a.probeTargetConn(); conn != nil {
+			a.imagesSupported = a.probeImageSupport(ctx, conn)
+			a.probedConnKey = connKey(conn)
+		}
+	}
 	return InitializeResponse{
 		ProtocolVersion: ProtocolVersionNumber,
 		AgentCapabilities: AgentCapabilities{
 			LoadSession:        true,
-			PromptCapabilities: PromptCapabilities{Image: true},
+			PromptCapabilities: PromptCapabilities{Image: a.imagesSupported},
 			SessionCapabilities: &SessionCapabilities{
 				List: &SessionListCapabilities{},
 			},
@@ -120,6 +165,24 @@ func (a *agent) Initialize(_ context.Context, req InitializeRequest) (Initialize
 		},
 		AuthMethods: []string{},
 	}, nil
+}
+
+// probeTargetConn returns the LLM connection that receives user images
+// (execute, falling back to thinking).
+func (a *agent) probeTargetConn() *LLMConnection {
+	if c := a.settings.LLM("execute"); c != nil {
+		return c
+	}
+	return a.settings.LLM("thinking")
+}
+
+// connKey identifies an LLM endpoint by url+model so we can tell when
+// project-local settings point at a different model than we probed.
+func connKey(c *LLMConnection) string {
+	if c == nil {
+		return ""
+	}
+	return c.URL + "|" + c.Model
 }
 
 func (a *agent) Authenticate(_ context.Context, _ AuthenticateRequest) (AuthenticateResponse, error) {
@@ -144,14 +207,38 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 		ctx := context.Background()
 
 		if a.settings.path != "" {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Using "+a.settings.path+"\n")))
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Using "+a.settings.path+"\n\n")))
 		} else {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ No settings.toml found\n")))
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ No settings.toml found\n\n")))
 		}
+
+		a.checkImageSupport(ctx, sid)
 
 		a.ensureGitignore(ctx, cwd, sid)
 		a.refreshFileCache(ctx, cwd, sid)
 	}()
+}
+
+// checkImageSupport re-probes the active LLM if project-local settings point
+// at a different model than the one probed in Initialize, then tells the user
+// whether image input is available. Runs on the indexing goroutine so it never
+// blocks the session handshake.
+func (a *agent) checkImageSupport(ctx context.Context, sid SessionId) {
+	conn := a.probeTargetConn()
+	if conn == nil {
+		a.imagesSupported = false
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Image support: disabled (no LLM configured)\n\n")))
+		return
+	}
+	if key := connKey(conn); key != a.probedConnKey {
+		a.imagesSupported = a.probeImageSupport(ctx, conn)
+		a.probedConnKey = key
+	}
+	if a.imagesSupported {
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Image support: enabled ("+conn.Model+")\n\n")))
+	} else {
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Image support: disabled ("+conn.Model+" did not accept image input)\n\n")))
+	}
 }
 
 func (a *agent) waitForIndex() {
@@ -168,7 +255,7 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 	}
 	a.initSession(cwd, s)
 	a.startIndexing(s.ID, cwd)
-	return NewSessionResponse{SessionId: s.ID, Modes: nil}, nil
+	return NewSessionResponse{SessionId: s.ID, Modes: a.sessionModes()}, nil
 }
 
 func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
@@ -179,14 +266,14 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 			s = newSessionWithID(cwd, req.SessionId)
 			a.initSession(cwd, s)
 			a.startIndexing(s.ID, cwd)
-			return LoadSessionResponse{Modes: nil}, nil
+			return LoadSessionResponse{Modes: a.sessionModes()}, nil
 		}
 		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
 	}
 	a.initSession(cwd, s)
 	a.replayHistory(ctx, req.SessionId, s)
 	a.startIndexing(s.ID, cwd)
-	return LoadSessionResponse{Modes: nil}, nil
+	return LoadSessionResponse{Modes: a.sessionModes()}, nil
 }
 
 func (a *agent) replayHistory(ctx context.Context, sid SessionId, s *Session) {
@@ -226,7 +313,14 @@ func (a *agent) SetSessionConfigOption(_ context.Context, req SetSessionConfigOp
 	return SetSessionConfigOptionResponse{ConfigOptions: []SessionConfigOption{}}, nil
 }
 
-func (a *agent) SetSessionMode(_ context.Context, req SetSessionModeRequest) (SetSessionModeResponse, error) {
+func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) (SetSessionModeResponse, error) {
+	if req.ModeId != modeInteractive && req.ModeId != modeAutopilot {
+		return SetSessionModeResponse{}, nil
+	}
+	a.mu.Lock()
+	a.mode = req.ModeId
+	a.mu.Unlock()
+	a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Mode: "+req.ModeId+"\n\n")))
 	return SetSessionModeResponse{}, nil
 }
 
@@ -246,11 +340,11 @@ func (a *agent) refreshFileCache(ctx context.Context, cwd string, sid SessionId)
 	a.fileCache = loadFileCache(cwd)
 	stale := updateFileCache(cwd, a.fileCache)
 	if len(stale) > 0 {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexing %d files...\n", len(stale)))))
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexing %d files...\n\n", len(stale)))))
 		if err := a.summarizeStaleFiles(ctx, cwd, a.fileCache, stale, sid); err != nil {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n\n")))
 		} else {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexed %d files.\n", len(stale)))))
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexed %d files.\n\n", len(stale)))))
 		}
 	}
 }
@@ -308,15 +402,20 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
-	// Store user message.
+	// Store user message. The stored message is the raw userText only —
+	// project context and plan/retry prefixes are injected onto the latest
+	// prompt at send time (see buildLLMHistory) and are NOT persisted, so
+	// history stays cacheable and compact.
 	sess := a.getSession(req.SessionId)
 	isFirstMessage := sess != nil && len(sess.Messages) == 0 && len(sess.History) == 0
+	currentUserIdx := -1
 	if sess != nil {
 		if len(images) > 0 {
 			sess.AddUserWithImages(userText, images)
 		} else {
 			sess.AddUser(userText)
 		}
+		currentUserIdx = len(sess.Messages) - 1
 		_ = sess.Save()
 	}
 
@@ -325,21 +424,21 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		go a.generateTitle(context.Background(), sess, userText)
 	}
 
-	// Plan → Execute → Verify cycle with retry.
-	const maxRetryCycles = 3
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
-	originalUserText := userText
+	// Plan → Execute → Verify. If verify fails, feed the failure context into
+	// a fresh plan and try again — the planner can pick a different strategy
+	// each pass, so we're not repeating the same failing attempt. Loop until
+	// verify is happy, with a hard cap (maxAttempts) as a safety net against
+	// a broken LLM that never converges.
+	const maxAttempts = 5
 	var result toolLoopResult
+	var conn *LLMConnection
+	planInput := userText
 
-	for cycle := 0; cycle < maxRetryCycles; cycle++ {
-		if cycle > 0 {
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(fmt.Sprintf("\n⚠ Retrying (attempt %d/%d)...\n", cycle+1, maxRetryCycles))))
-		}
-
-		// Plan.
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		a.sendPhase(ctx, req.SessionId, 0, false)
-		conn, planSteps, planToolUses, err := a.planAndRoute(ctx, req.SessionId, userText)
+		c, planSteps, planToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)
 		if err != nil {
 			if sess != nil && len(planToolUses) > 0 {
 				sess.AddAssistantWithTools("❌ "+err.Error(), planToolUses)
@@ -348,11 +447,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
 			return PromptResponse{StopReason: StopReasonEndTurn}, nil
 		}
+		conn = c
 
-		// Build execution content. Always include plan tool uses so that
-		// information retrieved during planning (e.g. web_search results) is
-		// carried into execution, where web tools are unavailable.
-		content := userText
+		// stored  = plan prefix + planInput  (persisted to TOML, 1:1 minus cache)
+		// content = sysPrompt/projCtx + stored (sent to LLM this turn)
+		stored := planInput
 		if len(planSteps) > 0 || len(planToolUses) > 0 {
 			var planCtx strings.Builder
 			if len(planSteps) > 0 {
@@ -368,10 +467,17 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 				}
 			}
 			planCtx.WriteString("\nUser request: ")
-			planCtx.WriteString(userText)
-			content = planCtx.String()
+			planCtx.WriteString(planInput)
+			stored = planCtx.String()
 		}
-		if isFirstMessage && cycle == 0 {
+
+		if sess != nil && currentUserIdx >= 0 && currentUserIdx < len(sess.Messages) {
+			sess.Messages[currentUserIdx].Content = stored
+			_ = sess.Save()
+		}
+
+		content := stored
+		if isFirstMessage && attempt == 0 {
 			sysPrompt, err := a.systemPrompt(req.SessionId)
 			if err != nil {
 				return a.replyError(ctx, req.SessionId, err.Error()), nil
@@ -384,43 +490,48 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			}
 		}
 
-		// Build message history.
+		// History is read 1:1 from TOML (including images on user turns). The
+		// current user message is skipped here and re-appended with the cache
+		// injected, so the cache lives only on the latest prompt and earlier
+		// history stays cacheable.
 		var messages []llmMessage
 		if sess != nil {
-			messages = a.buildLLMHistory(sess, originalUserText)
+			messages = a.buildLLMHistory(sess, currentUserIdx)
 		}
 		messages = append(messages, a.buildUserMessage(content, images))
 
-		// Execute.
 		a.sendPhase(ctx, req.SessionId, 1, false)
 		result, err = a.execute(ctx, req.SessionId, messages)
 		if err != nil {
 			return a.replyError(ctx, req.SessionId, err.Error()), nil
 		}
 
-		// Verify.
 		a.sendPhase(ctx, req.SessionId, 2, false)
 		var vr *verifyResult
-		result, vr, err = a.verify(ctx, req.SessionId, conn, messages, result, userText, planSteps)
+		result, vr, err = a.verify(ctx, req.SessionId, conn, messages, result, planInput, planSteps)
 		if err != nil {
 			return a.replyError(ctx, req.SessionId, err.Error()), nil
 		}
-
-		// If verification passed or no fix steps, we're done.
 		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
-			a.sendPhase(ctx, req.SessionId, 2, true)
 			break
 		}
 
-		// Verification failed with fix steps — retry with new context.
+		if attempt == maxAttempts-1 {
+			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(
+				fmt.Sprintf("⚠ Verification still failing after %d attempts — giving up. Last issues:\n%s\n", maxAttempts, strings.Join(vr.Issues, "\n")),
+			)))
+			break
+		}
+
 		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(
-			fmt.Sprintf("⚠ Verification failed. Fix steps:\n%s\n", strings.Join(vr.FixSteps, "\n")),
+			fmt.Sprintf("⚠ Verification failed (attempt %d/%d). Re-planning with the failure context:\n%s\n", attempt+1, maxAttempts, strings.Join(vr.FixSteps, "\n")),
 		)))
-		userText = fmt.Sprintf("Previous attempt failed.\nIssues: %s\nFix steps: %s\n\nOriginal request: %s",
+		planInput = fmt.Sprintf("The previous attempt failed verification.\nIssues: %s\nFix steps: %s\n\nOriginal request: %s\n\nRe-plan with this information. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it.",
 			strings.Join(vr.Issues, "; "),
 			strings.Join(vr.FixSteps, "; "),
-			originalUserText)
+			userText)
 	}
+	a.sendPhase(ctx, req.SessionId, 2, true)
 
 	if sess != nil && result.Text != "" {
 		fullResponse := result.Text
@@ -439,7 +550,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 }
 
 func (a *agent) buildUserMessage(content string, images []ImageData) llmMessage {
-	if len(images) == 0 {
+	if len(images) == 0 || !a.imagesSupported {
 		return llmMessage{Role: "user", Content: content}
 	}
 	// Build OpenAI-style content array with text and image blocks.
@@ -493,7 +604,7 @@ func main() {
 	}
 	log := slog.New(stderrHandler)
 
-	a := &agent{sessions: make(map[SessionId]*Session)}
+	a := &agent{sessions: make(map[SessionId]*Session), mode: modeInteractive}
 	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin, log)
 	a.conn = conn
 

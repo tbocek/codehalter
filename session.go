@@ -92,7 +92,10 @@ func newSession(cwd string) (*Session, error) {
 
 func newSubagentSession(cwd string, parentID SessionId, index, depth int) *Session {
 	os.MkdirAll(filepath.Join(cwd, sessionDir), 0755)
-	id := SessionId(fmt.Sprintf("sub_%s_%d", parentID, index))
+	// Nanosecond suffix so sequential launch_subagent calls from the same
+	// parent don't collide on id (each call re-starts index at 0).
+	now := time.Now()
+	id := SessionId(fmt.Sprintf("sub_%s_%d_%d", parentID, now.UnixNano(), index))
 	filename := fmt.Sprintf("session_%s.toml", id)
 	path := filepath.Join(cwd, sessionDir, filename)
 	s := &Session{
@@ -100,7 +103,7 @@ func newSubagentSession(cwd string, parentID SessionId, index, depth int) *Sessi
 		Cwd:       cwd,
 		Depth:     depth,
 		ParentID:  parentID,
-		CreatedAt: time.Now(),
+		CreatedAt: now,
 		filePath:  path,
 	}
 	_ = s.Save()

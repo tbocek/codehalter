@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -125,6 +127,146 @@ func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []l
 	return fullText.String(), calls, nil
 }
 
+// probeImageSupport determines whether the configured model accepts images,
+// using cheap metadata endpoints (no inference). Works against two llama.cpp
+// topologies:
+//
+//  1. A llama-swap-style router in front of multiple llama-server instances —
+//     GET /v1/models lists every model with its launch args; vision models
+//     were started with --mmproj.
+//  2. A single llama-server — GET /props reports modalities.vision once an
+//     mmproj is loaded.
+//
+// We try /v1/models first (it identifies the specific configured model even
+// when the router hasn't loaded it yet) and fall back to /props.
+func (a *agent) probeImageSupport(ctx context.Context, conn *LLMConnection) bool {
+	if conn == nil {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if supported, known := a.probeViaModels(probeCtx, conn); known {
+		slog.Info("probeImageSupport: via /v1/models", "model", conn.Model, "vision", supported)
+		return supported
+	}
+	if supported, known := a.probeViaProps(probeCtx, conn); known {
+		slog.Info("probeImageSupport: via /props", "model", conn.Model, "vision", supported)
+		return supported
+	}
+	slog.Info("probeImageSupport: indeterminate", "model", conn.Model)
+	return false
+}
+
+// probeViaModels asks the router's /v1/models for the configured model's
+// launch args. `--mmproj` in those args means the server loaded a multimodal
+// projector. Returns (supported, known) — known=false means this endpoint
+// could not answer (e.g. a plain llama-server whose /v1/models omits args).
+func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (bool, bool) {
+	modelsURL, ok := deriveServerURL(conn.URL, "/v1/models")
+	if !ok {
+		return false, false
+	}
+	resp, err := getWithAuth(ctx, modelsURL, conn.Token)
+	if err != nil {
+		slog.Info("probeViaModels: request failed", "url", modelsURL, "err", err)
+		return false, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, false
+	}
+	var models struct {
+		Data []struct {
+			ID     string `json:"id"`
+			Status struct {
+				Args []string `json:"args"`
+			} `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
+		return false, false
+	}
+	for _, m := range models.Data {
+		if m.ID != conn.Model {
+			continue
+		}
+		if len(m.Status.Args) == 0 {
+			return false, false
+		}
+		for _, arg := range m.Status.Args {
+			if arg == "--mmproj" {
+				return true, true
+			}
+		}
+		return false, true
+	}
+	return false, false
+}
+
+// probeViaProps reads llama-server's /props and checks modalities.vision.
+func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (bool, bool) {
+	propsURL, ok := deriveServerURL(conn.URL, "/props")
+	if !ok {
+		return false, false
+	}
+	resp, err := getWithAuth(ctx, propsURL, conn.Token)
+	if err != nil {
+		slog.Info("probeViaProps: request failed", "url", propsURL, "err", err)
+		return false, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		slog.Info("probeViaProps: non-OK", "url", propsURL, "status", resp.StatusCode, "body", string(body))
+		return false, false
+	}
+	var props struct {
+		Modalities *struct {
+			Vision bool `json:"vision"`
+		} `json:"modalities"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&props); err != nil {
+		return false, false
+	}
+	if props.Modalities == nil {
+		return false, false
+	}
+	return props.Modalities.Vision, true
+}
+
+// getWithAuth issues a GET with an optional bearer token and follows redirects
+// (http.DefaultClient follows up to 10 by default, needed for http→https).
+func getWithAuth(ctx context.Context, rawURL, token string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	return http.DefaultClient.Do(req)
+}
+
+// deriveServerURL strips a chat-completions-style path from rawURL and appends
+// suffix. Handles "…/v1/chat/completions" and bare "…/chat/completions".
+func deriveServerURL(rawURL, suffix string) (string, bool) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	path := u.Path
+	if i := strings.Index(path, "/v1/"); i >= 0 {
+		path = path[:i]
+	} else if j := strings.LastIndex(path, "/chat/completions"); j >= 0 {
+		path = path[:j]
+	}
+	u.Path = strings.TrimRight(path, "/") + suffix
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), true
+}
+
 // llmSimple sends a no-tools LLM call, logs to stderr.
 func (a *agent) llmSimple(ctx context.Context, conn *LLMConnection, messages []llmMessage) (string, error) {
 	text, _, err := a.llmStream(ctx, conn, messages, nil, func(token string) {
@@ -133,8 +275,6 @@ func (a *agent) llmSimple(ctx context.Context, conn *LLMConnection, messages []l
 	fmt.Fprintln(os.Stderr)
 	return text, err
 }
-
-const maxToolLoopIterations = 20
 
 const maxParallel = 10
 
@@ -187,7 +327,7 @@ func (a *agent) runToolLoopFiltered(ctx context.Context, sid SessionId, conn *LL
 
 	var res toolLoopResult
 	var allText strings.Builder
-	for i := 0; i < maxToolLoopIterations; i++ {
+	for {
 		text, calls, err := a.llmStream(ctx, conn, messages, tools, on)
 		if err != nil {
 			res.Text = allText.String()
@@ -227,6 +367,4 @@ func (a *agent) runToolLoopFiltered(ctx context.Context, sid SessionId, conn *LL
 			})
 		}
 	}
-	res.Text = allText.String()
-	return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
 }

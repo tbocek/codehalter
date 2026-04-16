@@ -98,7 +98,7 @@ func init() {
 
 		// Ask user to review.
 		askId := a.StartToolCall(ctx, sid, "Review the tabs in Firefox, then confirm", "think", nil)
-		ok, askErr := a.conn.AskYesNo(ctx, sid, askId, "Get results", "Cancel")
+		ok, askErr := a.askYesNoAuto(ctx, sid, askId, "Get results", "Cancel", true)
 		if askErr != nil || !ok {
 			a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Cancelled")})
 			for _, tabID := range tabs {
@@ -193,7 +193,7 @@ func init() {
 
 		// Ask user to review.
 		askId := a.StartToolCall(ctx, sid, "Review the page in Firefox, then confirm", "think", nil)
-		ok, askErr := a.conn.AskYesNo(ctx, sid, askId, "Get content", "Cancel")
+		ok, askErr := a.askYesNoAuto(ctx, sid, askId, "Get content", "Cancel", true)
 		if askErr != nil || !ok {
 			a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Cancelled")})
 			browser.CloseTab(ctx, tabID)

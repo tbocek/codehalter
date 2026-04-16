@@ -206,7 +206,7 @@ func (a *agent) summarizeStaleFiles(ctx context.Context, cwd string, cache *File
 	parallel(total, func(i int) {
 		rel := toSummarize[i]
 		n := doneCount.Add(1)
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexing %d/%d: %s\n", n, total, rel))))
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexing %d/%d: %s\n\n", n, total, rel))))
 		if a.summarizeFile(ctx, cwd, cache, conn, rel) == "ok" {
 			okCount.Add(1)
 		} else {

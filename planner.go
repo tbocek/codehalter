@@ -79,7 +79,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(question)))
 
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
-		choice, err := a.conn.AskChoice(ctx, sid, tcId, plan.Choices)
+		choice, err := a.askChoiceAuto(ctx, sid, tcId, plan.Choices, 0)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
 		if err != nil || choice == "abort" {
@@ -107,7 +107,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(planText.String())))
 
 		tcId := a.StartToolCall(ctx, sid, "Execute this plan?", "think", nil)
-		ok, err := a.conn.AskYesNo(ctx, sid, tcId, "Execute", "Cancel")
+		ok, err := a.askYesNoAuto(ctx, sid, tcId, "Execute", "Cancel", true)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf("User chose: %v", ok))})
 
 		if err != nil || !ok {

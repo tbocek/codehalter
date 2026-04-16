@@ -32,7 +32,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid SessionId) 
 	}
 
 	tcId := a.StartToolCall(ctx, sid, "Add .codehalter/ to .gitignore?", "think", nil)
-	ok, err := a.conn.AskYesNo(ctx, sid, tcId, "Ignore", "Track")
+	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Ignore", "Track", true)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
