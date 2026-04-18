@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -41,6 +42,10 @@ type Session struct {
 	History   []HistoryLevel `toml:"history"`
 	Messages  []Message      `toml:"messages"`
 	filePath  string
+	// mu serialises all mutations of the fields above and the Save() encoder.
+	// Prompt runs synchronously per session, but generateTitle runs as a
+	// background goroutine and would otherwise race on Title + the TOML file.
+	mu sync.Mutex
 }
 
 func loadSession(cwd string, id SessionId) (*Session, error) {
@@ -111,23 +116,33 @@ func newSubagentSession(cwd string, parentID SessionId, index, depth int) *Sessi
 }
 
 func (s *Session) AddUser(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, Message{Role: "user", Content: text})
 }
 
 func (s *Session) AddUserWithImages(text string, images []ImageData) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, Message{Role: "user", Content: text, Images: images})
 }
 
 func (s *Session) AddAssistant(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text})
 }
 
 func (s *Session) AddAssistantWithTools(text string, tools []ToolUse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text, ToolUses: tools})
 }
 
 // AppendToolUse adds a tool use to the last assistant message, creating one if needed.
 func (s *Session) AppendToolUse(tu ToolUse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if len(s.Messages) == 0 || s.Messages[len(s.Messages)-1].Role != "assistant" {
 		s.Messages = append(s.Messages, Message{Role: "assistant"})
 	}
@@ -135,7 +150,45 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 	last.ToolUses = append(last.ToolUses, tu)
 }
 
+// SetTitle updates the session title under the lock. Used by generateTitle
+// (background goroutine) and retitle (from compressHistory).
+func (s *Session) SetTitle(t string) {
+	s.mu.Lock()
+	s.Title = t
+	s.mu.Unlock()
+}
+
+// UpdateLastMessageContent mutates the Content field of message at idx. Used
+// by the prompt loop to inject plan context into the user turn.
+func (s *Session) UpdateLastMessageContent(idx int, content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idx < 0 || idx >= len(s.Messages) {
+		return
+	}
+	s.Messages[idx].Content = content
+}
+
+// UpsertLastAssistant sets the content of the trailing assistant message,
+// or appends a new one if the last message is not already an assistant turn.
+func (s *Session) UpsertLastAssistant(content string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Messages) > 0 && s.Messages[len(s.Messages)-1].Role == "assistant" {
+		s.Messages[len(s.Messages)-1].Content = content
+		return
+	}
+	s.Messages = append(s.Messages, Message{Role: "assistant", Content: content})
+}
+
 func (s *Session) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+// saveLocked writes the session to disk. Caller must hold s.mu.
+func (s *Session) saveLocked() error {
 	f, err := os.Create(s.filePath)
 	if err != nil {
 		return err

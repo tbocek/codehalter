@@ -52,6 +52,8 @@ type agent struct {
 	sessions        map[SessionId]*Session
 	settings        Settings
 	runners         []taskRunner
+	capabilities    capabilities
+	emptyProject    bool // true on first session if cwd had no source/manifest files
 	pendingRefs     []CodeRef
 	fileCache       *FileCache
 	indexDone       chan struct{}
@@ -118,6 +120,9 @@ func (a *agent) deleteSession(id SessionId) {
 }
 
 func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) {
+	if a.conn == nil {
+		return
+	}
 	_ = a.conn.SessionUpdate(ctx, SessionNotification{SessionId: sid, Update: u})
 }
 
@@ -213,10 +218,48 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 		}
 
 		a.checkImageSupport(ctx, sid)
+		a.notifyCapabilities(ctx, sid)
 
 		a.ensureGitignore(ctx, cwd, sid)
 		a.refreshFileCache(ctx, cwd, sid)
 	}()
+}
+
+// notifyCapabilities emits a summary of discovered build/test/lint/format
+// runners at session start, flagging any category where nothing was found so
+// the user knows to either configure their runner or accept the gap.
+func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
+	a.mu.Lock()
+	caps := a.capabilities
+	empty := a.emptyProject
+	a.mu.Unlock()
+
+	if empty {
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+			"Empty project — I'll ask about language and runner on your first message.\n\n")))
+		return
+	}
+	if len(caps.runners) == 0 {
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+			"⚠ No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")))
+		return
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "Project tooling (%s):\n", strings.Join(caps.runners, ", "))
+	row := func(label string, entries []string, hint string) {
+		if len(entries) > 0 {
+			fmt.Fprintf(&b, "  %-7s %s\n", label+":", strings.Join(entries, ", "))
+		} else {
+			fmt.Fprintf(&b, "  %-7s (none — %s)\n", label+":", hint)
+		}
+	}
+	row("build", caps.build, "consider adding a `build` target")
+	row("test", caps.test, "consider adding a `test` target")
+	row("lint", caps.lint, "consider adding a `lint`/`vet`/`check` target")
+	row("format", caps.format, "consider adding a `fmt`/`format` target")
+	b.WriteString("\n")
+	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
 }
 
 // checkImageSupport re-probes the active LLM if project-local settings point
@@ -426,14 +469,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
-	// Plan → Execute → Verify. If verify fails, feed the failure context into
-	// a fresh plan and try again — the planner can pick a different strategy
-	// each pass, so we're not repeating the same failing attempt. Loop until
-	// verify is happy, with a hard cap (maxAttempts) as a safety net against
-	// a broken LLM that never converges.
-	const maxAttempts = 5
-	var result toolLoopResult
-	var conn *LLMConnection
 	planInput := userText
 
 	// Pre-planning verification.
@@ -450,18 +485,89 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		a.sendPhase(ctx, req.SessionId, 0, false)
-		c, planSteps, planToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)
+	// Initial plan. Also decides whether the task is big enough to break
+	// into subtasks (plan.Subtasks). For simple tasks, this same plan is
+	// reused for attempt 0 of runTaskCycle — no double planning.
+	a.sendPhase(ctx, req.SessionId, 0, false)
+	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)
+	if err != nil {
+		if sess != nil && len(firstToolUses) > 0 {
+			sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
+			_ = sess.Save()
+		}
+		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
+		return PromptResponse{StopReason: StopReasonEndTurn}, nil
+	}
+
+	var result toolLoopResult
+	if firstPlan != nil && len(firstPlan.Subtasks) > 0 {
+		// Big task — iterate each subtask through its own plan→execute→verify.
+		result, err = a.runSubtasks(ctx, req.SessionId, firstPlan.Subtasks, firstToolUses, currentUserIdx, isFirstMessage, images)
 		if err != nil {
-			if sess != nil && len(planToolUses) > 0 {
-				sess.AddAssistantWithTools("❌ "+err.Error(), planToolUses)
-				_ = sess.Save()
-			}
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
+			// User cancelled or fatal; bail out without wrapping as an error reply
+			// (runSubtasks already surfaced the message).
 			return PromptResponse{StopReason: StopReasonEndTurn}, nil
 		}
-		conn = c
+	} else {
+		// Single task — reuse the initial plan on attempt 0; retries re-plan.
+		result, err = a.runTaskCycle(ctx, req.SessionId, userText, planInput, currentUserIdx, isFirstMessage, images, firstPlan, firstConn, firstToolUses)
+		if err != nil {
+			return a.replyError(ctx, req.SessionId, err.Error()), nil
+		}
+	}
+	a.sendPhase(ctx, req.SessionId, 2, true)
+
+	if sess != nil && result.Text != "" {
+		sess.UpsertLastAssistant(result.Text)
+		_ = sess.Save()
+		a.compressHistory(ctx, sess)
+	}
+
+	return PromptResponse{StopReason: StopReasonEndTurn}, nil
+}
+
+// runTaskCycle runs plan → execute → verify with retries for a single task.
+// On attempt 0, a pre-computed plan may be supplied (prePlan/preConn/preToolUses)
+// to avoid re-planning after an upfront planAndRoute call; retries always
+// re-plan with the failure context. userText is the original user-facing
+// request, planInput is what the planner sees (may carry failure context).
+func (a *agent) runTaskCycle(
+	ctx context.Context, sid SessionId,
+	userText, planInput string,
+	currentUserIdx int, isFirstInSession bool,
+	images []ImageData,
+	prePlan *planResult, preConn *LLMConnection, preToolUses []ToolUse,
+) (toolLoopResult, error) {
+	const maxAttempts = 5
+	var result toolLoopResult
+	sess := a.getSession(sid)
+
+	conn := preConn
+	var planSteps []string
+	if prePlan != nil {
+		planSteps = prePlan.Steps
+	}
+	planToolUses := preToolUses
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 || prePlan == nil {
+			a.sendPhase(ctx, sid, 0, false)
+			c, p, tu, err := a.planAndRoute(ctx, sid, planInput)
+			if err != nil {
+				if sess != nil && len(tu) > 0 {
+					sess.AddAssistantWithTools("❌ "+err.Error(), tu)
+					_ = sess.Save()
+				}
+				a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
+				return result, err
+			}
+			conn = c
+			planSteps = nil
+			if p != nil {
+				planSteps = p.Steps
+			}
+			planToolUses = tu
+		}
 
 		// stored  = plan prefix + planInput  (persisted to TOML, 1:1 minus cache)
 		// content = sysPrompt/projCtx + stored (sent to LLM this turn)
@@ -485,18 +591,24 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			stored = planCtx.String()
 		}
 
-		if sess != nil && currentUserIdx >= 0 && currentUserIdx < len(sess.Messages) {
-			sess.Messages[currentUserIdx].Content = stored
+		if sess != nil {
+			sess.UpdateLastMessageContent(currentUserIdx, stored)
 			_ = sess.Save()
 		}
 
 		content := stored
-		if isFirstMessage && attempt == 0 {
-			sysPrompt, err := a.systemPrompt(req.SessionId)
+		if isFirstInSession && attempt == 0 {
+			sysPrompt, err := a.systemPrompt(sid)
 			if err != nil {
-				return a.replyError(ctx, req.SessionId, err.Error()), nil
+				return result, err
 			}
 			content = sysPrompt + "\n---\n" + content
+			a.mu.Lock()
+			empty := a.emptyProject
+			a.mu.Unlock()
+			if empty {
+				content = emptyProjectHint + "\n---\n" + content
+			}
 		} else if sess != nil {
 			projCtx := buildProjectContext(sess.Cwd, a.fileCache)
 			if projCtx != "" {
@@ -514,30 +626,31 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 		messages = append(messages, a.buildUserMessage(content, images))
 
-		a.sendPhase(ctx, req.SessionId, 1, false)
-		result, err = a.execute(ctx, req.SessionId, messages)
+		a.sendPhase(ctx, sid, 1, false)
+		var err error
+		result, err = a.execute(ctx, sid, messages)
 		if err != nil {
-			return a.replyError(ctx, req.SessionId, err.Error()), nil
+			return result, err
 		}
 
-		a.sendPhase(ctx, req.SessionId, 2, false)
+		a.sendPhase(ctx, sid, 2, false)
 		var vr *verifyResult
-		result, vr, err = a.verify(ctx, req.SessionId, conn, messages, result, planInput, planSteps)
+		result, vr, err = a.verify(ctx, sid, conn, messages, result, planInput, planSteps)
 		if err != nil {
-			return a.replyError(ctx, req.SessionId, err.Error()), nil
+			return result, err
 		}
 		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
 			break
 		}
 
 		if attempt == maxAttempts-1 {
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
 				fmt.Sprintf("⚠ Verification still failing after %d attempts — giving up. Last issues:\n%s\n", maxAttempts, strings.Join(vr.Issues, "\n")),
 			)))
 			break
 		}
 
-		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
 			fmt.Sprintf("⚠ Verification failed (attempt %d/%d). Re-planning with the failure context:\n%s\n", attempt+1, maxAttempts, strings.Join(vr.FixSteps, "\n")),
 		)))
 		planInput = fmt.Sprintf("The previous attempt failed verification.\nIssues: %s\nFix steps: %s\n\nOriginal request: %s\n\nRe-plan with this information. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it.",
@@ -545,22 +658,103 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			strings.Join(vr.FixSteps, "; "),
 			userText)
 	}
-	a.sendPhase(ctx, req.SessionId, 2, true)
+	return result, nil
+}
 
-	if sess != nil && result.Text != "" {
-		fullResponse := result.Text
+// runSubtasks shows the decomposed subtask list, asks the user how to run
+// the batch (Interactive / Automatic / Cancel), and iterates each subtask
+// through its own runTaskCycle. Automatic flips the session into autopilot
+// mode for the duration so inner prompts auto-answer. Returns the final
+// subtask's result.
+func (a *agent) runSubtasks(
+	ctx context.Context, sid SessionId,
+	subtasks []string, initialToolUses []ToolUse,
+	currentUserIdx int, isFirstMessage bool,
+	images []ImageData,
+) (toolLoopResult, error) {
+	sess := a.getSession(sid)
 
-		// Update the last assistant message with the final text.
-		if len(sess.Messages) > 0 && sess.Messages[len(sess.Messages)-1].Role == "assistant" {
-			sess.Messages[len(sess.Messages)-1].Content = fullResponse
-		} else {
-			sess.AddAssistant(fullResponse)
+	var header strings.Builder
+	fmt.Fprintf(&header, "This looks like a big task. I'd break it into %d subtasks:\n", len(subtasks))
+	for i, s := range subtasks {
+		fmt.Fprintf(&header, "%d. %s\n", i+1, s)
+	}
+	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(header.String())))
+
+	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Interactive", "Automatic"}, 0)
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
+	if err != nil || choice == "abort" {
+		if sess != nil {
+			sess.AddAssistant(header.String() + "\nUser cancelled.")
+			_ = sess.Save()
 		}
-		_ = sess.Save()
-		a.compressHistory(ctx, sess)
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Cancelled.\n")))
+		return toolLoopResult{}, fmt.Errorf("user cancelled")
 	}
 
-	return PromptResponse{StopReason: StopReasonEndTurn}, nil
+	if choice == "Automatic" {
+		a.mu.Lock()
+		origMode := a.mode
+		a.mode = modeAutopilot
+		a.mu.Unlock()
+		defer func() {
+			a.mu.Lock()
+			a.mode = origMode
+			a.mu.Unlock()
+		}()
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("[Automatic] Running all subtasks without interruption.\n\n")))
+	}
+
+	var finalResult toolLoopResult
+	userIdx := currentUserIdx
+	firstInSession := isFirstMessage
+
+	for i, sub := range subtasks {
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+			fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(subtasks), sub),
+		)))
+
+		// For subtasks after the first, append a new user message so the prior
+		// subtask's assistant reply has a clean user turn to follow.
+		if i > 0 && sess != nil {
+			sess.AddUser(sub)
+			userIdx = len(sess.Messages) - 1
+			_ = sess.Save()
+			firstInSession = false
+		}
+
+		// Subtask 1 inherits the planning tool uses from the decomposition
+		// pass so the inner planner doesn't repeat those lookups.
+		planInput := sub
+		if i == 0 && len(initialToolUses) > 0 {
+			var buf strings.Builder
+			buf.WriteString("Context from initial task decomposition (these tools were already called — do not repeat):\n")
+			for _, tu := range initialToolUses {
+				fmt.Fprintf(&buf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 500))
+			}
+			buf.WriteString("\nSubtask: ")
+			buf.WriteString(sub)
+			planInput = buf.String()
+		}
+
+		result, err := a.runTaskCycle(ctx, sid, sub, planInput, userIdx, firstInSession, images, nil, nil, nil)
+		if err != nil {
+			return finalResult, err
+		}
+		finalResult = result
+
+		// Persist this subtask's result so subtask N+1 sees it in history.
+		if sess != nil && result.Text != "" {
+			sess.UpsertLastAssistant(result.Text)
+			_ = sess.Save()
+		}
+
+		// Images only travel with the real user message (subtask 0).
+		images = nil
+	}
+
+	return finalResult, nil
 }
 
 func (a *agent) buildUserMessage(content string, images []ImageData) llmMessage {

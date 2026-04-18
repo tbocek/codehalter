@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -41,7 +42,8 @@ func (a *agent) preVerify(ctx context.Context, sid SessionId, conn *LLMConnectio
 	trimmed := trimJSON(verifyRes.Text)
 	var result verifyResult
 	if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
-		return nil, err
+		slog.Error("preVerify: non-JSON response", "err", err, "snippet", truncate(trimmed, 200))
+		return nil, fmt.Errorf("preVerify non-JSON: %w", err)
 	}
 
 	return &result, nil
@@ -77,14 +79,19 @@ func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, 
 			include:  map[string]bool{"run_task": true},
 		})
 		if err != nil {
-			return res, nil, nil
+			slog.Error("verify: LLM call failed; treating as success", "err", err)
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Verification skipped: "+err.Error()+"\n")))
+			return res, &verifyResult{Success: true}, nil
 		}
 
 		trimmed := trimJSON(verifyRes.Text)
 
 		var result verifyResult
 		if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
-			return res, nil, nil
+			slog.Error("verify: LLM returned non-JSON response; treating as success",
+				"err", err, "snippet", truncate(trimmed, 200))
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Verification returned non-JSON; skipping self-check.\n")))
+			return res, &verifyResult{Success: true}, nil
 		}
 
 		if result.Success {
@@ -120,6 +127,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, 
 
 		fixRes, err := a.runToolLoop(ctx, sid, conn, messages, false)
 		if err != nil {
+			slog.Error("verify: inline fix pass failed", "err", err)
 			return res, &result, nil
 		}
 		res.Text = res.Text + "\n" + fixRes.Text

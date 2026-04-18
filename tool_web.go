@@ -34,7 +34,7 @@ func init() {
 				"properties": map[string]any{
 					"query": map[string]any{
 						"type":        "string",
-						"description": "The search query",
+						"description": "Keyword-style search query (NOT a natural-language sentence). Use specific technical terms, exact error messages, version numbers, or API/function names. Good: 'golang http.Client timeout context.DeadlineExceeded'. Bad: 'how do I handle timeouts in Go HTTP client'. Quote exact phrases when needed: '\"cannot find package\"'.",
 					},
 				},
 			},
@@ -58,10 +58,6 @@ func init() {
 			return "error starting browser: " + err.Error()
 		}
 		searchTab := browser.initialTab
-		if err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error: " + err.Error()
-		}
 
 		// Wait for DDG results to render.
 		var links []string
@@ -184,10 +180,6 @@ func init() {
 			return "error starting browser: " + err.Error()
 		}
 		tabID := browser.initialTab
-		if err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error: " + err.Error()
-		}
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Page opened in Firefox.")})
 

@@ -15,6 +15,11 @@ type planResult struct {
 	Question   string   `json:"question"`
 	Complexity string   `json:"complexity"`
 	Steps      []string `json:"steps"`
+	// Subtasks lists top-level pieces the planner wants to decompose the
+	// request into. When non-empty, Prompt treats each entry as its own
+	// plan→execute→verify cycle (see runSubtasks). Steps should be empty
+	// in this case — each subtask's own planner pass produces its steps.
+	Subtasks []string `json:"subtasks"`
 }
 
 func (a *agent) loadPlanPrompt(sid SessionId) string {
@@ -23,8 +28,13 @@ func (a *agent) loadPlanPrompt(sid SessionId) string {
 
 // planAndRoute analyzes the user's request, asks for clarification if needed,
 // shows the plan, and asks the user to confirm before execution.
-// Returns the LLM connection, the approved plan steps (if any), and an error.
-func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string) (*LLMConnection, []string, []ToolUse, error) {
+//
+// Returns the LLM connection, the parsed plan (may be nil if parsing failed
+// or there is no PLAN.md), the tool uses performed during planning, and an
+// error. When the plan has Subtasks, the "Execute this plan?" confirmation
+// is skipped — the caller (Prompt → runSubtasks) handles a one-shot
+// Interactive/Automatic/Cancel prompt for the whole batch instead.
+func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string) (*LLMConnection, *planResult, []ToolUse, error) {
 	thinking := a.settings.LLM("thinking")
 	if thinking == nil {
 		return nil, nil, nil, fmt.Errorf("no 'thinking' connection in .codehalter/settings.toml")
@@ -97,6 +107,13 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Understood: "+choice+"\n")))
 	}
 
+	// If the planner decomposed the request into subtasks, skip the per-plan
+	// "Execute this plan?" prompt — the caller will show the subtask list and
+	// ask Interactive/Automatic/Cancel for the whole batch instead.
+	if len(plan.Subtasks) > 0 {
+		return thinking, &plan, planRes.ToolUses, nil
+	}
+
 	// Show the plan and ask for confirmation.
 	if len(plan.Steps) > 0 {
 		var planText strings.Builder
@@ -120,7 +137,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		}
 	}
 
-	return thinking, plan.Steps, planRes.ToolUses, nil
+	return thinking, &plan, planRes.ToolUses, nil
 }
 
 // planForSubagent is like planAndRoute but auto-approves without user interaction.

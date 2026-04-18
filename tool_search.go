@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -16,13 +17,14 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "search_text",
-			"description": "Search for text across all files in the project. Returns up to 100 matches as file:line pairs.",
+			"description": "Search for text or a regex across all files in the project. Returns up to 100 matches as file:line pairs. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"query"},
 				"properties": map[string]any{
-					"query": map[string]any{"type": "string", "description": "Text to search for (case-sensitive substring match)"},
+					"query": map[string]any{"type": "string", "description": "Text to search for. Literal substring by default; Go RE2 regex when regex=true."},
 					"path":  map[string]any{"type": "string", "description": "Subdirectory to search in (relative to project root, empty for all)"},
+					"regex": map[string]any{"type": "boolean", "description": "If true, interpret query as a Go RE2 regular expression. Default: false (literal substring)."},
 				},
 			},
 		},
@@ -35,6 +37,15 @@ func init() {
 		query := args["query"]
 		if query == "" {
 			return "error: query is empty"
+		}
+
+		matcher := func(s string) bool { return strings.Contains(s, query) }
+		if args["regex"] == "true" {
+			re, err := regexp.Compile(query)
+			if err != nil {
+				return "error: invalid regex: " + err.Error()
+			}
+			matcher = re.MatchString
 		}
 
 		root := sess.Cwd
@@ -56,7 +67,7 @@ func init() {
 				break
 			}
 			absPath := filepath.Join(root, relPath)
-			matches := searchInFile(absPath, query, maxSearchResults-len(results))
+			matches := searchInFile(absPath, matcher, maxSearchResults-len(results))
 			for _, lineNum := range matches {
 				results = append(results, fmt.Sprintf("%s:%d", relPath, lineNum))
 			}
@@ -76,7 +87,7 @@ func init() {
 	}})
 }
 
-func searchInFile(path, query string, limit int) []int {
+func searchInFile(path string, matcher func(string) bool, limit int) []int {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -88,7 +99,7 @@ func searchInFile(path, query string, limit int) []int {
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
-		if strings.Contains(scanner.Text(), query) {
+		if matcher(scanner.Text()) {
 			matches = append(matches, lineNum)
 			if len(matches) >= limit {
 				break

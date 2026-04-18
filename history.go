@@ -45,10 +45,16 @@ func estimateTokens(s string) int {
 }
 
 // estimateMessagesTokens gives a rough token count for a slice of messages.
+// Tool uses are counted because historyMessage serialises their name, input,
+// and output into the assistant turn — so a tool-heavy conversation reaches
+// the budget much sooner than the content field alone suggests.
 func estimateMessagesTokens(msgs []Message) int {
 	total := 0
 	for _, m := range msgs {
-		total += estimateTokens(m.Content) + roleTokenOverhead // role overhead
+		total += estimateTokens(m.Content) + roleTokenOverhead
+		for _, tu := range m.ToolUses {
+			total += estimateTokens(tu.Name) + estimateTokens(tu.Input) + estimateTokens(tu.Output) + roleTokenOverhead
+		}
 	}
 	return total
 }
@@ -56,13 +62,21 @@ func estimateMessagesTokens(msgs []Message) int {
 // compressHistory checks if the raw message buffer exceeds the budget,
 // and if so, summarizes older messages into cascading summary levels.
 // Uses the "summary" LLM connection for summarization.
+//
+// sess.mu is held across the whole routine so that the background
+// generateTitle goroutine cannot interleave a Save() (or read stale Messages
+// while they're being resliced). retitle reacquires the lock via SetTitle, so
+// we release before calling it.
 func (a *agent) compressHistory(ctx context.Context, sess *Session) {
+	sess.mu.Lock()
 	if estimateMessagesTokens(sess.Messages) <= rawBufferTokens {
+		sess.mu.Unlock()
 		return
 	}
 
 	conn := a.settings.SummaryLLM()
 	if conn == nil {
+		sess.mu.Unlock()
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot compress history: no 'summary' or 'thinking' LLM connection\n")))
 		return
 	}
@@ -120,8 +134,10 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 		}
 	}
 
+	_ = sess.saveLocked()
+	sess.mu.Unlock()
+
 	a.retitle(ctx, sess)
-	_ = sess.Save()
 }
 
 // summarize calls the LLM to compress text into roughly targetTokens.
@@ -169,7 +185,7 @@ func (a *agent) generateTitle(ctx context.Context, sess *Session, userText strin
 	if len(title) > maxTitleLen {
 		title = title[:maxTitleLen]
 	}
-	sess.Title = title
+	sess.SetTitle(title)
 	_ = sess.Save()
 }
 
@@ -197,7 +213,7 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 	if len(title) > maxTitleLen {
 		title = title[:maxTitleLen]
 	}
-	sess.Title = title
+	sess.SetTitle(title)
 	_ = sess.Save()
 }
 

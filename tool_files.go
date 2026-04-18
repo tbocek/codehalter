@@ -15,6 +15,44 @@ var skipDirs = map[string]bool{
 	".idea": true, ".vscode": true, "target": true, "dist": true, "build": true,
 }
 
+// Read-size caps guard the LLM context against pathological files. When the
+// caller doesn't pass `limit`, read_file reads defaultReadLines and warns if
+// truncated. An explicit `limit` is still capped at maxReadLines, and the
+// final content is further capped by maxReadBytes to stop a minified blob
+// from blowing through the byte budget even under the line limit.
+const (
+	defaultReadLines = 2000
+	maxReadLines     = 5000
+	maxReadBytes     = 200 * 1024
+)
+
+// capReadContent trims over-long reads and returns a note describing what was
+// dropped. Returns empty note when nothing was trimmed.
+func capReadContent(content string, explicitLimit bool, startLine string) (string, string) {
+	var notes []string
+	lineCount := strings.Count(content, "\n")
+	if !strings.HasSuffix(content, "\n") && content != "" {
+		lineCount++
+	}
+
+	// Only emit a truncation hint when we capped something the caller didn't
+	// opt into. If they asked for limit=X explicitly, hitting X is expected.
+	if !explicitLimit && lineCount >= defaultReadLines {
+		start := "1"
+		if startLine != "" {
+			start = startLine
+		}
+		notes = append(notes, fmt.Sprintf("[truncated at %d lines starting at line %s; call read_file again with a later `line` to see the rest]", defaultReadLines, start))
+	}
+
+	if len(content) > maxReadBytes {
+		content = content[:maxReadBytes]
+		notes = append(notes, fmt.Sprintf("[truncated at %d bytes — file has long lines; use `line`+`limit` to narrow]", maxReadBytes))
+	}
+
+	return content, strings.Join(notes, " ")
+}
+
 // listProjectFiles returns relative paths of all files under root, skipping common junk dirs.
 func listProjectFiles(root string) []string {
 	var files []string
@@ -74,14 +112,14 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": "Read the contents of a file from the project. Use line and limit to read a specific range.",
+			"description": fmt.Sprintf("Read the contents of a file from the project. When neither line nor limit is given, reads up to %d lines (or %d KB) — if the file is larger the response is truncated with a note giving the total line count, and you can re-read specific ranges with line+limit.", defaultReadLines, maxReadBytes/1024),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
 					"path":  map[string]any{"type": "string", "description": "Path to the file (absolute or relative to project root)"},
 					"line":  map[string]any{"type": "integer", "description": "Start line (1-based). Omit to read from the beginning."},
-					"limit": map[string]any{"type": "integer", "description": "Max number of lines to read. Omit to read the whole file."},
+					"limit": map[string]any{"type": "integer", "description": fmt.Sprintf("Max number of lines to read (hard cap %d). Omit for the default window.", maxReadLines)},
 				},
 			},
 		},
@@ -98,10 +136,23 @@ func init() {
 		}
 		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
 
-		content, err := fsReadRange(a.conn.RPC(), ctx, sid, path, args["line"], args["limit"])
+		effectiveLimit := args["limit"]
+		explicitLimit := effectiveLimit != ""
+		if !explicitLimit {
+			effectiveLimit = strconv.Itoa(defaultReadLines)
+		} else if n, err := strconv.Atoi(effectiveLimit); err == nil && n > maxReadLines {
+			effectiveLimit = strconv.Itoa(maxReadLines)
+		}
+
+		content, err := fsReadRange(a.conn.RPC(), ctx, sid, path, args["line"], effectiveLimit)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error()
+		}
+
+		content, truncNote := capReadContent(content, explicitLimit, args["line"])
+		if truncNote != "" {
+			content += "\n" + truncNote
 		}
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(content)})

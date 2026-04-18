@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,19 +13,20 @@ import (
 )
 
 // discoverRunners checks for known task runners in the project and registers
-// a "run_task" tool if any are found.
+// a "run_task" tool if any are found. Also classifies discovered tasks by
+// purpose (build/test/lint/format) and stores the result on the agent for the
+// startup notification.
+//
+// If the project is completely empty, we don't write any skeleton files —
+// we just flag the empty state so the first user turn can inject a hint
+// telling the LLM to ask the user which language/runner to bootstrap with.
 func (a *agent) discoverRunners(cwd string) {
-	var runners []taskRunner
+	runners := detectRunners(cwd)
 
-	if r := discoverJust(cwd); r != nil {
-		runners = append(runners, *r)
-	}
-	if r := discoverMake(cwd); r != nil {
-		runners = append(runners, *r)
-	}
-	if r := discoverNpm(cwd); r != nil {
-		runners = append(runners, *r)
-	}
+	a.mu.Lock()
+	a.capabilities = classifyRunners(runners)
+	a.emptyProject = len(runners) == 0 && isEmptyProject(cwd)
+	a.mu.Unlock()
 
 	if len(runners) == 0 {
 		return
@@ -112,14 +115,44 @@ func (a *agent) discoverRunners(cwd string) {
 
 		cmd := exec.CommandContext(ctx, runner.Command, runner.Args(target)...)
 		cmd.Dir = sess.Cwd
-		output, err := cmd.CombinedOutput()
-		result := string(output)
-		if err != nil {
-			result += "\nexit: " + err.Error()
+
+		// Stream stdout+stderr to the UI line-by-line so the user sees
+		// progress from long-running builds, while still collecting the
+		// full transcript to hand back to the LLM as tool output.
+		pipeR, pipeW := io.Pipe()
+		cmd.Stdout = pipeW
+		cmd.Stderr = pipeW
+
+		if err := cmd.Start(); err != nil {
+			a.FailToolCall(ctx, sid, tcId, err.Error())
+			return "error starting task: " + err.Error()
 		}
 
-		// Show output in chat so the user can see it.
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("\n```\n$ "+task+"\n"+result+"```\n")))
+		waitErr := make(chan error, 1)
+		go func() {
+			waitErr <- cmd.Wait()
+			_ = pipeW.Close()
+		}()
+
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("\n```\n$ "+task+"\n")))
+
+		var collected strings.Builder
+		scanner := bufio.NewScanner(pipeR)
+		// go test -v / verbose build output can produce long single lines;
+		// the default 64 KB ceiling silently drops them.
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text() + "\n"
+			collected.WriteString(line)
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(line)))
+		}
+		runErr := <-waitErr
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("```\n")))
+
+		result := collected.String()
+		if runErr != nil {
+			result += "\nexit: " + runErr.Error()
+		}
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
 		return result
 	}})
@@ -139,10 +172,122 @@ func (r *taskRunner) Args(target string) []string {
 		return []string{target}
 	case "npm":
 		return []string{"run", target}
+	case "go":
+		// `go build ./...`, `go test ./...`, etc. — package arg required.
+		return []string{target, "./..."}
+	case "cargo":
+		return []string{target}
 	default:
 		return []string{target}
 	}
 }
+
+// detectRunners runs every supported runner-discovery probe and returns what
+// was found. Split out from discoverRunners so the empty-dir fallback can
+// re-probe after writing a placeholder Makefile.
+func detectRunners(cwd string) []taskRunner {
+	var runners []taskRunner
+	probes := []func(string) *taskRunner{
+		discoverJust, discoverMake, discoverNpm, discoverGo, discoverCargo,
+	}
+	for _, p := range probes {
+		if r := p(cwd); r != nil {
+			runners = append(runners, *r)
+		}
+	}
+	return runners
+}
+
+// capabilities groups runner tasks by what they accomplish so the startup
+// notification can flag what's missing per category.
+type capabilities struct {
+	build   []string
+	test    []string
+	lint    []string
+	format  []string
+	runners []string // distinct runner names found
+}
+
+// classifyTask returns the category (build/test/lint/format) that a task name
+// belongs to, or "" if it doesn't match. Matches on segment boundaries so
+// "checkout" isn't mistaken for "check" — we split on `-_:/.` and require an
+// exact segment match against the keyword set. First match wins.
+func classifyTask(task string) string {
+	segments := strings.FieldsFunc(strings.ToLower(task), func(r rune) bool {
+		return r == '-' || r == '_' || r == ':' || r == '.' || r == '/'
+	})
+	for _, seg := range segments {
+		switch seg {
+		case "build", "compile", "bundle", "dist":
+			return "build"
+		case "test", "tests", "spec", "specs":
+			return "test"
+		case "lint", "vet", "check", "verify", "clippy", "audit":
+			return "lint"
+		case "fmt", "format", "prettier":
+			return "format"
+		}
+	}
+	return ""
+}
+
+func classifyRunners(runners []taskRunner) capabilities {
+	var c capabilities
+	seenRunner := map[string]bool{}
+	for _, r := range runners {
+		if !seenRunner[r.Name] {
+			c.runners = append(c.runners, r.Name)
+			seenRunner[r.Name] = true
+		}
+		for _, task := range r.Tasks {
+			entry := r.Name + ":" + task
+			switch classifyTask(task) {
+			case "build":
+				c.build = append(c.build, entry)
+			case "test":
+				c.test = append(c.test, entry)
+			case "lint":
+				c.lint = append(c.lint, entry)
+			case "format":
+				c.format = append(c.format, entry)
+			}
+		}
+	}
+	return c
+}
+
+// isEmptyProject returns true when cwd has no meaningful source or config
+// files — a fresh `mkdir foo && cd foo` case where bootstrapping a Makefile
+// is safe. The .codehalter/ dir we create ourselves is ignored.
+func isEmptyProject(cwd string) bool {
+	entries, err := os.ReadDir(cwd)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if name == ".codehalter" {
+			continue
+		}
+		if strings.HasPrefix(name, ".") && e.IsDir() {
+			// Hidden dirs like .git/.idea don't count as "real" content, but
+			// their presence means this isn't a pristine mkdir — bail out.
+			return false
+		}
+		return false
+	}
+	return true
+}
+
+// emptyProjectHint is injected onto the first user turn when the working
+// directory has no source files, manifests, or runner config. It tells the
+// LLM to ask what language/framework the user wants before writing anything.
+const emptyProjectHint = `[Note: this project directory is empty — no source files or build manifests were found. Before doing anything else, use the ask_user tool to confirm:
+1. What language/framework should this project use? (Rust, Go, Node.js, Python, C, etc.)
+2. Which build runner do they prefer? (Cargo, go modules, npm/pnpm, just, Make)
+
+Only then create the appropriate skeleton — Cargo.toml for Rust, go.mod for Go, package.json for Node, justfile/Makefile otherwise — with sensible build/test/lint/format targets.]
+`
 
 func discoverJust(cwd string) *taskRunner {
 	for _, name := range []string{"justfile", "Justfile", ".justfile"} {
@@ -229,4 +374,30 @@ func discoverNpm(cwd string) *taskRunner {
 		return nil
 	}
 	return &taskRunner{Name: "npm", Command: "npm", Tasks: tasks}
+}
+
+// discoverGo exposes the standard `go` subcommands when go.mod is present.
+// No parsing needed — these targets are built in.
+func discoverGo(cwd string) *taskRunner {
+	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err != nil {
+		return nil
+	}
+	return &taskRunner{
+		Name:    "go",
+		Command: "go",
+		Tasks:   []string{"build", "test", "vet", "fmt"},
+	}
+}
+
+// discoverCargo exposes the standard `cargo` subcommands when Cargo.toml is
+// present. `cargo check` and `cargo clippy` cover the lint slot.
+func discoverCargo(cwd string) *taskRunner {
+	if _, err := os.Stat(filepath.Join(cwd, "Cargo.toml")); err != nil {
+		return nil
+	}
+	return &taskRunner{
+		Name:    "cargo",
+		Command: "cargo",
+		Tasks:   []string{"build", "test", "check", "clippy", "fmt", "clean"},
+	}
 }

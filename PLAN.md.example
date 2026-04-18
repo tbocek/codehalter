@@ -29,6 +29,17 @@ single `launch_subagent` step. Example — instead of:
 write:
   1. launch_subagent: Search for X, Search for Y
 
+## Decomposition for big tasks
+
+If the request is genuinely big AND naturally splits into sequential pieces
+that each deserve their own plan → execute → verify cycle (e.g. "add feature
+X, then migrate Y, then update docs"), emit `subtasks` instead of `steps`.
+Each subtask runs as its own full cycle; the user will be asked once whether
+to run them interactively or automatically.
+
+When `subtasks` is set, leave `steps` empty. Use subtasks ONLY for complex
+multi-phase work — do not decompose simple requests into trivia.
+
 ## Output
 
 When you have enough information, reply with ONLY a JSON object, no other text:
@@ -37,7 +48,8 @@ When you have enough information, reply with ONLY a JSON object, no other text:
   "choices": [],             // if not clear: up to 2 interpretations as short strings
   "question": "",            // if not clear: what to ask the user
   "complexity": "simple",    // "simple" or "complex"
-  "steps": ["step1", ...]   // brief plan the execution phase will follow
+  "steps": ["step1", ...],  // brief plan the execution phase will follow
+  "subtasks": []             // OR: for big multi-phase tasks, list each phase here and leave steps empty
 }
 
 Rules:
@@ -48,4 +60,7 @@ Rules:
 - If the task is a pure external lookup, do the `web_search` HERE; `steps` can
   be empty or just "Summarize findings for the user" — the results will be
   carried into execution automatically.
+- Use `subtasks` only when the task is big enough to warrant multiple
+  plan→execute→verify cycles. Typical threshold: 3+ clearly-separable phases,
+  or work that changes different areas of the codebase. Otherwise use `steps`.
 - Your final message must be ONLY the JSON object, no other text

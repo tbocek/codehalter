@@ -87,6 +87,9 @@ func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []l
 	var calls []toolCall
 
 	scanner := bufio.NewScanner(resp.Body)
+	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
+	// line limit silently truncates. 4 MB matches common reverse-proxy caps.
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -122,6 +125,9 @@ func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []l
 				last.Function.Arguments += tc.Function.Arguments
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fullText.String(), calls, fmt.Errorf("reading SSE stream: %w", err)
 	}
 
 	return fullText.String(), calls, nil
