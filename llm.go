@@ -49,11 +49,13 @@ type onToken func(token string)
 
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
 func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on onToken) (string, []toolCall, error) {
-	reqBody := map[string]any{
-		"model":    conn.Model,
-		"stream":   true,
-		"messages": messages,
+	reqBody := map[string]any{}
+	for k, v := range conn.ExtraBody {
+		reqBody[k] = v
 	}
+	reqBody["model"] = conn.Model
+	reqBody["stream"] = true
+	reqBody["messages"] = messages
 	if tools != nil {
 		reqBody["tools"] = tools
 	}
@@ -68,8 +70,8 @@ func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []l
 		return "", nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	if conn.Token != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+conn.Token)
+	if conn.APIKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
 
 	resp, err := http.DefaultClient.Do(httpReq)
@@ -173,7 +175,7 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (bool, 
 	if !ok {
 		return false, false
 	}
-	resp, err := getWithAuth(ctx, modelsURL, conn.Token)
+	resp, err := getWithAuth(ctx, modelsURL, conn.APIKey)
 	if err != nil {
 		slog.Info("probeViaModels: request failed", "url", modelsURL, "err", err)
 		return false, false
@@ -216,7 +218,7 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (bool, b
 	if !ok {
 		return false, false
 	}
-	resp, err := getWithAuth(ctx, propsURL, conn.Token)
+	resp, err := getWithAuth(ctx, propsURL, conn.APIKey)
 	if err != nil {
 		slog.Info("probeViaProps: request failed", "url", propsURL, "err", err)
 		return false, false

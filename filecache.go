@@ -177,9 +177,6 @@ func readPreview(cwd, rel string) string {
 // summarizeStaleFiles summarizes stale files in chunks and updates the cache.
 func (a *agent) summarizeStaleFiles(ctx context.Context, cwd string, cache *FileCache, staleFiles []string, sid SessionId) error {
 	conn := a.settings.SummaryLLM()
-	if conn == nil {
-		return fmt.Errorf("no 'summary' or 'thinking' LLM connection configured")
-	}
 
 	// Filter to text files only, mark binary.
 	var toSummarize []string
