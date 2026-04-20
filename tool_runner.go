@@ -71,7 +71,7 @@ func (a *agent) discoverRunners(cwd string) {
 			},
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
-			args := parseArgs(rawArgs)
+		args := parseArgs(rawArgs)
 		task := args["task"]
 		parts := strings.SplitN(task, ":", 2)
 		if len(parts) != 2 {
@@ -172,9 +172,8 @@ func (r *taskRunner) Args(target string) []string {
 		return []string{target}
 	case "npm":
 		return []string{"run", target}
-	case "go":
-		// `go build ./...`, `go test ./...`, etc. — package arg required.
-		return []string{target, "./..."}
+	case "gradle":
+		return []string{target}
 	case "cargo":
 		return []string{target}
 	default:
@@ -188,7 +187,7 @@ func (r *taskRunner) Args(target string) []string {
 func detectRunners(cwd string) []taskRunner {
 	var runners []taskRunner
 	probes := []func(string) *taskRunner{
-		discoverJust, discoverMake, discoverNpm, discoverGo, discoverCargo,
+		discoverJust, discoverMake, discoverNpm, discoverCargo, discoverGradle,
 	}
 	for _, p := range probes {
 		if r := p(cwd); r != nil {
@@ -376,19 +375,6 @@ func discoverNpm(cwd string) *taskRunner {
 	return &taskRunner{Name: "npm", Command: "npm", Tasks: tasks}
 }
 
-// discoverGo exposes the standard `go` subcommands when go.mod is present.
-// No parsing needed — these targets are built in.
-func discoverGo(cwd string) *taskRunner {
-	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err != nil {
-		return nil
-	}
-	return &taskRunner{
-		Name:    "go",
-		Command: "go",
-		Tasks:   []string{"build", "test", "vet", "fmt"},
-	}
-}
-
 // discoverCargo exposes the standard `cargo` subcommands when Cargo.toml is
 // present. `cargo check` and `cargo clippy` cover the lint slot.
 func discoverCargo(cwd string) *taskRunner {
@@ -400,4 +386,65 @@ func discoverCargo(cwd string) *taskRunner {
 		Command: "cargo",
 		Tasks:   []string{"build", "test", "check", "clippy", "fmt", "clean"},
 	}
+}
+
+func discoverGradle(cwd string) *taskRunner {
+	for _, name := range []string{"build.gradle", "build.gradle.kts"} {
+		if _, err := os.Stat(filepath.Join(cwd, name)); err == nil {
+			// Try to find the wrapper first.
+			cmdName := "gradle"
+			if _, err := os.Stat(filepath.Join(cwd, "gradlew")); err == nil {
+				cmdName = "./gradlew"
+			} else if _, err := os.Stat(filepath.Join(cwd, "gradlew.bat")); err == nil {
+				// For Windows, but we assume Unix-like environment for now.
+				// If we were strictly Windows, we'd use gradlew.bat.
+				cmdName = "gradlew"
+			}
+
+			// List tasks.
+			cmd := exec.Command("gradle", "tasks")
+			if cmdName != "gradle" {
+				cmd = exec.Command(cmdName, "tasks")
+			}
+			cmd.Dir = cwd
+			out, err := cmd.Output()
+			if err != nil {
+				return nil
+			}
+
+			var tasks []string
+			for _, line := range strings.Split(string(out), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "Tasks:") || strings.HasPrefix(line, "---") {
+					continue
+				}
+				// Gradle tasks often look like: "build" or "test"
+				// and often have indentation.
+				if len(line) > 0 && line[0] == ' ' {
+					// It's likely a task description or something.
+					// We only want the task name.
+					// But Gradle's `tasks` output is often formatted.
+					// Let's just try to split by space and take the first part.
+					parts := strings.Fields(line)
+					if len(parts) > 0 {
+						tasks = append(tasks, parts[0])
+					}
+				}
+			}
+			if len(tasks) == 0 {
+				// If we can't parse the tasks, just provide basic ones.
+				return &taskRunner{
+					Name:    "gradle",
+					Command: cmdName,
+					Tasks:   []string{"build", "test", "clean"},
+				}
+			}
+			return &taskRunner{
+				Name:    "gradle",
+				Command: cmdName,
+				Tasks:   tasks,
+			}
+		}
+	}
+	return nil
 }
