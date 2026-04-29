@@ -20,9 +20,6 @@ var defaultPlanMD string
 //go:embed EXECUTE.md.example
 var defaultExecuteMD string
 
-//go:embed SUMMARY.md.example
-var defaultSummaryMD string
-
 //go:embed VERIFY.md.example
 var defaultVerifyMD string
 
@@ -34,7 +31,6 @@ func ensureDefaults(cwd string) {
 		{"AGENT.md", defaultAgentMD},
 		{"PLAN.md", defaultPlanMD},
 		{"EXECUTE.md", defaultExecuteMD},
-		{"SUMMARY.md", defaultSummaryMD},
 		{"VERIFY.md", defaultVerifyMD},
 	} {
 		path := filepath.Join(dir, f.name)
@@ -54,8 +50,6 @@ type agent struct {
 	runners         []taskRunner
 	capabilities    capabilities
 	emptyProject    bool // true on first session if cwd had no source/manifest files
-	pendingRefs     []CodeRef
-	fileCache       *FileCache
 	indexDone       chan struct{}
 	imagesSupported bool
 	probedConnKey   string
@@ -221,7 +215,6 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 		a.notifyCapabilities(ctx, sid)
 
 		a.ensureGitignore(ctx, cwd, sid)
-		a.refreshFileCache(ctx, cwd, sid)
 	}()
 }
 
@@ -379,19 +372,6 @@ func (a *agent) Cancel(_ context.Context, _ CancelNotification) {
 	}
 }
 
-func (a *agent) refreshFileCache(ctx context.Context, cwd string, sid SessionId) {
-	a.fileCache = loadFileCache(cwd)
-	stale := updateFileCache(cwd, a.fileCache)
-	if len(stale) > 0 {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexing %d files...\n\n", len(stale)))))
-		if err := a.summarizeStaleFiles(ctx, cwd, a.fileCache, stale, sid); err != nil {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n\n")))
-		} else {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("Indexed %d files.\n\n", len(stale)))))
-		}
-	}
-}
-
 func (a *agent) systemPrompt(sid SessionId) (string, error) {
 	sess := a.getSession(sid)
 	if sess == nil {
@@ -406,8 +386,7 @@ func (a *agent) systemPrompt(sid SessionId) (string, error) {
 		b.WriteString("\n\n")
 	}
 
-	b.WriteString("Project directory: " + sess.Cwd + "\n\n")
-	b.WriteString(buildProjectContext(sess.Cwd, a.fileCache))
+	b.WriteString("Project directory: " + sess.Cwd + "\n")
 
 	return b.String(), nil
 }
@@ -608,11 +587,6 @@ func (a *agent) runTaskCycle(
 			a.mu.Unlock()
 			if empty {
 				content = emptyProjectHint + "\n---\n" + content
-			}
-		} else if sess != nil {
-			projCtx := buildProjectContext(sess.Cwd, a.fileCache)
-			if projCtx != "" {
-				content = projCtx + "\n---\n" + content
 			}
 		}
 

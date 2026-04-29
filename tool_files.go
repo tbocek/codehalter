@@ -191,10 +191,6 @@ func init() {
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &oldContent, newContent)})
 
-		a.mu.Lock()
-		a.pendingRefs = append(a.pendingRefs, MakeFileRef(path))
-		a.mu.Unlock()
-
 		return "file written successfully"
 	}})
 
@@ -248,10 +244,6 @@ func init() {
 		}
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
-
-		a.mu.Lock()
-		a.pendingRefs = append(a.pendingRefs, MakeFileRef(path))
-		a.mu.Unlock()
 
 		return "file written successfully"
 	}})

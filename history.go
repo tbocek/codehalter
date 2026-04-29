@@ -1,11 +1,8 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"crypto/sha256"
 	"fmt"
-	"os"
 	"strings"
 )
 
@@ -17,26 +14,16 @@ const (
 	summaryWordRatio  = 3.0 / 4.0
 	maxTitleLen       = 60
 	titleFallbackLen  = 50
-	wholeFileEndLine  = 999999
 
 	summarizePrompt = "Summarize this conversation concisely. Preserve key decisions and file paths. Do NOT include source code verbatim — instead reference the file path and describe what was changed. Drop pleasantries and redundant detail."
 	titlePrompt     = "Generate a very short title (max 6 words) for this conversation. Reply with only the title, nothing else."
 	retitlePrompt   = "Generate a very short title (max 6 words) for this conversation based on the summary below. Reply with only the title, nothing else.\n\n"
 )
 
-// CodeRef tracks a file region referenced in a history summary.
-type CodeRef struct {
-	Path      string `toml:"path"`
-	StartLine int    `toml:"start_line"`
-	EndLine   int    `toml:"end_line"`
-	Hash      string `toml:"hash"`
-}
-
 // HistoryLevel is a summary of older conversation messages.
 type HistoryLevel struct {
-	Level   int       `toml:"level"`
-	Content string    `toml:"content"`
-	Refs    []CodeRef `toml:"refs,omitempty"`
+	Level   int    `toml:"level"`
+	Content string `toml:"content"`
 }
 
 // estimateTokens gives a rough token count for a string.
@@ -101,13 +88,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 
 	summary := a.summarize(ctx, conn, oldText, summaryBudget)
 
-	// Collect refs from the session's pending refs (added by write/edit tools).
-	a.mu.Lock()
-	refs := a.pendingRefs
-	a.pendingRefs = nil
-	a.mu.Unlock()
-
-	sess.History = append(sess.History, HistoryLevel{Level: 0, Content: summary, Refs: refs})
+	sess.History = append(sess.History, HistoryLevel{Level: 0, Content: summary})
 
 	// Cascade: if adjacent levels have the same level number, merge and promote.
 	for {
@@ -122,12 +103,9 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 		merged := prev.Content + "\n\n" + cur.Content
 		if estimateTokens(merged) > rawBufferTokens {
 			promoted := a.summarize(ctx, conn, merged, summaryBudget)
-			// Merge refs from both levels, keeping the most recent hash per path.
-			mergedRefs := mergeRefs(prev.Refs, cur.Refs)
 			sess.History = append(sess.History[:n-2], HistoryLevel{
 				Level:   prev.Level + 1,
 				Content: promoted,
-				Refs:    mergedRefs,
 			})
 		} else {
 			break
@@ -217,126 +195,18 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 	_ = sess.Save()
 }
 
-// hashLines computes a hash of lines startLine..endLine (1-based) in a file.
-func hashLines(path string, startLine, endLine int) string {
-	f, err := os.Open(path)
-	if err != nil {
-		return ""
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	scanner := bufio.NewScanner(f)
-	lineNum := 0
-	for scanner.Scan() {
-		lineNum++
-		if lineNum >= startLine && lineNum <= endLine {
-			h.Write(scanner.Bytes())
-			h.Write([]byte{'\n'})
-		}
-		if lineNum > endLine {
-			break
-		}
-	}
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-// MakeCodeRef creates a CodeRef for a file region with the current hash.
-func MakeCodeRef(path string, startLine, endLine int) CodeRef {
-	return CodeRef{
-		Path:      path,
-		StartLine: startLine,
-		EndLine:   endLine,
-		Hash:      hashLines(path, startLine, endLine),
-	}
-}
-
-// MakeFileRef creates a CodeRef for an entire file.
-func MakeFileRef(path string) CodeRef {
-	return CodeRef{
-		Path:      path,
-		StartLine: 1,
-		EndLine:   wholeFileEndLine,
-		Hash:      hashFile(path),
-	}
-}
-
-func hashFile(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	h := sha256.Sum256(data)
-	return fmt.Sprintf("%x", h[:])
-}
-
-// checkInvalidRefs checks all code refs across history levels and returns
-// a list of human-readable invalidation notes for refs whose files changed.
-func checkInvalidRefs(history []HistoryLevel) []string {
-	var notes []string
-	for _, level := range history {
-		for _, ref := range level.Refs {
-			var currentHash string
-			if ref.EndLine >= wholeFileEndLine {
-				currentHash = hashFile(ref.Path)
-			} else {
-				currentHash = hashLines(ref.Path, ref.StartLine, ref.EndLine)
-			}
-			if currentHash == "" {
-				notes = append(notes, fmt.Sprintf("⚠ %s (referenced in history) no longer exists", ref.Path))
-			} else if currentHash != ref.Hash {
-				notes = append(notes, fmt.Sprintf("⚠ %s (referenced in history) has changed since it was last discussed — re-read before editing", ref.Path))
-			}
-		}
-	}
-	// Deduplicate.
-	seen := map[string]bool{}
-	var unique []string
-	for _, n := range notes {
-		if !seen[n] {
-			unique = append(unique, n)
-			seen[n] = true
-		}
-	}
-	return unique
-}
-
-// mergeRefs combines refs from two levels, keeping the latest hash per file path.
-func mergeRefs(a, b []CodeRef) []CodeRef {
-	byPath := map[string]CodeRef{}
-	for _, r := range a {
-		byPath[r.Path] = r
-	}
-	for _, r := range b {
-		byPath[r.Path] = r // newer overwrites older
-	}
-	var result []CodeRef
-	for _, r := range byPath {
-		result = append(result, r)
-	}
-	return result
-}
 
 // buildLLMHistory constructs the LLM message array from the session's stored
-// history and messages. Messages are read 1:1 from TOML — project context and
-// file-cache summaries are NOT stored and must be injected by the caller onto
-// the current user message. skipIdx is the index in sess.Messages of the
-// current user message; the caller appends it separately with the injected
-// context.
+// history and messages. Messages are read 1:1 from TOML — project context is
+// NOT stored and must be injected by the caller onto the current user message.
+// skipIdx is the index in sess.Messages of the current user message; the
+// caller appends it separately with the injected context.
 func (a *agent) buildLLMHistory(sess *Session, skipIdx int) []llmMessage {
 	var messages []llmMessage
 
 	if len(sess.History) > 0 {
 		var historyBuf strings.Builder
 		historyBuf.WriteString("[Conversation history - most recent decisions take priority]\n\n")
-
-		if invalidations := checkInvalidRefs(sess.History); len(invalidations) > 0 {
-			historyBuf.WriteString("[Code changes since last discussed]\n")
-			for _, note := range invalidations {
-				historyBuf.WriteString(note + "\n")
-			}
-			historyBuf.WriteString("\n")
-		}
 
 		for i := len(sess.History) - 1; i >= 0; i-- {
 			h := sess.History[i]

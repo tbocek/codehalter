@@ -55,13 +55,6 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		}
 	}
 	prompt.WriteString(planPrompt)
-	if sess != nil {
-		projCtx := buildProjectContext(sess.Cwd, a.fileCache)
-		if projCtx != "" {
-			prompt.WriteString("\n\n")
-			prompt.WriteString(projCtx)
-		}
-	}
 	prompt.WriteString("\n\nUser request: ")
 	prompt.WriteString(userText)
 
@@ -161,13 +154,6 @@ func (a *agent) planForSubagent(ctx context.Context, sid SessionId, instructions
 		}
 	}
 	prompt.WriteString(planPrompt)
-	if sess != nil {
-		projCtx := buildProjectContext(sess.Cwd, a.fileCache)
-		if projCtx != "" {
-			prompt.WriteString("\n\n")
-			prompt.WriteString(projCtx)
-		}
-	}
 	prompt.WriteString("\n\nUser request: ")
 	prompt.WriteString(instructions)
 

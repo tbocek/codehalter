@@ -120,7 +120,6 @@ func TestSessionRoundtrip(t *testing.T) {
 	s.History = append(s.History, HistoryLevel{
 		Level:   0,
 		Content: "earlier summary",
-		Refs:    []CodeRef{{Path: "x.go", StartLine: 1, EndLine: 42, Hash: "deadbeef"}},
 	})
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -154,12 +153,6 @@ func TestSessionRoundtrip(t *testing.T) {
 	}
 	if loaded.History[0].Content != "earlier summary" {
 		t.Errorf("History content mismatch: %q", loaded.History[0].Content)
-	}
-	if got := len(loaded.History[0].Refs); got != 1 {
-		t.Fatalf("Refs len: got %d, want 1", got)
-	}
-	if loaded.History[0].Refs[0].Hash != "deadbeef" {
-		t.Errorf("Ref hash mismatch")
 	}
 }
 
