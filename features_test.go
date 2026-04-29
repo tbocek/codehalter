@@ -487,8 +487,9 @@ func TestClassifyRunners(t *testing.T) {
 	}
 }
 
-// TestDiscoverGoAndCargo verifies the new zero-parse runners fire when their
-// manifest exists and produce the standard subcommand list.
+// TestDiscoverGoAndCargo verifies the zero-parse runners fire when their
+// manifest exists and produce the standard subcommand list. Go discovery
+// is a fallback that defers to a justfile/Makefile when one is present.
 func TestDiscoverGoAndCargo(t *testing.T) {
 	goDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(goDir, "go.mod"), []byte("module x\n"), 0644); err != nil {
@@ -500,6 +501,14 @@ func TestDiscoverGoAndCargo(t *testing.T) {
 	}
 	if args := r.Args("test"); !slices.Equal(args, []string{"test", "./..."}) {
 		t.Errorf("go Args(test): got %v, want [test ./...]", args)
+	}
+
+	// A Makefile alongside go.mod should suppress the Go fallback.
+	if err := os.WriteFile(filepath.Join(goDir, "Makefile"), []byte("test:\n\tgo test ./...\n"), 0644); err != nil {
+		t.Fatalf("Makefile: %v", err)
+	}
+	if r := discoverGo(goDir); r != nil {
+		t.Errorf("discoverGo with Makefile present: got %+v, want nil", r)
 	}
 
 	cargoDir := t.TempDir()

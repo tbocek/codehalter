@@ -7,8 +7,13 @@ import (
 )
 
 const (
-	rawBufferTokens   = 10000
-	summaryBudget     = 5000
+	// rawBufferTokens is the threshold at which compressHistory fires.
+	// Set close to the model's context limit so the prompt prefix stays
+	// stable across many turns — that maximizes prefix-cache reuse on the
+	// LLM side. With a 128k model this leaves ~28k for system prompt,
+	// summary levels, and output reservation.
+	rawBufferTokens   = 100000
+	summaryBudget     = 12000
 	charsPerToken     = 4
 	roleTokenOverhead = 4
 	summaryWordRatio  = 3.0 / 4.0

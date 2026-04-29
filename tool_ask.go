@@ -1,27 +1,45 @@
 package main
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
-// askYesNoAuto asks the user in interactive mode; in autopilot mode it returns
-// defaultYes immediately and sends a chat note so the user sees what was
-// auto-answered. Callers are still responsible for completing the tool call
-// they opened (typically via CompleteToolCall with a short note).
-func (a *agent) askYesNoAuto(ctx context.Context, sid SessionId, tcId, yesLabel, noLabel string, defaultYes bool) (bool, error) {
+// shouldAutoAnswer reports whether prompts must be auto-answered: either
+// global autopilot mode is on, or the session is a subagent (Depth > 0). Zed
+// doesn't know subagent session ids, so any permission request sent for one
+// would hang forever — auto-answering keeps the subagent moving.
+func (a *agent) shouldAutoAnswer(sid SessionId) (bool, string) {
 	if a.isAutopilot() {
+		return true, "autopilot"
+	}
+	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
+		return true, "subagent"
+	}
+	return false, ""
+}
+
+// askYesNoAuto asks the user in interactive mode; in autopilot mode or from a
+// subagent it returns defaultYes immediately and sends a chat note so the user
+// sees what was auto-answered. Callers are still responsible for completing
+// the tool call they opened (typically via CompleteToolCall with a short note).
+func (a *agent) askYesNoAuto(ctx context.Context, sid SessionId, tcId, yesLabel, noLabel string, defaultYes bool) (bool, error) {
+	if auto, reason := a.shouldAutoAnswer(sid); auto {
 		chosen := noLabel
 		if defaultYes {
 			chosen = yesLabel
 		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("[autopilot] "+chosen+"\n\n")))
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+chosen+"\n\n")))
 		return defaultYes, nil
 	}
 	return a.conn.AskYesNo(ctx, sid, tcId, yesLabel, noLabel)
 }
 
-// askChoiceAuto asks the user in interactive mode; in autopilot it returns
-// choices[defaultIdx] (or choices[0] if out of range, or "abort" if empty).
+// askChoiceAuto asks the user in interactive mode; in autopilot or from a
+// subagent it returns choices[defaultIdx] (or choices[0] if out of range, or
+// "abort" if empty).
 func (a *agent) askChoiceAuto(ctx context.Context, sid SessionId, tcId string, choices []string, defaultIdx int) (string, error) {
-	if a.isAutopilot() {
+	if auto, reason := a.shouldAutoAnswer(sid); auto {
 		if len(choices) == 0 {
 			return "abort", nil
 		}
@@ -29,7 +47,7 @@ func (a *agent) askChoiceAuto(ctx context.Context, sid SessionId, tcId string, c
 		if idx < 0 || idx >= len(choices) {
 			idx = 0
 		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("[autopilot] "+choices[idx]+"\n\n")))
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+choices[idx]+"\n\n")))
 		return choices[idx], nil
 	}
 	return a.conn.AskChoice(ctx, sid, tcId, choices)
@@ -104,8 +122,16 @@ func (a *AgentSideConnection) requestPermission(ctx context.Context, sid Session
 	if err != nil {
 		return "", err
 	}
+	// "cancelled" means the dialog was dismissed without a button click
+	// (IDE-side cancel, session switch, etc.) — distinct from the user
+	// explicitly choosing the "no"/"abort" option.
+	if resp.Outcome.Outcome == "cancelled" {
+		return "", errPermissionCancelled
+	}
 	return resp.Outcome.OptionId, nil
 }
+
+var errPermissionCancelled = errors.New("permission dialog dismissed")
 
 // AskChoice shows up to 2 choices (green) + abort (red). Returns the chosen optionId.
 func (a *AgentSideConnection) AskChoice(ctx context.Context, sid SessionId, toolCallId string, choices []string) (string, error) {

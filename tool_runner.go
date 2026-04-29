@@ -176,6 +176,9 @@ func (r *taskRunner) Args(target string) []string {
 		return []string{target}
 	case "cargo":
 		return []string{target}
+	case "go":
+		// `go build ./...`, `go test ./...`, etc. — package arg required.
+		return []string{target, "./..."}
 	default:
 		return []string{target}
 	}
@@ -187,7 +190,7 @@ func (r *taskRunner) Args(target string) []string {
 func detectRunners(cwd string) []taskRunner {
 	var runners []taskRunner
 	probes := []func(string) *taskRunner{
-		discoverJust, discoverMake, discoverNpm, discoverCargo, discoverGradle,
+		discoverJust, discoverMake, discoverNpm, discoverCargo, discoverGradle, discoverGo,
 	}
 	for _, p := range probes {
 		if r := p(cwd); r != nil {
@@ -373,6 +376,26 @@ func discoverNpm(cwd string) *taskRunner {
 		return nil
 	}
 	return &taskRunner{Name: "npm", Command: "npm", Tasks: tasks}
+}
+
+// discoverGo is a fallback that exposes the standard `go` subcommands when
+// go.mod is present AND the project doesn't already declare a justfile or
+// Makefile. The intent: if the user wrote a justfile/Makefile, those flags
+// and targets are authoritative — don't shadow them with raw `go test ./...`.
+func discoverGo(cwd string) *taskRunner {
+	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err != nil {
+		return nil
+	}
+	for _, name := range []string{"justfile", "Justfile", ".justfile", "Makefile", "makefile", "GNUmakefile"} {
+		if _, err := os.Stat(filepath.Join(cwd, name)); err == nil {
+			return nil
+		}
+	}
+	return &taskRunner{
+		Name:    "go",
+		Command: "go",
+		Tasks:   []string{"build", "test", "vet", "fmt"},
+	}
 }
 
 // discoverCargo exposes the standard `cargo` subcommands when Cargo.toml is
