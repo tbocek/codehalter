@@ -166,13 +166,9 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	}, nil
 }
 
-// probeTargetConn returns the LLM connection that receives user images
-// (execute, falling back to thinking).
+// probeTargetConn returns the LLM connection that receives user images.
 func (a *agent) probeTargetConn() *LLMConnection {
-	if c := a.settings.LLM("execute"); c != nil {
-		return c
-	}
-	return a.settings.LLM("thinking")
+	return a.settings.LLM("execute")
 }
 
 // connKey identifies an LLM endpoint by url+model so we can tell when
@@ -189,14 +185,20 @@ func (a *agent) Authenticate(_ context.Context, _ AuthenticateRequest) (Authenti
 	return AuthenticateResponse{}, nil
 }
 
-func (a *agent) initSession(cwd string, s *Session) {
+func (a *agent) initSession(cwd string, s *Session) error {
 	a.putSession(s)
 	ensureDefaults(cwd)
-	if settings, err := loadSettings(cwd); err == nil {
-		a.settings = settings
+	settings, err := loadSettings(cwd)
+	if err != nil {
+		return err
 	}
+	if err := settings.Validate(); err != nil {
+		return err
+	}
+	a.settings = settings
 	a.discoverRunners(cwd)
 	a.registerSubagentTool()
+	return nil
 }
 
 func (a *agent) startIndexing(sid SessionId, cwd string) {
@@ -289,7 +291,10 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 	if err != nil {
 		return NewSessionResponse{}, err
 	}
-	a.initSession(cwd, s)
+	if err := a.initSession(cwd, s); err != nil {
+		a.deleteSession(s.ID)
+		return NewSessionResponse{}, err
+	}
 	a.startIndexing(s.ID, cwd)
 	return NewSessionResponse{SessionId: s.ID, Modes: a.sessionModes()}, nil
 }
@@ -300,13 +305,19 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 	if err != nil {
 		if os.IsNotExist(err) {
 			s = newSessionWithID(cwd, req.SessionId)
-			a.initSession(cwd, s)
+			if err := a.initSession(cwd, s); err != nil {
+				a.deleteSession(s.ID)
+				return LoadSessionResponse{}, err
+			}
 			a.startIndexing(s.ID, cwd)
 			return LoadSessionResponse{Modes: a.sessionModes()}, nil
 		}
 		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
 	}
-	a.initSession(cwd, s)
+	if err := a.initSession(cwd, s); err != nil {
+		a.deleteSession(s.ID)
+		return LoadSessionResponse{}, err
+	}
 	a.replayHistory(ctx, req.SessionId, s)
 	a.startIndexing(s.ID, cwd)
 	return LoadSessionResponse{Modes: a.sessionModes()}, nil

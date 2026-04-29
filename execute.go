@@ -5,12 +5,8 @@ import (
 )
 
 // executeConn returns the LLM connection for the execution phase.
-// Falls back to "thinking" if no "execute" role is configured in settings.
 func (a *agent) executeConn() *LLMConnection {
-	if c := a.settings.LLM("execute"); c != nil {
-		return c
-	}
-	return a.settings.LLM("thinking")
+	return a.settings.LLM("execute")
 }
 
 // execute runs the execution phase. It prepends EXECUTE.md (if present) to the

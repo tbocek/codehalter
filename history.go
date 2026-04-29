@@ -62,11 +62,6 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	}
 
 	conn := a.settings.SummaryLLM()
-	if conn == nil {
-		sess.mu.Unlock()
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot compress history: no 'summary' or 'thinking' LLM connection\n")))
-		return
-	}
 
 	// Split messages: keep the most recent ~half, summarize the older half.
 	splitIdx := len(sess.Messages) / 2

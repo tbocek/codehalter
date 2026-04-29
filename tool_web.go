@@ -196,14 +196,6 @@ func init() {
 // summarizePage uses the summary LLM to extract only the relevant information from a web page.
 func (a *agent) summarizePage(ctx context.Context, query, url, pageText string) string {
 	conn := a.settings.SummaryLLM()
-	if conn == nil {
-		// No summary LLM available, truncate raw text.
-		const maxLen = 2000
-		if len(pageText) > maxLen {
-			return pageText[:maxLen] + "\n... (truncated)"
-		}
-		return pageText
-	}
 
 	// Truncate input to avoid overwhelming the summary LLM.
 	const maxInput = 8000

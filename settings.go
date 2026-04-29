@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -14,10 +15,11 @@ type Settings struct {
 }
 
 type LLMConnection struct {
-	Name  string `toml:"name"`
-	URL   string `toml:"url"`
-	Token string `toml:"token,omitempty"`
-	Model string `toml:"model"`
+	Name      string         `toml:"name"`
+	URL       string         `toml:"url"`
+	APIKey    string         `toml:"api_key,omitempty"`
+	Model     string         `toml:"model"`
+	ExtraBody map[string]any `toml:"extra_body,omitempty"`
 }
 
 // loadSettings looks for settings.toml in this order:
@@ -80,10 +82,32 @@ func (s *Settings) LLM(name string) *LLMConnection {
 	return nil
 }
 
-// SummaryLLM returns the summary connection, falling back to thinking.
+// requiredRoles are the LLM connection names that must be configured.
+var requiredRoles = []string{"thinking", "execute", "summary"}
+
+// SummaryLLM returns the summary connection. Validate guarantees it exists.
 func (s *Settings) SummaryLLM() *LLMConnection {
-	if c := s.LLM("summary"); c != nil {
-		return c
+	return s.LLM("summary")
+}
+
+// Validate ensures every required role is present. Returns a human-readable
+// error listing the missing roles, or nil if the configuration is complete.
+func (s *Settings) Validate() error {
+	var missing []string
+	for _, name := range requiredRoles {
+		if s.LLM(name) == nil {
+			missing = append(missing, name)
+		}
 	}
-	return s.LLM("thinking")
+	if len(missing) == 0 {
+		return nil
+	}
+	src := s.path
+	if src == "" {
+		src = "settings.toml"
+	}
+	return fmt.Errorf(
+		"missing required LLM connection(s): %s — add an [[llmconnections]] entry with name=\"%s\" (and any others listed) in %s",
+		strings.Join(missing, ", "), missing[0], src,
+	)
 }

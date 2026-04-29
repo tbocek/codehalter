@@ -63,12 +63,32 @@ url = "http://localhost:8080/v1/chat/completions"
 model = "qwen3-fast"
 ```
 
+All three roles (`thinking`, `execute`, `summary`) are required — codehalter refuses to start a session if any are missing. If you only have one model available, point all three `[[llmconnections]]` entries at the same URL and model.
+
+Each connection also accepts an optional `extra_body` table whose keys are merged into every request. Useful for toggling reasoning modes on hybrid models so one loaded model can serve both `thinking` and `execute`:
+
+```toml
+[[llmconnections]]
+name = "thinking"
+url = "http://localhost:8080/v1/chat/completions"
+model = "qwen3"
+extra_body = { enable_thinking = true }
+
+[[llmconnections]]
+name = "execute"
+url = "http://localhost:8080/v1/chat/completions"
+model = "qwen3"
+extra_body = { enable_thinking = false }
+```
+
+Core fields (`model`, `messages`, `stream`, `tools`) always win over `extra_body`.
+
 Each connection has a role:
 
 | Name | Purpose |
 |------|---------|
 | `thinking` | Planning, pre-verification, and post-execution verification |
-| `execute` | Running the tool loop that does the work (falls back to `thinking` if absent) |
+| `execute` | Running the tool loop that does the work |
 | `summary` | History compression and web-page summarization |
 
 ### Prompt files
