@@ -57,6 +57,7 @@ func init() {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error starting browser: " + err.Error()
 		}
+		defer browser.Close()
 		searchTab := browser.initialTab
 
 		// Wait for DDG results to render.
@@ -97,15 +98,11 @@ func init() {
 		ok, askErr := a.askYesNoAuto(ctx, sid, askId, "Get results", "Cancel", true)
 		if askErr != nil || !ok {
 			a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Cancelled")})
-			for _, tabID := range tabs {
-				browser.CloseTab(ctx, tabID)
-			}
-			browser.Close()
 			return "user cancelled search"
 		}
 		a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Extracting...")})
 
-		// Extract text from all tabs, then close them all.
+		// Extract text from all tabs.
 		type tabResult struct {
 			link string
 			text string
@@ -116,12 +113,6 @@ func init() {
 			text, err := browser.PageText(ctx, tabID)
 			extracted[i] = tabResult{link: links[i], text: text, err: err}
 		}
-
-		// Close all tabs and the browser.
-		for _, tabID := range tabs {
-			browser.CloseTab(ctx, tabID)
-		}
-		browser.Close()
 
 		// Summarize each page in parallel using the summary LLM.
 		summaries := make([]string, len(extracted))
@@ -179,6 +170,7 @@ func init() {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error starting browser: " + err.Error()
 		}
+		defer browser.Close()
 		tabID := browser.initialTab
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Page opened in Firefox.")})
@@ -188,15 +180,11 @@ func init() {
 		ok, askErr := a.askYesNoAuto(ctx, sid, askId, "Get content", "Cancel", true)
 		if askErr != nil || !ok {
 			a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Cancelled")})
-			browser.CloseTab(ctx, tabID)
-			browser.Close()
 			return "user cancelled"
 		}
 		a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Extracting...")})
 
 		text, err := browser.PageText(ctx, tabID)
-		browser.CloseTab(ctx, tabID)
-		browser.Close()
 		if err != nil {
 			return "error getting page text: " + err.Error()
 		}
