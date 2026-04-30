@@ -21,6 +21,9 @@ var defaultExecuteMD string
 //go:embed docs/VERIFY.md.example
 var defaultVerifyMD string
 
+//go:embed docs/DOCUMENT.md.example
+var defaultDocumentMD string
+
 //go:embed docs/SKILL-buildfile.md.example
 var skillBuildfile string
 
@@ -38,6 +41,12 @@ var skillJava string
 
 //go:embed docs/SKILL-bash.md.example
 var skillBash string
+
+//go:embed docs/Dockerfile.devcontainer.example
+var defaultDevcontainerDockerfile string
+
+//go:embed docs/devcontainer.json.example
+var defaultDevcontainerJSON string
 
 var defaultSkills = map[string]string{
 	"go":   skillGo,
@@ -58,6 +67,7 @@ func ensureDefaults(cwd string) {
 		{"PLAN.md", defaultPlanMD},
 		{"EXECUTE.md", defaultExecuteMD},
 		{"VERIFY.md", defaultVerifyMD},
+		{"DOCUMENT.md", defaultDocumentMD},
 		{"SKILL-buildfile.md", skillBuildfile},
 	} {
 		path := filepath.Join(dir, f.name)
@@ -246,6 +256,7 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 		a.notifyCapabilities(ctx, sid)
 
 		a.ensureGitignore(ctx, cwd, sid)
+		a.ensureDevcontainer(ctx, cwd, sid)
 	}()
 }
 

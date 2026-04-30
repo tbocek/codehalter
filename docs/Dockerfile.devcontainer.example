@@ -1,0 +1,36 @@
+# .devcontainer/Dockerfile
+# Built from golang:1-bookworm because codehalter needs a recent Go and
+# bookworm's golang-go package is too old. The base is still Debian.
+FROM golang:1-bookworm
+
+ARG USERNAME=dev
+ARG UID=1000
+ARG GID=1000
+
+# Toolchain — trim what you don't use; add cargo, openjdk-17, python3, etc.
+# as your project needs them. just/make are picked up by codehalter's
+# task-runner discovery automatically; nodejs+npm covers package.json.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git sudo \
+        just make \
+        nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user matching host UID/GID so files written into the bind-mounted
+# workspace stay owned by your host user, not root.
+RUN groupadd --gid ${GID} ${USERNAME} \
+    && useradd --uid ${UID} --gid ${GID} -m -s /bin/bash ${USERNAME} \
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
+
+# Install codehalter into a system path so Zed's `command` lookup is stable
+# across container rebuilds.
+ENV GOBIN=/usr/local/bin
+RUN go install github.com/tbocek/codehalter@latest
+
+USER ${USERNAME}
+
+# Note: Firefox (used by web_search/web_read) is not installed here because
+# codehalter launches it non-headless, which means X11 forwarding into the
+# container. If you want the web tools inside the container, add firefox-esr
+# above and configure DISPLAY + a /tmp/.X11-unix mount in devcontainer.json.
+# Otherwise just run codehalter on the host when you need web_search.

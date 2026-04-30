@@ -4,7 +4,7 @@ An [ACP](https://spec.anthropic.com/acp)-compatible AI coding agent that connect
 
 ## Features
 
-- **Plan → Execute → Verify pipeline** — every prompt is routed through a planning pass, an execution pass, and a self-verification pass. Failed verifications re-plan with the failure context; up to 5 attempts before giving up.
+- **Plan → Execute → Verify → Document pipeline** — every prompt is routed through a planning pass, an execution pass, and a self-verification pass. Failed verifications re-plan with the failure context; up to 5 attempts before giving up. Turns that wrote files end with a documentation pass that updates (or creates) the README when the change is user-visible.
 - **Pre-planning verification** — a read-only project health check runs before planning so broken baseline state is surfaced instead of silently corrupted by new work.
 - **Big-task decomposition** — when the planner splits a request into multiple subtasks, the user picks once: *Interactive* (approve each subtask), *Automatic* (run the whole batch under autopilot), or *Cancel*. Each subtask gets its own full plan → execute → verify cycle.
 - **Subagents** — `launch_subagent` spawns parallel sub-tasks for independent work; each runs its own plan/execute/verify, up to 2 levels deep.
@@ -106,13 +106,14 @@ If a role has no `extra_body_<role>` declared on any connection, codehalter stil
 
 ### Prompt files
 
-On first run, `ensureDefaults` drops three phase templates into `.codehalter/`:
+On first run, `ensureDefaults` drops four phase templates into `.codehalter/`:
 
 | File | Role |
 |------|------|
 | `PLAN.md` | Planning-phase instructions (clarity check, info retrieval, steps/subtasks JSON schema) |
 | `EXECUTE.md` | Execution-phase directives prepended to the user message |
 | `VERIFY.md` | Self-verification rubric applied to execute output |
+| `DOCUMENT.md` | Decides when the change is user-visible enough to update the README, then edits it minimally |
 
 Plus per-stack `SKILL-{lang}.md` files for any language detected in the project root (`go.mod` → SKILL-go.md, `package.json`+`tsconfig.json` → SKILL-ts.md, plain `package.json` → SKILL-js.md, `pom.xml`/`build.gradle` → SKILL-java.md, `*.sh`/`*.bash` files → SKILL-bash.md). Skills are concatenated into the system prompt on the first turn so they ride along in cached history. Designed for smaller local models (Qwen3, Gemma) that need explicit language conventions; larger models can usually have them deleted.
 
@@ -199,5 +200,6 @@ If your LLM server runs on the host, change the URL in `.codehalter/settings.tom
    - **Plan** — the `thinking` LLM analyzes the request with read-only tools, gathers external info via web tools if needed, and emits either `steps` (simple task) or `subtasks` (big task). In Interactive mode the user confirms before execution.
    - **Execute** — the `execute` LLM runs the agentic tool loop; file edits are shown as diffs and require user approval in Interactive mode.
    - **Verify** — the output is self-checked against `VERIFY.md`. On failure with fix steps, the loop re-plans with failure context (up to 5 attempts total).
+   - **Document** — only when the executor wrote files and verify succeeded: the `thinking` LLM checks against `DOCUMENT.md` whether the change is user-visible (new feature/flag/API/dep, install or config change) and, if so, updates or creates the project README. Routine refactors and bug fixes are skipped.
 4. For big tasks, each subtask repeats the plan → execute → verify cycle independently; prior subtasks' assistant replies stay in history so later subtasks have context.
 5. Conversation history is persisted to `.codehalter/session_<id>.toml`. When it grows large, the `summary` LLM compresses older messages into cascading summary levels.

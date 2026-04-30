@@ -1,0 +1,22 @@
+// .devcontainer/devcontainer.json
+{
+  "name": "codehalter",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "UID": "${localEnv:UID:1000}",
+      "GID": "${localEnv:GID:1000}"
+    }
+  },
+  // Lets settings.toml reach an LLM running on the host as
+  // host.docker.internal:8080.
+  "runArgs": ["--add-host=host.docker.internal:host-gateway"],
+  // Picked up by codehalter's container detection — startup banner will
+  // report `Container: devcontainer` instead of warning.
+  "containerEnv": { "DEVCONTAINER": "true" },
+  "remoteUser": "dev",
+  "mounts": [
+    // Persist the Go module cache across container rebuilds.
+    "source=codehalter-gocache,target=/home/dev/go/pkg/mod,type=volume"
+  ]
+}

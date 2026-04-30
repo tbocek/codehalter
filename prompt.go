@@ -15,7 +15,7 @@ import (
 
 // phaseNames are the pipeline stages; only the current one is shown to the
 // client at a time (the plan UI updates in place as phases progress).
-var phaseNames = []string{"Planning", "Executing", "Verifying"}
+var phaseNames = []string{"Planning", "Executing", "Verifying", "Documenting"}
 
 // sendPhase emits a plan update with a single entry for the given phase,
 // replacing any previous entry. done=true renders the phase as completed
@@ -183,7 +183,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			return a.replyError(ctx, req.SessionId, err.Error()), nil
 		}
 	}
-	a.sendPhase(ctx, req.SessionId, 2, true)
 
 	if sess != nil && result.Text != "" {
 		sess.UpsertLastAssistant(result.Text)
@@ -208,6 +207,7 @@ func (a *agent) runTaskCycle(
 ) (toolLoopResult, error) {
 	const maxAttempts = 5
 	var result toolLoopResult
+	var lastVR *verifyResult
 	sess := a.getSession(sid)
 
 	conn := preConn
@@ -271,6 +271,7 @@ func (a *agent) runTaskCycle(
 		if err != nil {
 			return result, err
 		}
+		lastVR = vr
 		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
 			break
 		}
@@ -290,6 +291,18 @@ func (a *agent) runTaskCycle(
 			strings.Join(vr.FixSteps, "; "),
 			userText)
 	}
+
+	// Document phase: only when the executor wrote files and verify did not
+	// declare the result broken. Failures with no fix_steps still reach here
+	// (we couldn't fix it but didn't bail) — skip the doc pass for those, the
+	// change isn't trustworthy enough to advertise in the README.
+	lastPhase := 2
+	if (lastVR == nil || lastVR.Success) && hasFileWrites(result.ToolUses) && conn != nil {
+		a.sendPhase(ctx, sid, 3, false)
+		result, _ = a.document(ctx, sid, conn, userText, planSteps, result)
+		lastPhase = 3
+	}
+	a.sendPhase(ctx, sid, lastPhase, true)
 	return result, nil
 }
 

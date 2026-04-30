@@ -8,9 +8,9 @@ import (
 	"strings"
 )
 
-// This file owns the three phases of a prompt cycle: plan → execute → verify.
-// Each phase is a thin orchestration layer over runToolLoop; the orchestrator
-// in prompt.go calls them in order and re-plans on verify failure.
+// This file owns the four phases of a prompt cycle: plan → execute → verify →
+// document. Each phase is a thin orchestration layer over runToolLoop; the
+// orchestrator in prompt.go calls them in order and re-plans on verify failure.
 
 // ---------------------------------------------------------------------------
 // Plan phase
@@ -308,4 +308,61 @@ func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, 
 	}
 
 	return res, &verifyResult{Success: true}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Document phase
+// ---------------------------------------------------------------------------
+
+// hasFileWrites reports whether any of the tool uses wrote to the filesystem.
+// The document phase is gated on this so read-only turns (questions, lookups)
+// don't trigger a doc-update LLM call.
+func hasFileWrites(uses []ToolUse) bool {
+	for _, u := range uses {
+		if u.Name == "write_file" || u.Name == "edit_file" {
+			return true
+		}
+	}
+	return false
+}
+
+// document runs after a successful verify when the turn actually wrote files.
+// It hands the executor's response to the thinking LLM with DOCUMENT.md and a
+// read-only tool set augmented with write_file/edit_file so the LLM can update
+// (or create) the project README when the change is user-visible. readOnly:true
+// suppresses chat streaming so the user doesn't see "no doc change needed"
+// noise on routine turns.
+func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection, userText string, planSteps []string, exec toolLoopResult) (toolLoopResult, error) {
+	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
+	if docPrompt == "" {
+		return exec, nil
+	}
+
+	var prompt strings.Builder
+	prompt.WriteString(docPrompt)
+	prompt.WriteString("\n\nUser request: ")
+	prompt.WriteString(userText)
+	if len(planSteps) > 0 {
+		prompt.WriteString("\n\nApproved plan:\n")
+		for i, step := range planSteps {
+			fmt.Fprintf(&prompt, "%d. %s\n", i+1, step)
+		}
+	}
+	prompt.WriteString("\n\nExecutor response:\n")
+	prompt.WriteString(exec.Text)
+
+	messages := []llmMessage{{Role: "user", Content: prompt.String()}}
+	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{
+		readOnly: true,
+		include: map[string]bool{
+			"write_file": true,
+			"edit_file":  true,
+		},
+	})
+	if err != nil {
+		slog.Warn("document phase failed", "err", err)
+		return exec, nil
+	}
+	exec.ToolUses = append(exec.ToolUses, docRes.ToolUses...)
+	return exec, nil
 }
