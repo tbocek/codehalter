@@ -51,14 +51,18 @@ func estimateMessagesTokens(msgs []Message) int {
 	return total
 }
 
-// compressHistory checks if the raw message buffer exceeds the budget,
-// and if so, summarizes older messages into cascading summary levels.
-// Uses the "summary" LLM connection for summarization.
+// compressHistory rotates the session when the raw message buffer exceeds
+// the budget: the current full state is frozen as a "session_archive_*"
+// TOML, and the live session is rewritten in place with a single Level 0
+// summary covering all prior context plus the most recent 20% of messages
+// kept verbatim. The session keeps its ACP-facing ID and on-disk path so
+// Zed's panel continues without interruption — the archive is browsable via
+// session/load if the user wants to inspect what was rotated out.
 //
-// sess.mu is held across the whole routine so that the background
-// generateTitle goroutine cannot interleave a Save() (or read stale Messages
-// while they're being resliced). retitle reacquires the lock via SetTitle, so
-// we release before calling it.
+// sess.mu is held across the whole routine so the background generateTitle
+// goroutine cannot interleave a Save() (or read stale Messages while they're
+// being resliced). retitle reacquires the lock via SetTitle, so we release
+// before calling it.
 func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	sess.mu.Lock()
 	if estimateMessagesTokens(sess.Messages) <= rawBufferTokens {
@@ -66,65 +70,53 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 		return
 	}
 
-	conn := a.settings.SummaryLLM()
+	conn := a.settings.LLMFor("summary", a.llmTier(sess.ID))
 
-	// Split messages: keep the most recent ~half, summarize the older half.
-	splitIdx := len(sess.Messages) / 2
+	// Split 20/80: the older 80% is folded into a fresh summary, the
+	// recent 20% stays raw. (len*4)/5 lands at 0 only when len < 2 — in
+	// that pathological case the single huge message is summarized whole.
+	splitIdx := (len(sess.Messages) * 4) / 5
+	if splitIdx == 0 {
+		splitIdx = len(sess.Messages)
+	}
 	oldMessages := sess.Messages[:splitIdx]
-	sess.Messages = sess.Messages[splitIdx:]
+	keepMessages := append([]Message(nil), sess.Messages[splitIdx:]...)
 
-	// Format old messages for summarization.
+	// Fold every existing history level + the older 80% raw messages into
+	// the input so the new Level 0 captures all prior context (the archive
+	// preserves the pre-rotation state for forensic browsing).
 	var buf strings.Builder
+	for _, h := range sess.History {
+		fmt.Fprintf(&buf, "[Earlier summary, level %d]\n%s\n\n", h.Level, h.Content)
+	}
 	for _, m := range oldMessages {
 		fmt.Fprintf(&buf, "%s: %s\n\n", m.Role, m.Content)
 	}
-	oldText := buf.String()
+	summary := a.summarize(ctx, sess.ID, conn, buf.String(), summaryBudget)
 
-	// If there's an existing level 0 summary, prepend it.
-	if len(sess.History) > 0 && sess.History[len(sess.History)-1].Level == 0 {
-		oldText = sess.History[len(sess.History)-1].Content + "\n\n" + oldText
-		sess.History = sess.History[:len(sess.History)-1]
+	archiveID, err := sess.rotate(keepMessages, []HistoryLevel{{Level: 0, Content: summary}})
+	if err != nil {
+		sess.mu.Unlock()
+		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Compaction failed: "+err.Error()+"\n\n")))
+		return
 	}
-
-	summary := a.summarize(ctx, conn, oldText, summaryBudget)
-
-	sess.History = append(sess.History, HistoryLevel{Level: 0, Content: summary})
-
-	// Cascade: if adjacent levels have the same level number, merge and promote.
-	for {
-		n := len(sess.History)
-		if n < 2 {
-			break
-		}
-		prev, cur := sess.History[n-2], sess.History[n-1]
-		if prev.Level != cur.Level {
-			break
-		}
-		merged := prev.Content + "\n\n" + cur.Content
-		if estimateTokens(merged) > rawBufferTokens {
-			promoted := a.summarize(ctx, conn, merged, summaryBudget)
-			sess.History = append(sess.History[:n-2], HistoryLevel{
-				Level:   prev.Level + 1,
-				Content: promoted,
-			})
-		} else {
-			break
-		}
-	}
-
 	_ = sess.saveLocked()
 	sess.mu.Unlock()
+
+	a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock(
+		fmt.Sprintf("🗜 History compacted — archived as %s\n\n", archiveID))))
 
 	a.retitle(ctx, sess)
 }
 
-// summarize calls the LLM to compress text into roughly targetTokens.
-func (a *agent) summarize(ctx context.Context, conn *LLMConnection, text string, targetTokens int) string {
+// summarize calls the LLM to compress text into roughly targetTokens. sid is
+// used only to route the per-session debug log (empty disables logging).
+func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnection, text string, targetTokens int) string {
 	prompt := fmt.Sprintf("%s\n\nTarget length: ~%d words.\n\n---\n%s", summarizePrompt, int(float64(targetTokens)*summaryWordRatio), text)
 	messages := []llmMessage{{Role: "user", Content: prompt}}
 
 	// Non-streaming request for summarization.
-	response, err := a.llmSimple(ctx, conn, messages)
+	response, err := a.llmSimple(ctx, sid, conn, messages)
 	if err != nil {
 		// If summarization fails, just truncate.
 		chars := targetTokens * charsPerToken
@@ -138,13 +130,13 @@ func (a *agent) summarize(ctx context.Context, conn *LLMConnection, text string,
 
 // generateTitle asks the LLM to create a short title from the first user message.
 func (a *agent) generateTitle(ctx context.Context, sess *Session, userText string) {
-	conn := a.settings.LLM("thinking")
+	conn := a.settings.LLMFor("thinking", a.llmTier(sess.ID))
 	if conn == nil {
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot generate title: no 'thinking' LLM connection\n")))
+		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot generate title: no LLM connections configured\n")))
 		return
 	}
 	messages := []llmMessage{{Role: "user", Content: titlePrompt + "\n\n" + userText}}
-	title, err := a.llmSimple(ctx, conn, messages)
+	title, err := a.llmSimple(ctx, sess.ID, conn, messages)
 	if err != nil {
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Title generation failed: "+err.Error()+"\n")))
 		title = userText
@@ -158,13 +150,18 @@ func (a *agent) generateTitle(ctx context.Context, sess *Session, userText strin
 			title = title[:titleFallbackLen]
 		}
 	}
+	sess.SetTitle(trimTitle(title))
+	_ = sess.Save()
+}
+
+// trimTitle normalizes whitespace, strips wrapping quotes, and caps length.
+func trimTitle(title string) string {
 	title = strings.TrimSpace(title)
 	title = strings.Trim(title, "\"'")
 	if len(title) > maxTitleLen {
 		title = title[:maxTitleLen]
 	}
-	sess.SetTitle(title)
-	_ = sess.Save()
+	return title
 }
 
 // retitle updates the session title based on the latest summary.
@@ -172,13 +169,13 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 	if len(sess.History) == 0 {
 		return
 	}
-	conn := a.settings.LLM("thinking")
+	conn := a.settings.LLMFor("thinking", a.llmTier(sess.ID))
 	if conn == nil {
 		return // already warned in compressHistory
 	}
 	latest := sess.History[len(sess.History)-1]
 	messages := []llmMessage{{Role: "user", Content: retitlePrompt + latest.Content}}
-	title, err := a.llmSimple(ctx, conn, messages)
+	title, err := a.llmSimple(ctx, sess.ID, conn, messages)
 	if err != nil {
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Retitle failed: "+err.Error()+"\n")))
 		return
@@ -186,12 +183,7 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 	if title == "" {
 		return
 	}
-	title = strings.TrimSpace(title)
-	title = strings.Trim(title, "\"'")
-	if len(title) > maxTitleLen {
-		title = title[:maxTitleLen]
-	}
-	sess.SetTitle(title)
+	sess.SetTitle(trimTitle(title))
 	_ = sess.Save()
 }
 

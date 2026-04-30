@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -14,12 +13,24 @@ type Settings struct {
 	path           string
 }
 
+// LLMConnection describes one llama.cpp/OpenAI-compatible endpoint.
+//
+// Position in Settings.LLMConnections determines the tier: index 0 is the
+// "main" tier (foreground agent), indices 1+ are the "subagent" tier
+// (parallel/offloaded work). Each connection declares per-role sampler
+// overrides via extra_body_<role>; LLMFor merges the matching one into the
+// request body. ExtraBody and Tag are runtime-only — they are populated by
+// LLMFor on the returned clone, never read from TOML.
 type LLMConnection struct {
-	Name      string         `toml:"name"`
-	URL       string         `toml:"url"`
-	APIKey    string         `toml:"api_key,omitempty"`
-	Model     string         `toml:"model"`
-	ExtraBody map[string]any `toml:"extra_body,omitempty"`
+	URL               string         `toml:"url"`
+	APIKey            string         `toml:"api_key,omitempty"`
+	Model             string         `toml:"model"`
+	ExtraBodyThinking map[string]any `toml:"extra_body_thinking,omitempty"`
+	ExtraBodyExecute  map[string]any `toml:"extra_body_execute,omitempty"`
+	ExtraBodySummary  map[string]any `toml:"extra_body_summary,omitempty"`
+
+	ExtraBody map[string]any `toml:"-"`
+	Tag       string         `toml:"-"`
 }
 
 // loadSettings looks for settings.toml in this order:
@@ -73,41 +84,66 @@ func decodeSettings(path string) (Settings, error) {
 	return s, nil
 }
 
-func (s *Settings) LLM(name string) *LLMConnection {
-	for i := range s.LLMConnections {
-		if s.LLMConnections[i].Name == name {
-			return &s.LLMConnections[i]
+// LLMFor selects the connection to use for the given role and caller tier.
+// tier == "main" prefers index 0, then 1+; tier == "subagent" prefers 1+,
+// then 0. Within that ordering, the first connection that declares
+// extra_body_<role> wins. If none does, the first connection in tier order
+// is returned with no role-specific overrides — so single-endpoint setups
+// keep working without per-role keys.
+//
+// The returned value is a clone with ExtraBody (the merged request overrides)
+// and Tag (for the per-session log) populated. nil if no connections exist.
+func (s *Settings) LLMFor(role, tier string) *LLMConnection {
+	if len(s.LLMConnections) == 0 {
+		return nil
+	}
+	var order []int
+	if tier == "subagent" && len(s.LLMConnections) > 1 {
+		for i := 1; i < len(s.LLMConnections); i++ {
+			order = append(order, i)
+		}
+		order = append(order, 0)
+	} else {
+		order = append(order, 0)
+		for i := 1; i < len(s.LLMConnections); i++ {
+			order = append(order, i)
 		}
 	}
-	return nil
+
+	extraFor := func(c *LLMConnection) map[string]any {
+		switch role {
+		case "thinking":
+			return c.ExtraBodyThinking
+		case "execute":
+			return c.ExtraBodyExecute
+		case "summary":
+			return c.ExtraBodySummary
+		}
+		return nil
+	}
+
+	for _, i := range order {
+		c := s.LLMConnections[i]
+		if eb := extraFor(&c); eb != nil {
+			c.ExtraBody = eb
+			c.Tag = role
+			return &c
+		}
+	}
+	c := s.LLMConnections[order[0]]
+	c.Tag = role
+	return &c
 }
 
-// requiredRoles are the LLM connection names that must be configured.
-var requiredRoles = []string{"thinking", "execute", "summary"}
-
-// SummaryLLM returns the summary connection. Validate guarantees it exists.
-func (s *Settings) SummaryLLM() *LLMConnection {
-	return s.LLM("summary")
-}
-
-// Validate ensures every required role is present. Returns a human-readable
-// error listing the missing roles, or nil if the configuration is complete.
+// Validate ensures the connection list is non-empty. Per-role overrides are
+// optional; LLMFor falls back to defaults when none are declared.
 func (s *Settings) Validate() error {
-	var missing []string
-	for _, name := range requiredRoles {
-		if s.LLM(name) == nil {
-			missing = append(missing, name)
-		}
-	}
-	if len(missing) == 0 {
+	if len(s.LLMConnections) > 0 {
 		return nil
 	}
 	src := s.path
 	if src == "" {
 		src = "settings.toml"
 	}
-	return fmt.Errorf(
-		"missing required LLM connection(s): %s — add an [[llmconnections]] entry with name=\"%s\" (and any others listed) in %s",
-		strings.Join(missing, ", "), missing[0], src,
-	)
+	return fmt.Errorf("no [[llmconnections]] entries in %s — add at least one with url and model", src)
 }

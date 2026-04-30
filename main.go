@@ -9,33 +9,70 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
-//go:embed AGENT.md.example
-var defaultAgentMD string
-
-//go:embed PLAN.md.example
+//go:embed docs/PLAN.md.example
 var defaultPlanMD string
 
-//go:embed EXECUTE.md.example
+//go:embed docs/EXECUTE.md.example
 var defaultExecuteMD string
 
-//go:embed VERIFY.md.example
+//go:embed docs/VERIFY.md.example
 var defaultVerifyMD string
 
+//go:embed docs/SKILL-buildfile.md.example
+var skillBuildfile string
+
+//go:embed docs/SKILL-go.md.example
+var skillGo string
+
+//go:embed docs/SKILL-ts.md.example
+var skillTS string
+
+//go:embed docs/SKILL-js.md.example
+var skillJS string
+
+//go:embed docs/SKILL-java.md.example
+var skillJava string
+
+//go:embed docs/SKILL-bash.md.example
+var skillBash string
+
+var defaultSkills = map[string]string{
+	"go":   skillGo,
+	"ts":   skillTS,
+	"js":   skillJS,
+	"java": skillJava,
+	"bash": skillBash,
+}
+
 // ensureDefaults copies embedded default files into .codehalter/ if they don't exist.
+// Phase prompts (PLAN/EXECUTE/VERIFY) are always seeded; SKILL files are seeded
+// only for stacks detected in cwd, so polyglot projects get the relevant ones
+// and single-language projects don't accumulate noise.
 func ensureDefaults(cwd string) {
 	dir := filepath.Join(cwd, ".codehalter")
 	os.MkdirAll(dir, 0o755)
 	for _, f := range []struct{ name, content string }{
-		{"AGENT.md", defaultAgentMD},
 		{"PLAN.md", defaultPlanMD},
 		{"EXECUTE.md", defaultExecuteMD},
 		{"VERIFY.md", defaultVerifyMD},
+		{"SKILL-buildfile.md", skillBuildfile},
 	} {
 		path := filepath.Join(dir, f.name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			os.WriteFile(path, []byte(f.content), 0o644)
+		}
+	}
+	for _, stack := range detectStacks(cwd) {
+		body, ok := defaultSkills[stack]
+		if !ok {
+			continue
+		}
+		path := filepath.Join(dir, "SKILL-"+stack+".md")
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			os.WriteFile(path, []byte(body), 0o644)
 		}
 	}
 }
@@ -113,28 +150,24 @@ func (a *agent) deleteSession(id SessionId) {
 	delete(a.sessions, id)
 }
 
+// llmTier returns the connection tier for the given session: "subagent" if
+// the session's depth is non-zero (it was spawned by another session), else
+// "main". Empty sid (pre-session probes, tests) is treated as main.
+func (a *agent) llmTier(sid SessionId) string {
+	if sid == "" {
+		return "main"
+	}
+	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
+		return "subagent"
+	}
+	return "main"
+}
+
 func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) {
 	if a.conn == nil {
 		return
 	}
 	_ = a.conn.SessionUpdate(ctx, SessionNotification{SessionId: sid, Update: u})
-}
-
-// phaseNames are the pipeline stages; only the current one is shown to the
-// client at a time (the plan UI updates in place as phases progress).
-var phaseNames = []string{"Planning", "Executing", "Verifying"}
-
-// sendPhase emits a plan update with a single entry for the current stage,
-// replacing any previous entry. When done=true it marks the last stage
-// completed so the client renders the pipeline as finished.
-func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bool) {
-	var entry PlanEntry
-	if done {
-		entry = PlanEntry{Content: phaseNames[len(phaseNames)-1], Priority: "medium", Status: "completed"}
-	} else {
-		entry = PlanEntry{Content: phaseNames[phase], Priority: "medium", Status: "in_progress"}
-	}
-	a.sendUpdate(ctx, sid, PlanUpdate([]PlanEntry{entry}))
 }
 
 func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
@@ -144,7 +177,7 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	// the LLM later, startIndexing will re-probe and update the flag.
 	if gs, err := loadGlobalSettings(); err == nil {
 		a.settings = gs
-		if conn := a.probeTargetConn(); conn != nil {
+		if conn := a.settings.LLMFor("execute", "main"); conn != nil {
 			a.imagesSupported = a.probeImageSupport(ctx, conn)
 			a.probedConnKey = connKey(conn)
 		}
@@ -164,11 +197,6 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 		},
 		AuthMethods: []string{},
 	}, nil
-}
-
-// probeTargetConn returns the LLM connection that receives user images.
-func (a *agent) probeTargetConn() *LLMConnection {
-	return a.settings.LLM("execute")
 }
 
 // connKey identifies an LLM endpoint by url+model so we can tell when
@@ -214,6 +242,7 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 		}
 
 		a.checkImageSupport(ctx, sid)
+		a.checkEnvironment(ctx, sid)
 		a.notifyCapabilities(ctx, sid)
 
 		a.ensureGitignore(ctx, cwd, sid)
@@ -262,7 +291,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
 // whether image input is available. Runs on the indexing goroutine so it never
 // blocks the session handshake.
 func (a *agent) checkImageSupport(ctx context.Context, sid SessionId) {
-	conn := a.probeTargetConn()
+	conn := a.settings.LLMFor("execute", "main")
 	if conn == nil {
 		a.imagesSupported = false
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Image support: disabled (no LLM configured)\n\n")))
@@ -277,6 +306,44 @@ func (a *agent) checkImageSupport(ctx context.Context, sid SessionId) {
 	} else {
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Image support: disabled ("+conn.Model+" did not accept image input)\n\n")))
 	}
+}
+
+// checkEnvironment reports whether codehalter is running inside a container
+// and whether Firefox (required for web_search/web_read) is available, so
+// devcontainer users see at startup whether the toolchain is wired up.
+func (a *agent) checkEnvironment(ctx context.Context, sid SessionId) {
+	var b strings.Builder
+	kind := containerKind()
+	if kind != "" {
+		fmt.Fprintf(&b, "Container: %s\n", kind)
+	} else {
+		b.WriteString("⚠ Container: not detected — codehalter edits files and runs tasks directly on your host. Consider using a devcontainer (see README → Sandboxing with a devcontainer).\n")
+	}
+	if path, err := findFirefox(); err == nil {
+		fmt.Fprintf(&b, "Firefox: %s\n\n", path)
+	} else {
+		b.WriteString("⚠ Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
+	}
+	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
+}
+
+// containerKind returns a short label identifying the container runtime, or
+// "" if we appear to be on the host. Cheap file/env probes only — no shelling
+// out — since this runs on the indexing goroutine at session start.
+func containerKind() string {
+	if os.Getenv("REMOTE_CONTAINERS") == "true" || os.Getenv("DEVCONTAINER") == "true" {
+		return "devcontainer"
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return "docker"
+	}
+	if _, err := os.Stat("/run/.containerenv"); err == nil {
+		return "podman"
+	}
+	if v := os.Getenv("container"); v != "" {
+		return v
+	}
+	return ""
 }
 
 func (a *agent) waitForIndex() {
@@ -367,6 +434,7 @@ func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) (
 	a.mu.Lock()
 	a.mode = req.ModeId
 	a.mu.Unlock()
+	a.sendUpdate(ctx, req.SessionId, CurrentModeUpdate(req.ModeId))
 	a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Mode: "+req.ModeId+"\n\n")))
 	return SetSessionModeResponse{}, nil
 }
@@ -390,377 +458,49 @@ func (a *agent) systemPrompt(sid SessionId) (string, error) {
 	}
 
 	var b strings.Builder
-
-	content, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", "AGENT.md"))
-	if err == nil {
-		b.Write(content)
-		b.WriteString("\n\n")
+	if skills := loadSkills(sess.Cwd); skills != "" {
+		b.WriteString(skills)
 	}
-
 	b.WriteString("Project directory: " + sess.Cwd + "\n")
 
 	return b.String(), nil
 }
 
-func (a *agent) replyError(ctx context.Context, sid SessionId, msg string) PromptResponse {
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ Error: "+msg+"\n")))
-	if sess := a.getSession(sid); sess != nil {
-		sess.AddAssistant("❌ " + msg)
-		_ = sess.Save()
+// sessionLog opens (append-only) the per-session debug log at
+// .codehalter/session_<sid>.log. Returns nil if sid is empty, the session is
+// unknown, or the file can't be opened — callers must nil-check. The log is
+// strictly diagnostic: codehalter never reads it back.
+func (a *agent) sessionLog(sid SessionId) *os.File {
+	if sid == "" {
+		return nil
 	}
-	return PromptResponse{StopReason: StopReasonEndTurn}
-}
-
-func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	a.mu.Lock()
-	a.cancel = cancel
-	a.mu.Unlock()
-	defer cancel()
-
-	a.waitForIndex()
-
-	// Extract user text and images from prompt blocks.
-	var userText string
-	var images []ImageData
-	for _, block := range req.Content {
-		if block.Text != nil {
-			userText += block.Text.Text
-		}
-		if block.Image != nil {
-			images = append(images, ImageData{
-				MimeType: block.Image.MimeType,
-				Data:     block.Image.Data,
-			})
-		}
+	sess := a.getSession(sid)
+	if sess == nil {
+		return nil
 	}
-
-	// Store user message. The stored message is the raw userText only —
-	// project context and plan/retry prefixes are injected onto the latest
-	// prompt at send time (see buildLLMHistory) and are NOT persisted, so
-	// history stays cacheable and compact.
-	sess := a.getSession(req.SessionId)
-	isFirstMessage := sess != nil && len(sess.Messages) == 0 && len(sess.History) == 0
-	currentUserIdx := -1
-	if sess != nil {
-		if len(images) > 0 {
-			sess.AddUserWithImages(userText, images)
-		} else {
-			sess.AddUser(userText)
-		}
-		currentUserIdx = len(sess.Messages) - 1
-		_ = sess.Save()
-	}
-
-	// Generate title for new sessions.
-	if isFirstMessage {
-		go a.generateTitle(context.Background(), sess, userText)
-	}
-
-	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
-
-	planInput := userText
-
-	// Pre-planning verification.
-	if thinkingConn := a.settings.LLM("thinking"); thinkingConn != nil {
-		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Running pre-planning verification...\n\n")))
-		vr, err := a.preVerify(ctx, req.SessionId, thinkingConn, userText)
-		if err == nil && vr != nil && !vr.Success {
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(fmt.Sprintf("⚠ Pre-planning check found issues:\n%s\n\n", strings.Join(vr.Issues, "\n")))))
-			planInput = fmt.Sprintf("The project is currently in a broken state:\nIssues: %s\n\nOriginal request: %s", strings.Join(vr.Issues, "; "), userText)
-		} else if err != nil {
-			slog.Error("preVerify failed", "error", err)
-		} else {
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Project state verified.\n\n")))
-		}
-	}
-
-	// Initial plan. Also decides whether the task is big enough to break
-	// into subtasks (plan.Subtasks). For simple tasks, this same plan is
-	// reused for attempt 0 of runTaskCycle — no double planning.
-	a.sendPhase(ctx, req.SessionId, 0, false)
-	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)
+	path := filepath.Join(sess.Cwd, sessionDir, fmt.Sprintf("session_%s.log", sid))
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
-		if sess != nil && len(firstToolUses) > 0 {
-			sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
-			_ = sess.Save()
-		}
-		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
-		return PromptResponse{StopReason: StopReasonEndTurn}, nil
+		return nil
 	}
-
-	var result toolLoopResult
-	if firstPlan != nil && len(firstPlan.Subtasks) > 0 {
-		// Big task — iterate each subtask through its own plan→execute→verify.
-		result, err = a.runSubtasks(ctx, req.SessionId, firstPlan.Subtasks, firstToolUses, currentUserIdx, isFirstMessage, images)
-		if err != nil {
-			// User cancelled or fatal; bail out without wrapping as an error reply
-			// (runSubtasks already surfaced the message).
-			return PromptResponse{StopReason: StopReasonEndTurn}, nil
-		}
-	} else {
-		// Single task — reuse the initial plan on attempt 0; retries re-plan.
-		result, err = a.runTaskCycle(ctx, req.SessionId, userText, planInput, currentUserIdx, isFirstMessage, images, firstPlan, firstConn, firstToolUses)
-		if err != nil {
-			return a.replyError(ctx, req.SessionId, err.Error()), nil
-		}
-	}
-	a.sendPhase(ctx, req.SessionId, 2, true)
-
-	if sess != nil && result.Text != "" {
-		sess.UpsertLastAssistant(result.Text)
-		_ = sess.Save()
-		a.compressHistory(ctx, sess)
-	}
-
-	return PromptResponse{StopReason: StopReasonEndTurn}, nil
+	return f
 }
 
-// runTaskCycle runs plan → execute → verify with retries for a single task.
-// On attempt 0, a pre-computed plan may be supplied (prePlan/preConn/preToolUses)
-// to avoid re-planning after an upfront planAndRoute call; retries always
-// re-plan with the failure context. userText is the original user-facing
-// request, planInput is what the planner sees (may carry failure context).
-func (a *agent) runTaskCycle(
-	ctx context.Context, sid SessionId,
-	userText, planInput string,
-	currentUserIdx int, isFirstInSession bool,
-	images []ImageData,
-	prePlan *planResult, preConn *LLMConnection, preToolUses []ToolUse,
-) (toolLoopResult, error) {
-	const maxAttempts = 5
-	var result toolLoopResult
-	sess := a.getSession(sid)
-
-	conn := preConn
-	var planSteps []string
-	if prePlan != nil {
-		planSteps = prePlan.Steps
+// logSession writes a tagged, timestamped block to the per-session debug log.
+// No-op when sid is unknown or the log can't be opened. The body is written
+// verbatim — caller decides whether to truncate. Use a short tag like "WEB"
+// or "TOOL" so the log stays grep-friendly.
+func (a *agent) logSession(sid SessionId, tag, format string, args ...any) {
+	logF := a.sessionLog(sid)
+	if logF == nil {
+		return
 	}
-	planToolUses := preToolUses
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 || prePlan == nil {
-			a.sendPhase(ctx, sid, 0, false)
-			c, p, tu, err := a.planAndRoute(ctx, sid, planInput)
-			if err != nil {
-				if sess != nil && len(tu) > 0 {
-					sess.AddAssistantWithTools("❌ "+err.Error(), tu)
-					_ = sess.Save()
-				}
-				a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
-				return result, err
-			}
-			conn = c
-			planSteps = nil
-			if p != nil {
-				planSteps = p.Steps
-			}
-			planToolUses = tu
-		}
-
-		// stored  = plan prefix + planInput  (persisted to TOML, 1:1 minus cache)
-		// content = sysPrompt/projCtx + stored (sent to LLM this turn)
-		stored := planInput
-		if len(planSteps) > 0 || len(planToolUses) > 0 {
-			var planCtx strings.Builder
-			if len(planSteps) > 0 {
-				planCtx.WriteString("The user approved this plan. Follow these steps exactly:\n")
-				for i, step := range planSteps {
-					fmt.Fprintf(&planCtx, "%d. %s\n", i+1, step)
-				}
-			}
-			if len(planToolUses) > 0 {
-				planCtx.WriteString("\nDuring planning, these tools were already called (do NOT repeat them):\n")
-				for _, tu := range planToolUses {
-					fmt.Fprintf(&planCtx, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 500))
-				}
-			}
-			planCtx.WriteString("\nUser request: ")
-			planCtx.WriteString(planInput)
-			stored = planCtx.String()
-		}
-
-		if sess != nil {
-			sess.UpdateLastMessageContent(currentUserIdx, stored)
-			_ = sess.Save()
-		}
-
-		content := stored
-		if isFirstInSession && attempt == 0 {
-			sysPrompt, err := a.systemPrompt(sid)
-			if err != nil {
-				return result, err
-			}
-			content = sysPrompt + "\n---\n" + content
-			a.mu.Lock()
-			empty := a.emptyProject
-			a.mu.Unlock()
-			if empty {
-				content = emptyProjectHint + "\n---\n" + content
-			}
-		}
-
-		// History is read 1:1 from TOML (including images on user turns). The
-		// current user message is skipped here and re-appended with the cache
-		// injected, so the cache lives only on the latest prompt and earlier
-		// history stays cacheable.
-		var messages []llmMessage
-		if sess != nil {
-			messages = a.buildLLMHistory(sess, currentUserIdx)
-		}
-		messages = append(messages, a.buildUserMessage(content, images))
-
-		a.sendPhase(ctx, sid, 1, false)
-		var err error
-		result, err = a.execute(ctx, sid, messages)
-		if err != nil {
-			return result, err
-		}
-
-		a.sendPhase(ctx, sid, 2, false)
-		var vr *verifyResult
-		result, vr, err = a.verify(ctx, sid, conn, messages, result, planInput, planSteps)
-		if err != nil {
-			return result, err
-		}
-		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
-			break
-		}
-
-		if attempt == maxAttempts-1 {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-				fmt.Sprintf("⚠ Verification still failing after %d attempts — giving up. Last issues:\n%s\n", maxAttempts, strings.Join(vr.Issues, "\n")),
-			)))
-			break
-		}
-
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-			fmt.Sprintf("⚠ Verification failed (attempt %d/%d). Re-planning with the failure context:\n%s\n", attempt+1, maxAttempts, strings.Join(vr.FixSteps, "\n")),
-		)))
-		planInput = fmt.Sprintf("The previous attempt failed verification.\nIssues: %s\nFix steps: %s\n\nOriginal request: %s\n\nRe-plan with this information. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it.",
-			strings.Join(vr.Issues, "; "),
-			strings.Join(vr.FixSteps, "; "),
-			userText)
+	defer logF.Close()
+	fmt.Fprintf(logF, "\n=== %s [%s] ===\n", time.Now().Format(time.RFC3339), tag)
+	fmt.Fprintf(logF, format, args...)
+	if !strings.HasSuffix(format, "\n") {
+		fmt.Fprintln(logF)
 	}
-	return result, nil
-}
-
-// runSubtasks shows the decomposed subtask list, asks the user how to run
-// the batch (Interactive / Automatic / Cancel), and iterates each subtask
-// through its own runTaskCycle. Automatic flips the session into autopilot
-// mode for the duration so inner prompts auto-answer. Returns the final
-// subtask's result.
-func (a *agent) runSubtasks(
-	ctx context.Context, sid SessionId,
-	subtasks []string, initialToolUses []ToolUse,
-	currentUserIdx int, isFirstMessage bool,
-	images []ImageData,
-) (toolLoopResult, error) {
-	sess := a.getSession(sid)
-
-	var header strings.Builder
-	fmt.Fprintf(&header, "This looks like a big task. I'd break it into %d subtasks:\n", len(subtasks))
-	for i, s := range subtasks {
-		fmt.Fprintf(&header, "%d. %s\n", i+1, s)
-	}
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(header.String())))
-
-	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Interactive", "Automatic"}, 0)
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
-	if err != nil || choice == "abort" {
-		if sess != nil {
-			sess.AddAssistant(header.String() + "\nUser cancelled.")
-			_ = sess.Save()
-		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Cancelled.\n")))
-		return toolLoopResult{}, fmt.Errorf("user cancelled")
-	}
-
-	if choice == "Automatic" {
-		a.mu.Lock()
-		origMode := a.mode
-		a.mode = modeAutopilot
-		a.mu.Unlock()
-		defer func() {
-			a.mu.Lock()
-			a.mode = origMode
-			a.mu.Unlock()
-		}()
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("[Automatic] Running all subtasks without interruption.\n\n")))
-	}
-
-	var finalResult toolLoopResult
-	userIdx := currentUserIdx
-	firstInSession := isFirstMessage
-
-	for i, sub := range subtasks {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-			fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(subtasks), sub),
-		)))
-
-		// For subtasks after the first, append a new user message so the prior
-		// subtask's assistant reply has a clean user turn to follow.
-		if i > 0 && sess != nil {
-			sess.AddUser(sub)
-			userIdx = len(sess.Messages) - 1
-			_ = sess.Save()
-			firstInSession = false
-		}
-
-		// Subtask 1 inherits the planning tool uses from the decomposition
-		// pass so the inner planner doesn't repeat those lookups.
-		planInput := sub
-		if i == 0 && len(initialToolUses) > 0 {
-			var buf strings.Builder
-			buf.WriteString("Context from initial task decomposition (these tools were already called — do not repeat):\n")
-			for _, tu := range initialToolUses {
-				fmt.Fprintf(&buf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 500))
-			}
-			buf.WriteString("\nSubtask: ")
-			buf.WriteString(sub)
-			planInput = buf.String()
-		}
-
-		result, err := a.runTaskCycle(ctx, sid, sub, planInput, userIdx, firstInSession, images, nil, nil, nil)
-		if err != nil {
-			return finalResult, err
-		}
-		finalResult = result
-
-		// Persist this subtask's result so subtask N+1 sees it in history.
-		if sess != nil && result.Text != "" {
-			sess.UpsertLastAssistant(result.Text)
-			_ = sess.Save()
-		}
-
-		// Images only travel with the real user message (subtask 0).
-		images = nil
-	}
-
-	return finalResult, nil
-}
-
-func (a *agent) buildUserMessage(content string, images []ImageData) llmMessage {
-	if len(images) == 0 || !a.imagesSupported {
-		return llmMessage{Role: "user", Content: content}
-	}
-	// Build OpenAI-style content array with text and image blocks.
-	var parts []any
-	parts = append(parts, map[string]any{
-		"type": "text",
-		"text": content,
-	})
-	for _, img := range images {
-		parts = append(parts, map[string]any{
-			"type": "image_url",
-			"image_url": map[string]string{
-				"url": fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data),
-			},
-		})
-	}
-	return llmMessage{Role: "user", Content: parts}
 }
 
 func (a *agent) loadPromptFile(sid SessionId, filename string) string {
@@ -781,20 +521,13 @@ func truncate(s string, maxLen int) string {
 }
 
 func main() {
-	logFile, _ := os.OpenFile("/tmp/codehalter_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if logFile != nil {
-		defer logFile.Close()
-	}
-	// Stderr gets all logs (DEBUG+), file gets INFO+ only.
+	// Per-session debug logs (full LLM req/reply, errors) live alongside
+	// each session's TOML at .codehalter/session_<id>.log; see sessionLog().
+	// Global slog goes to stderr only — Zed captures it for live debugging,
+	// and reproducing a session bug from a fresh shell is the session log's
+	// job, not a global file's.
 	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	if logFile != nil {
-		fileHandler := slog.NewTextHandler(logFile, &slog.HandlerOptions{Level: slog.LevelInfo})
-		log := slog.New(stderrHandler)
-		slog.SetDefault(slog.New(fileHandler))
-		_ = log // stderr logger used by jsonrpc via the passed log param
-	} else {
-		slog.SetDefault(slog.New(stderrHandler))
-	}
+	slog.SetDefault(slog.New(stderrHandler))
 	log := slog.New(stderrHandler)
 
 	a := &agent{sessions: make(map[SessionId]*Session), mode: modeInteractive}

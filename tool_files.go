@@ -102,7 +102,7 @@ func init() {
 			dir = resolved
 		}
 
-		tcId := a.StartToolCall(ctx, sid, "Listing files", "search", nil)
+		tcId := a.StartToolCall(ctx, sid, "Listing "+dir, "search", []ToolCallLocation{{Path: dir}})
 		files := listProjectFiles(dir)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf("%d files", len(files)))})
 		return strings.Join(files, "\n")

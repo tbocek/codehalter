@@ -9,7 +9,10 @@ import (
 )
 
 const ProtocolVersionNumber ProtocolVersion = 1
-const StopReasonEndTurn StopReason = "end_turn"
+const (
+	StopReasonEndTurn   StopReason = "end_turn"
+	StopReasonCancelled StopReason = "cancelled"
+)
 
 type ProtocolVersion int
 type SessionId string
@@ -234,6 +237,19 @@ type planUpdate struct {
 
 func PlanUpdate(entries []PlanEntry) SessionUpdate {
 	return planUpdate{Kind: "plan", Entries: entries}
+}
+
+// Current-mode update — informs the client UI that the active mode changed.
+// Field name is "modeId" (per ACP spec), distinct from the "currentModeId"
+// field inside SessionModeState advertised at session create/load.
+
+type currentModeUpdate struct {
+	Kind   string `json:"sessionUpdate"`
+	ModeId string `json:"modeId"`
+}
+
+func CurrentModeUpdate(modeId string) SessionUpdate {
+	return currentModeUpdate{Kind: "current_mode_update", ModeId: modeId}
 }
 
 // Agent is the interface an ACP agent must implement.

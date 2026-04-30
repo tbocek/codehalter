@@ -48,7 +48,14 @@ type sseChunk struct {
 type onToken func(token string)
 
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
-func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on onToken) (string, []toolCall, error) {
+// sid scopes the debug log: req body and raw SSE response are appended to
+// .codehalter/session_<sid>.log so a single file captures everything that
+// went over the wire for a session. Pass "" to disable logging (used by tests
+// and pre-session probes).
+func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on onToken) (string, []toolCall, error) {
+	// Seed with extra_body (per-role sampler/reasoning overrides), then write
+	// core fields last so model/messages/stream/tools can't be hijacked from
+	// settings.toml.
 	reqBody := map[string]any{}
 	for k, v := range conn.ExtraBody {
 		reqBody[k] = v
@@ -61,10 +68,16 @@ func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []l
 	}
 
 	body, _ := json.Marshal(reqBody)
-	if f, err := os.OpenFile("/tmp/codehalter_debug.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
-		fmt.Fprintf(f, "\n=== %s ===\n%s\n", time.Now().Format(time.RFC3339), string(body))
-		f.Close()
+
+	// Per-session log: request header + body, then we'll tee the raw SSE
+	// response into the same file as it streams. Closed on return.
+	logF := a.sessionLog(sid)
+	if logF != nil {
+		defer logF.Close()
+		fmt.Fprintf(logF, "\n=== %s [%s] REQUEST ===\n%s\n=== RESPONSE ===\n",
+			time.Now().Format(time.RFC3339), conn.Tag, string(body))
 	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", conn.URL, bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err
@@ -76,19 +89,51 @@ func (a *agent) llmStream(ctx context.Context, conn *LLMConnection, messages []l
 
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
+		if logF != nil {
+			fmt.Fprintf(logF, "[transport error] %v\n", err)
+		}
 		return "", nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return "", nil, fmt.Errorf("LLM returned %d: %s", resp.StatusCode, b)
+		// 1. Read the body
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", nil, fmt.Errorf("HTTP %d, failed to read body: %w", resp.StatusCode, err)
+		}
+		if logF != nil {
+			fmt.Fprintf(logF, "[HTTP %d] %s\n", resp.StatusCode, string(bodyBytes))
+		}
+
+		// 2. Try to parse the JSON to find a specific error message
+		var apiErr map[string]interface{}
+		if jsonErr := json.Unmarshal(bodyBytes, &apiErr); jsonErr == nil {
+			if errMsg, ok := apiErr["error"]; ok {
+				if errMap, ok := errMsg.(map[string]interface{}); ok {
+					if msg, ok := errMap["message"].(string); ok {
+						// Include the URL in the error
+						return "", nil, fmt.Errorf("LLM returned %d: %s [URL: %s]", resp.StatusCode, msg, resp.Request.URL.String())
+					}
+				}
+			}
+		}
+
+		// 3. Fallback: If JSON parsing failed, show raw body and URL
+		return "", nil, fmt.Errorf("LLM returned %d: %s [URL: %s]", resp.StatusCode, string(bodyBytes), resp.Request.URL.String())
 	}
 
 	var fullText strings.Builder
 	var calls []toolCall
 
-	scanner := bufio.NewScanner(resp.Body)
+	// Tee SSE bytes into the session log so the unparsed wire output is
+	// preserved. Parser still reads the same stream because TeeReader splits
+	// every Read between the consumer and the file.
+	var respReader io.Reader = resp.Body
+	if logF != nil {
+		respReader = io.TeeReader(resp.Body, logF)
+	}
+	scanner := bufio.NewScanner(respReader)
 	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
 	// line limit silently truncates. 4 MB matches common reverse-proxy caps.
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -275,9 +320,10 @@ func deriveServerURL(rawURL, suffix string) (string, bool) {
 	return u.String(), true
 }
 
-// llmSimple sends a no-tools LLM call, logs to stderr.
-func (a *agent) llmSimple(ctx context.Context, conn *LLMConnection, messages []llmMessage) (string, error) {
-	text, _, err := a.llmStream(ctx, conn, messages, nil, func(token string) {
+// llmSimple sends a no-tools LLM call, logs to stderr. sid scopes per-session
+// debug logging (see llmStream); pass "" for unscoped calls.
+func (a *agent) llmSimple(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage) (string, error) {
+	text, _, err := a.llmStream(ctx, sid, conn, messages, nil, func(token string) {
 		fmt.Fprint(os.Stderr, token)
 	})
 	fmt.Fprintln(os.Stderr)
@@ -311,18 +357,15 @@ func trimJSON(s string) string {
 	return strings.TrimSpace(s)
 }
 
-// runToolLoop runs the agentic tool loop: send to LLM, execute tool calls, repeat.
-// If readOnly is true, only read-only tools are sent and tokens are not streamed to Zed.
 type toolLoopResult struct {
 	Text     string
 	ToolUses []ToolUse
 }
 
-func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, readOnly bool) (toolLoopResult, error) {
-	return a.runToolLoopFiltered(ctx, sid, conn, messages, toolFilter{readOnly: readOnly})
-}
-
-func (a *agent) runToolLoopFiltered(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter) (toolLoopResult, error) {
+// runToolLoop runs the agentic tool loop: send to LLM, execute tool calls, repeat.
+// When filter.readOnly is true, only read-only tools are sent and tokens are
+// not streamed to Zed.
+func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter) (toolLoopResult, error) {
 	tools := llmToolDefinitionsFiltered(filter)
 	var on onToken
 	if !filter.readOnly {
@@ -336,7 +379,7 @@ func (a *agent) runToolLoopFiltered(ctx context.Context, sid SessionId, conn *LL
 	var res toolLoopResult
 	var allText strings.Builder
 	for {
-		text, calls, err := a.llmStream(ctx, conn, messages, tools, on)
+		text, calls, err := a.llmStream(ctx, sid, conn, messages, tools, on)
 		if err != nil {
 			res.Text = allText.String()
 			return res, err

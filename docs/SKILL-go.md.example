@@ -1,0 +1,23 @@
+# Go skill
+
+## Errors
+- Errors are values. Check explicitly: `if err != nil { return err }` or wrap with `fmt.Errorf("context: %w", err)`.
+- Do NOT use `panic` for control flow. Reserve panics for unrecoverable bugs.
+- Do NOT use a `try`/`catch` pattern; Go has neither.
+
+## Idioms
+- Use `:=` to declare and assign in one step; `=` to reassign an existing variable.
+- Defer cleanup right after acquiring a resource: `f, err := os.Open(...); ...; defer f.Close()`.
+- Pass `context.Context` as the first argument, named `ctx`.
+- Goroutine + channel for concurrency. Always have a clear "who closes the channel" rule.
+- Prefer small, named interfaces over big ones (`io.Reader`, not `BigCombinedThing`).
+
+## Style
+- Format with `gofmt` rules: tabs for indentation, brace on the same line.
+- Export with PascalCase, unexported with camelCase.
+- Don't write Java-style getters/setters; expose fields directly when appropriate.
+- Don't add doc comments unless the symbol is exported AND non-obvious.
+
+## Standard layout
+- `main.go` for entry point. Tests in `*_test.go` next to the file under test.
+- Use `_test.go` files. Run tests through the project's build target (see SKILL-buildfile), not raw `go test`.

@@ -1,0 +1,27 @@
+# Bash skill
+
+## Script header
+- Start every script with `#!/usr/bin/env bash` and `set -euo pipefail`.
+- `IFS=$'\n\t'` if the script does any list iteration over `$@` or split data.
+
+## Quoting
+- Quote ALL variable expansions: `"$var"`, `"$@"`, `"${arr[@]}"`. Unquoted expansions split on whitespace and glob.
+- Never write `$*` for argument forwarding — use `"$@"`.
+
+## Tests and conditionals
+- `[[ ... ]]` for tests, not `[ ... ]`. Pattern matching, regex, and safer parsing.
+- Exit-status checks: `if cmd; then ...` not `if [ $? = 0 ]`.
+
+## Substitution
+- `$(cmd)`, never backticks.
+- `${var:-default}` for fallback; `${var:?error}` for required.
+
+## Idioms
+- Prefer `mapfile`/`readarray` over while-read loops for collecting lines.
+- Use `local` inside functions to avoid leaking variables.
+- Use `trap` to clean up temp files / processes on EXIT.
+- Long-running pipelines: check `${PIPESTATUS[@]}` if you need to know which stage failed.
+
+## Style
+- Run `shellcheck` mentally — silence its top warnings (SC2086 quoting, SC2046 word splitting).
+- Avoid Bashisms (`[[`, arrays, `${var//pat/repl}`) in scripts that need to run under `/bin/sh`.

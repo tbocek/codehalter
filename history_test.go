@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,7 +58,7 @@ func newMockLLM(t *testing.T, responses ...string) *mockLLM {
 func (m *mockLLM) Close() { m.ts.Close() }
 
 func (m *mockLLM) conn(name string) *LLMConnection {
-	return &LLMConnection{Name: name, URL: m.ts.URL, Model: "test-model"}
+	return &LLMConnection{Tag: name, URL: m.ts.URL, Model: "test-model"}
 }
 
 func (m *mockLLM) callCount() int { return int(m.idx.Load()) }
@@ -240,6 +243,7 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 	var collected strings.Builder
 	text, calls, err := a.llmStream(
 		context.Background(),
+		"", // unscoped: no session log
 		mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "hi"}},
 		nil,
@@ -316,7 +320,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	// readOnly=true → no sendUpdate for streamed tokens (agent.conn is nil in
 	// this test, and the stub tool is ReadOnly so it's allowed).
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "please echo hello"}}, true)
+		[]llmMessage{{Role: "user", Content: "please echo hello"}}, toolFilter{readOnly: true})
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -366,9 +370,10 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 }
 
 // TestCompressHistoryRecordsSummary is the headline history test: once raw
-// messages exceed rawBufferTokens, compressHistory should call the summary
-// LLM, push a level-0 HistoryLevel, trim the raw messages, retitle via the
-// thinking LLM, and persist everything.
+// messages exceed rawBufferTokens, compressHistory should rotate the session
+// — freeze the pre-rotation state to a "session_archive_*" file, push a
+// level-0 HistoryLevel into the live session, trim raw messages to the
+// recent 20%, retitle via the thinking LLM, and persist everything.
 func TestCompressHistoryRecordsSummary(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText("SUMMARY-OF-OLD-MESSAGES"),
@@ -398,8 +403,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		sessions: map[SessionId]*Session{s.ID: s},
 		settings: Settings{
 			LLMConnections: []LLMConnection{
-				{Name: "summary", URL: mock.ts.URL, Model: "m"},
-				{Name: "thinking", URL: mock.ts.URL, Model: "m"},
+				{URL: mock.ts.URL, Model: "m"},
 			},
 		},
 	}
@@ -418,12 +422,30 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	if len(s.Messages) >= originalMsgCount {
 		t.Errorf("Messages not trimmed: before %d, after %d", originalMsgCount, len(s.Messages))
 	}
-	// The most recent half is kept → exactly len/2 remaining.
-	if want := originalMsgCount - originalMsgCount/2; len(s.Messages) != want {
+	// 20/80 split: only the recent 20% stays raw.
+	if want := originalMsgCount - (originalMsgCount*4)/5; len(s.Messages) != want {
 		t.Errorf("Messages after trim: got %d, want %d", len(s.Messages), want)
 	}
 	if s.Title != "NEW TITLE" {
 		t.Errorf("Title after retitle: got %q, want %q", s.Title, "NEW TITLE")
+	}
+
+	// An archive file should exist holding the pre-rotation full state, and
+	// the live session must keep its original ID + path.
+	archives, err := filepath.Glob(filepath.Join(dir, sessionDir, "session_archive_*.toml"))
+	if err != nil {
+		t.Fatalf("glob archives: %v", err)
+	}
+	if len(archives) != 1 {
+		t.Fatalf("expected 1 archive file, got %d: %v", len(archives), archives)
+	}
+	archiveID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(archives[0]), "session_"), ".toml")
+	archived, err := loadSession(dir, SessionId(archiveID))
+	if err != nil {
+		t.Fatalf("loadSession archive: %v", err)
+	}
+	if len(archived.Messages) != originalMsgCount {
+		t.Errorf("archive Messages: got %d, want %d", len(archived.Messages), originalMsgCount)
 	}
 
 	// Persistence.
@@ -565,6 +587,126 @@ func TestCapReadContent(t *testing.T) {
 	}
 }
 
+// TestPrefixStableAcrossTurns is the cache-correctness contract: a second
+// Prompt() turn must reproduce the previous turn's wire bytes byte-for-byte
+// for every message that's already on record. llama.cpp / vLLM / etc. only
+// reuse their KV cache when the leading tokens of the new request match the
+// leading tokens of the old one, so any drift in the prefix bytes silently
+// reprocesses the entire history each turn.
+//
+// The test mirrors what runTaskCycle does: stash a stored-message string,
+// build the wire content (with sysPrompt prepended on the first turn only),
+// then build messages for a second turn and compare.
+func TestPrefixStableAcrossTurns(t *testing.T) {
+	dir := t.TempDir()
+
+	// Seed a SKILL file so loadSkills returns a non-empty system prompt —
+	// otherwise the bug (sysPrompt prepended turn 1, dropped turn 2) is
+	// invisible because sysPrompt is empty.
+	cfgDir := filepath.Join(dir, ".codehalter")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cfgDir, "SKILL-go.md"), []byte("# Go skill\nsome conventions\n"), 0o644); err != nil {
+		t.Fatalf("write SKILL: %v", err)
+	}
+
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	a := &agent{sessions: map[SessionId]*Session{s.ID: s}}
+
+	// Sanity: systemPrompt must be non-empty so the bug we're guarding
+	// against (sysPrompt prepended turn 1, dropped turn 2) is observable.
+	if sp, _ := a.systemPrompt(s.ID); sp == "" {
+		t.Fatal("expected non-empty systemPrompt — SKILL seed didn't take effect")
+	}
+
+	// --- Turn 1: first prompt of the session ---
+	s.AddUser("first prompt")
+	idx1 := len(s.Messages) - 1
+
+	stored1, err := a.composeUserContent(s.ID, "first prompt", nil, nil, true)
+	if err != nil {
+		t.Fatalf("composeUserContent turn 1: %v", err)
+	}
+	s.UpdateLastMessageContent(idx1, stored1)
+
+	msgs1 := a.buildLLMHistory(s, idx1)
+	msgs1 = append(msgs1, a.buildUserMessage(stored1, nil))
+
+	// LLM replies; runTaskCycle persists the assistant turn.
+	s.UpsertLastAssistant("done with turn 1")
+
+	// --- Turn 2: a follow-up prompt ---
+	s.AddUser("second prompt")
+	idx2 := len(s.Messages) - 1
+	stored2, err := a.composeUserContent(s.ID, "second prompt", nil, nil, false)
+	if err != nil {
+		t.Fatalf("composeUserContent turn 2: %v", err)
+	}
+	s.UpdateLastMessageContent(idx2, stored2)
+
+	msgs2 := a.buildLLMHistory(s, idx2)
+	msgs2 = append(msgs2, a.buildUserMessage(stored2, nil))
+
+	if len(msgs2) <= len(msgs1) {
+		t.Fatalf("turn 2 should extend turn 1's history; got len1=%d len2=%d",
+			len(msgs1), len(msgs2))
+	}
+	// Every message turn 1 sent must reappear byte-identically as the prefix
+	// of turn 2's wire — this is exactly what the prefix cache keys on.
+	for i := range msgs1 {
+		b1, _ := json.Marshal(msgs1[i])
+		b2, _ := json.Marshal(msgs2[i])
+		if !bytes.Equal(b1, b2) {
+			t.Errorf("prefix message %d drifted between turns:\n  turn 1: %s\n  turn 2: %s",
+				i, b1, b2)
+		}
+	}
+}
+
+// TestLoadSkillsDeterministic verifies loadSkills sorts entries so the
+// concatenated system-prompt prefix is byte-stable across calls — a moving
+// SKILL order would invalidate the cache on every session start.
+func TestLoadSkillsDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	cfgDir := filepath.Join(dir, ".codehalter")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Write in non-alphabetical order; readdir order is filesystem-dependent.
+	files := map[string]string{
+		"SKILL-ts.md":   "# TS\n",
+		"SKILL-go.md":   "# Go\n",
+		"SKILL-bash.md": "# Bash\n",
+		"SKILL-java.md": "# Java\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(cfgDir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	first := loadSkills(dir)
+	for i := 0; i < 5; i++ {
+		got := loadSkills(dir)
+		if got != first {
+			t.Errorf("loadSkills run %d differs from run 0:\n  run 0: %q\n  run %d: %q", i, first, i, got)
+		}
+	}
+	// Bash should come first alphabetically; TS should be last. Looking at
+	// the order via index ensures we catch a swap, not just presence.
+	idx := func(needle string) int { return strings.Index(first, needle) }
+	if idx("# Bash") != 0 {
+		t.Errorf("expected loadSkills to start with Bash; got %q", truncate(first, 80))
+	}
+	if !(idx("# Bash") < idx("# Go") && idx("# Go") < idx("# Java") && idx("# Java") < idx("# TS")) {
+		t.Errorf("loadSkills not alphabetical:\n%s", first)
+	}
+}
+
 // TestCompressHistoryNoopWhenBelowBudget verifies that small sessions don't
 // call the LLM at all — no summary, no retitle.
 func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
@@ -583,8 +725,7 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 		sessions: map[SessionId]*Session{s.ID: s},
 		settings: Settings{
 			LLMConnections: []LLMConnection{
-				{Name: "summary", URL: mock.ts.URL, Model: "m"},
-				{Name: "thinking", URL: mock.ts.URL, Model: "m"},
+				{URL: mock.ts.URL, Model: "m"},
 			},
 		},
 	}

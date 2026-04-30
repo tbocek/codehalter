@@ -42,6 +42,12 @@ type Session struct {
 	History   []HistoryLevel `toml:"history"`
 	Messages  []Message      `toml:"messages"`
 	filePath  string
+	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
+	// phaseActive=true means a phase entry is showing as in_progress and
+	// must be marked completed before Prompt returns; phaseCurrent is the
+	// 0-based index into phaseNames it refers to.
+	phaseActive  bool
+	phaseCurrent int
 	// mu serialises all mutations of the fields above and the Save() encoder.
 	// Prompt runs synchronously per session, but generateTitle runs as a
 	// background goroutine and would otherwise race on Title + the TOML file.
@@ -187,6 +193,33 @@ func (s *Session) Save() error {
 	return s.saveLocked()
 }
 
+// rotate archives the session as it currently is to a new "session_archive_*"
+// file, then resets s in place to carry only `keep` raw messages and `hist`
+// summary levels. The live session keeps its own ID and filePath; only its
+// on-disk contents change. Returns the archive's id. Caller must hold s.mu.
+func (s *Session) rotate(keep []Message, hist []HistoryLevel) (SessionId, error) {
+	archiveID := SessionId(fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano()))
+	archivePath := filepath.Join(s.Cwd, sessionDir, fmt.Sprintf("session_%s.toml", archiveID))
+	archive := &Session{
+		ID:        archiveID,
+		Cwd:       s.Cwd,
+		Title:     s.Title,
+		CreatedAt: s.CreatedAt,
+		Depth:     s.Depth,
+		History:   s.History,
+		Messages:  s.Messages,
+		filePath:  archivePath,
+	}
+	// Fresh struct, no concurrent access — saveLocked's "caller holds mu"
+	// invariant is vacuously satisfied.
+	if err := archive.saveLocked(); err != nil {
+		return "", err
+	}
+	s.History = hist
+	s.Messages = keep
+	return archiveID, nil
+}
+
 // saveLocked writes the session to disk. Caller must hold s.mu.
 func (s *Session) saveLocked() error {
 	f, err := os.Create(s.filePath)
@@ -212,8 +245,10 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 		if !strings.HasPrefix(e.Name(), "session_") || !strings.HasSuffix(e.Name(), ".toml") {
 			continue
 		}
-		// Skip subagent sessions.
-		if strings.HasPrefix(e.Name(), "session_sub_") {
+		// Skip subagent and post-rotation archive sessions — both live on
+		// disk for inspection but should not clutter the picker.
+		if strings.HasPrefix(e.Name(), "session_sub_") ||
+			strings.HasPrefix(e.Name(), "session_archive_") {
 			continue
 		}
 		info, err := e.Info()

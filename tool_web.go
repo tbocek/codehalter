@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -46,7 +47,9 @@ func init() {
 			return "error: query is required"
 		}
 
-		tcId := a.StartToolCall(ctx, sid, "Searching: "+query, "search", nil)
+		a.logSession(sid, "WEB", "search query: %s", query)
+
+		tcId := a.StartToolCall(ctx, sid, "DuckDuckGo: "+query, "search", nil)
 
 		searchURL := "https://duckduckgo.com/?q=" + url.QueryEscape(query)
 
@@ -78,19 +81,24 @@ func init() {
 		if len(links) > maxResultTabs {
 			links = links[:maxResultTabs]
 		}
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{
+			TextContent(fmt.Sprintf("%d hits, opening in tabs", len(links))),
+		})
 
-		// Open each result in a new tab so the user can preview.
+		// Open each result in its own tab — emit a card per URL so the user
+		// sees which sites are being fetched, not just the final list.
 		var opened []string
 		for _, link := range links {
+			openId := a.StartToolCall(ctx, sid, "Opening: "+link, "search", nil)
 			if _, err := browser.OpenTab(ctx, link); err != nil {
+				a.FailToolCall(ctx, sid, openId, err.Error())
 				continue
 			}
+			a.CompleteToolCall(ctx, sid, openId, nil)
 			opened = append(opened, link)
 		}
 
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{
-			TextContent(fmt.Sprintf("Opened %d results in Firefox:\n%s", len(opened), strings.Join(opened, "\n"))),
-		})
+		a.logSession(sid, "WEB", "opened tabs (%d):\n%s", len(opened), strings.Join(opened, "\n"))
 
 		// Ask user to review.
 		askId := a.StartToolCall(ctx, sid, "Review the tabs in Firefox, then confirm", "think", nil)
@@ -153,6 +161,8 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 			return "error: url is required"
 		}
 
+		a.logSession(sid, "WEB", "open URL: %s", targetURL)
+
 		tcId := a.StartToolCall(ctx, sid, "Opening: "+targetURL, "search", nil)
 
 		port := nextBrowserPort()
@@ -180,11 +190,14 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 
 		text, err := browser.PageText(ctx, tabID)
 		if err != nil {
+			a.logSession(sid, "WEB", "page text error: %s", err.Error())
 			return "error getting page text: " + err.Error()
 		}
 
+		a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))
+
 		if summarize {
-			return a.summarizePage(ctx, "content of "+targetURL, targetURL, text)
+			return a.summarizePage(ctx, sid, "content of "+targetURL, targetURL, text)
 		}
 		if len(text) > maxRawPageChars {
 			text = text[:maxRawPageChars] + "\n... (truncated)"
@@ -193,9 +206,10 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 	}
 }
 
-// summarizePage uses the summary LLM to extract only the relevant information from a web page.
-func (a *agent) summarizePage(ctx context.Context, query, url, pageText string) string {
-	conn := a.settings.SummaryLLM()
+// summarizePage uses the summary LLM to extract only the relevant information
+// from a web page. sid scopes the per-session debug log.
+func (a *agent) summarizePage(ctx context.Context, sid SessionId, query, url, pageText string) string {
+	conn := a.settings.LLMFor("summary", a.llmTier(sid))
 
 	// Truncate input to avoid overwhelming the summary LLM.
 	const maxInput = 8000
@@ -209,7 +223,7 @@ func (a *agent) summarizePage(ctx context.Context, query, url, pageText string) 
 	)
 
 	messages := []llmMessage{{Role: "user", Content: prompt}}
-	summary, err := a.llmSimple(ctx, conn, messages)
+	summary, err := a.llmSimple(ctx, sid, conn, messages)
 	if err != nil {
 		const maxLen = 2000
 		if len(pageText) > maxLen {
@@ -218,6 +232,65 @@ func (a *agent) summarizePage(ctx context.Context, query, url, pageText string) 
 		return pageText
 	}
 	return strings.TrimSpace(summary)
+}
+
+// HTML log cleanup: keep semantic structure (headings, lists, tables, code,
+// anchors), drop layout chrome and binary blobs. Regex-based; not an HTML
+// parser — good enough for log readability, not for security-sensitive use.
+
+// dropBlockTags removes the opening tag, all content, and the closing tag.
+// Used for elements whose body is non-text (CSS, JS, vector graphics) or
+// universally noisy (forms aren't here because we unwrap them).
+var dropBlockTags = []string{"script", "style", "svg", "noscript", "iframe", "canvas", "head"}
+
+// dropVoidTags are self-closing or contentless tags we erase entirely.
+var dropVoidTags = map[string]bool{
+	"img": true, "br": true, "hr": true, "meta": true, "link": true,
+	"base": true, "input": true, "source": true, "track": true, "area": true,
+}
+
+// unwrapTags lose their open/close markers but keep inner text.
+var unwrapTags = map[string]bool{
+	"div": true, "span": true, "nav": true, "header": true, "footer": true,
+	"aside": true, "section": true, "article": true, "main": true,
+	"body": true, "html": true, "figure": true, "figcaption": true,
+	"picture": true, "label": true, "button": true, "form": true,
+	"fieldset": true, "legend": true,
+}
+
+// dropBlockRes matches each noise-block element (one regex per tag, since
+// RE2 has no backreferences). `(?is)` = case-insensitive + dotall.
+var dropBlockRes = func() []*regexp.Regexp {
+	out := make([]*regexp.Regexp, len(dropBlockTags))
+	for i, t := range dropBlockTags {
+		out[i] = regexp.MustCompile(`(?is)<` + t + `\b[^>]*>.*?</` + t + `\s*>`)
+	}
+	return out
+}()
+
+var tagRe = regexp.MustCompile(`(?i)<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>`)
+var hrefRe = regexp.MustCompile(`(?i)\shref\s*=\s*("[^"]*"|'[^']*'|\S+)`)
+
+// stripHTMLAttrs collapses HTML to its skeleton: noise blocks gone, layout
+// wrappers unwrapped, attributes dropped (except href on anchors). Aimed at
+// keeping the per-session log readable when we eventually capture raw HTML.
+func stripHTMLAttrs(s string) string {
+	for _, re := range dropBlockRes {
+		s = re.ReplaceAllString(s, "")
+	}
+	return tagRe.ReplaceAllStringFunc(s, func(match string) string {
+		sub := tagRe.FindStringSubmatch(match)
+		closing, tag, attrs := sub[1], strings.ToLower(sub[2]), sub[3]
+		if dropVoidTags[tag] || unwrapTags[tag] {
+			return ""
+		}
+		if tag == "a" && closing == "" {
+			if href := hrefRe.FindString(attrs); href != "" {
+				return "<a" + href + ">"
+			}
+		}
+		return "<" + closing + tag + ">"
+	})
 }
 
 // extractDDGLinks extracts result URLs from a DuckDuckGo search results page.
