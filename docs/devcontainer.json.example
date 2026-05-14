@@ -17,6 +17,10 @@
   "remoteUser": "dev",
   "mounts": [
     // Persist the Go module cache across container rebuilds.
-    "source=codehalter-gocache,target=/home/dev/go/pkg/mod,type=volume"
+    "source=codehalter-gocache,target=/home/dev/go/pkg/mod,type=volume",
+    // Reuse the host's global codehalter settings inside the container, so
+    // every project picks up the same [[llmconnections]] without copying.
+    // Read-only because the agent only ever reads this file.
+    "source=${localEnv:HOME}/.config/codehalter,target=/home/dev/.config/codehalter,type=bind,readonly"
   ]
 }
