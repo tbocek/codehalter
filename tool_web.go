@@ -111,19 +111,6 @@ func init() {
 
 		a.logSession(sid, "WEB", "opened tabs (%d):\n%s", len(opened), strings.Join(opened, "\n"))
 
-		// Ask user to review.
-		askId := a.StartToolCall(ctx, sid, "Review the tabs in Firefox, then confirm", "think", nil)
-		ok, askErr := a.askYesNoAuto(ctx, sid, askId, "OK", "Cancel", true)
-		if askErr != nil {
-			a.FailToolCall(ctx, sid, askId, askErr.Error())
-			return "error asking permission: " + askErr.Error()
-		}
-		if !ok {
-			a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Cancelled")})
-			return "user cancelled search"
-		}
-		a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Returning URLs")})
-
 		var results strings.Builder
 		for i, link := range opened {
 			if issue := issues[link]; issue != "" {
@@ -196,18 +183,6 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 			}
 		}
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(openMsg)})
-
-		askId := a.StartToolCall(ctx, sid, "Review the page in Firefox, then confirm", "think", nil)
-		ok, askErr := a.askYesNoAuto(ctx, sid, askId, "Get content", "Cancel", true)
-		if askErr != nil {
-			a.FailToolCall(ctx, sid, askId, askErr.Error())
-			return "error asking permission: " + askErr.Error()
-		}
-		if !ok {
-			a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Cancelled")})
-			return "user cancelled"
-		}
-		a.CompleteToolCall(ctx, sid, askId, []ToolCallContent{TextContent("Extracting...")})
 
 		text, err := browser.PageText(ctx, tabID)
 		if err != nil {
