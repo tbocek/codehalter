@@ -39,7 +39,7 @@ type Session struct {
 	CreatedAt time.Time      `toml:"created_at"`
 	Depth     int            `toml:"depth,omitempty"`
 	ParentID  SessionId      `toml:"parent_id,omitempty"`
-	History   []HistoryLevel `toml:"history"`
+	Summary   string         `toml:"summary,omitempty"`
 	Messages  []Message      `toml:"messages"`
 	filePath  string
 	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
@@ -224,10 +224,11 @@ func (s *Session) Save() error {
 }
 
 // rotate archives the session as it currently is to a new "session_archive_*"
-// file, then resets s in place to carry only `keep` raw messages and `hist`
-// summary levels. The live session keeps its own ID and filePath; only its
-// on-disk contents change. Returns the archive's id. Caller must hold s.mu.
-func (s *Session) rotate(keep []Message, hist []HistoryLevel) (SessionId, error) {
+// file, then resets s in place to carry only `keep` raw messages and `summary`
+// as the rolled-up prior context. The live session keeps its own ID and
+// filePath; only its on-disk contents change. Returns the archive's id.
+// Caller must hold s.mu.
+func (s *Session) rotate(keep []Message, summary string) (SessionId, error) {
 	archiveID := SessionId(fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano()))
 	archivePath := filepath.Join(s.Cwd, sessionDir, fmt.Sprintf("session_%s.toml", archiveID))
 	archive := &Session{
@@ -236,7 +237,7 @@ func (s *Session) rotate(keep []Message, hist []HistoryLevel) (SessionId, error)
 		Title:     s.Title,
 		CreatedAt: s.CreatedAt,
 		Depth:     s.Depth,
-		History:   s.History,
+		Summary:   s.Summary,
 		Messages:  s.Messages,
 		filePath:  archivePath,
 	}
@@ -245,7 +246,7 @@ func (s *Session) rotate(keep []Message, hist []HistoryLevel) (SessionId, error)
 	if err := archive.saveLocked(); err != nil {
 		return "", err
 	}
-	s.History = hist
+	s.Summary = summary
 	s.Messages = keep
 	return archiveID, nil
 }

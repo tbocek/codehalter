@@ -118,7 +118,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// prompt at send time (see buildLLMHistory) and are NOT persisted, so
 	// history stays cacheable and compact.
 	sess := a.getSession(req.SessionId)
-	isFirstMessage := sess != nil && len(sess.Messages) == 0 && len(sess.History) == 0
+	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
 	currentUserIdx := -1
 	if sess != nil {
 		if len(images) > 0 {

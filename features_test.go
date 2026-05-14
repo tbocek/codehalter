@@ -213,12 +213,12 @@ func TestUpdateLastMessageContentBounds(t *testing.T) {
 // History shape
 // ---------------------------------------------------------------------------
 
-// TestBuildLLMHistoryShape verifies the header injection when history exists
-// (user intro + assistant ack), message ordering, and that skipIdx is honoured.
+// TestBuildLLMHistoryShape verifies the header injection when a summary
+// exists (one user message), message ordering, and that skipIdx is honoured.
 func TestBuildLLMHistoryShape(t *testing.T) {
 	a := &agent{}
 	s := &Session{
-		History: []HistoryLevel{{Level: 0, Content: "earlier summary"}},
+		Summary: "earlier summary",
 		Messages: []Message{
 			{Role: "user", Content: "q1"},
 			{Role: "assistant", Content: "a1"},
@@ -228,33 +228,33 @@ func TestBuildLLMHistoryShape(t *testing.T) {
 
 	msgs := a.buildLLMHistory(s, 2)
 
-	if len(msgs) != 4 {
-		t.Fatalf("got %d messages, want 4: %+v", len(msgs), msgs)
+	if len(msgs) != 3 {
+		t.Fatalf("got %d messages, want 3: %+v", len(msgs), msgs)
 	}
-	if msgs[0].Role != "user" || msgs[1].Role != "assistant" {
-		t.Errorf("header roles: got %q/%q, want user/assistant", msgs[0].Role, msgs[1].Role)
+	if msgs[0].Role != "user" {
+		t.Errorf("header role: got %q, want user", msgs[0].Role)
 	}
 	if !strings.Contains(contentString(t, msgs[0]), "earlier summary") {
 		t.Errorf("intro missing summary content: %q", contentString(t, msgs[0]))
 	}
-	if got := contentString(t, msgs[2]); got != "q1" {
-		t.Errorf("msgs[2]: got %q, want q1", got)
+	if got := contentString(t, msgs[1]); got != "q1" {
+		t.Errorf("msgs[1]: got %q, want q1", got)
 	}
-	if got := contentString(t, msgs[3]); got != "a1" {
-		t.Errorf("msgs[3]: got %q, want a1", got)
+	if got := contentString(t, msgs[2]); got != "a1" {
+		t.Errorf("msgs[2]: got %q, want a1", got)
 	}
 
-	// No history → no header; skipIdx still honoured.
+	// No summary → no header; skipIdx still honoured.
 	s2 := &Session{Messages: []Message{
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},
 	}}
 	msgs2 := a.buildLLMHistory(s2, 0)
 	if len(msgs2) != 1 {
-		t.Fatalf("no-history case: got %d, want 1", len(msgs2))
+		t.Fatalf("no-summary case: got %d, want 1", len(msgs2))
 	}
 	if got := contentString(t, msgs2[0]); got != "a1" {
-		t.Errorf("no-history case content: got %q, want a1", got)
+		t.Errorf("no-summary case content: got %q, want a1", got)
 	}
 }
 

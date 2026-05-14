@@ -11,25 +11,24 @@ const (
 	// Set close to the model's context limit so the prompt prefix stays
 	// stable across many turns — that maximizes prefix-cache reuse on the
 	// LLM side. With a 128k model this leaves ~28k for system prompt,
-	// summary levels, and output reservation.
+	// summary, and output reservation.
 	rawBufferTokens   = 100000
 	summaryBudget     = 12000
 	charsPerToken     = 4
 	roleTokenOverhead = 4
-	summaryWordRatio  = 3.0 / 4.0
 	maxTitleLen       = 60
 	titleFallbackLen  = 50
 
-	summarizePrompt = "Summarize this conversation concisely. Preserve key decisions and file paths. Do NOT include source code verbatim — instead reference the file path and describe what was changed. Drop pleasantries and redundant detail."
+	// maxSummaryItemBytes caps any single message's content when it's fed
+	// to the summarize LLM. Without this, one giant message (e.g. a tool
+	// dump bigger than rawBufferTokens) would blow through the summarize
+	// model's own context window.
+	maxSummaryItemBytes = 20 * 1024
+
+	summarizePrompt = "Summarize this conversation concisely. Preserve: the user's overall goal; any open questions or in-flight work; decisions already made; file paths referenced. Do NOT include source code verbatim — reference the file path and describe what changed. Drop pleasantries and redundant detail."
 	titlePrompt     = "Generate a very short title (max 6 words) for this conversation. Reply with only the title, nothing else."
 	retitlePrompt   = "Generate a very short title (max 6 words) for this conversation based on the summary below. Reply with only the title, nothing else.\n\n"
 )
-
-// HistoryLevel is a summary of older conversation messages.
-type HistoryLevel struct {
-	Level   int    `toml:"level"`
-	Content string `toml:"content"`
-}
 
 // estimateTokens gives a rough token count for a string.
 func estimateTokens(s string) int {
@@ -53,11 +52,15 @@ func estimateMessagesTokens(msgs []Message) int {
 
 // compressHistory rotates the session when the raw message buffer exceeds
 // the budget: the current full state is frozen as a "session_archive_*"
-// TOML, and the live session is rewritten in place with a single Level 0
-// summary covering all prior context plus the most recent 20% of messages
-// kept verbatim. The session keeps its ACP-facing ID and on-disk path so
-// Zed's panel continues without interruption — the archive is browsable via
+// TOML, and the live session is rewritten in place with a single Summary
+// covering all prior context plus the most recent 20% of messages kept
+// verbatim. The session keeps its ACP-facing ID and on-disk path so Zed's
+// panel continues without interruption — the archive is browsable via
 // session/load if the user wants to inspect what was rotated out.
+//
+// On summarize failure we DO NOT rotate: better to keep the raw messages
+// (and try again next turn) than to corrupt the live session with a junk
+// summary. The user sees a warning instead.
 //
 // sess.mu is held across the whole routine so the background generateTitle
 // goroutine cannot interleave a Save() (or read stale Messages while they're
@@ -74,7 +77,8 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 
 	// Split 20/80: the older 80% is folded into a fresh summary, the
 	// recent 20% stays raw. (len*4)/5 lands at 0 only when len < 2 — in
-	// that pathological case the single huge message is summarized whole.
+	// that pathological case the single huge message is summarized whole
+	// (and clipBytes below keeps its contribution bounded).
 	splitIdx := (len(sess.Messages) * 4) / 5
 	if splitIdx == 0 {
 		splitIdx = len(sess.Messages)
@@ -82,19 +86,23 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	oldMessages := sess.Messages[:splitIdx]
 	keepMessages := append([]Message(nil), sess.Messages[splitIdx:]...)
 
-	// Fold every existing history level + the older 80% raw messages into
-	// the input so the new Level 0 captures all prior context (the archive
-	// preserves the pre-rotation state for forensic browsing).
 	var buf strings.Builder
-	for _, h := range sess.History {
-		fmt.Fprintf(&buf, "[Earlier summary, level %d]\n%s\n\n", h.Level, h.Content)
+	if sess.Summary != "" {
+		fmt.Fprintf(&buf, "[Earlier summary]\n%s\n\n", sess.Summary)
 	}
 	for _, m := range oldMessages {
-		fmt.Fprintf(&buf, "%s: %s\n\n", m.Role, m.Content)
+		fmt.Fprintf(&buf, "%s: %s\n\n", m.Role, clipBytes(m.Content, maxSummaryItemBytes))
 	}
-	summary := a.summarize(ctx, sess.ID, conn, buf.String(), summaryBudget)
 
-	archiveID, err := sess.rotate(keepMessages, []HistoryLevel{{Level: 0, Content: summary}})
+	summary, err := a.summarize(ctx, sess.ID, conn, buf.String())
+	if err != nil {
+		sess.mu.Unlock()
+		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock(
+			"⚠ History compaction skipped (summarize failed: "+err.Error()+"). Will retry next turn.\n\n")))
+		return
+	}
+
+	archiveID, err := sess.rotate(keepMessages, summary)
 	if err != nil {
 		sess.mu.Unlock()
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Compaction failed: "+err.Error()+"\n\n")))
@@ -109,23 +117,23 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	a.retitle(ctx, sess)
 }
 
-// summarize calls the LLM to compress text into roughly targetTokens. sid is
-// used only to route the per-session debug log (empty disables logging).
-func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnection, text string, targetTokens int) string {
-	prompt := fmt.Sprintf("%s\n\nTarget length: ~%d words.\n\n---\n%s", summarizePrompt, int(float64(targetTokens)*summaryWordRatio), text)
-	messages := []llmMessage{{Role: "user", Content: prompt}}
-
-	// Non-streaming request for summarization.
-	response, err := a.llmSimple(ctx, sid, conn, messages)
-	if err != nil {
-		// If summarization fails, just truncate.
-		chars := targetTokens * charsPerToken
-		if len(text) > chars {
-			return text[:chars] + "\n[truncated]"
-		}
-		return text
+// clipBytes truncates s to at most max bytes, leaving a marker in the middle
+// when it had to cut. Used to bound any single message's contribution to the
+// summarize prompt.
+func clipBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
 	}
-	return response
+	half := max / 2
+	return s[:half] + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + s[len(s)-half:]
+}
+
+// summarize calls the LLM to compress text. Returns an error on LLM failure
+// so the caller can decide whether to proceed — we never silently substitute
+// truncated raw text for a real summary.
+func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnection, text string) (string, error) {
+	prompt := fmt.Sprintf("%s\n\nTarget length: ~%d tokens.\n\n---\n%s", summarizePrompt, summaryBudget, text)
+	return a.llmSimple(ctx, sid, conn, []llmMessage{{Role: "user", Content: prompt}})
 }
 
 // generateTitle asks the LLM to create a short title from the first user message.
@@ -164,17 +172,16 @@ func trimTitle(title string) string {
 	return title
 }
 
-// retitle updates the session title based on the latest summary.
+// retitle updates the session title based on the current summary.
 func (a *agent) retitle(ctx context.Context, sess *Session) {
-	if len(sess.History) == 0 {
+	if sess.Summary == "" {
 		return
 	}
 	conn := a.pickAvailable(ctx, "thinking", a.llmTier(sess.ID))
 	if conn == nil {
 		return // already warned in compressHistory
 	}
-	latest := sess.History[len(sess.History)-1]
-	messages := []llmMessage{{Role: "user", Content: retitlePrompt + latest.Content}}
+	messages := []llmMessage{{Role: "user", Content: retitlePrompt + sess.Summary}}
 	title, err := a.llmSimple(ctx, sess.ID, conn, messages)
 	if err != nil {
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Retitle failed: "+err.Error()+"\n")))
@@ -189,25 +196,17 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 
 
 // buildLLMHistory constructs the LLM message array from the session's stored
-// history and messages. Messages are read 1:1 from TOML — project context is
+// summary and messages. Messages are read 1:1 from TOML — project context is
 // NOT stored and must be injected by the caller onto the current user message.
 // skipIdx is the index in sess.Messages of the current user message; the
 // caller appends it separately with the injected context.
 func (a *agent) buildLLMHistory(sess *Session, skipIdx int) []llmMessage {
 	var messages []llmMessage
 
-	if len(sess.History) > 0 {
-		var historyBuf strings.Builder
-		historyBuf.WriteString("[Conversation history - most recent decisions take priority]\n\n")
-
-		for i := len(sess.History) - 1; i >= 0; i-- {
-			h := sess.History[i]
-			fmt.Fprintf(&historyBuf, "[Summary level %d]:\n%s\n\n", h.Level, h.Content)
-		}
-		messages = append(messages, llmMessage{Role: "user", Content: historyBuf.String()})
+	if sess.Summary != "" {
 		messages = append(messages, llmMessage{
-			Role:    "assistant",
-			Content: "I've reviewed the conversation history. I'll prioritize the most recent decisions and context.",
+			Role:    "user",
+			Content: "[Earlier conversation summary — most recent messages below take priority]\n\n" + sess.Summary,
 		})
 	}
 

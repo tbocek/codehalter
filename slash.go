@@ -31,7 +31,7 @@ func (a *agent) handleSlashCommand(ctx context.Context, sid SessionId, userText 
 }
 
 // runClean archives the session's full state to a "session_archive_*" file,
-// then resets the live session in place — Messages and History are wiped,
+// then resets the live session in place — Messages and Summary are wiped,
 // the same SessionId continues. Zed cannot be told to refresh its panel
 // (ACP has no agent → client "reload" notification), so this leaves the
 // prior turns visible in Zed's UI; the next prompt starts the agent with a
@@ -45,12 +45,12 @@ func (a *agent) runClean(ctx context.Context, sid SessionId) {
 		return
 	}
 	sess.mu.Lock()
-	if len(sess.Messages) == 0 && len(sess.History) == 0 {
+	if len(sess.Messages) == 0 && sess.Summary == "" {
 		sess.mu.Unlock()
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Session already empty.\n")))
 		return
 	}
-	archiveID, err := sess.rotate(nil, nil)
+	archiveID, err := sess.rotate(nil, "")
 	if err != nil {
 		sess.mu.Unlock()
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ /clean failed: "+err.Error()+"\n")))
@@ -145,11 +145,14 @@ func (a *agent) buildImproveSnapshot(sid SessionId) string {
 	if sess.Title != "" {
 		fmt.Fprintf(&b, "- title: %s\n", sess.Title)
 	}
-	fmt.Fprintf(&b, "- messages: %d, history levels: %d\n\n",
-		len(sess.Messages), len(sess.History))
+	hasSummary := 0
+	if sess.Summary != "" {
+		hasSummary = 1
+	}
+	fmt.Fprintf(&b, "- messages: %d, summary: %d\n\n", len(sess.Messages), hasSummary)
 
-	for i, h := range sess.History {
-		fmt.Fprintf(&b, "## History summary level %d (#%d)\n%s\n\n", h.Level, i, h.Content)
+	if sess.Summary != "" {
+		fmt.Fprintf(&b, "## Earlier conversation summary\n%s\n\n", sess.Summary)
 	}
 
 	for i, m := range sess.Messages {

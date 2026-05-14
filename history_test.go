@@ -127,10 +127,7 @@ func TestSessionRoundtrip(t *testing.T) {
 	s.AddUser("hello")
 	s.AddAssistant("hi there")
 	s.AppendToolUse(ToolUse{Name: "read_file", Input: `{"path":"x.go"}`, Output: "file content"})
-	s.History = append(s.History, HistoryLevel{
-		Level:   0,
-		Content: "earlier summary",
-	})
+	s.Summary = "earlier summary"
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -158,11 +155,8 @@ func TestSessionRoundtrip(t *testing.T) {
 	if tu.Name != "read_file" || tu.Output != "file content" {
 		t.Errorf("ToolUse: got %+v", tu)
 	}
-	if got := len(loaded.History); got != 1 {
-		t.Fatalf("History len: got %d, want 1", got)
-	}
-	if loaded.History[0].Content != "earlier summary" {
-		t.Errorf("History content mismatch: %q", loaded.History[0].Content)
+	if loaded.Summary != "earlier summary" {
+		t.Errorf("Summary mismatch: got %q, want %q", loaded.Summary, "earlier summary")
 	}
 }
 
@@ -378,9 +372,9 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 
 // TestCompressHistoryRecordsSummary is the headline history test: once raw
 // messages exceed rawBufferTokens, compressHistory should rotate the session
-// — freeze the pre-rotation state to a "session_archive_*" file, push a
-// level-0 HistoryLevel into the live session, trim raw messages to the
-// recent 20%, retitle via the thinking LLM, and persist everything.
+// — freeze the pre-rotation state to a "session_archive_*" file, push the
+// new Summary into the live session, trim raw messages to the recent 20%,
+// retitle via the thinking LLM, and persist everything.
 func TestCompressHistoryRecordsSummary(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText("SUMMARY-OF-OLD-MESSAGES"),
@@ -417,14 +411,8 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 
 	a.compressHistory(context.Background(), s)
 
-	if got := len(s.History); got != 1 {
-		t.Fatalf("History len: got %d, want 1", got)
-	}
-	if s.History[0].Level != 0 {
-		t.Errorf("summary level: got %d, want 0", s.History[0].Level)
-	}
-	if s.History[0].Content != "SUMMARY-OF-OLD-MESSAGES" {
-		t.Errorf("summary content: got %q", s.History[0].Content)
+	if s.Summary != "SUMMARY-OF-OLD-MESSAGES" {
+		t.Errorf("summary: got %q, want %q", s.Summary, "SUMMARY-OF-OLD-MESSAGES")
 	}
 	if len(s.Messages) >= originalMsgCount {
 		t.Errorf("Messages not trimmed: before %d, after %d", originalMsgCount, len(s.Messages))
@@ -460,15 +448,14 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadSession: %v", err)
 	}
-	if got := len(loaded.History); got != 1 || loaded.History[0].Content != "SUMMARY-OF-OLD-MESSAGES" {
-		t.Errorf("persisted history: %+v", loaded.History)
+	if loaded.Summary != "SUMMARY-OF-OLD-MESSAGES" {
+		t.Errorf("persisted summary: got %q", loaded.Summary)
 	}
 	if loaded.Title != "NEW TITLE" {
 		t.Errorf("persisted title: got %q", loaded.Title)
 	}
 
-	// Exactly two LLM calls (summarize + retitle). No cascade fires for a
-	// single level-0 summary.
+	// Exactly two LLM calls (summarize + retitle).
 	if mock.callCount() != 2 {
 		t.Errorf("LLM calls: got %d, want 2", mock.callCount())
 	}
@@ -739,8 +726,8 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 
 	a.compressHistory(context.Background(), s)
 
-	if len(s.History) != 0 {
-		t.Errorf("expected no history levels, got %d", len(s.History))
+	if s.Summary != "" {
+		t.Errorf("expected empty summary, got %q", s.Summary)
 	}
 	if len(s.Messages) != 2 {
 		t.Errorf("expected messages untouched, got %d", len(s.Messages))
