@@ -210,9 +210,10 @@ func (a *agent) runTaskCycle(
 	images []ImageData,
 	prePlan *planResult, preConn *LLMConnection, preToolUses []ToolUse,
 ) (toolLoopResult, error) {
-	const maxAttempts = 2
+	const maxAttempts = 10
 	var result toolLoopResult
 	var lastVR *verifyResult
+	var seenBags []map[string]bool
 	sess := a.getSession(sid)
 
 	conn := preConn
@@ -282,6 +283,27 @@ func (a *agent) runTaskCycle(
 		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
 			break
 		}
+
+		// Loop-detection: if verify reports a near-duplicate of an earlier
+		// failure (Jaccard ≥ threshold over the bag of issue words), the LLM
+		// is stuck rephrasing the same problem. Bail rather than burn the
+		// remaining retry budget. Order, casing and punctuation are ignored
+		// so "missing import" and "import is missing" collapse together.
+		currentBag := issueBag(vr.Issues)
+		looped := false
+		for _, prev := range seenBags {
+			if jaccard(currentBag, prev) >= failureSimilarityThreshold {
+				looped = true
+				break
+			}
+		}
+		if looped {
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+				fmt.Sprintf("⚠ Same verification failure as a prior attempt — retrying would loop. Giving up. Last issues:\n%s\n", strings.Join(vr.Issues, "\n")),
+			)))
+			break
+		}
+		seenBags = append(seenBags, currentBag)
 
 		if attempt == maxAttempts-1 {
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
@@ -452,6 +474,62 @@ func (a *agent) composeUserContent(sid SessionId, planInput string, planSteps []
 		content = prefix + content
 	}
 	return content, nil
+}
+
+// failureSimilarityThreshold is the Jaccard ratio above which two
+// verify-failure bags are considered "the same problem." Tuned empirically
+// for short LLM-generated issue strings: 0.6 catches "missing import" /
+// "import is missing" (Jaccard 0.67) without collapsing genuinely different
+// files (e.g. foo.go vs bar.go syntax errors land around 0.67-0.83 and
+// would false-positive; the cost of an over-eager bail is recoverable by
+// re-prompting, so we accept that for the upside of catching small-model
+// rewordings).
+const failureSimilarityThreshold = 0.6
+
+// issueBag tokenises a list of issue strings into a single set of distinct
+// lowercase alphanumeric words. Punctuation, casing and ordering are all
+// discarded so two attempts reporting the same root cause in different
+// phrasing collapse to comparable bags.
+func issueBag(issues []string) map[string]bool {
+	bag := make(map[string]bool)
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			bag[cur.String()] = true
+			cur.Reset()
+		}
+	}
+	for _, iss := range issues {
+		for _, r := range strings.ToLower(iss) {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+				cur.WriteRune(r)
+			default:
+				flush()
+			}
+		}
+		flush()
+	}
+	return bag
+}
+
+// jaccard returns |A ∩ B| / |A ∪ B| for two word sets. 1.0 = identical,
+// 0.0 = disjoint. Two empty bags are treated as identical.
+func jaccard(a, b map[string]bool) float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return 1
+	}
+	inter := 0
+	for w := range a {
+		if b[w] {
+			inter++
+		}
+	}
+	union := len(a) + len(b) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
 }
 
 func (a *agent) buildUserMessage(content string, images []ImageData) llmMessage {

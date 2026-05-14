@@ -370,6 +370,120 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 }
 
+// TestToolLoopDedupReadOnly verifies that two identical read-only tool calls
+// in the same tool loop execute the underlying tool only once — the second
+// returns the cached output prefixed with a "[deduped: …]" note. Small models
+// frequently re-issue identical read_file calls; the cache stops the loop
+// from burning tokens.
+func TestToolLoopDedupReadOnly(t *testing.T) {
+	withFreshToolRegistry(t)
+	const name = "test_ro_counter"
+	var calls int
+	RegisterTool(Tool{
+		Def: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": name, "description": "counter",
+				"parameters": map[string]any{"type": "object"},
+			},
+		},
+		ReadOnly: true,
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			calls++
+			return "ok"
+		},
+	})
+
+	mock := newMockLLM(t,
+		sseToolCall("c1", name, `{}`),
+		sseToolCall("c2", name, `{}`),
+		sseText("done"),
+	)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{readOnly: true})
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("tool executed %d times, want 1 (second should be deduped)", calls)
+	}
+	if len(res.ToolUses) != 2 {
+		t.Fatalf("ToolUses: got %d, want 2", len(res.ToolUses))
+	}
+	if !strings.HasPrefix(res.ToolUses[1].Output, "[deduped:") {
+		t.Errorf("second tool output should be deduped, got %q", res.ToolUses[1].Output)
+	}
+}
+
+// TestToolLoopDedupInvalidatedByMutator verifies that a non-ReadOnly tool
+// clears the dedup cache so a subsequent read sees fresh state instead of
+// the pre-mutation cached value.
+func TestToolLoopDedupInvalidatedByMutator(t *testing.T) {
+	withFreshToolRegistry(t)
+	const readName = "test_ro"
+	const writeName = "test_rw"
+	var reads, writes int
+	RegisterTool(Tool{
+		Def: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": readName, "description": "read",
+				"parameters": map[string]any{"type": "object"},
+			},
+		},
+		ReadOnly: true,
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			reads++
+			return "read-ok"
+		},
+	})
+	RegisterTool(Tool{
+		Def: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": writeName, "description": "write",
+				"parameters": map[string]any{"type": "object"},
+			},
+		},
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+			writes++
+			return "wrote"
+		},
+	})
+
+	mock := newMockLLM(t,
+		sseToolCall("c1", readName, `{}`),
+		sseToolCall("c2", writeName, `{}`),
+		sseToolCall("c3", readName, `{}`),
+		sseText("done"),
+	)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{})
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if reads != 2 {
+		t.Errorf("read tool executed %d times, want 2 (second read must NOT be deduped after write)", reads)
+	}
+	if writes != 1 {
+		t.Errorf("write tool executed %d times, want 1", writes)
+	}
+	if len(res.ToolUses) != 3 {
+		t.Fatalf("ToolUses: got %d, want 3", len(res.ToolUses))
+	}
+	for i, tu := range res.ToolUses {
+		if strings.HasPrefix(tu.Output, "[deduped:") {
+			t.Errorf("ToolUses[%d] unexpectedly deduped: %q", i, tu.Output)
+		}
+	}
+}
+
 // TestCompressHistoryRecordsSummary is the headline history test: once raw
 // messages exceed rawBufferTokens, compressHistory should rotate the session
 // — freeze the pre-rotation state to a "session_archive_*" file, push the

@@ -4,8 +4,7 @@ An [ACP](https://spec.anthropic.com/acp)-compatible AI coding agent that connect
 
 ## Features
 
-- **Plan → Execute → Verify → Document pipeline** — every prompt is routed through a planning pass, an execution pass, and a self-verification pass. Failed verifications re-plan with the failure context; up to 5 attempts before giving up. Turns that wrote files end with a documentation pass that updates (or creates) the README when the change is user-visible.
-- **Pre-planning verification** — a read-only project health check runs before planning so broken baseline state is surfaced instead of silently corrupted by new work.
+- **Plan → Execute → Verify → Document pipeline** — every prompt is routed through a planning pass, an execution pass, and a self-verification pass. Failed verifications re-plan with the failure context; up to 10 attempts before giving up, with fuzzy duplicate-failure detection (Jaccard similarity over issue words) that bails early when the model keeps rephrasing the same problem. Turns that wrote files end with a documentation pass that updates (or creates) the README when the change is user-visible.
 - **Big-task decomposition** — when the planner splits a request into multiple subtasks, the user picks once: *Interactive* (approve each subtask), *Automatic* (run the whole batch under autopilot), or *Cancel*. Each subtask gets its own full plan → execute → verify cycle.
 - **Subagents** — `launch_subagent` spawns parallel sub-tasks for independent work; each runs its own plan/execute/verify, up to 2 levels deep.
 - **Agentic tool loop** — the LLM can read, edit, search, and run tasks iteratively with file edits surfaced as diffs.
@@ -162,10 +161,9 @@ If your LLM server runs on the host, change the URL in `.codehalter/settings.tom
 1. Zed spawns `codehalter` as a subprocess and communicates via JSON-RPC 2.0 over stdio.
 2. On session start, the agent indexes project files, probes image support on the configured LLM, discovers task runners, and reports which of build/test/lint/format are covered.
 3. Each prompt runs through the pipeline:
-   - **Pre-verify** — read-only check of project health; failures are folded into the planning input.
    - **Plan** — the `thinking` LLM analyzes the request with read-only tools, gathers external info via web tools if needed, and emits either `steps` (simple task) or `subtasks` (big task). In Interactive mode the user confirms before execution.
    - **Execute** — the `execute` LLM runs the agentic tool loop; file edits are shown as diffs and require user approval in Interactive mode.
-   - **Verify** — the output is self-checked against `VERIFY.md`. On failure with fix steps, the loop re-plans with failure context (up to 5 attempts total).
+   - **Verify** — the output is self-checked against `VERIFY.md`. On failure with fix steps, the loop re-plans with failure context (up to 10 attempts total; the loop also bails early if a new failure looks like a near-duplicate of an earlier one).
    - **Document** — only when the executor wrote files and verify succeeded: the `thinking` LLM checks against `DOCUMENT.md` whether the change is user-visible (new feature/flag/API/dep, install or config change) and, if so, updates or creates the project README. Routine refactors and bug fixes are skipped.
 4. For big tasks, each subtask repeats the plan → execute → verify cycle independently; prior subtasks' assistant replies stay in history so later subtasks have context.
 5. Conversation history is persisted to `.codehalter/session_<id>.toml`. When it grows large, the `summary` LLM compresses older messages into cascading summary levels.

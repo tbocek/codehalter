@@ -542,6 +542,18 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 		}
 	}
 
+	// readOnlyByName lets the dedup cache distinguish idempotent tools
+	// (read_file, list_files, …) from mutators (write_file, edit_file,
+	// run_task). Only read-only results are cached, and any mutator clears
+	// the cache so a subsequent read sees post-mutation state.
+	readOnlyByName := make(map[string]bool, len(registeredTools))
+	for _, t := range registeredTools {
+		fn, _ := t.Def["function"].(map[string]any)
+		if name, _ := fn["name"].(string); name != "" {
+			readOnlyByName[name] = t.ReadOnly
+		}
+	}
+
 	var res toolLoopResult
 	var allText strings.Builder
 	callCache := make(map[string]string)
@@ -566,17 +578,20 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 
 		for _, tc := range calls {
 			// Per-loop dedup: small models often call read_file / list_files
-			// with identical args several times in a row. Return the cached
-			// result with a short reminder so the loop converges instead of
-			// burning tokens. The cache is scoped to this loop invocation —
-			// later turns can re-fetch normally.
+			// with identical args repeatedly. Cache only idempotent tools, and
+			// invalidate on any mutator so a read after write sees fresh state.
+			readOnly := readOnlyByName[tc.Function.Name]
 			key := tc.Function.Name + "\x00" + tc.Function.Arguments
 			var result string
-			if cached, ok := callCache[key]; ok {
+			if cached, ok := callCache[key]; ok && readOnly {
 				result = "[deduped: identical " + tc.Function.Name + " call earlier in this turn]\n" + cached
 			} else {
 				result = a.executeTool(ctx, sid, tc)
-				callCache[key] = result
+				if readOnly {
+					callCache[key] = result
+				} else {
+					callCache = make(map[string]string)
+				}
 			}
 			tu := ToolUse{
 				Name:   tc.Function.Name,

@@ -679,3 +679,64 @@ func TestTrimJSON(t *testing.T) {
 		})
 	}
 }
+
+// TestIssueBagTokenisation pins the bag-of-words tokeniser used for fuzzy
+// failure matching: lowercase, punctuation-stripped, order-independent. The
+// reworded-near-duplicate case ("missing import" vs "import is missing") is
+// the one that motivates the fuzzy approach over exact key matching.
+func TestIssueBagTokenisation(t *testing.T) {
+	// Casing, punctuation and word order are all discarded.
+	a := issueBag([]string{"Missing import!", "Syntax error."})
+	b := issueBag([]string{"syntax  ERROR", "missing\timport"})
+	if !slices.Equal(sortedKeys(a), sortedKeys(b)) {
+		t.Errorf("expected equivalent bags, got %v vs %v", sortedKeys(a), sortedKeys(b))
+	}
+
+	// Adjacent non-alphanumeric runs collapse to a single separator (no empty
+	// tokens leak into the bag).
+	bag := issueBag([]string{"foo--bar...baz"})
+	want := []string{"bar", "baz", "foo"}
+	if !slices.Equal(sortedKeys(bag), want) {
+		t.Errorf("got %v, want %v", sortedKeys(bag), want)
+	}
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// TestJaccardSimilarity covers the failure-loop bail decision. The reworded
+// near-duplicate must score above the configured threshold so the retry
+// loop bails; unrelated failures must stay below.
+func TestJaccardSimilarity(t *testing.T) {
+	// Two empty bags are treated as identical (degenerate but well-defined).
+	if got := jaccard(map[string]bool{}, map[string]bool{}); got != 1 {
+		t.Errorf("empty/empty: got %v, want 1", got)
+	}
+
+	// Reworded duplicate: {"missing","import"} vs {"import","is","missing"}.
+	// |∩|=2, |∪|=3 → 0.666… → must exceed the threshold so a retry bails.
+	a := issueBag([]string{"missing import"})
+	b := issueBag([]string{"import is missing"})
+	if s := jaccard(a, b); s < failureSimilarityThreshold {
+		t.Errorf("reworded duplicate: got %v, want >= %v", s, failureSimilarityThreshold)
+	}
+
+	// Unrelated failures must NOT collapse — exact wording chosen so the
+	// Jaccard score is comfortably under the threshold.
+	c := issueBag([]string{"missing import in foo.go"})
+	d := issueBag([]string{"unused variable x"})
+	if s := jaccard(c, d); s >= failureSimilarityThreshold {
+		t.Errorf("disjoint issues: got %v, want < %v", s, failureSimilarityThreshold)
+	}
+
+	// Symmetric.
+	if jaccard(a, b) != jaccard(b, a) {
+		t.Errorf("expected jaccard to be symmetric")
+	}
+}
