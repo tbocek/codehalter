@@ -332,16 +332,19 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 	a.connReachable = make(map[string]bool, len(a.settings.LLMConnections))
 	var b strings.Builder
 	firstReachable := -1
+	// Each LLM gets its own paragraph (\n\n) — markdown collapses single
+	// newlines to spaces, so "LLM[0]: ...\nLLM[1]: ..." would render on one
+	// wrapped line and obscure that there are two separate connections.
 	for i, r := range results {
 		c := a.settings.LLMConnections[i]
 		a.connReachable[connKey(&c)] = r.Reachable
 		switch {
 		case !r.Reachable:
-			fmt.Fprintf(&b, "⚠ LLM[%d]: unreachable at %s — start your server or fix the url.\n", i, c.URL)
+			fmt.Fprintf(&b, "⚠ LLM[%d]: unreachable at %s — start your server or fix the url.\n\n", i, c.URL)
 		case r.ModelKnown && !r.ModelLoaded:
-			fmt.Fprintf(&b, "⚠ LLM[%d]: %s reachable but model %q not loaded.\n", i, c.URL, c.Model)
+			fmt.Fprintf(&b, "⚠ LLM[%d]: %s reachable but model %q not loaded.\n\n", i, c.URL, c.Model)
 		default:
-			fmt.Fprintf(&b, "LLM[%d]: %s @ %s\n", i, c.Model, c.URL)
+			fmt.Fprintf(&b, "✅ LLM[%d]: %s @ %s\n\n", i, c.Model, c.URL)
 		}
 		if r.Reachable && firstReachable < 0 {
 			firstReachable = i
@@ -354,7 +357,7 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 	} else {
 		a.imagesSupported = results[firstReachable].ImageSupport
 		if a.imagesSupported {
-			b.WriteString("Image support: enabled\n\n")
+			b.WriteString("✅ Image support: enabled\n\n")
 		} else {
 			b.WriteString("Image support: disabled\n\n")
 		}
@@ -368,12 +371,12 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 func (a *agent) checkEnvironment(ctx context.Context, sid SessionId) {
 	var b strings.Builder
 	if kind := containerKind(); kind != "" {
-		fmt.Fprintf(&b, "Container: %s\n", kind)
+		fmt.Fprintf(&b, "✅ Container: %s\n\n", kind)
 	} else {
-		b.WriteString("⚠ Container: none (running on host — file edits and tasks hit your real filesystem)\n")
+		b.WriteString("⚠ Container: none (running on host — file edits and tasks hit your real filesystem)\n\n")
 	}
 	if _, err := findFirefox(); err == nil {
-		b.WriteString("Firefox: found (web_search/web_read enabled)\n\n")
+		b.WriteString("✅ Firefox: found (web_search/web_read enabled)\n\n")
 	} else {
 		b.WriteString("⚠ Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
 	}

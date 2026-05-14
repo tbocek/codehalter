@@ -20,7 +20,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # workspace stay owned by your host user, not root.
 RUN groupadd --gid ${GID} ${USERNAME} \
     && useradd --uid ${UID} --gid ${GID} -m -s /bin/bash ${USERNAME} \
-    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+    && install -d -o ${UID} -g ${GID} /home/${USERNAME}/.config
 
 # Install codehalter into a system path so Zed's `command` lookup is stable
 # across container rebuilds. GOPROXY=direct fetches straight from GitHub so
