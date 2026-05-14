@@ -26,6 +26,13 @@ type planResult struct {
 	// plan→execute→verify cycle (see runSubtasks). Steps should be empty
 	// in this case — each subtask's own planner pass produces its steps.
 	Subtasks []string `json:"subtasks"`
+	// ReportOnly is true when the planner already has the answer in hand
+	// (pure-lookup tasks: "where is X?", "what version of Y?") and the
+	// executor only needs to relay findings — no file edits, no commands.
+	// When true, planAndRoute skips the "Execute this plan?" confirmation
+	// because there is nothing destructive to gate. Default false → current
+	// gating behavior preserved when the planner omits the field.
+	ReportOnly bool `json:"report_only"`
 }
 
 // runPlanLLM runs the planning LLM and parses the JSON response. Returns
@@ -120,6 +127,13 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 	// Show the plan and ask for confirmation.
 	if len(plan.Steps) > 0 {
 		planText := a.renderSteps(ctx, sid, plan.Steps)
+
+		// Pure-lookup plans need no execution gate — the executor just
+		// relays what the planner already gathered. PLAN.md tells the
+		// planner to set report_only=true for these so we skip the prompt.
+		if plan.ReportOnly {
+			return thinking, plan, toolUses, nil
+		}
 
 		tcId := a.StartToolCall(ctx, sid, "Execute this plan?", "think", nil)
 		ok, err := a.askYesNoAuto(ctx, sid, tcId, "Execute", "Cancel", true)
