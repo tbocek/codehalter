@@ -109,6 +109,14 @@ type agent struct {
 	// candidates against this so a dead server doesn't burn a 2s /slots
 	// timeout on every LLM call. Populated by checkLLM; nil before that.
 	connReachable map[string]bool
+
+	// gopls is a lazily-started LSP client shared across tool calls so the
+	// workspace index isn't rebuilt on every query. ensureGopls handles the
+	// once-per-process startup; goplsErr records a fatal start failure so we
+	// don't retry on every call.
+	gopls     *Gopls
+	goplsOnce sync.Once
+	goplsErr  error
 }
 
 // connKey returns a stable map key for a connection.

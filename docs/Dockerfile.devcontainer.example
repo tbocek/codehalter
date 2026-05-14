@@ -33,4 +33,9 @@ RUN groupadd --gid ${GID} ${USERNAME} \
 ENV GOBIN=/usr/local/bin
 RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
 
+# gopls powers the go_symbols / go_references tools (LSP workspace/symbol and
+# textDocument/references). codehalter spawns `gopls serve` lazily on first
+# use, so the daemon costs nothing until the model asks for it.
+RUN go install golang.org/x/tools/gopls@latest
+
 USER ${USERNAME}
