@@ -23,9 +23,11 @@ RUN groupadd --gid ${GID} ${USERNAME} \
     && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
 
 # Install codehalter into a system path so Zed's `command` lookup is stable
-# across container rebuilds.
+# across container rebuilds. GOPROXY=direct fetches straight from GitHub so
+# you always get the current main; proxy.golang.org's @latest resolution can
+# lag behind by hours.
 ENV GOBIN=/usr/local/bin
-RUN go install github.com/tbocek/codehalter@latest
+RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
 
 USER ${USERNAME}
 
