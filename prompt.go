@@ -2,10 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 )
+
+// errUserCancelled flags a deliberate stop initiated by the user (e.g. they
+// chose Abort in a tool-choice prompt). It's NOT an error to surface as a
+// red box — the prompt returns a clean PromptResponse with StopReasonCancelled
+// when this sentinel reaches the top level.
+var errUserCancelled = errors.New("user cancelled")
 
 // This file owns the prompt orchestrator: the per-turn loop that drives the
 // plan → execute → verify pipeline (runTaskCycle), the big-task branch that
@@ -62,13 +69,22 @@ func (a *agent) finalizePlan(sid SessionId) {
 	a.sendUpdate(context.Background(), sid, PlanUpdate([]PlanEntry{entry}))
 }
 
-func (a *agent) replyError(ctx context.Context, sid SessionId, msg string) PromptResponse {
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ Error: "+msg+"\n")))
+// failPrompt records a fatal error in the session and returns it so the ACP
+// dispatcher emits a JSON-RPC error response — Zed renders that as a red
+// error box in the chat. Use only for failures that abort the prompt
+// (LLM auth / out-of-credits / planAndRoute crash). Pass any tool uses
+// captured before the failure so they're preserved in history. Recoverable
+// warnings should keep using sendUpdate with a "⚠ ..." chunk.
+func (a *agent) failPrompt(sid SessionId, err error, toolUses []ToolUse) (PromptResponse, error) {
 	if sess := a.getSession(sid); sess != nil {
-		sess.AddAssistant("❌ " + msg)
+		if len(toolUses) > 0 {
+			sess.AddAssistantWithTools("❌ "+err.Error(), toolUses)
+		} else {
+			sess.AddAssistant("❌ " + err.Error())
+		}
 		_ = sess.Save()
 	}
-	return PromptResponse{StopReason: stopReasonFor(ctx)}
+	return PromptResponse{}, err
 }
 
 // stopReasonFor reports `cancelled` if the prompt's context was cancelled
@@ -159,12 +175,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	a.sendPhase(ctx, req.SessionId, 0, false)
 	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)
 	if err != nil {
-		if sess != nil && len(firstToolUses) > 0 {
-			sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
-			_ = sess.Save()
-		}
-		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
-		return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
+		return a.failPrompt(req.SessionId, err, firstToolUses)
 	}
 
 	var result toolLoopResult
@@ -172,15 +183,20 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		// Big task — iterate each subtask through its own plan→execute→verify.
 		result, err = a.runSubtasks(ctx, req.SessionId, firstPlan.Subtasks, firstToolUses, currentUserIdx, isFirstMessage, images)
 		if err != nil {
-			// User cancelled or fatal; bail out without wrapping as an error reply
-			// (runSubtasks already surfaced the message).
-			return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
+			// User cancellation is a clean stop, not an error to render as red.
+			if errors.Is(err, errUserCancelled) {
+				return PromptResponse{StopReason: StopReasonCancelled}, nil
+			}
+			return a.failPrompt(req.SessionId, err, nil)
 		}
 	} else {
 		// Single task — reuse the initial plan on attempt 0; retries re-plan.
 		result, err = a.runTaskCycle(ctx, req.SessionId, userText, planInput, currentUserIdx, isFirstMessage, images, firstPlan, firstConn, firstToolUses)
 		if err != nil {
-			return a.replyError(ctx, req.SessionId, err.Error()), nil
+			if errors.Is(err, errUserCancelled) {
+				return PromptResponse{StopReason: StopReasonCancelled}, nil
+			}
+			return a.failPrompt(req.SessionId, err, nil)
 		}
 	}
 
@@ -226,7 +242,6 @@ func (a *agent) runTaskCycle(
 					sess.AddAssistantWithTools("❌ "+err.Error(), tu)
 					_ = sess.Save()
 				}
-				a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("❌ "+err.Error()+"\n")))
 				return result, err
 			}
 			conn = c
@@ -335,7 +350,7 @@ func (a *agent) runSubtasks(
 			_ = sess.Save()
 		}
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Cancelled.\n")))
-		return toolLoopResult{}, fmt.Errorf("user cancelled")
+		return toolLoopResult{}, errUserCancelled
 	}
 
 	if choice == "Automatic" {
