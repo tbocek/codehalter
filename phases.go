@@ -33,7 +33,7 @@ type planResult struct {
 // when there's no PLAN.md, the tool loop fails, or the response can't be
 // parsed — callers treat any of those as "no plan, proceed without one".
 func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) (*LLMConnection, *planResult, []ToolUse, error) {
-	thinking := a.settings.LLMFor("thinking", a.llmTier(sid))
+	thinking := a.pickAvailable(ctx, "thinking", a.llmTier(sid))
 	if thinking == nil {
 		return nil, nil, nil, fmt.Errorf("no [[llmconnections]] in .codehalter/settings.toml")
 	}
@@ -170,7 +170,7 @@ func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessag
 	for _, name := range extraExclude {
 		exclude[name] = true
 	}
-	return a.runToolLoop(ctx, sid, a.settings.LLMFor("execute", a.llmTier(sid)), messages, toolFilter{
+	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, "execute", a.llmTier(sid)), messages, toolFilter{
 		readOnly: false,
 		exclude:  exclude,
 	})

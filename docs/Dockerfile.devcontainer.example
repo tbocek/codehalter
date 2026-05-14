@@ -1,7 +1,7 @@
 # .devcontainer/Dockerfile
 # Built from golang:1-bookworm because codehalter needs a recent Go and
 # bookworm's golang-go package is too old. The base is still Debian.
-FROM golang:1-bookworm
+FROM golang:1-trixie
 
 ARG USERNAME=dev
 ARG UID=1000

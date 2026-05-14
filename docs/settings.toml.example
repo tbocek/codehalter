@@ -1,0 +1,25 @@
+# Codehalter settings — edit this file, then restart the Zed session.
+#
+# To use these settings for every project on this machine, move this file to:
+#   ~/.config/codehalter/settings.toml
+# Codehalter looks there first, and only falls back to this project-local file
+# when no global settings exist. Once the global file is in place, this
+# project-local copy can be deleted.
+#
+# Each [[llmconnections]] entry points at one OpenAI-compatible endpoint
+# (llama.cpp, Ollama, vLLM, ...). Position matters:
+#   index 0    → "main" tier (foreground agent)
+#   indices 1+ → "subagent" tier (parallel/offloaded work, summarisation)
+# A single entry serves every role; add more entries only if you want to
+# split work across multiple servers/models.
+
+[[llmconnections]]
+url = "http://localhost:8080/v1/chat/completions"
+# api_key = "..."        # uncomment if your server requires bearer auth
+model = "your-model-id"  # must match the model name your server reports at /v1/models
+
+# Per-role sampler overrides. Drop either to reuse the same sampler for
+# both roles. Core fields (model, messages, stream, tools) always win over
+# extra_body_*.
+extra_body_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
+extra_body_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0 }

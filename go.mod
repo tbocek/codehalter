@@ -1,4 +1,4 @@
-module codehalter
+module github.com/tbocek/codehalter
 
 go 1.26
 

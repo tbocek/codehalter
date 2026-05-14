@@ -206,12 +206,12 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 	}
 }
 
-// summarizePage uses the summary LLM to extract only the relevant information
+// summarizePage uses the execute LLM to extract only the relevant information
 // from a web page. sid scopes the per-session debug log.
 func (a *agent) summarizePage(ctx context.Context, sid SessionId, query, url, pageText string) string {
-	conn := a.settings.LLMFor("summary", a.llmTier(sid))
+	conn := a.pickAvailable(ctx, "execute", a.llmTier(sid))
 
-	// Truncate input to avoid overwhelming the summary LLM.
+	// Truncate input to avoid overwhelming the LLM.
 	const maxInput = 8000
 	if len(pageText) > maxInput {
 		pageText = pageText[:maxInput]

@@ -106,9 +106,6 @@ func (a *agent) buildImproveSnapshot(sid SessionId) string {
 			if c.ExtraBodyExecute != nil {
 				roles = append(roles, "execute")
 			}
-			if c.ExtraBodySummary != nil {
-				roles = append(roles, "summary")
-			}
 			apiKey := ""
 			if c.APIKey != "" {
 				apiKey = " api_key=<set>"

@@ -40,18 +40,18 @@ go build -o codehalter .
 
 ## Configuration
 
-Codehalter looks for settings in two places (project-local takes priority):
+Codehalter looks for settings in two places, in this order:
 
-1. `.codehalter/settings.toml` in the project root
-2. `~/.config/codehalter/settings.toml` as a global fallback
+1. `~/.config/codehalter/settings.toml` (global — preferred, used across every project)
+2. `<project>/.codehalter/settings.toml` (project-local fallback)
+
+On first run with neither file present, codehalter prompts to write a commented skeleton into `<project>/.codehalter/settings.toml`. Edit it, then move it to `~/.config/codehalter/` to share across projects (the project-local copy can be deleted once the global one exists).
 
 ### Example settings
 
 Position-based: index 0 of `[[llmconnections]]` is the **main** tier (your foreground agent), indices 1+ are the **subagent** tier (parallel/offloaded work like `launch_subagent` or web summarisation). When the agent picks a connection, a session running at depth 0 prefers the main tier; subagents (depth > 0) prefer subagent tier. Each falls back to the other if needed.
 
-Each connection declares per-role sampler overrides via `extra_body_thinking`, `extra_body_execute`, `extra_body_summary`. The right one is merged into every OpenAI request. Core fields (`model`, `messages`, `stream`, `tools`) always win over `extra_body_*`.
-
-Single-machine setup — one connection serves every role; sampler swaps between phases (KV cache stays shared because samplers don't affect cache keys):
+Each connection declares per-role sampler overrides via `extra_body_thinking` and `extra_body_execute`. The right one is merged into every OpenAI request. Core fields (`model`, `messages`, `stream`, `tools`) always win over `extra_body_*`.
 
 ```toml
 [[llmconnections]]
@@ -59,50 +59,16 @@ url = "http://localhost:8080/v1/chat/completions"
 model = "qwen3.6-27b"
 extra_body_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
 extra_body_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0 }
-extra_body_summary  = { temperature = 0.6, top_p = 0.95, top_k = 20 }
 ```
 
-Multi-machine setup — main agent on the 7900XTX, subagents on a Strix Halo, summary on a 4b box:
-
-```toml
-# index 0 — main tier
-[[llmconnections]]
-url = "http://7900xtx:8080/v1/chat/completions"
-model = "qwen3-coder-30b"
-extra_body_thinking = { temperature = 1.0, top_p = 0.95 }
-extra_body_execute  = { temperature = 0.6, top_p = 0.95 }
-
-# index 1 — subagent tier (parallel work)
-[[llmconnections]]
-url = "http://strix-halo:8080/v1/chat/completions"
-model = "qwen3-120b"
-extra_body_thinking = { temperature = 1.0, top_p = 0.95 }
-extra_body_execute  = { temperature = 0.6, top_p = 0.95 }
-
-# index 2 — also subagent tier; declares only summary, so summary calls land here
-[[llmconnections]]
-url = "http://summary-box:8080/v1/chat/completions"
-model = "qwen3-4b"
-extra_body_summary = { temperature = 0.6, top_p = 0.95 }
-```
-
-For a hybrid-reasoning model, drive the reasoning toggle from the same `extra_body_<role>` keys:
-
-```toml
-[[llmconnections]]
-url = "http://localhost:8080/v1/chat/completions"
-model = "qwen3"
-extra_body_thinking = { enable_thinking = true }
-extra_body_execute  = { enable_thinking = false }
-```
+Add more `[[llmconnections]]` entries to split work across machines: index 0 stays the main tier, indices 1+ are subagent tier (`launch_subagent`, web-page summarisation). For a hybrid-reasoning model, drive the reasoning toggle from the same keys, e.g. `extra_body_thinking = { enable_thinking = true }` / `extra_body_execute = { enable_thinking = false }`.
 
 | Role | Purpose | Suggested temperature |
 |------|---------|------------------------|
 | `thinking` | Planning, pre-verification, post-execution verification | ~1.0 (diverse hypotheses, edge-case exploration) |
-| `execute` | Running the tool loop that does the work | ~0.6 (precise tool calls, fewer hallucinated args) |
-| `summary` | History compression and web-page summarisation | ~0.6 (faithful, not creative) |
+| `execute` | Tool loop, history compression, web-page summarisation | ~0.6 (precise, faithful) |
 
-If a role has no `extra_body_<role>` declared on any connection, codehalter still falls back to the first connection in tier order — the override is purely opt-in.
+If a role has no `extra_body_<role>` declared on any connection, codehalter falls back to the first connection in tier order with no overrides — the override is purely opt-in.
 
 ### Prompt files
 

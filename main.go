@@ -48,6 +48,9 @@ var defaultDevcontainerDockerfile string
 //go:embed docs/devcontainer.json.example
 var defaultDevcontainerJSON string
 
+//go:embed docs/settings.toml.example
+var defaultSettingsTOML string
+
 var defaultSkills = map[string]string{
 	"go":   skillGo,
 	"ts":   skillTS,
@@ -99,9 +102,17 @@ type agent struct {
 	emptyProject    bool // true on first session if cwd had no source/manifest files
 	indexDone       chan struct{}
 	imagesSupported bool
-	probedConnKey   string
 	mode            string // "interactive" | "autopilot"
+
+	// connReachable records whether each configured LLMConnection answered
+	// the startup probe. Keyed by connKey(URL+model). pickAvailable filters
+	// candidates against this so a dead server doesn't burn a 2s /slots
+	// timeout on every LLM call. Populated by checkLLM; nil before that.
+	connReachable map[string]bool
 }
+
+// connKey returns a stable map key for a connection.
+func connKey(c *LLMConnection) string { return c.URL + "\x00" + c.Model }
 
 const (
 	modeInteractive = "interactive"
@@ -181,15 +192,16 @@ func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) 
 }
 
 func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
-	// Detect image support by probing the execute/thinking LLM with a tiny
-	// image. We load the global settings only here — project-local settings
-	// live under a cwd we do not yet have. If project-local settings override
-	// the LLM later, startIndexing will re-probe and update the flag.
+	// Probe the execute/thinking LLM cheaply (metadata endpoints, no
+	// inference) to advertise image support in capabilities. We load the
+	// global settings only here — project-local settings live under a cwd
+	// we do not yet have. If project-local settings override the LLM later,
+	// startIndexing → checkLLM re-probes and updates the flag plus the
+	// startup banner.
 	if gs, err := loadGlobalSettings(); err == nil {
 		a.settings = gs
 		if conn := a.settings.LLMFor("execute", "main"); conn != nil {
-			a.imagesSupported = a.probeImageSupport(ctx, conn)
-			a.probedConnKey = connKey(conn)
+			a.imagesSupported = a.probeLLM(ctx, conn).ImageSupport
 		}
 	}
 	return InitializeResponse{
@@ -209,15 +221,6 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	}, nil
 }
 
-// connKey identifies an LLM endpoint by url+model so we can tell when
-// project-local settings point at a different model than we probed.
-func connKey(c *LLMConnection) string {
-	if c == nil {
-		return ""
-	}
-	return c.URL + "|" + c.Model
-}
-
 func (a *agent) Authenticate(_ context.Context, _ AuthenticateRequest) (AuthenticateResponse, error) {
 	// No auth needed for local llama.cpp.
 	return AuthenticateResponse{}, nil
@@ -230,9 +233,9 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	if err != nil {
 		return err
 	}
-	if err := settings.Validate(); err != nil {
-		return err
-	}
+	// Empty settings are tolerated (path == "") — startIndexing prompts the
+	// user to write a skeleton on first run; running with no LLM until then
+	// is graceful (checkLLM prints a warning instead of crashing).
 	a.settings = settings
 	a.discoverRunners(cwd)
 	a.registerSubagentTool()
@@ -245,15 +248,20 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 		defer close(a.indexDone)
 		ctx := context.Background()
 
+		// settings prompt before any LLM probe — if the user creates a
+		// skeleton here, checkLLM picks up the new path on the same startup.
+		a.ensureSettings(ctx, cwd, sid)
+
 		if a.settings.path != "" {
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Using "+a.settings.path+"\n\n")))
-		} else {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ No settings.toml found\n\n")))
 		}
 
-		a.checkImageSupport(ctx, sid)
-		a.checkEnvironment(ctx, sid)
+		// Order: config → project → environment → prompts. Keeping the
+		// container/firefox banner adjacent to the devcontainer prompt avoids
+		// "container, tooling, container again" interleaving.
+		a.checkLLM(ctx, sid)
 		a.notifyCapabilities(ctx, sid)
+		a.checkEnvironment(ctx, sid)
 
 		a.ensureGitignore(ctx, cwd, sid)
 		a.ensureDevcontainer(ctx, cwd, sid)
@@ -297,26 +305,61 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
 	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
 }
 
-// checkImageSupport re-probes the active LLM if project-local settings point
-// at a different model than the one probed in Initialize, then tells the user
-// whether image input is available. Runs on the indexing goroutine so it never
-// blocks the session handshake.
-func (a *agent) checkImageSupport(ctx context.Context, sid SessionId) {
-	conn := a.settings.LLMFor("execute", "main")
-	if conn == nil {
+// checkLLM probes every configured LLMConnection in parallel, records which
+// ones answered, and reports each line to the user. Runtime selection
+// (pickAvailable) then skips the unreachable ones instead of eating a /slots
+// timeout on every call. Image support is taken from the first reachable
+// connection — that's the one execute/main calls land on by default.
+func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
+	if len(a.settings.LLMConnections) == 0 {
 		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Image support: disabled (no LLM configured)\n\n")))
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ LLM: no [[llmconnections]] in settings.toml — codehalter cannot run until you add one.\n\n")))
 		return
 	}
-	if key := connKey(conn); key != a.probedConnKey {
-		a.imagesSupported = a.probeImageSupport(ctx, conn)
-		a.probedConnKey = key
+	if settingsLooksPlaceholder(a.settings) {
+		a.imagesSupported = false
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+			"⚠ LLM: "+a.settings.path+" still has the placeholder model \"your-model-id\". Edit it with your real url and model, then restart this Zed session.\n\n")))
+		return
 	}
-	if a.imagesSupported {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Image support: enabled ("+conn.Model+")\n\n")))
+
+	results := make([]probeResult, len(a.settings.LLMConnections))
+	parallel(len(a.settings.LLMConnections), func(i int) {
+		c := a.settings.LLMConnections[i]
+		results[i] = a.probeLLM(ctx, &c)
+	})
+
+	a.connReachable = make(map[string]bool, len(a.settings.LLMConnections))
+	var b strings.Builder
+	firstReachable := -1
+	for i, r := range results {
+		c := a.settings.LLMConnections[i]
+		a.connReachable[connKey(&c)] = r.Reachable
+		switch {
+		case !r.Reachable:
+			fmt.Fprintf(&b, "⚠ LLM[%d]: unreachable at %s — start your server or fix the url.\n", i, c.URL)
+		case r.ModelKnown && !r.ModelLoaded:
+			fmt.Fprintf(&b, "⚠ LLM[%d]: %s reachable but model %q not loaded.\n", i, c.URL, c.Model)
+		default:
+			fmt.Fprintf(&b, "LLM[%d]: %s @ %s\n", i, c.Model, c.URL)
+		}
+		if r.Reachable && firstReachable < 0 {
+			firstReachable = i
+		}
+	}
+
+	if firstReachable < 0 {
+		a.imagesSupported = false
+		b.WriteString("⚠ No LLM reachable — every connection above failed. Codehalter cannot run any prompt until at least one comes back.\n\n")
 	} else {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Image support: disabled ("+conn.Model+" did not accept image input)\n\n")))
+		a.imagesSupported = results[firstReachable].ImageSupport
+		if a.imagesSupported {
+			b.WriteString("Image support: enabled\n\n")
+		} else {
+			b.WriteString("Image support: disabled\n\n")
+		}
 	}
+	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
 }
 
 // checkEnvironment reports whether codehalter is running inside a container
@@ -324,14 +367,13 @@ func (a *agent) checkImageSupport(ctx context.Context, sid SessionId) {
 // devcontainer users see at startup whether the toolchain is wired up.
 func (a *agent) checkEnvironment(ctx context.Context, sid SessionId) {
 	var b strings.Builder
-	kind := containerKind()
-	if kind != "" {
+	if kind := containerKind(); kind != "" {
 		fmt.Fprintf(&b, "Container: %s\n", kind)
 	} else {
-		b.WriteString("⚠ Container: not detected — codehalter edits files and runs tasks directly on your host. Consider using a devcontainer (see README → Sandboxing with a devcontainer).\n")
+		b.WriteString("⚠ Container: none (running on host — file edits and tasks hit your real filesystem)\n")
 	}
-	if path, err := findFirefox(); err == nil {
-		fmt.Fprintf(&b, "Firefox: %s\n\n", path)
+	if _, err := findFirefox(); err == nil {
+		b.WriteString("Firefox: found (web_search/web_read enabled)\n\n")
 	} else {
 		b.WriteString("⚠ Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
 	}

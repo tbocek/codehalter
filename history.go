@@ -70,7 +70,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 		return
 	}
 
-	conn := a.settings.LLMFor("summary", a.llmTier(sess.ID))
+	conn := a.pickAvailable(ctx, "execute", a.llmTier(sess.ID))
 
 	// Split 20/80: the older 80% is folded into a fresh summary, the
 	// recent 20% stays raw. (len*4)/5 lands at 0 only when len < 2 — in
@@ -130,7 +130,7 @@ func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnectio
 
 // generateTitle asks the LLM to create a short title from the first user message.
 func (a *agent) generateTitle(ctx context.Context, sess *Session, userText string) {
-	conn := a.settings.LLMFor("thinking", a.llmTier(sess.ID))
+	conn := a.pickAvailable(ctx, "thinking", a.llmTier(sess.ID))
 	if conn == nil {
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot generate title: no LLM connections configured\n")))
 		return
@@ -169,7 +169,7 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 	if len(sess.History) == 0 {
 		return
 	}
-	conn := a.settings.LLMFor("thinking", a.llmTier(sess.ID))
+	conn := a.pickAvailable(ctx, "thinking", a.llmTier(sess.ID))
 	if conn == nil {
 		return // already warned in compressHistory
 	}

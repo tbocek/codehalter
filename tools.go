@@ -97,13 +97,21 @@ func toSet(s []string) map[string]bool {
 func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) string {
 	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 
+	var names []string
 	for _, t := range registeredTools {
 		fn, _ := t.Def["function"].(map[string]any)
-		if fn["name"] == tc.Function.Name {
+		name, _ := fn["name"].(string)
+		if name == tc.Function.Name {
 			return t.Execute(ctx, a, sid, tc.Function.Arguments)
 		}
+		if name != "" {
+			names = append(names, name)
+		}
 	}
-	return fmt.Sprintf("unknown tool: %s", tc.Function.Name)
+	// Listed names go back to the model as the tool result, so it can
+	// self-correct on the next turn instead of looping on the same hallucination.
+	return fmt.Sprintf("unknown tool %q. Use only the tools provided to you; available tools: %s",
+		tc.Function.Name, strings.Join(names, ", "))
 }
 
 // ---------------------------------------------------------------------------

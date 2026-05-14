@@ -26,7 +26,13 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionI
 		return
 	}
 
-	tcId := a.StartToolCall(ctx, sid, "Create .devcontainer/ template?", "think", nil)
+	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+		"To sandbox file edits and task runs, I can write a Debian-based "+
+			".devcontainer/Dockerfile and .devcontainer/devcontainer.json template "+
+			"you can then edit. Reopen the project in the container to use it. "+
+			"Skip is remembered in .codehalter/devcontainer.skip.\n\n")))
+
+	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
 	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Create", "Skip", true)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())

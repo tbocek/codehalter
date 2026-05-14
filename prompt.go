@@ -140,7 +140,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	planInput := userText
 
 	// Pre-planning verification.
-	if thinkingConn := a.settings.LLMFor("thinking", a.llmTier(req.SessionId)); thinkingConn != nil {
+	if thinkingConn := a.pickAvailable(ctx, "thinking", a.llmTier(req.SessionId)); thinkingConn != nil {
 		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Running pre-planning verification...\n\n")))
 		vr, err := a.preVerify(ctx, req.SessionId, thinkingConn, userText)
 		if err == nil && vr != nil && !vr.Success {

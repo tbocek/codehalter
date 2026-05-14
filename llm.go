@@ -180,9 +180,19 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 	return fullText.String(), calls, nil
 }
 
-// probeImageSupport determines whether the configured model accepts images,
-// using cheap metadata endpoints (no inference). Works against two llama.cpp
-// topologies:
+// probeResult is what a single LLM probe call yields: server reachability,
+// model presence (when the endpoint enumerates models), and image support.
+// Empty value means "we could not reach the server at all."
+type probeResult struct {
+	Reachable    bool // got 200 from any probe endpoint
+	ModelKnown   bool // /v1/models enumerated models — ModelLoaded is meaningful
+	ModelLoaded  bool // the configured model was in the enumeration
+	ImageSupport bool
+}
+
+// probeLLM checks reachability, model presence, and image support in a single
+// HTTP call against cheap metadata endpoints (no inference). Works against two
+// llama.cpp topologies:
 //
 //  1. A llama-swap-style router in front of multiple llama-server instances —
 //     GET /v1/models lists every model with its launch args; vision models
@@ -190,44 +200,46 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 //  2. A single llama-server — GET /props reports modalities.vision once an
 //     mmproj is loaded.
 //
-// We try /v1/models first (it identifies the specific configured model even
-// when the router hasn't loaded it yet) and fall back to /props.
-func (a *agent) probeImageSupport(ctx context.Context, conn *LLMConnection) bool {
+// /v1/models is preferred (it identifies the specific configured model even
+// when the router hasn't loaded it yet); /props is the fallback when the
+// router endpoint is missing.
+func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	if conn == nil {
-		return false
+		return probeResult{}
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if supported, known := a.probeViaModels(probeCtx, conn); known {
-		slog.Info("probeImageSupport: via /v1/models", "model", conn.Model, "vision", supported)
-		return supported
+	if r, ok := a.probeViaModels(probeCtx, conn); ok {
+		slog.Info("probeLLM: /v1/models", "model", conn.Model, "reachable", r.Reachable, "loaded", r.ModelLoaded, "image", r.ImageSupport)
+		return r
 	}
-	if supported, known := a.probeViaProps(probeCtx, conn); known {
-		slog.Info("probeImageSupport: via /props", "model", conn.Model, "vision", supported)
-		return supported
+	if r, ok := a.probeViaProps(probeCtx, conn); ok {
+		slog.Info("probeLLM: /props", "model", conn.Model, "reachable", r.Reachable, "image", r.ImageSupport)
+		return r
 	}
-	slog.Info("probeImageSupport: indeterminate", "model", conn.Model)
-	return false
+	slog.Info("probeLLM: unreachable", "url", conn.URL, "model", conn.Model)
+	return probeResult{}
 }
 
-// probeViaModels asks the router's /v1/models for the configured model's
-// launch args. `--mmproj` in those args means the server loaded a multimodal
-// projector. Returns (supported, known) — known=false means this endpoint
-// could not answer (e.g. a plain llama-server whose /v1/models omits args).
-func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (bool, bool) {
+// probeViaModels asks the router's /v1/models for the configured model and
+// (when present) its launch args. `--mmproj` in those args means the server
+// loaded a multimodal projector. Returns (result, ok) — ok=false means this
+// endpoint could not answer at all (network error / non-200 / model present
+// but launch args missing); caller should fall back to /props.
+func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
 	modelsURL, ok := deriveServerURL(conn.URL, "/v1/models")
 	if !ok {
-		return false, false
+		return probeResult{}, false
 	}
 	resp, err := getWithAuth(ctx, modelsURL, conn.APIKey)
 	if err != nil {
 		slog.Info("probeViaModels: request failed", "url", modelsURL, "err", err)
-		return false, false
+		return probeResult{}, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return false, false
+		return probeResult{}, false
 	}
 	var models struct {
 		Data []struct {
@@ -238,41 +250,50 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (bool, 
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
-		return false, false
+		return probeResult{}, false
 	}
+	r := probeResult{Reachable: true, ModelKnown: true}
 	for _, m := range models.Data {
 		if m.ID != conn.Model {
 			continue
 		}
 		if len(m.Status.Args) == 0 {
-			return false, false
+			// Plain llama-server: /v1/models returns the model but no args.
+			// Fall back to /props for image support.
+			return probeResult{}, false
 		}
+		r.ModelLoaded = true
 		for _, arg := range m.Status.Args {
 			if arg == "--mmproj" {
-				return true, true
+				r.ImageSupport = true
+				break
 			}
 		}
-		return false, true
+		return r, true
 	}
-	return false, false
+	// 200 OK, server enumerated models, but the configured one was not in
+	// the list — that's a definitive "not loaded", no fallback needed.
+	return r, true
 }
 
-// probeViaProps reads llama-server's /props and checks modalities.vision.
-func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (bool, bool) {
+// probeViaProps reads llama-server's /props. Tells us the server is reachable
+// and (via modalities.vision) whether the loaded model supports image input,
+// but cannot tell us *which* model is loaded — so ModelKnown stays false.
+func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
 	propsURL, ok := deriveServerURL(conn.URL, "/props")
 	if !ok {
-		return false, false
+		return probeResult{}, false
 	}
 	resp, err := getWithAuth(ctx, propsURL, conn.APIKey)
 	if err != nil {
 		slog.Info("probeViaProps: request failed", "url", propsURL, "err", err)
-		return false, false
+		return probeResult{}, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
 		slog.Info("probeViaProps: non-OK", "url", propsURL, "status", resp.StatusCode, "body", string(body))
-		return false, false
+		return probeResult{}, false
 	}
 	var props struct {
 		Modalities *struct {
@@ -280,12 +301,92 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (bool, b
 		} `json:"modalities"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&props); err != nil {
-		return false, false
+		return probeResult{}, false
 	}
-	if props.Modalities == nil {
-		return false, false
+	r := probeResult{Reachable: true}
+	if props.Modalities != nil {
+		r.ImageSupport = props.Modalities.Vision
 	}
-	return props.Modalities.Vision, true
+	return r, true
+}
+
+// pickAvailable picks the first LLMConnection in role/tier preference order
+// whose server reports a free slot. If all candidates are busy or
+// unreachable, falls back to the first preference — the caller's LLM call
+// will then queue server-side or surface a clear error. Returns nil only
+// when no connections are configured.
+func (a *agent) pickAvailable(ctx context.Context, role, tier string) *LLMConnection {
+	cs := a.settings.LLMCandidates(role, tier)
+	if len(cs) == 0 {
+		return nil
+	}
+	// Drop connections the startup probe couldn't reach so they don't burn
+	// a /slots timeout every call. If every candidate is marked dead, skip
+	// slot probing too — return the first preference so the caller surfaces
+	// a clear "LLM unreachable" error instead of waiting 2s per server.
+	if len(a.connReachable) > 0 {
+		var alive []LLMConnection
+		for _, c := range cs {
+			if a.connReachable[connKey(&c)] {
+				alive = append(alive, c)
+			}
+		}
+		if len(alive) == 0 {
+			return &cs[0]
+		}
+		cs = alive
+	}
+	for i := range cs {
+		if a.hasSlot(ctx, &cs[i]) {
+			return &cs[i]
+		}
+	}
+	return &cs[0]
+}
+
+// hasSlot returns true if the server has at least one idle slot, or if slot
+// state cannot be determined (no /slots endpoint, unparseable response).
+// Returns false only when /slots definitively reports every slot busy or the
+// server is unreachable. /slots requires `--slots` on llama-server; older
+// builds and cloud endpoints return 404/501 which we treat as "unknown =
+// available" so they keep working without slot-awareness.
+func (a *agent) hasSlot(ctx context.Context, conn *LLMConnection) bool {
+	slotsURL, ok := deriveServerURL(conn.URL, "/slots")
+	if !ok {
+		return true
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	resp, err := getWithAuth(probeCtx, slotsURL, conn.APIKey)
+	if err != nil {
+		slog.Info("hasSlot: unreachable", "url", slotsURL, "err", err)
+		return false
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case http.StatusNotFound, http.StatusNotImplemented, http.StatusForbidden, http.StatusUnauthorized:
+		return true
+	}
+	if resp.StatusCode != http.StatusOK {
+		slog.Info("hasSlot: non-OK", "url", slotsURL, "status", resp.StatusCode)
+		return false
+	}
+	var slots []struct {
+		IsProcessing bool `json:"is_processing"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&slots); err != nil {
+		return true
+	}
+	if len(slots) == 0 {
+		return true
+	}
+	for _, s := range slots {
+		if !s.IsProcessing {
+			return true
+		}
+	}
+	slog.Info("hasSlot: all busy", "url", slotsURL, "slots", len(slots))
+	return false
 }
 
 // getWithAuth issues a GET with an optional bearer token and follows redirects

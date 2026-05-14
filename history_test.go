@@ -32,6 +32,13 @@ func newMockLLM(t *testing.T, responses ...string) *mockLLM {
 	t.Helper()
 	m := &mockLLM{resps: responses, t: t}
 	m.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Runtime callers probe /slots before each LLM call. Mock doesn't
+		// implement it — 404 lets pickAvailable treat the server as "unknown,
+		// assume available" so the chat-completions path still runs.
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Errorf("mockLLM: decode request body: %v", err)
