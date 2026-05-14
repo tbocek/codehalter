@@ -449,18 +449,83 @@ func parallel(n int, fn func(i int)) {
 	wg.Wait()
 }
 
-// trimJSON strips markdown code fences from LLM JSON responses.
+// trimJSON extracts a JSON object from an LLM response. Small models often
+// wrap the JSON in prose ("Sure, here's the JSON: { … } Let me know!") or
+// markdown fences; we just locate the first `{` and the matching `}` and
+// keep that slice. Brace counting respects strings + escapes so braces inside
+// string values don't confuse the scan. Returns the trimmed input unchanged
+// if no balanced object is found — caller surfaces the parse error.
 func trimJSON(s string) string {
 	s = strings.TrimSpace(s)
-	s = strings.TrimPrefix(s, "```json")
-	s = strings.TrimPrefix(s, "```")
-	s = strings.TrimSuffix(s, "```")
-	return strings.TrimSpace(s)
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return s
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inStr = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return s
 }
 
 type toolLoopResult struct {
 	Text     string
 	ToolUses []ToolUse
+}
+
+// runToolLoopJSON runs the tool loop and unmarshals the response into dst.
+// Small models routinely produce JSON with surrounding prose; on parse
+// failure we send one corrective follow-up ("reply with ONLY JSON") and try
+// again before giving up. The returned toolLoopResult always carries the
+// merged tool uses from both passes so callers don't lose visibility.
+func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, dst any) (toolLoopResult, error) {
+	res, err := a.runToolLoop(ctx, sid, conn, messages, filter)
+	if err != nil {
+		return res, err
+	}
+	if err := json.Unmarshal([]byte(trimJSON(res.Text)), dst); err == nil {
+		return res, nil
+	}
+	slog.Info("JSON parse failed; retrying with corrective", "snippet", truncate(res.Text, 200))
+	fixMsgs := append([]llmMessage(nil), messages...)
+	fixMsgs = append(fixMsgs,
+		llmMessage{Role: "assistant", Content: res.Text},
+		llmMessage{Role: "user", Content: "Your previous reply was not valid JSON. Reply with ONLY the JSON object — first character `{`, last character `}`, nothing before or after. No prose, no markdown fences."},
+	)
+	res2, err := a.runToolLoop(ctx, sid, conn, fixMsgs, filter)
+	res.Text = res2.Text
+	res.ToolUses = append(res.ToolUses, res2.ToolUses...)
+	if err != nil {
+		return res, err
+	}
+	if err := json.Unmarshal([]byte(trimJSON(res2.Text)), dst); err != nil {
+		return res, fmt.Errorf("non-JSON after retry: %w", err)
+	}
+	return res, nil
 }
 
 // runToolLoop runs the agentic tool loop: send to LLM, execute tool calls, repeat.
@@ -479,6 +544,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 
 	var res toolLoopResult
 	var allText strings.Builder
+	callCache := make(map[string]string)
 	for {
 		text, calls, err := a.llmStream(ctx, sid, conn, messages, tools, on)
 		if err != nil {
@@ -499,7 +565,19 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 		})
 
 		for _, tc := range calls {
-			result := a.executeTool(ctx, sid, tc)
+			// Per-loop dedup: small models often call read_file / list_files
+			// with identical args several times in a row. Return the cached
+			// result with a short reminder so the loop converges instead of
+			// burning tokens. The cache is scoped to this loop invocation —
+			// later turns can re-fetch normally.
+			key := tc.Function.Name + "\x00" + tc.Function.Arguments
+			var result string
+			if cached, ok := callCache[key]; ok {
+				result = "[deduped: identical " + tc.Function.Name + " call earlier in this turn]\n" + cached
+			} else {
+				result = a.executeTool(ctx, sid, tc)
+				callCache[key] = result
+			}
 			tu := ToolUse{
 				Name:   tc.Function.Name,
 				Input:  tc.Function.Arguments,

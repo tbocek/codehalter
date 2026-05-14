@@ -48,7 +48,7 @@ func (a *agent) registerSubagentTool() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "launch_subagent",
-			"description": "Launch one or more subagents to work on independent subtasks in parallel. Each subagent gets its own plan/execute/verify cycle with access to the project's code tools. Use this when the plan has 2+ independent steps that don't depend on each other (e.g. searching for two different things, editing unrelated files, researching while coding). IMPORTANT: subagents cannot talk to the user — they cannot ask clarifying questions or request confirmation. Only launch a subagent when the task is unambiguous and self-contained. If you would need to ask the user anything to complete the task, do it yourself instead.",
+			"description": "Run 2+ independent subtasks in parallel, each with its own plan/execute/verify. Subagents cannot talk to the user — use only for unambiguous, self-contained tasks.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"tasks"},

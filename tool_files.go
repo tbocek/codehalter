@@ -112,7 +112,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": fmt.Sprintf("Read the contents of a file from the project. When neither line nor limit is given, reads up to %d lines (or %d KB) — if the file is larger the response is truncated with a note giving the total line count, and you can re-read specific ranges with line+limit.", defaultReadLines, maxReadBytes/1024),
+			"description": fmt.Sprintf("Read a file. Without line/limit, reads up to %d lines (%d KB); larger files are truncated with a note — re-call with line+limit for the rest.", defaultReadLines, maxReadBytes/1024),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path"},

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -38,7 +37,8 @@ type planResult struct {
 // runPlanLLM runs the planning LLM and parses the JSON response. Returns
 // (nil, nil, nil, err) when no LLM is configured. Returns (thinking, nil, ...)
 // when there's no PLAN.md, the tool loop fails, or the response can't be
-// parsed — callers treat any of those as "no plan, proceed without one".
+// parsed even after one corrective retry — callers treat any of those as
+// "no plan, proceed without one".
 func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) (*LLMConnection, *planResult, []ToolUse, error) {
 	thinking := a.pickAvailable(ctx, "thinking", a.llmTier(sid))
 	if thinking == nil {
@@ -49,12 +49,9 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 		return thinking, nil, nil, nil
 	}
 	messages := []llmMessage{{Role: "user", Content: planPrompt + "\n\nUser request: " + userText}}
-	planRes, err := a.runToolLoop(ctx, sid, thinking, messages, toolFilter{readOnly: true})
-	if err != nil {
-		return thinking, nil, planRes.ToolUses, nil
-	}
 	var plan planResult
-	if err := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan); err != nil {
+	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{readOnly: true}, &plan)
+	if err != nil {
 		return thinking, nil, planRes.ToolUses, nil
 	}
 	return thinking, &plan, planRes.ToolUses, nil
@@ -109,7 +106,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 				sess.AddAssistant(question + "\n(choices: " + strings.Join(plan.Choices, ", ") + ")\nUser aborted.")
 				_ = sess.Save()
 			}
-			return nil, nil, toolUses, fmt.Errorf("user aborted")
+			return nil, nil, toolUses, errUserCancelled
 		}
 
 		if sess != nil {
@@ -150,8 +147,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 				sess.AddAssistant(planText + "\nUser declined execution.")
 				_ = sess.Save()
 			}
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Cancelled.\n")))
-			return nil, nil, toolUses, fmt.Errorf("user declined execution")
+			return nil, nil, toolUses, errUserCancelled
 		}
 	}
 
@@ -210,128 +206,43 @@ type verifyResult struct {
 	FixSteps []string `json:"fix_steps,omitempty"`
 }
 
-const maxVerifyAttempts = 2
-
-// preVerify performs a read-only check of the project state using VERIFY.md
-// before planning begins. Returns the verification result if issues were found.
-func (a *agent) preVerify(ctx context.Context, sid SessionId, conn *LLMConnection, userText string) (*verifyResult, error) {
-	verifyPrompt := a.loadPromptFile(sid, "VERIFY.md")
-	if verifyPrompt == "" {
-		return &verifyResult{Success: true}, nil
-	}
-
-	var prompt strings.Builder
-	prompt.WriteString(verifyPrompt)
-	prompt.WriteString("\n\nUser request: ")
-	prompt.WriteString(userText)
-	prompt.WriteString("\n\nPerform a pre-planning check to see if the current project state is broken or has issues related to this request. Return JSON.")
-
-	messages := []llmMessage{{Role: "user", Content: prompt.String()}}
-	verifyRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{
-		readOnly: true,
-		include:  map[string]bool{"run_task": true},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	trimmed := trimJSON(verifyRes.Text)
-	var result verifyResult
-	if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
-		slog.Error("preVerify: non-JSON response", "err", err, "snippet", truncate(trimmed, 200))
-		return nil, fmt.Errorf("preVerify non-JSON: %w", err)
-	}
-
-	return &result, nil
-}
-
-// verify runs a self-check after execution. If the LLM finds issues, it gets
-// another chance to fix them. Returns the final result and the verify outcome.
+// verify runs a self-check after execution. Result.FixSteps (when present)
+// signals the caller to re-plan with the failure context — the inline-fix
+// path was removed because small models tend to compound errors when handed
+// a growing context of fix attempts. Returns the final result and the verify
+// outcome.
 func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, res toolLoopResult, userText string, planSteps []string) (toolLoopResult, *verifyResult, error) {
 	verifyPrompt := a.loadPromptFile(sid, "VERIFY.md")
 	if verifyPrompt == "" {
 		return res, &verifyResult{Success: true}, nil
 	}
 
-	for attempt := 0; attempt < maxVerifyAttempts; attempt++ {
-		// Build verification context.
-		var prompt strings.Builder
-		prompt.WriteString(verifyPrompt)
-		prompt.WriteString("\n\nUser request: ")
-		prompt.WriteString(userText)
-		if len(planSteps) > 0 {
-			prompt.WriteString("\n\nApproved plan:\n")
-			for i, step := range planSteps {
-				fmt.Fprintf(&prompt, "%d. %s\n", i+1, step)
-			}
+	var prompt strings.Builder
+	prompt.WriteString(verifyPrompt)
+	prompt.WriteString("\n\nUser request: ")
+	prompt.WriteString(userText)
+	if len(planSteps) > 0 {
+		prompt.WriteString("\n\nApproved plan:\n")
+		for i, step := range planSteps {
+			fmt.Fprintf(&prompt, "%d. %s\n", i+1, step)
 		}
-		prompt.WriteString("\n\nYour response was:\n")
-		prompt.WriteString(res.Text)
-
-		// Run verify with read-only tools + run_task.
-		verifyMessages := append(messages, llmMessage{Role: "user", Content: prompt.String()})
-		verifyRes, err := a.runToolLoop(ctx, sid, conn, verifyMessages, toolFilter{
-			readOnly: true,
-			include:  map[string]bool{"run_task": true},
-		})
-		if err != nil {
-			slog.Error("verify: LLM call failed; treating as success", "err", err)
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Verification skipped: "+err.Error()+"\n")))
-			return res, &verifyResult{Success: true}, nil
-		}
-
-		trimmed := trimJSON(verifyRes.Text)
-
-		var result verifyResult
-		if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
-			slog.Error("verify: LLM returned non-JSON response; treating as success",
-				"err", err, "snippet", truncate(trimmed, 200))
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Verification returned non-JSON; skipping self-check.\n")))
-			return res, &verifyResult{Success: true}, nil
-		}
-
-		if result.Success {
-			res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
-			return res, &result, nil
-		}
-
-		// If there are fix_steps, return to the caller for a full retry cycle.
-		if len(result.FixSteps) > 0 {
-			res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
-			return res, &result, nil
-		}
-
-		// No fix_steps — try an inline fix within this attempt.
-		var issueText strings.Builder
-		issueText.WriteString("⚠ Self-check found issues:\n")
-		for _, issue := range result.Issues {
-			fmt.Fprintf(&issueText, "- %s\n", issue)
-		}
-		issueText.WriteString("\nFixing...\n")
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(issueText.String())))
-
-		fixPrompt := "Your previous response had these issues:\n"
-		for _, issue := range result.Issues {
-			fixPrompt += "- " + issue + "\n"
-		}
-		fixPrompt += "\nPlease fix these issues now."
-
-		messages = append(messages,
-			llmMessage{Role: "assistant", Content: res.Text},
-			llmMessage{Role: "user", Content: fixPrompt},
-		)
-
-		fixRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{})
-		if err != nil {
-			slog.Error("verify: inline fix pass failed", "err", err)
-			return res, &result, nil
-		}
-		res.Text = res.Text + "\n" + fixRes.Text
-		res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
-		res.ToolUses = append(res.ToolUses, fixRes.ToolUses...)
 	}
+	prompt.WriteString("\n\nYour response was:\n")
+	prompt.WriteString(res.Text)
 
-	return res, &verifyResult{Success: true}, nil
+	verifyMessages := append(messages, llmMessage{Role: "user", Content: prompt.String()})
+	var result verifyResult
+	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{
+		readOnly: true,
+		include:  map[string]bool{"run_task": true},
+	}, &result)
+	res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
+	if err != nil {
+		slog.Error("verify: skipped, treating as success", "err", err)
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Verification skipped: "+err.Error()+"\n")))
+		return res, &verifyResult{Success: true}, nil
+	}
+	return res, &result, nil
 }
 
 // ---------------------------------------------------------------------------

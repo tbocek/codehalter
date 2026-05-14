@@ -155,26 +155,15 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	planInput := userText
 
-	// Pre-planning verification.
-	if thinkingConn := a.pickAvailable(ctx, "thinking", a.llmTier(req.SessionId)); thinkingConn != nil {
-		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Checking project state…\n\n")))
-		vr, err := a.preVerify(ctx, req.SessionId, thinkingConn, userText)
-		if err == nil && vr != nil && !vr.Success {
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(fmt.Sprintf("🟡 Found issues that may block this task:\n- %s\n\n", strings.Join(vr.Issues, "\n- ")))))
-			planInput = fmt.Sprintf("The project is currently in a broken state:\nIssues: %s\n\nOriginal request: %s", strings.Join(vr.Issues, "; "), userText)
-		} else if err != nil {
-			slog.Error("preVerify failed", "error", err)
-		} else {
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("No blockers — project state looks healthy.\n\n")))
-		}
-	}
-
 	// Initial plan. Also decides whether the task is big enough to break
 	// into subtasks (plan.Subtasks). For simple tasks, this same plan is
 	// reused for attempt 0 of runTaskCycle — no double planning.
 	a.sendPhase(ctx, req.SessionId, 0, false)
 	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)
 	if err != nil {
+		if errors.Is(err, errUserCancelled) {
+			return PromptResponse{StopReason: StopReasonCancelled}, nil
+		}
 		return a.failPrompt(req.SessionId, err, firstToolUses)
 	}
 
@@ -221,7 +210,7 @@ func (a *agent) runTaskCycle(
 	images []ImageData,
 	prePlan *planResult, preConn *LLMConnection, preToolUses []ToolUse,
 ) (toolLoopResult, error) {
-	const maxAttempts = 5
+	const maxAttempts = 2
 	var result toolLoopResult
 	var lastVR *verifyResult
 	sess := a.getSession(sid)
@@ -238,6 +227,9 @@ func (a *agent) runTaskCycle(
 			a.sendPhase(ctx, sid, 0, false)
 			c, p, tu, err := a.planAndRoute(ctx, sid, planInput)
 			if err != nil {
+				if errors.Is(err, errUserCancelled) {
+					return result, err
+				}
 				if sess != nil && len(tu) > 0 {
 					sess.AddAssistantWithTools("❌ "+err.Error(), tu)
 					_ = sess.Save()
@@ -349,7 +341,6 @@ func (a *agent) runSubtasks(
 			sess.AddAssistant(header.String() + "\nUser cancelled.")
 			_ = sess.Save()
 		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Cancelled.\n")))
 		return toolLoopResult{}, errUserCancelled
 	}
 

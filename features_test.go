@@ -363,8 +363,9 @@ func TestEstimateMessagesTokensCountsToolUses(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 // TestVerifyJSONParseFallback exercises the graceful-degradation path: when
-// the verify LLM returns non-JSON, we swallow the error, log it, and treat
-// the verification as successful so the pipeline still progresses.
+// the verify LLM returns non-JSON, we issue one corrective retry; if that
+// also fails to parse, we swallow the error and treat verification as
+// successful so the pipeline still progresses.
 func TestVerifyJSONParseFallback(t *testing.T) {
 	a, s := newTestAgent(t)
 
@@ -374,7 +375,10 @@ func TestVerifyJSONParseFallback(t *testing.T) {
 		t.Fatalf("write VERIFY.md: %v", err)
 	}
 
-	mock := newMockLLM(t, sseText("this is not JSON at all"))
+	mock := newMockLLM(t,
+		sseText("this is not JSON at all"),
+		sseText("still not JSON"),
+	)
 	defer mock.Close()
 
 	res := toolLoopResult{Text: "my previous response"}
@@ -392,8 +396,8 @@ func TestVerifyJSONParseFallback(t *testing.T) {
 	if out.Text != res.Text {
 		t.Errorf("expected res unchanged, got %q", out.Text)
 	}
-	if mock.callCount() != 1 {
-		t.Errorf("expected 1 LLM call, got %d", mock.callCount())
+	if mock.callCount() != 2 {
+		t.Errorf("expected 2 LLM calls (initial + retry), got %d", mock.callCount())
 	}
 }
 
@@ -661,7 +665,11 @@ func TestTrimJSON(t *testing.T) {
 		{name: "leading whitespace", in: "  \n{\"ok\":true}\n  ", want: `{"ok":true}`},
 		{name: "json fence", in: "```json\n{\"ok\":true}\n```", want: `{"ok":true}`},
 		{name: "bare fence", in: "```\n{\"ok\":true}\n```", want: `{"ok":true}`},
-		{name: "fence + array", in: "```json\n[1,2,3]\n```", want: `[1,2,3]`},
+		{name: "prose prefix", in: "Sure, here's the JSON:\n{\"ok\":true}", want: `{"ok":true}`},
+		{name: "prose suffix", in: "{\"ok\":true}\nLet me know if you need more.", want: `{"ok":true}`},
+		{name: "prose both sides", in: "Here you go: {\"ok\":true} — that's it!", want: `{"ok":true}`},
+		{name: "nested", in: "noise {\"a\":{\"b\":1}} noise", want: `{"a":{"b":1}}`},
+		{name: "brace in string", in: `{"s":"} not the end"}`, want: `{"s":"} not the end"}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
