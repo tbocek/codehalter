@@ -136,15 +136,21 @@ func init() {
 		}
 		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
 
-		effectiveLimit := args["limit"]
-		explicitLimit := effectiveLimit != ""
-		if !explicitLimit {
-			effectiveLimit = strconv.Itoa(defaultReadLines)
-		} else if n, err := strconv.Atoi(effectiveLimit); err == nil && n > maxReadLines {
-			effectiveLimit = strconv.Itoa(maxReadLines)
+		var linePtr *int
+		if v, err := strconv.Atoi(args["line"]); err == nil && v > 0 {
+			linePtr = &v
 		}
 
-		content, err := fsReadRange(a.conn.RPC(), ctx, sid, path, args["line"], effectiveLimit)
+		explicitLimit := args["limit"] != ""
+		limit := defaultReadLines
+		if v, err := strconv.Atoi(args["limit"]); err == nil && v > 0 {
+			limit = v
+			if limit > maxReadLines {
+				limit = maxReadLines
+			}
+		}
+
+		content, err := fsRead(a.conn.RPC(), ctx, sid, path, linePtr, &limit)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error()
@@ -182,7 +188,7 @@ func init() {
 		newContent := args["content"]
 		tcId := a.StartToolCall(ctx, sid, "Writing "+path, "edit", []ToolCallLocation{{Path: path}})
 
-		oldContent, _ := fsRead(a.conn.RPC(), ctx, sid, path)
+		oldContent, _ := fsRead(a.conn.RPC(), ctx, sid, path, nil, nil)
 
 		if err := fsWrite(a.conn.RPC(), ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
@@ -220,7 +226,7 @@ func init() {
 
 		tcId := a.StartToolCall(ctx, sid, "Editing "+path, "edit", []ToolCallLocation{{Path: path}})
 
-		content, err := fsRead(a.conn.RPC(), ctx, sid, path)
+		content, err := fsRead(a.conn.RPC(), ctx, sid, path, nil, nil)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error reading file: " + err.Error()
@@ -250,40 +256,18 @@ func init() {
 }
 
 
-func fsReadRange(c *Connection, ctx context.Context, sid SessionId, path, line, limit string) (string, error) {
-	type req struct {
-		SessionId SessionId `json:"sessionId"`
-		Path      string    `json:"path"`
-		Line      *int      `json:"line,omitempty"`
-		Limit     *int      `json:"limit,omitempty"`
-	}
-	r := req{SessionId: sid, Path: path}
-	if line != "" {
-		if v, err := strconv.Atoi(line); err == nil {
-			r.Line = &v
-		}
-	}
-	if limit != "" {
-		if v, err := strconv.Atoi(limit); err == nil {
-			r.Limit = &v
-		}
-	}
-	resp, err := SendRequest[struct {
-		Content string `json:"content"`
-	}](c, ctx, "fs/read_text_file", r)
-	if err != nil {
-		return "", err
-	}
-	return resp.Content, nil
-}
-
-func fsRead(c *Connection, ctx context.Context, sid SessionId, path string) (string, error) {
+// fsRead reads a text file via the ACP fs/read_text_file request. line/limit
+// are optional: pass nil for both to read the whole file, or non-nil pointers
+// to bound the response to a 1-indexed line window.
+func fsRead(c *Connection, ctx context.Context, sid SessionId, path string, line, limit *int) (string, error) {
 	resp, err := SendRequest[struct {
 		Content string `json:"content"`
 	}](c, ctx, "fs/read_text_file", struct {
 		SessionId SessionId `json:"sessionId"`
 		Path      string    `json:"path"`
-	}{SessionId: sid, Path: path})
+		Line      *int      `json:"line,omitempty"`
+		Limit     *int      `json:"limit,omitempty"`
+	}{SessionId: sid, Path: path, Line: line, Limit: limit})
 	if err != nil {
 		return "", err
 	}

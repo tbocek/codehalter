@@ -141,15 +141,15 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	// Pre-planning verification.
 	if thinkingConn := a.pickAvailable(ctx, "thinking", a.llmTier(req.SessionId)); thinkingConn != nil {
-		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Running pre-planning verification...\n\n")))
+		a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Checking project state…\n\n")))
 		vr, err := a.preVerify(ctx, req.SessionId, thinkingConn, userText)
 		if err == nil && vr != nil && !vr.Success {
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(fmt.Sprintf("⚠ Pre-planning check found issues:\n%s\n\n", strings.Join(vr.Issues, "\n")))))
+			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock(fmt.Sprintf("🟡 Found issues that may block this task:\n- %s\n\n", strings.Join(vr.Issues, "\n- ")))))
 			planInput = fmt.Sprintf("The project is currently in a broken state:\nIssues: %s\n\nOriginal request: %s", strings.Join(vr.Issues, "; "), userText)
 		} else if err != nil {
 			slog.Error("preVerify failed", "error", err)
 		} else {
-			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Project state verified.\n\n")))
+			a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("No blockers — project state looks healthy.\n\n")))
 		}
 	}
 

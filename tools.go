@@ -179,6 +179,20 @@ func (a *agent) CompleteToolCall(ctx context.Context, sid SessionId, id string, 
 	})
 }
 
+// CompleteToolCallTitled is like CompleteToolCall but also overwrites the
+// tool-call's title. Use this to surface a result preview in the panel
+// without requiring the user to expand the disclosure (e.g. change
+// "go_symbols: Foo" → "go_symbols: Foo → router.go:27 (+1)").
+func (a *agent) CompleteToolCallTitled(ctx context.Context, sid SessionId, id, title string, content []ToolCallContent) {
+	a.sendUpdate(ctx, sid, toolCallUpdate{
+		Kind:       "tool_call_update",
+		ToolCallId: id,
+		Title:      title,
+		Status:     "completed",
+		Content:    content,
+	})
+}
+
 func (a *agent) FailToolCall(ctx context.Context, sid SessionId, id, errMsg string) {
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",

@@ -2,11 +2,24 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 )
+
+// subagentTaskHash is a stable digest of an instructions+context pair, used
+// to dedupe launch_subagent calls. Whitespace at the edges is normalised so
+// trivial reformatting by the model still hits the cache.
+func subagentTaskHash(t subagentTask) string {
+	h := sha256.New()
+	h.Write([]byte(strings.TrimSpace(t.Instructions)))
+	h.Write([]byte{0})
+	h.Write([]byte(strings.TrimSpace(t.Context)))
+	return hex.EncodeToString(h.Sum(nil))[:16]
+}
 
 const maxSubagentDepth = 2
 
@@ -78,17 +91,50 @@ func (a *agent) registerSubagentTool() {
 
 		tcId := ag.StartToolCall(ctx, sid, fmt.Sprintf("Launching %d subagent(s)", len(tasks)), "execute", nil)
 
-		// Launch subagents in parallel.
+		// Dedup tasks. Small models frequently re-issue identical
+		// launch_subagent calls (within one tasks[] array, or across
+		// successive turns). We hash (instructions+context) and:
+		//   - within this call: collapse duplicates to one launch, then fan
+		//     the same result out to every original index.
+		//   - across calls in this session: return the prior result instead
+		//     of relaunching. Cache lives on the parent Session (in-memory
+		//     only — see Session.launchedSubagents docs).
 		results := make([]subagentResult, len(tasks))
 		var mu sync.Mutex
 
-		parallel(len(tasks), func(i int) {
-			task := tasks[i]
-			subSess := newSubagentSession(sess.Cwd, sid, i, sess.Depth+1)
+		type pending struct {
+			task    subagentTask
+			indices []int // original task[] indices sharing this hash
+		}
+		uniq := make(map[string]*pending)
+		var order []string // stable launch order: first-seen indices win
+
+		for i, task := range tasks {
+			h := subagentTaskHash(task)
+			if cached, ok := sess.recallSubagent(h); ok {
+				results[i] = subagentResult{Index: i, Success: true, Result: cached}
+				ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Reusing prior result for identical task\n\n", i+1))))
+				continue
+			}
+			if p, ok := uniq[h]; ok {
+				p.indices = append(p.indices, i)
+				continue
+			}
+			uniq[h] = &pending{task: task, indices: []int{i}}
+			order = append(order, h)
+		}
+
+		// Launch unique tasks in parallel.
+		parallel(len(order), func(k int) {
+			h := order[k]
+			p := uniq[h]
+			primary := p.indices[0]
+			task := p.task
+			subSess := newSubagentSession(sess.Cwd, sid, primary, sess.Depth+1)
 			ag.putSession(subSess)
 			defer ag.deleteSession(subSess.ID)
 
-			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Starting: %s\n\n", i+1, truncate(task.Instructions, 100)))))
+			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Starting: %s\n\n", primary+1, truncate(task.Instructions, 100)))))
 
 			// All internal plan/execute/verify calls use the subagent's own
 			// session id. That keeps plan steps, tool uses, and assistant
@@ -101,13 +147,22 @@ func (a *agent) registerSubagentTool() {
 
 			mu.Lock()
 			if err != nil {
-				results[i] = subagentResult{Index: i, Success: false, Error: err.Error()}
+				for _, i := range p.indices {
+					results[i] = subagentResult{Index: i, Success: false, Error: err.Error()}
+				}
 			} else {
-				results[i] = subagentResult{Index: i, Success: true, Result: result}
+				sess.rememberSubagent(h, result)
+				for _, i := range p.indices {
+					results[i] = subagentResult{Index: i, Success: true, Result: result}
+				}
 			}
 			mu.Unlock()
 
-			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Done\n\n", i+1))))
+			if len(p.indices) > 1 {
+				ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Done (shared with %d duplicate task(s))\n\n", primary+1, len(p.indices)-1))))
+			} else {
+				ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Done\n\n", primary+1))))
+			}
 		})
 
 		// Format results.

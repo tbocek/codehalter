@@ -94,18 +94,6 @@ func (a *agent) discoverRunners(cwd string) {
 			return fmt.Sprintf("error: unknown runner %q", runnerName)
 		}
 
-		// Verify the target is valid.
-		valid := false
-		for _, t := range runner.Tasks {
-			if t == target {
-				valid = true
-				break
-			}
-		}
-		if !valid {
-			return fmt.Sprintf("error: unknown target %q for runner %q", target, runnerName)
-		}
-
 		sess := a.getSession(sid)
 		if sess == nil {
 			return "error: no session"
@@ -411,62 +399,24 @@ func discoverCargo(cwd string) *taskRunner {
 	}
 }
 
+// discoverGradle exposes standard gradle tasks when build.gradle(.kts) is
+// present. Prefers ./gradlew if it exists. Uses a fixed task list rather
+// than parsing `gradle tasks` output — that command spins up the gradle
+// daemon (slow) and the format varies across plugins. Users with bespoke
+// targets can invoke them via just/Make.
 func discoverGradle(cwd string) *taskRunner {
 	for _, name := range []string{"build.gradle", "build.gradle.kts"} {
-		if _, err := os.Stat(filepath.Join(cwd, name)); err == nil {
-			// Try to find the wrapper first.
-			cmdName := "gradle"
-			if _, err := os.Stat(filepath.Join(cwd, "gradlew")); err == nil {
-				cmdName = "./gradlew"
-			} else if _, err := os.Stat(filepath.Join(cwd, "gradlew.bat")); err == nil {
-				// For Windows, but we assume Unix-like environment for now.
-				// If we were strictly Windows, we'd use gradlew.bat.
-				cmdName = "gradlew"
-			}
-
-			// List tasks.
-			cmd := exec.Command("gradle", "tasks")
-			if cmdName != "gradle" {
-				cmd = exec.Command(cmdName, "tasks")
-			}
-			cmd.Dir = cwd
-			out, err := cmd.Output()
-			if err != nil {
-				return nil
-			}
-
-			var tasks []string
-			for _, line := range strings.Split(string(out), "\n") {
-				line = strings.TrimSpace(line)
-				if line == "" || strings.HasPrefix(line, "Tasks:") || strings.HasPrefix(line, "---") {
-					continue
-				}
-				// Gradle tasks often look like: "build" or "test"
-				// and often have indentation.
-				if len(line) > 0 && line[0] == ' ' {
-					// It's likely a task description or something.
-					// We only want the task name.
-					// But Gradle's `tasks` output is often formatted.
-					// Let's just try to split by space and take the first part.
-					parts := strings.Fields(line)
-					if len(parts) > 0 {
-						tasks = append(tasks, parts[0])
-					}
-				}
-			}
-			if len(tasks) == 0 {
-				// If we can't parse the tasks, just provide basic ones.
-				return &taskRunner{
-					Name:    "gradle",
-					Command: cmdName,
-					Tasks:   []string{"build", "test", "clean"},
-				}
-			}
-			return &taskRunner{
-				Name:    "gradle",
-				Command: cmdName,
-				Tasks:   tasks,
-			}
+		if _, err := os.Stat(filepath.Join(cwd, name)); err != nil {
+			continue
+		}
+		cmd := "gradle"
+		if _, err := os.Stat(filepath.Join(cwd, "gradlew")); err == nil {
+			cmd = "./gradlew"
+		}
+		return &taskRunner{
+			Name:    "gradle",
+			Command: cmd,
+			Tasks:   []string{"build", "test", "check", "clean"},
 		}
 	}
 	return nil

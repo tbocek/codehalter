@@ -48,10 +48,40 @@ type Session struct {
 	// 0-based index into phaseNames it refers to.
 	phaseActive  bool
 	phaseCurrent int
+	// launchedSubagents caches results of completed launch_subagent tasks,
+	// keyed by a hash of (instructions, context). When the model re-asks for
+	// an identical subagent (within or across launch_subagent tool calls in
+	// the same session), we return the prior result instead of running it
+	// again — small models forget what they already launched. Not persisted
+	// across process restarts: re-running after a restart re-launches, which
+	// is the safer default than feeding back a possibly-stale cached result.
+	launchedSubagentsMu sync.Mutex
+	launchedSubagents   map[string]string
 	// mu serialises all mutations of the fields above and the Save() encoder.
 	// Prompt runs synchronously per session, but generateTitle runs as a
 	// background goroutine and would otherwise race on Title + the TOML file.
 	mu sync.Mutex
+}
+
+// recallSubagent returns a prior result for the given task hash if one exists.
+func (s *Session) recallSubagent(hash string) (string, bool) {
+	s.launchedSubagentsMu.Lock()
+	defer s.launchedSubagentsMu.Unlock()
+	if s.launchedSubagents == nil {
+		return "", false
+	}
+	r, ok := s.launchedSubagents[hash]
+	return r, ok
+}
+
+// rememberSubagent caches the result of a successful subagent run.
+func (s *Session) rememberSubagent(hash, result string) {
+	s.launchedSubagentsMu.Lock()
+	defer s.launchedSubagentsMu.Unlock()
+	if s.launchedSubagents == nil {
+		s.launchedSubagents = make(map[string]string)
+	}
+	s.launchedSubagents[hash] = result
 }
 
 func loadSession(cwd string, id SessionId) (*Session, error) {

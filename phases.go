@@ -62,12 +62,14 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 
 // renderSteps shows the plan's steps to the user and returns the rendered
 // text so the caller can fold it into the session transcript on cancel.
-func (a *agent) renderSteps(ctx context.Context, sid SessionId, steps []string) string {
+// header is the section heading ("Plan:" for actionable plans, "Findings:"
+// for report-only plans where the executor will just relay the answer).
+func (a *agent) renderSteps(ctx context.Context, sid SessionId, steps []string, header string) string {
 	if len(steps) == 0 {
 		return ""
 	}
 	var planText strings.Builder
-	planText.WriteString("Plan:\n")
+	planText.WriteString(header + "\n")
 	for i, step := range steps {
 		fmt.Fprintf(&planText, "%d. %s\n", i+1, step)
 	}
@@ -126,7 +128,11 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 
 	// Show the plan and ask for confirmation.
 	if len(plan.Steps) > 0 {
-		planText := a.renderSteps(ctx, sid, plan.Steps)
+		header := "Plan:"
+		if plan.ReportOnly {
+			header = "Findings:"
+		}
+		planText := a.renderSteps(ctx, sid, plan.Steps, header)
 
 		// Pure-lookup plans need no execution gate — the executor just
 		// relays what the planner already gathered. PLAN.md tells the
@@ -158,7 +164,11 @@ func (a *agent) planForSubagent(ctx context.Context, sid SessionId, instructions
 	if err != nil || plan == nil {
 		return thinking, nil, toolUses, err
 	}
-	a.renderSteps(ctx, sid, plan.Steps)
+	header := "Plan:"
+	if plan.ReportOnly {
+		header = "Findings:"
+	}
+	a.renderSteps(ctx, sid, plan.Steps, header)
 	return thinking, plan.Steps, toolUses, nil
 }
 
