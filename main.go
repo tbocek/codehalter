@@ -284,7 +284,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
 	}
 	if len(caps.runners) == 0 {
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-			"⚠ No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")))
+			"🟡 No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")))
 		return
 	}
 
@@ -313,13 +313,13 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
 func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 	if len(a.settings.LLMConnections) == 0 {
 		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ LLM: no [[llmconnections]] in settings.toml — codehalter cannot run until you add one.\n\n")))
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("🟡 LLM: no [[llmconnections]] in settings.toml — codehalter cannot run until you add one.\n\n")))
 		return
 	}
 	if settingsLooksPlaceholder(a.settings) {
 		a.imagesSupported = false
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-			"⚠ LLM: "+a.settings.path+" still has the placeholder model \"your-model-id\". Edit it with your real url and model, then restart this Zed session.\n\n")))
+			"🟡 LLM: "+a.settings.path+" still has the placeholder model \"your-model-id\". Edit it with your real url and model, then restart this Zed session.\n\n")))
 		return
 	}
 
@@ -340,9 +340,9 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 		a.connReachable[connKey(&c)] = r.Reachable
 		switch {
 		case !r.Reachable:
-			fmt.Fprintf(&b, "⚠ LLM[%d]: unreachable at %s — start your server or fix the url.\n\n", i, c.URL)
+			fmt.Fprintf(&b, "🟡 LLM[%d]: unreachable at %s — start your server or fix the url.\n\n", i, c.URL)
 		case r.ModelKnown && !r.ModelLoaded:
-			fmt.Fprintf(&b, "⚠ LLM[%d]: %s reachable but model %q not loaded.\n\n", i, c.URL, c.Model)
+			fmt.Fprintf(&b, "🟡 LLM[%d]: %s reachable but model %q not loaded.\n\n", i, c.URL, c.Model)
 		default:
 			fmt.Fprintf(&b, "✅ LLM[%d]: %s @ %s\n\n", i, c.Model, c.URL)
 		}
@@ -353,7 +353,7 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 
 	if firstReachable < 0 {
 		a.imagesSupported = false
-		b.WriteString("⚠ No LLM reachable — every connection above failed. Codehalter cannot run any prompt until at least one comes back.\n\n")
+		b.WriteString("🟡 No LLM reachable — every connection above failed. Codehalter cannot run any prompt until at least one comes back.\n\n")
 	} else {
 		a.imagesSupported = results[firstReachable].ImageSupport
 		if a.imagesSupported {
@@ -373,12 +373,12 @@ func (a *agent) checkEnvironment(ctx context.Context, sid SessionId) {
 	if kind := containerKind(); kind != "" {
 		fmt.Fprintf(&b, "✅ Container: %s\n\n", kind)
 	} else {
-		b.WriteString("⚠ Container: none (running on host — file edits and tasks hit your real filesystem)\n\n")
+		b.WriteString("🟡 Container: none (running on host — file edits and tasks hit your real filesystem)\n\n")
 	}
 	if _, err := findFirefox(); err == nil {
 		b.WriteString("✅ Firefox: found (web_search/web_read enabled)\n\n")
 	} else {
-		b.WriteString("⚠ Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
+		b.WriteString("🟡 Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
 	}
 	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
 }

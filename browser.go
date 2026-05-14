@@ -59,6 +59,7 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 	}
 
 	cmd := exec.CommandContext(ctx, firefoxPath,
+		"-headless",
 		"--private-window",
 		"--no-remote",
 		"--profile", profileDir,

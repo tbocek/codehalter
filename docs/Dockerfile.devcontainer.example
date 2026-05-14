@@ -10,10 +10,13 @@ ARG GID=1000
 # Toolchain — trim what you don't use; add cargo, openjdk-17, python3, etc.
 # as your project needs them. just/make are picked up by codehalter's
 # task-runner discovery automatically; nodejs+npm covers package.json.
+# firefox-esr powers web_search/web_read; codehalter launches it with
+# -headless so no X11 forwarding is needed.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git sudo \
         just make \
         nodejs npm \
+        firefox-esr \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user matching host UID/GID so files written into the bind-mounted
@@ -31,9 +34,3 @@ ENV GOBIN=/usr/local/bin
 RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
 
 USER ${USERNAME}
-
-# Note: Firefox (used by web_search/web_read) is not installed here because
-# codehalter launches it non-headless, which means X11 forwarding into the
-# container. If you want the web tools inside the container, add firefox-esr
-# above and configure DISPLAY + a /tmp/.X11-unix mount in devcontainer.json.
-# Otherwise just run codehalter on the host when you need web_search.

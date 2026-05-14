@@ -86,15 +86,26 @@ func init() {
 		})
 
 		// Open each result in its own tab — emit a card per URL so the user
-		// sees which sites are being fetched, not just the final list.
+		// sees which sites are being fetched, not just the final list. Peek
+		// the rendered text and flag bot walls / captchas so the LLM (and
+		// user) know which results aren't trustworthy.
 		var opened []string
+		issues := map[string]string{}
 		for _, link := range links {
 			openId := a.StartToolCall(ctx, sid, "Opening: "+link, "search", nil)
-			if _, err := browser.OpenTab(ctx, link); err != nil {
+			tab, err := browser.OpenTab(ctx, link)
+			if err != nil {
 				a.FailToolCall(ctx, sid, openId, err.Error())
 				continue
 			}
-			a.CompleteToolCall(ctx, sid, openId, nil)
+			var content []ToolCallContent
+			if text, terr := browser.PageText(ctx, tab); terr == nil {
+				if issue := pageIssue(text); issue != "" {
+					issues[link] = issue
+					content = []ToolCallContent{TextContent("🟡 " + issue)}
+				}
+			}
+			a.CompleteToolCall(ctx, sid, openId, content)
 			opened = append(opened, link)
 		}
 
@@ -115,7 +126,11 @@ func init() {
 
 		var results strings.Builder
 		for i, link := range opened {
-			fmt.Fprintf(&results, "%d. %s\n", i+1, link)
+			if issue := issues[link]; issue != "" {
+				fmt.Fprintf(&results, "%d. %s   [🟡 %s]\n", i+1, link, issue)
+			} else {
+				fmt.Fprintf(&results, "%d. %s\n", i+1, link)
+			}
 		}
 		return results.String()
 	}})
@@ -174,7 +189,13 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 		defer browser.Close()
 		tabID := browser.initialTab
 
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Page opened in Firefox.")})
+		openMsg := "Page opened in Firefox."
+		if peek, perr := browser.PageText(ctx, tabID); perr == nil {
+			if issue := pageIssue(peek); issue != "" {
+				openMsg = "🟡 " + issue
+			}
+		}
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(openMsg)})
 
 		askId := a.StartToolCall(ctx, sid, "Review the page in Firefox, then confirm", "think", nil)
 		ok, askErr := a.askYesNoAuto(ctx, sid, askId, "Get content", "Cancel", true)
@@ -291,6 +312,48 @@ func stripHTMLAttrs(s string) string {
 		}
 		return "<" + closing + tag + ">"
 	})
+}
+
+// botWallPatterns are case-insensitive substrings that strongly suggest a
+// page is a Cloudflare interstitial, captcha challenge, access denial, or
+// rate-limit wall rather than the content the agent asked for. Matched by
+// pageIssue against the rendered body text.
+var botWallPatterns = []struct {
+	needle string
+	label  string
+}{
+	{"just a moment", "Cloudflare interstitial"},
+	{"checking your browser", "Cloudflare interstitial"},
+	{"verify you are human", "captcha challenge"},
+	{"verifying you are human", "captcha challenge"},
+	{"are you human", "captcha challenge"},
+	{"press and hold", "anti-bot challenge"},
+	{"please enable javascript and cookies", "anti-bot wall"},
+	{"attention required", "anti-bot wall"},
+	{"access denied", "access denied"},
+	{"403 forbidden", "403 forbidden"},
+	{"too many requests", "rate limited"},
+}
+
+// pageIssue returns a short label when the rendered body looks like a bot
+// wall, captcha, access denial, or failed load. Empty string means the page
+// looks normal. Text-heuristic only; misses sophisticated walls, but catches
+// the common Cloudflare/captcha/403 patterns that derail web_search runs.
+func pageIssue(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "empty page (load failed?)"
+	}
+	lower := strings.ToLower(trimmed)
+	for _, p := range botWallPatterns {
+		if strings.Contains(lower, p.needle) {
+			return p.label
+		}
+	}
+	if len(trimmed) < 200 {
+		return "very short content (load failed or blocked?)"
+	}
+	return ""
 }
 
 // extractDDGLinks extracts result URLs from a DuckDuckGo search results page.
