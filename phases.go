@@ -172,6 +172,44 @@ func (a *agent) planForSubagent(ctx context.Context, sid SessionId, instructions
 // Execute phase
 // ---------------------------------------------------------------------------
 
+// pickVerifyTarget returns runner:target for the most "comprehensive" task
+// the project advertises (priority: verify > check > ci > all) or "" when
+// none exists. Used by execute() and verify() to inject a concrete hint that
+// the model should use the project's full verification contract via run_task
+// rather than running its constituents directly via run_command. Generic
+// across runners: any justfile/Makefile/npm-script target with one of these
+// names gets picked up automatically.
+func (a *agent) pickVerifyTarget() string {
+	priority := []string{"verify", "check", "ci", "all"}
+	a.mu.Lock()
+	runners := a.runners
+	a.mu.Unlock()
+	for _, want := range priority {
+		for _, r := range runners {
+			for _, t := range r.Tasks {
+				if strings.EqualFold(t, want) {
+					return r.Name + ":" + t
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// verifyTargetHint formats the per-project hint pointing at the comprehensive
+// verify-class target (see pickVerifyTarget). Empty string when there is no
+// such target — caller treats that as "no hint, use the generic rule".
+func (a *agent) verifyTargetHint() string {
+	vt := a.pickVerifyTarget()
+	if vt == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"This project declares `%s` as its verify-class target. Run it via run_task — its body is the project's contract for \"verified\" and may chain tidy/build steps that piecemeal commands miss. Do NOT substitute `go test ./...` / `npm test` / equivalent constituents.",
+		vt,
+	)
+}
+
 // execute runs the execution phase. It prepends EXECUTE.md (if present) to the
 // last user message, excludes web tools (information retrieval belongs to the
 // planning phase), and runs the agentic tool loop with write-enabled tools.
@@ -183,7 +221,15 @@ func (a *agent) planForSubagent(ctx context.Context, sid SessionId, instructions
 // llama.cpp slot evicts the prefix cache; routing execute off conn 0 keeps the
 // planner/document KV cache hot turn-over-turn.
 func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessage, extraExclude ...string) (toolLoopResult, error) {
-	if executeMD := a.loadPromptFile(sid, "EXECUTE.md"); executeMD != "" && len(messages) > 0 {
+	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
+	if hint := a.verifyTargetHint(); hint != "" {
+		if executeMD != "" {
+			executeMD = executeMD + "\n\n" + hint
+		} else {
+			executeMD = hint
+		}
+	}
+	if executeMD != "" && len(messages) > 0 {
 		last := len(messages) - 1
 		if messages[last].Role == "user" {
 			if content, ok := messages[last].Content.(string); ok {
@@ -236,6 +282,10 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 
 	var prompt strings.Builder
 	prompt.WriteString(verifyPrompt)
+	if hint := a.verifyTargetHint(); hint != "" {
+		prompt.WriteString("\n\n")
+		prompt.WriteString(hint)
+	}
 	prompt.WriteString("\n\nUser request: ")
 	prompt.WriteString(userText)
 	if len(planSteps) > 0 {

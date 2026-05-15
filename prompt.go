@@ -24,18 +24,37 @@ var errUserCancelled = errors.New("user cancelled")
 // client at a time (the plan UI updates in place as phases progress).
 var phaseNames = []string{"Planning", "Executing", "Verifying", "Documenting"}
 
-// sendPhase emits a plan update with a single entry for the given phase,
-// replacing any previous entry. done=true renders the phase as completed
-// (spinner stops); done=false renders it as in_progress. The session tracks
-// in-progress state so finalizePlan can mark whatever phase was running as
-// completed if Prompt exits early.
-func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bool) {
+// phaseEntries builds the multi-row plan entries to render in the client: all
+// phases up to and including `phase`, with prior phases marked completed and
+// phase `phase` marked in_progress or completed depending on `done`. Optional
+// `suffix` is appended to whichever row is in_progress (used for transient
+// markers like " (thinking…)"). Document (phase 3) only appears once it
+// actually starts, so a no-doc run ends with three rows.
+func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
 	if phase < 0 || phase >= len(phaseNames) {
-		return
+		return nil
 	}
-	status := "in_progress"
-	if done {
-		status = "completed"
+	entries := make([]PlanEntry, 0, phase+1)
+	for i := 0; i <= phase; i++ {
+		status := "completed"
+		content := phaseNames[i]
+		if i == phase && !done {
+			status = "in_progress"
+			content += suffix
+		}
+		entries = append(entries, PlanEntry{Content: content, Priority: "medium", Status: status})
+	}
+	return entries
+}
+
+// sendPhase emits a plan update covering every phase started so far. The
+// current phase is in_progress (or completed when done=true); earlier phases
+// are completed. The session tracks in-progress state so finalizePlan can
+// mark whatever phase was running as completed if Prompt exits early.
+func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bool) {
+	entries := phaseEntries(phase, done, "")
+	if entries == nil {
+		return
 	}
 	if sess := a.getSession(sid); sess != nil {
 		sess.phaseMu.Lock()
@@ -43,16 +62,14 @@ func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bo
 		sess.phaseActive = !done
 		sess.phaseMu.Unlock()
 	}
-	entry := PlanEntry{Content: phaseNames[phase], Priority: "medium", Status: status}
-	a.sendUpdate(ctx, sid, PlanUpdate([]PlanEntry{entry}))
+	a.sendUpdate(ctx, sid, PlanUpdate(entries))
 }
 
-// notifyPhaseSuffix re-emits the currently-active phase entry with `suffix`
-// appended to its content. Used as a transient marker (e.g. " (thinking…)")
-// while a phase-bound LLM call is in flight; pass "" to revert. No-op if no
-// phase is active so background calls (history compaction) don't clobber
-// the UI when no phase is showing. Replace semantics: PlanUpdate with a
-// single entry overwrites the previous plan render in place.
+// notifyPhaseSuffix re-emits the full multi-row plan with `suffix` appended
+// to whichever row is currently in_progress. Used as a transient marker
+// (e.g. " (thinking…)") while a phase-bound LLM call is in flight; pass "" to
+// revert. No-op when no phase is active so background calls (history
+// compaction) don't clobber the UI.
 func (a *agent) notifyPhaseSuffix(ctx context.Context, sid SessionId, suffix string) {
 	sess := a.getSession(sid)
 	if sess == nil {
@@ -62,21 +79,20 @@ func (a *agent) notifyPhaseSuffix(ctx context.Context, sid SessionId, suffix str
 	active := sess.phaseActive
 	phase := sess.phaseCurrent
 	sess.phaseMu.Unlock()
-	if !active || phase < 0 || phase >= len(phaseNames) {
+	if !active {
 		return
 	}
-	entry := PlanEntry{
-		Content:  phaseNames[phase] + suffix,
-		Priority: "medium",
-		Status:   "in_progress",
+	entries := phaseEntries(phase, false, suffix)
+	if entries == nil {
+		return
 	}
-	a.sendUpdate(ctx, sid, PlanUpdate([]PlanEntry{entry}))
+	a.sendUpdate(ctx, sid, PlanUpdate(entries))
 }
 
-// finalizePlan marks the currently-in-progress phase as completed so the UI
-// stops spinning. Idempotent and safe to call when no phase is active. Used
-// from a Prompt-level defer to cover every exit path: errors mid-phase
-// (LLM 500, tool failure), user cancel, or panic.
+// finalizePlan marks every phase up to and including the currently-active one
+// as completed so the UI stops spinning. Idempotent and safe to call when no
+// phase is active. Used from a Prompt-level defer to cover every exit path:
+// errors mid-phase (LLM 500, tool failure), user cancel, or panic.
 func (a *agent) finalizePlan(sid SessionId) {
 	sess := a.getSession(sid)
 	if sess == nil {
@@ -87,12 +103,15 @@ func (a *agent) finalizePlan(sid SessionId) {
 	phase := sess.phaseCurrent
 	sess.phaseActive = false
 	sess.phaseMu.Unlock()
-	if !active || phase < 0 || phase >= len(phaseNames) {
+	if !active {
 		return
 	}
-	entry := PlanEntry{Content: phaseNames[phase], Priority: "medium", Status: "completed"}
+	entries := phaseEntries(phase, true, "")
+	if entries == nil {
+		return
+	}
 	// Background ctx so the finalize fires even when the request ctx is cancelled.
-	a.sendUpdate(context.Background(), sid, PlanUpdate([]PlanEntry{entry}))
+	a.sendUpdate(context.Background(), sid, PlanUpdate(entries))
 }
 
 // failPrompt records a fatal error in the session and returns it so the ACP
