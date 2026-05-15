@@ -39,7 +39,16 @@ so even mutating calls are recoverable.
   `search_text` over reading whole files when you only need to find a symbol.
 - `web_search`, `web_read`, `web_read_raw` — for libraries, APIs, versions,
   docs, or anything outside this project. Use `web_read_raw` when you need an
-  exact URL/version/string preserved verbatim.
+  exact URL/version/string preserved verbatim. Query discipline:
+    - ONE precise query beats three sequential refinements. Write the most
+      specific query you can up front, including the exact symbol, tag, or
+      version (e.g. `golang:1.26-trixie site:hub.docker.com`, not
+      `Go 1.26 release` then `golang docker image` then `golang trixie tag`).
+    - If you genuinely need two independent facts, fan them out with
+      `launch_subagent` (parallel), don't issue them serially.
+    - If a search returns nothing useful, REFORMULATE — don't just rerun with
+      slightly different words. Stop after two attempts on the same question
+      and either `web_read` a known-good URL directly or move on.
 - `safe_run_command` — run commands inside the devcontainer with the
   workspace overlay-protected. Workspace writes are discarded on exit;
   writes elsewhere (apt-get, dpkg, pip) persist for the container's
