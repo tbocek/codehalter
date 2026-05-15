@@ -58,7 +58,7 @@ func init() {
 			dir = resolved
 		}
 
-		tcId := a.StartToolCall(ctx, sid, "Searching for: "+query, "search", nil)
+		tcId := a.StartToolCall(ctx, sid, "Searching: "+query, "search", nil)
 
 		var results []string
 		files := listProjectFiles(dir)
@@ -75,17 +75,17 @@ func init() {
 
 		if len(results) == 0 {
 			a.CompleteToolCallTitled(ctx, sid, tcId,
-				"Searching for: "+query+" → no matches",
+				"Searching: "+query+" (no matches)",
 				[]ToolCallContent{TextContent("no matches found")})
 			return "no matches found"
 		}
 
 		summary := fmt.Sprintf("%d matches", len(results))
 		if len(results) >= maxSearchResults {
-			summary += " (limit reached)"
+			summary += ", limit reached"
 		}
 		a.CompleteToolCallTitled(ctx, sid, tcId,
-			fmt.Sprintf("✅ Searching for: %s → %s", query, summary),
+			fmt.Sprintf("Searching: %s (%s)", query, summary),
 			[]ToolCallContent{TextContent(summary)})
 		return strings.Join(results, "\n")
 	}})
