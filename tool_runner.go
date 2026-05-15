@@ -137,10 +137,23 @@ func (a *agent) discoverRunners(cwd string) {
 		runErr := <-waitErr
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("```\n")))
 
-		result := collected.String()
+		// Surface a non-zero exit unambiguously: a banner at the TOP and
+		// bottom of the returned output (so a long stdout transcript can't
+		// bury it) plus a failed-status card so the UI renders red. Verify
+		// treats any failed run_task as a hard failure — see VERIFY.md.
 		if runErr != nil {
-			result += "\nexit: " + runErr.Error()
+			banner := fmt.Sprintf("❌ TASK FAILED: %s (%s)\n", task, runErr.Error())
+			result := banner + "\n" + collected.String() + "\n" + banner
+			a.sendUpdate(ctx, sid, toolCallUpdate{
+				Kind:       "tool_call_update",
+				ToolCallId: tcId,
+				Title:      "❌ " + task + " (" + runErr.Error() + ")",
+				Status:     "failed",
+				Content:    []ToolCallContent{TextContent(result)},
+			})
+			return result
 		}
+		result := collected.String()
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
 		return result
 	}})

@@ -5,8 +5,9 @@ If NO files were changed (no edit_file or write_file was used), skip verificatio
 
 If files WERE changed:
 1. If a test, verify, lint, or check task is available via run_task, run it.
-2. If run_task produced errors, investigate the root cause.
-3. Use read_file to verify your edits are syntactically correct.
+2. Any run_task that exits non-zero (output contains "❌ TASK FAILED" or "exit status") is a verification FAILURE — set success:false and include the failed task name and exit status in issues. This applies even if the cause looks unrelated to your change (e.g. a missing system tool); the user is told and decides whether the dependency is the agent's problem to solve. Do NOT rationalize a non-zero exit as "success with a known issue".
+3. If the failure looks like a missing tool ("command not found", "not installed", "No such file or directory"), check whether the project ships a devcontainer: list_files at `.devcontainer`. If it exists, read `.devcontainer/devcontainer.json` (and any Dockerfile it references) to see whether the missing tool is a documented dependency — if so, add an issue like `"tinygo missing — devcontainer declares it but the running image doesn't have it; rebuild the devcontainer"` and a fix_step that points at the specific file to edit. If `.devcontainer` does NOT exist, the fix_step is for the human: `"install tinygo and rerun"` (do not try to install system tools from inside the agent).
+4. Use read_file to verify your edits are syntactically correct.
 
 Do NOT flag style issues, incomplete explanations, or missing context.
 Do NOT repeat web searches or tool calls already performed.
