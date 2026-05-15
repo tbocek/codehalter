@@ -74,7 +74,7 @@ func listProjectFiles(root string) []string {
 }
 
 func init() {
-	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "list_files",
@@ -108,7 +108,7 @@ func init() {
 		return strings.Join(files, "\n")
 	}})
 
-	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",

@@ -44,7 +44,7 @@ func (a *agent) registerSubagentTool() {
 		}
 	}
 
-	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "launch_subagent",

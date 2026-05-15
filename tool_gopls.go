@@ -527,7 +527,7 @@ func truncateBlock(lines []string) string {
 //     sees the result preview without expanding the disclosure (e.g.
 //     "go_references router_stub.go:19:6 → 1 hit: cmd/build/.../main.go:22").
 func positionTool(name, description string, run func(ctx context.Context, g *Gopls, cwd, absPath string, line, col int) (modelText, panelText, titleSuffix string, err error)) Tool {
-	return Tool{ReadOnly: true, Def: map[string]any{
+	return Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        name,
@@ -606,7 +606,7 @@ func previewLocs(lines []string) string {
 }
 
 func init() {
-	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name": "go_symbols",

@@ -28,7 +28,7 @@ func (a *agent) discoverSandbox() {
 		return
 	}
 
-	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "safe_run_command",

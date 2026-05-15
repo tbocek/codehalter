@@ -13,7 +13,7 @@ import (
 const maxSearchResults = 100
 
 func init() {
-	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "search_text",

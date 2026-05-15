@@ -116,37 +116,23 @@ func TestResolvePath(t *testing.T) {
 // Tool filter
 // ---------------------------------------------------------------------------
 
-// TestToolFilter pins the three-way filter semantics: exclude trumps
-// everything, readOnly restricts to read-only tools unless include rescues
-// them.
+// TestToolFilter pins the exclude semantics: an empty filter passes every
+// registered tool, and the exclude set drops the named tools. The
+// "this tool mutates" gate is gone — every phase sees every tool.
 func TestToolFilter(t *testing.T) {
 	withFreshToolRegistry(t)
-	RegisterTool(Tool{Def: toolDef("read"), ReadOnly: true})
+	RegisterTool(Tool{Def: toolDef("read")})
 	RegisterTool(Tool{Def: toolDef("write")})
 	RegisterTool(Tool{Def: toolDef("other")})
 
-	// Output order mirrors registration order since llmToolDefinitionsFiltered
-	// iterates registeredTools in sequence — use slices.Equal, not a set cmp.
 	cases := []struct {
 		name   string
 		filter toolFilter
 		want   []string
 	}{
 		{"no filter", toolFilter{}, []string{"read", "write", "other"}},
-		{"read-only", toolFilter{readOnly: true}, []string{"read"}},
-		{"read-only with include",
-			toolFilter{readOnly: true, include: map[string]bool{"write": true}},
-			[]string{"read", "write"}},
-		{"exclude read",
-			toolFilter{exclude: map[string]bool{"read": true}},
-			[]string{"write", "other"}},
-		{"exclude trumps include",
-			toolFilter{
-				readOnly: true,
-				include:  map[string]bool{"write": true, "read": true},
-				exclude:  map[string]bool{"read": true},
-			},
-			[]string{"write"}},
+		{"exclude read", toolFilter{exclude: map[string]bool{"read": true}}, []string{"write", "other"}},
+		{"exclude two", toolFilter{exclude: map[string]bool{"read": true, "other": true}}, []string{"write"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

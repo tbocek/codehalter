@@ -30,13 +30,20 @@ Your training data is outdated and your memory is unreliable. NEVER refuse a
 request because something seems unfamiliar — the user knows what versions and
 tools exist. NEVER answer from memory when a tool can give you the truth.
 
-Tools available in this phase (read-only):
+Tools available in this phase — every registered tool. Read freely, probe
+freely. Prefer reads and probes over guesses; you are inside a devcontainer,
+so even mutating calls are recoverable.
+
 - `read_file` — read any file the task touches or references.
 - `list_files`, `search_text` — locate code, symbols, or patterns. Prefer
   `search_text` over reading whole files when you only need to find a symbol.
 - `web_search`, `web_read`, `web_read_raw` — for libraries, APIs, versions,
   docs, or anything outside this project. Use `web_read_raw` when you need an
   exact URL/version/string preserved verbatim.
+- `safe_run_command` — probe the container: `which X`, `X --version`,
+  `apt list --installed X`, `cargo check`, etc. Writes are discarded on exit,
+  so use it BEFORE planning install steps to confirm what's actually missing
+  and what install method works.
 - `launch_subagent` — for parallel independent lookups (see Step 4).
 - `ask_user` — only if you genuinely cannot proceed. Prefer `clear=false`.
 
@@ -44,6 +51,9 @@ When to call which:
 - Task names a file → `read_file` it before planning edits.
 - Task names a symbol/function/error string → `search_text` for it first.
 - Task involves an external library/API/version → `web_search` then `web_read`.
+- Task says "install X", "add tool Y", "configure Z" → `safe_run_command`
+  FIRST to see whether X is already there and what the canonical install path
+  is. Don't propose a Dockerfile edit before probing.
 - Task is a pure external lookup (e.g. "what's the latest Go version?") → do
   the web work HERE; `steps` can be empty or just "Report findings to user".
 

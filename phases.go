@@ -50,7 +50,7 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 	}
 	messages := []llmMessage{{Role: "user", Content: planPrompt + "\n\nUser request: " + userText}}
 	var plan planResult
-	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{readOnly: true}, &plan)
+	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{}, &plan)
 	if err != nil {
 		return thinking, nil, planRes.ToolUses, nil
 	}
@@ -191,8 +191,7 @@ func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessag
 		exclude[name] = true
 	}
 	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, "execute", a.llmTier(sid)), messages, toolFilter{
-		readOnly: false,
-		exclude:  exclude,
+		exclude: exclude,
 	})
 }
 
@@ -232,10 +231,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, 
 
 	verifyMessages := append(messages, llmMessage{Role: "user", Content: prompt.String()})
 	var result verifyResult
-	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{
-		readOnly: true,
-		include:  map[string]bool{"run_task": true},
-	}, &result)
+	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{}, &result)
 	res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
 	if err != nil {
 		slog.Error("verify: skipped, treating as success", "err", err)
@@ -262,11 +258,8 @@ func hasFileWrites(uses []ToolUse) bool {
 }
 
 // document runs after a successful verify when the turn actually wrote files.
-// It hands the executor's response to the thinking LLM with DOCUMENT.md and a
-// read-only tool set augmented with write_file/edit_file so the LLM can update
-// (or create) the project README when the change is user-visible. readOnly:true
-// suppresses chat streaming so the user doesn't see "no doc change needed"
-// noise on routine turns.
+// It hands the executor's response to the thinking LLM with DOCUMENT.md so the
+// LLM can update (or create) the project README when the change is user-visible.
 func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection, userText string, planSteps []string, exec toolLoopResult) (toolLoopResult, error) {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
 	if docPrompt == "" {
@@ -287,13 +280,7 @@ func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection
 	prompt.WriteString(exec.Text)
 
 	messages := []llmMessage{{Role: "user", Content: prompt.String()}}
-	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{
-		readOnly: true,
-		include: map[string]bool{
-			"write_file": true,
-			"edit_file":  true,
-		},
-	})
+	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{})
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil

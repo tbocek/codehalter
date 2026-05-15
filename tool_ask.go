@@ -54,7 +54,7 @@ func (a *agent) askChoiceAuto(ctx context.Context, sid SessionId, tcId string, c
 }
 
 func init() {
-	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "ask_user",

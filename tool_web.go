@@ -371,7 +371,7 @@ func nextBrowserPort() int {
 }
 
 func init() {
-	RegisterTool(Tool{ReadOnly: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "web_search",
@@ -440,12 +440,12 @@ func init() {
 		return formatted
 	}})
 
-	RegisterTool(Tool{ReadOnly: true, Def: webReadDef(
+	RegisterTool(Tool{Def: webReadDef(
 		"web_read",
 		"Open a URL in Firefox and return a concise summary of the page content. Use this for unstructured information (what does the page say about X). The user will review the page before the summary is returned.",
 	), Execute: makeWebRead(true)})
 
-	RegisterTool(Tool{ReadOnly: true, Def: webReadDef(
+	RegisterTool(Tool{Def: webReadDef(
 		"web_read_raw",
 		"Open a URL in Firefox and return the raw extracted text (truncated). Use this when summarization would lose precision: finding a specific download URL on the page, exact version numbers, code snippets, or any string that must be preserved verbatim. The user will review the page before the text is returned.",
 	), Execute: makeWebRead(false)})
@@ -483,7 +483,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 
 		a.logSession(sid, "WEB", "open URL: %s", targetURL)
 
-		tcId := a.StartToolCall(ctx, sid, "Opening: "+targetURL, "search", nil)
+		tcId := a.StartToolCall(ctx, sid, "Web Read: "+targetURL, "search", nil)
 
 		port := nextBrowserPort()
 		browser, err := StartBrowser(ctx, port, targetURL)
@@ -507,7 +507,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 		if issue := pageIssue(text); issue != "" {
 			icon, msg = "🟡", issue
 		}
-		a.CompleteToolCallTitled(ctx, sid, tcId, icon+" "+targetURL,
+		a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read: "+targetURL+" "+icon,
 			[]ToolCallContent{TextContent(icon + " " + msg)})
 
 		a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))

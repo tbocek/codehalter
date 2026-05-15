@@ -36,9 +36,8 @@ func (a *agent) resolvePath(sid SessionId, path string) (string, error) {
 // ---------------------------------------------------------------------------
 
 type Tool struct {
-	Def      map[string]any
-	ReadOnly bool // non-destructive, safe to use during planning
-	Execute  func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string
+	Def     map[string]any
+	Execute func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string
 }
 
 var registeredTools []Tool
@@ -47,17 +46,12 @@ func RegisterTool(t Tool) {
 	registeredTools = append(registeredTools, t)
 }
 
+// toolFilter lets phases exclude specific tools from a turn (e.g. execute
+// strips web_search/web_read so the model can't go fishing mid-edit). Every
+// other tool is exposed in every phase — we run inside a devcontainer, so
+// "this tool might mutate" is no longer a reason to hide it from the planner.
 type toolFilter struct {
-	readOnly bool
-	include  map[string]bool // non-ReadOnly tools to include anyway
-	exclude  map[string]bool // tools to exclude
-}
-
-func llmToolDefinitions(readOnly bool, extraTools ...string) []map[string]any {
-	return llmToolDefinitionsFiltered(toolFilter{
-		readOnly: readOnly,
-		include:  toSet(extraTools),
-	})
+	exclude map[string]bool
 }
 
 func llmToolDefinitionsFiltered(f toolFilter) []map[string]any {
@@ -66,9 +60,6 @@ func llmToolDefinitionsFiltered(f toolFilter) []map[string]any {
 		fn, _ := t.Def["function"].(map[string]any)
 		name, _ := fn["name"].(string)
 		if f.exclude[name] {
-			continue
-		}
-		if f.readOnly && !t.ReadOnly && !f.include[name] {
 			continue
 		}
 		defs = append(defs, t.Def)
@@ -84,14 +75,6 @@ func parseArgs(rawArgs string) map[string]string {
 		args = make(map[string]string)
 	}
 	return args
-}
-
-func toSet(s []string) map[string]bool {
-	m := make(map[string]bool, len(s))
-	for _, v := range s {
-		m[v] = true
-	}
-	return m
 }
 
 func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) string {

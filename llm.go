@@ -559,28 +559,13 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMCon
 }
 
 // runToolLoop runs the agentic tool loop: send to LLM, execute tool calls, repeat.
-// When filter.readOnly is true, only read-only tools are sent and tokens are
-// not streamed to Zed.
+// Tokens always stream to Zed so the user sees every phase (planner JSON,
+// verifier reasoning, doc writer) in chat — there's nothing to hide.
 func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter) (toolLoopResult, error) {
 	tools := llmToolDefinitionsFiltered(filter)
-	var on onToken
-	if !filter.readOnly {
-		on = func(token string) {
-			if sid != "" {
-				a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(token)))
-			}
-		}
-	}
-
-	// readOnlyByName lets the dedup cache distinguish idempotent tools
-	// (read_file, list_files, …) from mutators (write_file, edit_file,
-	// run_task). Only read-only results are cached, and any mutator clears
-	// the cache so a subsequent read sees post-mutation state.
-	readOnlyByName := make(map[string]bool, len(registeredTools))
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		if name, _ := fn["name"].(string); name != "" {
-			readOnlyByName[name] = t.ReadOnly
+	on := func(token string) {
+		if sid != "" {
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(token)))
 		}
 	}
 
@@ -607,22 +592,19 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 		})
 
 		for _, tc := range calls {
-			// Per-loop dedup: small models often call read_file / list_files
-			// with identical args repeatedly. Cache only idempotent tools, and
-			// invalidate on any mutator so a read after write sees fresh state.
-			readOnly := readOnlyByName[tc.Function.Name]
+			// Per-loop dedup: small models often re-issue identical calls
+			// (read_file looped on the same path, write_file with the same
+			// content). One cache keyed by name+args covers both: the second
+			// hit returns the first result with a "[deduped: …]" banner so
+			// the model knows it already did this.
 			key := tc.Function.Name + "\x00" + tc.Function.Arguments
 			started := time.Now()
 			var result string
-			if cached, ok := callCache[key]; ok && readOnly {
+			if cached, ok := callCache[key]; ok {
 				result = "[deduped: identical " + tc.Function.Name + " call earlier in this turn]\n" + cached
 			} else {
 				result = a.executeTool(ctx, sid, tc)
-				if readOnly {
-					callCache[key] = result
-				} else {
-					callCache = make(map[string]string)
-				}
+				callCache[key] = result
 			}
 			tu := ToolUse{
 				Name:       tc.Function.Name,
