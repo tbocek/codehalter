@@ -77,12 +77,15 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 		defer a.notifyPhaseSuffix(ctx, sid, "")
 	}
 
-	// Per-session log: request header + body, then we'll tee the raw SSE
-	// response into the same file as it streams. Closed on return.
+	// Per-session log: request header + body. The raw SSE wire is too noisy
+	// to read (one event per token, each repeating the full envelope), so we
+	// parse the stream and write a single aggregated RESPONSE block at the
+	// end. Mid-stream events (HTTP errors, partial state on transport
+	// failure) are appended inline below. Closed on return.
 	logF := a.sessionLog(sid)
 	if logF != nil {
 		defer logF.Close()
-		fmt.Fprintf(logF, "\n=== %s [%s] REQUEST ===\n%s\n=== RESPONSE ===\n",
+		fmt.Fprintf(logF, "\n=== %s [%s] REQUEST ===\n%s\n",
 			time.Now().Format(time.RFC3339), conn.Tag, string(body))
 	}
 
@@ -134,14 +137,7 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 	var fullText strings.Builder
 	var calls []toolCall
 
-	// Tee SSE bytes into the session log so the unparsed wire output is
-	// preserved. Parser still reads the same stream because TeeReader splits
-	// every Read between the consumer and the file.
-	var respReader io.Reader = resp.Body
-	if logF != nil {
-		respReader = io.TeeReader(resp.Body, logF)
-	}
-	scanner := bufio.NewScanner(respReader)
+	scanner := bufio.NewScanner(resp.Body)
 	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
 	// line limit silently truncates. 4 MB matches common reverse-proxy caps.
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
@@ -182,10 +178,36 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 		}
 	}
 	if err := scanner.Err(); err != nil {
+		writeResponseLog(logF, fullText.String(), calls, err)
 		return fullText.String(), calls, fmt.Errorf("reading SSE stream: %w", err)
 	}
 
+	writeResponseLog(logF, fullText.String(), calls, nil)
 	return fullText.String(), calls, nil
+}
+
+// writeResponseLog emits one compact RESPONSE block per LLM call. The raw SSE
+// wire is one event per token (~100 lines for a short reply, thousands for a
+// tool-call argument blob) — useless for skimming. This collapses all the
+// deltas into the reconstructed text and tool calls so the log reads like a
+// transcript instead of a packet capture.
+func writeResponseLog(logF *os.File, text string, calls []toolCall, streamErr error) {
+	if logF == nil {
+		return
+	}
+	fmt.Fprintln(logF, "=== RESPONSE ===")
+	if text != "" {
+		fmt.Fprintf(logF, "content:\n%s\n", text)
+	}
+	for i, c := range calls {
+		fmt.Fprintf(logF, "tool_call[%d] %s id=%s args=%s\n", i, c.Function.Name, c.ID, c.Function.Arguments)
+	}
+	if text == "" && len(calls) == 0 {
+		fmt.Fprintln(logF, "(empty response)")
+	}
+	if streamErr != nil {
+		fmt.Fprintf(logF, "[stream error] %v\n", streamErr)
+	}
 }
 
 // probeResult is what a single LLM probe call yields: server reachability,

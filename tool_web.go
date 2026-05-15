@@ -356,7 +356,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "web_search",
-			"description": "Search the web with DuckDuckGo. Returns up to 10 results as a numbered list (title, URL, snippet) for you to triage — does NOT fetch page content. Pick the 1-3 most promising URLs and follow up with web_read (summarized) or web_read_raw (raw text — for finding a specific link/string verbatim); do not open every result.",
+			"description": "Search the web with DuckDuckGo. Returns up to 10 results as a numbered list (title, URL, snippet) for you to triage — does NOT fetch page content. Snippets alone are NOT enough to answer factual questions: you MUST follow up by calling web_read (summarized) or web_read_raw (raw text — for finding a specific link/string verbatim) on at least one (ideally 1-3) of the most promising URLs. Skipping web_read is only acceptable if every result is clearly off-topic, in which case you should refine the query and search again.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"query"},
@@ -414,6 +414,9 @@ func init() {
 		a.CompleteToolCallTitled(ctx, sid, tcId,
 			fmt.Sprintf("✅ DuckDuckGo: %s → %d results", query, len(results)),
 			[]ToolCallContent{TextContent(formatted)})
+		// Surface the list inline in the chat too, so the user can see the
+		// URLs and snippets without expanding the tool card.
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("\n"+formatted+"\n")))
 		a.logSession(sid, "WEB", "results (%d):\n%s", len(results), formatted)
 		return formatted
 	}})

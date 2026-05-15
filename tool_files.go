@@ -167,10 +167,15 @@ func init() {
 				lineCount++
 			}
 		}
-		resultTitle := fmt.Sprintf("✅ %s → %d lines", path, lineCount)
-		if args["line"] != "" {
-			resultTitle = fmt.Sprintf("✅ %s:%s → %d lines", path, args["line"], lineCount)
+		start := 1
+		if v, err := strconv.Atoi(args["line"]); err == nil && v > 0 {
+			start = v
 		}
+		end := start
+		if lineCount > 0 {
+			end = start + lineCount - 1
+		}
+		resultTitle := fmt.Sprintf("Reading: %s (%d-%d)", path, start, end)
 		if truncNote != "" {
 			resultTitle += " (truncated)"
 		}
