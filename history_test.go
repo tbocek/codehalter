@@ -289,9 +289,9 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 				},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 			args := parseArgs(rawArgs)
-			return "echo: " + args["msg"]
+			return "echo: " + args["msg"], false
 		},
 	})
 
@@ -385,9 +385,9 @@ func TestToolLoopDedup(t *testing.T) {
 				"parameters": map[string]any{"type": "object"},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 			reads++
-			return "read-ok"
+			return "read-ok", false
 		},
 	})
 	RegisterTool(Tool{
@@ -398,9 +398,9 @@ func TestToolLoopDedup(t *testing.T) {
 				"parameters": map[string]any{"type": "object"},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 			writes++
-			return "wrote"
+			return "wrote", false
 		},
 	})
 

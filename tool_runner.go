@@ -70,12 +70,12 @@ func (a *agent) discoverRunners(cwd string) {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		task := args["task"]
 		parts := strings.SplitN(task, ":", 2)
 		if len(parts) != 2 {
-			return "error: task must be in format runner:target"
+			return "error: task must be in format runner:target", false
 		}
 		runnerName, target := parts[0], parts[1]
 
@@ -91,12 +91,12 @@ func (a *agent) discoverRunners(cwd string) {
 		a.mu.Unlock()
 
 		if runner == nil {
-			return fmt.Sprintf("error: unknown runner %q", runnerName)
+			return fmt.Sprintf("error: unknown runner %q", runnerName), false
 		}
 
 		sess := a.getSession(sid)
 		if sess == nil {
-			return "error: no session"
+			return "error: no session", false
 		}
 
 		tcId := a.StartToolCall(ctx, sid, "Running: "+task, "execute", nil)
@@ -113,7 +113,9 @@ func (a *agent) discoverRunners(cwd string) {
 
 		if err := cmd.Start(); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error starting task: " + err.Error()
+			// Couldn't even start the runner — that's a real failure,
+			// not just a non-zero exit. Flag it so verify catches it.
+			return "error starting task: " + err.Error(), true
 		}
 
 		waitErr := make(chan error, 1)
@@ -139,8 +141,10 @@ func (a *agent) discoverRunners(cwd string) {
 
 		// Surface a non-zero exit unambiguously: a banner at the TOP and
 		// bottom of the returned output (so a long stdout transcript can't
-		// bury it) plus a failed-status card so the UI renders red. Verify
-		// treats any failed run_task as a hard failure — see VERIFY.md.
+		// bury it) plus a failed-status card so the UI renders red. The
+		// returned `failed=true` is the authoritative signal — verify uses
+		// it to override an LLM "success=true" verdict (see phases.go).
+		// The banner still helps the model see the failure in-context.
 		if runErr != nil {
 			banner := fmt.Sprintf("❌ TASK FAILED: %s (%s)\n", task, runErr.Error())
 			result := banner + "\n" + collected.String() + "\n" + banner
@@ -151,11 +155,11 @@ func (a *agent) discoverRunners(cwd string) {
 				Status:     "failed",
 				Content:    []ToolCallContent{TextContent(result)},
 			})
-			return result
+			return result, true
 		}
 		result := collected.String()
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
-		return result
+		return result, false
 	}})
 }
 

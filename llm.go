@@ -340,24 +340,32 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 	return r, true
 }
 
-// pickAvailable picks an LLMConnection from the role/tier candidate list,
-// round-robining the starting index so parallel callers (subagents in
-// particular) spread across configured servers instead of all hammering the
-// first one. From the rotor's offset we then scan with wrap-around for a
-// server with a free slot. If none has one, we fall back to the rotor's
-// starting position — the caller's LLM call will queue server-side or surface
-// a clear error. Returns nil only when no connections are configured.
+// pickAvailable routes by tier so the main agent's prefix KV cache on conn 0
+// stays warm across turns:
+//
+//   - tier=="main": pin to conn 0 with role-specific extra_body merged. No
+//     rotor, no slot probe — if conn 0 is busy the call queues server-side
+//     rather than spilling onto another server and cold-starting the prefix.
+//     Only falls through to round-robin when conn 0 was marked unreachable
+//     by the startup probe.
+//   - tier=="subagent": round-robin across reachable conns 1+. Conn 0 is
+//     reserved for the main agent's slot; subagents only land there when no
+//     conn 1+ exists (single-connection setups) or every conn 1+ is dead.
+//
+// Returns nil only when no connections are configured.
 func (a *agent) pickAvailable(ctx context.Context, role, tier string) *LLMConnection {
 	cs := a.settings.LLMCandidates(role, tier)
 	if len(cs) == 0 {
 		return nil
 	}
-	// Drop connections the startup probe couldn't reach so they don't burn
-	// a /slots timeout every call. If every candidate is marked dead, skip
-	// slot probing too — return the first preference so the caller surfaces
-	// a clear "LLM unreachable" error instead of waiting 2s per server.
+
+	// Drop connections the startup probe couldn't reach so we don't burn a
+	// /slots timeout per call. If every candidate is dead, return the first
+	// so the caller surfaces a clear "LLM unreachable" error instead of
+	// waiting 2s per server.
+	alive := cs
 	if len(a.connReachable) > 0 {
-		var alive []LLMConnection
+		alive = alive[:0:0]
 		for _, c := range cs {
 			if a.connReachable[connKey(&c)] {
 				alive = append(alive, c)
@@ -366,16 +374,42 @@ func (a *agent) pickAvailable(ctx context.Context, role, tier string) *LLMConnec
 		if len(alive) == 0 {
 			return &cs[0]
 		}
-		cs = alive
 	}
-	start := int(a.pickRotor.Add(1)-1) % len(cs)
-	for i := 0; i < len(cs); i++ {
-		idx := (start + i) % len(cs)
-		if a.hasSlot(ctx, &cs[idx]) {
-			return &cs[idx]
+
+	if tier == "main" {
+		// LLMCandidates("main") orders [0, 1, ...] within a role, so the
+		// first alive entry whose conn-key matches conns[0] IS conn 0 with
+		// role-merged extra_body. Use it sticky.
+		zeroKey := connKey(&a.settings.LLMConnections[0])
+		for i := range alive {
+			if connKey(&alive[i]) == zeroKey {
+				return &alive[i]
+			}
+		}
+		// Conn 0 unreachable — fall through to round-robin on the rest.
+	} else if tier == "subagent" && len(alive) > 1 {
+		// Strip conn 0 so subagents can't evict the main agent's prefix
+		// cache. Keep it as a last-resort fallback when no conn 1+ is alive.
+		zeroKey := connKey(&a.settings.LLMConnections[0])
+		filtered := alive[:0:0]
+		for _, c := range alive {
+			if connKey(&c) != zeroKey {
+				filtered = append(filtered, c)
+			}
+		}
+		if len(filtered) > 0 {
+			alive = filtered
 		}
 	}
-	return &cs[start]
+
+	start := int(a.pickRotor.Add(1)-1) % len(alive)
+	for i := 0; i < len(alive); i++ {
+		idx := (start + i) % len(alive)
+		if a.hasSlot(ctx, &alive[idx]) {
+			return &alive[idx]
+		}
+	}
+	return &alive[start]
 }
 
 // hasSlot returns true if the server has at least one idle slot, or if slot
@@ -531,6 +565,14 @@ type toolLoopResult struct {
 	ToolUses []ToolUse
 }
 
+// toolCacheEntry remembers both halves of a tool result so a deduped second
+// call returns the same (output, failed) the first call produced. Without
+// this, a cached "run_task" hit would lose the failure flag.
+type toolCacheEntry struct {
+	output string
+	failed bool
+}
+
 // runToolLoopJSON runs the tool loop and unmarshals the response into dst.
 // Small models routinely produce JSON with surrounding prose; on parse
 // failure we send one corrective follow-up ("reply with ONLY JSON") and try
@@ -575,7 +617,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 
 	var res toolLoopResult
 	var allText strings.Builder
-	callCache := make(map[string]string)
+	callCache := make(map[string]toolCacheEntry)
 	for {
 		text, calls, err := a.llmStream(ctx, sid, conn, messages, tools, on)
 		if err != nil {
@@ -604,16 +646,19 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 			key := tc.Function.Name + "\x00" + tc.Function.Arguments
 			started := time.Now()
 			var result string
+			var failed bool
 			if cached, ok := callCache[key]; ok {
-				result = "[deduped: identical " + tc.Function.Name + " call earlier in this turn]\n" + cached
+				result = "[deduped: identical " + tc.Function.Name + " call earlier in this turn]\n" + cached.output
+				failed = cached.failed
 			} else {
-				result = a.executeTool(ctx, sid, tc)
-				callCache[key] = result
+				result, failed = a.executeTool(ctx, sid, tc)
+				callCache[key] = toolCacheEntry{output: result, failed: failed}
 			}
 			tu := ToolUse{
 				Name:       tc.Function.Name,
 				Input:      tc.Function.Arguments,
 				Output:     result,
+				Failed:     failed,
 				StartedAt:  started,
 				DurationMs: time.Since(started).Milliseconds(),
 			}

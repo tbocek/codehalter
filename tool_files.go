@@ -86,18 +86,18 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
-			args := parseArgs(rawArgs)
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		args := parseArgs(rawArgs)
 		sess := a.getSession(sid)
 		if sess == nil {
-			return "error: no session"
+			return "error: no session", false
 		}
 		root := sess.Cwd
 		dir := root
 		if subdir := args["path"]; subdir != "" {
 			resolved, err := a.resolvePath(sid, subdir)
 			if err != nil {
-				return "error: " + err.Error()
+				return "error: " + err.Error(), false
 			}
 			dir = resolved
 		}
@@ -107,7 +107,7 @@ func init() {
 		a.CompleteToolCallTitled(ctx, sid, tcId,
 			fmt.Sprintf("Listing: %s (%d files)", dir, len(files)),
 			[]ToolCallContent{TextContent(fmt.Sprintf("%d files", len(files)))})
-		return strings.Join(files, "\n")
+		return strings.Join(files, "\n"), false
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -125,11 +125,11 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
-			args := parseArgs(rawArgs)
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 
 		title := "Reading: " + path
@@ -155,7 +155,7 @@ func init() {
 		content, err := fsRead(a.conn.RPC(), ctx, sid, path, linePtr, &limit)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 
 		content, truncNote := capReadContent(content, explicitLimit, args["line"])
@@ -187,7 +187,7 @@ func init() {
 		}
 
 		a.CompleteToolCallTitled(ctx, sid, tcId, resultTitle, []ToolCallContent{TextContent(content)})
-		return content
+		return content, false
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -204,11 +204,11 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
-			args := parseArgs(rawArgs)
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 		newContent := args["content"]
 		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
@@ -217,12 +217,12 @@ func init() {
 
 		if err := fsWrite(a.conn.RPC(), ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error writing file: " + err.Error()
+			return "error writing file: " + err.Error(), false
 		}
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &oldContent, newContent)})
 
-		return "file written successfully"
+		return "file written successfully", false
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -240,11 +240,11 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
-			args := parseArgs(rawArgs)
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 		oldText := args["old_text"]
 		newText := args["new_text"]
@@ -254,29 +254,29 @@ func init() {
 		content, err := fsRead(a.conn.RPC(), ctx, sid, path, nil, nil)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error reading file: " + err.Error()
+			return "error reading file: " + err.Error(), false
 		}
 
 		count := strings.Count(content, oldText)
 		if count == 0 {
 			a.FailToolCall(ctx, sid, tcId, "old_text not found in file")
-			return "error: old_text not found in file"
+			return "error: old_text not found in file", false
 		}
 		if count > 1 {
 			a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("old_text matches %d times, must be unique", count))
-			return fmt.Sprintf("error: old_text matches %d times, must be unique", count)
+			return fmt.Sprintf("error: old_text matches %d times, must be unique", count), false
 		}
 
 		newContent := strings.Replace(content, oldText, newText, 1)
 
 		if err := fsWrite(a.conn.RPC(), ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error writing file: " + err.Error()
+			return "error writing file: " + err.Error(), false
 		}
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
 
-		return "file written successfully"
+		return "file written successfully", false
 	}})
 }
 

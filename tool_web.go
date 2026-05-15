@@ -387,11 +387,11 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		query := args["query"]
 		if query == "" {
-			return "error: query is required"
+			return "error: query is required", false
 		}
 
 		a.logSession(sid, "WEB", "search query: %s", query)
@@ -405,7 +405,7 @@ func init() {
 		browser, err := StartBrowser(ctx, port, searchURL)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error starting browser: " + err.Error()
+			return "error starting browser: " + err.Error(), false
 		}
 		defer browser.Close()
 		searchTab := browser.initialTab
@@ -422,7 +422,7 @@ func init() {
 		browser.CloseTab(ctx, searchTab)
 		if len(results) == 0 {
 			a.FailToolCall(ctx, sid, tcId, "no search results found")
-			return "error: no search results found"
+			return "error: no search results found", false
 		}
 
 		if len(results) > maxWebSearchResults {
@@ -437,7 +437,7 @@ func init() {
 		// URLs and snippets without expanding the tool card.
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("\n"+formatted+"\n")))
 		a.logSession(sid, "WEB", "results (%d):\n%s", len(results), formatted)
-		return formatted
+		return formatted, false
 	}})
 
 	RegisterTool(Tool{Def: webReadDef(
@@ -473,12 +473,12 @@ func webReadDef(name, description string) map[string]any {
 
 const maxRawPageChars = 30000
 
-func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string) string {
-	return func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string) (string, bool) {
+	return func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		targetURL := args["url"]
 		if targetURL == "" {
-			return "error: url is required"
+			return "error: url is required", false
 		}
 
 		a.logSession(sid, "WEB", "open URL: %s", targetURL)
@@ -489,7 +489,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 		browser, err := StartBrowser(ctx, port, targetURL)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error starting browser: " + err.Error()
+			return "error starting browser: " + err.Error(), false
 		}
 		defer browser.Close()
 		tabID := browser.initialTab
@@ -498,7 +498,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 		if err != nil {
 			a.logSession(sid, "WEB", "page text error: %s", err.Error())
 			a.FailToolCall(ctx, sid, tcId, "page text error: "+err.Error())
-			return "error getting page text: " + err.Error()
+			return "error getting page text: " + err.Error(), false
 		}
 
 		// Binary success/failure marker after the URL: ✅ when the body looks
@@ -517,12 +517,12 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 		a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))
 
 		if summarize {
-			return a.summarizePage(ctx, sid, "content of "+targetURL, targetURL, text)
+			return a.summarizePage(ctx, sid, "content of "+targetURL, targetURL, text), false
 		}
 		if len(text) > maxRawPageChars {
 			text = text[:maxRawPageChars] + "\n... (truncated)"
 		}
-		return text
+		return text, false
 	}
 }
 

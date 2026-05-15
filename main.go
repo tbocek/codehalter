@@ -115,9 +115,10 @@ type agent struct {
 	// timeout on every LLM call. Populated by checkLLM; nil before that.
 	connReachable map[string]bool
 
-	// pickRotor round-robins the starting index in pickAvailable so parallel
-	// callers (subagents in particular) fan out across configured servers
-	// instead of all piling onto the first idle candidate.
+	// pickRotor round-robins subagent calls across configured conns 1+ so
+	// parallel callers fan out instead of all piling onto the first idle
+	// candidate. Main-agent calls bypass the rotor (pinned to conn 0 to
+	// keep its prefix KV cache warm) — see pickAvailable.
 	pickRotor atomic.Uint64
 
 	// gopls is a lazily-started LSP client shared across tool calls so the
@@ -461,15 +462,11 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 	cwd := cwdOrDefault(req.Cwd)
 	s, err := loadSession(cwd, req.SessionId)
 	if err != nil {
-		if os.IsNotExist(err) {
-			s = newSessionWithID(cwd, req.SessionId)
-			if err := a.initSession(cwd, s); err != nil {
-				a.deleteSession(s.ID)
-				return LoadSessionResponse{}, err
-			}
-			a.startIndexing(s.ID, cwd)
-			return LoadSessionResponse{Modes: a.sessionModes()}, nil
-		}
+		// Don't resurrect a missing session under Zed's cached ID — its
+		// timestamp prefix came from a phantom earlier NewSession that
+		// never wrote a file (no prompt), so reusing it produces stale
+		// filenames (filename time is hours older than first-prompt time).
+		// Force Zed to call session/new with a fresh, current ID.
 		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
 	}
 	if err := a.initSession(cwd, s); err != nil {

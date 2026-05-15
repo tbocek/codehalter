@@ -205,15 +205,26 @@ type verifyResult struct {
 	FixSteps []string `json:"fix_steps,omitempty"`
 }
 
-// verify runs a self-check after execution. Result.FixSteps (when present)
-// signals the caller to re-plan with the failure context — the inline-fix
-// path was removed because small models tend to compound errors when handed
-// a growing context of fix attempts. Returns the final result and the verify
-// outcome.
-func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, res toolLoopResult, userText string, planSteps []string) (toolLoopResult, *verifyResult, error) {
+// verify runs a self-check after execution. It routes to the "execute" role
+// (lower temperature, less thinking) rather than reusing the planner's
+// connection — small thinking models tend to rationalize failures into
+// success=true, while a colder execute model sticks to the rule. Result.FixSteps
+// (when present) signals the caller to re-plan with the failure context — the
+// inline-fix path was removed because small models tend to compound errors when
+// handed a growing context of fix attempts. Returns the final result and the
+// verify outcome.
+//
+// When fallbackConn is non-nil, it's used only if no LLM is configured for the
+// execute role (test path with synthetic agent and no settings).
+func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConnection, messages []llmMessage, res toolLoopResult, userText string, planSteps []string) (toolLoopResult, *verifyResult, error) {
 	verifyPrompt := a.loadPromptFile(sid, "VERIFY.md")
 	if verifyPrompt == "" {
 		return res, &verifyResult{Success: true}, nil
+	}
+
+	conn := a.pickAvailable(ctx, "execute", a.llmTier(sid))
+	if conn == nil {
+		conn = fallbackConn
 	}
 
 	var prompt strings.Builder
@@ -229,6 +240,10 @@ func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, 
 	prompt.WriteString("\n\nYour response was:\n")
 	prompt.WriteString(res.Text)
 
+	// Capture executor's tool-use count before we append verify's own —
+	// the Failed override only inspects executor tools.
+	execToolCount := len(res.ToolUses)
+
 	verifyMessages := append(messages, llmMessage{Role: "user", Content: prompt.String()})
 	var result verifyResult
 	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{}, &result)
@@ -238,6 +253,22 @@ func (a *agent) verify(ctx context.Context, sid SessionId, conn *LLMConnection, 
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Verification skipped: "+err.Error()+"\n")))
 		return res, &verifyResult{Success: true}, nil
 	}
+
+	// Authoritative override: a typed-failed tool result during execution
+	// trumps the LLM's verdict. Small models routinely return success=true
+	// even after seeing a tool's "❌ TASK FAILED" banner in their context,
+	// so we don't trust the JSON when the raw exit-code stream disagrees.
+	if result.Success {
+		for i := 0; i < execToolCount; i++ {
+			u := res.ToolUses[i]
+			if u.Failed {
+				result.Success = false
+				result.Issues = append(result.Issues,
+					fmt.Sprintf("%s failed (exit-code override; verifier had reported success=true)", u.Name))
+			}
+		}
+	}
+
 	return res, &result, nil
 }
 

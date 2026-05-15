@@ -67,26 +67,26 @@ func (a *agent) registerSubagentTool() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, ag *agent, sid SessionId, rawArgs string) string {
+	}, Execute: func(ctx context.Context, ag *agent, sid SessionId, rawArgs string) (string, bool) {
 		// Parse tasks from raw JSON arguments.
 		var parsed struct {
 			Tasks []subagentTask `json:"tasks"`
 		}
 		if err := json.Unmarshal([]byte(rawArgs), &parsed); err != nil {
-			return "error: invalid JSON: " + err.Error()
+			return "error: invalid JSON: " + err.Error(), false
 		}
 		tasks := parsed.Tasks
 		if len(tasks) == 0 {
-			return "error: no tasks provided"
+			return "error: no tasks provided", false
 		}
 
 		// Check depth.
 		sess := ag.getSession(sid)
 		if sess == nil {
-			return "error: no session"
+			return "error: no session", false
 		}
 		if sess.Depth >= maxSubagentDepth {
-			return "error: maximum subagent nesting depth reached"
+			return "error: maximum subagent nesting depth reached", false
 		}
 
 		tcId := ag.StartToolCall(ctx, sid, fmt.Sprintf("Launching: %d subagent(s)", len(tasks)), "execute", nil)
@@ -176,7 +176,7 @@ func (a *agent) registerSubagentTool() {
 		}
 
 		ag.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf("%d subagent(s) completed", len(tasks)))})
-		return out.String()
+		return out.String(), false
 	}})
 }
 

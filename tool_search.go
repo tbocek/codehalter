@@ -28,22 +28,22 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
-			args := parseArgs(rawArgs)
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		args := parseArgs(rawArgs)
 		sess := a.getSession(sid)
 		if sess == nil {
-			return "error: no session"
+			return "error: no session", false
 		}
 		query := args["query"]
 		if query == "" {
-			return "error: query is empty"
+			return "error: query is empty", false
 		}
 
 		matcher := func(s string) bool { return strings.Contains(s, query) }
 		if args["regex"] == "true" {
 			re, err := regexp.Compile(query)
 			if err != nil {
-				return "error: invalid regex: " + err.Error()
+				return "error: invalid regex: " + err.Error(), false
 			}
 			matcher = re.MatchString
 		}
@@ -53,7 +53,7 @@ func init() {
 		if subdir := args["path"]; subdir != "" {
 			resolved, err := a.resolvePath(sid, subdir)
 			if err != nil {
-				return "error: " + err.Error()
+				return "error: " + err.Error(), false
 			}
 			dir = resolved
 		}
@@ -77,7 +77,7 @@ func init() {
 			a.CompleteToolCallTitled(ctx, sid, tcId,
 				"Searching: "+query+" (no matches)",
 				[]ToolCallContent{TextContent("no matches found")})
-			return "no matches found"
+			return "no matches found", false
 		}
 
 		summary := fmt.Sprintf("%d matches", len(results))
@@ -87,7 +87,7 @@ func init() {
 		a.CompleteToolCallTitled(ctx, sid, tcId,
 			fmt.Sprintf("Searching: %s (%s)", query, summary),
 			[]ToolCallContent{TextContent(summary)})
-		return strings.Join(results, "\n")
+		return strings.Join(results, "\n"), false
 	}})
 }
 

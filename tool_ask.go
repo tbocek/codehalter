@@ -69,14 +69,14 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
-			args := parseArgs(rawArgs)
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		args := parseArgs(rawArgs)
 		question, yesLabel, noLabel := args["question"], args["yes_label"], args["no_label"]
 		tcId := a.StartToolCall(ctx, sid, question, "think", nil)
 		ok, err := a.askYesNoAuto(ctx, sid, tcId, yesLabel, noLabel, true)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 		chosen := noLabel
 		if ok {
@@ -84,9 +84,9 @@ func init() {
 		}
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + chosen)})
 		if ok {
-			return "user said yes"
+			return "user said yes", false
 		}
-		return "user said no"
+		return "user said no", false
 	}})
 }
 

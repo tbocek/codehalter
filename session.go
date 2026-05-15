@@ -30,6 +30,11 @@ type ToolUse struct {
 	Name   string `toml:"name"`
 	Input  string `toml:"input"`
 	Output string `toml:"output"`
+	// Failed is set by the tool handler when it observed a hard failure
+	// (e.g. run_task saw a non-zero exit). Authoritative — verify uses it
+	// to override an LLM "success=true" verdict when codehalter itself
+	// knows the call failed. omitempty keeps older session files clean.
+	Failed bool `toml:"failed,omitempty"`
 	// StartedAt and DurationMs are populated by runToolLoop when the call is
 	// dispatched. omitempty keeps older session files decoding cleanly. For
 	// deduped cache hits DurationMs is near zero and StartedAt is when the
@@ -104,23 +109,12 @@ func loadSession(cwd string, id SessionId) (*Session, error) {
 	return &s, nil
 }
 
-// newSessionWithID builds the in-memory session struct but does NOT write the
-// toml file. The file appears on first Save() — typically from prompt.go after
-// the first user message. Zed opens an agent connection per editor tab; if a
-// tab is opened and never prompted, this avoids leaving an empty stub session
-// on disk that would clutter `listSessions` and confuse "why are there two
+// newSession builds the in-memory session struct but does NOT write the toml
+// file. The file appears on first Save() — typically from prompt.go after the
+// first user message. Zed opens an agent connection per editor tab; if a tab
+// is opened and never prompted, this avoids leaving an empty stub session on
+// disk that would clutter `listSessions` and confuse "why are there two
 // sessions for one project" (especially across container/host cwd mirrors).
-func newSessionWithID(cwd string, id SessionId) *Session {
-	filename := fmt.Sprintf("session_%s.toml", id)
-	path := filepath.Join(cwd, sessionDir, filename)
-	return &Session{
-		ID:        id,
-		Cwd:       cwd,
-		CreatedAt: time.Now(),
-		filePath:  path,
-	}
-}
-
 func newSession(cwd string) (*Session, error) {
 	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0755); err != nil {
 		return nil, fmt.Errorf("creating session dir: %w", err)

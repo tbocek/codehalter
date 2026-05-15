@@ -542,27 +542,27 @@ func positionTool(name, description string, run func(ctx context.Context, g *Gop
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		sess := a.getSession(sid)
 		if sess == nil {
-			return "error: no session"
+			return "error: no session", false
 		}
 		file := args["file"]
 		if file == "" {
-			return "error: file is empty"
+			return "error: file is empty", false
 		}
 		line, err := strconv.Atoi(args["line"])
 		if err != nil || line < 1 {
-			return "error: invalid line (must be 1-indexed integer)"
+			return "error: invalid line (must be 1-indexed integer)", false
 		}
 		col, err := strconv.Atoi(args["col"])
 		if err != nil || col < 1 {
-			return "error: invalid col (must be 1-indexed integer)"
+			return "error: invalid col (must be 1-indexed integer)", false
 		}
 		absPath, err := a.resolvePath(sid, file)
 		if err != nil {
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 
 		title := fmt.Sprintf("%s: %s:%d:%d", name, file, line, col)
@@ -570,12 +570,12 @@ func positionTool(name, description string, run func(ctx context.Context, g *Gop
 		g, err := a.ensureGopls(ctx, sess.Cwd)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 		modelText, panelText, titleSuffix, err := run(ctx, g, sess.Cwd, absPath, line, col)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 		if panelText == "" {
 			panelText = modelText
@@ -585,7 +585,7 @@ func positionTool(name, description string, run func(ctx context.Context, g *Gop
 			finalTitle = title + " → " + titleSuffix
 		}
 		a.CompleteToolCallTitled(ctx, sid, tcId, finalTitle, []ToolCallContent{TextContent(panelText)})
-		return modelText
+		return modelText, false
 	}}
 }
 
@@ -623,31 +623,31 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		sess := a.getSession(sid)
 		if sess == nil {
-			return "error: no session"
+			return "error: no session", false
 		}
 		query := args["query"]
 		if query == "" {
-			return "error: query is empty"
+			return "error: query is empty", false
 		}
 
 		tcId := a.StartToolCall(ctx, sid, "go_symbols: "+query, "search", nil)
 		g, err := a.ensureGopls(ctx, sess.Cwd)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 		syms, err := g.WorkspaceSymbol(ctx, query)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error: " + err.Error()
+			return "error: " + err.Error(), false
 		}
 		if len(syms) == 0 {
 			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("no symbols found")})
-			return "no symbols found"
+			return "no symbols found", false
 		}
 
 		lines := make([]string, 0, len(syms))
@@ -662,7 +662,7 @@ func init() {
 		}
 		title := "go_symbols: " + query + " → " + previewLocs(previews)
 		a.CompleteToolCallTitled(ctx, sid, tcId, title, []ToolCallContent{TextContent(truncateBlock(lines))})
-		return strings.Join(lines, "\n")
+		return strings.Join(lines, "\n"), false
 	}})
 
 	RegisterTool(positionTool("go_references",

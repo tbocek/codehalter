@@ -36,8 +36,15 @@ func (a *agent) resolvePath(sid SessionId, path string) (string, error) {
 // ---------------------------------------------------------------------------
 
 type Tool struct {
-	Def     map[string]any
-	Execute func(ctx context.Context, a *agent, sid SessionId, rawArgs string) string
+	Def map[string]any
+	// Execute returns the tool's output and a `failed` flag. `failed` is the
+	// authoritative signal that the underlying operation reported a hard
+	// failure (e.g. run_task observed a non-zero exit). It's surfaced as
+	// ToolUse.Failed so the verify phase can override an LLM "success=true"
+	// when codehalter itself saw the call fail. Most handlers return
+	// (output, false); only run_task and similar truth-bearing tools set
+	// failed=true.
+	Execute func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool)
 }
 
 var registeredTools []Tool
@@ -77,7 +84,7 @@ func parseArgs(rawArgs string) map[string]string {
 	return args
 }
 
-func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) string {
+func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) (string, bool) {
 	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 
 	var names []string
@@ -94,7 +101,7 @@ func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) str
 	// Listed names go back to the model as the tool result, so it can
 	// self-correct on the next turn instead of looping on the same hallucination.
 	return fmt.Sprintf("unknown tool %q. Use only the tools provided to you; available tools: %s",
-		tc.Function.Name, strings.Join(names, ", "))
+		tc.Function.Name, strings.Join(names, ", ")), false
 }
 
 // ---------------------------------------------------------------------------

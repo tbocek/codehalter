@@ -111,15 +111,15 @@ func (a *agent) discoverSandbox() {
 	}, Execute: runCmdExecute})
 }
 
-func runCmdExecute(ctx context.Context, a *agent, sid SessionId, rawArgs string) string {
+func runCmdExecute(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
 	cmdStr := args["command"]
 	if cmdStr == "" {
-		return "error: command is required"
+		return "error: command is required", false
 	}
 	sess := a.getSession(sid)
 	if sess == nil {
-		return "error: no session"
+		return "error: no session", false
 	}
 
 	tcId := a.StartToolCall(ctx, sid, "Run: "+cmdStr, "execute", nil)
@@ -134,7 +134,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid SessionId, rawArgs string)
 
 	if err := cmd.Start(); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return "error starting bash: " + err.Error()
+		return "error starting bash: " + err.Error(), false
 	}
 
 	waitErr := make(chan error, 1)
@@ -158,7 +158,8 @@ func runCmdExecute(ctx context.Context, a *agent, sid SessionId, rawArgs string)
 
 	// Always surface the exit code. run_command is a probe: non-zero is
 	// data, not failure. Title and result both carry "(exit N)" so the
-	// model can read either and act on it.
+	// model can read either and act on it. Failed is always false here —
+	// a probe exiting non-zero shouldn't fail the turn.
 	exitCode := 0
 	if exitErr, ok := runErr.(*exec.ExitError); ok {
 		exitCode = exitErr.ExitCode()
@@ -174,5 +175,5 @@ func runCmdExecute(ctx context.Context, a *agent, sid SessionId, rawArgs string)
 	a.CompleteToolCallTitled(ctx, sid, tcId,
 		fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),
 		[]ToolCallContent{TextContent(result)})
-	return result
+	return result, false
 }
