@@ -48,6 +48,15 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 	if planPrompt == "" {
 		return thinking, nil, nil, nil
 	}
+	// Tell the planner about the project's verify-class target so the final
+	// plan step names `just:verify` (or equivalent) instead of `just:test`.
+	// Without this, the small planner picks whatever target name comes to
+	// mind first and skips the chained tidy/vet/build steps that `verify`
+	// wraps. Same hint goes into execute/verify too, but those see the plan
+	// already locked in — the planner is the load-bearing place.
+	if hint := a.verifyTargetHint(); hint != "" {
+		planPrompt = planPrompt + "\n\n" + hint
+	}
 	messages := []llmMessage{{Role: "user", Content: planPrompt + "\n\nUser request: " + userText}}
 	var plan planResult
 	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{}, &plan)
@@ -216,10 +225,10 @@ func (a *agent) verifyTargetHint() string {
 // extraExclude lists additional tool names to exclude (e.g. launch_subagent
 // when a subagent has reached its max nesting depth).
 //
-// Execute is pinned to the "subagent" tier even for the main session so conn 0
-// stays exclusively warm for thinking-role prompts. Switching roles on the same
-// llama.cpp slot evicts the prefix cache; routing execute off conn 0 keeps the
-// planner/document KV cache hot turn-over-turn.
+// Routed via llmTier(sid): the main session always uses [llm] for cache
+// consistency — every phase (plan/execute/verify/document) hits the same slot
+// so the prefix cache stays warm across the whole turn. Subagent sessions
+// route to [[subllm]] so they don't evict the main slot's cache.
 func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessage, extraExclude ...string) (toolLoopResult, error) {
 	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
 	if hint := a.verifyTargetHint(); hint != "" {
@@ -241,7 +250,7 @@ func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessag
 	for _, name := range extraExclude {
 		exclude[name] = true
 	}
-	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, "execute", "subagent"), messages, toolFilter{
+	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, "execute", a.llmTier(sid)), messages, toolFilter{
 		exclude: exclude,
 	})
 }
@@ -273,9 +282,8 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 		return res, &verifyResult{Success: true}, nil
 	}
 
-	// Same reasoning as execute(): verify rides the subagent tier so conn 0
-	// stays warm for thinking-role prompts.
-	conn := a.pickAvailable(ctx, "execute", "subagent")
+	// Same routing as execute(): main session uses [llm], subagents use [[subllm]].
+	conn := a.pickAvailable(ctx, "execute", a.llmTier(sid))
 	if conn == nil {
 		conn = fallbackConn
 	}

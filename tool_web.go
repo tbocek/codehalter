@@ -527,11 +527,11 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 }
 
 // summarizePage uses the execute LLM to extract only the relevant information
-// from a web page. sid scopes the per-session debug log. Pinned to subagent
-// tier — the page-summarisation prompt shares nothing with the planner's
-// normal prefix, so running it on [llm] would evict the warm planner cache.
+// from a web page. sid scopes the per-session debug log. Routes via llmTier:
+// main session → [llm], subagent → [[subllm]] — same cache-consistency rule
+// as the rest of the pipeline.
 func (a *agent) summarizePage(ctx context.Context, sid SessionId, query, url, pageText string) string {
-	conn := a.pickAvailable(ctx, "execute", "subagent")
+	conn := a.pickAvailable(ctx, "execute", a.llmTier(sid))
 
 	// Truncate input to avoid overwhelming the LLM.
 	const maxInput = 8000

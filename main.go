@@ -210,6 +210,16 @@ func (a *agent) llmTier(sid SessionId) string {
 	return "main"
 }
 
+// tierForSession is the *Session-aware variant of llmTier, used by goroutines
+// (compressHistory, generateTitle, retitle) that already hold the session
+// pointer and don't need to look it up again.
+func tierForSession(sess *Session) string {
+	if sess != nil && sess.Depth > 0 {
+		return "subagent"
+	}
+	return "main"
+}
+
 func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) {
 	if a.conn == nil {
 		return
