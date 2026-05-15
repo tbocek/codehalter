@@ -109,12 +109,23 @@ func loadSession(cwd string, id SessionId) (*Session, error) {
 	return &s, nil
 }
 
-// newSession builds the in-memory session struct but does NOT write the toml
-// file. The file appears on first Save() — typically from prompt.go after the
-// first user message. Zed opens an agent connection per editor tab; if a tab
-// is opened and never prompted, this avoids leaving an empty stub session on
-// disk that would clutter `listSessions` and confuse "why are there two
-// sessions for one project" (especially across container/host cwd mirrors).
+// newSessionWithID resurrects a session under a Zed-supplied id (used by
+// LoadSession when the .toml is missing). The file appears on first Save() —
+// typically from prompt.go after the first user message. Zed opens an agent
+// connection per editor tab; if a tab is opened and never prompted, this
+// avoids leaving an empty stub session on disk that would clutter
+// listSessions.
+func newSessionWithID(cwd string, id SessionId) *Session {
+	filename := fmt.Sprintf("session_%s.toml", id)
+	path := filepath.Join(cwd, sessionDir, filename)
+	return &Session{
+		ID:        id,
+		Cwd:       cwd,
+		CreatedAt: time.Now(),
+		filePath:  path,
+	}
+}
+
 func newSession(cwd string) (*Session, error) {
 	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0755); err != nil {
 		return nil, fmt.Errorf("creating session dir: %w", err)

@@ -463,22 +463,20 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 	s, err := loadSession(cwd, req.SessionId)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Zed's cached ID points at a phantom session that never wrote
-			// a file (NewSession returned an ID but the user never
-			// prompted). Resurrecting under the cached ID would carry its
-			// stale timestamp into the new filename, so we mint a fresh
-			// session and hand Zed the new id via LoadSessionResponse —
-			// the protocol's sessionId field exists for exactly this case.
-			s, err := newSession(cwd)
-			if err != nil {
-				return LoadSessionResponse{}, err
-			}
+			// Zed cached an ID from an earlier session/new that never
+			// wrote a file (no prompt). It then sends session/load with
+			// that ID, and subsequently session/prompt under the same
+			// ID — LoadSessionResponse.sessionId is NOT honored by Zed,
+			// so we must accept the cached id as-is or prompts won't
+			// route. The filename inherits the cached id's stale
+			// timestamp, which is a known cosmetic wart.
+			s = newSessionWithID(cwd, req.SessionId)
 			if err := a.initSession(cwd, s); err != nil {
 				a.deleteSession(s.ID)
 				return LoadSessionResponse{}, err
 			}
 			a.startIndexing(s.ID, cwd)
-			return LoadSessionResponse{SessionId: s.ID, Modes: a.sessionModes()}, nil
+			return LoadSessionResponse{Modes: a.sessionModes()}, nil
 		}
 		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
 	}
