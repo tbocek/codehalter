@@ -339,7 +339,7 @@ func findFirefox() (string, error) {
 // Tool wrappers
 // ---------------------------------------------------------------------------
 
-const maxResultTabs = 10
+const maxWebSearchResults = 10
 
 var browserPortCounter atomic.Int32
 
@@ -356,7 +356,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "web_search",
-			"description": "Search the web using DuckDuckGo and open the top results in Firefox tabs for the user to review. Returns the list of result URLs. Follow up with web_read (summarized) or web_read_raw (raw text — for finding a specific link/string on the page).",
+			"description": "Search the web with DuckDuckGo. Returns up to 10 results as a numbered list (title, URL, snippet) for you to triage — does NOT fetch page content. Pick the 1-3 most promising URLs and follow up with web_read (summarized) or web_read_raw (raw text — for finding a specific link/string verbatim); do not open every result.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"query"},
@@ -392,62 +392,28 @@ func init() {
 		searchTab := browser.initialTab
 
 		// Wait for DDG results to render.
-		var links []string
+		var results []ddgResult
 		for i := 0; i < 30; i++ {
-			links, _ = extractDDGLinks(ctx, browser, searchTab)
-			if len(links) > 0 {
+			results, _ = extractDDGResults(ctx, browser, searchTab)
+			if len(results) > 0 {
 				break
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
 		browser.CloseTab(ctx, searchTab)
-		if len(links) == 0 {
+		if len(results) == 0 {
 			a.FailToolCall(ctx, sid, tcId, "no search results found")
 			return "error: no search results found"
 		}
 
-		if len(links) > maxResultTabs {
-			links = links[:maxResultTabs]
-		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{
-			TextContent(fmt.Sprintf("%d hits, opening in tabs", len(links))),
-		})
-
-		// Open each result in its own tab — emit a card per URL so the user
-		// sees which sites are being fetched, not just the final list. Peek
-		// the rendered text and flag bot walls / captchas so the LLM (and
-		// user) know which results aren't trustworthy.
-		var opened []string
-		issues := map[string]string{}
-		for _, link := range links {
-			openId := a.StartToolCall(ctx, sid, "Opening: "+link, "search", nil)
-			tab, err := browser.OpenTab(ctx, link)
-			if err != nil {
-				a.FailToolCall(ctx, sid, openId, err.Error())
-				continue
-			}
-			var content []ToolCallContent
-			if text, terr := browser.PageText(ctx, tab); terr == nil {
-				if issue := pageIssue(text); issue != "" {
-					issues[link] = issue
-					content = []ToolCallContent{TextContent("🟡 " + issue)}
-				}
-			}
-			a.CompleteToolCall(ctx, sid, openId, content)
-			opened = append(opened, link)
+		if len(results) > maxWebSearchResults {
+			results = results[:maxWebSearchResults]
 		}
 
-		a.logSession(sid, "WEB", "opened tabs (%d):\n%s", len(opened), strings.Join(opened, "\n"))
-
-		var results strings.Builder
-		for i, link := range opened {
-			if issue := issues[link]; issue != "" {
-				fmt.Fprintf(&results, "%d. %s   [🟡 %s]\n", i+1, link, issue)
-			} else {
-				fmt.Fprintf(&results, "%d. %s\n", i+1, link)
-			}
-		}
-		return results.String()
+		formatted := formatDDGResults(results)
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(formatted)})
+		a.logSession(sid, "WEB", "results (%d):\n%s", len(results), formatted)
+		return formatted
 	}})
 
 	RegisterTool(Tool{ReadOnly: true, Def: webReadDef(
@@ -504,19 +470,21 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 		defer browser.Close()
 		tabID := browser.initialTab
 
-		openMsg := "Page opened in Firefox."
-		if peek, perr := browser.PageText(ctx, tabID); perr == nil {
-			if issue := pageIssue(peek); issue != "" {
-				openMsg = "🟡 " + issue
-			}
-		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(openMsg)})
-
 		text, err := browser.PageText(ctx, tabID)
 		if err != nil {
 			a.logSession(sid, "WEB", "page text error: %s", err.Error())
+			a.FailToolCall(ctx, sid, tcId, "page text error: "+err.Error())
 			return "error getting page text: " + err.Error()
 		}
+
+		// One green check / yellow flag in both the collapsed title and the
+		// expanded content so status is visible without expanding the card.
+		icon, msg := "✅", "Page loaded"
+		if issue := pageIssue(text); issue != "" {
+			icon, msg = "🟡", issue
+		}
+		a.CompleteToolCallTitled(ctx, sid, tcId, icon+" "+targetURL,
+			[]ToolCallContent{TextContent(icon + " " + msg)})
 
 		a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))
 
@@ -659,19 +627,67 @@ func pageIssue(text string) string {
 	return ""
 }
 
-// extractDDGLinks extracts result URLs from a DuckDuckGo search results page.
-func extractDDGLinks(ctx context.Context, b *Browser, contextID string) ([]string, error) {
+// ddgResult is one row from a DuckDuckGo SERP.
+type ddgResult struct {
+	Title   string `json:"title"`
+	URL     string `json:"url"`
+	Snippet string `json:"snippet"`
+}
+
+// extractDDGResults pulls title/URL/snippet for each result on a DDG SERP and
+// drops duplicate URLs. DDG renders the same anchor in multiple sections
+// (organic + "people also viewed" + mobile carousel) so the raw query returns
+// the same href several times; we keep first-occurrence order.
+func extractDDGResults(ctx context.Context, b *Browser, contextID string) ([]ddgResult, error) {
 	js := `JSON.stringify(
-		Array.from(document.querySelectorAll('a[data-testid="result-title-a"]'))
-			.map(a => a.href)
-			.filter(h => h.startsWith('http'))
+		Array.from(document.querySelectorAll('a[data-testid="result-title-a"]')).map(a => {
+			const root = a.closest('article') || a.closest('[data-testid="result"]') || a.parentElement;
+			const snip = root && (
+				root.querySelector('[data-result="snippet"]') ||
+				root.querySelector('span[data-testid="result-snippet"]') ||
+				root.querySelector('.result__snippet')
+			);
+			return {
+				title: (a.innerText || "").trim(),
+				url: a.href,
+				snippet: snip ? (snip.innerText || "").trim() : ""
+			};
+		}).filter(r => r.url.startsWith('http'))
 	)`
 	raw, err := b.EvalJS(ctx, contextID, js)
 	if err != nil {
 		return nil, err
 	}
+	var all []ddgResult
+	if err := json.Unmarshal([]byte(raw), &all); err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(all))
+	out := make([]ddgResult, 0, len(all))
+	for _, r := range all {
+		if seen[r.URL] {
+			continue
+		}
+		seen[r.URL] = true
+		out = append(out, r)
+	}
+	return out, nil
+}
 
-	var links []string
-	json.Unmarshal([]byte(raw), &links)
-	return links, nil
+// formatDDGResults renders the result list as a compact numbered text block
+// for the LLM (and the chat panel) — title on one line, URL on the next,
+// snippet (when present) indented underneath.
+func formatDDGResults(rs []ddgResult) string {
+	var b strings.Builder
+	for i, r := range rs {
+		title := r.Title
+		if title == "" {
+			title = "(no title)"
+		}
+		fmt.Fprintf(&b, "%d. %s\n   %s\n", i+1, title, r.URL)
+		if r.Snippet != "" {
+			fmt.Fprintf(&b, "   %s\n", r.Snippet)
+		}
+	}
+	return b.String()
 }

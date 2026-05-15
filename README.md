@@ -11,7 +11,7 @@ An [ACP](https://spec.anthropic.com/acp)-compatible AI coding agent that connect
 - **Built-in tools** — `read_file`, `write_file`, `edit_file`, `list_files`, `search_text` (literal or regex), `run_task`, `ask_user`, `web_search`, `web_read`, `launch_subagent`.
 - **Task runner integration** — auto-discovers targets from `justfile`, `Makefile`, `package.json`, `go.mod`, or `Cargo.toml` and classifies them as build/test/lint/format for the startup report.
 - **Empty-project bootstrap** — fresh directories are flagged; the LLM asks on the first turn which language/runner to scaffold before writing anything.
-- **Web tools** — `web_search` (DuckDuckGo) and `web_read` open results in Firefox for review, then summarize. Restricted to the planning phase so execution stays offline.
+- **Web tools** — `web_search` (DuckDuckGo) returns a list of result titles/URLs/snippets for the LLM to triage; `web_read` then opens a chosen URL in Firefox and returns a summary (or `web_read_raw` for verbatim text). Restricted to the planning phase so execution stays offline.
 - **Image support** — when the active LLM advertises vision, prompt images are passed through as OpenAI-style content blocks.
 - **Session persistence** — conversations are saved as TOML files under `.codehalter/` and can be resumed across editor restarts.
 - **History compression** — older messages are hierarchically summarized by the `summary` LLM to stay within token budgets.
