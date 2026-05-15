@@ -64,13 +64,17 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 		return nil, fmt.Errorf("creating temp profile: %w", err)
 	}
 
+	// Start on about:blank, not initialURL: the CLI-driven load gives us no
+	// "load complete" signal, so PageText races the renderer and snapshots an
+	// empty body on fast servers. We Navigate() to initialURL below with
+	// wait:"complete" once BiDi is up.
 	cmd := exec.CommandContext(ctx, firefoxPath,
 		"-headless",
 		"--private-window",
 		"--no-remote",
 		"--profile", profileDir,
 		fmt.Sprintf("--remote-debugging-port=%d", port),
-		initialURL,
+		"about:blank",
 	)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
@@ -118,7 +122,7 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 	}
 	slog.Info("bidi session created", "result", string(result))
 
-	// Get the initial tab's context ID (Firefox opens with the initialURL).
+	// Get the initial tab's context ID (Firefox opened on about:blank).
 	treeResult, err := b.Send(ctx, "browsingContext.getTree", map[string]any{})
 	if err == nil {
 		var tree struct {
@@ -130,6 +134,21 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 		if len(tree.Contexts) > 0 {
 			b.initialTab = tree.Contexts[0].Context
 			slog.Info("initial tab", "context", b.initialTab)
+		}
+	}
+
+	// Drive the real navigation through BiDi so we get a load-complete barrier.
+	// Cap at 10s: wait:"complete" can hang on pages that never fire the load
+	// event (long-poll chats, sites that keep streaming). On timeout we ignore
+	// the error and continue — PageText on a partially-loaded body still beats
+	// failing the tool call.
+	if b.initialTab != "" && initialURL != "" {
+		navCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := b.Navigate(navCtx, b.initialTab, initialURL)
+		cancel()
+		if err != nil && navCtx.Err() == nil {
+			b.Close()
+			return nil, fmt.Errorf("navigating to %s: %w", initialURL, err)
 		}
 	}
 
