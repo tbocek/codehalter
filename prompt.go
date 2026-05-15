@@ -38,10 +38,10 @@ func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bo
 		status = "completed"
 	}
 	if sess := a.getSession(sid); sess != nil {
-		sess.mu.Lock()
+		sess.phaseMu.Lock()
 		sess.phaseCurrent = phase
 		sess.phaseActive = !done
-		sess.mu.Unlock()
+		sess.phaseMu.Unlock()
 	}
 	entry := PlanEntry{Content: phaseNames[phase], Priority: "medium", Status: status}
 	a.sendUpdate(ctx, sid, PlanUpdate([]PlanEntry{entry}))
@@ -58,10 +58,10 @@ func (a *agent) notifyPhaseSuffix(ctx context.Context, sid SessionId, suffix str
 	if sess == nil {
 		return
 	}
-	sess.mu.Lock()
+	sess.phaseMu.Lock()
 	active := sess.phaseActive
 	phase := sess.phaseCurrent
-	sess.mu.Unlock()
+	sess.phaseMu.Unlock()
 	if !active || phase < 0 || phase >= len(phaseNames) {
 		return
 	}
@@ -82,11 +82,11 @@ func (a *agent) finalizePlan(sid SessionId) {
 	if sess == nil {
 		return
 	}
-	sess.mu.Lock()
+	sess.phaseMu.Lock()
 	active := sess.phaseActive
 	phase := sess.phaseCurrent
 	sess.phaseActive = false
-	sess.mu.Unlock()
+	sess.phaseMu.Unlock()
 	if !active || phase < 0 || phase >= len(phaseNames) {
 		return
 	}
@@ -240,6 +240,12 @@ func (a *agent) runTaskCycle(
 	var result toolLoopResult
 	var lastVR *verifyResult
 	var seenBags []map[string]bool
+	// wroteFilesEver tracks whether ANY attempt in this retry loop performed a
+	// file write. The document gate at the bottom must see the cumulative
+	// answer: when verify failed on attempt N (causing a re-plan) and the
+	// final successful attempt only re-read files to confirm, result.ToolUses
+	// alone misses the earlier edits and the document phase silently skips.
+	wroteFilesEver := false
 	sess := a.getSession(sid)
 
 	conn := preConn
@@ -298,12 +304,24 @@ func (a *agent) runTaskCycle(
 		if err != nil {
 			return result, err
 		}
+		if hasFileWrites(result.ToolUses) {
+			wroteFilesEver = true
+		}
 
 		a.sendPhase(ctx, sid, 2, false)
 		var vr *verifyResult
+		preVerifyToolCount := len(result.ToolUses)
 		result, vr, err = a.verify(ctx, sid, conn, messages, result, planInput, planSteps)
 		if err != nil {
 			return result, err
+		}
+		// verify() runs the LLM with an unfiltered tool set, so it can
+		// invoke edit_file/write_file while re-checking the result. Capture
+		// any new file writes it produced so the cumulative wroteFilesEver
+		// flag (and the document gate downstream) sees them.
+		if len(result.ToolUses) > preVerifyToolCount &&
+			hasFileWrites(result.ToolUses[preVerifyToolCount:]) {
+			wroteFilesEver = true
 		}
 		lastVR = vr
 		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
@@ -352,7 +370,7 @@ func (a *agent) runTaskCycle(
 	// (we couldn't fix it but didn't bail) — skip the doc pass for those, the
 	// change isn't trustworthy enough to advertise in the README.
 	lastPhase := 2
-	if (lastVR == nil || lastVR.Success) && hasFileWrites(result.ToolUses) && conn != nil {
+	if (lastVR == nil || lastVR.Success) && wroteFilesEver && conn != nil {
 		a.sendPhase(ctx, sid, 3, false)
 		result, _ = a.document(ctx, sid, conn, userText, planSteps, result)
 		lastPhase = 3

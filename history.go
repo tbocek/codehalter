@@ -73,7 +73,14 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 		return
 	}
 
-	conn := a.pickAvailable(ctx, "execute", a.llmTier(sess.ID))
+	// Pinned to "subagent" tier (not llmTier) so the main [llm] slot's
+	// prefix cache survives compaction. Summarising a huge raw transcript has
+	// nothing in common with the planner's normal prefix, so running it on
+	// [llm] would evict the cache for no future-hit benefit. On subagent
+	// sessions llmTier would already return "subagent", so this is only a
+	// behavioural change for foreground sessions — exactly the ones we want
+	// to protect.
+	conn := a.pickAvailable(ctx, "execute", "subagent")
 
 	// Split 20/80: the older 80% is folded into a fresh summary, the
 	// recent 20% stays raw. (len*4)/5 lands at 0 only when len < 2 — in
@@ -136,9 +143,12 @@ func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnectio
 	return a.llmSimple(ctx, sid, conn, []llmMessage{{Role: "user", Content: prompt}})
 }
 
-// generateTitle asks the LLM to create a short title from the first user message.
+// generateTitle asks the LLM to create a short title from the first user
+// message. Routed to the subagent tier — a one-shot title prompt has nothing
+// in common with the planner's normal prefix, so running it on [llm] would
+// evict the warm planner cache for no future-hit benefit.
 func (a *agent) generateTitle(ctx context.Context, sess *Session, userText string) {
-	conn := a.pickAvailable(ctx, "thinking", a.llmTier(sess.ID))
+	conn := a.pickAvailable(ctx, "thinking", "subagent")
 	if conn == nil {
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot generate title: no LLM connections configured\n")))
 		return
@@ -172,12 +182,14 @@ func trimTitle(title string) string {
 	return title
 }
 
-// retitle updates the session title based on the current summary.
+// retitle updates the session title based on the current summary. Same
+// rationale as generateTitle — pinned to subagent tier to preserve the
+// planner's prefix cache on [llm].
 func (a *agent) retitle(ctx context.Context, sess *Session) {
 	if sess.Summary == "" {
 		return
 	}
-	conn := a.pickAvailable(ctx, "thinking", a.llmTier(sess.ID))
+	conn := a.pickAvailable(ctx, "thinking", "subagent")
 	if conn == nil {
 		return // already warned in compressHistory
 	}

@@ -94,24 +94,27 @@ func (a *agent) buildImproveSnapshot(sid SessionId) string {
 		b.WriteString("- (no settings.toml loaded)\n\n")
 	} else {
 		fmt.Fprintf(&b, "- path: %s\n", a.settings.path)
-		for i, c := range a.settings.LLMConnections {
-			tier := "subagent"
-			if i == 0 {
-				tier = "main"
+		if c := a.settings.LLM; c != nil {
+			apiKey := ""
+			if c.APIKey != "" {
+				apiKey = " api_key=<set>"
 			}
-			var roles []string
-			if c.ExtraBodyThinking != nil {
-				roles = append(roles, "thinking")
-			}
-			if c.ExtraBodyExecute != nil {
-				roles = append(roles, "execute")
+			fmt.Fprintf(&b, "- [llm] tier=main url=%s model=%s%s\n",
+				c.URL, c.Model, apiKey)
+		} else {
+			b.WriteString("- [llm] (not set)\n")
+		}
+		for i, c := range a.settings.SubLLM {
+			tag := c.Tag
+			if tag == "" {
+				tag = "any"
 			}
 			apiKey := ""
 			if c.APIKey != "" {
 				apiKey = " api_key=<set>"
 			}
-			fmt.Fprintf(&b, "- [%d] tier=%s url=%s model=%s roles=[%s]%s\n",
-				i, tier, c.URL, c.Model, strings.Join(roles, ","), apiKey)
+			fmt.Fprintf(&b, "- [subllm.%d] tier=subagent tag=%s url=%s model=%s%s\n",
+				i, tag, c.URL, c.Model, apiKey)
 		}
 		b.WriteString("\n")
 	}

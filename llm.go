@@ -69,13 +69,12 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 
 	body, _ := json.Marshal(reqBody)
 
-	// Surface "(thinking…)" on the active phase entry while a thinking-role
-	// LLM call is in flight. notifyPhaseSuffix is a no-op when no phase is
-	// active, so summarisation calls between phases don't flash anything.
-	if conn.Tag == "thinking" {
-		a.notifyPhaseSuffix(ctx, sid, " (thinking…)")
-		defer a.notifyPhaseSuffix(ctx, sid, "")
-	}
+	// Surface "(thinking…)" on the active phase entry while any LLM call is in
+	// flight — execute and verify can stall on cache misses too, not just the
+	// thinking role. notifyPhaseSuffix is a no-op when no phase is active so
+	// summarisation calls between phases don't flash anything.
+	a.notifyPhaseSuffix(ctx, sid, " (thinking…)")
+	defer a.notifyPhaseSuffix(ctx, sid, "")
 
 	// Per-session log: request header + body. The raw SSE wire is too noisy
 	// to read (one event per token, each repeating the full envelope), so we
@@ -340,19 +339,11 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 	return r, true
 }
 
-// pickAvailable routes by tier so the main agent's prefix KV cache on conn 0
-// stays warm across turns:
-//
-//   - tier=="main": pin to conn 0 with role-specific extra_body merged. No
-//     rotor, no slot probe — if conn 0 is busy the call queues server-side
-//     rather than spilling onto another server and cold-starting the prefix.
-//     Only falls through to round-robin when conn 0 was marked unreachable
-//     by the startup probe.
-//   - tier=="subagent": round-robin across reachable conns 1+. Conn 0 is
-//     reserved for the main agent's slot; subagents only land there when no
-//     conn 1+ exists (single-connection setups) or every conn 1+ is dead.
-//
-// Returns nil only when no connections are configured.
+// pickAvailable resolves a connection for the given role and tier. The schema
+// already separates tiers ([llm] vs [[subllm]]) so this just filters out
+// candidates the startup probe marked unreachable, then round-robins across
+// what remains (useful when multiple subllm entries share a tag, e.g. two
+// machines serving "execute"). Returns nil only when no connections exist.
 func (a *agent) pickAvailable(ctx context.Context, role, tier string) *LLMConnection {
 	cs := a.settings.LLMCandidates(role, tier)
 	if len(cs) == 0 {
@@ -373,32 +364,6 @@ func (a *agent) pickAvailable(ctx context.Context, role, tier string) *LLMConnec
 		}
 		if len(alive) == 0 {
 			return &cs[0]
-		}
-	}
-
-	if tier == "main" {
-		// LLMCandidates("main") orders [0, 1, ...] within a role, so the
-		// first alive entry whose conn-key matches conns[0] IS conn 0 with
-		// role-merged extra_body. Use it sticky.
-		zeroKey := connKey(&a.settings.LLMConnections[0])
-		for i := range alive {
-			if connKey(&alive[i]) == zeroKey {
-				return &alive[i]
-			}
-		}
-		// Conn 0 unreachable — fall through to round-robin on the rest.
-	} else if tier == "subagent" && len(alive) > 1 {
-		// Strip conn 0 so subagents can't evict the main agent's prefix
-		// cache. Keep it as a last-resort fallback when no conn 1+ is alive.
-		zeroKey := connKey(&a.settings.LLMConnections[0])
-		filtered := alive[:0:0]
-		for _, c := range alive {
-			if connKey(&c) != zeroKey {
-				filtered = append(filtered, c)
-			}
-		}
-		if len(filtered) > 0 {
-			alive = filtered
 		}
 	}
 
@@ -669,9 +634,21 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 				sess.AppendToolUse(tu)
 				_ = sess.Save()
 			}
+			// Small models routinely keep retrying a failing run_command
+			// without consulting the SKILL-*.md docs that were loaded into
+			// the system prompt at session start. Re-surface them at the
+			// moment the model would benefit most: right after the failure.
+			// Hint is appended to the live tool result only — not to the
+			// stored ToolUse.Output — so session.toml stays clean.
+			content := result
+			if failed {
+				if hint := a.failureSkillHint(sid, tc.Function.Name); hint != "" {
+					content = result + "\n\n" + hint
+				}
+			}
 			messages = append(messages, llmMessage{
 				Role:       "tool",
-				Content:    result,
+				Content:    content,
 				ToolCallID: tc.ID,
 			})
 		}

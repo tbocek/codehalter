@@ -48,26 +48,38 @@ On first run with neither file present, codehalter prompts to write a commented 
 
 ### Example settings
 
-Position-based: index 0 of `[[llmconnections]]` is the **main** tier (your foreground agent), indices 1+ are the **subagent** tier (parallel/offloaded work like `launch_subagent` or web summarisation). When the agent picks a connection, a session running at depth 0 prefers the main tier; subagents (depth > 0) prefer subagent tier. Each falls back to the other if needed.
+Two kinds of entries, separated by tier:
 
-Each connection declares per-role sampler overrides via `extra_body_thinking` and `extra_body_execute`. The right one is merged into every OpenAI request. Core fields (`model`, `messages`, `stream`, `tools`) always win over `extra_body_*`.
+- `[llm]` — the **main** tier connection (one entry). Owns the foreground session's KV cache, so its prefix stays warm across turns. Typically a smaller/faster model. Used for plan, document, and history compaction.
+- `[[subllm]]` — **subagent** tier connections (zero or more entries). Each declares `tag = "thinking"` or `tag = "execute"` to identify the role it serves. Used for execute/verify on the main session (so the main conn's cache isn't evicted by role swaps) and for any `launch_subagent` work.
+
+`params` is forwarded verbatim as the OpenAI request's extra body — put samplers and any model-specific knobs (`enable_thinking`, `reasoning_mode`, …) there. Core fields (`model`, `messages`, `stream`, `tools`) always win over `params`.
 
 ```toml
-[[llmconnections]]
+[llm]
 url = "http://localhost:8080/v1/chat/completions"
 model = "qwen3.6-27b"
-extra_body_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
-extra_body_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0 }
+params = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
+
+[[subllm]]
+tag = "execute"
+url = "http://other-host:9001/v1/chat/completions"
+model = "qwen3.5-122b"
+params = { temperature = 0.6, top_p = 0.8, top_k = 20, min_p = 0.0 }
+
+[[subllm]]
+tag = "thinking"
+url = "http://other-host:9001/v1/chat/completions"
+model = "qwen3.5-122b"
+params = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
 ```
 
-Add more `[[llmconnections]]` entries to split work across machines: index 0 stays the main tier, indices 1+ are subagent tier (`launch_subagent`, web-page summarisation). For a hybrid-reasoning model, drive the reasoning toggle from the same keys, e.g. `extra_body_thinking = { enable_thinking = true }` / `extra_body_execute = { enable_thinking = false }`.
+When `[[subllm]]` is empty, the main `[llm]` serves both tiers. Multiple `[[subllm]]` entries with the same `tag` are round-robined.
 
 | Role | Purpose | Suggested temperature |
 |------|---------|------------------------|
-| `thinking` | Planning, pre-verification, post-execution verification | ~1.0 (diverse hypotheses, edge-case exploration) |
-| `execute` | Tool loop, history compression, web-page summarisation | ~0.6 (precise, faithful) |
-
-If a role has no `extra_body_<role>` declared on any connection, codehalter falls back to the first connection in tier order with no overrides — the override is purely opt-in.
+| `thinking` | Planning, document, history compaction | ~1.0 (diverse hypotheses, edge-case exploration) |
+| `execute` | Tool loop, verify, web-page summarisation | ~0.6 (precise, faithful) |
 
 ### Prompt files
 

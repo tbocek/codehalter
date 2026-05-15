@@ -110,17 +110,52 @@ When `subtasks` is set, leave `steps` empty. The user gets one Interactive /
 Automatic / Cancel prompt for the whole batch; each subtask then runs its own
 plan→execute→verify cycle.
 
-## Step 4 — `launch_subagent` for parallel lookups
+## Step 4 — `launch_subagent` for parallel-safe work
 
-If the plan would have 2+ independent lookup steps (no step depends on
-another's output), collapse them into one `launch_subagent` step. Example:
-  Bad:
+Use `launch_subagent` for ANY work that is independent of other steps — not
+just lookups. Two heuristics, applied together:
+
+1. **Independence** — the step's inputs don't depend on another step's output,
+   and its writes don't conflict with another step's writes (different files,
+   or different non-overlapping sections of the same file).
+2. **Self-contained context** — the instructions you'd write for the subagent
+   plus the surrounding facts (file paths, version numbers, error strings)
+   are enough; the subagent doesn't need the rest of the conversation.
+
+When both hold, emit ONE `launch_subagent` step per independent unit. They run
+on a separate LLM connection and in parallel, so the wall-clock saving is real.
+
+Examples that QUALIFY:
+  Bad (sequential):
     1. Search for usages of foo
     2. Search for usages of bar
-  Good:
+  Good (parallel):
     1. launch_subagent: Search for usages of foo and bar; report files+lines.
 
-Do not use `launch_subagent` for sequential work or for the main edit pass.
+  Bad (sequential edits on independent files):
+    1. Bump go version in go.mod to 1.26
+    2. Bump go version in examples/go.mod to 1.26
+    3. Bump go version in site/go.mod to 1.26
+  Good (parallel edits, one subagent per file):
+    1. launch_subagent: Edit go.mod — change "go 1.25" to "go 1.26"
+    2. launch_subagent: Edit examples/go.mod — change "go 1.25" to "go 1.26"
+    3. launch_subagent: Edit site/go.mod — change "go 1.25" to "go 1.26"
+
+  Bad (sequential web reads):
+    1. web_read the Go 1.26 release notes
+    2. web_read the golang Docker image tags page
+  Good (parallel):
+    1. launch_subagent: Fetch Go 1.26 release notes and the golang Docker tags
+       page; report version-relevant findings.
+
+Do NOT use `launch_subagent` when:
+- Step B depends on step A's output (sequential).
+- Multiple steps mutate the same file region (write conflicts).
+- The work is a single small edit and forking adds more overhead than it saves.
+
+A good shape: if your plan has ≥2 steps that touch different files / different
+docs / different lookups and could run at the same time, each becomes a
+subagent step. The user prefers this over one long serial chain.
 
 ## Step 5 — Decide if this is a "report-only" task
 

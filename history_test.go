@@ -469,9 +469,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	a := &agent{
 		sessions: map[SessionId]*Session{s.ID: s},
 		settings: Settings{
-			LLMConnections: []LLMConnection{
-				{URL: mock.ts.URL, Model: "m"},
-			},
+			LLM: &LLMConnection{URL: mock.ts.URL, Model: "m"},
 		},
 	}
 
@@ -784,9 +782,7 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 	a := &agent{
 		sessions: map[SessionId]*Session{s.ID: s},
 		settings: Settings{
-			LLMConnections: []LLMConnection{
-				{URL: mock.ts.URL, Model: "m"},
-			},
+			LLM: &LLMConnection{URL: mock.ts.URL, Model: "m"},
 		},
 	}
 

@@ -6,20 +6,44 @@
 # when no global settings exist. Once the global file is in place, this
 # project-local copy can be deleted.
 #
-# Each [[llmconnections]] entry points at one OpenAI-compatible endpoint
-# (llama.cpp, Ollama, vLLM, ...). Position matters:
-#   index 0    → "main" tier (foreground agent)
-#   indices 1+ → "subagent" tier (parallel/offloaded work, summarisation)
-# A single entry serves every role; add more entries only if you want to
-# split work across multiple servers/models.
+# Two kinds of entries:
+#
+#   [llm]      → the main-tier connection. One entry. Owns the main session's
+#                KV cache, so its prefix stays warm across turns. Typically a
+#                smaller/faster model. Used for plan, document, and history
+#                compaction on the foreground session.
+#
+#   [[subllm]] → subagent-tier connections. Zero or more entries. Each
+#                declares `tag = "thinking"` or `tag = "execute"` to identify
+#                the role it serves. Used for execute/verify on the main
+#                session (so conn 0's cache isn't evicted by role swaps) and
+#                for any `launch_subagent` work. Multiple entries with the
+#                same tag get round-robined.
+#
+# If [[subllm]] is empty, the main [llm] serves both tiers.
+#
+# `params` is forwarded verbatim as the OpenAI request's extra body, so put
+# samplers (temperature, top_p, ...) and any model-specific keys
+# (enable_thinking, reasoning_mode, ...) in there. Core fields (model,
+# messages, stream, tools) always win over params.
 
-[[llmconnections]]
+[llm]
 url = "http://localhost:8080/v1/chat/completions"
 # api_key = "..."        # uncomment if your server requires bearer auth
 model = "your-model-id"  # must match the model name your server reports at /v1/models
+params = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
 
-# Per-role sampler overrides. Drop either to reuse the same sampler for
-# both roles. Core fields (model, messages, stream, tools) always win over
-# extra_body_*.
-extra_body_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
-extra_body_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0 }
+# Example subagent entries — uncomment and edit when you have a second
+# server (or a separate role profile on the same server).
+#
+# [[subllm]]
+# tag = "execute"
+# url = "http://your-other-server:9001/v1/chat/completions"
+# model = "your-larger-model-id"
+# params = { temperature = 0.6, top_p = 0.8, top_k = 20, min_p = 0.0 }
+#
+# [[subllm]]
+# tag = "thinking"
+# url = "http://your-other-server:9001/v1/chat/completions"
+# model = "your-larger-model-id"
+# params = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }

@@ -56,7 +56,11 @@ type Session struct {
 	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
 	// phaseActive=true means a phase entry is showing as in_progress and
 	// must be marked completed before Prompt returns; phaseCurrent is the
-	// 0-based index into phaseNames it refers to.
+	// 0-based index into phaseNames it refers to. Guarded by phaseMu, NOT
+	// the main session mu — compressHistory holds sess.mu across long LLM
+	// calls and llmStream calls notifyPhaseSuffix mid-stream, so reusing
+	// sess.mu for phase reads would deadlock.
+	phaseMu      sync.Mutex
 	phaseActive  bool
 	phaseCurrent int
 	// launchedSubagents caches results of completed launch_subagent tasks,
@@ -68,9 +72,13 @@ type Session struct {
 	// is the safer default than feeding back a possibly-stale cached result.
 	launchedSubagentsMu sync.Mutex
 	launchedSubagents   map[string]string
-	// mu serialises all mutations of the fields above and the Save() encoder.
-	// Prompt runs synchronously per session, but generateTitle runs as a
-	// background goroutine and would otherwise race on Title + the TOML file.
+	// mu serialises mutations of the persisted fields (Title, Messages,
+	// Summary, …) and the Save() encoder. Prompt runs synchronously per
+	// session, but generateTitle runs as a background goroutine and would
+	// otherwise race on Title + the TOML file. The phaseMu and
+	// launchedSubagentsMu fields above intentionally have their own locks —
+	// they don't touch persisted state and must not block on the long-held
+	// mu (compressHistory in particular).
 	mu sync.Mutex
 }
 

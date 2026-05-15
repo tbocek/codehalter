@@ -42,7 +42,7 @@ type planResult struct {
 func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) (*LLMConnection, *planResult, []ToolUse, error) {
 	thinking := a.pickAvailable(ctx, "thinking", a.llmTier(sid))
 	if thinking == nil {
-		return nil, nil, nil, fmt.Errorf("no [[llmconnections]] in .codehalter/settings.toml")
+		return nil, nil, nil, fmt.Errorf("no [llm] in .codehalter/settings.toml")
 	}
 	planPrompt := a.loadPromptFile(sid, "PLAN.md")
 	if planPrompt == "" {
@@ -177,6 +177,11 @@ func (a *agent) planForSubagent(ctx context.Context, sid SessionId, instructions
 // planning phase), and runs the agentic tool loop with write-enabled tools.
 // extraExclude lists additional tool names to exclude (e.g. launch_subagent
 // when a subagent has reached its max nesting depth).
+//
+// Execute is pinned to the "subagent" tier even for the main session so conn 0
+// stays exclusively warm for thinking-role prompts. Switching roles on the same
+// llama.cpp slot evicts the prefix cache; routing execute off conn 0 keeps the
+// planner/document KV cache hot turn-over-turn.
 func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessage, extraExclude ...string) (toolLoopResult, error) {
 	if executeMD := a.loadPromptFile(sid, "EXECUTE.md"); executeMD != "" && len(messages) > 0 {
 		last := len(messages) - 1
@@ -190,7 +195,7 @@ func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessag
 	for _, name := range extraExclude {
 		exclude[name] = true
 	}
-	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, "execute", a.llmTier(sid)), messages, toolFilter{
+	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, "execute", "subagent"), messages, toolFilter{
 		exclude: exclude,
 	})
 }
@@ -222,7 +227,9 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 		return res, &verifyResult{Success: true}, nil
 	}
 
-	conn := a.pickAvailable(ctx, "execute", a.llmTier(sid))
+	// Same reasoning as execute(): verify rides the subagent tier so conn 0
+	// stays warm for thinking-role prompts.
+	conn := a.pickAvailable(ctx, "execute", "subagent")
 	if conn == nil {
 		conn = fallbackConn
 	}

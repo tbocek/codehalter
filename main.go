@@ -338,9 +338,10 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
 // timeout on every call. Image support is taken from the first reachable
 // connection — that's the one execute/main calls land on by default.
 func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
-	if len(a.settings.LLMConnections) == 0 {
+	conns := a.settings.allConnections()
+	if len(conns) == 0 {
 		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("🟡 LLM: no [[llmconnections]] in settings.toml — codehalter cannot run until you add one.\n\n")))
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("🟡 LLM: no [llm] in settings.toml — codehalter cannot run until you add one.\n\n")))
 		return
 	}
 	if settingsLooksPlaceholder(a.settings) {
@@ -350,28 +351,35 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 		return
 	}
 
-	results := make([]probeResult, len(a.settings.LLMConnections))
-	parallel(len(a.settings.LLMConnections), func(i int) {
-		c := a.settings.LLMConnections[i]
+	results := make([]probeResult, len(conns))
+	parallel(len(conns), func(i int) {
+		c := conns[i]
 		results[i] = a.probeLLM(ctx, &c)
 	})
 
-	a.connReachable = make(map[string]bool, len(a.settings.LLMConnections))
+	a.connReachable = make(map[string]bool, len(conns))
 	var b strings.Builder
 	firstReachable := -1
 	// Each LLM gets its own paragraph (\n\n) — markdown collapses single
 	// newlines to spaces, so "LLM[0]: ...\nLLM[1]: ..." would render on one
 	// wrapped line and obscure that there are two separate connections.
 	for i, r := range results {
-		c := a.settings.LLMConnections[i]
+		c := conns[i]
 		a.connReachable[connKey(&c)] = r.Reachable
+		label := "llm"
+		if i > 0 {
+			label = fmt.Sprintf("subllm[%d]", i-1)
+			if c.Tag != "" {
+				label += " " + c.Tag
+			}
+		}
 		switch {
 		case !r.Reachable:
-			fmt.Fprintf(&b, "🟡 LLM[%d]: unreachable at %s — start your server or fix the url.\n\n", i, c.URL)
+			fmt.Fprintf(&b, "🟡 %s: unreachable at %s — start your server or fix the url.\n\n", label, c.URL)
 		case r.ModelKnown && !r.ModelLoaded:
-			fmt.Fprintf(&b, "🟡 LLM[%d]: %s reachable but model %q not loaded.\n\n", i, c.URL, c.Model)
+			fmt.Fprintf(&b, "🟡 %s: %s reachable but model %q not loaded.\n\n", label, c.URL, c.Model)
 		default:
-			fmt.Fprintf(&b, "✅ LLM[%d]: %s @ %s\n\n", i, c.Model, c.URL)
+			fmt.Fprintf(&b, "✅ %s: %s @ %s\n\n", label, c.Model, c.URL)
 		}
 		if r.Reachable && firstReachable < 0 {
 			firstReachable = i

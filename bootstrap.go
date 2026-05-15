@@ -165,6 +165,43 @@ func detectStacks(cwd string) []string {
 	return stacks
 }
 
+// failureSkillHint returns a short pointer to SKILL-*.md files relevant to the
+// failed tool, or "" when no skill docs exist or the tool isn't one of the
+// shell-style ones where skills typically apply. Used by runToolLoop to nudge
+// small models toward reading the skill docs after a hard failure instead of
+// blindly retrying. Returns paths relative to cwd so the model's read_file
+// call works without further escaping.
+func (a *agent) failureSkillHint(sid SessionId, toolName string) string {
+	// Only fire on tools where a SKILL doc plausibly helps. Edit-failures
+	// usually mean the model passed wrong content, not that it needs a skill.
+	switch toolName {
+	case "run_command", "run_task":
+	default:
+		return ""
+	}
+	sess := a.getSession(sid)
+	if sess == nil {
+		return ""
+	}
+	entries, err := os.ReadDir(filepath.Join(sess.Cwd, ".codehalter"))
+	if err != nil {
+		return ""
+	}
+	var skills []string
+	for _, e := range entries {
+		n := e.Name()
+		if strings.HasPrefix(n, "SKILL-") && strings.HasSuffix(n, ".md") {
+			skills = append(skills, ".codehalter/"+n)
+		}
+	}
+	if len(skills) == 0 {
+		return ""
+	}
+	sort.Strings(skills)
+	return "[Hint: this command failed. The project ships skill docs that cover this kind of failure — read one with read_file before retrying: " +
+		strings.Join(skills, ", ") + "]"
+}
+
 // loadSkills concatenates every SKILL-*.md present in .codehalter/. Detection
 // (detectStacks) decides which to seed initially, but loading honors whatever
 // the user actually has on disk — drop a SKILL-rust.md in there manually and
