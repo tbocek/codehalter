@@ -89,7 +89,7 @@ func (a *agent) registerSubagentTool() {
 			return "error: maximum subagent nesting depth reached"
 		}
 
-		tcId := ag.StartToolCall(ctx, sid, fmt.Sprintf("Launching %d subagent(s)", len(tasks)), "execute", nil)
+		tcId := ag.StartToolCall(ctx, sid, fmt.Sprintf("Launching: %d subagent(s)", len(tasks)), "execute", nil)
 
 		// Dedup tasks. Small models frequently re-issue identical
 		// launch_subagent calls (within one tasks[] array, or across

@@ -102,9 +102,11 @@ func init() {
 			dir = resolved
 		}
 
-		tcId := a.StartToolCall(ctx, sid, "Listing "+dir, "search", []ToolCallLocation{{Path: dir}})
+		tcId := a.StartToolCall(ctx, sid, "Listing: "+dir, "search", []ToolCallLocation{{Path: dir}})
 		files := listProjectFiles(dir)
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf("%d files", len(files)))})
+		a.CompleteToolCallTitled(ctx, sid, tcId,
+			fmt.Sprintf("Listing: %s (%d files)", dir, len(files)),
+			[]ToolCallContent{TextContent(fmt.Sprintf("%d files", len(files)))})
 		return strings.Join(files, "\n")
 	}})
 
@@ -130,9 +132,9 @@ func init() {
 			return "error: " + err.Error()
 		}
 
-		title := "Reading " + path
+		title := "Reading: " + path
 		if args["line"] != "" {
-			title = fmt.Sprintf("Reading %s:%s", path, args["line"])
+			title = fmt.Sprintf("Reading: %s:%s", path, args["line"])
 		}
 		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
 
@@ -209,7 +211,7 @@ func init() {
 			return "error: " + err.Error()
 		}
 		newContent := args["content"]
-		tcId := a.StartToolCall(ctx, sid, "Writing "+path, "edit", []ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
 		oldContent, _ := fsRead(a.conn.RPC(), ctx, sid, path, nil, nil)
 
@@ -247,7 +249,7 @@ func init() {
 		oldText := args["old_text"]
 		newText := args["new_text"]
 
-		tcId := a.StartToolCall(ctx, sid, "Editing "+path, "edit", []ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
 		content, err := fsRead(a.conn.RPC(), ctx, sid, path, nil, nil)
 		if err != nil {

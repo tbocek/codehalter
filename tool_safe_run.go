@@ -10,14 +10,17 @@ import (
 	"strings"
 )
 
-// discoverSandbox probes for `bubblewrap` (bwrap) and registers
-// `safe_run_command` only if the binary is present AND can actually create
-// the namespace + overlay this host. Without that, the tool stays
-// unregistered — the model never sees it, so it can't ask for a sandbox
-// we can't safely deliver. The probe itself runs a no-op `true` under a
-// trivial bwrap invocation; if that fails (no userns, no FUSE, hardened
-// container), we bail.
+// discoverSandbox registers `safe_run_command` when we're inside a container
+// AND bwrap can create the required namespaces. Outside a container the tool
+// would let the agent write to the host's /usr, /etc, etc. — there the
+// "container is throwaway" assumption doesn't hold, so we don't expose it.
+// The probe runs a no-op `true` under a trivial bwrap invocation; if that
+// fails (no userns, kernel restricts unprivileged bwrap), we bail.
 func (a *agent) discoverSandbox() {
+	if containerKind() == "" {
+		slog.Info("safe_run_command: not inside a container, tool not registered")
+		return
+	}
 	if _, err := exec.LookPath("bwrap"); err != nil {
 		slog.Info("safe_run_command: bwrap not on PATH, tool not registered")
 		return
@@ -32,14 +35,14 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "safe_run_command",
-			"description": "Run a shell command in a sandboxed overlay where any writes to the workspace are discarded on exit. Use this to PROBE whether a command will succeed (e.g. `which tinygo`, `cargo check`, `npm install --dry-run`, `apt list --installed 2>/dev/null | grep tinygo`) WITHOUT modifying the real workspace. The command sees the workspace as writable, but every write lands in a tmpfs upper layer that evaporates when the command exits. Exit code is always reported in the output and the title — interpret it (`which X` exiting 1 means X is missing, not that the tool failed).",
+			"description": "Run a shell command inside this devcontainer with the workspace overlay-protected: writes to the workspace are discarded on exit, but writes anywhere else in the container (e.g. `apt-get install`, `dpkg -i`, `pip install`) persist for the container's lifetime — they're gone after a devcontainer rebuild, but available immediately for testing. Use this for two patterns: (1) PROBE — `which tinygo`, `cargo check`, `node --version`, `apt list --installed | grep X` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install tinygo`), first run the same install via safe_run_command, then verify it works (e.g. `tinygo version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which X` exiting 1 means X is missing, not that the tool failed.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
 				"properties": map[string]any{
 					"command": map[string]any{
 						"type":        "string",
-						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Examples: `which tinygo`, `cargo check 2>&1 | tail -20`, `command -v node && node --version`.",
+						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Examples: `which tinygo`, `apt-get install -y tinygo && tinygo version`, `cargo check 2>&1 | tail -20`.",
 					},
 				},
 			},
@@ -60,17 +63,20 @@ func safeRunExecute(ctx context.Context, a *agent, sid SessionId, rawArgs string
 
 	tcId := a.StartToolCall(ctx, sid, "Safe-run: "+cmdStr, "execute", nil)
 
-	// bwrap layout:
-	//   - / is bind-mounted read-only so the command can read /etc, /usr,
-	//     etc. (needed for `which`, `apt list`, `--version` probes).
+	// bwrap layout (container-only, see discoverSandbox):
+	//   - / is bind-mounted READ-WRITE so `apt-get install`, `dpkg -i`,
+	//     `pip install`, etc. actually take effect. Persistence is bounded by
+	//     the container's lifetime — a devcontainer rebuild wipes everything
+	//     not in the Dockerfile, which is exactly what makes this safe.
+	//   - The workspace is overlay-mounted on top: lower = real cwd, upper =
+	//     anonymous tmpfs. Writes there go into the upper layer and vanish on
+	//     exit so the bind-mounted host workspace stays untouched.
 	//   - /tmp is a fresh tmpfs so scratch writes don't escape.
 	//   - /proc and /dev are minimal but real (some tools probe /proc).
-	//   - The workspace is overlay-mounted: lower = real cwd (RO), upper =
-	//     anonymous tmpfs. Writes go into the upper layer and vanish on exit.
 	//   - --die-with-parent: when codehalter dies, the sandboxed shell dies
 	//     too (no orphaned bwrap processes).
 	bwrapArgs := []string{
-		"--ro-bind", "/", "/",
+		"--bind", "/", "/",
 		"--tmpfs", "/tmp",
 		"--proc", "/proc",
 		"--dev", "/dev",

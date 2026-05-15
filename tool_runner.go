@@ -99,7 +99,7 @@ func (a *agent) discoverRunners(cwd string) {
 			return "error: no session"
 		}
 
-		tcId := a.StartToolCall(ctx, sid, "Running "+task, "execute", nil)
+		tcId := a.StartToolCall(ctx, sid, "Running: "+task, "execute", nil)
 
 		cmd := exec.CommandContext(ctx, runner.Command, runner.Args(target)...)
 		cmd.Dir = sess.Cwd
@@ -147,7 +147,7 @@ func (a *agent) discoverRunners(cwd string) {
 			a.sendUpdate(ctx, sid, toolCallUpdate{
 				Kind:       "tool_call_update",
 				ToolCallId: tcId,
-				Title:      "❌ " + task + " (" + runErr.Error() + ")",
+				Title:      "Running: " + task + " (" + runErr.Error() + ") ❌",
 				Status:     "failed",
 				Content:    []ToolCallContent{TextContent(result)},
 			})

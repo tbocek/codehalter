@@ -431,7 +431,7 @@ func init() {
 
 		formatted := formatDDGResults(results)
 		a.CompleteToolCallTitled(ctx, sid, tcId,
-			fmt.Sprintf("✅ DuckDuckGo: %s → %d results", query, len(results)),
+			fmt.Sprintf("DuckDuckGo: %s (%d results)", query, len(results)),
 			[]ToolCallContent{TextContent(formatted)})
 		// Surface the list inline in the chat too, so the user can see the
 		// URLs and snippets without expanding the tool card.
@@ -501,11 +501,15 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 			return "error getting page text: " + err.Error()
 		}
 
-		// One green check / yellow flag in both the collapsed title and the
-		// expanded content so status is visible without expanding the card.
+		// Binary success/failure marker after the URL: ✅ when the body looks
+		// like real content, ❌ when pageIssue flags a load failure, bot wall,
+		// or content too thin to use. The card itself is still marked
+		// completed (not failed) because the model can decide to retry with
+		// web_read_raw or fall back to web_search; we don't want Zed to bury
+		// the result in a red-collapsed card.
 		icon, msg := "✅", "Page loaded"
 		if issue := pageIssue(text); issue != "" {
-			icon, msg = "🟡", issue
+			icon, msg = "❌", issue
 		}
 		a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read: "+targetURL+" "+icon,
 			[]ToolCallContent{TextContent(icon + " " + msg)})

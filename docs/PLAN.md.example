@@ -40,10 +40,19 @@ so even mutating calls are recoverable.
 - `web_search`, `web_read`, `web_read_raw` — for libraries, APIs, versions,
   docs, or anything outside this project. Use `web_read_raw` when you need an
   exact URL/version/string preserved verbatim.
-- `safe_run_command` — probe the container: `which X`, `X --version`,
-  `apt list --installed X`, `cargo check`, etc. Writes are discarded on exit,
-  so use it BEFORE planning install steps to confirm what's actually missing
-  and what install method works.
+- `safe_run_command` — run commands inside the devcontainer with the
+  workspace overlay-protected. Workspace writes are discarded on exit;
+  writes elsewhere (apt-get, dpkg, pip) persist for the container's
+  lifetime. Use this two ways:
+    1. PROBE before planning: `which X`, `X --version`,
+       `apt list --installed X`, `cargo check`. Confirm what's actually
+       missing before proposing changes.
+    2. TEST INSTALLS before patching the Dockerfile: if your plan would
+       include `RUN apt-get install Y`, FIRST run the exact install via
+       safe_run_command and verify it works (e.g. `apt-get install -y Y &&
+       Y --version`). Only commit to the Dockerfile patch in the plan if
+       the test install succeeded. An untested Dockerfile change is a
+       guess.
 - `launch_subagent` — for parallel independent lookups (see Step 4).
 - `ask_user` — only if you genuinely cannot proceed. Prefer `clear=false`.
 
