@@ -49,16 +49,17 @@ so even mutating calls are recoverable.
     - If a search returns nothing useful, REFORMULATE — don't just rerun with
       slightly different words. Stop after two attempts on the same question
       and either `web_read` a known-good URL directly or move on.
-- `safe_run_command` — run commands inside the devcontainer with the
-  workspace overlay-protected. Workspace writes are discarded on exit;
-  writes elsewhere (apt-get, dpkg, pip) persist for the container's
-  lifetime. Use this two ways:
+- `run_command` — run shell commands inside the devcontainer. The container
+  is the sandbox: apt-get/dpkg/pip writes persist for its lifetime (wiped on
+  rebuild), workspace writes are real but recoverable from `.git/`. `git` is
+  shimmed to exit 127 so history-rewriting commands cannot destroy
+  recoverable history. Use this two ways:
     1. PROBE before planning: `which X`, `X --version`,
        `apt list --installed X`, `cargo check`. Confirm what's actually
        missing before proposing changes.
     2. TEST INSTALLS before patching the Dockerfile: if your plan would
        include `RUN apt-get install Y`, FIRST run the exact install via
-       safe_run_command and verify it works (e.g. `apt-get install -y Y &&
+       run_command and verify it works (e.g. `apt-get install -y Y &&
        Y --version`). Only commit to the Dockerfile patch in the plan if
        the test install succeeded. An untested Dockerfile change is a
        guess.
@@ -69,7 +70,7 @@ When to call which:
 - Task names a file → `read_file` it before planning edits.
 - Task names a symbol/function/error string → `search_text` for it first.
 - Task involves an external library/API/version → `web_search` then `web_read`.
-- Task says "install X", "add tool Y", "configure Z" → `safe_run_command`
+- Task says "install X", "add tool Y", "configure Z" → `run_command`
   FIRST to see whether X is already there and what the canonical install path
   is. Don't propose a Dockerfile edit before probing.
 - Task is a pure external lookup (e.g. "what's the latest Go version?") → do

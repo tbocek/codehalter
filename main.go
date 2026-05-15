@@ -127,6 +127,13 @@ type agent struct {
 	gopls     *Gopls
 	goplsOnce sync.Once
 	goplsErr  error
+
+	// runCmdStatus is the human-readable outcome of discoverSandbox: either
+	// "available" (tool registered) or a specific reason it wasn't (not in a
+	// container, shim install failed). checkEnvironment surfaces it so the
+	// user sees in chat whether run_command is wired up — silent slog.Info
+	// was leaving users wondering why the LLM never called it.
+	runCmdStatus string
 }
 
 // connKey returns a stable map key for a connection.
@@ -398,6 +405,15 @@ func (a *agent) checkEnvironment(ctx context.Context, sid SessionId) {
 		b.WriteString("✅ Firefox: found (web_search/web_read enabled)\n\n")
 	} else {
 		b.WriteString("🟡 Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
+	}
+	switch a.runCmdStatus {
+	case "available":
+		b.WriteString("✅ run_command: available (probes and test installs; `git` is shimmed to exit 127)\n\n")
+	case "":
+		// discoverSandbox never ran. Should not happen — initSession calls it
+		// unconditionally. Stay silent rather than print misleading info.
+	default:
+		fmt.Fprintf(&b, "🟡 run_command: disabled — %s\n\n", a.runCmdStatus)
 	}
 	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
 }

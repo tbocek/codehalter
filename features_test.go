@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -724,5 +725,52 @@ func TestJaccardSimilarity(t *testing.T) {
 	// Symmetric.
 	if jaccard(a, b) != jaccard(b, a) {
 		t.Errorf("expected jaccard to be symmetric")
+	}
+}
+
+// TestRunCmdGitShim verifies that when run_command's PATH shim is in place,
+// bash resolves `git` to the stub (exit 127) regardless of how the command
+// is spelled. We exec bash for real here — no container required, because
+// the shim is just a PATH-rewriting trick. Absolute paths intentionally
+// still hit the real git: that's documented in the tool description and is
+// the LLM's responsibility to avoid.
+func TestRunCmdGitShim(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	dir, err := installGitShim()
+	if err != nil {
+		t.Fatalf("installGitShim: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	prevShim := runCmdShimDir
+	runCmdShimDir = dir
+	defer func() { runCmdShimDir = prevShim }()
+
+	// Spellings that go through PATH lookup → must hit the stub.
+	blocked := []string{
+		"git status",
+		"git push --force",
+		"command git log",
+		"exec git rev-parse HEAD || true",
+		`$(which git) status`,
+	}
+	for _, cmd := range blocked {
+		c := exec.Command("bash", "-c", cmd)
+		c.Env = envWithGitShim()
+		out, _ := c.CombinedOutput()
+		if !strings.Contains(string(out), "git is blocked") {
+			t.Errorf("expected stub to fire for %q, got output: %q", cmd, string(out))
+		}
+	}
+
+	// Commands that mention "git" as a substring of another binary name
+	// must still resolve normally (we're not breaking unrelated tools).
+	// Use a command that's guaranteed to exist on test systems.
+	c := exec.Command("bash", "-c", "echo gitleaks-not-installed; true")
+	c.Env = envWithGitShim()
+	if out, err := c.CombinedOutput(); err != nil {
+		t.Errorf("expected echo to succeed regardless of shim, got err=%v output=%q", err, string(out))
 	}
 }

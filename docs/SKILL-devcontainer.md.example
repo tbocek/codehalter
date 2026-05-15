@@ -1,15 +1,20 @@
 # Devcontainer skill
 
 This project ships a `.devcontainer/` directory, so the agent is running inside
-a container and the host workspace is bind-mounted in. `safe_run_command` is
-your sandbox: the workspace is overlay-protected (writes are discarded on
-exit), but everywhere else in the container is writable and persists for the
-container's lifetime. A devcontainer rebuild wipes everything not declared in
-the Dockerfile — that's what makes it safe to install things freely here.
+a container and the host workspace is bind-mounted in. `run_command` runs shell
+commands directly: the container itself is your sandbox (it's throwaway, and
+apt-get/dpkg/pip writes persist for the container's lifetime — wiped on
+rebuild). Workspace writes are real, but recoverable from `.git/`.
+
+**Blocked**: `git` is shimmed in `run_command`'s PATH to a stub that exits
+127. History-rewriting commands (`git reset --hard`, `git push --force`,
+`git branch -D`, `git filter-branch`) cannot destroy your recoverable
+history. Read code with `read_file`; the user runs git themselves. Absolute
+paths (`/usr/bin/git`) bypass the shim — do not use them.
 
 ## When a task fails with "command not found"
 
-1. Confirm with `safe_run_command`: `which tinygo` (or `command -v tinygo`).
+1. Confirm with `run_command`: `which tinygo` (or `command -v tinygo`).
    Exit 1 = missing.
 2. Read `.devcontainer/devcontainer.json` and any `Dockerfile` it references.
    - If the missing tool IS declared → image is stale. Fix is "rebuild the
@@ -22,10 +27,10 @@ the Dockerfile — that's what makes it safe to install things freely here.
 
 When you're about to write `RUN apt-get install X` (or `pip install`, `npm
 install -g`, `dpkg -i`, etc.) into the Dockerfile, first run the same install
-via `safe_run_command` and verify it actually works:
+via `run_command` and verify it actually works:
 
 ```
-safe_run_command: apt-get update && apt-get install -y tinygo && tinygo version
+run_command: apt-get update && apt-get install -y tinygo && tinygo version
 ```
 
 The install persists for the lifetime of this container, so you can then
@@ -46,16 +51,20 @@ you just verified, and tell the user to rebuild.
 - `apt list --installed 2>/dev/null | grep X` — what version is pinned?
 - `ls -la some/path`, `cat config.toml` — inspect state.
 
-Workspace writes (anything under the project root) are still discarded on
-exit. So `cargo check` is safe even though it touches `target/`.
+Workspace writes from these probes (e.g. `cargo check` populating `target/`)
+are real. That's fine for build artifacts; just don't run destructive shell
+commands against source files — use `edit_file`/`write_file` for that.
 
-## What `safe_run_command` is NOT for
+## What `run_command` is NOT for
 
-- Long-running services — bwrap dies with the parent process.
+- Long-running services — the process dies with codehalter; when the agent
+  exits, the shell exits too.
 - Replacing `run_task` — for declared project tasks (`just build`, `npm
   test`), keep using `run_task` so the user sees it in the same UI.
-- Workspace mutations you want to keep — those are discarded. To actually
-  edit a file, use `write_file` or `edit_file`.
+- File edits — use `write_file` or `edit_file`; those go through the agent's
+  diff/approval UI.
+- Anything `git`-related — git is shimmed. Read code with `read_file`, not
+  `git show` / `git log`.
 
 Exit code is always in the output and the tool card title. Interpret it:
 `which tinygo` exiting 1 means the binary is missing, not that the tool erred.

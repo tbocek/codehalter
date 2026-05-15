@@ -11,16 +11,14 @@ ARG GID=1000
 # as your project needs them. just/make are picked up by codehalter's
 # task-runner discovery automatically; nodejs+npm covers package.json.
 # firefox-esr powers web_search/web_read; codehalter launches it with
-# -headless so no X11 forwarding is needed. bubblewrap powers the
-# safe_run_command tool, which runs probes in a discardable overlay so
-# the agent can `which tinygo` or `cargo check` without touching the
-# real workspace.
+# -headless so no X11 forwarding is needed. run_command (probes + test
+# installs) runs commands directly under bash — the container itself is the
+# sandbox.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git sudo \
         just make \
         nodejs npm \
         firefox-esr \
-        bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user matching host UID/GID so files written into the bind-mounted
