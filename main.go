@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -113,6 +114,11 @@ type agent struct {
 	// candidates against this so a dead server doesn't burn a 2s /slots
 	// timeout on every LLM call. Populated by checkLLM; nil before that.
 	connReachable map[string]bool
+
+	// pickRotor round-robins the starting index in pickAvailable so parallel
+	// callers (subagents in particular) fan out across configured servers
+	// instead of all piling onto the first idle candidate.
+	pickRotor atomic.Uint64
 
 	// gopls is a lazily-started LSP client shared across tool calls so the
 	// workspace index isn't rebuilt on every query. ensureGopls handles the

@@ -340,11 +340,13 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 	return r, true
 }
 
-// pickAvailable picks the first LLMConnection in role/tier preference order
-// whose server reports a free slot. If all candidates are busy or
-// unreachable, falls back to the first preference — the caller's LLM call
-// will then queue server-side or surface a clear error. Returns nil only
-// when no connections are configured.
+// pickAvailable picks an LLMConnection from the role/tier candidate list,
+// round-robining the starting index so parallel callers (subagents in
+// particular) spread across configured servers instead of all hammering the
+// first one. From the rotor's offset we then scan with wrap-around for a
+// server with a free slot. If none has one, we fall back to the rotor's
+// starting position — the caller's LLM call will queue server-side or surface
+// a clear error. Returns nil only when no connections are configured.
 func (a *agent) pickAvailable(ctx context.Context, role, tier string) *LLMConnection {
 	cs := a.settings.LLMCandidates(role, tier)
 	if len(cs) == 0 {
@@ -366,12 +368,14 @@ func (a *agent) pickAvailable(ctx context.Context, role, tier string) *LLMConnec
 		}
 		cs = alive
 	}
-	for i := range cs {
-		if a.hasSlot(ctx, &cs[i]) {
-			return &cs[i]
+	start := int(a.pickRotor.Add(1)-1) % len(cs)
+	for i := 0; i < len(cs); i++ {
+		idx := (start + i) % len(cs)
+		if a.hasSlot(ctx, &cs[idx]) {
+			return &cs[idx]
 		}
 	}
-	return &cs[0]
+	return &cs[start]
 }
 
 // hasSlot returns true if the server has at least one idle slot, or if slot
