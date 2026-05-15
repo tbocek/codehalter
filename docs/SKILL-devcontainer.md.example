@@ -1,0 +1,45 @@
+# Devcontainer skill
+
+This project ships a `.devcontainer/` directory, so the agent is running inside
+a container and the host workspace is bind-mounted in. Two things follow:
+
+## Probe before reporting "missing dependency"
+
+If a task fails with `command not found`, `not installed`, or
+`No such file or directory` for a binary:
+
+1. Use `safe_run_command` to confirm: e.g. `which tinygo` or
+   `command -v tinygo`. The exit code tells you whether the binary exists in
+   the container's PATH.
+2. Read `.devcontainer/devcontainer.json` and any `Dockerfile` it references.
+   - If the missing tool IS declared (`apt-get install … tinygo …`,
+     `RUN go install tinygo`, etc.) → the container image is stale; the fix
+     is "rebuild the devcontainer" (point at the install line that should
+     have run).
+   - If the missing tool is NOT declared → the fix is "add it to the
+     Dockerfile" (concrete patch) or "install it locally" (for the human).
+3. Report the root cause and the fix path. Do NOT retry the same failing
+   command without changing anything first.
+
+## safe_run_command — what it does and doesn't do
+
+`safe_run_command` runs a shell command in a `bubblewrap` overlay where the
+workspace is writable but every write is captured in a discardable upper
+layer. After the command exits, those writes are gone — the real workspace
+is unchanged. Use it freely for probes:
+
+- `which X`, `command -v X`, `X --version` — does the tool exist?
+- `cargo check`, `tsc --noEmit`, `go vet ./...` — would compilation succeed?
+- `npm install --dry-run`, `apt-get install -s X` — what would change?
+- `ls -la some/path`, `cat config.toml` — inspect state without touching it.
+
+What it is NOT for:
+- Persistent installs (`apt install`, `pip install`) — the install evaporates
+  on exit. If you want the tool installed in the actual container, edit the
+  Dockerfile and tell the user to rebuild the devcontainer.
+- Long-running services — bwrap dies with the parent process.
+- Replacing `run_task` — for declared project tasks, keep using `run_task`.
+
+The exit code is always reported in the output and the tool card title.
+Interpret it: `which tinygo` exiting `1` means the binary is missing, not
+that the agent erred.

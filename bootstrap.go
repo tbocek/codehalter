@@ -158,6 +158,10 @@ func detectStacks(cwd string) []string {
 		stacks = append(stacks, "bash")
 	}
 
+	if dirExists(filepath.Join(cwd, ".devcontainer")) {
+		stacks = append(stacks, "devcontainer")
+	}
+
 	return stacks
 }
 

@@ -42,6 +42,9 @@ var skillJava string
 //go:embed docs/SKILL-bash.md.example
 var skillBash string
 
+//go:embed docs/SKILL-devcontainer.md.example
+var skillDevcontainer string
+
 //go:embed docs/Dockerfile.devcontainer.example
 var defaultDevcontainerDockerfile string
 
@@ -52,11 +55,12 @@ var defaultDevcontainerJSON string
 var defaultSettingsTOML string
 
 var defaultSkills = map[string]string{
-	"go":   skillGo,
-	"ts":   skillTS,
-	"js":   skillJS,
-	"java": skillJava,
-	"bash": skillBash,
+	"go":           skillGo,
+	"ts":           skillTS,
+	"js":           skillJS,
+	"java":         skillJava,
+	"bash":         skillBash,
+	"devcontainer": skillDevcontainer,
 }
 
 // ensureDefaults copies embedded default files into .codehalter/ if they don't exist.
@@ -246,6 +250,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	// is graceful (checkLLM prints a warning instead of crashing).
 	a.settings = settings
 	a.discoverRunners(cwd)
+	a.discoverSandbox()
 	a.registerSubagentTool()
 	return nil
 }
