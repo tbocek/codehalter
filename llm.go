@@ -530,13 +530,12 @@ type toolLoopResult struct {
 	ToolUses []ToolUse
 }
 
-// toolCacheEntry remembers both halves of a tool result so a deduped second
-// call returns the same (output, failed) the first call produced. Without
-// this, a cached "run_task" hit would lose the failure flag.
-type toolCacheEntry struct {
-	output string
-	failed bool
-}
+// maxToolLoopIterations bounds runToolLoop so a model that keeps producing
+// "different enough" tool calls (e.g. path variations to dodge perceived
+// repetition) can't spin forever. One iteration is one LLM round-trip; a
+// complex execute pass is usually 10-20, so 50 leaves comfortable headroom
+// while still bailing on genuine runaways.
+const maxToolLoopIterations = 50
 
 // runToolLoopJSON runs the tool loop and unmarshals the response into dst.
 // Small models routinely produce JSON with surrounding prose; on parse
@@ -582,8 +581,11 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 
 	var res toolLoopResult
 	var allText strings.Builder
-	callCache := make(map[string]toolCacheEntry)
-	for {
+	for iter := 0; ; iter++ {
+		if iter >= maxToolLoopIterations {
+			res.Text = allText.String()
+			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
+		}
 		text, calls, err := a.llmStream(ctx, sid, conn, messages, tools, on)
 		if err != nil {
 			res.Text = allText.String()
@@ -603,22 +605,8 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 		})
 
 		for _, tc := range calls {
-			// Per-loop dedup: small models often re-issue identical calls
-			// (read_file looped on the same path, write_file with the same
-			// content). One cache keyed by name+args covers both: the second
-			// hit returns the first result with a "[deduped: …]" banner so
-			// the model knows it already did this.
-			key := tc.Function.Name + "\x00" + tc.Function.Arguments
 			started := time.Now()
-			var result string
-			var failed bool
-			if cached, ok := callCache[key]; ok {
-				result = "[deduped: identical " + tc.Function.Name + " call earlier in this turn]\n" + cached.output
-				failed = cached.failed
-			} else {
-				result, failed = a.executeTool(ctx, sid, tc)
-				callCache[key] = toolCacheEntry{output: result, failed: failed}
-			}
+			result, failed := a.executeTool(ctx, sid, tc)
 			tu := ToolUse{
 				Name:       tc.Function.Name,
 				Input:      tc.Function.Arguments,

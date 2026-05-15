@@ -152,7 +152,7 @@ func init() {
 			}
 		}
 
-		content, err := fsRead(a.conn.RPC(), ctx, sid, path, linePtr, &limit)
+		content, err := fsRead(a, ctx, sid, path, linePtr, &limit)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error(), false
@@ -213,9 +213,9 @@ func init() {
 		newContent := args["content"]
 		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
-		oldContent, _ := fsRead(a.conn.RPC(), ctx, sid, path, nil, nil)
+		oldContent, _ := fsRead(a, ctx, sid, path, nil, nil)
 
-		if err := fsWrite(a.conn.RPC(), ctx, sid, path, newContent); err != nil {
+		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error writing file: " + err.Error(), false
 		}
@@ -251,7 +251,7 @@ func init() {
 
 		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
-		content, err := fsRead(a.conn.RPC(), ctx, sid, path, nil, nil)
+		content, err := fsRead(a, ctx, sid, path, nil, nil)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error reading file: " + err.Error(), false
@@ -269,7 +269,7 @@ func init() {
 
 		newContent := strings.Replace(content, oldText, newText, 1)
 
-		if err := fsWrite(a.conn.RPC(), ctx, sid, path, newContent); err != nil {
+		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error writing file: " + err.Error(), false
 		}
@@ -281,13 +281,20 @@ func init() {
 }
 
 
-// fsRead reads a text file via the ACP fs/read_text_file request. line/limit
-// are optional: pass nil for both to read the whole file, or non-nil pointers
-// to bound the response to a 1-indexed line window.
-func fsRead(c *Connection, ctx context.Context, sid SessionId, path string, line, limit *int) (string, error) {
+// fsRead reads a text file. For top-level sessions known to the ACP client
+// (Zed), the call goes over the wire so the editor can render diffs and
+// honour unsaved buffer state. Subagent sessions were never announced to
+// Zed (newSubagentSession just mints an id locally), so an ACP read would
+// hit -32603 Internal error — we fall back to direct disk I/O for them.
+// line/limit are optional: pass nil for both to read the whole file, or
+// non-nil pointers to bound the response to a 1-indexed line window.
+func fsRead(a *agent, ctx context.Context, sid SessionId, path string, line, limit *int) (string, error) {
+	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
+		return directRead(path, line, limit)
+	}
 	resp, err := SendRequest[struct {
 		Content string `json:"content"`
-	}](c, ctx, "fs/read_text_file", struct {
+	}](a.conn.RPC(), ctx, "fs/read_text_file", struct {
 		SessionId SessionId `json:"sessionId"`
 		Path      string    `json:"path"`
 		Line      *int      `json:"line,omitempty"`
@@ -299,11 +306,44 @@ func fsRead(c *Connection, ctx context.Context, sid SessionId, path string, line
 	return resp.Content, nil
 }
 
-func fsWrite(c *Connection, ctx context.Context, sid SessionId, path, content string) error {
-	_, err := SendRequest[struct{}](c, ctx, "fs/write_text_file", struct {
+// fsWrite writes a text file. Same subagent fallback as fsRead — Zed has no
+// record of a sub_* session id, so ACP writes are dead and we go straight
+// to disk.
+func fsWrite(a *agent, ctx context.Context, sid SessionId, path, content string) error {
+	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
+		return os.WriteFile(path, []byte(content), 0644)
+	}
+	_, err := SendRequest[struct{}](a.conn.RPC(), ctx, "fs/write_text_file", struct {
 		SessionId SessionId `json:"sessionId"`
 		Path      string    `json:"path"`
 		Content   string    `json:"content"`
 	}{SessionId: sid, Path: path, Content: content})
 	return err
+}
+
+// directRead is the subagent-path equivalent of an ACP fs/read_text_file:
+// reads the file from disk and applies the 1-indexed line/limit window so
+// the returned slice matches the shape the ACP path would have produced.
+// SplitAfter keeps trailing newlines on each line so the join is lossless.
+func directRead(path string, line, limit *int) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	if line == nil && limit == nil {
+		return string(data), nil
+	}
+	lines := strings.SplitAfter(string(data), "\n")
+	start := 0
+	if line != nil && *line > 0 {
+		start = *line - 1
+	}
+	if start >= len(lines) {
+		return "", nil
+	}
+	end := len(lines)
+	if limit != nil && *limit > 0 && start+*limit < end {
+		end = start + *limit
+	}
+	return strings.Join(lines[start:end], ""), nil
 }

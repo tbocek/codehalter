@@ -367,12 +367,13 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 }
 
-// TestToolLoopDedup verifies that two identical tool calls in the same tool
-// loop execute the underlying tool only once — the second returns the cached
-// output with a "[deduped: …]" banner. Applies uniformly: both read-style
-// idempotent calls AND write-style calls dedup on identical args, so the model
-// can't write the same content twice or read the same path twice within a turn.
-func TestToolLoopDedup(t *testing.T) {
+// TestToolLoopNoDedup verifies that identical tool calls in the same tool
+// loop each execute the underlying tool. The dedup cache used to suppress
+// the second call, which broke read-after-write: a mutator (sed via
+// run_command) would change state, then a re-issued read returned the
+// pre-mutation cached value and the model concluded the mutation failed.
+// Now every call executes; the model gets a fresh result every time.
+func TestToolLoopNoDedup(t *testing.T) {
 	withFreshToolRegistry(t)
 	const readName = "test_read"
 	const writeName = "test_write"
@@ -419,20 +420,19 @@ func TestToolLoopDedup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
-	if reads != 1 {
-		t.Errorf("read tool executed %d times, want 1 (second must be deduped)", reads)
+	if reads != 2 {
+		t.Errorf("read tool executed %d times, want 2 (no dedup)", reads)
 	}
-	if writes != 1 {
-		t.Errorf("write tool executed %d times, want 1 (second must be deduped)", writes)
+	if writes != 2 {
+		t.Errorf("write tool executed %d times, want 2 (no dedup)", writes)
 	}
 	if len(res.ToolUses) != 4 {
 		t.Fatalf("ToolUses: got %d, want 4", len(res.ToolUses))
 	}
-	if !strings.HasPrefix(res.ToolUses[1].Output, "[deduped:") {
-		t.Errorf("second read should be deduped, got %q", res.ToolUses[1].Output)
-	}
-	if !strings.HasPrefix(res.ToolUses[3].Output, "[deduped:") {
-		t.Errorf("second write should be deduped, got %q", res.ToolUses[3].Output)
+	for i, tu := range res.ToolUses {
+		if strings.HasPrefix(tu.Output, "[deduped:") {
+			t.Errorf("ToolUses[%d] should not be deduped, got %q", i, tu.Output)
+		}
 	}
 }
 
