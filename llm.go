@@ -69,6 +69,14 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 
 	body, _ := json.Marshal(reqBody)
 
+	// Surface "(thinking…)" on the active phase entry while a thinking-role
+	// LLM call is in flight. notifyPhaseSuffix is a no-op when no phase is
+	// active, so summarisation calls between phases don't flash anything.
+	if conn.Tag == "thinking" {
+		a.notifyPhaseSuffix(ctx, sid, " (thinking…)")
+		defer a.notifyPhaseSuffix(ctx, sid, "")
+	}
+
 	// Per-session log: request header + body, then we'll tee the raw SSE
 	// response into the same file as it streams. Closed on return.
 	logF := a.sessionLog(sid)

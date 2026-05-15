@@ -47,6 +47,32 @@ func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bo
 	a.sendUpdate(ctx, sid, PlanUpdate([]PlanEntry{entry}))
 }
 
+// notifyPhaseSuffix re-emits the currently-active phase entry with `suffix`
+// appended to its content. Used as a transient marker (e.g. " (thinking…)")
+// while a phase-bound LLM call is in flight; pass "" to revert. No-op if no
+// phase is active so background calls (history compaction) don't clobber
+// the UI when no phase is showing. Replace semantics: PlanUpdate with a
+// single entry overwrites the previous plan render in place.
+func (a *agent) notifyPhaseSuffix(ctx context.Context, sid SessionId, suffix string) {
+	sess := a.getSession(sid)
+	if sess == nil {
+		return
+	}
+	sess.mu.Lock()
+	active := sess.phaseActive
+	phase := sess.phaseCurrent
+	sess.mu.Unlock()
+	if !active || phase < 0 || phase >= len(phaseNames) {
+		return
+	}
+	entry := PlanEntry{
+		Content:  phaseNames[phase] + suffix,
+		Priority: "medium",
+		Status:   "in_progress",
+	}
+	a.sendUpdate(ctx, sid, PlanUpdate([]PlanEntry{entry}))
+}
+
 // finalizePlan marks the currently-in-progress phase as completed so the UI
 // stops spinning. Idempotent and safe to call when no phase is active. Used
 // from a Prompt-level defer to cover every exit path: errors mid-phase

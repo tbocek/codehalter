@@ -157,11 +157,29 @@ func init() {
 		}
 
 		content, truncNote := capReadContent(content, explicitLimit, args["line"])
+
+		// Line count of the actual returned slice (before any truncation note
+		// is appended), so the title preview reflects what the LLM/user got.
+		lineCount := 0
+		if content != "" {
+			lineCount = strings.Count(content, "\n")
+			if !strings.HasSuffix(content, "\n") {
+				lineCount++
+			}
+		}
+		resultTitle := fmt.Sprintf("✅ %s → %d lines", path, lineCount)
+		if args["line"] != "" {
+			resultTitle = fmt.Sprintf("✅ %s:%s → %d lines", path, args["line"], lineCount)
+		}
+		if truncNote != "" {
+			resultTitle += " (truncated)"
+		}
+
 		if truncNote != "" {
 			content += "\n" + truncNote
 		}
 
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(content)})
+		a.CompleteToolCallTitled(ctx, sid, tcId, resultTitle, []ToolCallContent{TextContent(content)})
 		return content
 	}})
 

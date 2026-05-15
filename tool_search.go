@@ -74,7 +74,9 @@ func init() {
 		}
 
 		if len(results) == 0 {
-			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("no matches found")})
+			a.CompleteToolCallTitled(ctx, sid, tcId,
+				"Searching for: "+query+" → no matches",
+				[]ToolCallContent{TextContent("no matches found")})
 			return "no matches found"
 		}
 
@@ -82,7 +84,9 @@ func init() {
 		if len(results) >= maxSearchResults {
 			summary += " (limit reached)"
 		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(summary)})
+		a.CompleteToolCallTitled(ctx, sid, tcId,
+			fmt.Sprintf("✅ Searching for: %s → %s", query, summary),
+			[]ToolCallContent{TextContent(summary)})
 		return strings.Join(results, "\n")
 	}})
 }

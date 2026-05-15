@@ -411,7 +411,9 @@ func init() {
 		}
 
 		formatted := formatDDGResults(results)
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(formatted)})
+		a.CompleteToolCallTitled(ctx, sid, tcId,
+			fmt.Sprintf("✅ DuckDuckGo: %s → %d results", query, len(results)),
+			[]ToolCallContent{TextContent(formatted)})
 		a.logSession(sid, "WEB", "results (%d):\n%s", len(results), formatted)
 		return formatted
 	}})
