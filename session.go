@@ -30,6 +30,12 @@ type ToolUse struct {
 	Name   string `toml:"name"`
 	Input  string `toml:"input"`
 	Output string `toml:"output"`
+	// StartedAt and DurationMs are populated by runToolLoop when the call is
+	// dispatched. omitempty keeps older session files decoding cleanly. For
+	// deduped cache hits DurationMs is near zero and StartedAt is when the
+	// hit happened, not when the original call ran.
+	StartedAt  time.Time `toml:"started_at,omitempty"`
+	DurationMs int64     `toml:"duration_ms,omitempty"`
 }
 
 type Session struct {

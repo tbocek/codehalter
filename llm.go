@@ -582,6 +582,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 			// invalidate on any mutator so a read after write sees fresh state.
 			readOnly := readOnlyByName[tc.Function.Name]
 			key := tc.Function.Name + "\x00" + tc.Function.Arguments
+			started := time.Now()
 			var result string
 			if cached, ok := callCache[key]; ok && readOnly {
 				result = "[deduped: identical " + tc.Function.Name + " call earlier in this turn]\n" + cached
@@ -594,9 +595,11 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 				}
 			}
 			tu := ToolUse{
-				Name:   tc.Function.Name,
-				Input:  tc.Function.Arguments,
-				Output: result,
+				Name:       tc.Function.Name,
+				Input:      tc.Function.Arguments,
+				Output:     result,
+				StartedAt:  started,
+				DurationMs: time.Since(started).Milliseconds(),
 			}
 			res.ToolUses = append(res.ToolUses, tu)
 
