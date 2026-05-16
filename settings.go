@@ -24,20 +24,49 @@ type Settings struct {
 }
 
 // LLMConnection describes one llama.cpp/OpenAI-compatible endpoint. The same
-// struct is used for both the main [llm] and subagent [[subllm]] entries;
-// Tag is only meaningful on the subllm side (the main entry's tag is set at
-// runtime to the requesting role for logging).
+// struct is used for both the main [llm] and subagent [[subllm]] entries.
+//
+// Sampler params can be split by role: `params_thinking` for plan/title/
+// history (higher temperature, exploratory) and `params_execute` for
+// execute/verify/document/summarize (lower temperature, follow-instruction).
+// `params` is the legacy single-set field — still honoured as the fallback
+// when the role-specific variant is empty. Each role-specific set hits the
+// SAME prefix cache on the server because sampler params never enter the KV
+// cache key — only prompt tokens do.
+//
+// Tag is now purely informational (logged in llmStream); routing no longer
+// filters by tag, every entry serves every role with the right param set.
 type LLMConnection struct {
-	URL    string         `toml:"url"`
-	APIKey string         `toml:"api_key,omitempty"`
-	Model  string         `toml:"model"`
-	Tag    string         `toml:"tag,omitempty"`
-	Params map[string]any `toml:"params,omitempty"`
+	URL            string         `toml:"url"`
+	APIKey         string         `toml:"api_key,omitempty"`
+	Model          string         `toml:"model"`
+	Tag            string         `toml:"tag,omitempty"`
+	Params         map[string]any `toml:"params,omitempty"`
+	ParamsThinking map[string]any `toml:"params_thinking,omitempty"`
+	ParamsExecute  map[string]any `toml:"params_execute,omitempty"`
 
-	// ExtraBody is the runtime alias for Params used by llmStream when
-	// assembling the OpenAI request body. Populated by LLMCandidates so
-	// callers don't have to know about the Params field.
+	// ExtraBody is the runtime alias for the role-resolved Params used by
+	// llmStream when assembling the OpenAI request body. Populated by
+	// LLMCandidates / pickAvailable so callers don't have to know which
+	// of Params / ParamsThinking / ParamsExecute applies.
 	ExtraBody map[string]any `toml:"-"`
+}
+
+// paramsFor returns the sampler params for the given role, falling back to
+// the legacy single `params` set when the role-specific one isn't configured.
+// An empty map (nil) is fine — llmStream just won't add any extra body keys.
+func (c *LLMConnection) paramsFor(role string) map[string]any {
+	switch role {
+	case "thinking":
+		if len(c.ParamsThinking) > 0 {
+			return c.ParamsThinking
+		}
+	case "execute":
+		if len(c.ParamsExecute) > 0 {
+			return c.ParamsExecute
+		}
+	}
+	return c.Params
 }
 
 // loadSettings looks for settings.toml in this order:
@@ -109,23 +138,20 @@ func (s *Settings) LLMFor(role, tier string) *LLMConnection {
 
 // LLMCandidates returns every connection in preference order for the given
 // role and caller tier. tier == "main" returns the [llm] entry (one slot).
-// tier == "subagent" returns [[subllm]] entries with matching Tag first,
-// then untagged subllm entries (wildcards), with the main [llm] as the
-// last-resort fallback. Wrong-tag subllm entries are intentionally NOT
-// considered: the user tagged them on purpose, and a "thinking"-tagged
-// subllm has the wrong sampler params for an "execute" call — falling back
-// to main is both cache-warmer and behaviourally closer to what the user
+// tier == "subagent" returns every [[subllm]] entry (round-robined by the
+// caller), with the main [llm] as a last-resort fallback if no subllm is
 // configured.
 //
-// Each entry is a clone with ExtraBody populated from Params and Tag
-// normalised to the requested role (for logging in llmStream).
+// Each candidate's ExtraBody is populated from the role-specific param set
+// (params_thinking / params_execute / legacy params) and Tag is overridden
+// to the requesting role for logging.
 func (s *Settings) LLMCandidates(role, tier string) []LLMConnection {
 	mainCopy := func() *LLMConnection {
 		if s.LLM == nil {
 			return nil
 		}
 		c := *s.LLM
-		c.ExtraBody = c.Params
+		c.ExtraBody = c.paramsFor(role)
 		c.Tag = role
 		return &c
 	}
@@ -138,21 +164,15 @@ func (s *Settings) LLMCandidates(role, tier string) []LLMConnection {
 		return []LLMConnection{*c}
 	}
 
-	// tier == "subagent": tagged matches first, then untagged wildcards,
-	// then main as the last-resort fallback. Wrong-tag entries are skipped.
-	var matched, untagged []LLMConnection
+	// tier == "subagent": every entry serves every role with its own
+	// per-role params. Round-robin happens in pickAvailable.
+	var out []LLMConnection
 	for _, c := range s.SubLLM {
 		cc := c
-		cc.ExtraBody = cc.Params
-		switch {
-		case cc.Tag == role:
-			matched = append(matched, cc)
-		case cc.Tag == "":
-			cc.Tag = role
-			untagged = append(untagged, cc)
-		}
+		cc.ExtraBody = cc.paramsFor(role)
+		cc.Tag = role
+		out = append(out, cc)
 	}
-	out := append(matched, untagged...)
 	if len(out) == 0 {
 		if c := mainCopy(); c != nil {
 			out = append(out, *c)

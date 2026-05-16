@@ -11,14 +11,36 @@ import (
 )
 
 // subagentTaskHash is a stable digest of an instructions+context pair, used
-// to dedupe launch_subagent calls. Whitespace at the edges is normalised so
-// trivial reformatting by the model still hits the cache.
+// to dedupe launch_subagent calls. We normalise aggressively (lowercase,
+// strip code fences, collapse whitespace) because small models love to
+// re-issue the same task with cosmetically different framing (e.g. wrapping
+// the context in ```...``` the second time).
 func subagentTaskHash(t subagentTask) string {
 	h := sha256.New()
-	h.Write([]byte(strings.TrimSpace(t.Instructions)))
+	h.Write([]byte(normalizeForHash(t.Instructions)))
 	h.Write([]byte{0})
-	h.Write([]byte(strings.TrimSpace(t.Context)))
+	h.Write([]byte(normalizeForHash(t.Context)))
 	return hex.EncodeToString(h.Sum(nil))[:16]
+}
+
+func normalizeForHash(s string) string {
+	s = strings.ToLower(s)
+	s = strings.ReplaceAll(s, "`", "")
+	var b strings.Builder
+	b.Grow(len(s))
+	prevSpace := true
+	for _, r := range s {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		prevSpace = false
+	}
+	return strings.TrimSpace(b.String())
 }
 
 const maxSubagentDepth = 2

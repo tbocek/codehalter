@@ -7,6 +7,23 @@ carry out the plan.
 - Follow the approved plan. Do not add extra steps or scope.
 - Do NOT re-explore the codebase from scratch. The planner already looked.
   Read files again only when you are about to edit them or need exact contents.
+- Do NOT re-read a file you already have in this conversation's history
+  (planner reads, earlier execute reads). Scroll back instead. Re-read only
+  if you have edited the file since, or if you need the current state for a
+  precise byte-level edit.
+- Trust your own tool successes. When `edit_file` / `write_file` / `run_task`
+  returned a success result, the change took effect — do NOT dispatch a
+  follow-up tool call (a `read_file`, another `edit_file`, a fresh
+  `launch_subagent`) to "verify" or "double-check" state you just changed.
+  Re-verification is the job of the verify phase, not the executor. If the
+  result is success, move on to the next plan step.
+- Do NOT use `launch_subagent` for single-file edits or single-shot lookups.
+  Each subagent pays a separate LLM warm-up + tool-loop, which dwarfs the
+  cost of one inline `edit_file` or `read_file`. Use it only when you have
+  ≥2 genuinely independent multi-step units that would otherwise run
+  serially (e.g. three independent investigations across different
+  packages). For three one-line edits across three files, just call
+  `edit_file` three times in parallel from this loop.
 - Do NOT attempt web_search, web_read, or web_read_raw. Those tools are
   UNAVAILABLE in this phase by design — any external information was
   retrieved during planning and is included in your context.

@@ -9,41 +9,48 @@
 # Two kinds of entries:
 #
 #   [llm]      → the main-tier connection. One entry. Owns the main session's
-#                KV cache, so its prefix stays warm across turns. Typically a
-#                smaller/faster model. Used for plan, document, and history
-#                compaction on the foreground session.
+#                KV cache, so its prefix stays warm across turns.
 #
-#   [[subllm]] → subagent-tier connections. Zero or more entries. Each
-#                declares `tag = "thinking"` or `tag = "execute"` to identify
-#                the role it serves. Used for execute/verify on the main
-#                session (so conn 0's cache isn't evicted by role swaps) and
-#                for any `launch_subagent` work. Multiple entries with the
-#                same tag get round-robined.
+#   [[subllm]] → subagent-tier connections. Zero or more entries. Each is a
+#                slot; multiple entries get round-robined for parallel
+#                subagent work. If empty, the main [llm] serves both tiers.
 #
-# If [[subllm]] is empty, the main [llm] serves both tiers.
+# Sampler params can be split by role on EITHER tier:
 #
-# `params` is forwarded verbatim as the OpenAI request's extra body, so put
-# samplers (temperature, top_p, ...) and any model-specific keys
-# (enable_thinking, reasoning_mode, ...) in there. Core fields (model,
-# messages, stream, tools) always win over params.
+#   params_thinking → used for PLAN, history summarisation, title generation.
+#                     Set higher temperature / top_p — these phases benefit
+#                     from exploration.
+#   params_execute  → used for EXECUTE, VERIFY, DOCUMENT, web-page summary,
+#                     and every subagent's tool loop. Set lower temperature
+#                     — these phases need to follow instructions precisely.
+#   params          → legacy single-set fallback. Used when the role-specific
+#                     variant isn't configured. Fine for simple setups.
+#
+# All three are forwarded verbatim as the OpenAI request's extra body
+# (sampler keys plus anything model-specific like enable_thinking,
+# reasoning_mode). Core fields (model, messages, stream, tools) always
+# override. Sampler params never enter the prefix KV cache key, so switching
+# between params_thinking and params_execute on the same server hits the same
+# cache — no warm-up cost.
 
 [llm]
 url = "http://localhost:8080/v1/chat/completions"
 # api_key = "..."        # uncomment if your server requires bearer auth
 model = "your-model-id"  # must match the model name your server reports at /v1/models
-params = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
+params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
+params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0 }
 
-# Example subagent entries — uncomment and edit when you have a second
-# server (or a separate role profile on the same server).
+# Example subagent entries — uncomment when you have a separate server (or
+# multiple slots on the same server you want to use in parallel).
 #
 # [[subllm]]
-# tag = "execute"
 # url = "http://your-other-server:9001/v1/chat/completions"
 # model = "your-larger-model-id"
-# params = { temperature = 0.6, top_p = 0.8, top_k = 20, min_p = 0.0 }
+# params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
+# params_execute  = { temperature = 0.7, top_p = 0.8,  top_k = 20, min_p = 0.0 }
 #
 # [[subllm]]
-# tag = "thinking"
 # url = "http://your-other-server:9001/v1/chat/completions"
 # model = "your-larger-model-id"
-# params = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
+# params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
+# params_execute  = { temperature = 0.7, top_p = 0.8,  top_k = 20, min_p = 0.0 }

@@ -44,6 +44,10 @@ so even mutating calls are recoverable.
       specific query you can up front, including the exact symbol, tag, or
       version (e.g. `golang:1.26-trixie site:hub.docker.com`, not
       `Go 1.26 release` then `golang docker image` then `golang trixie tag`).
+    - HARD CAP: at most TWO web_search calls per distinct fact. If the first
+      search returned a result that answers the question, trust it and move
+      on — do not "re-confirm" with a second search asking the same thing in
+      different words. Re-confirmation is the most common time sink in plan.
     - If you genuinely need two independent facts, fan them out with
       `launch_subagent` (parallel), don't issue them serially.
     - If a search returns nothing useful, REFORMULATE — don't just rerun with

@@ -357,7 +357,7 @@ func (a *agent) pickAvailable(ctx context.Context, sid SessionId, role string) *
 	// on every plan/execute transition.
 	if sess != nil && sess.Depth > 0 && sess.PinnedSubLLMIdx >= 0 && sess.PinnedSubLLMIdx < len(a.settings.SubLLM) {
 		c := a.settings.SubLLM[sess.PinnedSubLLMIdx]
-		c.ExtraBody = c.Params
+		c.ExtraBody = c.paramsFor(role)
 		c.Tag = role
 		return &c
 	}
