@@ -37,7 +37,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid SessionId) 
 	}
 
 	tcId := a.StartToolCall(ctx, sid, "Add .codehalter/ to .gitignore?", "think", nil)
-	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Ignore", "Track", true)
+	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Ignore", "Track")
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
@@ -96,7 +96,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionI
 			"Skip is remembered in .codehalter/devcontainer.skip.\n\n")))
 
 	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
-	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Create", "Skip", true)
+	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Create", "Skip")
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return

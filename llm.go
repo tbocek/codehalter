@@ -573,8 +573,14 @@ const maxToolLoopIterations = 50
 // failure we send one corrective follow-up ("reply with ONLY JSON") and try
 // again before giving up. The returned toolLoopResult always carries the
 // merged tool uses from both passes so callers don't lose visibility.
+//
+// Text tokens never stream to the UI here — JSON is internal machinery, and
+// the caller renders the parsed result (renderSteps for plans, verify
+// outcome for verify). Tool calls still surface as cards so the user sees
+// what the planner/verifier is probing.
 func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, dst any) (toolLoopResult, error) {
-	res, err := a.runToolLoop(ctx, sid, conn, messages, filter)
+	noop := func(string) {}
+	res, err := a.runToolLoopOn(ctx, sid, conn, messages, filter, noop)
 	if err != nil {
 		return res, err
 	}
@@ -587,7 +593,7 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMCon
 		llmMessage{Role: "assistant", Content: res.Text},
 		llmMessage{Role: "user", Content: "Your previous reply was not valid JSON. Reply with ONLY the JSON object — first character `{`, last character `}`, nothing before or after. No prose, no markdown fences."},
 	)
-	res2, err := a.runToolLoop(ctx, sid, conn, fixMsgs, filter)
+	res2, err := a.runToolLoopOn(ctx, sid, conn, fixMsgs, filter, noop)
 	res.Text = res2.Text
 	res.ToolUses = append(res.ToolUses, res2.ToolUses...)
 	if err != nil {
@@ -599,16 +605,23 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMCon
 	return res, nil
 }
 
-// runToolLoop runs the agentic tool loop: send to LLM, execute tool calls, repeat.
-// Tokens always stream to Zed so the user sees every phase (planner JSON,
-// verifier reasoning, doc writer) in chat — there's nothing to hide.
+// runToolLoop runs the agentic tool loop with the default token-streaming
+// callback so the user sees execute / document phases live. The internal
+// JSON phases (planner, verifier) call runToolLoopOn directly with a no-op.
 func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter) (toolLoopResult, error) {
-	tools := llmToolDefinitionsFiltered(filter)
 	on := func(token string) {
 		if sid != "" {
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(token)))
 		}
 	}
+	return a.runToolLoopOn(ctx, sid, conn, messages, filter, on)
+}
+
+// runToolLoopOn is the core agentic tool loop: send to LLM, execute tool
+// calls, repeat. Callers supply the per-token callback (default streaming
+// for runToolLoop, no-op for runToolLoopJSON).
+func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, on func(string)) (toolLoopResult, error) {
+	tools := llmToolDefinitionsFiltered(filter)
 
 	var res toolLoopResult
 	var allText strings.Builder

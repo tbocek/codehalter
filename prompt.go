@@ -419,7 +419,7 @@ func (a *agent) runSubtasks(
 	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(header.String())))
 
 	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Interactive", "Automatic"}, 0)
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Interactive", "Automatic"})
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 	if err != nil || choice == "abort" {
 		if sess != nil {

@@ -20,35 +20,26 @@ func (a *agent) shouldAutoAnswer(sid SessionId) (bool, string) {
 }
 
 // askYesNoAuto asks the user in interactive mode; in autopilot mode or from a
-// subagent it returns defaultYes immediately and sends a chat note so the user
-// sees what was auto-answered. Callers are still responsible for completing
-// the tool call they opened (typically via CompleteToolCall with a short note).
-func (a *agent) askYesNoAuto(ctx context.Context, sid SessionId, tcId, yesLabel, noLabel string, defaultYes bool) (bool, error) {
+// subagent it returns yes immediately and sends a chat note so the user sees
+// what was auto-answered. Callers are still responsible for completing the
+// tool call they opened (typically via CompleteToolCall with a short note).
+func (a *agent) askYesNoAuto(ctx context.Context, sid SessionId, tcId, yesLabel, noLabel string) (bool, error) {
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		chosen := noLabel
-		if defaultYes {
-			chosen = yesLabel
-		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+chosen+"\n\n")))
-		return defaultYes, nil
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+yesLabel+"\n\n")))
+		return true, nil
 	}
 	return a.conn.AskYesNo(ctx, sid, tcId, yesLabel, noLabel)
 }
 
 // askChoiceAuto asks the user in interactive mode; in autopilot or from a
-// subagent it returns choices[defaultIdx] (or choices[0] if out of range, or
-// "abort" if empty).
-func (a *agent) askChoiceAuto(ctx context.Context, sid SessionId, tcId string, choices []string, defaultIdx int) (string, error) {
+// subagent it returns choices[0] (or "abort" if empty).
+func (a *agent) askChoiceAuto(ctx context.Context, sid SessionId, tcId string, choices []string) (string, error) {
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
 		if len(choices) == 0 {
 			return "abort", nil
 		}
-		idx := defaultIdx
-		if idx < 0 || idx >= len(choices) {
-			idx = 0
-		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+choices[idx]+"\n\n")))
-		return choices[idx], nil
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+choices[0]+"\n\n")))
+		return choices[0], nil
 	}
 	return a.conn.AskChoice(ctx, sid, tcId, choices)
 }
@@ -73,7 +64,7 @@ func init() {
 		args := parseArgs(rawArgs)
 		question, yesLabel, noLabel := args["question"], args["yes_label"], args["no_label"]
 		tcId := a.StartToolCall(ctx, sid, question, "think", nil)
-		ok, err := a.askYesNoAuto(ctx, sid, tcId, yesLabel, noLabel, true)
+		ok, err := a.askYesNoAuto(ctx, sid, tcId, yesLabel, noLabel)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error(), false

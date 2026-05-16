@@ -184,6 +184,19 @@ Reply with ONLY a JSON object. No prose, no markdown fences, no commentary
 before or after. The first character of your final message must be `{` and
 the last must be `}`.
 
+This rule applies to EVERY assistant message in this phase, not just the
+final one. While you are gathering information, your assistant messages
+must be either:
+  - a tool call (or several parallel tool calls), with NO accompanying text, or
+  - the final JSON object.
+
+Do NOT emit "thinking out loud" narration between tool calls — no
+"Let me check X first.", no bulleted findings summaries like
+"- TinyGo: v0.41 supports Go 1.26", no recap of what you just read. Keep
+the chain silent and end with the JSON. The user sees the parsed plan
+rendered after you reply; any prose you emit in the loop is duplicated
+noise.
+
 Schema:
 {
   "clear": true,

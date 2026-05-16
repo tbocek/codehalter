@@ -206,7 +206,7 @@ func (a *agent) ensureSettings(ctx context.Context, cwd string, sid SessionId) {
 			"every project on this machine.\n\n")))
 
 	tcId := a.StartToolCall(ctx, sid, "Write skeleton .codehalter/settings.toml?", "think", nil)
-	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Create", "Skip", true)
+	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Create", "Skip")
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
