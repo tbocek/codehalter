@@ -1,0 +1,14 @@
+# Copied verbatim into each test project's .codehalter/settings.toml before
+# the agent runs. Edit url/model to match the LLM server the spawned
+# codehalter (running inside the test repo's devcontainer) should reach.
+#
+# Reachability is from inside the container — `localhost` on the host is not
+# `localhost` to the container. Use the container-visible address, e.g.
+# `http://host.docker.internal:8080` or the host's LAN IP.
+
+[llm]
+url = "http://host.docker.internal:8080/v1/chat/completions"
+model = "your-model-id"
+
+# [[subllm]] entries are optional; leave the array empty for the bench. The
+# whole point is to measure one [llm] configuration end-to-end.

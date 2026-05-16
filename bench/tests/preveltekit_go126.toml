@@ -1,0 +1,10 @@
+name = "preveltekit-go126"
+repo = "https://github.com/tbocek/preveltekit.git"
+commit = "e58a25d6058d6ed3cede1ea18cd7dcb549821f0f"
+prompt = "can we update the project to golang 1.26? and fix resulting errors?"
+verify = "just verify"
+timeout = "30m"
+# settings is resolved relative to this test file's directory, so
+# `../settings.toml` picks up bench/settings.toml. Override per-test if a
+# different LLM should drive this run.
+settings = "$HOME/.config/codehalter/settings.toml"

@@ -1,0 +1,24 @@
+// Default devcontainer dropped into test repos that don't ship one. Adapted
+// from codehalter/docs/devcontainer.json.example — the only change is the
+// removed `--name codehalter-devcontainer` runArg: the bench identifies its
+// containers via the `codehalter-bench=<test-name>` id-label instead, and a
+// fixed --name would force every test to collide on the same docker name.
+{
+  "name": "codehalter-bench",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "args": {
+      "UID": "${localEnv:UID:1000}",
+      "GID": "${localEnv:GID:1000}"
+    }
+  },
+  // Lets settings.toml inside the container reach an LLM running on the host
+  // as host.docker.internal:8080.
+  "runArgs": ["--add-host=host.docker.internal:host-gateway"],
+  // Picked up by codehalter's container detection.
+  "containerEnv": { "DEVCONTAINER": "true" },
+  "remoteUser": "dev",
+  "mounts": [
+    "source=codehalter-bench-gocache,target=/home/dev/go/pkg/mod,type=volume"
+  ]
+}
