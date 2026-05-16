@@ -57,7 +57,15 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 	if hint := a.verifyTargetHint(); hint != "" {
 		planPrompt = planPrompt + "\n\n" + hint
 	}
-	messages := []llmMessage{{Role: "user", Content: planPrompt + "\n\nUser request: " + userText}}
+	// Carry the full session history so plan shares a prefix with the other
+	// phases (execute/verify/document). Without this, each turn's plan call
+	// sends only `PLAN.md + userText` and the cache from prior turns is
+	// useless.
+	var messages []llmMessage
+	if sess := a.getSession(sid); sess != nil {
+		messages = a.buildLLMHistory(sess, -1)
+	}
+	messages = append(messages, llmMessage{Role: "user", Content: planPrompt + "\n\nUser request: " + userText})
 	var plan planResult
 	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{}, &plan)
 	if err != nil {
@@ -361,7 +369,15 @@ func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection
 	prompt.WriteString("\n\nExecutor response:\n")
 	prompt.WriteString(exec.Text)
 
-	messages := []llmMessage{{Role: "user", Content: prompt.String()}}
+	// Carry the session history so document shares a prefix with the other
+	// phases — the prior turns are identical bytes to what plan/execute/
+	// verify just saw, so the slot's cache stays warm into the doc pass
+	// instead of being thrown away for a fresh fill.
+	var messages []llmMessage
+	if sess := a.getSession(sid); sess != nil {
+		messages = a.buildLLMHistory(sess, -1)
+	}
+	messages = append(messages, llmMessage{Role: "user", Content: prompt.String()})
 	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{})
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
