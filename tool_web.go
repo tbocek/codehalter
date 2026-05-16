@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -465,13 +466,29 @@ func webReadDef(name, description string) map[string]any {
 						"type":        "string",
 						"description": "The URL to read",
 					},
+					"offset": map[string]any{
+						"type":        "integer",
+						"description": "Character offset into the page body to start at. Pair with limit to view a specific range of a page already cached from an earlier call (no HTTP re-fetch). Omit (or 0) on the first call.",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": fmt.Sprintf("Max characters to return starting at offset (hard cap %d). Use after a truncated read to view a deeper region of the cached body. Omit on the first call.", maxWebRangeChars),
+					},
 				},
 			},
 		},
 	}
 }
 
-const maxRawPageChars = 30000
+const (
+	// maxRawPageChars caps the bytes returned by web_read_raw on the FIRST
+	// fetch (before truncateForLLM further compresses for the model). Full
+	// body is still cached so range reads can dip past this.
+	maxRawPageChars = 30000
+	// maxWebRangeChars caps a single offset/limit slice from the cached body
+	// so a "view more" can't dump megabytes back into the prefix at once.
+	maxWebRangeChars = 8000
+)
 
 func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string) (string, bool) {
 	return func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
@@ -479,6 +496,33 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 		targetURL := args["url"]
 		if targetURL == "" {
 			return "error: url is required", false
+		}
+		offset, _ := strconv.Atoi(args["offset"])
+		if offset < 0 {
+			offset = 0
+		}
+		limit, _ := strconv.Atoi(args["limit"])
+		if limit <= 0 || limit > maxWebRangeChars {
+			limit = maxWebRangeChars
+		}
+		rangeRequest := offset > 0 || args["limit"] != ""
+
+		// Range request hits the cache first — no second HTTP round-trip when
+		// the page was fetched earlier in this session. Cache miss falls
+		// through to the regular fetch path so the model can still get a slice
+		// (it just costs the fetch the first time).
+		if rangeRequest {
+			if sess := a.getSession(sid); sess != nil {
+				if body, ok := sess.recallWebBody(targetURL); ok {
+					slice := sliceWebBody(body, offset, limit)
+					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
+					a.CompleteToolCallTitled(ctx, sid, tcId,
+						fmt.Sprintf("Web Read (cached): %s [%d:%d of %d]", targetURL, offset, offset+len(slice), len(body)),
+						[]ToolCallContent{TextContent(fmt.Sprintf("returned %d chars from cache (offset %d, body %d)", len(slice), offset, len(body)))})
+					a.logSession(sid, "WEB", "range from cache: url=%s offset=%d limit=%d returned=%d body=%d", targetURL, offset, limit, len(slice), len(body))
+					return slice, false
+				}
+			}
 		}
 
 		a.logSession(sid, "WEB", "open URL: %s", targetURL)
@@ -501,6 +545,13 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 			return "error getting page text: " + err.Error(), false
 		}
 
+		// Cache the full extracted text BEFORE summarization / raw truncation.
+		// Later offset/limit calls slice from this — they should be able to
+		// reach past the raw 30k cap or the summary's compression.
+		if sess := a.getSession(sid); sess != nil {
+			sess.rememberWebBody(targetURL, text)
+		}
+
 		// Binary success/failure marker after the URL: ✅ when the body looks
 		// like real content, ❌ when pageIssue flags a load failure, bot wall,
 		// or content too thin to use. The card itself is still marked
@@ -516,6 +567,12 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 
 		a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))
 
+		// A range request that fell through (cache miss) returns a slice of
+		// the freshly-fetched body — honor offset/limit even on the first
+		// call so the model gets exactly what it asked for.
+		if rangeRequest {
+			return sliceWebBody(text, offset, limit), false
+		}
 		if summarize {
 			return a.summarizePage(ctx, sid, "content of "+targetURL, targetURL, text), false
 		}
@@ -524,6 +581,22 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 		}
 		return text, false
 	}
+}
+
+// sliceWebBody returns up to `limit` characters of `body` starting at `offset`,
+// clamping both ends so out-of-range arguments produce a sensible empty/last
+// slice instead of a panic. The model can pass offset past the end (e.g. when
+// it doesn't know the exact length) — we return "" rather than erroring so the
+// model can correct on the next call.
+func sliceWebBody(body string, offset, limit int) string {
+	if offset >= len(body) {
+		return ""
+	}
+	end := offset + limit
+	if end > len(body) {
+		end = len(body)
+	}
+	return body[offset:end]
 }
 
 // summarizePage uses the execute LLM to extract only the relevant information

@@ -88,6 +88,13 @@ type Session struct {
 	// is the safer default than feeding back a possibly-stale cached result.
 	launchedSubagentsMu sync.Mutex
 	launchedSubagents   map[string]string
+	// webBodies caches the full raw page text from web_read / web_read_raw,
+	// keyed by URL. When the LLM-visible result is truncated, the model can
+	// re-call with offset/limit to view a specific range — we slice from the
+	// cache instead of issuing another HTTP fetch, so paging through a long
+	// document is free after the first read. In-memory only; lost on restart.
+	webBodiesMu sync.Mutex
+	webBodies   map[string]string
 	// mu serialises mutations of the persisted fields (Title, Messages,
 	// Summary, …) and the Save() encoder. Prompt runs synchronously per
 	// session, but generateTitle runs as a background goroutine and would
@@ -132,6 +139,32 @@ func (s *Session) rememberSubagent(hash, result string) {
 		s.launchedSubagents = make(map[string]string)
 	}
 	s.launchedSubagents[hash] = result
+}
+
+// recallWebBody returns a cached page body if the URL was fetched earlier in
+// this session. Lets range-style web_read calls slice from cache without
+// re-issuing the HTTP request.
+func (s *Session) recallWebBody(url string) (string, bool) {
+	s.webBodiesMu.Lock()
+	defer s.webBodiesMu.Unlock()
+	if s.webBodies == nil {
+		return "", false
+	}
+	b, ok := s.webBodies[url]
+	return b, ok
+}
+
+// rememberWebBody stores the full raw page text from a web_read / web_read_raw
+// fetch. Overwrites on re-fetch so a refresh updates the cache; this is what
+// the model wants — if it asked for a fresh fetch it should see fresh content
+// on subsequent range views.
+func (s *Session) rememberWebBody(url, body string) {
+	s.webBodiesMu.Lock()
+	defer s.webBodiesMu.Unlock()
+	if s.webBodies == nil {
+		s.webBodies = make(map[string]string)
+	}
+	s.webBodies[url] = body
 }
 
 func loadSession(cwd string, id SessionId) (*Session, error) {

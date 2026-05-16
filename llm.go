@@ -711,16 +711,21 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 				sess.AppendToolUse(tu)
 				_ = sess.Save()
 			}
+			// Shrink the model-visible tool result before it enters the
+			// message stream: anything past truncateThreshold is replaced
+			// with head/tail + a per-tool "to see more" hint. session.toml
+			// still records the full output via tu.Output above — only the
+			// in-flight messages[] that get re-sent every turn shrink.
+			content := truncateForLLM(tc.Function.Name, tc.Function.Arguments, result)
 			// Small models routinely keep retrying a failing run_command
 			// without consulting the SKILL-*.md docs that were loaded into
 			// the system prompt at session start. Re-surface them at the
 			// moment the model would benefit most: right after the failure.
 			// Hint is appended to the live tool result only — not to the
 			// stored ToolUse.Output — so session.toml stays clean.
-			content := result
 			if failed {
 				if hint := a.failureSkillHint(sid, tc.Function.Name); hint != "" {
-					content = result + "\n\n" + hint
+					content = content + "\n\n" + hint
 				}
 			}
 			messages = append(messages, llmMessage{
