@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -139,11 +141,112 @@ func (c *acpClient) readLoop() {
 			if c.onNotify != nil {
 				c.onNotify(msg.Method, msg.Params)
 			}
+			continue
+		}
+		// Server-issued request: codehalter delegates filesystem reads/writes
+		// to the client via fs/read_text_file and fs/write_text_file (the Zed
+		// integration path). Bench has no editor and no unsaved-buffer state,
+		// so we just hit disk and return. Dispatching in a goroutine keeps the
+		// readLoop free for the response that the request handler will send.
+		if msg.Method != "" && len(msg.ID) > 0 {
+			go c.handleServerRequest(msg)
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		c.readErr.Store(&err)
 	}
+}
+
+// handleServerRequest answers an inbound JSON-RPC request from codehalter.
+// Unknown methods get JSON-RPC -32601 ("method not found") so the agent
+// surfaces a clear error instead of blocking on a never-arriving response.
+func (c *acpClient) handleServerRequest(msg rawRPC) {
+	var result any
+	var rpcErr *rpcError
+	switch msg.Method {
+	case "fs/read_text_file":
+		result, rpcErr = handleFSRead(msg.Params)
+	case "fs/write_text_file":
+		result, rpcErr = handleFSWrite(msg.Params)
+	default:
+		rpcErr = &rpcError{Code: -32601, Message: "method not found: " + msg.Method}
+	}
+
+	resp := rawRPC{JSONRPC: "2.0", ID: msg.ID, Error: rpcErr}
+	if rpcErr == nil {
+		// Always marshal a result, even for empty struct{} writes — RawMessage
+		// with omitempty drops a nil value, which would leave the response with
+		// neither result nor error and confuse codehalter's matcher.
+		b, err := json.Marshal(result)
+		if err != nil {
+			resp.Error = &rpcError{Code: -32603, Message: "marshal result: " + err.Error()}
+		} else {
+			resp.Result = b
+		}
+	}
+
+	body, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_, _ = c.w.Write(append(body, '\n'))
+}
+
+// handleFSRead reads a file and applies the optional 1-indexed line/limit
+// window — mirrors codehalter's directRead so the subagent and main-session
+// paths return the same shape for the same args.
+func handleFSRead(params json.RawMessage) (any, *rpcError) {
+	var p struct {
+		Path  string `json:"path"`
+		Line  *int   `json:"line,omitempty"`
+		Limit *int   `json:"limit,omitempty"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}
+	}
+	data, err := os.ReadFile(p.Path)
+	if err != nil {
+		return nil, &rpcError{Code: -32603, Message: err.Error()}
+	}
+	content := string(data)
+	if p.Line != nil || p.Limit != nil {
+		lines := strings.SplitAfter(content, "\n")
+		start := 0
+		if p.Line != nil && *p.Line > 0 {
+			start = *p.Line - 1
+		}
+		if start >= len(lines) {
+			content = ""
+		} else {
+			end := len(lines)
+			if p.Limit != nil && *p.Limit > 0 && start+*p.Limit < end {
+				end = start + *p.Limit
+			}
+			content = strings.Join(lines[start:end], "")
+		}
+	}
+	return struct {
+		Content string `json:"content"`
+	}{Content: content}, nil
+}
+
+// handleFSWrite writes a file directly. No diff/approval UI exists in bench;
+// codehalter's `interactive` vs `autopilot` mode gating runs entirely on the
+// server side, and bench has already flipped the session into autopilot.
+func handleFSWrite(params json.RawMessage) (any, *rpcError) {
+	var p struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}
+	}
+	if err := os.WriteFile(p.Path, []byte(p.Content), 0o644); err != nil {
+		return nil, &rpcError{Code: -32603, Message: err.Error()}
+	}
+	return struct{}{}, nil
 }
 
 // call sends a request and blocks until the matching response arrives.
