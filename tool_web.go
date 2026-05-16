@@ -523,6 +523,23 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 					return slice, false
 				}
 			}
+		} else {
+			// No-range repeat on the same URL+mode: return the previously-rendered
+			// output verbatim. Small models often re-ask for the same URL within
+			// one phase (or across plan→execute); skipping the fetch + summarize
+			// here saves the dominant cost (Firefox launch + page load is 30-60s,
+			// summarize is another LLM round-trip). Identical bytes are also nice
+			// to the prefix cache if the second call shows up in the same prompt.
+			if sess := a.getSession(sid); sess != nil {
+				if cached, ok := sess.recallWebResult(targetURL, summarize); ok {
+					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
+					a.CompleteToolCallTitled(ctx, sid, tcId,
+						"Web Read (cached): "+targetURL,
+						[]ToolCallContent{TextContent(fmt.Sprintf("returned cached result (%d chars, no re-fetch)", len(cached)))})
+					a.logSession(sid, "WEB", "result from cache: url=%s summarize=%v returned=%d", targetURL, summarize, len(cached))
+					return cached, false
+				}
+			}
 		}
 
 		a.logSession(sid, "WEB", "open URL: %s", targetURL)
@@ -569,17 +586,25 @@ func makeWebRead(summarize bool) func(context.Context, *agent, SessionId, string
 
 		// A range request that fell through (cache miss) returns a slice of
 		// the freshly-fetched body — honor offset/limit even on the first
-		// call so the model gets exactly what it asked for.
+		// call so the model gets exactly what it asked for. Range slices are
+		// NOT memoized in webResults (offset/limit vary), but the underlying
+		// body is in webBodies so the next range call is still free.
 		if rangeRequest {
 			return sliceWebBody(text, offset, limit), false
 		}
+		var out string
 		if summarize {
-			return a.summarizePage(ctx, sid, "content of "+targetURL, targetURL, text), false
+			out = a.summarizePage(ctx, sid, "content of "+targetURL, targetURL, text)
+		} else {
+			out = text
+			if len(out) > maxRawPageChars {
+				out = out[:maxRawPageChars] + "\n... (truncated)"
+			}
 		}
-		if len(text) > maxRawPageChars {
-			text = text[:maxRawPageChars] + "\n... (truncated)"
+		if sess := a.getSession(sid); sess != nil {
+			sess.rememberWebResult(targetURL, summarize, out)
 		}
-		return text, false
+		return out, false
 	}
 }
 

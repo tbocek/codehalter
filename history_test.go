@@ -454,8 +454,9 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		t.Fatalf("newSession: %v", err)
 	}
 
-	// rawBufferTokens = 100_000, charsPerToken = 4 → need > 400_000 chars.
-	// 20 messages × ~22_000 chars = ~440_000 chars = ~110_000 tokens.
+	// rawBufferTokens (fallback when n_ctx is unknown) = 60_000, charsPerToken = 4
+	// → need > 240_000 chars. 20 messages × ~22_000 chars = ~440_000 chars =
+	// ~110_000 tokens, comfortably over the trigger.
 	filler := strings.Repeat("lorem ipsum ", 1834) // ~22_000 chars
 	for i := 0; i < 10; i++ {
 		s.AddUser(fmt.Sprintf("user msg %d %s", i, filler))

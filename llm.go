@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -210,13 +211,18 @@ func writeResponseLog(logF *os.File, text string, calls []toolCall, streamErr er
 }
 
 // probeResult is what a single LLM probe call yields: server reachability,
-// model presence (when the endpoint enumerates models), and image support.
-// Empty value means "we could not reach the server at all."
+// model presence (when the endpoint enumerates models), image support, and
+// (when discoverable) the model's context window in tokens. Empty value
+// means "we could not reach the server at all."
 type probeResult struct {
 	Reachable    bool // got 200 from any probe endpoint
 	ModelKnown   bool // /v1/models enumerated models — ModelLoaded is meaningful
 	ModelLoaded  bool // the configured model was in the enumeration
 	ImageSupport bool
+	// ContextSize is the model's max prompt+output tokens as reported by
+	// /props (n_ctx) or /v1/models launch args (--ctx-size / -c). 0 means
+	// unknown — caller falls back to rawBufferTokens for compaction sizing.
+	ContextSize int
 }
 
 // probeLLM checks reachability, model presence, and image support in a single
@@ -292,10 +298,29 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 			return probeResult{}, false
 		}
 		r.ModelLoaded = true
-		for _, arg := range m.Status.Args {
-			if arg == "--mmproj" {
+		// Scan launch args for two facts: --mmproj (vision) and the
+		// context-size flag (--ctx-size / -c, either spaced or =-joined).
+		// Don't `break` on the first hit — we want both signals.
+		for i, arg := range m.Status.Args {
+			switch {
+			case arg == "--mmproj":
 				r.ImageSupport = true
-				break
+			case arg == "--ctx-size" || arg == "-c":
+				if i+1 < len(m.Status.Args) {
+					if n, err := strconv.Atoi(m.Status.Args[i+1]); err == nil {
+						r.ContextSize = n
+					}
+				}
+			default:
+				if v, ok := strings.CutPrefix(arg, "--ctx-size="); ok {
+					if n, err := strconv.Atoi(v); err == nil {
+						r.ContextSize = n
+					}
+				} else if v, ok := strings.CutPrefix(arg, "-c="); ok {
+					if n, err := strconv.Atoi(v); err == nil {
+						r.ContextSize = n
+					}
+				}
 			}
 		}
 		return r, true
@@ -328,6 +353,13 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 		Modalities *struct {
 			Vision bool `json:"vision"`
 		} `json:"modalities"`
+		// llama.cpp's /props exposes n_ctx in two shapes across releases:
+		// recent builds nest it under default_generation_settings, older
+		// ones surface it at the top level. We accept either.
+		DefaultGenerationSettings *struct {
+			NCtx int `json:"n_ctx"`
+		} `json:"default_generation_settings"`
+		NCtx int `json:"n_ctx"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&props); err != nil {
 		return probeResult{}, false
@@ -335,6 +367,12 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 	r := probeResult{Reachable: true}
 	if props.Modalities != nil {
 		r.ImageSupport = props.Modalities.Vision
+	}
+	if props.DefaultGenerationSettings != nil {
+		r.ContextSize = props.DefaultGenerationSettings.NCtx
+	}
+	if r.ContextSize == 0 {
+		r.ContextSize = props.NCtx
 	}
 	return r, true
 }

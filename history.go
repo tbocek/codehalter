@@ -7,12 +7,30 @@ import (
 )
 
 const (
-	// rawBufferTokens is the threshold at which compressHistory fires.
-	// Set close to the model's context limit so the prompt prefix stays
-	// stable across many turns — that maximizes prefix-cache reuse on the
-	// LLM side. With a 128k model this leaves ~28k for system prompt,
-	// summary, and output reservation.
-	rawBufferTokens   = 100000
+	// rawBufferTokens is the FALLBACK compaction trigger used only when the
+	// startup probe couldn't discover the model's context window. When n_ctx
+	// is known, compactTriggerTokens computes the trigger from it instead so
+	// the threshold scales to the actual model. Keep this conservative — a
+	// fallback firing too late costs more than firing slightly early.
+	rawBufferTokens = 60000
+
+	// compactOverheadTokens reserves space for everything that isn't the
+	// Messages array: system prompt + tool schemas (~5-6k), pending user
+	// turn (1-3k), output budget (4-8k). Subtracted from the model's n_ctx
+	// before applying the estimator-bias factor.
+	compactOverheadTokens = 15000
+
+	// compactSafetyPct accounts for our chars/4 token estimator under-counting
+	// real BPE tokens, especially on tool-heavy JSON content (lots of short
+	// tokens like ",", ":", '"'). Apply as a percentage so the trigger fires
+	// before the *real* token count overruns the server's window.
+	compactSafetyPct = 80
+
+	// minCompactTrigger keeps the trigger sane for pathologically small
+	// contexts — below this we'd compact every other turn and the summary
+	// budget alone would dominate the post-compaction prefix.
+	minCompactTrigger = 8000
+
 	summaryBudget     = 12000
 	charsPerToken     = 4
 	roleTokenOverhead = 4
@@ -33,6 +51,22 @@ const (
 // estimateTokens gives a rough token count for a string.
 func estimateTokens(s string) int {
 	return len(s) / charsPerToken
+}
+
+// compactTriggerTokens returns the estimated-token threshold at which
+// compressHistory should fire. Derived from the [llm] connection's n_ctx
+// (discovered by the startup probe): subtract fixed overhead, then apply
+// compactSafetyPct to absorb estimator bias. Falls back to rawBufferTokens
+// when n_ctx is unknown (offline tests, server didn't report it).
+func (a *agent) compactTriggerTokens() int {
+	if a.mainContextTokens <= 0 {
+		return rawBufferTokens
+	}
+	avail := a.mainContextTokens - compactOverheadTokens
+	if avail < minCompactTrigger {
+		return minCompactTrigger
+	}
+	return (avail * compactSafetyPct) / 100
 }
 
 // estimateMessagesTokens gives a rough token count for a slice of messages.
@@ -68,7 +102,7 @@ func estimateMessagesTokens(msgs []Message) int {
 // before calling it.
 func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	sess.mu.Lock()
-	if estimateMessagesTokens(sess.Messages) <= rawBufferTokens {
+	if estimateMessagesTokens(sess.Messages) <= a.compactTriggerTokens() {
 		sess.mu.Unlock()
 		return
 	}

@@ -115,6 +115,13 @@ type agent struct {
 	// timeout on every LLM call. Populated by checkLLM; nil before that.
 	connReachable map[string]bool
 
+	// mainContextTokens is the [llm] connection's context window in tokens,
+	// discovered by the startup probe (/props.n_ctx or /v1/models --ctx-size).
+	// 0 means unknown (probe failed or server didn't report it) — compaction
+	// then falls back to the rawBufferTokens constant. compressHistory reads
+	// this; nothing else should.
+	mainContextTokens int
+
 	// pickRotor round-robins subagent calls across configured conns 1+ so
 	// parallel callers fan out instead of all piling onto the first idle
 	// candidate. Main-agent calls bypass the rotor (pinned to conn 0 to
@@ -346,6 +353,12 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 	})
 
 	a.connReachable = make(map[string]bool, len(conns))
+	// conns[0] is the main [llm] entry (allConnections() emits it first).
+	// Its context size drives compaction sizing; subllm sizes aren't used
+	// for that because subagent sessions have their own short lifetimes.
+	if len(results) > 0 && results[0].ContextSize > 0 {
+		a.mainContextTokens = results[0].ContextSize
+	}
 	var b strings.Builder
 	firstReachable := -1
 	// Each LLM gets its own paragraph (\n\n) — markdown collapses single
@@ -383,6 +396,11 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 			b.WriteString("✅ Image support: enabled\n\n")
 		} else {
 			b.WriteString("Image support: disabled\n\n")
+		}
+		if a.mainContextTokens > 0 {
+			fmt.Fprintf(&b, "✅ Context window: %d tokens (compact at ~%d)\n\n", a.mainContextTokens, a.compactTriggerTokens())
+		} else {
+			fmt.Fprintf(&b, "🟡 Context window: unknown — server didn't report n_ctx, using default compact trigger %d\n\n", rawBufferTokens)
 		}
 	}
 	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))

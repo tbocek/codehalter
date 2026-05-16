@@ -95,6 +95,13 @@ type Session struct {
 	// document is free after the first read. In-memory only; lost on restart.
 	webBodiesMu sync.Mutex
 	webBodies   map[string]string
+	// webResults caches the final rendered output (summary or raw-truncated)
+	// keyed by URL+mode. A literal-repeat web_read on the same URL skips both
+	// the HTTP fetch AND the re-summarize, and the model receives the exact
+	// same string — friendly to the LLM prefix cache. Range requests bypass
+	// this and go through webBodies/sliceWebBody.
+	webResultsMu sync.Mutex
+	webResults   map[string]string
 	// mu serialises mutations of the persisted fields (Title, Messages,
 	// Summary, …) and the Save() encoder. Prompt runs synchronously per
 	// session, but generateTitle runs as a background goroutine and would
@@ -165,6 +172,39 @@ func (s *Session) rememberWebBody(url, body string) {
 		s.webBodies = make(map[string]string)
 	}
 	s.webBodies[url] = body
+}
+
+// webResultKey distinguishes summarized vs. raw output for the same URL so
+// web_read and web_read_raw don't collide in the result cache.
+func webResultKey(url string, summarize bool) string {
+	if summarize {
+		return url + "\x00summary"
+	}
+	return url + "\x00raw"
+}
+
+// recallWebResult returns a previously-rendered web_read / web_read_raw output
+// for the same URL+mode. Lets the second call on a duplicate URL skip fetch
+// and re-summarize entirely.
+func (s *Session) recallWebResult(url string, summarize bool) (string, bool) {
+	s.webResultsMu.Lock()
+	defer s.webResultsMu.Unlock()
+	if s.webResults == nil {
+		return "", false
+	}
+	r, ok := s.webResults[webResultKey(url, summarize)]
+	return r, ok
+}
+
+// rememberWebResult stores the final rendered output for a URL+mode so a
+// duplicate call returns the byte-identical string without redoing any work.
+func (s *Session) rememberWebResult(url string, summarize bool, out string) {
+	s.webResultsMu.Lock()
+	defer s.webResultsMu.Unlock()
+	if s.webResults == nil {
+		s.webResults = make(map[string]string)
+	}
+	s.webResults[webResultKey(url, summarize)] = out
 }
 
 func loadSession(cwd string, id SessionId) (*Session, error) {
