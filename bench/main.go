@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -27,6 +28,8 @@ func main() {
 	binFlag := flag.String("codehalter", "../codehalter", "pre-built codehalter binary to stage inside the devcontainer")
 	workFlag := flag.String("work", "/tmp/codehalter-bench", "directory where per-test clones live (host path bind-mounted into the devcontainer)")
 	resultsFlag := flag.String("results", "results.jsonl", "append one JSON row per test here")
+	archiveFlag := flag.String("archive", "results", "directory under which per-run timestamped artifact folders are created (empty disables)")
+	noteFlag := flag.String("note", "", "free-form tag recorded on every result row of this run (e.g. \"testing MTP\")")
 	flag.Parse()
 
 	settings, err := filepath.Abs(*settingsFlag)
@@ -66,6 +69,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve results: %v", err)
 	}
+	// One timestamp per `just bench` invocation, shared across every test —
+	// makes it trivial to grab "the run I just did" from results/<ts>/.
+	// Filesystem-safe format (no colons, no spaces) so `cd` autocompletes.
+	var archiveRun string
+	if *archiveFlag != "" {
+		archiveBase, err := filepath.Abs(*archiveFlag)
+		if err != nil {
+			log.Fatalf("resolve archive: %v", err)
+		}
+		archiveRun = filepath.Join(archiveBase, time.Now().Format("2006-01-02_15-04-05"))
+		if err := os.MkdirAll(archiveRun, 0o755); err != nil {
+			log.Fatalf("create archive dir: %v", err)
+		}
+		fmt.Fprintf(os.Stderr, "archive: %s\n", archiveRun)
+	}
 
 	tests, err := collectTests(flag.Args())
 	if err != nil {
@@ -82,9 +100,12 @@ func main() {
 	defer resultsF.Close()
 
 	ctx := context.Background()
+	if *noteFlag != "" {
+		fmt.Fprintf(os.Stderr, "note: %s\n", *noteFlag)
+	}
 	for _, tc := range tests {
 		fmt.Fprintf(os.Stderr, "\n=== %s ===\n", tc.Name)
-		res, workDir, runErr := runTest(ctx, tc, settings, dc, bin, work)
+		res, workDir, runErr := runTest(ctx, tc, settings, dc, bin, work, *noteFlag, archiveRun)
 		if runErr != nil {
 			fmt.Fprintf(os.Stderr, "FAIL %s: %v (workdir: %s)\n", tc.Name, runErr, workDir)
 		} else if res.OK {

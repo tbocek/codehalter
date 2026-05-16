@@ -32,13 +32,20 @@
 # override. Sampler params never enter the prefix KV cache key, so switching
 # between params_thinking and params_execute on the same server hits the same
 # cache — no warm-up cost.
+#
+# `max_tokens` caps a single completion. Defaults to 8192 when unset, which
+# is generous headroom for healthy turns (execute ~2-4k, plan/verify <1k) and
+# bounds the worst case where a small model loops forever inside one
+# completion. If the server returns finish_reason="length", codehalter
+# surfaces a clear error rather than retrying — set it higher only if a
+# legitimate turn is being truncated.
 
 [llm]
 url = "http://localhost:8080/v1/chat/completions"
 # api_key = "..."        # uncomment if your server requires bearer auth
 model = "your-model-id"  # must match the model name your server reports at /v1/models
-params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
-params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0 }
+params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, max_tokens = 4096 }
+params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, max_tokens = 8192 }
 
 # Example subagent entries — uncomment when you have a separate server (or
 # multiple slots on the same server you want to use in parallel).

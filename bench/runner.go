@@ -85,7 +85,9 @@ func (tc testCase) devcontainerPath(fallback string) string {
 	return tc.resolveTestPath(tc.Devcontainer, fallback)
 }
 
-// testResult is one row appended to bench/results.jsonl.
+// testResult is one row appended to bench/results.jsonl. Note is a free-form
+// user tag set via the -note flag (e.g. "testing MTP", "qwen-30b-a3b run") so
+// later analysis can group rows by experiment. Error is set only on failures.
 type testResult struct {
 	Name       string    `json:"name"`
 	StartedAt  time.Time `json:"started_at"`
@@ -95,18 +97,36 @@ type testResult struct {
 	VerifyExit int       `json:"verify_exit"`
 	OK         bool      `json:"ok"`
 	Note       string    `json:"note,omitempty"`
+	Error      string    `json:"error,omitempty"`
 }
 
 // runTest drives a single test end-to-end. Returns a result row plus the path
 // to the per-test workdir (which is kept on disk so the user can re-inspect).
 // fallbackSettings / fallbackDevcontainer are used only when the test TOML
-// doesn't carry its own `settings` / `devcontainer` path.
-func runTest(ctx context.Context, tc testCase, fallbackSettings, fallbackDevcontainer, codehalterBin, workRoot string) (testResult, string, error) {
-	result := testResult{Name: tc.Name, StartedAt: time.Now()}
+// doesn't carry its own `settings` / `devcontainer` path. archiveDir is the
+// per-run directory (already includes the timestamp) under which this test's
+// artifacts get copied after the run.
+func runTest(ctx context.Context, tc testCase, fallbackSettings, fallbackDevcontainer, codehalterBin, workRoot, note, archiveDir string) (testResult, string, error) {
+	result := testResult{Name: tc.Name, StartedAt: time.Now(), Note: note}
 	workDir := filepath.Join(workRoot, tc.Name)
+
+	// Copy session artifacts into the run's archive directory whether the test
+	// passes or fails — failure modes are exactly when you want the log. Defer
+	// no-ops if archiveDir is empty (analysis disabled) or .codehalter/ wasn't
+	// created (failed before clone).
+	defer func() {
+		if archiveDir == "" {
+			return
+		}
+		dst := filepath.Join(archiveDir, tc.Name)
+		if err := archiveArtifacts(workDir, dst); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: archive %s: %v\n", tc.Name, err)
+		}
+	}()
+
 	settingsPath := tc.settingsPath(fallbackSettings)
 	if _, err := os.Stat(settingsPath); err != nil {
-		result.Note = "settings: " + err.Error()
+		result.Error = "settings: " + err.Error()
 		return result, workDir, fmt.Errorf("settings file %s missing", settingsPath)
 	}
 	dcPath := tc.devcontainerPath(fallbackDevcontainer)
@@ -121,7 +141,7 @@ func runTest(ctx context.Context, tc testCase, fallbackSettings, fallbackDevcont
 	defer cancel()
 
 	if err := prepareWorkdir(workDir, tc.Repo, tc.Commit, settingsPath, dcPath); err != nil {
-		result.Note = "prepare: " + err.Error()
+		result.Error = "prepare: " + err.Error()
 		return result, workDir, err
 	}
 
@@ -140,7 +160,7 @@ func runTest(ctx context.Context, tc testCase, fallbackSettings, fallbackDevcont
 	// `devcontainer up` brings up the project's container, tagged with our
 	// per-test label so we can find it again on the next run.
 	if err := devUp(tctx, workDir, tc.Name); err != nil {
-		result.Note = "devcontainer up: " + err.Error()
+		result.Error = "devcontainer up: " + err.Error()
 		return result, workDir, err
 	}
 
@@ -157,7 +177,7 @@ func runTest(ctx context.Context, tc testCase, fallbackSettings, fallbackDevcont
 	// is bind-mounted) and exec it from there. Avoids touching the image.
 	inContainerBin, err := stageBinary(tctx, workDir, codehalterBin)
 	if err != nil {
-		result.Note = "stage binary: " + err.Error()
+		result.Error = "stage binary: " + err.Error()
 		return result, workDir, err
 	}
 
@@ -166,7 +186,7 @@ func runTest(ctx context.Context, tc testCase, fallbackSettings, fallbackDevcont
 	result.AgentMs = time.Since(agentStart).Milliseconds()
 	result.StopReason = string(stopReason)
 	if agentErr != nil {
-		result.Note = "agent: " + agentErr.Error()
+		result.Error = "agent: " + agentErr.Error()
 		return result, workDir, agentErr
 	}
 
@@ -176,7 +196,7 @@ func runTest(ctx context.Context, tc testCase, fallbackSettings, fallbackDevcont
 	result.VerifyExit = exit
 	result.OK = exit == 0 && stopReason == StopReasonEndTurn
 	if verr != nil && exit == 0 {
-		result.Note = "verify wrapper: " + verr.Error()
+		result.Error = "verify wrapper: " + verr.Error()
 	}
 	return result, workDir, nil
 }
@@ -453,6 +473,34 @@ func runHostIn(dir, name string, args ...string) error {
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// archiveArtifacts copies every file from <workDir>/.codehalter/ into dst,
+// skipping the staged codehalter binary (11MB, useless for analysis). All
+// other contents — session_*.toml/log, bench_agent.log, PLAN/EXECUTE/VERIFY/
+// DOCUMENT.md, SKILL-*.md, settings.toml — get preserved. A missing source
+// directory is silently OK so failed-before-clone runs don't produce noise.
+func archiveArtifacts(workDir, dst string) error {
+	src := filepath.Join(workDir, ".codehalter")
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := os.MkdirAll(dst, 0o755); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || e.Name() == "codehalter" {
+			continue
+		}
+		if err := copyFile(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func copyFile(src, dst string) error {

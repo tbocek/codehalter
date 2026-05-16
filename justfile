@@ -22,7 +22,13 @@ bench-build: build
     go build -o bench/bench-runner ./bench/
 
 # Build then run the benchmark. Runs from bench/ so the default `tests/`
-# glob and `settings.toml` paths resolve. Pass an explicit test file as
-# the first argument to run just that one (default: all under bench/tests/).
-bench *args: bench-build
-    cd bench && ./bench-runner {{args}}
+# glob and `settings.toml` paths resolve.
+#
+#   just bench                                       # all tests, no note
+#   just bench "testing MTP"                         # all tests, tagged in results.jsonl
+#   just bench "qwen30b-a3b" tests/preveltekit_go126.toml  # one test, tagged
+#
+# For other flags (`-work`, `-codehalter`, …) call bench-runner directly:
+#   cd bench && ./bench-runner -note "x" -work /tmp/foo tests/...
+bench note='' *args='': bench-build
+    cd bench && ./bench-runner -note {{quote(note)}} {{args}}

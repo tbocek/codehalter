@@ -48,6 +48,17 @@ type sseChunk struct {
 // onToken is called for each text token. nil means discard.
 type onToken func(token string)
 
+// defaultMaxTokens caps a single completion when the user's settings don't
+// already specify one. A healthy execute turn is 2-4k tokens and a JSON
+// plan/verify is under 1k, so 8192 is generous headroom — well-behaved
+// outputs never trip it. The point is bounding the worst case where a small
+// model fixates inside a single completion and emits the same tool call (or
+// reasoning sentence) forever without producing a stop token; the per-tool-
+// loop iteration cap can't help there because the runaway happens within ONE
+// LLM round-trip. Override per role by setting `max_tokens` inside
+// params_thinking / params_execute in settings.toml.
+const defaultMaxTokens = 8192
+
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
 // sid scopes the debug log: req body and raw SSE response are appended to
 // .codehalter/session_<sid>.log so a single file captures everything that
@@ -60,6 +71,9 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 	reqBody := map[string]any{}
 	for k, v := range conn.ExtraBody {
 		reqBody[k] = v
+	}
+	if _, ok := reqBody["max_tokens"]; !ok {
+		reqBody["max_tokens"] = defaultMaxTokens
 	}
 	reqBody["model"] = conn.Model
 	reqBody["stream"] = true
@@ -136,6 +150,7 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 
 	var fullText strings.Builder
 	var calls []toolCall
+	var finishReason string
 
 	scanner := bufio.NewScanner(resp.Body)
 	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
@@ -159,6 +174,10 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 			continue
 		}
 
+		if r := chunk.Choices[0].FinishReason; r != "" {
+			finishReason = r
+		}
+
 		delta := chunk.Choices[0].Delta
 
 		if delta.Content != "" {
@@ -180,6 +199,19 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 	if err := scanner.Err(); err != nil {
 		writeResponseLog(logF, fullText.String(), calls, err)
 		return fullText.String(), calls, fmt.Errorf("reading SSE stream: %w", err)
+	}
+
+	// finish_reason="length" means the server stopped because we hit
+	// max_tokens, not because the model emitted a stop token. The output is
+	// truncated mid-thought (or mid-tool-call JSON) and almost always means
+	// the model was looping or rambling. Bail out cleanly rather than
+	// retrying — the JSON corrective in runToolLoopJSON is for malformed
+	// prose, not for runaways, and prompt.go's retry loop would just hit
+	// the same wall on the next attempt.
+	if finishReason == "length" {
+		err := fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated. Likely the model is looping; raise max_tokens in params_%s if a legitimate turn needs more headroom", conn.Tag, conn.Model, conn.Tag)
+		writeResponseLog(logF, fullText.String(), calls, err)
+		return fullText.String(), calls, err
 	}
 
 	writeResponseLog(logF, fullText.String(), calls, nil)
