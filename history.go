@@ -76,7 +76,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	// Main session uses [llm], subagents use [[subllm]] — same cache-consistency
 	// rule as the rest of the pipeline: every call on a given session hits the
 	// same slot so the prefix cache stays warm.
-	conn := a.pickAvailable(ctx, "execute", tierForSession(sess))
+	conn := a.pickAvailable(ctx, sess.ID, "execute")
 
 	// Split 20/80: the older 80% is folded into a fresh summary, the
 	// recent 20% stays raw. (len*4)/5 lands at 0 only when len < 2 — in
@@ -140,10 +140,10 @@ func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnectio
 }
 
 // generateTitle asks the LLM to create a short title from the first user
-// message. Routes via tierForSession — main session always uses [llm] for
-// cache consistency, subagents use [[subllm]].
+// message. Routes via the session's pin — main session always uses [llm]
+// for cache consistency, subagents use their pinned [[subllm]] entry.
 func (a *agent) generateTitle(ctx context.Context, sess *Session, userText string) {
-	conn := a.pickAvailable(ctx, "thinking", tierForSession(sess))
+	conn := a.pickAvailable(ctx, sess.ID, "thinking")
 	if conn == nil {
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot generate title: no LLM connections configured\n")))
 		return
@@ -178,12 +178,12 @@ func trimTitle(title string) string {
 }
 
 // retitle updates the session title based on the current summary. Same
-// routing as generateTitle — main → [llm], subagent → [[subllm]].
+// routing as generateTitle — main → [llm], subagent → pinned [[subllm]].
 func (a *agent) retitle(ctx context.Context, sess *Session) {
 	if sess.Summary == "" {
 		return
 	}
-	conn := a.pickAvailable(ctx, "thinking", tierForSession(sess))
+	conn := a.pickAvailable(ctx, sess.ID, "thinking")
 	if conn == nil {
 		return // already warned in compressHistory
 	}

@@ -339,12 +339,34 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 	return r, true
 }
 
-// pickAvailable resolves a connection for the given role and tier. The schema
-// already separates tiers ([llm] vs [[subllm]]) so this just filters out
-// candidates the startup probe marked unreachable, then round-robins across
-// what remains (useful when multiple subllm entries share a tag, e.g. two
-// machines serving "execute"). Returns nil only when no connections exist.
-func (a *agent) pickAvailable(ctx context.Context, role, tier string) *LLMConnection {
+// pickAvailable resolves a connection for the session and role. Tier is
+// derived from the session's depth (depth>0 → subagent → [[subllm]],
+// otherwise → main → [llm]). Subagent sessions carry a PinnedSubLLMIdx
+// assigned at creation by launch_subagent; when set we route every call from
+// that session to settings.SubLLM[PinnedSubLLMIdx] regardless of role tag,
+// so the slot's prefix cache stays warm across plan/execute/verify switches.
+// Unpinned (main, tests) falls through to LLMCandidates + round-robin across
+// alive servers. Returns nil only when no connections exist.
+func (a *agent) pickAvailable(ctx context.Context, sid SessionId, role string) *LLMConnection {
+	sess := a.getSession(sid)
+
+	// Subagent with a pinned [[subllm]] entry: hard route, ignore tag match.
+	// Cache consistency wins over per-role sampler tuning — the parent's
+	// launch_subagent already picked a slot for this session, and bouncing
+	// across entries (the old tag-match behaviour) evicted the prefix cache
+	// on every plan/execute transition.
+	if sess != nil && sess.Depth > 0 && sess.PinnedSubLLMIdx >= 0 && sess.PinnedSubLLMIdx < len(a.settings.SubLLM) {
+		c := a.settings.SubLLM[sess.PinnedSubLLMIdx]
+		c.ExtraBody = c.Params
+		c.Tag = role
+		return &c
+	}
+
+	tier := "main"
+	if sess != nil && sess.Depth > 0 {
+		tier = "subagent"
+	}
+
 	cs := a.settings.LLMCandidates(role, tier)
 	if len(cs) == 0 {
 		return nil
@@ -466,10 +488,19 @@ func (a *agent) llmSimple(ctx context.Context, sid SessionId, conn *LLMConnectio
 
 const maxParallel = 10
 
-// parallel runs fn for each index [0, n) with up to maxParallel goroutines.
-func parallel(n int, fn func(i int)) {
+// parallel runs fn for each index [0, n) with up to `cap` concurrent
+// goroutines. cap<=0 falls back to maxParallel. Callers that know an upper
+// bound (e.g. launch_subagent capping at the number of [[subllm]] entries)
+// pass it explicitly so excess work queues instead of contending for slots.
+func parallel(n, cap int, fn func(i int)) {
+	if cap <= 0 {
+		cap = maxParallel
+	}
+	if cap > n {
+		cap = n
+	}
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, maxParallel)
+	sem := make(chan struct{}, cap)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(i int) {
@@ -605,6 +636,14 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 		})
 
 		for _, tc := range calls {
+			// Subagent sessions don't surface their own UI (Zed doesn't know
+			// their sid), so forward a one-liner to the parent before each
+			// tool call. Gives the user a live feed of what each subagent is
+			// up to instead of just "Starting…" → 5 minutes → "Done".
+			if sess := a.getSession(sid); sess != nil && sess.ParentID != "" && sess.DisplayLabel != "" {
+				a.sendUpdate(ctx, sess.ParentID, AgentMessageChunk(TextBlock(
+					fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80)))))
+			}
 			started := time.Now()
 			result, failed := a.executeTool(ctx, sid, tc)
 			tu := ToolUse{

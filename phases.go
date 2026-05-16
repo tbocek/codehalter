@@ -40,7 +40,7 @@ type planResult struct {
 // parsed even after one corrective retry — callers treat any of those as
 // "no plan, proceed without one".
 func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) (*LLMConnection, *planResult, []ToolUse, error) {
-	thinking := a.pickAvailable(ctx, "thinking", a.llmTier(sid))
+	thinking := a.pickAvailable(ctx, sid, "thinking")
 	if thinking == nil {
 		return nil, nil, nil, fmt.Errorf("no [llm] in .codehalter/settings.toml")
 	}
@@ -163,20 +163,6 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 	return thinking, plan, toolUses, nil
 }
 
-// planForSubagent is like planAndRoute but auto-approves without user interaction.
-func (a *agent) planForSubagent(ctx context.Context, sid SessionId, instructions string) (*LLMConnection, []string, []ToolUse, error) {
-	thinking, plan, toolUses, err := a.runPlanLLM(ctx, sid, instructions)
-	if err != nil || plan == nil {
-		return thinking, nil, toolUses, err
-	}
-	header := "Plan:"
-	if plan.ReportOnly {
-		header = "Findings:"
-	}
-	a.renderSteps(ctx, sid, plan.Steps, header)
-	return thinking, plan.Steps, toolUses, nil
-}
-
 // ---------------------------------------------------------------------------
 // Execute phase
 // ---------------------------------------------------------------------------
@@ -250,7 +236,7 @@ func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessag
 	for _, name := range extraExclude {
 		exclude[name] = true
 	}
-	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, "execute", a.llmTier(sid)), messages, toolFilter{
+	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{
 		exclude: exclude,
 	})
 }
@@ -283,7 +269,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 	}
 
 	// Same routing as execute(): main session uses [llm], subagents use [[subllm]].
-	conn := a.pickAvailable(ctx, "execute", a.llmTier(sid))
+	conn := a.pickAvailable(ctx, sid, "execute")
 	if conn == nil {
 		conn = fallbackConn
 	}

@@ -48,7 +48,7 @@ func (a *agent) registerSubagentTool() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "launch_subagent",
-			"description": "Run 2+ independent subtasks in parallel, each with its own plan/execute/verify. Subagents cannot talk to the user — use only for unambiguous, self-contained tasks.",
+			"description": "Run 2+ short, independent leaf tasks in parallel. Each subagent runs ONLY the tool loop (no separate plan/verify phase) and reports back — use it for unambiguous single-file edits, one focused lookup, or one bounded command, NOT for multi-step work that needs its own planning. Subagents cannot talk to the user. Parallelism is capped at the number of configured [[subllm]] connections; excess tasks queue.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"tasks"},
@@ -124,13 +124,28 @@ func (a *agent) registerSubagentTool() {
 			order = append(order, h)
 		}
 
-		// Launch unique tasks in parallel.
-		parallel(len(order), func(k int) {
+		// Parallelism cap = number of [[subllm]] entries. With fewer connections
+		// than tasks, excess tasks wait in the semaphore until one finishes —
+		// this is the user's contract: "I specified N subllm, run at most N
+		// concurrent". If no [[subllm]] is configured at all we fall back to a
+		// cap of 1 (serialise on [llm]) so we don't blow up an unconfigured
+		// setup with parallel writes to the main slot.
+		numConns := len(ag.settings.SubLLM)
+		if numConns < 1 {
+			numConns = 1
+		}
+
+		// Launch unique tasks in parallel, each pinned to one [[subllm]] entry
+		// in round-robin order. The pin survives the whole subagent run so the
+		// slot's prefix cache stays warm across the tool loop.
+		parallel(len(order), numConns, func(k int) {
 			h := order[k]
 			p := uniq[h]
 			primary := p.indices[0]
 			task := p.task
-			subSess := newSubagentSession(sess.Cwd, sid, primary, sess.Depth+1)
+			pinnedIdx := k % numConns
+			subSess := newSubagentSession(sess.Cwd, sid, primary, sess.Depth+1, pinnedIdx)
+			subSess.DisplayLabel = fmt.Sprintf("subagent %d", primary+1)
 			ag.putSession(subSess)
 			defer ag.deleteSession(subSess.ID)
 
@@ -180,11 +195,13 @@ func (a *agent) registerSubagentTool() {
 	}})
 }
 
-// runSubagent executes a full plan→execute→verify cycle against subSess. All
-// internal calls use subSess.ID so tool uses, plan steps, and assistant text
-// are saved there (not in the parent). UI updates emitted by the tool loop
-// target subSess.ID too and are dropped by the client since it has never been
-// announced — only the returned result string flows back to the parent.
+// runSubagent runs the tool loop only against subSess — no plan, no verify.
+// The parent already planned the work and will verify the overall result, so
+// the subagent is just a short, scoped tool-loop runner. All internal calls
+// use subSess.ID so tool uses and assistant text are saved there (not in the
+// parent). UI updates emitted by the tool loop target subSess.ID too and are
+// dropped by the client since it has never been announced — only the returned
+// result string flows back to the parent.
 func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
 	sid := subSess.ID
 
@@ -196,26 +213,8 @@ func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagent
 	subSess.AddUser(instructions)
 	_ = subSess.Save()
 
-	// Plan (auto-approve).
-	conn, planSteps, _, err := a.planForSubagent(ctx, sid, instructions)
-	if err != nil {
-		return "", err
-	}
-
 	content := instructions
-	if len(planSteps) > 0 {
-		var planCtx strings.Builder
-		planCtx.WriteString("Follow these steps exactly:\n")
-		for i, step := range planSteps {
-			fmt.Fprintf(&planCtx, "%d. %s\n", i+1, step)
-		}
-		planCtx.WriteString("\nTask: ")
-		planCtx.WriteString(instructions)
-		content = planCtx.String()
-	}
-
-	sysPrompt, err := a.systemPrompt(sid)
-	if err == nil && sysPrompt != "" {
+	if sysPrompt, err := a.systemPrompt(sid); err == nil && sysPrompt != "" {
 		content = sysPrompt + "\n---\n" + content
 	}
 
@@ -229,11 +228,6 @@ func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagent
 	}
 
 	result, err := a.execute(ctx, sid, messages, extraExclude...)
-	if err != nil {
-		return result.Text, err
-	}
-
-	result, _, err = a.verify(ctx, sid, conn, messages, result, instructions, planSteps)
 	if err != nil {
 		return result.Text, err
 	}

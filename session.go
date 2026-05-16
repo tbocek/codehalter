@@ -80,6 +80,21 @@ type Session struct {
 	// they don't touch persisted state and must not block on the long-held
 	// mu (compressHistory in particular).
 	mu sync.Mutex
+	// PinnedSubLLMIdx pins a subagent session to one [[subllm]] entry. All
+	// LLM calls from this session route to settings.SubLLM[PinnedSubLLMIdx]
+	// regardless of role tag — cache-coherence trumps per-role sampler
+	// matching: the slot stays warm across the whole subagent run instead of
+	// bouncing between entries on every plan/execute switch. -1 means no
+	// pin (main session, tests). Round-robin assigned at creation by
+	// launch_subagent so concurrent subagents fan across [[subllm]] entries.
+	PinnedSubLLMIdx int `toml:"pinned_subllm_idx,omitempty"`
+	// DisplayLabel is the short human-readable name the runner uses when it
+	// surfaces this session's activity to its parent ("subagent 1",
+	// "subagent 2", …). Not persisted — purely a UI breadcrumb so the
+	// parent's chat can show what each subagent is doing tool-call by
+	// tool-call. Set by launch_subagent at creation; empty on main sessions
+	// (we don't forward main-session updates anywhere).
+	DisplayLabel string `toml:"-"`
 }
 
 // recallSubagent returns a prior result for the given task hash if one exists.
@@ -150,7 +165,7 @@ func newSession(cwd string) (*Session, error) {
 	}, nil
 }
 
-func newSubagentSession(cwd string, parentID SessionId, index, depth int) *Session {
+func newSubagentSession(cwd string, parentID SessionId, index, depth, pinnedSubLLMIdx int) *Session {
 	os.MkdirAll(filepath.Join(cwd, sessionDir), 0755)
 	// Nanosecond suffix so sequential launch_subagent calls from the same
 	// parent don't collide on id (each call re-starts index at 0).
@@ -159,12 +174,13 @@ func newSubagentSession(cwd string, parentID SessionId, index, depth int) *Sessi
 	filename := fmt.Sprintf("session_%s.toml", id)
 	path := filepath.Join(cwd, sessionDir, filename)
 	s := &Session{
-		ID:        id,
-		Cwd:       cwd,
-		Depth:     depth,
-		ParentID:  parentID,
-		CreatedAt: now,
-		filePath:  path,
+		ID:              id,
+		Cwd:             cwd,
+		Depth:           depth,
+		ParentID:        parentID,
+		CreatedAt:       now,
+		filePath:        path,
+		PinnedSubLLMIdx: pinnedSubLLMIdx,
 	}
 	_ = s.Save()
 	return s

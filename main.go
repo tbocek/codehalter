@@ -197,28 +197,6 @@ func (a *agent) deleteSession(id SessionId) {
 	delete(a.sessions, id)
 }
 
-// llmTier returns the connection tier for the given session: "subagent" if
-// the session's depth is non-zero (it was spawned by another session), else
-// "main". Empty sid (pre-session probes, tests) is treated as main.
-func (a *agent) llmTier(sid SessionId) string {
-	if sid == "" {
-		return "main"
-	}
-	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
-		return "subagent"
-	}
-	return "main"
-}
-
-// tierForSession is the *Session-aware variant of llmTier, used by goroutines
-// (compressHistory, generateTitle, retitle) that already hold the session
-// pointer and don't need to look it up again.
-func tierForSession(sess *Session) string {
-	if sess != nil && sess.Depth > 0 {
-		return "subagent"
-	}
-	return "main"
-}
 
 func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) {
 	if a.conn == nil {
@@ -362,7 +340,7 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 	}
 
 	results := make([]probeResult, len(conns))
-	parallel(len(conns), func(i int) {
+	parallel(len(conns), maxParallel, func(i int) {
 		c := conns[i]
 		results[i] = a.probeLLM(ctx, &c)
 	})
