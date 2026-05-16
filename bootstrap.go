@@ -73,9 +73,10 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid SessionId) 
 // .devcontainer/devcontainer.json when codehalter is running outside a
 // container and the project has no devcontainer config yet.
 //
-// Asks at most once per project: a "yes" creates the files; a "no" writes
-// an empty .codehalter/devcontainer.skip marker so we stop nagging. Delete
-// either path (or just .codehalter/devcontainer.skip) to be asked again.
+// Asks on every session startup so the user is reminded as long as the
+// project is unsandboxed. "Yes" creates the files (and future sessions
+// short-circuit because .devcontainer/ now exists); "Skip" just dismisses
+// the prompt for this session — opening the project again brings it back.
 func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionId) {
 	if containerKind() != "" {
 		return
@@ -84,16 +85,11 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionI
 	if dirExists(dir) {
 		return
 	}
-	skipMarker := filepath.Join(cwd, sessionDir, "devcontainer.skip")
-	if fileExists(skipMarker) {
-		return
-	}
 
 	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
 		"To sandbox file edits and task runs, I can write a Debian-based "+
 			".devcontainer/Dockerfile and .devcontainer/devcontainer.json template "+
-			"you can then edit. Reopen the project in the container to use it. "+
-			"Skip is remembered in .codehalter/devcontainer.skip.\n\n")))
+			"you can then edit. Reopen the project in the container to use it.\n\n")))
 
 	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
 	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Create", "Skip")
@@ -102,7 +98,6 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionI
 		return
 	}
 	if !ok {
-		_ = os.WriteFile(skipMarker, nil, 0o644)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
 		return
 	}
