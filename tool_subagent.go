@@ -70,7 +70,7 @@ func (a *agent) registerSubagentTool() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "launch_subagent",
-			"description": "Run 2+ short, independent leaf tasks in parallel. Each subagent runs ONLY the tool loop (no separate plan/verify phase) and reports back — use it for unambiguous single-file edits, one focused lookup, or one bounded command, NOT for multi-step work that needs its own planning. Subagents cannot talk to the user. Parallelism is capped at the number of configured [[subllm]] connections; excess tasks queue.",
+			"description": "Run 2+ short, independent leaf tasks in parallel. Each subagent runs ONLY the tool loop (no separate plan/verify phase) and reports back — use it for unambiguous single-file edits, one focused lookup, or one bounded command, NOT for multi-step work that needs its own planning. Subagents cannot talk to the user and CANNOT see this conversation's history; they only see their own `instructions` + `context`. Each subagent is pinned to one [[subllm]] slot for the duration of its run so its prefix cache stays warm. Parallelism is capped at the number of configured [[subllm]] connections; excess tasks queue.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"tasks"},
@@ -80,8 +80,8 @@ func (a *agent) registerSubagentTool() {
 						"items": map[string]any{
 							"type": "object",
 							"properties": map[string]any{
-								"instructions": map[string]any{"type": "string", "description": "What this subagent should do"},
-								"context":      map[string]any{"type": "string", "description": "Relevant context from the parent task (file contents, previous results, etc.)"},
+								"instructions": map[string]any{"type": "string", "description": "The exact task this subagent should perform. Phrase it as a self-contained order — the subagent has no other source of intent."},
+								"context":      map[string]any{"type": "string", "description": "EVERY fact the subagent needs to start working immediately: exact file paths, the literal text to find/replace, version numbers, error strings, relevant snippets from prior tool output. The subagent does NOT see this conversation or earlier tool results — anything it has to discover on its own is wasted time."},
 							},
 							"required": []string{"instructions"},
 						},

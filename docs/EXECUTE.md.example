@@ -17,13 +17,22 @@ carry out the plan.
   `launch_subagent`) to "verify" or "double-check" state you just changed.
   Re-verification is the job of the verify phase, not the executor. If the
   result is success, move on to the next plan step.
-- Do NOT use `launch_subagent` for single-file edits or single-shot lookups.
-  Each subagent pays a separate LLM warm-up + tool-loop, which dwarfs the
-  cost of one inline `edit_file` or `read_file`. Use it only when you have
-  ≥2 genuinely independent multi-step units that would otherwise run
-  serially (e.g. three independent investigations across different
-  packages). For three one-line edits across three files, just call
-  `edit_file` three times in parallel from this loop.
+- Use `launch_subagent` for parallel-safe work. Each subagent runs on its
+  own pinned [[subllm]] slot, and parallelism is capped at the number of
+  configured slots (excess tasks queue). When you have ≥2 independent
+  units — multiple file edits in different files, multiple independent
+  lookups, multiple bounded probes — fan them out as one launch_subagent
+  call with one task per unit instead of running them serially in this
+  loop. Skip launch_subagent only when the work is a single small step
+  that one inline tool call would finish faster than the subagent's
+  startup cost.
+- When you do call `launch_subagent`, the subagent's only inputs are the
+  `instructions` and `context` fields — it does NOT see this conversation
+  or any earlier tool results. Put EVERY fact it needs into `context`:
+  exact file paths, the exact text to find/replace, version numbers,
+  error strings, prior tool output. A subagent that has to re-read or
+  re-investigate to figure out what you meant has already lost the time
+  parallelism would have saved.
 - Do NOT attempt web_search, web_read, or web_read_raw. Those tools are
   UNAVAILABLE in this phase by design — any external information was
   retrieved during planning and is included in your context.
