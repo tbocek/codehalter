@@ -177,12 +177,20 @@ func (a *agent) isAutopilot() bool {
 
 var _ Agent = (*agent)(nil)
 
+// cwdOrDefault resolves the session's working directory to a clean absolute
+// path. Clients may pass "." (bench harness) or any relative path; resolvePath
+// then prefix-checks against sess.Cwd, and the check breaks when Cwd isn't
+// absolute because filepath.Clean drops the leading "./" — read_file("go.mod")
+// would resolve to "go.mod" and fail the "outside project directory" check
+// even though it's inside the project.
 func cwdOrDefault(cwd string) string {
-	if cwd != "" {
-		return cwd
+	if cwd == "" {
+		cwd, _ = os.Getwd()
 	}
-	d, _ := os.Getwd()
-	return d
+	if abs, err := filepath.Abs(cwd); err == nil {
+		return abs
+	}
+	return cwd
 }
 
 func (a *agent) getSession(id SessionId) *Session {

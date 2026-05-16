@@ -644,9 +644,11 @@ type toolLoopResult struct {
 // maxToolLoopIterations bounds runToolLoop so a model that keeps producing
 // "different enough" tool calls (e.g. path variations to dodge perceived
 // repetition) can't spin forever. One iteration is one LLM round-trip; a
-// complex execute pass is usually 10-20, so 50 leaves comfortable headroom
-// while still bailing on genuine runaways.
-const maxToolLoopIterations = 50
+// complex execute pass is usually 10-20, so 200 leaves generous headroom
+// for unusually long but legitimate runs while still bailing on genuine
+// runaways. The signature nudge and per-name escalation above catch the
+// common stuck patterns earlier, so this cap is the last-resort backstop.
+const maxToolLoopIterations = 200
 
 // toolNameEscalateThreshold is the cumulative count of any single tool name
 // in one loop after which the connection switches from the "execute" role

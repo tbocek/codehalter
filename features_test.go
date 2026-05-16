@@ -113,6 +113,27 @@ func TestResolvePath(t *testing.T) {
 	}
 }
 
+// TestCwdOrDefaultAbsolutes pins the contract that sess.Cwd is always an
+// absolute path. The bench harness sends Cwd: "." over ACP, and an unresolved
+// "." breaks resolvePath's prefix check (filepath.Clean drops the leading
+// "./" so "go.mod" matches neither "./" nor "."). resolvePath then rejects
+// every project-relative path with "outside project directory".
+func TestCwdOrDefaultAbsolutes(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	for _, in := range []string{".", "", "./"} {
+		got := cwdOrDefault(in)
+		if !filepath.IsAbs(got) {
+			t.Errorf("cwdOrDefault(%q) = %q, want absolute path", in, got)
+		}
+		if got != cwd {
+			t.Errorf("cwdOrDefault(%q) = %q, want %q", in, got, cwd)
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Tool filter
 // ---------------------------------------------------------------------------
