@@ -42,8 +42,8 @@ so even mutating calls are recoverable.
   exact URL/version/string preserved verbatim. Query discipline:
     - ONE precise query beats three sequential refinements. Write the most
       specific query you can up front, including the exact symbol, tag, or
-      version (e.g. `golang:1.26-trixie site:hub.docker.com`, not
-      `Go 1.26 release` then `golang docker image` then `golang trixie tag`).
+      version (e.g. `<exact-image>:<tag> site:hub.docker.com` rather than
+      a chain of generic queries that walk toward the same fact).
     - HARD CAP: at most TWO web_search calls per distinct fact. If the first
       search returned a result that answers the question, trust it and move
       on — do not "re-confirm" with a second search asking the same thing in
@@ -137,20 +137,20 @@ Examples that QUALIFY:
     1. launch_subagent: Search for usages of foo and bar; report files+lines.
 
   Bad (sequential edits on independent files):
-    1. Bump go version in go.mod to 1.26
-    2. Bump go version in examples/go.mod to 1.26
-    3. Bump go version in site/go.mod to 1.26
+    1. Apply the same change in <file-a>
+    2. Apply the same change in <file-b>
+    3. Apply the same change in <file-c>
   Good (parallel edits, one subagent per file):
-    1. launch_subagent: Edit go.mod — change "go 1.25" to "go 1.26"
-    2. launch_subagent: Edit examples/go.mod — change "go 1.25" to "go 1.26"
-    3. launch_subagent: Edit site/go.mod — change "go 1.25" to "go 1.26"
+    1. launch_subagent: Edit <file-a> — replace "<old>" with "<new>"
+    2. launch_subagent: Edit <file-b> — replace "<old>" with "<new>"
+    3. launch_subagent: Edit <file-c> — replace "<old>" with "<new>"
 
   Bad (sequential web reads):
-    1. web_read the Go 1.26 release notes
-    2. web_read the golang Docker image tags page
+    1. web_read the release notes for <library>
+    2. web_read the registry/tags page for <image>
   Good (parallel):
-    1. launch_subagent: Fetch Go 1.26 release notes and the golang Docker tags
-       page; report version-relevant findings.
+    1. launch_subagent: Fetch <library> release notes and <image> registry
+       tags page; report version-relevant findings.
 
 Do NOT use `launch_subagent` when:
 - Step B depends on step A's output (sequential).
@@ -192,7 +192,7 @@ must be either:
 
 Do NOT emit "thinking out loud" narration between tool calls — no
 "Let me check X first.", no bulleted findings summaries like
-"- TinyGo: v0.41 supports Go 1.26", no recap of what you just read. Keep
+"- <Library>: vX.Y supports <feature>", no recap of what you just read. Keep
 the chain silent and end with the JSON. The user sees the parsed plan
 rendered after you reply; any prose you emit in the loop is duplicated
 noise.

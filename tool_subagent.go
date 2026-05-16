@@ -217,6 +217,28 @@ func (a *agent) registerSubagentTool() {
 	}})
 }
 
+// subagentRules is the subagent's entire phase prompt. Deliberately tiny:
+// subagents are leaf workers, not investigators. They must do exactly what
+// `instructions` says — no extra `run_task` "to verify", no re-reading files
+// they just wrote, no chasing failures that aren't their job. The parent
+// already planned the work and runs the verify phase on the overall result;
+// a subagent that goes broader wastes the parallelism it was forked for.
+const subagentRules = `You are a subagent. Do exactly the task in "Task:" — nothing more.
+
+Hard rules:
+- Do NOT run any verify-class command (` + "`" + `just:verify` + "`" + `, ` + "`" + `npm:ci` + "`" + `,
+  ` + "`" + `make:check` + "`" + `, ` + "`" + `cargo:test` + "`" + `, etc.). The parent will verify.
+- Do NOT investigate or report on failures unrelated to your task.
+- Do NOT re-read a file after editing it — your edit succeeded if
+  edit_file/write_file returned success. Trust your own tool successes.
+- Do NOT explain what you did at length. End with a single short line
+  stating the outcome (e.g. "Edited <file>: <old> → <new>").
+- If your task is impossible or ambiguous, return one sentence
+  explaining why. Do NOT improvise a different task.
+
+Use only the tools needed for "Task:". Typical subagents make 1-3 tool
+calls and then stop.`
+
 // runSubagent runs the tool loop only against subSess — no plan, no verify.
 // The parent already planned the work and will verify the overall result, so
 // the subagent is just a short, scoped tool-loop runner. All internal calls
@@ -224,32 +246,50 @@ func (a *agent) registerSubagentTool() {
 // parent). UI updates emitted by the tool loop target subSess.ID too and are
 // dropped by the client since it has never been announced — only the returned
 // result string flows back to the parent.
+//
+// Bypasses agent.execute on purpose: that path injects the full EXECUTE.md
+// (which encourages investigating failures, reading project files, etc.) and
+// the verify-target hint. Subagents need the opposite — a tight "do only
+// what's asked" prompt. We build the message and tool exclusions directly.
 func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
 	sid := subSess.ID
 
 	instructions := task.Instructions
 	if task.Context != "" {
 		instructions = "Context:\n" + task.Context + "\n\nTask:\n" + task.Instructions
+	} else {
+		instructions = "Task:\n" + task.Instructions
 	}
 
 	subSess.AddUser(instructions)
 	_ = subSess.Save()
 
-	content := instructions
+	var b strings.Builder
 	if sysPrompt, err := a.systemPrompt(sid); err == nil && sysPrompt != "" {
-		content = sysPrompt + "\n---\n" + content
+		b.WriteString(sysPrompt)
+		b.WriteString("\n---\n")
 	}
+	b.WriteString(subagentRules)
+	b.WriteString("\n---\n")
+	b.WriteString(instructions)
 
-	messages := []llmMessage{{Role: "user", Content: content}}
+	messages := []llmMessage{{Role: "user", Content: b.String()}}
 
 	// Subagents can't interact with the user (UI is dropped), so ask_user
-	// would hang. launch_subagent is excluded at max depth to bound recursion.
-	extraExclude := []string{"ask_user"}
+	// would hang. Web tools were planner-phase only — execute-tier work has
+	// no business going to the web. launch_subagent is excluded at max depth
+	// to bound recursion.
+	exclude := map[string]bool{
+		"ask_user":     true,
+		"web_search":   true,
+		"web_read":     true,
+		"web_read_raw": true,
+	}
 	if subSess.Depth >= maxSubagentDepth {
-		extraExclude = append(extraExclude, "launch_subagent")
+		exclude["launch_subagent"] = true
 	}
 
-	result, err := a.execute(ctx, sid, messages, extraExclude...)
+	result, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{exclude: exclude})
 	if err != nil {
 		return result.Text, err
 	}
