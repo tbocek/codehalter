@@ -436,6 +436,160 @@ func TestToolLoopNoDedup(t *testing.T) {
 	}
 }
 
+// TestToolLoopRepeatNudgeAndBail covers the repetition recovery path: the
+// second consecutive identical tool call still executes (read-after-write
+// must keep working) but appends a user-role nudge; the third identical
+// call bails before executing. ~3 iterations of stuck behavior fails
+// fast instead of waiting for the 50-iter cap.
+func TestToolLoopRepeatNudgeAndBail(t *testing.T) {
+	withFreshToolRegistry(t)
+	const toolName = "test_probe_a3f"
+	var execs int
+	RegisterTool(Tool{
+		Def: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": toolName, "description": "probe",
+				"parameters": map[string]any{"type": "object"},
+			},
+		},
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+			execs++
+			return "result", false
+		},
+	})
+
+	mock := newMockLLM(t,
+		sseToolCall("c1", toolName, `{}`),
+		sseToolCall("c2", toolName, `{}`),
+		sseToolCall("c3", toolName, `{}`),
+	)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	_, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute")
+	if err == nil {
+		t.Fatalf("runToolLoop: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "stuck on identical call") {
+		t.Errorf("error: got %v, want substring 'stuck on identical call'", err)
+	}
+	if execs != 2 {
+		t.Errorf("tool execs: got %d, want 2 (iter 1 + iter 2; iter 3 bails)", execs)
+	}
+	if mock.callCount() != 3 {
+		t.Errorf("LLM calls: got %d, want 3", mock.callCount())
+	}
+	// The 3rd LLM request should carry the nudge message appended after
+	// iter 2's tool result.
+	req3 := mock.request(2)
+	msgs, _ := req3["messages"].([]any)
+	var found bool
+	for _, m := range msgs {
+		mm, _ := m.(map[string]any)
+		if mm["role"] == "user" {
+			if s, _ := mm["content"].(string); strings.Contains(s, "repeated the same tool call") {
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		t.Errorf("3rd LLM request did not contain the repeat-nudge user message")
+	}
+}
+
+// TestToolLoopEscalatesToThinkingAfterNameThreshold covers the per-name
+// escalation: when one tool name is invoked toolNameEscalateThreshold times
+// in a single loop (cosmetic arg variation dodges the byte-for-byte nudge),
+// the connection swaps to the "thinking" role's sampler. Same URL/model so
+// the prefix cache stays warm — just a warmer sampler to break out.
+//
+// Runs with [llm] only and no [[subllm]] configured, to validate the
+// LLMCandidates("thinking", "main") path returns the main entry with
+// ParamsThinking populated.
+func TestToolLoopEscalatesToThinkingAfterNameThreshold(t *testing.T) {
+	withFreshToolRegistry(t)
+	const toolName = "test_grep_q9z"
+	var execs int
+	RegisterTool(Tool{
+		Def: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": toolName, "description": "grep",
+				"parameters": map[string]any{"type": "object"},
+			},
+		},
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+			execs++
+			return "no match", false
+		},
+	})
+
+	// 5 tool calls with *different* args so the signature-based nudge never
+	// fires (each sig is unique). The escalation must catch this pattern.
+	// 6th call produces final text after the swap.
+	mock := newMockLLM(t,
+		sseToolCall("c1", toolName, `{"q":"x1"}`),
+		sseToolCall("c2", toolName, `{"q":"x2"}`),
+		sseToolCall("c3", toolName, `{"q":"x3"}`),
+		sseToolCall("c4", toolName, `{"q":"x4"}`),
+		sseToolCall("c5", toolName, `{"q":"x5"}`),
+		sseText("giving up."),
+	)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	// Distinct sampler params per role; no SubLLM — exercises the llm-only path.
+	a.settings = Settings{
+		LLM: &LLMConnection{
+			URL:            mock.ts.URL,
+			Model:          "test-model",
+			ParamsExecute:  map[string]any{"temperature": 0.3},
+			ParamsThinking: map[string]any{"temperature": 1.0},
+		},
+	}
+
+	conn := a.pickAvailable(context.Background(), s.ID, "execute")
+	if conn == nil {
+		t.Fatalf("pickAvailable(execute) returned nil")
+	}
+	_, err := a.runToolLoop(context.Background(), s.ID, conn,
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute")
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+
+	if execs != 5 {
+		t.Errorf("tool execs: got %d, want 5", execs)
+	}
+	if mock.callCount() != 6 {
+		t.Errorf("LLM calls: got %d, want 6", mock.callCount())
+	}
+
+	// Calls 1..5 used execute sampler (temperature 0.3).
+	for i := 0; i < 5; i++ {
+		req := mock.request(i)
+		if req == nil {
+			t.Fatalf("request %d missing", i)
+		}
+		temp, _ := req["temperature"].(float64)
+		if temp != 0.3 {
+			t.Errorf("request %d temperature: got %v, want 0.3", i, temp)
+		}
+	}
+	// Call 6 must have escalated to thinking (temperature 1.0).
+	req6 := mock.request(5)
+	if req6 == nil {
+		t.Fatalf("request 6 missing")
+	}
+	temp6, _ := req6["temperature"].(float64)
+	if temp6 != 1.0 {
+		t.Errorf("request 6 temperature: got %v, want 1.0 (escalation should have flipped sampler)", temp6)
+	}
+}
+
 // TestCompressHistoryRecordsSummary is the headline history test: once raw
 // messages exceed rawBufferTokens, compressHistory should rotate the session
 // — freeze the pre-rotation state to a "session_archive_*" file, push the

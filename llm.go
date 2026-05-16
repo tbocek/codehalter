@@ -648,6 +648,38 @@ type toolLoopResult struct {
 // while still bailing on genuine runaways.
 const maxToolLoopIterations = 50
 
+// toolNameEscalateThreshold is the cumulative count of any single tool name
+// in one loop after which the connection switches from the "execute" role
+// to "thinking". Same server (so the KV prefix cache stays warm — sampler
+// params never enter the cache key), warmer sampler. Complementary to the
+// signature-based nudge above: that one catches byte-for-byte consecutive
+// repeats, this one catches "same tool, cosmetically different args"
+// patterns where presence_penalty drives the model to dance around a stuck
+// root cause without ever picking a different action. One-shot per loop.
+const toolNameEscalateThreshold = 5
+
+// toolCallSig produces a stable signature for the tool calls emitted in one
+// iteration: byte-for-byte name + arguments, joined when there's more than
+// one. Used to spot tight repetition where the model keeps re-running the
+// same call (same `grep`, same `read_file`) without doing anything with the
+// result — the most common pathology when small models get stuck.
+func toolCallSig(calls []toolCall) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, c := range calls {
+		if i > 0 {
+			b.WriteByte('|')
+		}
+		b.WriteString(c.Function.Name)
+		b.WriteByte('(')
+		b.WriteString(c.Function.Arguments)
+		b.WriteByte(')')
+	}
+	return b.String()
+}
+
 // runToolLoopJSON runs the tool loop and unmarshals the response into dst.
 // Small models routinely produce JSON with surrounding prose; on parse
 // failure we send one corrective follow-up ("reply with ONLY JSON") and try
@@ -724,6 +756,22 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 			sess.MarkLastAssistantTiming(res.StartedAt, res.DurationMs, phase)
 		}
 	}
+	// Repetition state: track the signature of the previous iteration's tool
+	// calls. Two consecutive identical signatures inject a corrective and
+	// give the model one chance to break out; a third (post-nudge) bails.
+	// A different signature resets the streak — natural variation isn't
+	// punished, only tight loops.
+	var lastSig string
+	var sameSigCount int
+	var nudged bool
+	// Per-name cumulative counts across the whole loop. When any single tool
+	// name crosses toolNameEscalateThreshold we swap conn to the "thinking"
+	// role on the same server (sampler-only change; KV prefix cache key is
+	// derived from prompt tokens, not sampler params, so the cache stays
+	// warm). One-shot per loop — if the warmer sampler doesn't help, the
+	// signature nudge / 50-iter cap will still bail us out.
+	toolNameCounts := map[string]int{}
+	var escalated bool
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			res.Text = allText.String()
@@ -747,6 +795,40 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 			res.Text = allText.String()
 			stampTiming()
 			return res, nil
+		}
+
+		sig := toolCallSig(calls)
+		if sig != "" && sig == lastSig {
+			sameSigCount++
+		} else {
+			sameSigCount = 1
+			nudged = false
+		}
+		lastSig = sig
+
+		// Third identical call after a nudge → give up. The model had its
+		// recovery chance and didn't take it; further iterations will burn
+		// the same time. Surfaces as a clean error rather than waiting for
+		// the 50-iter cap.
+		if sameSigCount >= 3 && nudged {
+			res.Text = allText.String()
+			stampTiming()
+			return res, fmt.Errorf("tool loop stuck on identical call after nudge: %s", truncate(sig, 200))
+		}
+		// Second identical call → nudge once. We still EXECUTE the duplicate
+		// (legitimate read-after-write needs the fresh read to land, even
+		// when its sig matches the prior read), but tack on a user-role
+		// corrective at the end of this iteration so the next LLM round-trip
+		// sees a break-out instruction alongside the (possibly unchanged)
+		// tool result.
+		nudgeThisIter := sameSigCount == 2 && !nudged
+		if nudgeThisIter {
+			nudged = true
+			if sid != "" {
+				a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+					"⚠ Repeated tool call detected — nudging the model to try a different action.\n",
+				)))
+			}
 		}
 
 		messages = append(messages, llmMessage{
@@ -803,6 +885,46 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 				Content:    content,
 				ToolCallID: tc.ID,
 			})
+		}
+
+		// If this iteration was flagged as a repeat, append a corrective
+		// user message after the tool results so the model sees the nudge
+		// alongside the (often unchanged) output it just got back.
+		if nudgeThisIter {
+			messages = append(messages, llmMessage{
+				Role: "user",
+				Content: "You just repeated the same tool call with the same arguments. Re-running rarely produces new information. Either:\n" +
+					"1. Act on the output you already have (edit a file, run a different command, or summarise your finding), or\n" +
+					"2. If you are stuck or the task is infeasible, say so and stop.\n\n" +
+					"Do not call the same tool with the same arguments again unless you have first changed state that the call observes (e.g. a file you just edited).",
+			})
+		}
+
+		// Per-name escalation: same tool repeatedly (cosmetic arg variation
+		// dodges the signature nudge above) means the sampler is too cold to
+		// abandon a stuck plan. Switch to the "thinking" role's params — same
+		// URL/model so the prefix cache survives — and let the warmer sampler
+		// pick a different action. One-shot per loop.
+		if !escalated {
+			for _, c := range calls {
+				toolNameCounts[c.Function.Name]++
+			}
+			for name, n := range toolNameCounts {
+				if n < toolNameEscalateThreshold {
+					continue
+				}
+				thinkConn := a.pickAvailable(ctx, sid, "thinking")
+				if thinkConn == nil {
+					break
+				}
+				conn = thinkConn
+				escalated = true
+				if sid != "" {
+					a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+						fmt.Sprintf("⚠ Tool '%s' invoked %d× this loop — switching to thinking sampler to break out.\n", name, n))))
+				}
+				break
+			}
 		}
 	}
 }
