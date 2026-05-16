@@ -289,7 +289,7 @@ func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagent
 		exclude["launch_subagent"] = true
 	}
 
-	result, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{exclude: exclude})
+	result, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "subagent")
 	if err != nil {
 		return result.Text, err
 	}

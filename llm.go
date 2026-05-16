@@ -559,6 +559,16 @@ func trimJSON(s string) string {
 type toolLoopResult struct {
 	Text     string
 	ToolUses []ToolUse
+	// StartedAt is when the first llmStream call of this loop began.
+	// DurationMs is the cumulative wall-clock time spent in llmStream calls
+	// across all iterations (excludes tool execution). Phase is the pipeline
+	// stage tag passed in by the caller ("plan", "execute", "verify",
+	// "document", "subagent"). Callers that own the final assistant message
+	// (prompt.go, runSubagent) use these to stamp the message they create
+	// after the loop returns.
+	StartedAt  time.Time
+	DurationMs int64
+	Phase      string
 }
 
 // maxToolLoopIterations bounds runToolLoop so a model that keeps producing
@@ -578,9 +588,9 @@ const maxToolLoopIterations = 50
 // the caller renders the parsed result (renderSteps for plans, verify
 // outcome for verify). Tool calls still surface as cards so the user sees
 // what the planner/verifier is probing.
-func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, dst any) (toolLoopResult, error) {
+func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, dst any) (toolLoopResult, error) {
 	noop := func(string) {}
-	res, err := a.runToolLoopOn(ctx, sid, conn, messages, filter, noop)
+	res, err := a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, noop)
 	if err != nil {
 		return res, err
 	}
@@ -593,9 +603,10 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMCon
 		llmMessage{Role: "assistant", Content: res.Text},
 		llmMessage{Role: "user", Content: "Your previous reply was not valid JSON. Reply with ONLY the JSON object — first character `{`, last character `}`, nothing before or after. No prose, no markdown fences."},
 	)
-	res2, err := a.runToolLoopOn(ctx, sid, conn, fixMsgs, filter, noop)
+	res2, err := a.runToolLoopOn(ctx, sid, conn, fixMsgs, filter, phase, noop)
 	res.Text = res2.Text
 	res.ToolUses = append(res.ToolUses, res2.ToolUses...)
+	res.DurationMs += res2.DurationMs
 	if err != nil {
 		return res, err
 	}
@@ -608,37 +619,63 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMCon
 // runToolLoop runs the agentic tool loop with the default token-streaming
 // callback so the user sees execute / document phases live. The internal
 // JSON phases (planner, verifier) call runToolLoopOn directly with a no-op.
-func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter) (toolLoopResult, error) {
+func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string) (toolLoopResult, error) {
 	on := func(token string) {
 		if sid != "" {
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(token)))
 		}
 	}
-	return a.runToolLoopOn(ctx, sid, conn, messages, filter, on)
+	return a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, on)
 }
 
 // runToolLoopOn is the core agentic tool loop: send to LLM, execute tool
 // calls, repeat. Callers supply the per-token callback (default streaming
-// for runToolLoop, no-op for runToolLoopJSON).
-func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, on func(string)) (toolLoopResult, error) {
+// for runToolLoop, no-op for runToolLoopJSON). The phase string ("plan",
+// "execute", "verify", "document", "subagent") flows onto the trailing
+// assistant message via MarkLastAssistantTiming together with the
+// cumulative llmStream wall-clock — so session.toml records who ran the
+// turn and how much of its time was model generation vs tool execution.
+func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, on func(string)) (toolLoopResult, error) {
 	tools := llmToolDefinitionsFiltered(filter)
 
 	var res toolLoopResult
+	res.Phase = phase
 	var allText strings.Builder
+	var genElapsed time.Duration
+	// stampTiming applies the accumulated start/duration/phase to the
+	// trailing assistant message in session. Called on every exit path so
+	// even error returns leave a recorded turn for postmortem analysis.
+	stampTiming := func() {
+		if res.StartedAt.IsZero() {
+			return
+		}
+		res.DurationMs = genElapsed.Milliseconds()
+		if sess := a.getSession(sid); sess != nil {
+			sess.MarkLastAssistantTiming(res.StartedAt, res.DurationMs, phase)
+		}
+	}
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			res.Text = allText.String()
+			stampTiming()
 			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
 		}
+		streamStart := time.Now()
+		if res.StartedAt.IsZero() {
+			res.StartedAt = streamStart
+		}
 		text, calls, err := a.llmStream(ctx, sid, conn, messages, tools, on)
+		genElapsed += time.Since(streamStart)
 		if err != nil {
 			res.Text = allText.String()
+			stampTiming()
 			return res, err
 		}
 		allText.WriteString(text)
 
 		if len(calls) == 0 {
 			res.Text = allText.String()
+			stampTiming()
 			return res, nil
 		}
 

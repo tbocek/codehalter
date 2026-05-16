@@ -67,7 +67,7 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 	}
 	messages = append(messages, llmMessage{Role: "user", Content: planPrompt + "\n\nUser request: " + userText})
 	var plan planResult
-	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{}, &plan)
+	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{}, "plan", &plan)
 	if err != nil {
 		return thinking, nil, planRes.ToolUses, nil
 	}
@@ -246,7 +246,7 @@ func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessag
 	}
 	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{
 		exclude: exclude,
-	})
+	}, "execute")
 }
 
 // ---------------------------------------------------------------------------
@@ -305,7 +305,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 
 	verifyMessages := append(messages, llmMessage{Role: "user", Content: prompt.String()})
 	var result verifyResult
-	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{}, &result)
+	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{}, "verify", &result)
 	res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
 	if err != nil {
 		slog.Error("verify: skipped, treating as success", "err", err)
@@ -378,7 +378,7 @@ func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection
 		messages = a.buildLLMHistory(sess, -1)
 	}
 	messages = append(messages, llmMessage{Role: "user", Content: prompt.String()})
-	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{})
+	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{}, "document")
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil

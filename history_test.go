@@ -318,7 +318,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "please echo hello"}}, toolFilter{})
+		[]llmMessage{{Role: "user", Content: "please echo hello"}}, toolFilter{}, "execute")
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -416,7 +416,7 @@ func TestToolLoopNoDedup(t *testing.T) {
 
 	a, s := newTestAgent(t)
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{})
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute")
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}

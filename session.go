@@ -19,6 +19,22 @@ type Message struct {
 	Content  string      `toml:"content"`
 	Images   []ImageData `toml:"images,omitempty"`
 	ToolUses []ToolUse   `toml:"tool_uses,omitempty"`
+	// StartedAt is the wall-clock time the message was created. For user
+	// turns this is when the prompt arrived; for assistant turns this is
+	// when the first llmStream call of that turn started. Always populated
+	// for newly-created messages; older session files decode with the zero
+	// value (omitempty keeps them clean).
+	StartedAt time.Time `toml:"started_at,omitempty"`
+	// DurationMs is meaningful only for assistant turns: cumulative wall-clock
+	// time spent in llmStream calls for that turn (the agentic loop may run
+	// multiple llmStream → tools → llmStream cycles, all attributed here).
+	// Excludes tool execution time — those are timed individually on each
+	// ToolUse. Zero on user turns.
+	DurationMs int64 `toml:"duration_ms,omitempty"`
+	// Phase tags which pipeline stage produced this message: "plan",
+	// "execute", "verify", "document", or "subagent". Empty on user turns
+	// and on legacy entries from before this field existed.
+	Phase string `toml:"phase,omitempty"`
 }
 
 type ImageData struct {
@@ -189,25 +205,25 @@ func newSubagentSession(cwd string, parentID SessionId, index, depth, pinnedSubL
 func (s *Session) AddUser(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Messages = append(s.Messages, Message{Role: "user", Content: text})
+	s.Messages = append(s.Messages, Message{Role: "user", Content: text, StartedAt: time.Now()})
 }
 
 func (s *Session) AddUserWithImages(text string, images []ImageData) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Messages = append(s.Messages, Message{Role: "user", Content: text, Images: images})
+	s.Messages = append(s.Messages, Message{Role: "user", Content: text, Images: images, StartedAt: time.Now()})
 }
 
 func (s *Session) AddAssistant(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text})
+	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text, StartedAt: time.Now()})
 }
 
 func (s *Session) AddAssistantWithTools(text string, tools []ToolUse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text, ToolUses: tools})
+	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text, ToolUses: tools, StartedAt: time.Now()})
 }
 
 // AppendToolUse adds a tool use to the last assistant message, creating one if needed.
@@ -249,7 +265,27 @@ func (s *Session) UpsertLastAssistant(content string) {
 		s.Messages[len(s.Messages)-1].Content = content
 		return
 	}
-	s.Messages = append(s.Messages, Message{Role: "assistant", Content: content})
+	s.Messages = append(s.Messages, Message{Role: "assistant", Content: content, StartedAt: time.Now()})
+}
+
+// MarkLastAssistantTiming stamps timing and phase onto the trailing assistant
+// message, creating one if no assistant turn is currently the latest entry.
+// Used by runToolLoopOn at the end of an assistant turn so the .toml records
+// when generation started, how much wall-clock the LLM calls took, and which
+// phase produced the turn. started.IsZero() preserves any existing stamp
+// (idempotent — repeated calls with a zero start time don't clobber).
+func (s *Session) MarkLastAssistantTiming(started time.Time, durationMs int64, phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Messages) == 0 || s.Messages[len(s.Messages)-1].Role != "assistant" {
+		s.Messages = append(s.Messages, Message{Role: "assistant"})
+	}
+	m := &s.Messages[len(s.Messages)-1]
+	if !started.IsZero() {
+		m.StartedAt = started
+	}
+	m.DurationMs = durationMs
+	m.Phase = phase
 }
 
 func (s *Session) Save() error {
