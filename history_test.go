@@ -583,16 +583,13 @@ func TestToolLoopRepeatNudgeAndBail(t *testing.T) {
 	}
 }
 
-// TestToolLoopEscalatesToThinkingAfterNameThreshold covers the per-name
-// escalation: when one tool name is invoked toolNameEscalateThreshold times
-// in a single loop (cosmetic arg variation dodges the byte-for-byte nudge),
-// the connection swaps to the "thinking" role's sampler. Same URL/model so
-// the prefix cache stays warm — just a warmer sampler to break out.
-//
-// Runs with a single [[llm]] entry, to validate that escalation flips the
-// active conn's ExtraBody from ParamsExecute to ParamsThinking on the same
-// URL/model so the prefix cache survives the sampler swap.
-func TestToolLoopEscalatesToThinkingAfterNameThreshold(t *testing.T) {
+// TestToolLoopDoesNotEscalateOnDistinctArgs verifies that legitimate fan-out
+// across distinct arguments (e.g. read_file on go.mod, examples/go.mod, …
+// when surveying a multi-module repo) does NOT trip the per-name escalation.
+// Only redundant calls — same (name, args) pair seen before — count toward
+// toolNameEscalateThreshold. Sampler must stay on the execute role for the
+// whole loop.
+func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	withFreshToolRegistry(t)
 	const toolName = "test_grep_q9z"
 	var execs int
@@ -610,23 +607,20 @@ func TestToolLoopEscalatesToThinkingAfterNameThreshold(t *testing.T) {
 		},
 	})
 
-	// 5 tool calls with *different* args so the signature-based nudge never
-	// fires (each sig is unique). The escalation must catch this pattern.
-	// 6th call produces final text after the swap.
+	// 5 tool calls with *different* args (the surveying-pattern that used
+	// to trip the old per-name counter). With distinct-args counting, none
+	// of these count as redundant, so no escalation should fire.
 	mock := newMockLLM(t,
 		sseToolCall("c1", toolName, `{"q":"x1"}`),
 		sseToolCall("c2", toolName, `{"q":"x2"}`),
 		sseToolCall("c3", toolName, `{"q":"x3"}`),
 		sseToolCall("c4", toolName, `{"q":"x4"}`),
 		sseToolCall("c5", toolName, `{"q":"x5"}`),
-		sseText("giving up."),
+		sseText("done."),
 	)
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	// Distinct sampler params per role; single entry — exercises the
-	// role-swap path on LLM[0] (escalation hits the same conn with thinking
-	// params, not a separate slot).
 	a.settings = Settings{
 		LLM: []LLMConnection{{
 			URL:            mock.ts.URL,
@@ -653,8 +647,91 @@ func TestToolLoopEscalatesToThinkingAfterNameThreshold(t *testing.T) {
 		t.Errorf("LLM calls: got %d, want 6", mock.callCount())
 	}
 
-	// Calls 1..5 used execute sampler (temperature 0.3).
-	for i := 0; i < 5; i++ {
+	// Every call must still use the execute sampler — no escalation.
+	for i := 0; i < mock.callCount(); i++ {
+		req := mock.request(i)
+		if req == nil {
+			t.Fatalf("request %d missing", i)
+		}
+		temp, _ := req["temperature"].(float64)
+		if temp != 0.3 {
+			t.Errorf("request %d temperature: got %v, want 0.3 (no escalation expected on distinct args)", i, temp)
+		}
+	}
+}
+
+// TestToolLoopEscalatesOnRepeatedArgs covers the per-name escalation under
+// distinct-args counting: when the same (name, arguments) pair is revisited
+// enough times in one loop, the connection swaps to the "thinking" role's
+// sampler. We interleave two arg values to avoid two consecutive byte-for-
+// byte identical sigs (which would trip the signature nudge / bail first).
+func TestToolLoopEscalatesOnRepeatedArgs(t *testing.T) {
+	withFreshToolRegistry(t)
+	const toolName = "test_grep_q9z"
+	var execs int
+	RegisterTool(Tool{
+		Def: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": toolName, "description": "grep",
+				"parameters": map[string]any{"type": "object"},
+			},
+		},
+		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+			execs++
+			return "no match", false
+		},
+	})
+
+	// Alternate two args: A B A B A B A. Sigs differ each iter so the
+	// signature nudge never fires, but every call after the first
+	// occurrence of each arg counts as redundant. The per-name counter
+	// (aggregated across all args of the same tool) reaches
+	// toolNameEscalateThreshold (5) at iter 6 — escalating the 8th LLM
+	// call's sampler.
+	mock := newMockLLM(t,
+		sseToolCall("a1", toolName, `{"q":"A"}`),
+		sseToolCall("b1", toolName, `{"q":"B"}`),
+		sseToolCall("a2", toolName, `{"q":"A"}`),
+		sseToolCall("b2", toolName, `{"q":"B"}`),
+		sseToolCall("a3", toolName, `{"q":"A"}`),
+		sseToolCall("b3", toolName, `{"q":"B"}`),
+		sseToolCall("a4", toolName, `{"q":"A"}`),
+		sseText("giving up."),
+	)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	a.settings = Settings{
+		LLM: []LLMConnection{{
+			URL:            mock.ts.URL,
+			Model:          "test-model",
+			ParamsExecute:  map[string]any{"temperature": 0.3},
+			ParamsThinking: map[string]any{"temperature": 1.0},
+		}},
+	}
+
+	conn := a.pickAvailable(context.Background(), s.ID, "execute")
+	if conn == nil {
+		t.Fatalf("pickAvailable(execute) returned nil")
+	}
+	_, err := a.runToolLoop(context.Background(), s.ID, conn,
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute")
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+
+	if execs != 7 {
+		t.Errorf("tool execs: got %d, want 7", execs)
+	}
+	if mock.callCount() != 8 {
+		t.Errorf("LLM calls: got %d, want 8", mock.callCount())
+	}
+
+	// Calls 1..7 used execute sampler (temperature 0.3) — escalation runs
+	// at the END of iter 6 (the 7th call), so the call itself still went
+	// out under execute params; the 8th is the first one with thinking.
+	for i := 0; i < 7; i++ {
 		req := mock.request(i)
 		if req == nil {
 			t.Fatalf("request %d missing", i)
@@ -664,14 +741,14 @@ func TestToolLoopEscalatesToThinkingAfterNameThreshold(t *testing.T) {
 			t.Errorf("request %d temperature: got %v, want 0.3", i, temp)
 		}
 	}
-	// Call 6 must have escalated to thinking (temperature 1.0).
-	req6 := mock.request(5)
-	if req6 == nil {
-		t.Fatalf("request 6 missing")
+	// Call 8 must have escalated to thinking (temperature 1.0).
+	req8 := mock.request(7)
+	if req8 == nil {
+		t.Fatalf("request 8 missing")
 	}
-	temp6, _ := req6["temperature"].(float64)
-	if temp6 != 1.0 {
-		t.Errorf("request 6 temperature: got %v, want 1.0 (escalation should have flipped sampler)", temp6)
+	temp8, _ := req8["temperature"].(float64)
+	if temp8 != 1.0 {
+		t.Errorf("request 8 temperature: got %v, want 1.0 (escalation should have flipped sampler)", temp8)
 	}
 }
 

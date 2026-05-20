@@ -622,14 +622,17 @@ type toolLoopResult struct {
 // common stuck patterns earlier, so this cap is the last-resort backstop.
 const maxToolLoopIterations = 200
 
-// toolNameEscalateThreshold is the cumulative count of any single tool name
-// in one loop after which the connection switches from the "execute" role
-// to "thinking". Same server (so the KV prefix cache stays warm — sampler
-// params never enter the cache key), warmer sampler. Complementary to the
-// signature-based nudge above: that one catches byte-for-byte consecutive
-// repeats, this one catches "same tool, cosmetically different args"
-// patterns where presence_penalty drives the model to dance around a stuck
-// root cause without ever picking a different action. One-shot per loop.
+// toolNameEscalateThreshold is the number of *redundant* calls to a single
+// tool name in one loop after which the connection switches from the
+// "execute" role to "thinking". Same server (so the KV prefix cache stays
+// warm — sampler params never enter the cache key), warmer sampler. A call
+// is redundant when its (name, arguments) pair has already been seen this
+// loop; legitimate fan-out across distinct files/queries (e.g. surveying
+// every go.mod in a multi-module repo) does NOT count, so broad read
+// passes no longer trip the escalation. Complementary to the signature-
+// based nudge above: that one catches byte-for-byte consecutive repeats,
+// this one catches interleaved revisits to the same args. One-shot per
+// loop.
 const toolNameEscalateThreshold = 5
 
 // toolCallSig produces a stable signature for the tool calls emitted in one
@@ -753,6 +756,12 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 	// warm). One-shot per loop — if the warmer sampler doesn't help, the
 	// signature nudge / 50-iter cap will still bail us out.
 	toolNameCounts := map[string]int{}
+	// toolArgSeen[name] is the set of (already-seen) argument strings for a
+	// given tool name. The per-name escalation only counts a call as
+	// redundant when its args have been seen before — fan-out across
+	// distinct files (e.g. read_file on go.mod, examples/go.mod, …) doesn't
+	// trip the escalation; only genuine revisits do.
+	toolArgSeen := map[string]map[string]bool{}
 	var escalated bool
 	// respondNudged: when respondEnabled and the model returns an empty tool
 	// call list, we nudge once to call respond. If the next turn still has no
@@ -932,14 +941,24 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 			})
 		}
 
-		// Per-name escalation: same tool repeatedly (cosmetic arg variation
-		// dodges the signature nudge above) means the sampler is too cold to
-		// abandon a stuck plan. Switch to the "thinking" role's params — same
-		// URL/model so the prefix cache survives — and let the warmer sampler
-		// pick a different action. One-shot per loop.
+		// Per-name escalation: redundant calls to the same tool (same args
+		// seen before) mean the sampler is too cold to abandon a stuck plan.
+		// Distinct args don't count — surveying many files via read_file
+		// doesn't trip this. Switch to the "thinking" role's params — same
+		// URL/model so the prefix cache survives — and let the warmer
+		// sampler pick a different action. One-shot per loop.
 		if !escalated {
 			for _, c := range calls {
-				toolNameCounts[c.Function.Name]++
+				seen := toolArgSeen[c.Function.Name]
+				if seen == nil {
+					seen = map[string]bool{}
+					toolArgSeen[c.Function.Name] = seen
+				}
+				if seen[c.Function.Arguments] {
+					toolNameCounts[c.Function.Name]++
+				} else {
+					seen[c.Function.Arguments] = true
+				}
 			}
 			for name, n := range toolNameCounts {
 				if n < toolNameEscalateThreshold {

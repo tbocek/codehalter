@@ -173,11 +173,11 @@ func (a *agent) registerSubagentTool() {
 			task := p.task
 			pinnedIdx := pinOrder[k%len(pinOrder)]
 			subSess := newSubagentSession(sess.Cwd, sid, primary, sess.Depth+1, pinnedIdx)
-			subSess.DisplayLabel = fmt.Sprintf("subagent %d", primary+1)
+			subSess.DisplayLabel = fmt.Sprintf("subagent %d@llm %d", primary+1, pinnedIdx)
 			ag.putSession(subSess)
 			defer ag.deleteSession(subSess.ID)
 
-			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Starting: %s\n\n", primary+1, truncate(task.Instructions, 100)))))
+			ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[%s] Starting: %s\n\n", subSess.DisplayLabel, truncate(task.Instructions, 100)))))
 
 			// All internal plan/execute/verify calls use the subagent's own
 			// session id. That keeps plan steps, tool uses, and assistant
@@ -202,9 +202,9 @@ func (a *agent) registerSubagentTool() {
 			mu.Unlock()
 
 			if len(p.indices) > 1 {
-				ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Done (shared with %d duplicate task(s))\n\n", primary+1, len(p.indices)-1))))
+				ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[%s] Done (shared with %d duplicate task(s))\n\n", subSess.DisplayLabel, len(p.indices)-1))))
 			} else {
-				ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[subagent %d] Done\n\n", primary+1))))
+				ag.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(fmt.Sprintf("[%s] Done\n\n", subSess.DisplayLabel))))
 			}
 		})
 
