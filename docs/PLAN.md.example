@@ -127,40 +127,15 @@ just lookups. Two heuristics, applied together:
    plus the surrounding facts (file paths, version numbers, error strings)
    are enough; the subagent doesn't need the rest of the conversation.
 
-When both hold, emit ONE `launch_subagent` step per independent unit. They run
-on a separate LLM connection and in parallel, so the wall-clock saving is real.
-
-Examples that QUALIFY:
-  Bad (sequential):
-    1. Search for usages of foo
-    2. Search for usages of bar
-  Good (parallel):
-    1. launch_subagent: Search for usages of foo and bar; report files+lines.
-
-  Bad (sequential edits on independent files):
-    1. Apply the same change in <file-a>
-    2. Apply the same change in <file-b>
-    3. Apply the same change in <file-c>
-  Good (parallel edits, one subagent per file):
-    1. launch_subagent: Edit <file-a> — replace "<old>" with "<new>"
-    2. launch_subagent: Edit <file-b> — replace "<old>" with "<new>"
-    3. launch_subagent: Edit <file-c> — replace "<old>" with "<new>"
-
-  Bad (sequential web reads):
-    1. web_read the release notes for <library>
-    2. web_read the registry/tags page for <image>
-  Good (parallel):
-    1. launch_subagent: Fetch <library> release notes and <image> registry
-       tags page; report version-relevant findings.
+When both hold, `launch_subagent` is a candidate. Subagents run on separate
+LLM connections in parallel; whether to fan out one subagent per unit or bundle
+several units into one subagent depends on the relative cost of subagent
+startup vs serial execution on a single connection — judge per case.
 
 Do NOT use `launch_subagent` when:
 - Step B depends on step A's output (sequential).
 - Multiple steps mutate the same file region (write conflicts).
 - The work is a single small edit and forking adds more overhead than it saves.
-
-A good shape: if your plan has ≥2 steps that touch different files / different
-docs / different lookups and could run at the same time, each becomes a
-subagent step. The user prefers this over one long serial chain.
 
 ## Step 5 — Decide if this is a "report-only" task
 

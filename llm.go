@@ -40,6 +40,17 @@ type sseChunk struct {
 		Delta struct {
 			Content   string     `json:"content"`
 			ToolCalls []toolCall `json:"tool_calls"`
+			// ReasoningContent is the chain-of-thought channel emitted by
+			// thinking models (Qwen3, DeepSeek-R1, GPT-OSS, …) when the
+			// upstream server is configured to split <think>…</think> off
+			// the main content stream (llama.cpp `--reasoning-format
+			// deepseek`, vLLM `--reasoning-parser deepseek_r1`, etc.). We
+			// don't merge it into Content because then prefix-cache lookups
+			// would key on a different string than the model actually
+			// generated — but we DO accumulate and log it so a turn that
+			// burns its whole budget thinking reports as "N bytes reasoning,
+			// 0 visible" instead of "(empty response)".
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -178,6 +189,7 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 	}
 
 	var fullText strings.Builder
+	var reasoningText strings.Builder
 	var calls []toolCall
 	var finishReason string
 	firstToken := true
@@ -210,9 +222,13 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 
 		delta := chunk.Choices[0].Delta
 
-		if firstToken && (delta.Content != "" || len(delta.ToolCalls) > 0) {
+		if firstToken && (delta.Content != "" || len(delta.ToolCalls) > 0 || delta.ReasoningContent != "") {
 			firstToken = false
 			a.setStatus(ctx, sid, " (thinking…)")
+		}
+
+		if delta.ReasoningContent != "" {
+			reasoningText.WriteString(delta.ReasoningContent)
 		}
 
 		if delta.Content != "" {
@@ -232,7 +248,7 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		writeResponseLog(logF, fullText.String(), calls, err)
+		writeResponseLog(logF, fullText.String(), reasoningText.String(), calls, err)
 		return fullText.String(), calls, fmt.Errorf("reading SSE stream: %w", err)
 	}
 
@@ -242,14 +258,18 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 	// the model was looping or rambling. Bail out cleanly rather than
 	// retrying — the JSON corrective in runToolLoopJSON is for malformed
 	// prose, not for runaways, and prompt.go's retry loop would just hit
-	// the same wall on the next attempt.
+	// the same wall on the next attempt. The reasoning-byte count is
+	// surfaced so an "empty response" cap-hit is recognisable as "the model
+	// spent its whole budget thinking" vs an actual runaway in the visible
+	// stream.
 	if finishReason == "length" {
-		err := fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated. Likely the model is looping; raise max_tokens in params_%s if a legitimate turn needs more headroom", conn.Tag, conn.Model, conn.Tag)
-		writeResponseLog(logF, fullText.String(), calls, err)
+		err := fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
+			conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)
+		writeResponseLog(logF, fullText.String(), reasoningText.String(), calls, err)
 		return fullText.String(), calls, err
 	}
 
-	writeResponseLog(logF, fullText.String(), calls, nil)
+	writeResponseLog(logF, fullText.String(), reasoningText.String(), calls, nil)
 	return fullText.String(), calls, nil
 }
 
@@ -258,18 +278,21 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 // tool-call argument blob) — useless for skimming. This collapses all the
 // deltas into the reconstructed text and tool calls so the log reads like a
 // transcript instead of a packet capture.
-func writeResponseLog(logF *os.File, text string, calls []toolCall, streamErr error) {
+func writeResponseLog(logF *os.File, text, reasoning string, calls []toolCall, streamErr error) {
 	if logF == nil {
 		return
 	}
 	fmt.Fprintln(logF, "=== RESPONSE ===")
+	if reasoning != "" {
+		fmt.Fprintf(logF, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
+	}
 	if text != "" {
 		fmt.Fprintf(logF, "content:\n%s\n", text)
 	}
 	for i, c := range calls {
 		fmt.Fprintf(logF, "tool_call[%d] %s id=%s args=%s\n", i, c.Function.Name, c.ID, c.Function.Arguments)
 	}
-	if text == "" && len(calls) == 0 {
+	if text == "" && len(calls) == 0 && reasoning == "" {
 		fmt.Fprintln(logF, "(empty response)")
 	}
 	if streamErr != nil {
