@@ -413,7 +413,7 @@ func (a *agent) runTaskCycle(
 	images []ImageData,
 	prePlan *planResult, preConn *LLMConnection, preToolUses []ToolUse,
 ) (toolLoopResult, error) {
-	const maxAttempts = 10
+	const maxAttempts = 20
 	var result toolLoopResult
 	var lastVR *verifyResult
 	var seenBags []map[string]bool
