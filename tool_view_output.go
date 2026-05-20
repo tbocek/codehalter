@@ -31,10 +31,10 @@ func init() {
 		"function": map[string]any{
 			"name": "view_output",
 			"description": "View a portion of a prior tool call's full output without re-running it. " +
-				"Use this when an earlier tool result was truncated (the truncation hint shows the `id` to pass here) " +
-				"or when you need to revisit a past result. Modes: `head` = first N lines, `tail` = last N lines, " +
-				"`grep` = every line matching `pattern` (RE2 regex). For head/tail, `lines` defaults to 100. " +
-				"Prefer this over re-running the original tool, especially for `run_task` / `run_command`.",
+				"ONLY use this when the original tool result was truncated — the truncation hint shows the `id` to pass here. " +
+				"If you have the original output in your tool history and it was NOT truncated, scroll back to it instead; don't call view_output. " +
+				"Modes: `head` = first N lines, `tail` = last N lines, `grep` = every line matching `pattern` (RE2 regex). " +
+				"For head/tail, `lines` defaults to 100. Prefer this over re-running the original tool (run_task / run_command) when the data is genuinely missing from history.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"id", "mode"},

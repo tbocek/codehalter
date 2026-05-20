@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -20,16 +21,33 @@ func (a *agent) resolvePath(sid SessionId, path string) (string, error) {
 	if sess == nil {
 		return "", fmt.Errorf("no session found")
 	}
-	var resolved string
-	if filepath.IsAbs(path) {
-		resolved = filepath.Clean(path)
-	} else {
-		resolved = filepath.Clean(filepath.Join(sess.Cwd, path))
+	inside := func(p string) bool {
+		return p == sess.Cwd || strings.HasPrefix(p, sess.Cwd+string(filepath.Separator))
 	}
-	if !strings.HasPrefix(resolved, sess.Cwd+string(filepath.Separator)) && resolved != sess.Cwd {
+	if filepath.IsAbs(path) {
+		resolved := filepath.Clean(path)
+		if !inside(resolved) {
+			return "", fmt.Errorf("path %q is outside project directory", path)
+		}
+		return resolved, nil
+	}
+	rel := filepath.Clean(filepath.Join(sess.Cwd, path))
+	if !inside(rel) {
 		return "", fmt.Errorf("path %q is outside project directory", path)
 	}
-	return resolved, nil
+	// LLMs sometimes write absolute-looking paths with a missing leading "/"
+	// (e.g. `workspaces/preveltekit/go.mod` when cwd is /workspaces/preveltekit).
+	// If the cwd-joined interpretation doesn't exist on disk but the "/"-
+	// prepended one does and stays inside cwd, prefer that.
+	if _, err := os.Stat(rel); err != nil {
+		abs := filepath.Clean("/" + path)
+		if abs != rel && inside(abs) {
+			if _, err := os.Stat(abs); err == nil {
+				return abs, nil
+			}
+		}
+	}
+	return rel, nil
 }
 
 // ---------------------------------------------------------------------------

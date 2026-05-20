@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -51,6 +52,62 @@ func capReadContent(content string, explicitLimit bool, startLine string) (strin
 	}
 
 	return content, strings.Join(notes, " ")
+}
+
+// grepLines filters content to lines matching re, optionally with before/after
+// context. Each emitted line is prefixed with its 1-based line number (within
+// the original file, offset by startLine to account for line-windowed reads).
+// Returns (output, matchCount, totalLines). Adjacent or overlapping context
+// windows are merged with a "--" separator between disjoint groups, mirroring
+// grep -A -B behaviour.
+func grepLines(content string, re *regexp.Regexp, before, after, startLine int) (string, int, int) {
+	if startLine < 1 {
+		startLine = 1
+	}
+	if before < 0 {
+		before = 0
+	}
+	if after < 0 {
+		after = 0
+	}
+	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+	if content == "" {
+		lines = nil
+	}
+	keep := make([]bool, len(lines))
+	matches := 0
+	for i, ln := range lines {
+		if re.MatchString(ln) {
+			matches++
+			lo := i - before
+			if lo < 0 {
+				lo = 0
+			}
+			hi := i + after
+			if hi >= len(lines) {
+				hi = len(lines) - 1
+			}
+			for j := lo; j <= hi; j++ {
+				keep[j] = true
+			}
+		}
+	}
+	var b strings.Builder
+	lastEmitted := -2
+	for i, ln := range lines {
+		if !keep[i] {
+			continue
+		}
+		if lastEmitted >= 0 && i > lastEmitted+1 {
+			b.WriteString("--\n")
+		}
+		fmt.Fprintf(&b, "%d: %s\n", startLine+i, ln)
+		lastEmitted = i
+	}
+	if matches == 0 {
+		return fmt.Sprintf("[no matches in %d lines]", len(lines)), 0, len(lines)
+	}
+	return b.String(), matches, len(lines)
 }
 
 // listProjectFiles returns relative paths of all files under root, skipping common junk dirs.
@@ -114,14 +171,17 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": fmt.Sprintf("Read a text file. Output is truncated to %d lines or %d KB — a truncation note will tell you to re-call with line+limit to continue. Do NOT re-read a file whose contents you already have in this turn's tool history; scroll back instead.", defaultReadLines, maxReadBytes/1024),
+			"description": fmt.Sprintf("Read a text file. Output is truncated to %d lines or %d KB — a truncation note will tell you to re-call with line+limit to continue. Do NOT re-read a file whose contents you already have in this turn's tool history AND which you have not modified since; scroll back instead. Once you call edit_file or write_file on a path, re-reading IS allowed (and expected). Use the `grep` parameter to extract only matching lines with line numbers — replaces `run_command grep -n …`. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go) — both are resolved.", defaultReadLines, maxReadBytes/1024),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
-					"path":  map[string]any{"type": "string", "description": "Absolute path or path relative to the project root."},
-					"line":  map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
-					"limit": map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line window.", maxReadLines, defaultReadLines)},
+					"path":   map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
+					"line":   map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
+					"limit":  map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line window.", maxReadLines, defaultReadLines)},
+					"grep":   map[string]any{"type": "string", "description": "Optional Go RE2 regex. When set, returns only matching lines (each prefixed with `lineno: `), not the full file. Use `(?i)` for case-insensitive. Combine with line/limit to grep within a window."},
+					"before": map[string]any{"type": "integer", "description": "Context lines before each grep match (like `grep -B`). Ignored when `grep` is unset."},
+					"after":  map[string]any{"type": "integer", "description": "Context lines after each grep match (like `grep -A`). Ignored when `grep` is unset."},
 				},
 			},
 		},
@@ -133,7 +193,9 @@ func init() {
 		}
 
 		title := "Reading: " + path
-		if args["line"] != "" {
+		if args["grep"] != "" {
+			title = fmt.Sprintf("Grepping: %s for %q", path, args["grep"])
+		} else if args["line"] != "" {
 			title = fmt.Sprintf("Reading: %s:%s", path, args["line"])
 		}
 		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
@@ -156,6 +218,26 @@ func init() {
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error(), false
+		}
+
+		// Grep mode: filter to matching lines with optional context, return
+		// early without applying the full-file truncation rules.
+		if pattern := args["grep"]; pattern != "" {
+			re, gerr := regexp.Compile(pattern)
+			if gerr != nil {
+				a.FailToolCall(ctx, sid, tcId, "invalid regex: "+gerr.Error())
+				return "error: invalid grep regex: " + gerr.Error(), false
+			}
+			before, _ := strconv.Atoi(args["before"])
+			after, _ := strconv.Atoi(args["after"])
+			startLine := 1
+			if linePtr != nil {
+				startLine = *linePtr
+			}
+			out, matches, total := grepLines(content, re, before, after, startLine)
+			resultTitle := fmt.Sprintf("Grepping: %s for %q (%d/%d)", path, pattern, matches, total)
+			a.CompleteToolCallTitled(ctx, sid, tcId, resultTitle, []ToolCallContent{TextContent(out)})
+			return out, false
 		}
 
 		content, truncNote := capReadContent(content, explicitLimit, args["line"])
@@ -199,7 +281,7 @@ func init() {
 				"type":     "object",
 				"required": []string{"path", "content"},
 				"properties": map[string]any{
-					"path":    map[string]any{"type": "string", "description": "Absolute path or path relative to the project root."},
+					"path":    map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
 					"content": map[string]any{"type": "string", "description": "Full file content. Will replace the file entirely."},
 				},
 			},
@@ -234,7 +316,7 @@ func init() {
 				"type":     "object",
 				"required": []string{"path", "old_text", "new_text"},
 				"properties": map[string]any{
-					"path":     map[string]any{"type": "string", "description": "Absolute path or path relative to the project root."},
+					"path":     map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
 					"old_text": map[string]any{"type": "string", "description": "Exact text to find. MUST match the file byte-for-byte (whitespace, indentation, trailing newlines included) AND must be unique in the file — include enough surrounding context to disambiguate."},
 					"new_text": map[string]any{"type": "string", "description": "Replacement text. Pass an empty string to delete old_text."},
 				},

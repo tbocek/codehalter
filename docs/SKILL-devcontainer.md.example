@@ -39,9 +39,15 @@ freshest version available on this image:
 - **Debian/Ubuntu**: `apt-cache search <pkg>`, `apt-cache policy <pkg>` (shows
   candidate version). Stable repos can be very old; backports / PPAs may
   carry newer ones.
-- **Arch**: `yay -Ss <pkg>` (covers both official repos and the AUR — the
-  AUR often has fresher versions than `pacman` alone). `yay -Si <pkg>` for
-  details.
+- **Arch**: ALWAYS prefer `yay` over `pacman` here — `yay` searches and
+  installs from both the official repos AND the AUR in one pass, and the AUR
+  routinely carries fresher versions (and packages that aren't in the
+  official repos at all, like `tinygo-bin`). Use `yay -Ss <pkg>` to search
+  both sources, `yay -Si <pkg>` for details, `yay -S --noconfirm <pkg>` to
+  install. Do NOT start with `pacman -S` and only fall back to `yay` when it
+  fails — that wastes a round trip. If you must use `pacman` for some reason
+  (e.g. yay isn't on PATH), `pacman -Ss` only covers the official repos and
+  will miss AUR packages.
 - **Alpine**: `apk search <pkg>`, `apk info <pkg>`.
 
 If the candidate version looks older than you expected, or you're not sure
@@ -88,14 +94,16 @@ commands against source files — use `edit_file`/`write_file` for that.
 
 ## What `run_command` is NOT for
 
+The tool description itself lists the precise "use tool X instead of CLI Y"
+redirects (cat→`read_file`, grep→`search_text`, sed→`sed_file`, …). At the
+skill level, two broader things are worth calling out that aren't a 1:1 CLI
+swap:
+
 - Long-running services — the process dies with codehalter; when the agent
-  exits, the shell exits too.
+  exits, the shell exits too. Don't start daemons in the foreground here.
 - Replacing `run_task` — for declared project tasks (`just build`, `npm
-  test`), keep using `run_task` so the user sees it in the same UI.
-- File edits — use `write_file` or `edit_file`; those go through the agent's
-  diff/approval UI.
-- Anything `git`-related — git is shimmed. Read code with `read_file`, not
-  `git show` / `git log`.
+  test`), keep using `run_task` so the user sees it in the same UI as when
+  they invoke the same target by hand.
 
 Exit code is always in the output and the tool card title. Interpret it:
 `which <tool>` exiting 1 means the binary is missing, not that the tool

@@ -96,14 +96,21 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_command",
-			"description": "Run a shell command directly inside this devcontainer. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. Use this for: (1) PROBE — `which tinygo`, `cargo check`, `node --version`, `apt list --installed | grep X` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install tinygo`), first run the same install via run_command, then verify it works (e.g. `tinygo version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which X` exiting 1 means X is missing, not that the tool failed. BLOCKED: `git` resolves to a stub that exits 127, so history-rewriting commands (reset --hard, push --force, branch -D, filter-branch) cannot destroy recoverable history. Read code with read_file, not `git show` / `git log`. The user runs git themselves.",
+			"description": "Run a shell command directly inside this devcontainer. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. Use this for: (1) PROBE — `which tinygo`, `cargo check`, `node --version`, `apt list --installed | grep X` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install tinygo`), first run the same install via run_command, then verify it works (e.g. `tinygo version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which X` exiting 1 means X is missing, not that the tool failed. " +
+				"DO NOT USE for file inspection or editing — use the dedicated tools instead: " +
+				"`cat file` / `head` / `tail` / `sed -n 'A,Bp'` → `read_file` (with `line` + `limit`); " +
+				"`grep -n PATTERN file` → `read_file` with `grep`/`before`/`after`; " +
+				"`grep -rn PATTERN .` → `search_text`; " +
+				"`sed -i 's/X/Y/g' file` → `sed_file` (regex substitute or line delete); " +
+				"slicing a prior tool's output → `view_output`. These route through the agent's diff/cache layer; raw shell duplicates them and burns LLM turns. " +
+				"BLOCKED: `git` resolves to a stub that exits 127, so history-rewriting commands (reset --hard, push --force, branch -D, filter-branch) cannot destroy recoverable history. Read code with read_file, not `git show` / `git log`. The user runs git themselves.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
 				"properties": map[string]any{
 					"command": map[string]any{
 						"type":        "string",
-						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Examples: `which tinygo`, `apt-get install -y tinygo && tinygo version`, `cargo check 2>&1 | tail -20`. Do not invoke git — it is shimmed to exit 127.",
+						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Examples: `which tinygo`, `apt-get install -y tinygo && tinygo version`, `cargo check 2>&1 | tail -20`. Do not invoke git — it is shimmed to exit 127. Do not use this for cat/head/tail/grep/sed against project files — use read_file / search_text / sed_file / view_output instead.",
 					},
 				},
 			},

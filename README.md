@@ -23,7 +23,7 @@ An [ACP](https://spec.anthropic.com/acp)-compatible AI coding agent that connect
 - **Session persistence** — conversations are saved as TOML files under `.codehalter/` and can be resumed across editor restarts.
 - **History compression** — older messages are summarised to stay within token budgets. After every turn a background goroutine condenses the user/assistant pair into a six-section structured note (Goal / Constraints / Progress / Decisions / Next Steps / Critical Context) on a free `llm[1+]` slot; when compaction triggers, the accumulated shadow buffer is installed as the new summary in lieu of a synchronous compress-and-replace pass. The compaction trigger scales to the LLM's discovered `n_ctx` rather than a hard-coded buffer. Requires ≥2 `[[llm]]` entries to actually run in parallel — with only one entry configured, the feature self-disables and falls back to the synchronous path.
 - **Two modes** — *Interactive* (ask before non-trivial actions) and *Autopilot* (auto-answer prompts, no interruption). Selectable per-session from the Zed mode picker.
-- **Configurable LLM endpoints** — different roles (`thinking`, `execute`, `summary`) can point at different models or servers.
+- **Configurable LLM endpoints** — different roles (`thinking`, `execute`) can point at different models or servers.
 
 ## Prerequisites
 
