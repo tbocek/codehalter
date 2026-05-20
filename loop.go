@@ -267,6 +267,13 @@ type verifyResult struct {
 	Success  bool     `json:"success"`
 	Issues   []string `json:"issues"`
 	FixSteps []string `json:"fix_steps,omitempty"`
+	// SustainabilityConcerns lists fixes the executor performed that won't
+	// survive a container rebuild / fresh clone — e.g. `apt-get install X`
+	// run via run_command without a matching `.devcontainer/Dockerfile`
+	// edit. Independent of pass/fail: even when exit codes are clean, a
+	// non-empty list downgrades the verdict to failure so the re-plan can
+	// persist the fix. See VERIFY.md.
+	SustainabilityConcerns []string `json:"sustainability_concerns,omitempty"`
 }
 
 // verify runs a self-check after execution. It routes to the "execute" role
@@ -323,18 +330,48 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 		return res, &verifyResult{Success: true}, nil
 	}
 
-	// Authoritative override: a typed-failed tool result during execution
-	// trumps the LLM's verdict. Small models routinely return success=true
-	// even after seeing a tool's "❌ TASK FAILED" banner in their context,
-	// so we don't trust the JSON when the raw exit-code stream disagrees.
-	if result.Success {
-		for i := 0; i < execToolCount; i++ {
-			u := res.ToolUses[i]
-			if u.Failed {
-				result.Success = false
-				result.Issues = append(result.Issues,
-					fmt.Sprintf("%s failed (exit-code override; verifier had reported success=true)", u.Name))
+	// Exit-code authority: the executor's typed Failed flags are ground
+	// truth for pass/fail. The LLM's `success` field is advisory — small
+	// models hallucinate in BOTH directions (inventing failures on clean
+	// runs, rationalizing real failures as success=true), so we override
+	// either way from the raw tool stream.
+	anyToolFailed := false
+	for i := 0; i < execToolCount; i++ {
+		if res.ToolUses[i].Failed {
+			anyToolFailed = true
+			break
+		}
+	}
+	if anyToolFailed {
+		if result.Success {
+			result.Success = false
+			if len(result.Issues) == 0 {
+				for i := 0; i < execToolCount; i++ {
+					u := res.ToolUses[i]
+					if u.Failed {
+						result.Issues = append(result.Issues,
+							fmt.Sprintf("%s failed (exit-code override; verifier had reported success=true)", u.Name))
+					}
+				}
 			}
+		}
+	} else if !result.Success {
+		// LLM invented issues with no failed tool to back them up — discard.
+		result.Success = true
+		result.Issues = nil
+		result.FixSteps = nil
+	}
+
+	// Sustainability: a clean exit with non-sustainable fixes (e.g. an
+	// `apt-get install X` run via run_command without a matching Dockerfile
+	// edit) is still incomplete — the fix will vanish on container rebuild.
+	// Treat as failure with concerns folded into fix_steps so re-plan can
+	// persist them.
+	if result.Success && len(result.SustainabilityConcerns) > 0 {
+		result.Success = false
+		for _, c := range result.SustainabilityConcerns {
+			result.Issues = append(result.Issues, "not yet sustainable: "+c)
+			result.FixSteps = append(result.FixSteps, c)
 		}
 	}
 
