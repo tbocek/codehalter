@@ -655,7 +655,7 @@ func (a *agent) systemPrompt(sid SessionId) (string, error) {
 	b.WriteString("Today's date: " + time.Now().Format("2006-01-02") + "\n")
 	b.WriteString("When the user asks about a technology, language, library, or version X, " +
 		"first check how X and its adjacent tooling are configured in this project " +
-		"(e.g. go → also tinygo; npm → also pnpm/yarn; python → also uv/poetry/pypy; " +
+		"(e.g. npm → also pnpm/yarn; python → also uv/poetry/pypy; " +
 		"a framework → also the build/runtime variant) before searching the web or " +
 		"making assumptions. Read manifest/build files (go.mod, package.json, Cargo.toml, " +
 		"Makefile, justfile, Dockerfile, README) and grep for related terms — the right " +

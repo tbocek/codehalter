@@ -32,7 +32,7 @@ For each external fact:
 - If a search returns nothing useful, REFORMULATE — don't rerun similar words.
 - Fan independent lookups out through `launch_subagent` instead of serializing.
 
-For project work, prefer probes: `list_files`/`grep`/`read_file`. If
+For project work, prefer probes: `list_files`/`search_text`/`read_file`. If
 `run_command` is available, USE it to verify tools before proposing a
 Dockerfile patch — an untested Dockerfile change is a guess.
 

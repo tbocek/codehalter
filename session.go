@@ -170,6 +170,13 @@ type Session struct {
 	// only; a restart pays one redundant regeneration on the next turn.
 	gitCommitMu       sync.Mutex
 	gitCommitLastHash [32]byte
+	// readDedup remembers read_file outcomes for the current Prompt() turn
+	// so a literal-repeat read (same path+line+limit, file unchanged) is
+	// rejected instead of re-running. Reset at the top of Prompt(); busted
+	// for a specific path whenever edit_file / write_file writes through
+	// fsWrite. In-memory only.
+	readDedupMu sync.Mutex
+	readDedup   map[string]readDedupEntry
 	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
 	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
 	// of role — cache-coherence trumps per-role sampler matching, the conn

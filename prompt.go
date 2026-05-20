@@ -174,6 +174,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// safe to run on every prompt without spamming the chat.
 	if sess := a.getSession(req.SessionId); sess != nil {
 		a.checkSettings(ctx, sess.Cwd, req.SessionId)
+		// Clear per-turn read-dedup. Dedup is scoped to a single Prompt()
+		// turn so that across-turn re-reads (after a user reply, edits made
+		// outside our process, etc.) still go through.
+		sess.readDedupMu.Lock()
+		sess.readDedup = nil
+		sess.readDedupMu.Unlock()
 	}
 
 	// Extract user text and images from prompt blocks.

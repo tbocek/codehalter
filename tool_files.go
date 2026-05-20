@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var skipDirs = map[string]bool{
@@ -54,60 +54,19 @@ func capReadContent(content string, explicitLimit bool, startLine string) (strin
 	return content, strings.Join(notes, " ")
 }
 
-// grepLines filters content to lines matching re, optionally with before/after
-// context. Each emitted line is prefixed with its 1-based line number (within
-// the original file, offset by startLine to account for line-windowed reads).
-// Returns (output, matchCount, totalLines). Adjacent or overlapping context
-// windows are merged with a "--" separator between disjoint groups, mirroring
-// grep -A -B behaviour.
-func grepLines(content string, re *regexp.Regexp, before, after, startLine int) (string, int, int) {
-	if startLine < 1 {
-		startLine = 1
-	}
-	if before < 0 {
-		before = 0
-	}
-	if after < 0 {
-		after = 0
-	}
-	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
-	if content == "" {
-		lines = nil
-	}
-	keep := make([]bool, len(lines))
-	matches := 0
-	for i, ln := range lines {
-		if re.MatchString(ln) {
-			matches++
-			lo := i - before
-			if lo < 0 {
-				lo = 0
-			}
-			hi := i + after
-			if hi >= len(lines) {
-				hi = len(lines) - 1
-			}
-			for j := lo; j <= hi; j++ {
-				keep[j] = true
-			}
-		}
-	}
-	var b strings.Builder
-	lastEmitted := -2
-	for i, ln := range lines {
-		if !keep[i] {
-			continue
-		}
-		if lastEmitted >= 0 && i > lastEmitted+1 {
-			b.WriteString("--\n")
-		}
-		fmt.Fprintf(&b, "%d: %s\n", startLine+i, ln)
-		lastEmitted = i
-	}
-	if matches == 0 {
-		return fmt.Sprintf("[no matches in %d lines]", len(lines)), 0, len(lines)
-	}
-	return b.String(), matches, len(lines)
+// readDedupEntry remembers a successful read_file outcome so a literal-repeat
+// call can short-circuit. We compare the file's current mtime+size against
+// what we saw last time; when they match, the model already has this content
+// in its tool-call history and should not pay for another read.
+type readDedupEntry struct {
+	mtime time.Time
+	size  int64
+}
+
+// readDedupKey canonicalises (path, line, limit) into a single map key so two
+// equivalent calls collide. Empty line/limit normalise to 0 (whole file).
+func readDedupKey(path string, line, limit int) string {
+	return fmt.Sprintf("%s|%d|%d", path, line, limit)
 }
 
 // listProjectFiles returns relative paths of all files under root, skipping common junk dirs.
@@ -171,17 +130,14 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": fmt.Sprintf("Read a text file. Output is truncated to %d lines or %d KB — a truncation note will tell you to re-call with line+limit to continue. Do NOT re-read a file whose contents you already have in this turn's tool history AND which you have not modified since; scroll back instead. Once you call edit_file or write_file on a path, re-reading IS allowed (and expected). Use the `grep` parameter to extract only matching lines with line numbers — replaces `run_command grep -n …`. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go) — both are resolved.", defaultReadLines, maxReadBytes/1024),
+			"description": fmt.Sprintf("Read a text file. Output is truncated to %d lines or %d KB — a truncation note will tell you to re-call with line+limit to continue. Do NOT re-read a file whose contents you already have in this turn's tool history AND which you have not modified since; scroll back instead. A literal-repeat read (same path, same line/limit, file unchanged) is rejected with a pointer to the prior result. Once you call edit_file or write_file on a path, re-reading IS allowed (and expected). Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go) — both are resolved.", defaultReadLines, maxReadBytes/1024),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
-					"path":   map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
-					"line":   map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
-					"limit":  map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line window.", maxReadLines, defaultReadLines)},
-					"grep":   map[string]any{"type": "string", "description": "Optional Go RE2 regex. When set, returns only matching lines (each prefixed with `lineno: `), not the full file. Use `(?i)` for case-insensitive. Combine with line/limit to grep within a window."},
-					"before": map[string]any{"type": "integer", "description": "Context lines before each grep match (like `grep -B`). Ignored when `grep` is unset."},
-					"after":  map[string]any{"type": "integer", "description": "Context lines after each grep match (like `grep -A`). Ignored when `grep` is unset."},
+					"path":  map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
+					"line":  map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
+					"limit": map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line window.", maxReadLines, defaultReadLines)},
 				},
 			},
 		},
@@ -191,14 +147,6 @@ func init() {
 		if err != nil {
 			return "error: " + err.Error(), false
 		}
-
-		title := "Reading: " + path
-		if args["grep"] != "" {
-			title = fmt.Sprintf("Grepping: %s for %q", path, args["grep"])
-		} else if args["line"] != "" {
-			title = fmt.Sprintf("Reading: %s:%s", path, args["line"])
-		}
-		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
 
 		var linePtr *int
 		if v, err := strconv.Atoi(args["line"]); err == nil && v > 0 {
@@ -214,30 +162,58 @@ func init() {
 			}
 		}
 
+		// Dedup repeat reads. Same path + same window + file's mtime/size
+		// unchanged since the last read in this turn → refuse instead of
+		// burning another full read. Reset at Prompt() boundary (see Prompt()
+		// in prompt.go), and busted whenever edit_file / write_file touches
+		// the path so a post-edit re-read still goes through.
+		sess := a.getSession(sid)
+		lineKey := 0
+		if linePtr != nil {
+			lineKey = *linePtr
+		}
+		limitKey := 0
+		if explicitLimit {
+			limitKey = limit
+		}
+		dedupKey := readDedupKey(path, lineKey, limitKey)
+		if sess != nil {
+			sess.readDedupMu.Lock()
+			if prev, ok := sess.readDedup[dedupKey]; ok {
+				if st, statErr := os.Stat(path); statErr == nil && st.ModTime().Equal(prev.mtime) && st.Size() == prev.size {
+					sess.readDedupMu.Unlock()
+					msg := fmt.Sprintf("read_file: %s (line=%d, limit=%d) already read earlier this turn and the file has not changed since — reuse the prior tool-call result from history instead of re-reading.", path, lineKey, limitKey)
+					return msg, false
+				}
+			}
+			sess.readDedupMu.Unlock()
+		}
+
+		title := "Reading: " + path
+		if args["line"] != "" {
+			title = fmt.Sprintf("Reading: %s:%s", path, args["line"])
+		}
+		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
+
 		content, err := fsRead(a, ctx, sid, path, linePtr, &limit)
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error(), false
 		}
 
-		// Grep mode: filter to matching lines with optional context, return
-		// early without applying the full-file truncation rules.
-		if pattern := args["grep"]; pattern != "" {
-			re, gerr := regexp.Compile(pattern)
-			if gerr != nil {
-				a.FailToolCall(ctx, sid, tcId, "invalid regex: "+gerr.Error())
-				return "error: invalid grep regex: " + gerr.Error(), false
+		// Record success in the dedup cache after a clean read. Use the
+		// post-read stat so the recorded mtime/size match what the LLM just
+		// saw — a write between read and stat would still bust the cache on
+		// the next call because the new stat won't match this one.
+		if sess != nil {
+			if st, statErr := os.Stat(path); statErr == nil {
+				sess.readDedupMu.Lock()
+				if sess.readDedup == nil {
+					sess.readDedup = make(map[string]readDedupEntry)
+				}
+				sess.readDedup[dedupKey] = readDedupEntry{mtime: st.ModTime(), size: st.Size()}
+				sess.readDedupMu.Unlock()
 			}
-			before, _ := strconv.Atoi(args["before"])
-			after, _ := strconv.Atoi(args["after"])
-			startLine := 1
-			if linePtr != nil {
-				startLine = *linePtr
-			}
-			out, matches, total := grepLines(content, re, before, after, startLine)
-			resultTitle := fmt.Sprintf("Grepping: %s for %q (%d/%d)", path, pattern, matches, total)
-			a.CompleteToolCallTitled(ctx, sid, tcId, resultTitle, []ToolCallContent{TextContent(out)})
-			return out, false
 		}
 
 		content, truncNote := capReadContent(content, explicitLimit, args["line"])
@@ -390,10 +366,20 @@ func fsRead(a *agent, ctx context.Context, sid SessionId, path string, line, lim
 
 // fsWrite writes a text file. Same subagent fallback as fsRead — Zed has no
 // record of a sub_* session id, so ACP writes are dead and we go straight
-// to disk.
+// to disk. Any cached read-dedup entries for this path are dropped here
+// because the file just changed — a subsequent read_file must run.
 func fsWrite(a *agent, ctx context.Context, sid SessionId, path, content string) error {
-	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
-		return os.WriteFile(path, []byte(content), 0644)
+	if sess := a.getSession(sid); sess != nil {
+		sess.readDedupMu.Lock()
+		for k := range sess.readDedup {
+			if strings.HasPrefix(k, path+"|") {
+				delete(sess.readDedup, k)
+			}
+		}
+		sess.readDedupMu.Unlock()
+		if sess.Depth > 0 {
+			return os.WriteFile(path, []byte(content), 0644)
+		}
 	}
 	_, err := SendRequest[struct{}](a.conn.RPC(), ctx, "fs/write_text_file", struct {
 		SessionId SessionId `json:"sessionId"`
