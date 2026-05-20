@@ -48,6 +48,15 @@ const maxSubagentDepth = 2
 type subagentTask struct {
 	Instructions string `json:"instructions"`
 	Context      string `json:"context,omitempty"`
+	// Task selects the subagent's flow:
+	//   "execute" (default) — runs the tool loop only. Use for surgical,
+	//     pre-specified work the parent has already planned: one edit, one
+	//     lookup, one bounded command. The subagent must NOT plan or verify.
+	//   "thinking" — runs plan → execute → verify on the subagent's own
+	//     session. Use when the subtask is itself a small task that needs
+	//     its own planning and self-check (e.g. "investigate X and apply
+	//     the fix").
+	Task string `json:"task,omitempty"`
 }
 
 type subagentResult struct {
@@ -67,7 +76,7 @@ func (a *agent) registerSubagentTool() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "launch_subagent",
-			"description": "Run 2+ short, independent leaf tasks in parallel. Each subagent runs ONLY the tool loop (no separate plan/verify phase) and reports back — use it for unambiguous single-file edits, one focused lookup, or one bounded command, NOT for multi-step work that needs its own planning. Subagents cannot talk to the user. The first subagent in a batch inherits this conversation's full history (it runs on the main LLM, its prefix cache is already warm); the rest start fresh on extra LLM slots and see only their own `instructions` + `context`. Parallelism is bounded by the sum of `parallel` across configured [[llm]] entries; excess tasks queue.",
+			"description": "Run 2+ short, independent tasks in parallel. Each task has a `task` field selecting its flow: `execute` (default) runs ONLY the tool loop — use for surgical edits, one lookup, one bounded command the caller has already planned; `thinking` runs plan → execute → verify on the subagent itself — use when the subtask needs its own planning and self-check. Subagents cannot talk to the user. The first subagent in a batch inherits this conversation's full history (it runs on the main LLM, its prefix cache is already warm); the rest start fresh on extra LLM slots and see only their own `instructions` + `context`. Parallelism is bounded by the sum of `parallel` across configured [[llm]] entries; excess tasks queue.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"tasks"},
@@ -79,6 +88,7 @@ func (a *agent) registerSubagentTool() {
 							"properties": map[string]any{
 								"instructions": map[string]any{"type": "string", "description": "The exact task this subagent should perform. Phrase it as a self-contained order — the subagent has no other source of intent."},
 								"context":      map[string]any{"type": "string", "description": "EVERY fact the subagent needs to start working immediately: exact file paths, the literal text to find/replace, version numbers, error strings, relevant snippets from prior tool output. The subagent does NOT see this conversation or earlier tool results — anything it has to discover on its own is wasted time."},
+								"task":         map[string]any{"type": "string", "enum": []string{"execute", "thinking"}, "description": "`execute` (default): subagent runs the tool loop only, no plan or verify — the caller already planned this. `thinking`: subagent runs plan → execute → verify on its own session — only for subtasks that need independent planning."},
 							},
 							"required": []string{"instructions"},
 						},
@@ -223,13 +233,15 @@ func (a *agent) registerSubagentTool() {
 	}})
 }
 
-// subagentRules is the subagent's entire phase prompt. Deliberately tiny:
-// subagents are leaf workers, not investigators. They must do exactly what
-// `instructions` says — no extra `run_task` "to verify", no re-reading files
-// they just wrote, no chasing failures that aren't their job. The parent
-// already planned the work and runs the verify phase on the overall result;
-// a subagent that goes broader wastes the parallelism it was forked for.
-const subagentRules = `You are a subagent. Do exactly the task in "Task:" — nothing more.
+// subagentRules is the execute-mode subagent's entire phase prompt.
+// Deliberately tiny: execute-mode subagents are leaf workers, not
+// investigators. They must do exactly what `instructions` says — no extra
+// `run_task` "to verify", no re-reading files they just wrote, no chasing
+// failures that aren't their job. The parent already planned the work and
+// runs the verify phase on the overall result; a subagent that goes broader
+// wastes the parallelism it was forked for. Thinking-mode subagents do NOT
+// see these rules — they run their own plan/execute/verify cycle.
+const subagentRules = `You are a subagent in EXECUTE mode. Do exactly the task in "Task:" — nothing more.
 
 Hard rules:
 - Do NOT run any verify-class command (` + "`" + `just:verify` + "`" + `, ` + "`" + `npm:ci` + "`" + `,
@@ -245,18 +257,33 @@ Hard rules:
 Use only the tools needed for "Task:". Typical subagents make 1-3 tool
 calls and then stop.`
 
-// runSubagent runs the tool loop only against subSess — no plan, no verify.
-// The parent already planned the work and will verify the overall result, so
-// the subagent is just a short, scoped tool-loop runner. All internal calls
-// use subSess.ID so tool uses and assistant text are saved there (not in the
-// parent). UI updates emitted by the tool loop target subSess.ID too and are
-// dropped by the client since it has never been announced — only the returned
-// result string flows back to the parent.
+// runSubagent dispatches to the execute- or thinking-mode flow based on
+// task.Task. Default is "execute" — leaf worker, tool loop only. "thinking"
+// is for subtasks that need their own plan → execute → verify cycle.
+func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(task.Task)) {
+	case "thinking":
+		return a.runSubagentThinking(ctx, subSess, task)
+	case "", "execute":
+		return a.runSubagentExecute(ctx, subSess, task)
+	default:
+		return "", fmt.Errorf("invalid task type %q (use \"execute\" or \"thinking\")", task.Task)
+	}
+}
+
+// runSubagentExecute runs the tool loop only against subSess — no plan, no
+// verify. The parent already planned the work and will verify the overall
+// result, so this is just a short, scoped tool-loop runner. All internal
+// calls use subSess.ID so tool uses and assistant text are saved there (not
+// in the parent). UI updates emitted by the tool loop target subSess.ID too
+// and are dropped by the client since it has never been announced — only the
+// returned result string flows back to the parent.
 //
 // Bypasses agent.execute on purpose: that path injects the full EXECUTE.md
 // (which encourages investigating failures, reading project files, etc.) and
-// the verify-target hint. Subagents need the opposite — a tight "do only
-// what's asked" prompt. We build the message and tool exclusions directly.
+// the verify-target hint. Execute-mode subagents need the opposite — a tight
+// "do only what's asked" prompt. We build the message and tool exclusions
+// directly.
 //
 // History inheritance: when pinned to LLM[0] we prepend the parent's full
 // message history so the byte-identical prefix keeps that conn's KV cache
@@ -264,7 +291,7 @@ calls and then stop.`
 // prefix and seeding parent history would just bloat their context for no
 // cache benefit. This matters because LLM[0] is the dispatch target for the
 // first task in every breadth-first fan-out.
-func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
+func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
 	sid := subSess.ID
 
 	instructions := task.Instructions
@@ -330,4 +357,62 @@ func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagent
 	}
 
 	return result.Text, nil
+}
+
+// runSubagentThinking runs a slimmed plan → execute → verify cycle on
+// subSess. Unlike runTaskCycle (which retries up to 20 times and runs the
+// document phase), this is a single pass: one plan, one execute, one verify,
+// then return whatever execute produced. Replan-on-failure and DOCUMENT.md
+// belong to the parent — a thinking subagent surfaces its result and lets
+// the parent decide what to do with a verification failure.
+//
+// The subagent's session is seeded like the parent's: the systemPrompt is
+// folded into the first user message so buildLLMHistory replays the same
+// bytes on every phase. We do NOT inherit the parent's message history here
+// — thinking subagents own their cycle and shouldn't get confused by the
+// parent's open task. Cache warmth on LLM[0] is sacrificed for clarity; if
+// it becomes a problem we can revisit by copying parent messages.
+//
+// User-facing prompts inside planAndRoute (clarification / "execute this
+// plan?") auto-confirm because shouldAutoAnswer returns true for any session
+// with Depth > 0 (see tool_ask.go).
+func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
+	sid := subSess.ID
+
+	instructions := task.Instructions
+	if task.Context != "" {
+		instructions = "Context:\n" + task.Context + "\n\nTask:\n" + task.Instructions
+	} else {
+		instructions = "Task:\n" + task.Instructions
+	}
+
+	var b strings.Builder
+	if sysPrompt, err := a.systemPrompt(sid); err == nil && sysPrompt != "" {
+		b.WriteString(sysPrompt)
+		b.WriteString("\n---\n")
+	}
+	b.WriteString(instructions)
+	subSess.AddUser(b.String())
+	_ = subSess.Save()
+
+	// Plan. planAndRoute auto-answers clarification + "execute?" prompts
+	// (Depth > 0). It returns the planner's connection so execute/verify
+	// route to the same conn.
+	_, _, _, err := a.planAndRoute(ctx, sid, "")
+	if err != nil {
+		return "", err
+	}
+
+	res, err := a.execute(ctx, sid)
+	if err != nil {
+		return res.Text, err
+	}
+
+	conn := a.pickAvailable(ctx, sid, "execute")
+	res, _, err = a.verify(ctx, sid, conn, res)
+	if err != nil {
+		return res.Text, err
+	}
+
+	return res.Text, nil
 }
