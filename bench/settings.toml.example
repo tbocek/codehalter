@@ -6,9 +6,10 @@
 # `localhost` to the container. Use the container-visible address, e.g.
 # `http://host.docker.internal:8080` or the host's LAN IP.
 
-[llm]
+[[llm]]
 url = "http://host.docker.internal:8080/v1/chat/completions"
 model = "your-model-id"
+parallel = 1
 
-# [[subllm]] entries are optional; leave the array empty for the bench. The
-# whole point is to measure one [llm] configuration end-to-end.
+# Extra [[llm]] entries are optional; one entry is enough for the bench. The
+# whole point is to measure a single end-to-end configuration.

@@ -1,4 +1,4 @@
-# Default bench Dockerfile — copy of codehalter/docs/Dockerfile.devcontainer.example.
+# Default bench Dockerfile — copy of codehalter/docs/Dockerfile.devcontainer.debian.example.
 # Edit if a test needs extra toolchains (cargo, jdk, python, etc.). Tests that
 # need a different image entirely can ship their own bench/devcontainer/ overlay
 # and reference it via `devcontainer = "..."` in the test's .toml.
@@ -21,6 +21,8 @@ RUN groupadd --gid ${GID} ${USERNAME} \
     && install -d -o ${UID} -g ${GID} /home/${USERNAME}/.config
 
 ENV GOBIN=/usr/local/bin
+# gopls ships go_symbols / go_references etc. as MCP tools (`gopls mcp`).
+# codehalter auto-seeds the entry when go.mod is present.
 RUN go install golang.org/x/tools/gopls@latest
 
 USER ${USERNAME}

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -46,14 +45,20 @@ var skillBash string
 //go:embed docs/SKILL-devcontainer.md.example
 var skillDevcontainer string
 
-//go:embed docs/Dockerfile.devcontainer.example
-var defaultDevcontainerDockerfile string
+//go:embed docs/Dockerfile.devcontainer.debian.example
+var defaultDevcontainerDockerfileDebian string
+
+//go:embed docs/Dockerfile.devcontainer.arch.example
+var defaultDevcontainerDockerfileArch string
 
 //go:embed docs/devcontainer.json.example
 var defaultDevcontainerJSON string
 
 //go:embed docs/settings.toml.example
 var defaultSettingsTOML string
+
+//go:embed docs/mcp.toml.example
+var defaultMCPToml string
 
 var defaultSkills = map[string]string{
 	"go":           skillGo,
@@ -83,7 +88,8 @@ func ensureDefaults(cwd string) {
 			os.WriteFile(path, []byte(f.content), 0o644)
 		}
 	}
-	for _, stack := range detectStacks(cwd) {
+	stacks := detectStacks(cwd)
+	for _, stack := range stacks {
 		body, ok := defaultSkills[stack]
 		if !ok {
 			continue
@@ -92,6 +98,25 @@ func ensureDefaults(cwd string) {
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			os.WriteFile(path, []byte(body), 0o644)
 		}
+	}
+
+	// mcp.toml — only seeded on first run. If go.mod is present at seed
+	// time, append an uncommented gopls entry so go_symbols / go_references
+	// (now provided by `gopls mcp`) are wired up out of the box. Once the
+	// file exists we never touch it again — the user owns it.
+	mcpPath := filepath.Join(dir, "mcp.toml")
+	if _, err := os.Stat(mcpPath); os.IsNotExist(err) {
+		content := defaultMCPToml
+		for _, s := range stacks {
+			if s == "go" {
+				if !strings.HasSuffix(content, "\n") {
+					content += "\n"
+				}
+				content += "\n[[server]]\nname = \"gopls\"\ncommand = \"gopls\"\nargs = [\"mcp\"]\n"
+				break
+			}
+		}
+		os.WriteFile(mcpPath, []byte(content), 0o644)
 	}
 }
 
@@ -110,31 +135,50 @@ type agent struct {
 	mode            string // "interactive" | "autopilot"
 
 	// connReachable records whether each configured LLMConnection answered
-	// the startup probe. Keyed by connKey(URL+model). pickAvailable filters
-	// candidates against this so a dead server doesn't burn a 2s /slots
-	// timeout on every LLM call. Populated by checkLLM; nil before that.
+	// the startup probe. Keyed by connKey(URL+model). pickBackgroundConn
+	// filters candidates against this so a dead extra slot doesn't burn a
+	// timeout on every background summarise call. Populated by checkLLM;
+	// nil before that.
 	connReachable map[string]bool
 
-	// mainContextTokens is the [llm] connection's context window in tokens,
+	// mainContextTokens is LLM[0]'s context window in tokens,
 	// discovered by the startup probe (/props.n_ctx or /v1/models --ctx-size).
 	// 0 means unknown (probe failed or server didn't report it) — compaction
 	// then falls back to the rawBufferTokens constant. compressHistory reads
 	// this; nothing else should.
 	mainContextTokens int
 
-	// pickRotor round-robins subagent calls across configured conns 1+ so
-	// parallel callers fan out instead of all piling onto the first idle
-	// candidate. Main-agent calls bypass the rotor (pinned to conn 0 to
-	// keep its prefix KV cache warm) — see pickAvailable.
-	pickRotor atomic.Uint64
+	// slotSems caps concurrent LLM calls per configured [[llm]] entry —
+	// settings.LLM[i] has a buffered channel at slotSems[i] of capacity
+	// LLM[i].parallelCap(). llmStream acquires on entry and releases on exit,
+	// so a busy conn naturally queues excess calls instead of over-dispatching
+	// to its server. Sized by buildSlotSems on startup and after any settings
+	// reload. nil entry → no semaphore (test mocks).
+	slotSems []chan struct{}
 
-	// gopls is a lazily-started LSP client shared across tool calls so the
-	// workspace index isn't rebuilt on every query. ensureGopls handles the
-	// once-per-process startup; goplsErr records a fatal start failure so we
-	// don't retry on every call.
-	gopls     *Gopls
-	goplsOnce sync.Once
-	goplsErr  error
+	// mcpClients holds the spawned MCP server children, keyed by their
+	// configured `name`. Tools they advertise are registered into the
+	// global tool registry as `<name>__<tool>` so multiple servers can ship
+	// a tool called e.g. "search" without colliding. Populated and mutated
+	// by reconcileMCP; nil on projects without an mcp.toml.
+	mcpClients map[string]*MCPClient
+
+	// mcpReconcileMu serialises reconcileMCP across concurrent callers
+	// (startIndexing's banner pass and Prompt's per-turn pass). The lock
+	// scope covers the full diff/start/stop sequence so two reconciles
+	// can't race on a.mcpClients or the global tool registry.
+	mcpReconcileMu sync.Mutex
+	// mcpApplied is the set of [[server]] entries the last successful
+	// reconcile actually brought up. The next pass diffs the new file
+	// against this to decide what to start, stop, or restart. Entries that
+	// failed to start are NOT included, so the next reconcile retries them
+	// with a fresh StartMCPClient call once the file changes again.
+	mcpApplied []MCPServerConfig
+	// mcpAppliedMtime is the mtime of .codehalter/mcp.toml at the time of
+	// the last reconcile. Unchanged mtime → skip the diff entirely, which
+	// also keeps a persistently-broken server from re-emitting the same
+	// failed card on every prompt. Zero value means "never reconciled yet".
+	mcpAppliedMtime time.Time
 
 	// runCmdStatus is the human-readable outcome of discoverSandbox: either
 	// "available" (tool registered) or a specific reason it wasn't (not in a
@@ -229,7 +273,8 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	// startup banner.
 	if gs, err := loadGlobalSettings(); err == nil {
 		a.settings = gs
-		if conn := a.settings.LLMFor("execute", "main"); conn != nil {
+		a.buildSlotSems()
+		if conn := a.settings.MainLLM("execute"); conn != nil {
 			a.imagesSupported = a.probeLLM(ctx, conn).ImageSupport
 		}
 	}
@@ -266,6 +311,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	// user to write a skeleton on first run; running with no LLM until then
 	// is graceful (checkLLM prints a warning instead of crashing).
 	a.settings = settings
+	a.buildSlotSems()
 	a.discoverRunners(cwd)
 	a.discoverSandbox()
 	a.registerSubagentTool()
@@ -277,25 +323,47 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 	go func() {
 		defer close(a.indexDone)
 		ctx := context.Background()
-
-		// settings prompt before any LLM probe — if the user creates a
-		// skeleton here, checkLLM picks up the new path on the same startup.
-		a.ensureSettings(ctx, cwd, sid)
-
-		if a.settings.path != "" {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Using "+a.settings.path+"\n\n")))
-		}
-
-		// Order: config → project → environment → prompts. Keeping the
-		// container/firefox banner adjacent to the devcontainer prompt avoids
-		// "container, tooling, container again" interleaving.
-		a.checkLLM(ctx, sid)
-		a.notifyCapabilities(ctx, sid)
-		a.checkEnvironment(ctx, sid)
-
-		a.ensureGitignore(ctx, cwd, sid)
-		a.ensureDevcontainer(ctx, cwd, sid)
+		a.bootstrapSettings(ctx, cwd, sid)
 	}()
+}
+
+// bootstrapSettings runs the once-per-session startup sequence: interactive
+// prompts (settings/gitignore/devcontainer) that would be hostile to repeat
+// on every turn, the heavy one-time LLM probe, the project capabilities
+// banner, and the environment summary. The per-prompt re-check is delegated
+// to checkSettings, which bootstrapSettings calls in-line so the MCP
+// reconcile lands in the same flow.
+//
+// Order: config → project → tools → environment → prompts. The
+// container/firefox banner sits next to the devcontainer prompt so the
+// "container, tooling, container again" interleaving doesn't happen.
+func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid SessionId) {
+	a.ensureSettings(ctx, cwd, sid)
+
+	if a.settings.path != "" {
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Using "+a.settings.path+"\n\n")))
+	}
+
+	a.checkLLM(ctx, sid)
+	a.notifyCapabilities(ctx, sid)
+	a.checkSettings(ctx, cwd, sid)
+	a.checkEnvironment(ctx, sid)
+
+	a.ensureGitignore(ctx, cwd, sid)
+	a.ensureDevcontainer(ctx, cwd, sid)
+}
+
+// checkSettings is the per-prompt "did anything change?" pass. Every step
+// here MUST be silent when nothing has changed — running this on every user
+// turn should add zero chat noise during a steady-state conversation, only
+// emitting cards when there's something the user needs to see. Today it
+// reconciles .codehalter/mcp.toml (mtime-gated); future mid-session checks
+// (settings.toml reload triggering an LLM re-probe, capability re-detection
+// when a Makefile appears) belong here too.
+func (a *agent) checkSettings(ctx context.Context, cwd string, sid SessionId) {
+	changes := a.reconcileMCP(ctx, cwd)
+	a.renderMCPChanges(ctx, sid, changes)
+	a.cleanupGitCommitIfClean(cwd, sid)
 }
 
 // notifyCapabilities emits a summary of discovered build/test/lint/format
@@ -336,15 +404,15 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
 }
 
 // checkLLM probes every configured LLMConnection in parallel, records which
-// ones answered, and reports each line to the user. Runtime selection
-// (pickAvailable) then skips the unreachable ones instead of eating a /slots
-// timeout on every call. Image support is taken from the first reachable
-// connection — that's the one execute/main calls land on by default.
+// ones answered, and reports each line to the user. Background summarisation
+// then skips the unreachable extras instead of eating a timeout per call.
+// Image support is taken from LLM[0] — that's the one the main session's
+// turns land on, so its capabilities are the ones the user sees.
 func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 	conns := a.settings.allConnections()
 	if len(conns) == 0 {
 		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("🟡 LLM: no [llm] in settings.toml — codehalter cannot run until you add one.\n\n")))
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("🟡 LLM: no [[llm]] in settings.toml — codehalter cannot run until you add one.\n\n")))
 		return
 	}
 	if settingsLooksPlaceholder(a.settings) {
@@ -361,26 +429,23 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 	})
 
 	a.connReachable = make(map[string]bool, len(conns))
-	// conns[0] is the main [llm] entry (allConnections() emits it first).
-	// Its context size drives compaction sizing; subllm sizes aren't used
-	// for that because subagent sessions have their own short lifetimes.
+	// conns[0] is the main entry that owns the foreground session's KV cache.
+	// Its context size drives compaction sizing; extra slots' sizes aren't
+	// used for that because subagent sessions have their own short lifetimes.
 	if len(results) > 0 && results[0].ContextSize > 0 {
 		a.mainContextTokens = results[0].ContextSize
 	}
 	var b strings.Builder
 	firstReachable := -1
 	// Each LLM gets its own paragraph (\n\n) — markdown collapses single
-	// newlines to spaces, so "LLM[0]: ...\nLLM[1]: ..." would render on one
+	// newlines to spaces, so "llm[0]: ...\nllm[1]: ..." would render on one
 	// wrapped line and obscure that there are two separate connections.
 	for i, r := range results {
 		c := conns[i]
 		a.connReachable[connKey(&c)] = r.Reachable
-		label := "llm"
-		if i > 0 {
-			label = fmt.Sprintf("subllm[%d]", i-1)
-			if c.Tag != "" {
-				label += " " + c.Tag
-			}
+		label := fmt.Sprintf("llm[%d]", i)
+		if i > 0 && c.Tag != "" {
+			label += " " + c.Tag
 		}
 		switch {
 		case !r.Reachable:
@@ -388,7 +453,7 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 		case r.ModelKnown && !r.ModelLoaded:
 			fmt.Fprintf(&b, "🟡 %s: %s reachable but model %q not loaded.\n\n", label, c.URL, c.Model)
 		default:
-			fmt.Fprintf(&b, "✅ %s: %s @ %s\n\n", label, c.Model, c.URL)
+			fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.URL, c.parallelCap())
 		}
 		if r.Reachable && firstReachable < 0 {
 			firstReachable = i

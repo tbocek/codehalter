@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -45,12 +46,93 @@ type Tool struct {
 	// (output, false); only run_task and similar truth-bearing tools set
 	// failed=true.
 	Execute func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool)
+	// Terminal marks a tool as the loop's exit point: when the model invokes
+	// it, the agentic tool loop returns after this batch completes, with the
+	// tool's Output (one Execute return value) becoming the assistant's final
+	// text. Currently only `respond` is terminal — see tool_respond.go. The
+	// loop guarantees the result is still recorded in history before exiting.
+	Terminal bool
 }
 
-var registeredTools []Tool
+// terminalToolName returns the name of the first registered tool with
+// Terminal=true that is NOT in the exclude filter. Used by runToolLoopOn to
+// decide whether the synthetic-respond exit applies for this phase: plan,
+// verify, and document exclude the respond tool because they parse JSON
+// output, so for those filters this returns "" and the loop falls back to the
+// legacy text exit. Returns "" when no terminal tool is enabled.
+func terminalToolName(f toolFilter) string {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	for _, t := range registeredTools {
+		if !t.Terminal {
+			continue
+		}
+		fn, _ := t.Def["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if name == "" || f.exclude[name] {
+			continue
+		}
+		return name
+	}
+	return ""
+}
+
+// registryMu guards registeredTools. Most writes happen at init() (single
+// goroutine), but the MCP reconciler mutates the registry mid-session — both
+// on startup (parallel server bring-up) and on every Prompt() (diff-and-apply
+// after the user edits mcp.toml). Reads from runToolLoop / subagent dispatch
+// happen after reconcile completes within a Prompt(), but ACP can deliver
+// SessionUpdate to other sessions concurrently, so the lock is mandatory.
+var (
+	registryMu      sync.Mutex
+	registeredTools []Tool
+)
 
 func RegisterTool(t Tool) {
+	registryMu.Lock()
+	defer registryMu.Unlock()
 	registeredTools = append(registeredTools, t)
+}
+
+// UnregisterToolsByPrefix removes every tool whose function name starts with
+// the given prefix. Used by the MCP reconciler to drop a server's tools when
+// it shuts down or its config changes. Returns the number removed.
+func UnregisterToolsByPrefix(prefix string) int {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	kept := registeredTools[:0]
+	removed := 0
+	for _, t := range registeredTools {
+		fn, _ := t.Def["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if strings.HasPrefix(name, prefix) {
+			removed++
+			continue
+		}
+		kept = append(kept, t)
+	}
+	// Zero the tail so closed-over goroutines (e.g. an in-flight tools/call)
+	// don't keep the old Execute closure alive through this slice.
+	for i := len(kept); i < len(registeredTools); i++ {
+		registeredTools[i] = Tool{}
+	}
+	registeredTools = kept
+	return removed
+}
+
+// hasToolPrefix reports whether any registered tool starts with the prefix.
+// Used by the MCP reconciler to detect leftover registrations.
+func hasToolPrefix(prefix string) bool {
+	registryMu.Lock()
+	defer registryMu.Unlock()
+	for _, t := range registeredTools {
+		fn, _ := t.Def["function"].(map[string]any)
+		name, _ := fn["name"].(string)
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // toolFilter lets phases exclude specific tools from a turn (e.g. execute
@@ -62,6 +144,8 @@ type toolFilter struct {
 }
 
 func llmToolDefinitionsFiltered(f toolFilter) []map[string]any {
+	registryMu.Lock()
+	defer registryMu.Unlock()
 	var defs []map[string]any
 	for _, t := range registeredTools {
 		fn, _ := t.Def["function"].(map[string]any)
@@ -87,8 +171,16 @@ func parseArgs(rawArgs string) map[string]string {
 func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) (string, bool) {
 	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 
+	// Snapshot the registry under the lock so Execute can run without holding
+	// it (Execute may take seconds — bash commands, LLM subagents — and we
+	// must not block concurrent registration or other callers during that).
+	registryMu.Lock()
+	snap := make([]Tool, len(registeredTools))
+	copy(snap, registeredTools)
+	registryMu.Unlock()
+
 	var names []string
-	for _, t := range registeredTools {
+	for _, t := range snap {
 		fn, _ := t.Def["function"].(map[string]any)
 		name, _ := fn["name"].(string)
 		if name == tc.Function.Name {
@@ -112,6 +204,18 @@ var toolCallCounter atomic.Uint64
 
 func nextToolCallID() string {
 	return fmt.Sprintf("tc_%d", toolCallCounter.Add(1))
+}
+
+// toolUseCounter assigns each recorded ToolUse a stable per-process handle so
+// view_output can address it later without re-running the original tool.
+// Process-global rather than session-scoped — search is already scoped to one
+// session, and a single counter is simpler than tracking last-seen IDs per
+// session across restarts (where the counter resets but historical IDs in
+// session TOML survive — view_output handles "id not found" cleanly).
+var toolUseCounter atomic.Uint64
+
+func nextToolUseID() string {
+	return fmt.Sprintf("tu_%d", toolUseCounter.Add(1))
 }
 
 type toolCallUpdate struct {

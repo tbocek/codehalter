@@ -87,17 +87,24 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionI
 	}
 
 	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-		"To sandbox file edits and task runs, I can write a Debian-based "+
+		"To sandbox file edits and task runs, I can write a "+
 			".devcontainer/Dockerfile and .devcontainer/devcontainer.json template "+
 			"you can then edit. Reopen the project in the container to use it.\n\n")))
 
 	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
-	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Create", "Skip")
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Debian", "Arch"})
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
 	}
-	if !ok {
+
+	var dockerfile string
+	switch choice {
+	case "Debian":
+		dockerfile = defaultDevcontainerDockerfileDebian
+	case "Arch":
+		dockerfile = defaultDevcontainerDockerfileArch
+	default:
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
 		return
 	}
@@ -106,7 +113,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionI
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
 	}
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(defaultDevcontainerDockerfile), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
 	}
@@ -115,7 +122,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionI
 		return
 	}
 
-	note := "Wrote .devcontainer/Dockerfile and .devcontainer/devcontainer.json. Reopen the project in the container to use them."
+	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json. Reopen the project in the container to use them."
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
 	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(note+"\n")))
 }

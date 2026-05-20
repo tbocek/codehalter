@@ -35,9 +35,23 @@ RUN groupadd --gid ${GID} ${USERNAME} \
 ENV GOBIN=/usr/local/bin
 RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
 
-# gopls powers the go_symbols / go_references tools (LSP workspace/symbol and
-# textDocument/references). codehalter spawns `gopls serve` lazily on first
-# use, so the daemon costs nothing until the model asks for it.
+# gopls speaks MCP via its `mcp` subcommand and ships go_symbols /
+# go_references / go_definition / go_hover etc. as MCP tools. codehalter
+# spawns `gopls mcp` for any project with a go.mod (the auto-seeded
+# .codehalter/mcp.toml has the entry). Drop this RUN if you don't want Go
+# tooling in the container — but then also disable the gopls entry in
+# mcp.toml or codehalter will warn at startup that the binary isn't on PATH.
 RUN go install golang.org/x/tools/gopls@latest
+
+# Extra MCP servers — uncomment what you want and add a matching [[server]]
+# block to .codehalter/mcp.toml. Examples:
+#
+# Node-based servers via npx (preinstalls common ones to skip the per-session
+# download):
+#   RUN npm install -g @modelcontextprotocol/server-filesystem
+#
+# Python-based servers via uvx (install uv first):
+#   RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+#   RUN /root/.local/bin/uv tool install mcp-server-github
 
 USER ${USERNAME}

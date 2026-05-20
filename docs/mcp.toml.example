@@ -1,0 +1,57 @@
+# Codehalter MCP server registry — edit this file, then restart the Zed session.
+#
+# Each [[server]] entry spawns one long-lived child process speaking the Model
+# Context Protocol (MCP) over stdio. Codehalter calls `tools/list` once on
+# startup and registers every advertised tool into the agent's tool registry,
+# namespaced as `<server-name>__<tool>` so multiple servers can ship a tool
+# called "search" without colliding. Tool descriptions come from the MCP
+# server itself, so the model gets whatever the server author wrote — keep an
+# eye on token cost when enabling chatty servers.
+#
+# Schema per entry:
+#   name      = "short-id"        # required; used as the namespace prefix
+#   command   = "executable"      # required; resolved via $PATH
+#   args      = ["..."]           # optional; arguments passed to the command
+#   env       = { KEY = "value" } # optional; merged into the child's env
+#
+# To disable an entry, comment out its lines — there's no `enabled = false`
+# switch on purpose, keeps the schema and reconciler logic small.
+#
+# Reachability: the command must be visible to whichever shell runs codehalter.
+# Inside a devcontainer that means the binary has to be installed in the
+# image — add a `RUN go install ...` (or apt-get) line to your Dockerfile.
+# Codehalter logs a startup warning when a configured server's command isn't
+# found in PATH, so you'll see it in the session banner.
+#
+# ---------------------------------------------------------------------------
+# Auto-seeded entries
+# ---------------------------------------------------------------------------
+#
+# When codehalter writes this file for the first time and detects a go.mod in
+# the project root, it appends a [[server]] for gopls. gopls's `mcp` subcommand
+# exposes go_symbols / go_references / go_definition / go_hover and friends —
+# the same tools codehalter used to ship as a hand-rolled LSP client.
+#
+# If you don't want gopls running, comment out (or delete) its [[server]]
+# block. If you want it for a non-Go project, add a [[server]] block manually
+# using the example below.
+#
+# ---------------------------------------------------------------------------
+# Examples — uncomment and adapt
+# ---------------------------------------------------------------------------
+#
+# [[server]]
+# name = "gopls"
+# command = "gopls"
+# args = ["mcp"]
+#
+# [[server]]
+# name = "fs"
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"]
+#
+# [[server]]
+# name = "github"
+# command = "uvx"
+# args = ["mcp-server-github"]
+# env = { GITHUB_TOKEN = "ghp_..." }

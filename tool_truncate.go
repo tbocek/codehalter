@@ -19,51 +19,59 @@ const (
 
 // truncateForLLM returns content unchanged if short; otherwise emits a
 // head/tail-shaped slice with a per-tool "to see more" hint in the middle.
-// toolName + args let the hint name the exact follow-up call (e.g. the cached
-// URL for web_read, the path+line for read_file) so the model doesn't have to
-// reconstruct what it just asked about.
-func truncateForLLM(toolName, args, content string) string {
+// useID is the ToolUse handle the loop just assigned — embedded in the hint
+// so the model can `view_output id=useID mode=grep pattern=…` to retrieve any
+// portion of the original without re-running the underlying tool. toolName +
+// args let the hint name the exact alternate follow-up call (e.g. read_file
+// path+line, web_read url+offset) so the model doesn't have to reconstruct
+// what it just asked about.
+func truncateForLLM(useID, toolName, args, content string) string {
 	if len(content) <= truncateThreshold {
 		return content
 	}
 	omitted := len(content) - truncateHeadChars - truncateTailChars
 	head := content[:truncateHeadChars]
 	tail := content[len(content)-truncateTailChars:]
-	hint := truncationHint(toolName, args)
+	hint := truncationHint(useID, toolName, args)
 	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", head, omitted, len(content), hint, tail)
 }
 
-// truncationHint returns the per-tool "to see more" pointer. The hint tells
-// the model exactly which follow-up call recovers the missing middle without
-// burning another turn on trial-and-error. parseArgs is best-effort — when the
-// args don't contain a useful key (or come in malformed) we fall back to a
-// generic suggestion.
-func truncationHint(toolName, args string) string {
+// truncationHint returns the per-tool "to see more" pointer. Every hint
+// includes a `view_output id=<useID>` path that retrieves any portion of the
+// FULL cached output without re-running the underlying tool — critical for
+// `run_task` / `run_command` where re-running is slow or non-idempotent.
+// Tools with cheap, idempotent re-invocation paths (read_file with a different
+// line range, web_read with offset/limit) also keep that alternate hint
+// because slicing on the caller's terms is sometimes more useful than
+// grepping. parseArgs is best-effort — when args don't contain a useful key
+// the alternate-call suggestion is dropped and only view_output remains.
+func truncationHint(useID, toolName, args string) string {
 	a := parseArgs(args)
+	viewOut := fmt.Sprintf("call view_output id=%q mode=grep pattern=<regex> (or mode=head / mode=tail with lines=<n>) to retrieve the cached full output without re-running this tool", useID)
 	switch toolName {
 	case "read_file":
 		path := a["path"]
 		if path == "" {
-			return "To see more: call read_file again with line=<n> limit=<m> to view a specific range, or search_text with a pattern to jump straight to the relevant section."
+			return "To see more: " + viewOut + ", OR call read_file again with line=<n> limit=<m> to view a specific range."
 		}
-		return fmt.Sprintf("To see more: call read_file path=%q with line=<n> limit=<m> for a specific range, or search_text path=%q pattern=<regex> to jump to the relevant section.", path, path)
+		return fmt.Sprintf("To see more: %s, OR call read_file path=%q with line=<n> limit=<m> for a specific range, or search_text path=%q pattern=<regex>.", viewOut, path, path)
 	case "web_read", "web_read_raw":
 		u := a["url"]
 		if u == "" {
-			return "To see more: call this tool again with offset=<n> limit=<m> — the full body is cached server-side, so no re-fetch."
+			return "To see more: " + viewOut + ", OR call this tool again with offset=<n> limit=<m> — the full body is cached server-side, so no re-fetch."
 		}
-		return fmt.Sprintf("To see more: call %s again with url=%q offset=<n> limit=<m> — the full body is cached server-side, so no re-fetch.", toolName, u)
+		return fmt.Sprintf("To see more: %s, OR call %s again with url=%q offset=<n> limit=<m> — the full body is cached server-side, so no re-fetch.", viewOut, toolName, u)
 	case "run_command", "run_task":
-		return "To see more: re-run with output filtered (e.g. `cmd 2>&1 | grep <pattern>` or `... | sed -n '100,200p'`) to isolate the relevant section."
+		return "To see more: " + viewOut + ". Do NOT re-run the command just to see more output — view_output reads the cached result."
 	case "list_files":
 		path := a["path"]
 		if path == "" {
-			return "To see more: call list_files on a deeper subdirectory, or use search_text to locate a specific file by pattern."
+			return "To see more: " + viewOut + ", OR call list_files on a deeper subdirectory."
 		}
-		return fmt.Sprintf("To see more: call list_files on a subdirectory of %q, or use search_text to locate a specific file by pattern.", path)
+		return fmt.Sprintf("To see more: %s, OR call list_files on a subdirectory of %q.", viewOut, path)
 	case "search_text":
-		return "To see more: re-run search_text with a more specific pattern, or narrow the path argument."
+		return "To see more: " + viewOut + ", OR re-run search_text with a more specific pattern or narrower path."
 	default:
-		return "To see more: call this tool again with narrower parameters."
+		return "To see more: " + viewOut + "."
 	}
 }

@@ -21,6 +21,16 @@
     // Reuse the host's global codehalter settings inside the container, so
     // every project picks up the same [[llmconnections]] without copying.
     // Read-only because the agent only ever reads this file.
-    "source=${localEnv:HOME}/.config/codehalter,target=/home/dev/.config/codehalter,type=bind,readonly"
+    "source=${localEnv:HOME}/.config/codehalter,target=/home/dev/.config/codehalter,type=bind,readonly",
+    // .git is bind-mounted read-only on purpose: the agent can read history
+    // (git log, git diff, git status) but cannot commit, push, rewrite refs,
+    // or stage. Commits/pushes are the human's job — codehalter drafts a
+    // message into .codehalter/.git_commit and tells you the host-side
+    // command to run.
+    "source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind,readonly",
+    // The host's .gitconfig (user.name, user.email, signing key, aliases)
+    // is mounted into the dev user's home so any git read commands inside
+    // the container see the same identity — no per-container reconfig.
+    "source=${localEnv:HOME}/.gitconfig,target=/home/dev/.gitconfig,type=bind,readonly"
   ]
 }

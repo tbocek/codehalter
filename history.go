@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 const (
@@ -54,10 +55,10 @@ func estimateTokens(s string) int {
 }
 
 // compactTriggerTokens returns the estimated-token threshold at which
-// compressHistory should fire. Derived from the [llm] connection's n_ctx
-// (discovered by the startup probe): subtract fixed overhead, then apply
-// compactSafetyPct to absorb estimator bias. Falls back to rawBufferTokens
-// when n_ctx is unknown (offline tests, server didn't report it).
+// compressHistory should fire. Derived from llm[0]'s n_ctx (discovered by
+// the startup probe): subtract fixed overhead, then apply compactSafetyPct
+// to absorb estimator bias. Falls back to rawBufferTokens when n_ctx is
+// unknown (offline tests, server didn't report it).
 func (a *agent) compactTriggerTokens() int {
 	if a.mainContextTokens <= 0 {
 		return rawBufferTokens
@@ -106,11 +107,16 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 		sess.mu.Unlock()
 		return
 	}
+	sess.mu.Unlock()
 
-	// Main session uses [llm], subagents use [[subllm]] — same cache-consistency
-	// rule as the rest of the pipeline: every call on a given session hits the
-	// same slot so the prefix cache stays warm.
-	conn := a.pickAvailable(ctx, sess.ID, "execute")
+	// Join any in-flight background summarisation so the shadow buffer is
+	// complete before we decide whether to use it. This happens BEFORE we
+	// re-acquire sess.mu — backgroundSummarise's goroutine acquires sess.mu
+	// briefly when reading messages, and we'd deadlock holding it here.
+	sess.shadowPending.Wait()
+	shadow := sess.drainShadow()
+
+	sess.mu.Lock()
 
 	// Split 20/80: the older 80% is folded into a fresh summary, the
 	// recent 20% stays raw. (len*4)/5 lands at 0 only when len < 2 — in
@@ -120,23 +126,43 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	if splitIdx == 0 {
 		splitIdx = len(sess.Messages)
 	}
-	oldMessages := sess.Messages[:splitIdx]
 	keepMessages := append([]Message(nil), sess.Messages[splitIdx:]...)
 
-	var buf strings.Builder
-	if sess.Summary != "" {
-		fmt.Fprintf(&buf, "[Earlier summary]\n%s\n\n", sess.Summary)
-	}
-	for _, m := range oldMessages {
-		fmt.Fprintf(&buf, "%s: %s\n\n", m.Role, clipBytes(m.Content, maxSummaryItemBytes))
-	}
-
-	summary, err := a.summarize(ctx, sess.ID, conn, buf.String())
-	if err != nil {
-		sess.mu.Unlock()
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock(
-			"⚠ History compaction skipped (summarize failed: "+err.Error()+"). Will retry next turn.\n\n")))
-		return
+	// Fast path: shadow buffer has structured per-turn notes covering the
+	// turns we're about to rotate out. Use them directly instead of running
+	// the synchronous summarize pass — the work has already been spread
+	// across each turn while the user wasn't waiting. The existing Summary
+	// (covering pre-previous-compaction context) is prepended verbatim so
+	// nothing earlier gets lost.
+	var summary string
+	if shadow != "" {
+		var b strings.Builder
+		if sess.Summary != "" {
+			b.WriteString(sess.Summary)
+			b.WriteString("\n\n")
+		}
+		b.WriteString(shadow)
+		summary = b.String()
+	} else {
+		// Main session uses LLM[0], subagents use their pinned LLM[i] — same
+		// cache-consistency rule as the rest of the pipeline: every call on a
+		// given session hits the same slot so the prefix cache stays warm.
+		conn := a.pickAvailable(ctx, sess.ID, "execute")
+		var buf strings.Builder
+		if sess.Summary != "" {
+			fmt.Fprintf(&buf, "[Earlier summary]\n%s\n\n", sess.Summary)
+		}
+		for _, m := range sess.Messages[:splitIdx] {
+			fmt.Fprintf(&buf, "%s: %s\n\n", m.Role, clipBytes(m.Content, maxSummaryItemBytes))
+		}
+		s, err := a.summarize(ctx, sess.ID, conn, buf.String())
+		if err != nil {
+			sess.mu.Unlock()
+			a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock(
+				"⚠ History compaction skipped (summarize failed: "+err.Error()+"). Will retry next turn.\n\n")))
+			return
+		}
+		summary = s
 	}
 
 	archiveID, err := sess.rotate(keepMessages, summary)
@@ -173,9 +199,135 @@ func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnectio
 	return a.llmSimple(ctx, sid, conn, []llmMessage{{Role: "user", Content: prompt}})
 }
 
+// structuredTurnPrompt is the per-turn template fed to the background
+// summariser. The six sections are the load-bearing ones for resuming a long
+// task: Goal anchors what the user wants, Constraints capture stated rules,
+// Progress + Decisions show what's locked in, Next Steps + Critical Context
+// keep the thread alive across compaction. Each section is constrained to one
+// line so the cumulative shadow buffer stays compact — a long session with
+// many turns can otherwise dwarf the model's context.
+const structuredTurnPrompt = "Summarise this exchange into a structured turn note. Each section is one line — be terse, no fluff. Skip any section that doesn't apply. Reply with just the structured note, no preamble.\n\n" +
+	"Goal: what the user wants overall (not just this turn)\n" +
+	"Constraints: rules/requirements/preferences the user has stated\n" +
+	"Progress: concrete progress this turn (files changed, commands run, info gathered)\n" +
+	"Decisions: choices made or directions taken\n" +
+	"Next Steps: what's queued or open\n" +
+	"Critical Context: paths, identifiers, versions, or state that must not be lost\n"
+
+// maxShadowInputBytes bounds the bytes sent to the background summariser for
+// any single turn — without this, a turn that produced megabytes of tool
+// output (huge run_command dumps) would blow through the summariser's own
+// context window. Matches maxSummaryItemBytes for symmetry with the
+// synchronous compaction path.
+const maxShadowInputBytes = 20 * 1024
+
+// pickBackgroundConn returns a connection for background per-turn
+// summarisation. The point of doing this in the background is to keep it OFF
+// the main session's slot — that slot (LLM[0]) is holding the warm prefix
+// cache for the next turn. So we deliberately pick from LLM[1+] and never
+// the main entry. For subagent sessions (already routed via their own pin),
+// and for configurations with only LLM[0] available, we return nil — the
+// caller skips the background work and the next compaction falls through to
+// the synchronous summarize path. This is the "≥2 parallel slots"
+// recommendation in the README: with only one entry, background
+// summarisation can't run in parallel and the feature self-disables.
+//
+// Selection picks the first reachable LLM[1+] entry; with multiple extras
+// the per-conn semaphore in llmStream handles queueing transparently, so we
+// don't need an explicit round-robin or non-blocking probe here.
+func (a *agent) pickBackgroundConn(_ context.Context, sid SessionId) *LLMConnection {
+	sess := a.getSession(sid)
+	if sess == nil || sess.Depth > 0 {
+		return nil
+	}
+	if len(a.settings.LLM) < 2 {
+		return nil
+	}
+	for i := 1; i < len(a.settings.LLM); i++ {
+		c := &a.settings.LLM[i]
+		if len(a.connReachable) > 0 && !a.connReachable[connKey(c)] {
+			continue
+		}
+		return a.settings.ConnAt(i, "execute")
+	}
+	return nil
+}
+
+// backgroundSummarise spawns a goroutine that condenses the just-completed
+// turn pair (last user message + last assistant response) into the structured
+// note format and appends it to the session's shadow buffer. Called from the
+// end of Prompt — the user has already received the assistant reply by then,
+// so latency here is invisible to them. The goroutine uses
+// context.Background() so it isn't killed when the user cancels the next
+// prompt, but it carries a generous timeout so a stuck call can't pin a slot.
+// shadowPending tracks the goroutine so compressHistory can join before
+// draining.
+func (a *agent) backgroundSummarise(sess *Session) {
+	if sess == nil {
+		return
+	}
+	conn := a.pickBackgroundConn(context.Background(), sess.ID)
+	if conn == nil {
+		return // no separate slot; falls through to sync summarize at compaction
+	}
+
+	// Snapshot the last user + assistant pair under the session lock so we
+	// don't race with the next Prompt mutating Messages while we're reading.
+	sess.mu.Lock()
+	msgs := sess.Messages
+	if len(msgs) < 2 {
+		sess.mu.Unlock()
+		return
+	}
+	var userMsg, assistantMsg Message
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if assistantMsg.Role == "" && msgs[i].Role == "assistant" {
+			assistantMsg = msgs[i]
+			continue
+		}
+		if assistantMsg.Role != "" && msgs[i].Role == "user" {
+			userMsg = msgs[i]
+			break
+		}
+	}
+	sess.mu.Unlock()
+	if userMsg.Role == "" || assistantMsg.Role == "" {
+		return
+	}
+
+	sess.shadowPending.Add(1)
+	go func() {
+		defer sess.shadowPending.Done()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+
+		var buf strings.Builder
+		buf.WriteString(structuredTurnPrompt)
+		buf.WriteString("\nUser turn:\n")
+		buf.WriteString(clipBytes(userMsg.Content, maxShadowInputBytes))
+		buf.WriteString("\n\nAssistant turn:\n")
+		buf.WriteString(clipBytes(assistantMsg.Content, maxShadowInputBytes))
+		if len(assistantMsg.ToolUses) > 0 {
+			buf.WriteString("\n\n[Tool calls performed:]\n")
+			for _, tu := range assistantMsg.ToolUses {
+				fmt.Fprintf(&buf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 200))
+			}
+		}
+
+		out, err := a.llmSimple(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: buf.String()}})
+		if err != nil {
+			// Silent — the synchronous path at next compaction will catch
+			// anything we miss. No need to surface a UI warning for every
+			// transient summariser hiccup.
+			return
+		}
+		sess.appendShadow(out)
+	}()
+}
+
 // generateTitle asks the LLM to create a short title from the first user
-// message. Routes via the session's pin — main session always uses [llm]
-// for cache consistency, subagents use their pinned [[subllm]] entry.
+// message. Routes via the session's pin — main session always uses LLM[0]
+// for cache consistency, subagents use their pinned LLM[i] entry.
 func (a *agent) generateTitle(ctx context.Context, sess *Session, userText string) {
 	conn := a.pickAvailable(ctx, sess.ID, "thinking")
 	if conn == nil {
@@ -212,7 +364,7 @@ func trimTitle(title string) string {
 }
 
 // retitle updates the session title based on the current summary. Same
-// routing as generateTitle — main → [llm], subagent → pinned [[subllm]].
+// routing as generateTitle — main → LLM[0], subagent → pinned LLM[i].
 func (a *agent) retitle(ctx context.Context, sess *Session) {
 	if sess.Summary == "" {
 		return

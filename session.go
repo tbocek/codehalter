@@ -43,6 +43,12 @@ type ImageData struct {
 }
 
 type ToolUse struct {
+	// ID is a per-session stable handle ("tu_<n>") generated when the tool
+	// loop records the call. Surfaced in head/tail truncation hints so the
+	// model can call `view_output id=tu_N` to retrieve any portion of the
+	// full result without re-running the original tool. Empty for ToolUses
+	// loaded from older session files; view_output treats those as not found.
+	ID     string `toml:"id,omitempty"`
 	Name   string `toml:"name"`
 	Input  string `toml:"input"`
 	Output string `toml:"output"`
@@ -74,8 +80,8 @@ type Session struct {
 	// must be marked completed before Prompt returns; phaseCurrent is the
 	// 0-based index into phaseNames it refers to. Guarded by phaseMu, NOT
 	// the main session mu — compressHistory holds sess.mu across long LLM
-	// calls and llmStream calls notifyPhaseSuffix mid-stream, so reusing
-	// sess.mu for phase reads would deadlock.
+	// calls and llmStream calls setStatus mid-stream, so reusing sess.mu
+	// for phase reads would deadlock.
 	phaseMu      sync.Mutex
 	phaseActive  bool
 	phaseCurrent int
@@ -110,14 +116,33 @@ type Session struct {
 	// they don't touch persisted state and must not block on the long-held
 	// mu (compressHistory in particular).
 	mu sync.Mutex
-	// PinnedSubLLMIdx pins a subagent session to one [[subllm]] entry. All
-	// LLM calls from this session route to settings.SubLLM[PinnedSubLLMIdx]
-	// regardless of role tag — cache-coherence trumps per-role sampler
-	// matching: the slot stays warm across the whole subagent run instead of
-	// bouncing between entries on every plan/execute switch. -1 means no
-	// pin (main session, tests). Round-robin assigned at creation by
-	// launch_subagent so concurrent subagents fan across [[subllm]] entries.
-	PinnedSubLLMIdx int `toml:"pinned_subllm_idx,omitempty"`
+	// shadowSummary accumulates structured per-turn notes (Goal / Constraints
+	// / Progress / Decisions / Next Steps / Critical Context) produced by
+	// the background summariser fired at the end of each turn. compressHistory
+	// drains this into Session.Summary instead of running the synchronous
+	// summarize pass — the work has already been spread across each turn while
+	// the user wasn't waiting. shadowPending tracks the background goroutine
+	// so compaction can join any in-flight call before draining. In-memory
+	// only: if the process restarts before compaction, the work is lost and
+	// the next compaction falls through to the synchronous path.
+	shadowMu      sync.Mutex
+	shadowSummary strings.Builder
+	shadowPending sync.WaitGroup
+	// gitCommitPending tracks in-flight backgroundGitCommit goroutines so the
+	// per-prompt cleanup (cleanupGitCommitIfClean) can wait for them before
+	// checking the working-tree status. Without the wait, a slow LLM call from
+	// turn N could resurrect a .codehalter/.git_commit file that turn N+1's
+	// cleanup just deleted because the user committed externally meanwhile.
+	gitCommitPending sync.WaitGroup
+	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
+	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
+	// of role — cache-coherence trumps per-role sampler matching, the conn
+	// stays warm across the subagent's whole run instead of bouncing on every
+	// plan/execute switch. -1 means no pin (main session, tests).
+	// Breadth-first assigned at creation by launch_subagent: the first
+	// subagent in a batch pins to LLM[0], the rest fan out across LLM[1+]
+	// up to each conn's parallel cap.
+	PinnedLLMIdx int `toml:"pinned_llm_idx,omitempty"`
 	// DisplayLabel is the short human-readable name the runner uses when it
 	// surfaces this session's activity to its parent ("subagent 1",
 	// "subagent 2", …). Not persisted — purely a UI breadcrumb so the
@@ -254,7 +279,7 @@ func newSession(cwd string) (*Session, error) {
 	}, nil
 }
 
-func newSubagentSession(cwd string, parentID SessionId, index, depth, pinnedSubLLMIdx int) *Session {
+func newSubagentSession(cwd string, parentID SessionId, index, depth, pinnedLLMIdx int) *Session {
 	os.MkdirAll(filepath.Join(cwd, sessionDir), 0755)
 	// Nanosecond suffix so sequential launch_subagent calls from the same
 	// parent don't collide on id (each call re-starts index at 0).
@@ -263,13 +288,13 @@ func newSubagentSession(cwd string, parentID SessionId, index, depth, pinnedSubL
 	filename := fmt.Sprintf("session_%s.toml", id)
 	path := filepath.Join(cwd, sessionDir, filename)
 	s := &Session{
-		ID:              id,
-		Cwd:             cwd,
-		Depth:           depth,
-		ParentID:        parentID,
-		CreatedAt:       now,
-		filePath:        path,
-		PinnedSubLLMIdx: pinnedSubLLMIdx,
+		ID:           id,
+		Cwd:          cwd,
+		Depth:        depth,
+		ParentID:     parentID,
+		CreatedAt:    now,
+		filePath:     path,
+		PinnedLLMIdx: pinnedLLMIdx,
 	}
 	_ = s.Save()
 	return s
@@ -308,6 +333,53 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 	}
 	last := &s.Messages[len(s.Messages)-1]
 	last.ToolUses = append(last.ToolUses, tu)
+}
+
+// FindToolUseOutput scans every message's tool uses for one matching id and
+// returns its Output. Used by view_output to re-serve the full output of any
+// prior tool call without re-running it. Returns "" when no match (older
+// session files that predate ToolUse.ID, or a hallucinated id).
+func (s *Session) FindToolUseOutput(id string) string {
+	if id == "" {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.Messages {
+		for _, tu := range s.Messages[i].ToolUses {
+			if tu.ID == id {
+				return tu.Output
+			}
+		}
+	}
+	return ""
+}
+
+// appendShadow adds a structured per-turn note to the shadow buffer. Each
+// chunk is separated by a blank line so compressHistory can dump the buffer
+// directly into Summary. Caller must NOT hold s.mu (shadowMu is independent).
+func (s *Session) appendShadow(chunk string) {
+	chunk = strings.TrimSpace(chunk)
+	if chunk == "" {
+		return
+	}
+	s.shadowMu.Lock()
+	defer s.shadowMu.Unlock()
+	if s.shadowSummary.Len() > 0 {
+		s.shadowSummary.WriteString("\n\n")
+	}
+	s.shadowSummary.WriteString(chunk)
+}
+
+// drainShadow returns the accumulated structured notes and resets the buffer.
+// Called by compressHistory after joining shadowPending — at that point the
+// buffer holds every per-turn note since the last compaction.
+func (s *Session) drainShadow() string {
+	s.shadowMu.Lock()
+	defer s.shadowMu.Unlock()
+	out := s.shadowSummary.String()
+	s.shadowSummary.Reset()
+	return out
 }
 
 // SetTitle updates the session title under the lock. Used by generateTitle

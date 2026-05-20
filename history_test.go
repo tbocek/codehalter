@@ -274,6 +274,11 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 // the tool loop executes it, appends the ToolUse to the session, and persists
 // to disk — before the second LLM turn produces the final text.
 func TestToolLoopRecordsToolUses(t *testing.T) {
+	// Isolate from the package-level registry so the synthetic `respond` tool
+	// (registered in tool_respond.go init) isn't in scope — its presence would
+	// flip the loop's empty-tool-call branch from "exit with allText" to a
+	// nudge, which is a different code path tested elsewhere.
+	withFreshToolRegistry(t)
 	// Register a stub tool inline so we don't depend on filesystem tool
 	// implementations. This runs at init in package-level registeredTools.
 	const testToolName = "test_echo_tool_9d7f"
@@ -364,6 +369,84 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 
 	if mock.callCount() != 2 {
 		t.Errorf("LLM call count: got %d, want 2", mock.callCount())
+	}
+}
+
+// TestToolLoopRespondExits verifies that when the model calls the synthetic
+// `respond` terminal tool, the loop exits with the message arg as res.Text on
+// the same iteration — no second LLM round-trip to "produce final text".
+// This is the post-respond exit semantic (vs the legacy "empty tool_calls
+// means done" path covered by TestToolLoopRecordsToolUses with a fresh
+// registry).
+func TestToolLoopRespondExits(t *testing.T) {
+	// Use the real package registry so respond is in scope (no withFreshToolRegistry).
+	mock := newMockLLM(t,
+		sseToolCall("call_1", respondToolName, `{"message":"final answer"}`),
+	)
+	defer mock.Close()
+
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s.AddUser("answer me")
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	a := &agent{sessions: map[SessionId]*Session{s.ID: s}}
+
+	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "answer me"}}, toolFilter{}, "execute")
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+
+	if res.Text != "final answer" {
+		t.Errorf("res.Text: got %q, want %q", res.Text, "final answer")
+	}
+	if mock.callCount() != 1 {
+		t.Errorf("LLM call count: got %d, want 1 (respond should exit on the same iteration)", mock.callCount())
+	}
+	if len(res.ToolUses) != 1 || res.ToolUses[0].Name != respondToolName {
+		t.Errorf("ToolUses: want one respond call, got %+v", res.ToolUses)
+	}
+}
+
+// TestToolLoopRespondExcludedFromJSONPhases verifies that the plan/verify/
+// document filter (excluding respond) keeps the legacy text-only exit: a
+// no-tool-calls turn returns immediately instead of nudging for respond. This
+// is what lets runToolLoopJSON parse the assistant text as JSON.
+func TestToolLoopRespondExcludedFromJSONPhases(t *testing.T) {
+	mock := newMockLLM(t,
+		sseText(`{"clear": true, "steps": ["do x"]}`),
+	)
+	defer mock.Close()
+
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s.AddUser("plan something")
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	a := &agent{sessions: map[SessionId]*Session{s.ID: s}}
+
+	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "plan something"}},
+		toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan")
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if mock.callCount() != 1 {
+		t.Errorf("LLM call count: got %d, want 1 (no nudge when respond is excluded)", mock.callCount())
+	}
+	if !strings.Contains(res.Text, "do x") {
+		t.Errorf("res.Text missing JSON content: got %q", res.Text)
 	}
 }
 
@@ -506,9 +589,9 @@ func TestToolLoopRepeatNudgeAndBail(t *testing.T) {
 // the connection swaps to the "thinking" role's sampler. Same URL/model so
 // the prefix cache stays warm — just a warmer sampler to break out.
 //
-// Runs with [llm] only and no [[subllm]] configured, to validate the
-// LLMCandidates("thinking", "main") path returns the main entry with
-// ParamsThinking populated.
+// Runs with a single [[llm]] entry, to validate that escalation flips the
+// active conn's ExtraBody from ParamsExecute to ParamsThinking on the same
+// URL/model so the prefix cache survives the sampler swap.
 func TestToolLoopEscalatesToThinkingAfterNameThreshold(t *testing.T) {
 	withFreshToolRegistry(t)
 	const toolName = "test_grep_q9z"
@@ -541,14 +624,16 @@ func TestToolLoopEscalatesToThinkingAfterNameThreshold(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	// Distinct sampler params per role; no SubLLM — exercises the llm-only path.
+	// Distinct sampler params per role; single entry — exercises the
+	// role-swap path on LLM[0] (escalation hits the same conn with thinking
+	// params, not a separate slot).
 	a.settings = Settings{
-		LLM: &LLMConnection{
+		LLM: []LLMConnection{{
 			URL:            mock.ts.URL,
 			Model:          "test-model",
 			ParamsExecute:  map[string]any{"temperature": 0.3},
 			ParamsThinking: map[string]any{"temperature": 1.0},
-		},
+		}},
 	}
 
 	conn := a.pickAvailable(context.Background(), s.ID, "execute")
@@ -624,7 +709,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	a := &agent{
 		sessions: map[SessionId]*Session{s.ID: s},
 		settings: Settings{
-			LLM: &LLMConnection{URL: mock.ts.URL, Model: "m"},
+			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
 		},
 	}
 
@@ -937,7 +1022,7 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 	a := &agent{
 		sessions: map[SessionId]*Session{s.ID: s},
 		settings: Settings{
-			LLM: &LLMConnection{URL: mock.ts.URL, Model: "m"},
+			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
 		},
 	}
 
@@ -951,5 +1036,96 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 	}
 	if mock.callCount() != 0 {
 		t.Errorf("expected no LLM calls, got %d", mock.callCount())
+	}
+}
+
+// TestCompressHistoryShadowFastPath verifies the background-summariser fast
+// path: when shadow buffer already has structured notes (populated during the
+// turns), compaction installs them directly as Summary and skips the
+// synchronous summarize LLM call. Only the retitle call should fire.
+func TestCompressHistoryShadowFastPath(t *testing.T) {
+	mock := newMockLLM(t,
+		sseText("RETITLED FROM SHADOW"),
+	)
+	defer mock.Close()
+
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+
+	filler := strings.Repeat("lorem ipsum ", 1834)
+	for i := 0; i < 10; i++ {
+		s.AddUser(fmt.Sprintf("user msg %d %s", i, filler))
+		s.AddAssistant(fmt.Sprintf("asst msg %d %s", i, filler))
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	s.appendShadow("Goal: do thing\nProgress: did thing")
+	s.appendShadow("Goal: do thing\nProgress: refined thing")
+
+	a := &agent{
+		sessions: map[SessionId]*Session{s.ID: s},
+		settings: Settings{
+			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
+		},
+	}
+
+	a.compressHistory(context.Background(), s)
+
+	if !strings.Contains(s.Summary, "did thing") || !strings.Contains(s.Summary, "refined thing") {
+		t.Errorf("expected Summary to contain both shadow chunks, got %q", s.Summary)
+	}
+	// Exactly one LLM call (retitle only — no synchronous summarize).
+	if mock.callCount() != 1 {
+		t.Errorf("LLM calls: got %d, want 1 (retitle only)", mock.callCount())
+	}
+	// Drain again — buffer must be empty after compaction.
+	if remaining := s.drainShadow(); remaining != "" {
+		t.Errorf("shadow buffer not drained after compaction: %q", remaining)
+	}
+}
+
+// TestCompressHistoryShadowPreservesPriorSummary verifies that when the
+// shadow fast path runs and a previous Summary is already in place, the
+// previous Summary is kept and the shadow is appended after it.
+func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
+	mock := newMockLLM(t,
+		sseText("RETITLED"),
+	)
+	defer mock.Close()
+
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s.Summary = "PRIOR SUMMARY FROM AN EARLIER COMPACTION"
+
+	filler := strings.Repeat("lorem ipsum ", 1834)
+	for i := 0; i < 10; i++ {
+		s.AddUser(fmt.Sprintf("user %d %s", i, filler))
+		s.AddAssistant(fmt.Sprintf("asst %d %s", i, filler))
+	}
+
+	s.appendShadow("Goal: x\nProgress: y")
+
+	a := &agent{
+		sessions: map[SessionId]*Session{s.ID: s},
+		settings: Settings{
+			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
+		},
+	}
+
+	a.compressHistory(context.Background(), s)
+
+	if !strings.Contains(s.Summary, "PRIOR SUMMARY") {
+		t.Errorf("prior Summary dropped during shadow fast path; got %q", s.Summary)
+	}
+	if !strings.Contains(s.Summary, "Goal: x") {
+		t.Errorf("shadow chunk missing from new Summary; got %q", s.Summary)
 	}
 }

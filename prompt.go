@@ -8,17 +8,18 @@ import (
 	"strings"
 )
 
+// This file owns the prompt orchestrator: Prompt is the ACP entry point, it
+// dispatches each user turn to either runTaskCycle (simple request, in
+// loop.go) or runSubtasks (big-task decomposition with one cycle per
+// subtask). The phase UI helpers (sendPhase, setStatus, finalizePlan) and
+// the request-level error shaper (failPrompt, stopReasonFor) also live here
+// — they're orchestrator concerns, not part of the loop body.
+
 // errUserCancelled flags a deliberate stop initiated by the user (e.g. they
 // chose Abort in a tool-choice prompt). It's NOT an error to surface as a
 // red box — the prompt returns a clean PromptResponse with StopReasonCancelled
 // when this sentinel reaches the top level.
 var errUserCancelled = errors.New("user cancelled")
-
-// This file owns the prompt orchestrator: the per-turn loop that drives the
-// plan → execute → verify pipeline (runTaskCycle), the big-task branch that
-// decomposes a request into subtasks (runSubtasks), the wire-bytes assembly
-// that keeps the prefix cache hot (composeUserContent), and the small phase
-// UI helpers used along the way (sendPhase, finalizePlan).
 
 // phaseNames are the pipeline stages; only the current one is shown to the
 // client at a time (the plan UI updates in place as phases progress).
@@ -27,9 +28,10 @@ var phaseNames = []string{"Planning", "Executing", "Verifying", "Documenting"}
 // phaseEntries builds the multi-row plan entries to render in the client: all
 // phases up to and including `phase`, with prior phases marked completed and
 // phase `phase` marked in_progress or completed depending on `done`. Optional
-// `suffix` is appended to whichever row is in_progress (used for transient
-// markers like " (thinking…)"). Document (phase 3) only appears once it
-// actually starts, so a no-doc run ends with three rows.
+// `suffix` is appended to whichever row is in_progress (used by setStatus to
+// surface transient lifecycle markers like " (thinking…)" or " (running
+// read_file…)"). Document (phase 3) only appears once it actually starts, so
+// a no-doc run ends with three rows.
 func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
 	if phase < 0 || phase >= len(phaseNames) {
 		return nil
@@ -65,12 +67,14 @@ func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bo
 	a.sendUpdate(ctx, sid, PlanUpdate(entries))
 }
 
-// notifyPhaseSuffix re-emits the full multi-row plan with `suffix` appended
-// to whichever row is currently in_progress. Used as a transient marker
-// (e.g. " (thinking…)") while a phase-bound LLM call is in flight; pass "" to
-// revert. No-op when no phase is active so background calls (history
-// compaction) don't clobber the UI.
-func (a *agent) notifyPhaseSuffix(ctx context.Context, sid SessionId, suffix string) {
+// setStatus re-emits the full multi-row plan with `suffix` appended to
+// whichever row is currently in_progress. Used as a transient marker for
+// lifecycle states: " (sent to llm…)" between HTTP POST and first token,
+// " (thinking…)" while tokens stream, " (running read_file…)" while a tool
+// executes. Pass "" to revert to the bare phase name. No-op when no phase is
+// active so background calls (history compaction, per-turn summariser) don't
+// clobber the UI.
+func (a *agent) setStatus(ctx context.Context, sid SessionId, suffix string) {
 	sess := a.getSession(sid)
 	if sess == nil {
 		return
@@ -152,6 +156,14 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	a.waitForIndex()
 
+	// Pick up anything the user edited between turns (mcp.toml today;
+	// settings.toml / capabilities later). checkSettings is silent when
+	// nothing changed and only emits tool-call cards for real diffs, so it's
+	// safe to run on every prompt without spamming the chat.
+	if sess := a.getSession(req.SessionId); sess != nil {
+		a.checkSettings(ctx, sess.Cwd, req.SessionId)
+	}
+
 	// Extract user text and images from prompt blocks.
 	var userText string
 	var images []ImageData
@@ -165,13 +177,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 				Data:     block.Image.Data,
 			})
 		}
-	}
-
-	// Slash commands (/improve, /clean) — handled before any session
-	// mutation or LLM dispatch so the command itself isn't stored in
-	// history.
-	if a.handleSlashCommand(ctx, req.SessionId, userText) {
-		return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
 	}
 
 	// Store user message. The stored message is the raw userText only —
@@ -213,8 +218,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	}
 
 	var result toolLoopResult
-	if firstPlan != nil && len(firstPlan.Subtasks) > 0 {
+	subtaskPath := firstPlan != nil && len(firstPlan.Subtasks) > 0
+	if subtaskPath {
 		// Big task — iterate each subtask through its own plan→execute→verify.
+		// runSubtasks fires backgroundSummarise per subtask iteration so every
+		// turn pair gets a structured note; the epilogue below skips the
+		// summary call in that path to avoid double-summarising the last pair.
 		result, err = a.runSubtasks(ctx, req.SessionId, firstPlan.Subtasks, firstToolUses, currentUserIdx, isFirstMessage, images)
 		if err != nil {
 			// User cancellation is a clean stop, not an error to render as red.
@@ -237,165 +246,21 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	if sess != nil && result.Text != "" {
 		sess.UpsertLastAssistant(result.Text)
 		_ = sess.Save()
+		// Fire-and-forget per-turn summarisation onto a free LLM[1+] slot.
+		// Skipped on the subtasks path — runSubtasks already fired it for
+		// every iteration including the last, and double-firing would
+		// duplicate the final pair's structured note in the shadow buffer.
+		if !subtaskPath {
+			a.backgroundSummarise(sess)
+		}
+		// Refresh .codehalter/.git_commit on LLM[2+] (or LLM[1] after
+		// shadowPending — see pickGitCommitConn). Overwrites by design, so
+		// it's safe to fire once per Prompt regardless of subtaskPath.
+		a.backgroundGitCommit(sess)
 		a.compressHistory(ctx, sess)
 	}
 
 	return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
-}
-
-// runTaskCycle runs plan → execute → verify with retries for a single task.
-// On attempt 0, a pre-computed plan may be supplied (prePlan/preConn/preToolUses)
-// to avoid re-planning after an upfront planAndRoute call; retries always
-// re-plan with the failure context. userText is the original user-facing
-// request, planInput is what the planner sees (may carry failure context).
-func (a *agent) runTaskCycle(
-	ctx context.Context, sid SessionId,
-	userText, planInput string,
-	currentUserIdx int, isFirstInSession bool,
-	images []ImageData,
-	prePlan *planResult, preConn *LLMConnection, preToolUses []ToolUse,
-) (toolLoopResult, error) {
-	const maxAttempts = 10
-	var result toolLoopResult
-	var lastVR *verifyResult
-	var seenBags []map[string]bool
-	// wroteFilesEver tracks whether ANY attempt in this retry loop performed a
-	// file write. The document gate at the bottom must see the cumulative
-	// answer: when verify failed on attempt N (causing a re-plan) and the
-	// final successful attempt only re-read files to confirm, result.ToolUses
-	// alone misses the earlier edits and the document phase silently skips.
-	wroteFilesEver := false
-	sess := a.getSession(sid)
-
-	conn := preConn
-	var planSteps []string
-	if prePlan != nil {
-		planSteps = prePlan.Steps
-	}
-	planToolUses := preToolUses
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 || prePlan == nil {
-			a.sendPhase(ctx, sid, 0, false)
-			c, p, tu, err := a.planAndRoute(ctx, sid, planInput)
-			if err != nil {
-				if errors.Is(err, errUserCancelled) {
-					return result, err
-				}
-				if sess != nil && len(tu) > 0 {
-					sess.AddAssistantWithTools("❌ "+err.Error(), tu)
-					_ = sess.Save()
-				}
-				return result, err
-			}
-			conn = c
-			planSteps = nil
-			if p != nil {
-				planSteps = p.Steps
-			}
-			planToolUses = tu
-		}
-
-		// composeUserContent yields the exact wire bytes for this turn —
-		// planCtx + planInput, plus sysPrompt on the very first message of
-		// the session. Persisting that wire format (rather than a stripped
-		// version) is what keeps the LLM-side prefix cache hot across turns:
-		// turn N+1's buildLLMHistory rebuilds the same bytes turn N sent.
-		stored, err := a.composeUserContent(sid, planInput, planSteps, planToolUses, isFirstInSession)
-		if err != nil {
-			return result, err
-		}
-
-		if sess != nil {
-			sess.UpdateLastMessageContent(currentUserIdx, stored)
-			_ = sess.Save()
-		}
-
-		// History is read 1:1 from TOML (including images on user turns).
-		var messages []llmMessage
-		if sess != nil {
-			messages = a.buildLLMHistory(sess, currentUserIdx)
-		}
-		messages = append(messages, a.buildUserMessage(stored, images))
-
-		a.sendPhase(ctx, sid, 1, false)
-		result, err = a.execute(ctx, sid, messages)
-		if err != nil {
-			return result, err
-		}
-		if hasFileWrites(result.ToolUses) {
-			wroteFilesEver = true
-		}
-
-		a.sendPhase(ctx, sid, 2, false)
-		var vr *verifyResult
-		preVerifyToolCount := len(result.ToolUses)
-		result, vr, err = a.verify(ctx, sid, conn, messages, result, planInput, planSteps)
-		if err != nil {
-			return result, err
-		}
-		// verify() runs the LLM with an unfiltered tool set, so it can
-		// invoke edit_file/write_file while re-checking the result. Capture
-		// any new file writes it produced so the cumulative wroteFilesEver
-		// flag (and the document gate downstream) sees them.
-		if len(result.ToolUses) > preVerifyToolCount &&
-			hasFileWrites(result.ToolUses[preVerifyToolCount:]) {
-			wroteFilesEver = true
-		}
-		lastVR = vr
-		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
-			break
-		}
-
-		// Loop-detection: if verify reports a near-duplicate of an earlier
-		// failure (Jaccard ≥ threshold over the bag of issue words), the LLM
-		// is stuck rephrasing the same problem. Bail rather than burn the
-		// remaining retry budget. Order, casing and punctuation are ignored
-		// so "missing import" and "import is missing" collapse together.
-		currentBag := issueBag(vr.Issues)
-		looped := false
-		for _, prev := range seenBags {
-			if jaccard(currentBag, prev) >= failureSimilarityThreshold {
-				looped = true
-				break
-			}
-		}
-		if looped {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-				fmt.Sprintf("⚠ Same verification failure as a prior attempt — retrying would loop. Giving up. Last issues:\n%s\n", strings.Join(vr.Issues, "\n")),
-			)))
-			break
-		}
-		seenBags = append(seenBags, currentBag)
-
-		if attempt == maxAttempts-1 {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-				fmt.Sprintf("⚠ Verification still failing after %d attempts — giving up. Last issues:\n%s\n", maxAttempts, strings.Join(vr.Issues, "\n")),
-			)))
-			break
-		}
-
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
-			fmt.Sprintf("⚠ Verification failed (attempt %d/%d). Re-planning with the failure context:\n%s\n", attempt+1, maxAttempts, strings.Join(vr.FixSteps, "\n")),
-		)))
-		planInput = fmt.Sprintf("The previous attempt failed verification.\nIssues: %s\nFix steps: %s\n\nOriginal request: %s\n\nRe-plan with this information. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it.",
-			strings.Join(vr.Issues, "; "),
-			strings.Join(vr.FixSteps, "; "),
-			userText)
-	}
-
-	// Document phase: only when the executor wrote files and verify did not
-	// declare the result broken. Failures with no fix_steps still reach here
-	// (we couldn't fix it but didn't bail) — skip the doc pass for those, the
-	// change isn't trustworthy enough to advertise in the README.
-	lastPhase := 2
-	if (lastVR == nil || lastVR.Success) && wroteFilesEver && conn != nil {
-		a.sendPhase(ctx, sid, 3, false)
-		result, _ = a.document(ctx, sid, conn, userText, planSteps, result)
-		lastPhase = 3
-	}
-	a.sendPhase(ctx, sid, lastPhase, true)
-	return result, nil
 }
 
 // runSubtasks shows the decomposed subtask list, asks the user how to run
@@ -484,6 +349,9 @@ func (a *agent) runSubtasks(
 		if sess != nil && result.Text != "" {
 			sess.UpsertLastAssistant(result.Text)
 			_ = sess.Save()
+			// Per-subtask background summary so the shadow buffer covers
+			// every turn pair, not just the final subtask's reply.
+			a.backgroundSummarise(sess)
 		}
 
 		// Images only travel with the real user message (subtask 0).
@@ -491,127 +359,4 @@ func (a *agent) runSubtasks(
 	}
 
 	return finalResult, nil
-}
-
-// composeUserContent assembles the wire bytes for one user turn. The result
-// is BOTH persisted to sess.Messages and sent to the LLM, so the next turn's
-// buildLLMHistory replays the same bytes — that's the prefix-cache contract.
-//
-// On the first message of a session it folds the system prompt (skills +
-// project dir) and the empty-project hint into the content. Subsequent turns
-// don't re-add those: they're already in sess.Messages[0] from turn 1, and
-// re-adding would shift them and break the cache.
-func (a *agent) composeUserContent(sid SessionId, planInput string, planSteps []string, planToolUses []ToolUse, isFirstInSession bool) (string, error) {
-	var b strings.Builder
-	if len(planSteps) > 0 {
-		b.WriteString("The user approved this plan. Follow these steps exactly:\n")
-		for i, step := range planSteps {
-			fmt.Fprintf(&b, "%d. %s\n", i+1, step)
-		}
-	}
-	if len(planToolUses) > 0 {
-		b.WriteString("\nDuring planning, these tools were already called (do NOT repeat them):\n")
-		for _, tu := range planToolUses {
-			fmt.Fprintf(&b, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 500))
-		}
-	}
-	content := planInput
-	if b.Len() > 0 {
-		b.WriteString("\nUser request: ")
-		b.WriteString(planInput)
-		content = b.String()
-	}
-
-	if isFirstInSession {
-		sysPrompt, err := a.systemPrompt(sid)
-		if err != nil {
-			return "", err
-		}
-		a.mu.Lock()
-		empty := a.emptyProject
-		a.mu.Unlock()
-		prefix := sysPrompt + "\n---\n"
-		if empty {
-			prefix = emptyProjectHint + "\n---\n" + prefix
-		}
-		content = prefix + content
-	}
-	return content, nil
-}
-
-// failureSimilarityThreshold is the Jaccard ratio above which two
-// verify-failure bags are considered "the same problem." Tuned empirically
-// for short LLM-generated issue strings: 0.6 catches "missing import" /
-// "import is missing" (Jaccard 0.67) without collapsing genuinely different
-// files (e.g. foo.go vs bar.go syntax errors land around 0.67-0.83 and
-// would false-positive; the cost of an over-eager bail is recoverable by
-// re-prompting, so we accept that for the upside of catching small-model
-// rewordings).
-const failureSimilarityThreshold = 0.6
-
-// issueBag tokenises a list of issue strings into a single set of distinct
-// lowercase alphanumeric words. Punctuation, casing and ordering are all
-// discarded so two attempts reporting the same root cause in different
-// phrasing collapse to comparable bags.
-func issueBag(issues []string) map[string]bool {
-	bag := make(map[string]bool)
-	var cur strings.Builder
-	flush := func() {
-		if cur.Len() > 0 {
-			bag[cur.String()] = true
-			cur.Reset()
-		}
-	}
-	for _, iss := range issues {
-		for _, r := range strings.ToLower(iss) {
-			switch {
-			case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-				cur.WriteRune(r)
-			default:
-				flush()
-			}
-		}
-		flush()
-	}
-	return bag
-}
-
-// jaccard returns |A ∩ B| / |A ∪ B| for two word sets. 1.0 = identical,
-// 0.0 = disjoint. Two empty bags are treated as identical.
-func jaccard(a, b map[string]bool) float64 {
-	if len(a) == 0 && len(b) == 0 {
-		return 1
-	}
-	inter := 0
-	for w := range a {
-		if b[w] {
-			inter++
-		}
-	}
-	union := len(a) + len(b) - inter
-	if union == 0 {
-		return 0
-	}
-	return float64(inter) / float64(union)
-}
-
-func (a *agent) buildUserMessage(content string, images []ImageData) llmMessage {
-	if len(images) == 0 || !a.imagesSupported {
-		return llmMessage{Role: "user", Content: content}
-	}
-	// Build OpenAI-style content array with text and image blocks.
-	var parts []any
-	parts = append(parts, map[string]any{
-		"type": "text",
-		"text": content,
-	})
-	for _, img := range images {
-		parts = append(parts, map[string]any{
-			"type": "image_url",
-			"image_url": map[string]string{
-				"url": fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data),
-			},
-		})
-	}
-	return llmMessage{Role: "user", Content: parts}
 }

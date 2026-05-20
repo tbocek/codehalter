@@ -1,0 +1,66 @@
+# .devcontainer/Dockerfile
+# Arch base — versions: https://quay.io/repository/archlinux/archlinux?tab=tags
+# base-devel ships the compile toolchain (gcc, make, pacman, sudo, fakeroot,
+# pkgconf, ...) but NOT git or curl, so we install them explicitly below.
+FROM quay.io/archlinux/archlinux:base-devel
+
+ARG USERNAME=dev
+ARG UID=1000
+ARG GID=1000
+
+# Toolchain — trim what you don't use; add rust, jdk17-openjdk, python, etc.
+# as your project needs them. just is picked up by codehalter's task-runner
+# discovery automatically; nodejs+npm covers package.json. firefox powers
+# web_search/web_read; codehalter launches it with -headless so no X11
+# forwarding is needed. run_command (probes + test installs) runs commands
+# directly under bash — the container itself is the sandbox.
+RUN pacman -Syu --noconfirm --needed \
+        ca-certificates curl git \
+        just \
+        nodejs npm \
+        firefox \
+        go \
+    && rm -rf /var/cache/pacman/pkg/*
+
+# Non-root user matching host UID/GID so files written into the bind-mounted
+# workspace stay owned by your host user, not root. wheel + NOPASSWD lets the
+# user sudo without a password, matching the Debian variant.
+RUN groupadd --gid ${GID} ${USERNAME} \
+    && useradd --uid ${UID} --gid ${GID} -m -s /bin/bash -G wheel ${USERNAME} \
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+    && install -d -o ${UID} -g ${GID} /home/${USERNAME}/.config
+
+# Install codehalter into a system path so Zed's `command` lookup is stable
+# across container rebuilds. GOPROXY=direct fetches straight from GitHub so
+# you always get the current main; proxy.golang.org's @latest resolution can
+# lag behind by hours.
+ENV GOBIN=/usr/local/bin
+RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
+
+# gopls speaks MCP via its `mcp` subcommand and ships go_symbols /
+# go_references / go_definition / go_hover etc. as MCP tools. codehalter
+# spawns `gopls mcp` for any project with a go.mod (the auto-seeded
+# .codehalter/mcp.toml has the entry). Drop this RUN if you don't want Go
+# tooling in the container — but then also disable the gopls entry in
+# mcp.toml or codehalter will warn at startup that the binary isn't on PATH.
+RUN go install golang.org/x/tools/gopls@latest
+
+USER ${USERNAME}
+WORKDIR /home/${USERNAME}
+
+# yay (AUR helper) — built from source as the non-root user because makepkg
+# refuses to run as root. Comment this out if you don't need AUR packages.
+RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
+    && cd /tmp/yay && makepkg -si --noconfirm \
+    && cd / && rm -rf /tmp/yay
+
+# Extra MCP servers — uncomment what you want and add a matching [[server]]
+# block to .codehalter/mcp.toml. Examples:
+#
+# Node-based servers via npx (preinstalls common ones to skip the per-session
+# download — run as root before the USER switch above):
+#   RUN npm install -g @modelcontextprotocol/server-filesystem
+#
+# Python-based servers via uvx:
+#   RUN sudo pacman -Syu --noconfirm uv
+#   RUN uv tool install mcp-server-github

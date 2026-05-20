@@ -2,14 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 )
 
-// This file owns the four phases of a prompt cycle: plan → execute → verify →
-// document. Each phase is a thin orchestration layer over runToolLoop; the
-// orchestrator in prompt.go calls them in order and re-plans on verify failure.
+// This file owns the agent's per-task loop. One iteration is plan → execute →
+// verify, with an optional document phase after a successful verify. When
+// verify fails with fix steps, the loop re-plans with the failure context and
+// runs again (up to maxAttempts, with Jaccard duplicate-issue detection to
+// bail early when the model is rephrasing the same problem). Each phase is a
+// thin wrapper over runToolLoop; runTaskCycle (at the bottom) is the retry
+// engine. The Prompt orchestrator (prompt.go) calls runTaskCycle once per
+// task — either directly for simple requests, or once per subtask for big
+// requests decomposed by the planner.
 
 // ---------------------------------------------------------------------------
 // Plan phase
@@ -42,7 +49,7 @@ type planResult struct {
 func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) (*LLMConnection, *planResult, []ToolUse, error) {
 	thinking := a.pickAvailable(ctx, sid, "thinking")
 	if thinking == nil {
-		return nil, nil, nil, fmt.Errorf("no [llm] in .codehalter/settings.toml")
+		return nil, nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
 	}
 	planPrompt := a.loadPromptFile(sid, "PLAN.md")
 	if planPrompt == "" {
@@ -67,7 +74,10 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 	}
 	messages = append(messages, llmMessage{Role: "user", Content: planPrompt + "\n\nUser request: " + userText})
 	var plan planResult
-	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{}, "plan", &plan)
+	// Exclude respond: planning emits a JSON object as plain text, so we don't
+	// want the model to escape into the synthetic terminal-tool grammar that
+	// execute uses. Same reasoning in verify() and document() below.
+	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", &plan)
 	if err != nil {
 		return thinking, nil, planRes.ToolUses, nil
 	}
@@ -219,10 +229,10 @@ func (a *agent) verifyTargetHint() string {
 // extraExclude lists additional tool names to exclude (e.g. launch_subagent
 // when a subagent has reached its max nesting depth).
 //
-// Routed via llmTier(sid): the main session always uses [llm] for cache
-// consistency — every phase (plan/execute/verify/document) hits the same slot
-// so the prefix cache stays warm across the whole turn. Subagent sessions
-// route to [[subllm]] so they don't evict the main slot's cache.
+// Routed via pickAvailable(sid): the main session always uses LLM[0] for
+// cache consistency — every phase (plan/execute/verify/document) hits the
+// same slot so the prefix cache stays warm across the whole turn. Subagent
+// sessions route to their pinned LLM[i] for the same reason.
 func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessage, extraExclude ...string) (toolLoopResult, error) {
 	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
 	if hint := a.verifyTargetHint(); hint != "" {
@@ -276,7 +286,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 		return res, &verifyResult{Success: true}, nil
 	}
 
-	// Same routing as execute(): main session uses [llm], subagents use [[subllm]].
+	// Same routing as execute(): main session uses LLM[0], subagents their pinned LLM[i].
 	conn := a.pickAvailable(ctx, sid, "execute")
 	if conn == nil {
 		conn = fallbackConn
@@ -305,7 +315,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 
 	verifyMessages := append(messages, llmMessage{Role: "user", Content: prompt.String()})
 	var result verifyResult
-	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{}, "verify", &result)
+	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "verify", &result)
 	res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
 	if err != nil {
 		slog.Error("verify: skipped, treating as success", "err", err)
@@ -378,11 +388,293 @@ func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection
 		messages = a.buildLLMHistory(sess, -1)
 	}
 	messages = append(messages, llmMessage{Role: "user", Content: prompt.String()})
-	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{}, "document")
+	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "document")
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil
 	}
 	exec.ToolUses = append(exec.ToolUses, docRes.ToolUses...)
 	return exec, nil
+}
+
+// ---------------------------------------------------------------------------
+// Loop: plan → execute → verify (→ document), with re-plan on verify failure
+// ---------------------------------------------------------------------------
+
+// runTaskCycle runs plan → execute → verify with retries for a single task.
+// On attempt 0, a pre-computed plan may be supplied (prePlan/preConn/preToolUses)
+// to avoid re-planning after an upfront planAndRoute call; retries always
+// re-plan with the failure context. userText is the original user-facing
+// request, planInput is what the planner sees (may carry failure context).
+func (a *agent) runTaskCycle(
+	ctx context.Context, sid SessionId,
+	userText, planInput string,
+	currentUserIdx int, isFirstInSession bool,
+	images []ImageData,
+	prePlan *planResult, preConn *LLMConnection, preToolUses []ToolUse,
+) (toolLoopResult, error) {
+	const maxAttempts = 10
+	var result toolLoopResult
+	var lastVR *verifyResult
+	var seenBags []map[string]bool
+	// wroteFilesEver tracks whether ANY attempt in this retry loop performed a
+	// file write. The document gate at the bottom must see the cumulative
+	// answer: when verify failed on attempt N (causing a re-plan) and the
+	// final successful attempt only re-read files to confirm, result.ToolUses
+	// alone misses the earlier edits and the document phase silently skips.
+	wroteFilesEver := false
+	sess := a.getSession(sid)
+
+	conn := preConn
+	var planSteps []string
+	if prePlan != nil {
+		planSteps = prePlan.Steps
+	}
+	planToolUses := preToolUses
+
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 || prePlan == nil {
+			a.sendPhase(ctx, sid, 0, false)
+			c, p, tu, err := a.planAndRoute(ctx, sid, planInput)
+			if err != nil {
+				if errors.Is(err, errUserCancelled) {
+					return result, err
+				}
+				if sess != nil && len(tu) > 0 {
+					sess.AddAssistantWithTools("❌ "+err.Error(), tu)
+					_ = sess.Save()
+				}
+				return result, err
+			}
+			conn = c
+			planSteps = nil
+			if p != nil {
+				planSteps = p.Steps
+			}
+			planToolUses = tu
+		}
+
+		// composeUserContent yields the exact wire bytes for this turn —
+		// planCtx + planInput, plus sysPrompt on the very first message of
+		// the session. Persisting that wire format (rather than a stripped
+		// version) is what keeps the LLM-side prefix cache hot across turns:
+		// turn N+1's buildLLMHistory rebuilds the same bytes turn N sent.
+		stored, err := a.composeUserContent(sid, planInput, planSteps, planToolUses, isFirstInSession)
+		if err != nil {
+			return result, err
+		}
+
+		if sess != nil {
+			sess.UpdateLastMessageContent(currentUserIdx, stored)
+			_ = sess.Save()
+		}
+
+		// History is read 1:1 from TOML (including images on user turns).
+		var messages []llmMessage
+		if sess != nil {
+			messages = a.buildLLMHistory(sess, currentUserIdx)
+		}
+		messages = append(messages, a.buildUserMessage(stored, images))
+
+		a.sendPhase(ctx, sid, 1, false)
+		result, err = a.execute(ctx, sid, messages)
+		if err != nil {
+			return result, err
+		}
+		if hasFileWrites(result.ToolUses) {
+			wroteFilesEver = true
+		}
+
+		a.sendPhase(ctx, sid, 2, false)
+		var vr *verifyResult
+		preVerifyToolCount := len(result.ToolUses)
+		result, vr, err = a.verify(ctx, sid, conn, messages, result, planInput, planSteps)
+		if err != nil {
+			return result, err
+		}
+		// verify() runs the LLM with an unfiltered tool set, so it can
+		// invoke edit_file/write_file while re-checking the result. Capture
+		// any new file writes it produced so the cumulative wroteFilesEver
+		// flag (and the document gate downstream) sees them.
+		if len(result.ToolUses) > preVerifyToolCount &&
+			hasFileWrites(result.ToolUses[preVerifyToolCount:]) {
+			wroteFilesEver = true
+		}
+		lastVR = vr
+		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
+			break
+		}
+
+		// Loop-detection: if verify reports a near-duplicate of an earlier
+		// failure (Jaccard ≥ threshold over the bag of issue words), the LLM
+		// is stuck rephrasing the same problem. Bail rather than burn the
+		// remaining retry budget. Order, casing and punctuation are ignored
+		// so "missing import" and "import is missing" collapse together.
+		currentBag := issueBag(vr.Issues)
+		looped := false
+		for _, prev := range seenBags {
+			if jaccard(currentBag, prev) >= failureSimilarityThreshold {
+				looped = true
+				break
+			}
+		}
+		if looped {
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+				fmt.Sprintf("⚠ Same verification failure as a prior attempt — retrying would loop. Giving up. Last issues:\n%s\n", strings.Join(vr.Issues, "\n")),
+			)))
+			break
+		}
+		seenBags = append(seenBags, currentBag)
+
+		if attempt == maxAttempts-1 {
+			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+				fmt.Sprintf("⚠ Verification still failing after %d attempts — giving up. Last issues:\n%s\n", maxAttempts, strings.Join(vr.Issues, "\n")),
+			)))
+			break
+		}
+
+		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+			fmt.Sprintf("⚠ Verification failed (attempt %d/%d). Re-planning with the failure context:\n%s\n", attempt+1, maxAttempts, strings.Join(vr.FixSteps, "\n")),
+		)))
+		planInput = fmt.Sprintf("The previous attempt failed verification.\nIssues: %s\nFix steps: %s\n\nOriginal request: %s\n\nRe-plan with this information. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it.",
+			strings.Join(vr.Issues, "; "),
+			strings.Join(vr.FixSteps, "; "),
+			userText)
+	}
+
+	// Document phase: only when the executor wrote files and verify did not
+	// declare the result broken. Failures with no fix_steps still reach here
+	// (we couldn't fix it but didn't bail) — skip the doc pass for those, the
+	// change isn't trustworthy enough to advertise in the README.
+	lastPhase := 2
+	if (lastVR == nil || lastVR.Success) && wroteFilesEver && conn != nil {
+		a.sendPhase(ctx, sid, 3, false)
+		result, _ = a.document(ctx, sid, conn, userText, planSteps, result)
+		lastPhase = 3
+	}
+	a.sendPhase(ctx, sid, lastPhase, true)
+	return result, nil
+}
+
+// composeUserContent assembles the wire bytes for one user turn. The result
+// is BOTH persisted to sess.Messages and sent to the LLM, so the next turn's
+// buildLLMHistory replays the same bytes — that's the prefix-cache contract.
+//
+// On the first message of a session it folds the system prompt (skills +
+// project dir) and the empty-project hint into the content. Subsequent turns
+// don't re-add those: they're already in sess.Messages[0] from turn 1, and
+// re-adding would shift them and break the cache.
+func (a *agent) composeUserContent(sid SessionId, planInput string, planSteps []string, planToolUses []ToolUse, isFirstInSession bool) (string, error) {
+	var b strings.Builder
+	if len(planSteps) > 0 {
+		b.WriteString("The user approved this plan. Follow these steps exactly:\n")
+		for i, step := range planSteps {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, step)
+		}
+	}
+	if len(planToolUses) > 0 {
+		b.WriteString("\nDuring planning, these tools were already called (do NOT repeat them):\n")
+		for _, tu := range planToolUses {
+			fmt.Fprintf(&b, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 500))
+		}
+	}
+	content := planInput
+	if b.Len() > 0 {
+		b.WriteString("\nUser request: ")
+		b.WriteString(planInput)
+		content = b.String()
+	}
+
+	if isFirstInSession {
+		sysPrompt, err := a.systemPrompt(sid)
+		if err != nil {
+			return "", err
+		}
+		a.mu.Lock()
+		empty := a.emptyProject
+		a.mu.Unlock()
+		prefix := sysPrompt + "\n---\n"
+		if empty {
+			prefix = emptyProjectHint + "\n---\n" + prefix
+		}
+		content = prefix + content
+	}
+	return content, nil
+}
+
+func (a *agent) buildUserMessage(content string, images []ImageData) llmMessage {
+	if len(images) == 0 || !a.imagesSupported {
+		return llmMessage{Role: "user", Content: content}
+	}
+	// Build OpenAI-style content array with text and image blocks.
+	var parts []any
+	parts = append(parts, map[string]any{
+		"type": "text",
+		"text": content,
+	})
+	for _, img := range images {
+		parts = append(parts, map[string]any{
+			"type": "image_url",
+			"image_url": map[string]string{
+				"url": fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data),
+			},
+		})
+	}
+	return llmMessage{Role: "user", Content: parts}
+}
+
+// failureSimilarityThreshold is the Jaccard ratio above which two
+// verify-failure bags are considered "the same problem." Tuned empirically
+// for short LLM-generated issue strings: 0.6 catches "missing import" /
+// "import is missing" (Jaccard 0.67) without collapsing genuinely different
+// files (e.g. foo.go vs bar.go syntax errors land around 0.67-0.83 and
+// would false-positive; the cost of an over-eager bail is recoverable by
+// re-prompting, so we accept that for the upside of catching small-model
+// rewordings).
+const failureSimilarityThreshold = 0.6
+
+// issueBag tokenises a list of issue strings into a single set of distinct
+// lowercase alphanumeric words. Punctuation, casing and ordering are all
+// discarded so two attempts reporting the same root cause in different
+// phrasing collapse to comparable bags.
+func issueBag(issues []string) map[string]bool {
+	bag := make(map[string]bool)
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			bag[cur.String()] = true
+			cur.Reset()
+		}
+	}
+	for _, iss := range issues {
+		for _, r := range strings.ToLower(iss) {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+				cur.WriteRune(r)
+			default:
+				flush()
+			}
+		}
+		flush()
+	}
+	return bag
+}
+
+// jaccard returns |A ∩ B| / |A ∪ B| for two word sets. 1.0 = identical,
+// 0.0 = disjoint. Two empty bags are treated as identical.
+func jaccard(a, b map[string]bool) float64 {
+	if len(a) == 0 && len(b) == 0 {
+		return 1
+	}
+	inter := 0
+	for w := range a {
+		if b[w] {
+			inter++
+		}
+	}
+	union := len(a) + len(b) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
 }

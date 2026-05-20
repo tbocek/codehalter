@@ -626,7 +626,7 @@ func sliceWebBody(body string, offset, limit int) string {
 
 // summarizePage uses the execute LLM to extract only the relevant information
 // from a web page. sid scopes the per-session debug log. Routes via the
-// session's pin: main → [llm], subagent → its pinned [[subllm]] entry.
+// session's pin: main → LLM[0], subagent → its pinned LLM[i] entry.
 func (a *agent) summarizePage(ctx context.Context, sid SessionId, query, url, pageText string) string {
 	conn := a.pickAvailable(ctx, sid, "execute")
 

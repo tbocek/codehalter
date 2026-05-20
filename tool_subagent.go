@@ -59,18 +59,15 @@ type subagentResult struct {
 
 // registerSubagentTool registers the launch_subagent tool if not already registered.
 func (a *agent) registerSubagentTool() {
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		if fn["name"] == "launch_subagent" {
-			return
-		}
+	if hasToolPrefix("launch_subagent") {
+		return
 	}
 
 	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "launch_subagent",
-			"description": "Run 2+ short, independent leaf tasks in parallel. Each subagent runs ONLY the tool loop (no separate plan/verify phase) and reports back — use it for unambiguous single-file edits, one focused lookup, or one bounded command, NOT for multi-step work that needs its own planning. Subagents cannot talk to the user and CANNOT see this conversation's history; they only see their own `instructions` + `context`. Each subagent is pinned to one [[subllm]] slot for the duration of its run so its prefix cache stays warm. Parallelism is capped at the number of configured [[subllm]] connections; excess tasks queue.",
+			"description": "Run 2+ short, independent leaf tasks in parallel. Each subagent runs ONLY the tool loop (no separate plan/verify phase) and reports back — use it for unambiguous single-file edits, one focused lookup, or one bounded command, NOT for multi-step work that needs its own planning. Subagents cannot talk to the user. The first subagent in a batch inherits this conversation's full history (it runs on the main LLM, its prefix cache is already warm); the rest start fresh on extra LLM slots and see only their own `instructions` + `context`. Parallelism is bounded by the sum of `parallel` across configured [[llm]] entries; excess tasks queue.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"tasks"},
@@ -146,26 +143,35 @@ func (a *agent) registerSubagentTool() {
 			order = append(order, h)
 		}
 
-		// Parallelism cap = number of [[subllm]] entries. With fewer connections
-		// than tasks, excess tasks wait in the semaphore until one finishes —
-		// this is the user's contract: "I specified N subllm, run at most N
-		// concurrent". If no [[subllm]] is configured at all we fall back to a
-		// cap of 1 (serialise on [llm]) so we don't blow up an unconfigured
-		// setup with parallel writes to the main slot.
-		numConns := len(ag.settings.SubLLM)
-		if numConns < 1 {
-			numConns = 1
+		// Parallelism is bounded by the sum of `parallel` across configured
+		// [[llm]] entries. SubagentPinOrder returns a breadth-first interleave
+		// of conn indices: for caps [1, 3] it yields [0, 1, 1, 1] — task 0
+		// pins to LLM[0] (warm parent cache benefit), tasks 1..3 to LLM[1].
+		// We dispatch len(order) tasks but cap concurrency at len(pinOrder),
+		// and within each task the per-call semaphore in llmStream throttles
+		// further if the conn is already saturated by another subagent's
+		// nested calls.
+		pinOrder := ag.settings.SubagentPinOrder()
+		if len(pinOrder) == 0 {
+			pinOrder = []int{0}
+		}
+		fanout := len(pinOrder)
+		if fanout > len(order) {
+			fanout = len(order)
 		}
 
-		// Launch unique tasks in parallel, each pinned to one [[subllm]] entry
-		// in round-robin order. The pin survives the whole subagent run so the
-		// slot's prefix cache stays warm across the tool loop.
-		parallel(len(order), numConns, func(k int) {
+		// Launch unique tasks in parallel, each pinned to one [[llm]] entry
+		// in breadth-first order. The pin survives the whole subagent run so
+		// the conn's prefix cache stays warm across the tool loop. Tasks past
+		// pinOrder's length wrap modulo — the per-conn semaphore in llmStream
+		// is what actually enforces the cap, so wrapping just means "extra
+		// tasks queue on already-assigned conns".
+		parallel(len(order), fanout, func(k int) {
 			h := order[k]
 			p := uniq[h]
 			primary := p.indices[0]
 			task := p.task
-			pinnedIdx := k % numConns
+			pinnedIdx := pinOrder[k%len(pinOrder)]
 			subSess := newSubagentSession(sess.Cwd, sid, primary, sess.Depth+1, pinnedIdx)
 			subSess.DisplayLabel = fmt.Sprintf("subagent %d", primary+1)
 			ag.putSession(subSess)
@@ -251,6 +257,13 @@ calls and then stop.`
 // (which encourages investigating failures, reading project files, etc.) and
 // the verify-target hint. Subagents need the opposite — a tight "do only
 // what's asked" prompt. We build the message and tool exclusions directly.
+//
+// History inheritance: when pinned to LLM[0] we prepend the parent's full
+// message history so the byte-identical prefix keeps that conn's KV cache
+// warm. Subagents on LLM[1+] start fresh — those conns hold no relevant
+// prefix and seeding parent history would just bloat their context for no
+// cache benefit. This matters because LLM[0] is the dispatch target for the
+// first task in every breadth-first fan-out.
 func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
 	sid := subSess.ID
 
@@ -273,7 +286,17 @@ func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagent
 	b.WriteString("\n---\n")
 	b.WriteString(instructions)
 
-	messages := []llmMessage{{Role: "user", Content: b.String()}}
+	var messages []llmMessage
+	if subSess.PinnedLLMIdx == 0 {
+		// Inherit parent's history so LLM[0]'s prefix cache stays warm. The
+		// new instructions land as a fresh user turn at the end. The parent
+		// session's lock is acquired briefly to copy; tool dispatch keeps
+		// running on the parent in parallel, but we only read the snapshot.
+		if parent := a.getSession(subSess.ParentID); parent != nil {
+			messages = a.buildLLMHistory(parent, -1)
+		}
+	}
+	messages = append(messages, llmMessage{Role: "user", Content: b.String()})
 
 	// Subagents can't interact with the user (UI is dropped), so ask_user
 	// would hang. Web tools were planner-phase only — execute-tier work has

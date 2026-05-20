@@ -84,12 +84,41 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 
 	body, _ := json.Marshal(reqBody)
 
-	// Surface "(thinking…)" on the active phase entry while any LLM call is in
-	// flight — execute and verify can stall on cache misses too, not just the
-	// thinking role. notifyPhaseSuffix is a no-op when no phase is active so
-	// summarisation calls between phases don't flash anything.
-	a.notifyPhaseSuffix(ctx, sid, " (thinking…)")
-	defer a.notifyPhaseSuffix(ctx, sid, "")
+	// Per-conn slot semaphore: cap concurrent in-flight calls to this conn's
+	// configured `parallel`. The token is released on llmStream return, NOT for
+	// the lifetime of a subagent — so during the tool-dispatch gap between two
+	// llmStream calls the conn is free for another caller. With pool size 1
+	// this naturally serialises everything (no deadlock even when a subagent
+	// nests another), and with N>1 fan-out fills the pool until full and queues
+	// the rest. Surface the wait as a status suffix so the UI shows "(queued…)"
+	// instead of looking frozen while a slot is busy.
+	slot := a.connSlot(conn)
+	if slot >= 0 && slot < len(a.slotSems) {
+		// Try non-blocking first; only emit the queued suffix when we're
+		// actually about to wait. Avoids flashing the wrong status on the
+		// common hot path where the slot is free.
+		select {
+		case a.slotSems[slot] <- struct{}{}:
+		default:
+			a.setStatus(ctx, sid, " (queued…)")
+			select {
+			case a.slotSems[slot] <- struct{}{}:
+			case <-ctx.Done():
+				a.setStatus(ctx, sid, "")
+				return "", nil, ctx.Err()
+			}
+		}
+		defer func() { <-a.slotSems[slot] }()
+	}
+
+	// Drive the lifecycle suffix on the active phase entry across the LLM
+	// round-trip: "(sent to llm…)" while we wait for the first SSE token (cache
+	// misses, queueing on a busy llama-server, slow TTFT), then flip to
+	// "(thinking…)" the moment streaming starts. setStatus is a no-op when no
+	// phase is active so summarisation calls between phases don't flash
+	// anything.
+	a.setStatus(ctx, sid, " (sent to llm…)")
+	defer a.setStatus(ctx, sid, "")
 
 	// Per-session log: request header + body. The raw SSE wire is too noisy
 	// to read (one event per token, each repeating the full envelope), so we
@@ -151,6 +180,7 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 	var fullText strings.Builder
 	var calls []toolCall
 	var finishReason string
+	firstToken := true
 
 	scanner := bufio.NewScanner(resp.Body)
 	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
@@ -179,6 +209,11 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 		}
 
 		delta := chunk.Choices[0].Delta
+
+		if firstToken && (delta.Content != "" || len(delta.ToolCalls) > 0) {
+			firstToken = false
+			a.setStatus(ctx, sid, " (thinking…)")
+		}
 
 		if delta.Content != "" {
 			fullText.WriteString(delta.Content)
@@ -409,109 +444,46 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 	return r, true
 }
 
-// pickAvailable resolves a connection for the session and role. Tier is
-// derived from the session's depth (depth>0 → subagent → [[subllm]],
-// otherwise → main → [llm]). Subagent sessions carry a PinnedSubLLMIdx
-// assigned at creation by launch_subagent; when set we route every call from
-// that session to settings.SubLLM[PinnedSubLLMIdx] regardless of role tag,
-// so the slot's prefix cache stays warm across plan/execute/verify switches.
-// Unpinned (main, tests) falls through to LLMCandidates + round-robin across
-// alive servers. Returns nil only when no connections exist.
-func (a *agent) pickAvailable(ctx context.Context, sid SessionId, role string) *LLMConnection {
+// pickAvailable resolves the connection for the session and role. The main
+// session always uses LLM[0] — its KV cache owns the parent's conversation
+// prefix. Subagent sessions carry a PinnedLLMIdx assigned at launch by
+// launch_subagent; every call from that session routes back to the same
+// entry so the conn's prefix cache stays warm across plan/execute switches.
+// Concurrency is enforced by per-conn semaphores in llmStream; this picker
+// just resolves the routing target.
+func (a *agent) pickAvailable(_ context.Context, sid SessionId, role string) *LLMConnection {
 	sess := a.getSession(sid)
-
-	// Subagent with a pinned [[subllm]] entry: hard route, ignore tag match.
-	// Cache consistency wins over per-role sampler tuning — the parent's
-	// launch_subagent already picked a slot for this session, and bouncing
-	// across entries (the old tag-match behaviour) evicted the prefix cache
-	// on every plan/execute transition.
-	if sess != nil && sess.Depth > 0 && sess.PinnedSubLLMIdx >= 0 && sess.PinnedSubLLMIdx < len(a.settings.SubLLM) {
-		c := a.settings.SubLLM[sess.PinnedSubLLMIdx]
-		c.ExtraBody = c.paramsFor(role)
-		c.Tag = role
-		return &c
-	}
-
-	tier := "main"
-	if sess != nil && sess.Depth > 0 {
-		tier = "subagent"
-	}
-
-	cs := a.settings.LLMCandidates(role, tier)
-	if len(cs) == 0 {
-		return nil
-	}
-
-	// Drop connections the startup probe couldn't reach so we don't burn a
-	// /slots timeout per call. If every candidate is dead, return the first
-	// so the caller surfaces a clear "LLM unreachable" error instead of
-	// waiting 2s per server.
-	alive := cs
-	if len(a.connReachable) > 0 {
-		alive = alive[:0:0]
-		for _, c := range cs {
-			if a.connReachable[connKey(&c)] {
-				alive = append(alive, c)
-			}
-		}
-		if len(alive) == 0 {
-			return &cs[0]
+	if sess != nil && sess.Depth > 0 && sess.PinnedLLMIdx >= 0 {
+		if c := a.settings.ConnAt(sess.PinnedLLMIdx, role); c != nil {
+			return c
 		}
 	}
-
-	start := int(a.pickRotor.Add(1)-1) % len(alive)
-	for i := 0; i < len(alive); i++ {
-		idx := (start + i) % len(alive)
-		if a.hasSlot(ctx, &alive[idx]) {
-			return &alive[idx]
-		}
-	}
-	return &alive[start]
+	return a.settings.MainLLM(role)
 }
 
-// hasSlot returns true if the server has at least one idle slot, or if slot
-// state cannot be determined (no /slots endpoint, unparseable response).
-// Returns false only when /slots definitively reports every slot busy or the
-// server is unreachable. /slots requires `--slots` on llama-server; older
-// builds and cloud endpoints return 404/501 which we treat as "unknown =
-// available" so they keep working without slot-awareness.
-func (a *agent) hasSlot(ctx context.Context, conn *LLMConnection) bool {
-	slotsURL, ok := deriveServerURL(conn.URL, "/slots")
-	if !ok {
-		return true
-	}
-	probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-	defer cancel()
-	resp, err := getWithAuth(probeCtx, slotsURL, conn.APIKey)
-	if err != nil {
-		slog.Info("hasSlot: unreachable", "url", slotsURL, "err", err)
-		return false
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case http.StatusNotFound, http.StatusNotImplemented, http.StatusForbidden, http.StatusUnauthorized:
-		return true
-	}
-	if resp.StatusCode != http.StatusOK {
-		slog.Info("hasSlot: non-OK", "url", slotsURL, "status", resp.StatusCode)
-		return false
-	}
-	var slots []struct {
-		IsProcessing bool `json:"is_processing"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&slots); err != nil {
-		return true
-	}
-	if len(slots) == 0 {
-		return true
-	}
-	for _, s := range slots {
-		if !s.IsProcessing {
-			return true
+// connSlot returns the index into settings.LLM that this connection
+// corresponds to, used by llmStream to find the matching semaphore. Returns
+// -1 when the conn is not in the configured list (test mocks, probe-only
+// stubs); the caller treats -1 as "no semaphore" and dispatches directly.
+func (a *agent) connSlot(conn *LLMConnection) int {
+	for i := range a.settings.LLM {
+		if a.settings.LLM[i].URL == conn.URL && a.settings.LLM[i].Model == conn.Model {
+			return i
 		}
 	}
-	slog.Info("hasSlot: all busy", "url", slotsURL, "slots", len(slots))
-	return false
+	return -1
+}
+
+// buildSlotSems sizes one buffered channel per LLM entry to its parallelCap.
+// Called once on agent startup after settings load. Re-init on settings
+// reload is handled by the caller (ensureSettings invokes loadSettings →
+// re-init slotSems).
+func (a *agent) buildSlotSems() {
+	sems := make([]chan struct{}, len(a.settings.LLM))
+	for i := range a.settings.LLM {
+		sems[i] = make(chan struct{}, a.settings.LLM[i].parallelCap())
+	}
+	a.slotSems = sems
 }
 
 // getWithAuth issues a GET with an optional bearer token and follows redirects
@@ -560,8 +532,8 @@ const maxParallel = 10
 
 // parallel runs fn for each index [0, n) with up to `cap` concurrent
 // goroutines. cap<=0 falls back to maxParallel. Callers that know an upper
-// bound (e.g. launch_subagent capping at the number of [[subllm]] entries)
-// pass it explicitly so excess work queues instead of contending for slots.
+// bound (e.g. launch_subagent's SubagentPinOrder length) pass it explicitly
+// so excess work queues instead of contending for slots.
 func parallel(n, cap int, fn func(i int)) {
 	if cap <= 0 {
 		cap = maxParallel
@@ -742,6 +714,14 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, on func(string)) (toolLoopResult, error) {
 	tools := llmToolDefinitionsFiltered(filter)
 
+	// termName is the registered Terminal tool exposed in this phase ("" when
+	// none — e.g. plan/verify/document filter respond out). When non-empty,
+	// the empty-tool-calls branch below stops meaning "model finished" and
+	// starts meaning "model dropped out of tool-calling grammar" — see the
+	// nudge + fallback there.
+	termName := terminalToolName(filter)
+	hasTerminal := termName != ""
+
 	var res toolLoopResult
 	res.Phase = phase
 	var allText strings.Builder
@@ -774,6 +754,11 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 	// signature nudge / 50-iter cap will still bail us out.
 	toolNameCounts := map[string]int{}
 	var escalated bool
+	// respondNudged: when respondEnabled and the model returns an empty tool
+	// call list, we nudge once to call respond. If the next turn still has no
+	// tool calls we fall through to the legacy text-only exit so the loop
+	// can't spin forever on a model that refuses the synthetic terminal.
+	var respondNudged bool
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			res.Text = allText.String()
@@ -794,6 +779,23 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 		allText.WriteString(text)
 
 		if len(calls) == 0 {
+			// Terminal-tool mode: empty tool_calls means the model dropped
+			// out of tool-calling grammar instead of finishing. Nudge it to
+			// either call the terminal tool or another tool, but only once —
+			// a model that refuses twice gets the legacy text exit so we
+			// don't loop indefinitely on the new constraint.
+			if hasTerminal && !respondNudged {
+				respondNudged = true
+				messages = append(messages, llmMessage{Role: "assistant", Content: text})
+				messages = append(messages, llmMessage{
+					Role: "user",
+					Content: fmt.Sprintf("Your last response was plain text with no tool call. "+
+						"This turn ends only when you call `%s` with your final "+
+						"user-facing message, or another tool if you still have work "+
+						"to do. Do not reply in prose — call a tool.", termName),
+				})
+				continue
+			}
 			res.Text = allText.String()
 			stampTiming()
 			return res, nil
@@ -839,6 +841,12 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 			ToolCalls: calls,
 		})
 
+		// terminalCalled flips when this batch contains a Terminal tool call;
+		// we finish processing the batch (so its tool result lands in history
+		// for postmortem) and then exit with the message as res.Text.
+		var terminalCalled bool
+		var terminalMessage string
+
 		for _, tc := range calls {
 			// Subagent sessions don't surface their own UI (Zed doesn't know
 			// their sid), so forward a one-liner to the parent before each
@@ -848,9 +856,16 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 				a.sendUpdate(ctx, sess.ParentID, AgentMessageChunk(TextBlock(
 					fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80)))))
 			}
+			a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
 			started := time.Now()
 			result, failed := a.executeTool(ctx, sid, tc)
+			if hasTerminal && tc.Function.Name == termName && !terminalCalled {
+				terminalCalled = true
+				terminalMessage = result
+			}
+			useID := nextToolUseID()
 			tu := ToolUse{
+				ID:         useID,
 				Name:       tc.Function.Name,
 				Input:      tc.Function.Arguments,
 				Output:     result,
@@ -869,8 +884,10 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 			// message stream: anything past truncateThreshold is replaced
 			// with head/tail + a per-tool "to see more" hint. session.toml
 			// still records the full output via tu.Output above — only the
-			// in-flight messages[] that get re-sent every turn shrink.
-			content := truncateForLLM(tc.Function.Name, tc.Function.Arguments, result)
+			// in-flight messages[] that get re-sent every turn shrink. The
+			// hint embeds useID so the model can `view_output id=useID …`
+			// to retrieve any portion of the original without re-running.
+			content := truncateForLLM(useID, tc.Function.Name, tc.Function.Arguments, result)
 			// Small models routinely keep retrying a failing run_command
 			// without consulting the SKILL-*.md docs that were loaded into
 			// the system prompt at session start. Re-surface them at the
@@ -887,6 +904,19 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 				Content:    content,
 				ToolCallID: tc.ID,
 			})
+		}
+
+		// Terminal tool called: stream the message to the UI as one chunk
+		// (the model emitted it as tool arguments, which never went through
+		// the text-stream callback) and exit. The same-sig nudge and per-name
+		// escalation below are skipped — this turn is over.
+		if terminalCalled {
+			if on != nil && terminalMessage != "" {
+				on(terminalMessage)
+			}
+			res.Text = terminalMessage
+			stampTiming()
+			return res, nil
 		}
 
 		// If this iteration was flagged as a repeat, append a corrective

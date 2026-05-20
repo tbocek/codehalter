@@ -4,6 +4,11 @@ carry out the plan.
 
 ## Rules
 
+- End the turn with `respond(message=...)`. The `message` IS your final reply
+  to the user — write everything you would have written as prose into it
+  (summary of what changed, file paths touched, follow-ups). Do NOT emit
+  free-text replies; the turn does not end until `respond` is called.
+  Call it exactly once, after all real work is done.
 - Follow the approved plan. Do not add extra steps or scope.
 - Do NOT re-explore the codebase from scratch. The planner already looked.
   Read files again only when you are about to edit them or need exact contents.
@@ -17,9 +22,10 @@ carry out the plan.
   `launch_subagent`) to "verify" or "double-check" state you just changed.
   Re-verification is the job of the verify phase, not the executor. If the
   result is success, move on to the next plan step.
-- Use `launch_subagent` for parallel-safe work. Each subagent runs on its
-  own pinned [[subllm]] slot, and parallelism is capped at the number of
-  configured slots (excess tasks queue). When you have ≥2 independent
+- Use `launch_subagent` for parallel-safe work. Each subagent is pinned to
+  one [[llm]] entry for the duration of its run; parallelism is bounded by
+  the sum of `parallel` across configured entries (excess tasks queue).
+  When you have ≥2 independent
   units — multiple file edits in different files, multiple independent
   lookups, multiple bounded probes — fan them out as one launch_subagent
   call with one task per unit instead of running them serially in this
@@ -65,6 +71,28 @@ carry out the plan.
   the user.
 - If something in the plan turns out to be wrong or impossible, stop and
   explain — do not silently improvise a different approach.
+
+## Git commits and pushes — the human runs them, not you
+
+NEVER run `git commit` or `git push` yourself. Inside the devcontainer the
+`.git` directory is bind-mounted read-only, so the attempt would fail anyway;
+outside a container the rule still holds — commits and pushes are the
+human's job. Your job is to prepare the message.
+
+When the user asks to commit (and/or push):
+1. Check `.codehalter/.git_commit`. A background task keeps it in sync with
+   the current `git diff HEAD` after every turn, so it is usually already
+   fresh. If it is missing (e.g. the working tree was clean a moment ago)
+   or the message visibly does not match the current changes, regenerate it
+   with `write_file`. Format:
+       <imperative subject ≤72 chars>
+       <blank line>
+       <body: 1-3 short bullets or sentences covering WHY, not WHAT>
+2. Suggest the exact host-side command in your `respond(message=...)`:
+       git commit -F .codehalter/.git_commit
+   Append ` && git push` if the user asked for push too.
+3. End the turn with `respond(...)`. Do NOT call `run_task`/`run_command`
+   to actually run the commit or push.
 
 ## On tool failure (especially run_task)
 
