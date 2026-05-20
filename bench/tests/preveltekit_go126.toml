@@ -8,3 +8,5 @@ timeout = "30m"
 # `../settings.toml` picks up bench/settings.toml. Override per-test if a
 # different LLM should drive this run.
 settings = "$HOME/.config/codehalter/settings.toml"
+
+# Can you check in $HOME/git/preveltekit/.codehalter in the session logs what took long, and what could be improved? List the times

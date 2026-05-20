@@ -258,7 +258,12 @@ func Dispatch[Req any, Resp any](
 	if err != nil {
 		c.log.Error("handler failed", "method", req.Method, "error", err)
 		if req.ID != nil {
-			c.SendError(req.ID, -32000, err.Error())
+			// JSON-RPC 2.0 "Internal error". We deliberately avoid -32000:
+			// ACP reserves it for AUTH_REQUIRED, so using it for generic
+			// handler failures makes Zed render a misleading "Authentication
+			// Required" red box (with an Authenticate button) for unrelated
+			// problems — e.g. an LLM stream cancelled mid-flight by the user.
+			c.SendError(req.ID, -32603, err.Error())
 		}
 		return
 	}

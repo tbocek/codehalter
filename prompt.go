@@ -21,6 +21,18 @@ import (
 // when this sentinel reaches the top level.
 var errUserCancelled = errors.New("user cancelled")
 
+// isCancelled returns true for both the deliberate-cancel sentinel and a
+// raw context.Canceled / DeadlineExceeded. The latter is what the LLM
+// stream / HTTP client surface when the user hits the red Cancel button
+// mid-request — surfacing it as a JSON-RPC error makes Zed render the
+// AUTH_REQUIRED red box (because ACP reserves -32000 for that). All three
+// must collapse to a clean StopReasonCancelled at the top of Prompt.
+func isCancelled(err error) bool {
+	return errors.Is(err, errUserCancelled) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded)
+}
+
 // phaseNames are the pipeline stages; only the current one is shown to the
 // client at a time (the plan UI updates in place as phases progress).
 var phaseNames = []string{"Planning", "Executing", "Verifying", "Documenting"}
@@ -211,7 +223,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	a.sendPhase(ctx, req.SessionId, 0, false)
 	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)
 	if err != nil {
-		if errors.Is(err, errUserCancelled) {
+		if isCancelled(err) {
 			return PromptResponse{StopReason: StopReasonCancelled}, nil
 		}
 		return a.failPrompt(req.SessionId, err, firstToolUses)
@@ -227,7 +239,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		result, err = a.runSubtasks(ctx, req.SessionId, firstPlan.Subtasks, firstToolUses, currentUserIdx, isFirstMessage, images)
 		if err != nil {
 			// User cancellation is a clean stop, not an error to render as red.
-			if errors.Is(err, errUserCancelled) {
+			if isCancelled(err) {
 				return PromptResponse{StopReason: StopReasonCancelled}, nil
 			}
 			return a.failPrompt(req.SessionId, err, nil)
@@ -236,7 +248,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		// Single task — reuse the initial plan on attempt 0; retries re-plan.
 		result, err = a.runTaskCycle(ctx, req.SessionId, userText, planInput, currentUserIdx, isFirstMessage, images, firstPlan, firstConn, firstToolUses)
 		if err != nil {
-			if errors.Is(err, errUserCancelled) {
+			if isCancelled(err) {
 				return PromptResponse{StopReason: StopReasonCancelled}, nil
 			}
 			return a.failPrompt(req.SessionId, err, nil)
