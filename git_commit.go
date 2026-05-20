@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,6 +68,13 @@ func (a *agent) cleanupGitCommitIfClean(cwd string, sid SessionId) {
 		return
 	}
 	_ = os.Remove(filepath.Join(cwd, gitCommitFile))
+	// Reset hash so the next non-empty status regenerates the file, even
+	// if (rarely) the new status+diff hashes identical to the prior one.
+	if sess := a.getSession(sid); sess != nil {
+		sess.gitCommitMu.Lock()
+		sess.gitCommitLastHash = [32]byte{}
+		sess.gitCommitMu.Unlock()
+	}
 }
 
 // pickGitCommitConn selects an LLM slot for the background git-commit updater.
@@ -96,6 +104,19 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	if !dirExists(filepath.Join(sess.Cwd, ".git")) {
 		return
 	}
+	status, err := gitStatusPorcelain(sess.Cwd)
+	if err != nil || strings.TrimSpace(status) == "" {
+		return
+	}
+	diff, _ := gitDiffHead(sess.Cwd)
+	hash := sha256.Sum256([]byte(status + "\x00" + diff))
+	sess.gitCommitMu.Lock()
+	unchanged := hash == sess.gitCommitLastHash
+	sess.gitCommitMu.Unlock()
+	if unchanged {
+		return
+	}
+
 	if !sess.gitCommitJob.TryStart() {
 		return
 	}
@@ -104,13 +125,6 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 		sess.gitCommitJob.Done()
 		return
 	}
-
-	status, err := gitStatusPorcelain(sess.Cwd)
-	if err != nil || strings.TrimSpace(status) == "" {
-		sess.gitCommitJob.Done()
-		return
-	}
-	diff, _ := gitDiffHead(sess.Cwd)
 
 	go func() {
 		defer sess.gitCommitJob.Done()
@@ -145,6 +159,11 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 
 		path := filepath.Join(sess.Cwd, gitCommitFile)
 		_ = os.MkdirAll(filepath.Dir(path), 0o755)
-		_ = os.WriteFile(path, []byte(strings.TrimSpace(out)+"\n"), 0o644)
+		if err := os.WriteFile(path, []byte(strings.TrimSpace(out)+"\n"), 0o644); err != nil {
+			return
+		}
+		sess.gitCommitMu.Lock()
+		sess.gitCommitLastHash = hash
+		sess.gitCommitMu.Unlock()
 	}()
 }

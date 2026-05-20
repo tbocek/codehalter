@@ -145,15 +145,15 @@ func (a *agent) registerSubagentTool() {
 
 		// Parallelism is bounded by the sum of `parallel` across configured
 		// [[llm]] entries. SubagentPinOrder returns a breadth-first interleave
-		// of conn indices: for caps [1, 3] it yields [0, 1, 1, 1] — task 0
-		// pins to LLM[0] (warm parent cache benefit), tasks 1..3 to LLM[1].
-		// We dispatch len(order) tasks but cap concurrency at len(pinOrder),
-		// and within each task the per-call semaphore in llmStream throttles
-		// further if the conn is already saturated by another subagent's
-		// nested calls.
+		// of (conn, slot) pairs: for caps [1, 3] it yields
+		// [{0,0}, {1,0}, {1,1}, {1,2}] — task 0 pins to LLM[0] (warm parent
+		// cache benefit), tasks 1..3 to LLM[1] slots 0..2. We dispatch
+		// len(order) tasks but cap concurrency at len(pinOrder), and within
+		// each task the per-call semaphore in llmStream throttles further if
+		// the conn is already saturated by another subagent's nested calls.
 		pinOrder := ag.settings.SubagentPinOrder()
 		if len(pinOrder) == 0 {
-			pinOrder = []int{0}
+			pinOrder = []PinSlot{{Conn: 0, Slot: 0}}
 		}
 		fanout := len(pinOrder)
 		if fanout > len(order) {
@@ -171,9 +171,9 @@ func (a *agent) registerSubagentTool() {
 			p := uniq[h]
 			primary := p.indices[0]
 			task := p.task
-			pinnedIdx := pinOrder[k%len(pinOrder)]
-			subSess := newSubagentSession(sess.Cwd, sid, primary, sess.Depth+1, pinnedIdx)
-			subSess.DisplayLabel = fmt.Sprintf("subagent %d@llm %d", primary+1, pinnedIdx)
+			pin := pinOrder[k%len(pinOrder)]
+			subSess := newSubagentSession(sess.Cwd, sid, primary, sess.Depth+1, pin.Conn)
+			subSess.DisplayLabel = fmt.Sprintf("llm%d@%d/%d", primary+1, pin.Conn, pin.Slot)
 			ag.putSession(subSess)
 			defer ag.deleteSession(subSess.ID)
 

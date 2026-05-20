@@ -160,13 +160,23 @@ func (s *Settings) ConnAt(idx int, role string) *LLMConnection {
 	return &c
 }
 
+// PinSlot pairs a conn index with the slot-within-conn occupied by a subagent
+// task. For caps [1, 3] the breadth-first interleave yields
+// [{0,0}, {1,0}, {1,1}, {1,2}] — the Slot field disambiguates multiple
+// subagents pinned to the same conn so display labels can show conn/slot.
+type PinSlot struct {
+	Conn int
+	Slot int
+}
+
 // SubagentPinOrder returns the breadth-first slot interleave used to assign
 // pinned conn indices to subagent tasks. Caps total = sum of every LLM
 // entry's parallelCap. For caps [1, 3] the returned slice is
-// [0, 1, 1, 1] — task 0 pins to LLM[0], tasks 1..3 to LLM[1]. Tasks beyond
-// the slice length wrap (k % len), so the same per-conn cap still applies
-// once they reach the conn's semaphore at dispatch time.
-func (s *Settings) SubagentPinOrder() []int {
+// [{0,0}, {1,0}, {1,1}, {1,2}] — task 0 pins to LLM[0] slot 0, tasks 1..3
+// to LLM[1] slots 0..2. Tasks beyond the slice length wrap (k % len), so
+// the same per-conn cap still applies once they reach the conn's semaphore
+// at dispatch time.
+func (s *Settings) SubagentPinOrder() []PinSlot {
 	if len(s.LLM) == 0 {
 		return nil
 	}
@@ -176,11 +186,11 @@ func (s *Settings) SubagentPinOrder() []int {
 			maxCap = c
 		}
 	}
-	var out []int
+	var out []PinSlot
 	for slot := 0; slot < maxCap; slot++ {
 		for i := range s.LLM {
 			if slot < s.LLM[i].parallelCap() {
-				out = append(out, i)
+				out = append(out, PinSlot{Conn: i, Slot: slot})
 			}
 		}
 	}

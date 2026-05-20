@@ -163,6 +163,13 @@ type Session struct {
 	// before they read the resulting state.
 	summariseJob bgJob
 	gitCommitJob bgJob
+	// gitCommitLastHash is the sha256 of (status + diff) from the last
+	// successful backgroundGitCommit write. Subsequent calls short-circuit
+	// when the snapshot hashes identical — the file on disk is already
+	// up to date, so there's no reason to spend an LLM call. In-memory
+	// only; a restart pays one redundant regeneration on the next turn.
+	gitCommitMu       sync.Mutex
+	gitCommitLastHash [32]byte
 	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
 	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
 	// of role — cache-coherence trumps per-role sampler matching, the conn
