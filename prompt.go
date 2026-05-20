@@ -279,9 +279,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		if !subtaskPath {
 			a.backgroundSummarise(sess)
 		}
-		// Refresh .codehalter/.git_commit on LLM[2+] (or LLM[1] after
-		// shadowPending — see pickGitCommitConn). Overwrites by design, so
-		// it's safe to fire once per Prompt regardless of subtaskPath.
+		// Refresh .codehalter/.git_commit on LLM[2+] (or LLM[1] after the
+		// summariseJob settles — see pickGitCommitConn). Overwrites by
+		// design, so it's safe to fire once per Prompt regardless of subtaskPath.
 		a.backgroundGitCommit(sess)
 		a.compressHistory(ctx, sess)
 	}

@@ -57,7 +57,7 @@ func (a *agent) cleanupGitCommitIfClean(cwd string, sid SessionId) {
 		return
 	}
 	if sess := a.getSession(sid); sess != nil {
-		sess.gitCommitPending.Wait()
+		sess.gitCommitJob.Wait()
 	}
 	status, err := gitStatusPorcelain(cwd)
 	if err != nil {
@@ -70,39 +70,11 @@ func (a *agent) cleanupGitCommitIfClean(cwd string, sid SessionId) {
 }
 
 // pickGitCommitConn selects an LLM slot for the background git-commit updater.
-//
-// Rules:
-//   - Never LLM[0] — that's the foreground KV-cache slot for the user's next
-//     turn.
-//   - Prefer LLM[2..X]: those are free of the per-turn shadow summariser
-//     (which runs on LLM[1]), so we can fan out in parallel.
-//   - Fall back to LLM[1] only when no LLM[2+] is reachable. In that case the
-//     caller must wait on sess.shadowPending first so we don't pile two LLM
-//     calls on the same conn back-to-back and starve its semaphore.
-//   - Subagent sessions and <2-slot configurations get nil — feature disabled.
-//
-// Returns (conn, waitForShadow). waitForShadow=true means "wait on
-// sess.shadowPending before issuing the call"; false means "go now".
+// Delegates to pickBackgroundLLM with minIdx=2 so we prefer LLM[2+] (free of
+// the per-turn shadow summariser on LLM[1]) and fall back to LLM[1] with
+// waitForShadow=true to avoid piling two calls on the same conn.
 func (a *agent) pickGitCommitConn(sid SessionId) (*LLMConnection, bool) {
-	sess := a.getSession(sid)
-	if sess == nil || sess.Depth > 0 {
-		return nil, false
-	}
-	if len(a.settings.LLM) < 2 {
-		return nil, false
-	}
-	for i := 2; i < len(a.settings.LLM); i++ {
-		c := &a.settings.LLM[i]
-		if len(a.connReachable) > 0 && !a.connReachable[connKey(c)] {
-			continue
-		}
-		return a.settings.ConnAt(i, "execute"), false
-	}
-	c := &a.settings.LLM[1]
-	if len(a.connReachable) > 0 && !a.connReachable[connKey(c)] {
-		return nil, false
-	}
-	return a.settings.ConnAt(1, "execute"), true
+	return a.pickBackgroundLLM(sid, 2)
 }
 
 // backgroundGitCommit fires after every assistant turn. Snapshots the current
@@ -124,39 +96,39 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	if !dirExists(filepath.Join(sess.Cwd, ".git")) {
 		return
 	}
-	if !sess.gitCommitRunning.CompareAndSwap(false, true) {
+	if !sess.gitCommitJob.TryStart() {
 		return
 	}
 	conn, waitForShadow := a.pickGitCommitConn(sess.ID)
 	if conn == nil {
-		sess.gitCommitRunning.Store(false)
+		sess.gitCommitJob.Done()
 		return
 	}
 
 	status, err := gitStatusPorcelain(sess.Cwd)
 	if err != nil || strings.TrimSpace(status) == "" {
-		sess.gitCommitRunning.Store(false)
+		sess.gitCommitJob.Done()
 		return
 	}
 	diff, _ := gitDiffHead(sess.Cwd)
 
-	sess.gitCommitPending.Add(1)
 	go func() {
-		defer sess.gitCommitPending.Done()
-		defer sess.gitCommitRunning.Store(false)
+		defer sess.gitCommitJob.Done()
 		if waitForShadow {
-			sess.shadowPending.Wait()
+			sess.summariseJob.Wait()
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
 		var buf strings.Builder
 		buf.WriteString(gitCommitPrompt)
-		buf.WriteString("\n--- git status --porcelain ---\n")
+		buf.WriteString("\n<git_status>\n")
 		buf.WriteString(status)
+		buf.WriteString("</git_status>\n")
 		if strings.TrimSpace(diff) != "" {
-			buf.WriteString("\n--- git diff HEAD ---\n")
+			buf.WriteString("\n<git_diff>\n")
 			buf.WriteString(clipBytes(diff, maxShadowInputBytes))
+			buf.WriteString("\n</git_diff>\n")
 		}
 
 		out, err := a.llmSimple(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: buf.String()}})

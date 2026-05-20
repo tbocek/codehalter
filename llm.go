@@ -942,8 +942,8 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 		// iteration's tool batch. Without this, a planner that spends 17
 		// minutes in one tool loop produces zero shadow notes and a stale
 		// .codehalter/.git_commit — the existing Prompt() epilogue only runs
-		// after the whole task finishes. Coalesced via summariseRunning /
-		// gitCommitRunning so 50 iterations don't queue 50 LLM[1] jobs.
+		// after the whole task finishes. Coalesced via summariseJob /
+		// gitCommitJob (bgJob) so 50 iterations don't queue 50 LLM[1] jobs.
 		// Subagents (Depth>0) skip — they already route via their pinned slot
 		// and don't own the shadow buffer.
 		if sess := a.getSession(sid); sess != nil && sess.Depth == 0 {

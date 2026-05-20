@@ -44,9 +44,18 @@ const (
 	// model's own context window.
 	maxSummaryItemBytes = 20 * 1024
 
-	summarizePrompt = "Summarize this conversation concisely. Preserve: the user's overall goal; any open questions or in-flight work; decisions already made; file paths referenced. Do NOT include source code verbatim — reference the file path and describe what changed. Drop pleasantries and redundant detail."
-	titlePrompt     = "Generate a very short title (max 6 words) for this conversation. Reply with only the title, nothing else."
-	retitlePrompt   = "Generate a very short title (max 6 words) for this conversation based on the summary below. Reply with only the title, nothing else.\n\n"
+	summarizePrompt = "You are a context summarization assistant. Read the conversation in <conversation>…</conversation> and output a structured summary following the exact format below.\n\n" +
+		"Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.\n\n" +
+		"Preserve exact file paths, function names, identifiers, versions, and error messages. Do NOT include source code verbatim — reference the file path and describe what changed. Drop pleasantries and redundant detail.\n\n" +
+		"Format (use these EXACT H2 sections; omit a section by leaving its body empty, but keep the heading):\n\n" +
+		"## Goal\n<what the user wants overall>\n\n" +
+		"## Constraints & Preferences\n<rules / preferences the user has stated>\n\n" +
+		"## Progress\n### Done\n- [x] <completed item>\n### In Progress\n- [ ] <item being worked on>\n### Blocked\n- [ ] <item blocked, with reason>\n\n" +
+		"## Key Decisions\n<decisions already made — what + why>\n\n" +
+		"## Next Steps\n<what's queued or open>\n\n" +
+		"## Critical Context\n<paths, identifiers, versions, error strings that must not be lost>"
+	titlePrompt   = "Generate a very short title (max 6 words) for this conversation. Reply with only the title, nothing else."
+	retitlePrompt = "Generate a very short title (max 6 words) for this conversation based on the summary below. Reply with only the title, nothing else.\n\n"
 )
 
 // estimateTokens gives a rough token count for a string.
@@ -113,7 +122,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	// complete before we decide whether to use it. This happens BEFORE we
 	// re-acquire sess.mu — backgroundSummarise's goroutine acquires sess.mu
 	// briefly when reading messages, and we'd deadlock holding it here.
-	sess.shadowPending.Wait()
+	sess.summariseJob.Wait()
 	shadow := sess.drainShadow()
 
 	sess.mu.Lock()
@@ -195,7 +204,7 @@ func clipBytes(s string, max int) string {
 // so the caller can decide whether to proceed — we never silently substitute
 // truncated raw text for a real summary.
 func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnection, text string) (string, error) {
-	prompt := fmt.Sprintf("%s\n\nTarget length: ~%d tokens.\n\n---\n%s", summarizePrompt, summaryBudget, text)
+	prompt := fmt.Sprintf("%s\n\nTarget length: ~%d tokens.\n\n<conversation>\n%s\n</conversation>", summarizePrompt, summaryBudget, text)
 	return a.llmSimple(ctx, sid, conn, []llmMessage{{Role: "user", Content: prompt}})
 }
 
@@ -221,36 +230,51 @@ const structuredTurnPrompt = "Summarise this exchange into a structured turn not
 // synchronous compaction path.
 const maxShadowInputBytes = 20 * 1024
 
-// pickBackgroundConn returns a connection for background per-turn
-// summarisation. The point of doing this in the background is to keep it OFF
-// the main session's slot — that slot (LLM[0]) is holding the warm prefix
-// cache for the next turn. So we deliberately pick from LLM[1+] and never
-// the main entry. For subagent sessions (already routed via their own pin),
-// and for configurations with only LLM[0] available, we return nil — the
-// caller skips the background work and the next compaction falls through to
-// the synchronous summarize path. This is the "≥2 parallel slots"
-// recommendation in the README: with only one entry, background
-// summarisation can't run in parallel and the feature self-disables.
+// pickBackgroundLLM selects an LLM slot for background work (per-turn
+// summary, git commit refresh). LLM[0] is always skipped — it's holding the
+// warm prefix cache for the user's next foreground turn. Subagent sessions
+// and single-LLM configurations get nil; callers self-disable.
 //
-// Selection picks the first reachable LLM[1+] entry; with multiple extras
-// the per-conn semaphore in llmStream handles queueing transparently, so we
-// don't need an explicit round-robin or non-blocking probe here.
-func (a *agent) pickBackgroundConn(_ context.Context, sid SessionId) *LLMConnection {
+// minIdx controls which slots are eligible:
+//   - minIdx=1: any reachable LLM[1+]. Used by backgroundSummarise — it IS
+//     the shadow producer, so no shadow-wait is needed.
+//   - minIdx=2: prefer LLM[2+] (independent of LLM[1]'s summariser load);
+//     fall back to LLM[1] when no LLM[2+] is reachable. The fallback path
+//     reports waitForShadow=true so the caller can join sess.summariseJob
+//     before issuing the call — otherwise two LLM calls pile up on the same
+//     conn and starve its parallel semaphore.
+//
+// Returns (conn, waitForShadow). conn==nil means "feature self-disabled,
+// skip the background work".
+func (a *agent) pickBackgroundLLM(sid SessionId, minIdx int) (*LLMConnection, bool) {
 	sess := a.getSession(sid)
 	if sess == nil || sess.Depth > 0 {
-		return nil
+		return nil, false
 	}
 	if len(a.settings.LLM) < 2 {
-		return nil
+		return nil, false
 	}
-	for i := 1; i < len(a.settings.LLM); i++ {
-		c := &a.settings.LLM[i]
-		if len(a.connReachable) > 0 && !a.connReachable[connKey(c)] {
-			continue
+	reachable := func(c *LLMConnection) bool {
+		return len(a.connReachable) == 0 || a.connReachable[connKey(c)]
+	}
+	for i := minIdx; i < len(a.settings.LLM); i++ {
+		if reachable(&a.settings.LLM[i]) {
+			return a.settings.ConnAt(i, "execute"), false
 		}
-		return a.settings.ConnAt(i, "execute")
 	}
-	return nil
+	// Fallback path is only meaningful when caller asked for LLM[2+] preference.
+	if minIdx > 1 && reachable(&a.settings.LLM[1]) {
+		return a.settings.ConnAt(1, "execute"), true
+	}
+	return nil, false
+}
+
+// pickBackgroundConn is the thin shim kept for backgroundSummarise — it never
+// needs the LLM[2+] preference or the waitForShadow signal, just any
+// reachable LLM[1+].
+func (a *agent) pickBackgroundConn(_ context.Context, sid SessionId) *LLMConnection {
+	c, _ := a.pickBackgroundLLM(sid, 1)
+	return c
 }
 
 // backgroundSummarise spawns a goroutine that condenses the just-completed
@@ -260,20 +284,19 @@ func (a *agent) pickBackgroundConn(_ context.Context, sid SessionId) *LLMConnect
 // produces incremental progress notes instead of one giant summary at the end.
 // The goroutine uses context.Background() so it isn't killed when the user
 // cancels the next prompt, but it carries a generous timeout so a stuck call
-// can't pin a slot. shadowPending tracks the goroutine so compressHistory
-// can join before draining. summariseRunning coalesces back-to-back fires
-// from the tool loop — when one is in-flight, the next attempt skips and the
-// firing point after that re-snapshots.
+// can't pin a slot. The bgJob coalesces back-to-back fires from the tool loop
+// (TryStart drops when one is in-flight) and exposes Wait so compressHistory
+// can join before draining the shadow buffer.
 func (a *agent) backgroundSummarise(sess *Session) {
 	if sess == nil {
 		return
 	}
-	if !sess.summariseRunning.CompareAndSwap(false, true) {
+	if !sess.summariseJob.TryStart() {
 		return
 	}
 	conn := a.pickBackgroundConn(context.Background(), sess.ID)
 	if conn == nil {
-		sess.summariseRunning.Store(false)
+		sess.summariseJob.Done()
 		return // no separate slot; falls through to sync summarize at compaction
 	}
 
@@ -283,7 +306,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	msgs := sess.Messages
 	if len(msgs) < 2 {
 		sess.mu.Unlock()
-		sess.summariseRunning.Store(false)
+		sess.summariseJob.Done()
 		return
 	}
 	var userMsg, assistantMsg Message
@@ -299,28 +322,28 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	}
 	sess.mu.Unlock()
 	if userMsg.Role == "" || assistantMsg.Role == "" {
-		sess.summariseRunning.Store(false)
+		sess.summariseJob.Done()
 		return
 	}
 
-	sess.shadowPending.Add(1)
 	go func() {
-		defer sess.shadowPending.Done()
-		defer sess.summariseRunning.Store(false)
+		defer sess.summariseJob.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
 		var buf strings.Builder
 		buf.WriteString(structuredTurnPrompt)
-		buf.WriteString("\nUser turn:\n")
+		buf.WriteString("\n<user_turn>\n")
 		buf.WriteString(clipBytes(userMsg.Content, maxShadowInputBytes))
-		buf.WriteString("\n\nAssistant turn:\n")
+		buf.WriteString("\n</user_turn>\n<assistant_turn>\n")
 		buf.WriteString(clipBytes(assistantMsg.Content, maxShadowInputBytes))
+		buf.WriteString("\n</assistant_turn>")
 		if len(assistantMsg.ToolUses) > 0 {
-			buf.WriteString("\n\n[Tool calls performed:]\n")
+			buf.WriteString("\n<tool_calls>\n")
 			for _, tu := range assistantMsg.ToolUses {
 				fmt.Fprintf(&buf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 200))
 			}
+			buf.WriteString("</tool_calls>")
 		}
 
 		out, err := a.llmSimple(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: buf.String()}})

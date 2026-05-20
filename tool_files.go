@@ -78,11 +78,11 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "list_files",
-			"description": "List files in the project directory. Returns a newline-separated list of relative paths.",
+			"description": "List project files. Returns relative paths, newline-separated. Skips .git/.codehalter/node_modules/vendor and similar junk dirs automatically.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path": map[string]any{"type": "string", "description": "Subdirectory to list (relative to project root, empty for root)"},
+					"path": map[string]any{"type": "string", "description": "Subdirectory relative to project root. Empty = list from root."},
 				},
 			},
 		},
@@ -114,14 +114,14 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": fmt.Sprintf("Read a file. Without line/limit, reads up to %d lines (%d KB); larger files are truncated with a note — re-call with line+limit for the rest.", defaultReadLines, maxReadBytes/1024),
+			"description": fmt.Sprintf("Read a text file. Output is truncated to %d lines or %d KB — a truncation note will tell you to re-call with line+limit to continue. Do NOT re-read a file whose contents you already have in this turn's tool history; scroll back instead.", defaultReadLines, maxReadBytes/1024),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
-					"path":  map[string]any{"type": "string", "description": "Path to the file (absolute or relative to project root)"},
-					"line":  map[string]any{"type": "integer", "description": "Start line (1-based). Omit to read from the beginning."},
-					"limit": map[string]any{"type": "integer", "description": fmt.Sprintf("Max number of lines to read (hard cap %d). Omit for the default window.", maxReadLines)},
+					"path":  map[string]any{"type": "string", "description": "Absolute path or path relative to the project root."},
+					"line":  map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
+					"limit": map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line window.", maxReadLines, defaultReadLines)},
 				},
 			},
 		},
@@ -194,13 +194,13 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "write_file",
-			"description": "Write content to a file in the project.",
+			"description": "Create a new file or completely overwrite an existing one. For targeted changes to an existing file use edit_file — it preserves context that write_file would clobber.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path", "content"},
 				"properties": map[string]any{
-					"path":    map[string]any{"type": "string", "description": "Path to the file (absolute or relative to project root)"},
-					"content": map[string]any{"type": "string", "description": "The new file content"},
+					"path":    map[string]any{"type": "string", "description": "Absolute path or path relative to the project root."},
+					"content": map[string]any{"type": "string", "description": "Full file content. Will replace the file entirely."},
 				},
 			},
 		},
@@ -229,14 +229,14 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "edit_file",
-			"description": "Edit a file by replacing a specific text snippet. Use read_file first to see the current content. The old_text must match exactly (including whitespace).",
+			"description": "Replace one exact text snippet in a file. Use read_file first to see the current contents. Returns an error when old_text is missing, matches more than once, or the file can't be written — fix and retry.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path", "old_text", "new_text"},
 				"properties": map[string]any{
-					"path":     map[string]any{"type": "string", "description": "Path to the file (absolute or relative to project root)"},
-					"old_text": map[string]any{"type": "string", "description": "The exact text to find and replace"},
-					"new_text": map[string]any{"type": "string", "description": "The replacement text"},
+					"path":     map[string]any{"type": "string", "description": "Absolute path or path relative to the project root."},
+					"old_text": map[string]any{"type": "string", "description": "Exact text to find. MUST match the file byte-for-byte (whitespace, indentation, trailing newlines included) AND must be unique in the file — include enough surrounding context to disambiguate."},
+					"new_text": map[string]any{"type": "string", "description": "Replacement text. Pass an empty string to delete old_text."},
 				},
 			},
 		},

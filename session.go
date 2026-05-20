@@ -66,6 +66,38 @@ type ToolUse struct {
 	DurationMs int64     `toml:"duration_ms,omitempty"`
 }
 
+// bgJob coalesces fan-out of a fire-and-forget background goroutine and lets
+// other goroutines join the in-flight call. TryStart claims the slot AND
+// registers the pending goroutine in one atomic step — the caller must defer
+// Done on every path after a successful TryStart (including early returns
+// from within the launching function, before the goroutine itself fires).
+type bgJob struct {
+	running atomic.Bool
+	pending sync.WaitGroup
+}
+
+// TryStart attempts to acquire the slot. Returns true when the caller is now
+// the active runner (and MUST call Done exactly once); false when another
+// runner is in-flight and this caller should skip.
+func (j *bgJob) TryStart() bool {
+	if !j.running.CompareAndSwap(false, true) {
+		return false
+	}
+	j.pending.Add(1)
+	return true
+}
+
+// Done releases the slot and decrements the pending WaitGroup. Pair with a
+// successful TryStart.
+func (j *bgJob) Done() {
+	j.pending.Done()
+	j.running.Store(false)
+}
+
+// Wait blocks until any in-flight goroutine claimed via TryStart has called
+// Done. Used by joiners that need fresh state.
+func (j *bgJob) Wait() { j.pending.Wait() }
+
 type Session struct {
 	ID        SessionId      `toml:"id"`
 	Cwd       string         `toml:"cwd"`
@@ -118,33 +150,19 @@ type Session struct {
 	// mu (compressHistory in particular).
 	mu sync.Mutex
 	// shadowSummary accumulates structured per-turn notes (Goal / Constraints
-	// / Progress / Decisions / Next Steps / Critical Context) produced by
-	// the background summariser fired at the end of each turn. compressHistory
+	// / Progress / Decisions / Next Steps / Critical Context) produced by the
+	// background summariser fired after each llmStream response. compressHistory
 	// drains this into Session.Summary instead of running the synchronous
-	// summarize pass — the work has already been spread across each turn while
-	// the user wasn't waiting. shadowPending tracks the background goroutine
-	// so compaction can join any in-flight call before draining. In-memory
-	// only: if the process restarts before compaction, the work is lost and
-	// the next compaction falls through to the synchronous path.
+	// summarize pass. In-memory only — process restart loses it and the next
+	// compaction falls through to the synchronous path.
 	shadowMu      sync.Mutex
 	shadowSummary strings.Builder
-	shadowPending sync.WaitGroup
-	// gitCommitPending tracks in-flight backgroundGitCommit goroutines so the
-	// per-prompt cleanup (cleanupGitCommitIfClean) can wait for them before
-	// checking the working-tree status. Without the wait, a slow LLM call from
-	// turn N could resurrect a .codehalter/.git_commit file that turn N+1's
-	// cleanup just deleted because the user committed externally meanwhile.
-	gitCommitPending sync.WaitGroup
-	// summariseRunning / gitCommitRunning coalesce per-LLM-call fan-out. The
-	// tool loop fires background summary + git_commit after every llmStream
-	// response — a single stuck planner can issue 50+ iterations, which would
-	// otherwise queue 50+ jobs against LLM[1]'s parallel cap. CompareAndSwap
-	// here drops the call when a prior one is still in-flight; the next free
-	// firing point re-snapshots from the now-fresher session/working-tree
-	// state, so we get progress notes paced by the summariser/git_commit
-	// LLM's natural speed instead of letting an unbounded queue accumulate.
-	summariseRunning atomic.Bool
-	gitCommitRunning atomic.Bool
+	// summariseJob / gitCommitJob coalesce per-LLM-call fan-out: TryStart
+	// drops the call when a prior one is in-flight, and Wait() lets callers
+	// (compressHistory, cleanupGitCommitIfClean) join any pending goroutine
+	// before they read the resulting state.
+	summariseJob bgJob
+	gitCommitJob bgJob
 	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
 	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
 	// of role — cache-coherence trumps per-role sampler matching, the conn
@@ -383,8 +401,8 @@ func (s *Session) appendShadow(chunk string) {
 }
 
 // drainShadow returns the accumulated structured notes and resets the buffer.
-// Called by compressHistory after joining shadowPending — at that point the
-// buffer holds every per-turn note since the last compaction.
+// Called by compressHistory after joining sess.summariseJob — at that point
+// the buffer holds every per-turn note since the last compaction.
 func (s *Session) drainShadow() string {
 	s.shadowMu.Lock()
 	defer s.shadowMu.Unlock()
