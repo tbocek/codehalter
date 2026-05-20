@@ -915,6 +915,19 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 			})
 		}
 
+		// Per-LLM-call progress fan-out: fire summary + git_commit after each
+		// iteration's tool batch. Without this, a planner that spends 17
+		// minutes in one tool loop produces zero shadow notes and a stale
+		// .codehalter/.git_commit — the existing Prompt() epilogue only runs
+		// after the whole task finishes. Coalesced via summariseRunning /
+		// gitCommitRunning so 50 iterations don't queue 50 LLM[1] jobs.
+		// Subagents (Depth>0) skip — they already route via their pinned slot
+		// and don't own the shadow buffer.
+		if sess := a.getSession(sid); sess != nil && sess.Depth == 0 {
+			a.backgroundSummarise(sess)
+			a.backgroundGitCommit(sess)
+		}
+
 		// Terminal tool called: stream the message to the UI as one chunk
 		// (the model emitted it as tool arguments, which never went through
 		// the text-stream callback) and exit. The same-sig nudge and per-name

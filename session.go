@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -134,6 +135,16 @@ type Session struct {
 	// turn N could resurrect a .codehalter/.git_commit file that turn N+1's
 	// cleanup just deleted because the user committed externally meanwhile.
 	gitCommitPending sync.WaitGroup
+	// summariseRunning / gitCommitRunning coalesce per-LLM-call fan-out. The
+	// tool loop fires background summary + git_commit after every llmStream
+	// response — a single stuck planner can issue 50+ iterations, which would
+	// otherwise queue 50+ jobs against LLM[1]'s parallel cap. CompareAndSwap
+	// here drops the call when a prior one is still in-flight; the next free
+	// firing point re-snapshots from the now-fresher session/working-tree
+	// state, so we get progress notes paced by the summariser/git_commit
+	// LLM's natural speed instead of letting an unbounded queue accumulate.
+	summariseRunning atomic.Bool
+	gitCommitRunning atomic.Bool
 	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
 	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
 	// of role — cache-coherence trumps per-role sampler matching, the conn

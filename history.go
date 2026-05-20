@@ -255,19 +255,25 @@ func (a *agent) pickBackgroundConn(_ context.Context, sid SessionId) *LLMConnect
 
 // backgroundSummarise spawns a goroutine that condenses the just-completed
 // turn pair (last user message + last assistant response) into the structured
-// note format and appends it to the session's shadow buffer. Called from the
-// end of Prompt — the user has already received the assistant reply by then,
-// so latency here is invisible to them. The goroutine uses
-// context.Background() so it isn't killed when the user cancels the next
-// prompt, but it carries a generous timeout so a stuck call can't pin a slot.
-// shadowPending tracks the goroutine so compressHistory can join before
-// draining.
+// note format and appends it to the session's shadow buffer. Fired after each
+// llmStream response inside the tool loop, so a long-running phase still
+// produces incremental progress notes instead of one giant summary at the end.
+// The goroutine uses context.Background() so it isn't killed when the user
+// cancels the next prompt, but it carries a generous timeout so a stuck call
+// can't pin a slot. shadowPending tracks the goroutine so compressHistory
+// can join before draining. summariseRunning coalesces back-to-back fires
+// from the tool loop — when one is in-flight, the next attempt skips and the
+// firing point after that re-snapshots.
 func (a *agent) backgroundSummarise(sess *Session) {
 	if sess == nil {
 		return
 	}
+	if !sess.summariseRunning.CompareAndSwap(false, true) {
+		return
+	}
 	conn := a.pickBackgroundConn(context.Background(), sess.ID)
 	if conn == nil {
+		sess.summariseRunning.Store(false)
 		return // no separate slot; falls through to sync summarize at compaction
 	}
 
@@ -277,6 +283,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	msgs := sess.Messages
 	if len(msgs) < 2 {
 		sess.mu.Unlock()
+		sess.summariseRunning.Store(false)
 		return
 	}
 	var userMsg, assistantMsg Message
@@ -292,12 +299,14 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	}
 	sess.mu.Unlock()
 	if userMsg.Role == "" || assistantMsg.Role == "" {
+		sess.summariseRunning.Store(false)
 		return
 	}
 
 	sess.shadowPending.Add(1)
 	go func() {
 		defer sess.shadowPending.Done()
+		defer sess.summariseRunning.Store(false)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 

@@ -124,13 +124,18 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	if !dirExists(filepath.Join(sess.Cwd, ".git")) {
 		return
 	}
+	if !sess.gitCommitRunning.CompareAndSwap(false, true) {
+		return
+	}
 	conn, waitForShadow := a.pickGitCommitConn(sess.ID)
 	if conn == nil {
+		sess.gitCommitRunning.Store(false)
 		return
 	}
 
 	status, err := gitStatusPorcelain(sess.Cwd)
 	if err != nil || strings.TrimSpace(status) == "" {
+		sess.gitCommitRunning.Store(false)
 		return
 	}
 	diff, _ := gitDiffHead(sess.Cwd)
@@ -138,6 +143,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	sess.gitCommitPending.Add(1)
 	go func() {
 		defer sess.gitCommitPending.Done()
+		defer sess.gitCommitRunning.Store(false)
 		if waitForShadow {
 			sess.shadowPending.Wait()
 		}
