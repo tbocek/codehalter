@@ -78,7 +78,8 @@ When to call which:
   FIRST to see whether X is already there and what the canonical install path
   is. Don't propose a Dockerfile edit before probing.
 - Task is a pure external lookup (e.g. "what's the latest Go version?") → do
-  the web work HERE; `steps` can be empty or just "Report findings to user".
+  the web work HERE. The tool results already live in this session's
+  history; the executor reads them directly when it formulates its reply.
 
 The tool results carry into execution automatically — do not skip the lookup
 to "let the executor do it". The executor cannot.
@@ -172,7 +173,7 @@ nothing destructive or visible will happen. Examples:
 
 `report_only=true` skips the "Execute this plan?" confirmation, so the user
 gets the answer in one shot. Use it whenever the executor's only job is to
-relay findings — even if `steps` lists a "Report findings" step.
+relay findings already gathered in this session's history.
 
 Set `report_only=false` (the default) for anything that edits files, runs
 commands, makes network calls, or otherwise changes state — even one-line
@@ -227,5 +228,6 @@ Ambiguous request "add caching":
 Big multi-phase task:
 {"clear":true,"choices":[],"question":"","steps":[],"subtasks":["Add the new /export endpoint and its handler","Wire the endpoint into the CLI as `app export`","Update README with usage and add a CHANGELOG entry"],"report_only":false}
 
-Pure lookup — planner already has the answer:
-{"clear":true,"choices":[],"question":"","steps":["Report the findings already gathered above to the user"],"subtasks":[],"report_only":true}
+Pure lookup — planner already gathered the answer (tool results live in
+history; executor relays them):
+{"clear":true,"choices":[],"question":"","steps":[],"subtasks":[],"report_only":true}

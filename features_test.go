@@ -199,24 +199,6 @@ func TestUpsertLastAssistant(t *testing.T) {
 	}
 }
 
-// TestUpdateLastMessageContentBounds guards the silent out-of-bounds branch —
-// an invalid idx must not panic and must not mutate anything.
-func TestUpdateLastMessageContentBounds(t *testing.T) {
-	s := &Session{Messages: []Message{{Role: "user", Content: "hi"}}}
-
-	s.UpdateLastMessageContent(-1, "x")
-	s.UpdateLastMessageContent(99, "x")
-	if s.Messages[0].Content != "hi" {
-		t.Errorf("out-of-bounds idx should not mutate, got %q", s.Messages[0].Content)
-	}
-
-	// Valid idx still updates.
-	s.UpdateLastMessageContent(0, "updated")
-	if s.Messages[0].Content != "updated" {
-		t.Errorf("valid idx: got %q, want 'updated'", s.Messages[0].Content)
-	}
-}
-
 // ---------------------------------------------------------------------------
 // History shape
 // ---------------------------------------------------------------------------
@@ -390,11 +372,7 @@ func TestVerifyJSONParseFallback(t *testing.T) {
 	defer mock.Close()
 
 	res := toolLoopResult{Text: "my previous response"}
-	out, vr, err := a.verify(
-		context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "do a thing"}},
-		res, "do a thing", nil,
-	)
+	out, vr, err := a.verify(context.Background(), s.ID, mock.conn("execute"), res)
 	if err != nil {
 		t.Fatalf("verify returned error: %v", err)
 	}

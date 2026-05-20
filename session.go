@@ -390,17 +390,6 @@ func (s *Session) SetTitle(t string) {
 	s.mu.Unlock()
 }
 
-// UpdateLastMessageContent mutates the Content field of message at idx. Used
-// by the prompt loop to inject plan context into the user turn.
-func (s *Session) UpdateLastMessageContent(idx int, content string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if idx < 0 || idx >= len(s.Messages) {
-		return
-	}
-	s.Messages[idx].Content = content
-}
-
 // UpsertLastAssistant sets the content of the trailing assistant message,
 // or appends a new one if the last message is not already an assistant turn.
 func (s *Session) UpsertLastAssistant(content string) {

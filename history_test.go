@@ -969,9 +969,11 @@ func TestCapReadContent(t *testing.T) {
 // leading tokens of the old one, so any drift in the prefix bytes silently
 // reprocesses the entire history each turn.
 //
-// The test mirrors what runTaskCycle does: stash a stored-message string,
-// build the wire content (with sysPrompt prepended on the first turn only),
-// then build messages for a second turn and compare.
+// The append-only transcript model makes this trivial: each phase pushes a
+// new user/assistant pair onto sess.Messages and never mutates earlier
+// entries, so buildLLMHistory replays the same bytes. The test exercises the
+// load-bearing case — the first turn's user message folds in the sysPrompt
+// prefix, and that prefix must remain identical on later turns.
 func TestPrefixStableAcrossTurns(t *testing.T) {
 	dir := t.TempDir()
 
@@ -994,37 +996,27 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 
 	// Sanity: systemPrompt must be non-empty so the bug we're guarding
 	// against (sysPrompt prepended turn 1, dropped turn 2) is observable.
-	if sp, _ := a.systemPrompt(s.ID); sp == "" {
+	sysPrompt, _ := a.systemPrompt(s.ID)
+	if sysPrompt == "" {
 		t.Fatal("expected non-empty systemPrompt — SKILL seed didn't take effect")
 	}
 
 	// --- Turn 1: first prompt of the session ---
-	s.AddUser("first prompt")
-	idx1 := len(s.Messages) - 1
+	// Prompt() folds sysPrompt into the user's first message; subsequent
+	// phases (PLAN/EXECUTE/VERIFY/DOCUMENT.md) get their own user turns.
+	s.AddUser(sysPrompt + "\n---\nfirst prompt")
+	msgs1 := a.buildLLMHistory(s, -1)
 
-	stored1, err := a.composeUserContent(s.ID, "first prompt", nil, nil, true)
-	if err != nil {
-		t.Fatalf("composeUserContent turn 1: %v", err)
-	}
-	s.UpdateLastMessageContent(idx1, stored1)
-
-	msgs1 := a.buildLLMHistory(s, idx1)
-	msgs1 = append(msgs1, a.buildUserMessage(stored1, nil))
-
-	// LLM replies; runTaskCycle persists the assistant turn.
+	// Assistant replies (planner JSON, executor text, etc. — collapsed to
+	// one assistant message here since the test only cares about the
+	// user/assistant alternation that lands in history).
 	s.UpsertLastAssistant("done with turn 1")
 
 	// --- Turn 2: a follow-up prompt ---
+	// Subsequent user turns store just the raw text — sysPrompt is already
+	// in sess.Messages[0] from turn 1.
 	s.AddUser("second prompt")
-	idx2 := len(s.Messages) - 1
-	stored2, err := a.composeUserContent(s.ID, "second prompt", nil, nil, false)
-	if err != nil {
-		t.Fatalf("composeUserContent turn 2: %v", err)
-	}
-	s.UpdateLastMessageContent(idx2, stored2)
-
-	msgs2 := a.buildLLMHistory(s, idx2)
-	msgs2 = append(msgs2, a.buildUserMessage(stored2, nil))
+	msgs2 := a.buildLLMHistory(s, -1)
 
 	if len(msgs2) <= len(msgs1) {
 		t.Fatalf("turn 2 should extend turn 1's history; got len1=%d len2=%d",

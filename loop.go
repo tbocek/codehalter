@@ -12,11 +12,14 @@ import (
 // verify, with an optional document phase after a successful verify. When
 // verify fails with fix steps, the loop re-plans with the failure context and
 // runs again (up to maxAttempts, with Jaccard duplicate-issue detection to
-// bail early when the model is rephrasing the same problem). Each phase is a
-// thin wrapper over runToolLoop; runTaskCycle (at the bottom) is the retry
-// engine. The Prompt orchestrator (prompt.go) calls runTaskCycle once per
-// task — either directly for simple requests, or once per subtask for big
-// requests decomposed by the planner.
+// bail early when the model is rephrasing the same problem).
+//
+// Each phase appends its prompt file (PLAN.md / EXECUTE.md / VERIFY.md /
+// DOCUMENT.md) as a fresh user message on sess.Messages, runs the LLM with
+// the full history as input, then persists the LLM's response as the
+// trailing assistant message. The transcript IS the history — no synthetic
+// handoff strings, no message rewriting, so the prefix cache stays warm
+// across phases by simple append.
 
 // ---------------------------------------------------------------------------
 // Plan phase
@@ -41,12 +44,14 @@ type planResult struct {
 	ReportOnly bool `json:"report_only"`
 }
 
-// runPlanLLM runs the planning LLM and parses the JSON response. Returns
+// runPlanLLM appends PLAN.md (plus an optional replanContext on retries) as a
+// fresh user message, runs the planning LLM, persists the JSON response as
+// the trailing assistant turn, and returns the parsed plan. Returns
 // (nil, nil, nil, err) when no LLM is configured. Returns (thinking, nil, ...)
 // when there's no PLAN.md, the tool loop fails, or the response can't be
 // parsed even after one corrective retry — callers treat any of those as
 // "no plan, proceed without one".
-func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) (*LLMConnection, *planResult, []ToolUse, error) {
+func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, replanContext string) (*LLMConnection, *planResult, []ToolUse, error) {
 	thinking := a.pickAvailable(ctx, sid, "thinking")
 	if thinking == nil {
 		return nil, nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
@@ -64,15 +69,24 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 	if hint := a.verifyTargetHint(); hint != "" {
 		planPrompt = planPrompt + "\n\n" + hint
 	}
-	// Carry the full session history so plan shares a prefix with the other
-	// phases (execute/verify/document). Without this, each turn's plan call
-	// sends only `PLAN.md + userText` and the cache from prior turns is
-	// useless.
+	// On retries the caller supplies a short "the previous attempt failed —
+	// re-plan" note; the actual failure detail is already in history on the
+	// preceding verify response, so we don't repeat it here.
+	if replanContext != "" {
+		planPrompt = planPrompt + "\n\n" + replanContext
+	}
+
+	sess := a.getSession(sid)
+	if sess != nil {
+		sess.AddUser(planPrompt)
+		_ = sess.Save()
+	}
+
 	var messages []llmMessage
-	if sess := a.getSession(sid); sess != nil {
+	if sess != nil {
 		messages = a.buildLLMHistory(sess, -1)
 	}
-	messages = append(messages, llmMessage{Role: "user", Content: planPrompt + "\n\nUser request: " + userText})
+
 	var plan planResult
 	// Exclude respond: planning emits a JSON object as plain text, so we don't
 	// want the model to escape into the synthetic terminal-tool grammar that
@@ -80,6 +94,10 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, userText string) 
 	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", &plan)
 	if err != nil {
 		return thinking, nil, planRes.ToolUses, nil
+	}
+	if sess != nil && planRes.Text != "" {
+		sess.UpsertLastAssistant(planRes.Text)
+		_ = sess.Save()
 	}
 	return thinking, &plan, planRes.ToolUses, nil
 }
@@ -101,16 +119,42 @@ func (a *agent) renderSteps(ctx context.Context, sid SessionId, steps []string, 
 	return planText.String()
 }
 
-// planAndRoute analyzes the user's request, asks for clarification if needed,
-// shows the plan, and asks the user to confirm before execution.
+// appendAssistantNote concatenates a short note (e.g. "Understood: A",
+// "User declined execution") onto the trailing assistant message instead of
+// creating a fresh assistant turn. Two consecutive assistant messages would
+// break strict role alternation; UpsertLastAssistant overwrites in place,
+// preserving the planner's JSON content plus any prior tool uses.
+func appendAssistantNote(sess *Session, note string) {
+	if sess == nil || note == "" {
+		return
+	}
+	sess.mu.Lock()
+	var existing string
+	if len(sess.Messages) > 0 && sess.Messages[len(sess.Messages)-1].Role == "assistant" {
+		existing = sess.Messages[len(sess.Messages)-1].Content
+	}
+	sess.mu.Unlock()
+	if existing != "" {
+		sess.UpsertLastAssistant(existing + "\n\n" + note)
+	} else {
+		sess.UpsertLastAssistant(note)
+	}
+}
+
+// planAndRoute appends PLAN.md, runs the planner, asks for clarification if
+// needed, shows the plan, and asks the user to confirm before execution.
 //
 // Returns the LLM connection, the parsed plan (may be nil if parsing failed
 // or there is no PLAN.md), the tool uses performed during planning, and an
 // error. When the plan has Subtasks, the "Execute this plan?" confirmation
 // is skipped — the caller (Prompt → runSubtasks) handles a one-shot
 // Interactive/Automatic/Cancel prompt for the whole batch instead.
-func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string) (*LLMConnection, *planResult, []ToolUse, error) {
-	thinking, plan, toolUses, err := a.runPlanLLM(ctx, sid, userText)
+//
+// replanContext is "" on the first planning pass; on re-plan it's a short
+// "the previous attempt failed verification — re-plan" note (the failure
+// detail itself is already in history on the preceding verify response).
+func (a *agent) planAndRoute(ctx context.Context, sid SessionId, replanContext string) (*LLMConnection, *planResult, []ToolUse, error) {
+	thinking, plan, toolUses, err := a.runPlanLLM(ctx, sid, replanContext)
 	if err != nil || plan == nil {
 		return thinking, plan, toolUses, err
 	}
@@ -129,15 +173,15 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
 		if err != nil || choice == "abort" {
+			appendAssistantNote(sess, "User aborted on clarification.")
 			if sess != nil {
-				sess.AddAssistant(question + "\n(choices: " + strings.Join(plan.Choices, ", ") + ")\nUser aborted.")
 				_ = sess.Save()
 			}
 			return nil, nil, toolUses, errUserCancelled
 		}
 
+		appendAssistantNote(sess, "User chose: "+choice)
 		if sess != nil {
-			sess.AddAssistant(question + "\n(choices: " + strings.Join(plan.Choices, ", ") + ")\nUser chose: " + choice)
 			_ = sess.Save()
 		}
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Understood: "+choice+"\n")))
@@ -156,7 +200,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		if plan.ReportOnly {
 			header = "Findings:"
 		}
-		planText := a.renderSteps(ctx, sid, plan.Steps, header)
+		a.renderSteps(ctx, sid, plan.Steps, header)
 
 		// Pure-lookup plans need no execution gate — the executor just
 		// relays what the planner already gathered. PLAN.md tells the
@@ -170,8 +214,8 @@ func (a *agent) planAndRoute(ctx context.Context, sid SessionId, userText string
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf("User chose: %v", ok))})
 
 		if err != nil || !ok {
+			appendAssistantNote(sess, "User declined execution.")
 			if sess != nil {
-				sess.AddAssistant(planText + "\nUser declined execution.")
 				_ = sess.Save()
 			}
 			return nil, nil, toolUses, errUserCancelled
@@ -223,9 +267,11 @@ func (a *agent) verifyTargetHint() string {
 	)
 }
 
-// execute runs the execution phase. It prepends EXECUTE.md (if present) to the
-// last user message, excludes web tools (information retrieval belongs to the
-// planning phase), and runs the agentic tool loop with write-enabled tools.
+// execute runs the execution phase. It appends EXECUTE.md (if present) as a
+// fresh user message, excludes web tools (information retrieval belongs to
+// the planning phase), and runs the agentic tool loop with write-enabled
+// tools. The response is persisted as the trailing assistant turn.
+//
 // extraExclude lists additional tool names to exclude (e.g. launch_subagent
 // when a subagent has reached its max nesting depth).
 //
@@ -233,7 +279,7 @@ func (a *agent) verifyTargetHint() string {
 // cache consistency — every phase (plan/execute/verify/document) hits the
 // same slot so the prefix cache stays warm across the whole turn. Subagent
 // sessions route to their pinned LLM[i] for the same reason.
-func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessage, extraExclude ...string) (toolLoopResult, error) {
+func (a *agent) execute(ctx context.Context, sid SessionId, extraExclude ...string) (toolLoopResult, error) {
 	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
 	if hint := a.verifyTargetHint(); hint != "" {
 		if executeMD != "" {
@@ -242,21 +288,30 @@ func (a *agent) execute(ctx context.Context, sid SessionId, messages []llmMessag
 			executeMD = hint
 		}
 	}
-	if executeMD != "" && len(messages) > 0 {
-		last := len(messages) - 1
-		if messages[last].Role == "user" {
-			if content, ok := messages[last].Content.(string); ok {
-				messages[last].Content = executeMD + "\n\n---\n\n" + content
-			}
-		}
+	sess := a.getSession(sid)
+	if sess != nil && executeMD != "" {
+		sess.AddUser(executeMD)
+		_ = sess.Save()
+	}
+	var messages []llmMessage
+	if sess != nil {
+		messages = a.buildLLMHistory(sess, -1)
 	}
 	exclude := map[string]bool{"web_search": true, "web_read": true, "web_read_raw": true}
 	for _, name := range extraExclude {
 		exclude[name] = true
 	}
-	return a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{
+	res, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{
 		exclude: exclude,
 	}, "execute")
+	if err != nil {
+		return res, err
+	}
+	if sess != nil && res.Text != "" {
+		sess.UpsertLastAssistant(res.Text)
+		_ = sess.Save()
+	}
+	return res, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -276,58 +331,59 @@ type verifyResult struct {
 	SustainabilityConcerns []string `json:"sustainability_concerns,omitempty"`
 }
 
-// verify runs a self-check after execution. It routes to the "execute" role
-// (lower temperature, less thinking) rather than reusing the planner's
-// connection — small thinking models tend to rationalize failures into
-// success=true, while a colder execute model sticks to the rule. Result.FixSteps
-// (when present) signals the caller to re-plan with the failure context — the
-// inline-fix path was removed because small models tend to compound errors when
-// handed a growing context of fix attempts. Returns the final result and the
-// verify outcome.
+// verify appends VERIFY.md as a fresh user message and runs a self-check.
+// It routes to the "execute" role (lower temperature, less thinking) rather
+// than reusing the planner's connection — small thinking models tend to
+// rationalize failures into success=true, while a colder execute model
+// sticks to the rule. Result.FixSteps (when present) signals the caller to
+// re-plan with the failure context. Returns the merged result and the verify
+// outcome.
 //
-// When fallbackConn is non-nil, it's used only if no LLM is configured for the
-// execute role (test path with synthetic agent and no settings).
-func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConnection, messages []llmMessage, res toolLoopResult, userText string, planSteps []string) (toolLoopResult, *verifyResult, error) {
+// When fallbackConn is non-nil, it's used only if no LLM is configured for
+// the execute role (test path with synthetic agent and no settings).
+func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConnection, res toolLoopResult) (toolLoopResult, *verifyResult, error) {
 	verifyPrompt := a.loadPromptFile(sid, "VERIFY.md")
 	if verifyPrompt == "" {
 		return res, &verifyResult{Success: true}, nil
 	}
 
-	// Same routing as execute(): main session uses LLM[0], subagents their pinned LLM[i].
+	// Same routing as execute(): main session uses LLM[0], subagents their
+	// pinned LLM[i].
 	conn := a.pickAvailable(ctx, sid, "execute")
 	if conn == nil {
 		conn = fallbackConn
 	}
 
-	var prompt strings.Builder
-	prompt.WriteString(verifyPrompt)
+	prompt := verifyPrompt
 	if hint := a.verifyTargetHint(); hint != "" {
-		prompt.WriteString("\n\n")
-		prompt.WriteString(hint)
+		prompt = prompt + "\n\n" + hint
 	}
-	prompt.WriteString("\n\nUser request: ")
-	prompt.WriteString(userText)
-	if len(planSteps) > 0 {
-		prompt.WriteString("\n\nApproved plan:\n")
-		for i, step := range planSteps {
-			fmt.Fprintf(&prompt, "%d. %s\n", i+1, step)
-		}
+
+	sess := a.getSession(sid)
+	if sess != nil {
+		sess.AddUser(prompt)
+		_ = sess.Save()
 	}
-	prompt.WriteString("\n\nYour response was:\n")
-	prompt.WriteString(res.Text)
 
 	// Capture executor's tool-use count before we append verify's own —
 	// the Failed override only inspects executor tools.
 	execToolCount := len(res.ToolUses)
 
-	verifyMessages := append(messages, llmMessage{Role: "user", Content: prompt.String()})
+	var messages []llmMessage
+	if sess != nil {
+		messages = a.buildLLMHistory(sess, -1)
+	}
 	var result verifyResult
-	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, verifyMessages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "verify", &result)
+	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "verify", &result)
 	res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
 	if err != nil {
 		slog.Error("verify: skipped, treating as success", "err", err)
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Verification skipped: "+err.Error()+"\n")))
 		return res, &verifyResult{Success: true}, nil
+	}
+	if sess != nil && verifyRes.Text != "" {
+		sess.UpsertLastAssistant(verifyRes.Text)
+		_ = sess.Save()
 	}
 
 	// Exit-code authority: the executor's typed Failed flags are ground
@@ -395,40 +451,33 @@ func hasFileWrites(uses []ToolUse) bool {
 }
 
 // document runs after a successful verify when the turn actually wrote files.
-// It hands the executor's response to the thinking LLM with DOCUMENT.md so the
-// LLM can update (or create) the project README when the change is user-visible.
-func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection, userText string, planSteps []string, exec toolLoopResult) (toolLoopResult, error) {
+// It appends DOCUMENT.md as a fresh user message and runs the thinking LLM so
+// it can update (or create) the project README when the change is
+// user-visible.
+func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection, exec toolLoopResult) (toolLoopResult, error) {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
 	if docPrompt == "" {
 		return exec, nil
 	}
 
-	var prompt strings.Builder
-	prompt.WriteString(docPrompt)
-	prompt.WriteString("\n\nUser request: ")
-	prompt.WriteString(userText)
-	if len(planSteps) > 0 {
-		prompt.WriteString("\n\nApproved plan:\n")
-		for i, step := range planSteps {
-			fmt.Fprintf(&prompt, "%d. %s\n", i+1, step)
-		}
+	sess := a.getSession(sid)
+	if sess != nil {
+		sess.AddUser(docPrompt)
+		_ = sess.Save()
 	}
-	prompt.WriteString("\n\nExecutor response:\n")
-	prompt.WriteString(exec.Text)
 
-	// Carry the session history so document shares a prefix with the other
-	// phases — the prior turns are identical bytes to what plan/execute/
-	// verify just saw, so the slot's cache stays warm into the doc pass
-	// instead of being thrown away for a fresh fill.
 	var messages []llmMessage
-	if sess := a.getSession(sid); sess != nil {
+	if sess != nil {
 		messages = a.buildLLMHistory(sess, -1)
 	}
-	messages = append(messages, llmMessage{Role: "user", Content: prompt.String()})
 	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "document")
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil
+	}
+	if sess != nil && docRes.Text != "" {
+		sess.UpsertLastAssistant(docRes.Text)
+		_ = sess.Save()
 	}
 	exec.ToolUses = append(exec.ToolUses, docRes.ToolUses...)
 	return exec, nil
@@ -439,16 +488,13 @@ func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection
 // ---------------------------------------------------------------------------
 
 // runTaskCycle runs plan → execute → verify with retries for a single task.
-// On attempt 0, a pre-computed plan may be supplied (prePlan/preConn/preToolUses)
-// to avoid re-planning after an upfront planAndRoute call; retries always
-// re-plan with the failure context. userText is the original user-facing
-// request, planInput is what the planner sees (may carry failure context).
+// On attempt 0, a pre-computed plan may be supplied (prePlan/preConn) to
+// avoid re-planning after an upfront planAndRoute call; retries always
+// re-plan, with a short replanContext nudging the planner toward the prior
+// verify failure that's already in history.
 func (a *agent) runTaskCycle(
 	ctx context.Context, sid SessionId,
-	userText, planInput string,
-	currentUserIdx int, isFirstInSession bool,
-	images []ImageData,
-	prePlan *planResult, preConn *LLMConnection, preToolUses []ToolUse,
+	prePlan *planResult, preConn *LLMConnection,
 ) (toolLoopResult, error) {
 	const maxAttempts = 20
 	var result toolLoopResult
@@ -463,16 +509,12 @@ func (a *agent) runTaskCycle(
 	sess := a.getSession(sid)
 
 	conn := preConn
-	var planSteps []string
-	if prePlan != nil {
-		planSteps = prePlan.Steps
-	}
-	planToolUses := preToolUses
+	var replanContext string
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 || prePlan == nil {
 			a.sendPhase(ctx, sid, 0, false)
-			c, p, tu, err := a.planAndRoute(ctx, sid, planInput)
+			c, _, tu, err := a.planAndRoute(ctx, sid, replanContext)
 			if err != nil {
 				if errors.Is(err, errUserCancelled) {
 					return result, err
@@ -484,37 +526,11 @@ func (a *agent) runTaskCycle(
 				return result, err
 			}
 			conn = c
-			planSteps = nil
-			if p != nil {
-				planSteps = p.Steps
-			}
-			planToolUses = tu
 		}
-
-		// composeUserContent yields the exact wire bytes for this turn —
-		// planCtx + planInput, plus sysPrompt on the very first message of
-		// the session. Persisting that wire format (rather than a stripped
-		// version) is what keeps the LLM-side prefix cache hot across turns:
-		// turn N+1's buildLLMHistory rebuilds the same bytes turn N sent.
-		stored, err := a.composeUserContent(sid, planInput, planSteps, planToolUses, isFirstInSession)
-		if err != nil {
-			return result, err
-		}
-
-		if sess != nil {
-			sess.UpdateLastMessageContent(currentUserIdx, stored)
-			_ = sess.Save()
-		}
-
-		// History is read 1:1 from TOML (including images on user turns).
-		var messages []llmMessage
-		if sess != nil {
-			messages = a.buildLLMHistory(sess, currentUserIdx)
-		}
-		messages = append(messages, a.buildUserMessage(stored, images))
 
 		a.sendPhase(ctx, sid, 1, false)
-		result, err = a.execute(ctx, sid, messages)
+		var err error
+		result, err = a.execute(ctx, sid)
 		if err != nil {
 			return result, err
 		}
@@ -525,7 +541,7 @@ func (a *agent) runTaskCycle(
 		a.sendPhase(ctx, sid, 2, false)
 		var vr *verifyResult
 		preVerifyToolCount := len(result.ToolUses)
-		result, vr, err = a.verify(ctx, sid, conn, messages, result, planInput, planSteps)
+		result, vr, err = a.verify(ctx, sid, conn, result)
 		if err != nil {
 			return result, err
 		}
@@ -573,10 +589,9 @@ func (a *agent) runTaskCycle(
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
 			fmt.Sprintf("⚠ Verification failed (attempt %d/%d). Re-planning with the failure context:\n%s\n", attempt+1, maxAttempts, strings.Join(vr.FixSteps, "\n")),
 		)))
-		planInput = fmt.Sprintf("The previous attempt failed verification.\nIssues: %s\nFix steps: %s\n\nOriginal request: %s\n\nRe-plan with this information. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it.",
-			strings.Join(vr.Issues, "; "),
-			strings.Join(vr.FixSteps, "; "),
-			userText)
+		// The full failure detail is already in history on the preceding
+		// verify response — point the planner at it without re-stitching.
+		replanContext = "The previous attempt failed verification (see the verify response above). Re-plan to address the failure. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it."
 	}
 
 	// Document phase: only when the executor wrote files and verify did not
@@ -586,78 +601,11 @@ func (a *agent) runTaskCycle(
 	lastPhase := 2
 	if (lastVR == nil || lastVR.Success) && wroteFilesEver && conn != nil {
 		a.sendPhase(ctx, sid, 3, false)
-		result, _ = a.document(ctx, sid, conn, userText, planSteps, result)
+		result, _ = a.document(ctx, sid, conn, result)
 		lastPhase = 3
 	}
 	a.sendPhase(ctx, sid, lastPhase, true)
 	return result, nil
-}
-
-// composeUserContent assembles the wire bytes for one user turn. The result
-// is BOTH persisted to sess.Messages and sent to the LLM, so the next turn's
-// buildLLMHistory replays the same bytes — that's the prefix-cache contract.
-//
-// On the first message of a session it folds the system prompt (skills +
-// project dir) and the empty-project hint into the content. Subsequent turns
-// don't re-add those: they're already in sess.Messages[0] from turn 1, and
-// re-adding would shift them and break the cache.
-func (a *agent) composeUserContent(sid SessionId, planInput string, planSteps []string, planToolUses []ToolUse, isFirstInSession bool) (string, error) {
-	var b strings.Builder
-	if len(planSteps) > 0 {
-		b.WriteString("The user approved this plan. Follow these steps exactly:\n")
-		for i, step := range planSteps {
-			fmt.Fprintf(&b, "%d. %s\n", i+1, step)
-		}
-	}
-	if len(planToolUses) > 0 {
-		b.WriteString("\nDuring planning, these tools were already called (do NOT repeat them):\n")
-		for _, tu := range planToolUses {
-			fmt.Fprintf(&b, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 500))
-		}
-	}
-	content := planInput
-	if b.Len() > 0 {
-		b.WriteString("\nUser request: ")
-		b.WriteString(planInput)
-		content = b.String()
-	}
-
-	if isFirstInSession {
-		sysPrompt, err := a.systemPrompt(sid)
-		if err != nil {
-			return "", err
-		}
-		a.mu.Lock()
-		empty := a.emptyProject
-		a.mu.Unlock()
-		prefix := sysPrompt + "\n---\n"
-		if empty {
-			prefix = emptyProjectHint + "\n---\n" + prefix
-		}
-		content = prefix + content
-	}
-	return content, nil
-}
-
-func (a *agent) buildUserMessage(content string, images []ImageData) llmMessage {
-	if len(images) == 0 || !a.imagesSupported {
-		return llmMessage{Role: "user", Content: content}
-	}
-	// Build OpenAI-style content array with text and image blocks.
-	var parts []any
-	parts = append(parts, map[string]any{
-		"type": "text",
-		"text": content,
-	})
-	for _, img := range images {
-		parts = append(parts, map[string]any{
-			"type": "image_url",
-			"image_url": map[string]string{
-				"url": fmt.Sprintf("data:%s;base64,%s", img.MimeType, img.Data),
-			},
-		})
-	}
-	return llmMessage{Role: "user", Content: parts}
 }
 
 // failureSimilarityThreshold is the Jaccard ratio above which two

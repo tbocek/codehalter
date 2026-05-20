@@ -191,20 +191,35 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
-	// Store user message. The stored message is the raw userText only —
-	// project context and plan/retry prefixes are injected onto the latest
-	// prompt at send time (see buildLLMHistory) and are NOT persisted, so
-	// history stays cacheable and compact.
+	// Store user message. On the very first turn of the session we fold the
+	// system prompt (skills + project dir) and the empty-project hint into
+	// the stored content — that way it lives in history as the leading user
+	// turn and every phase's buildLLMHistory call replays the same bytes.
+	// Subsequent turns store just the raw userText: sysPrompt is already in
+	// sess.Messages[0].
 	sess := a.getSession(req.SessionId)
 	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
-	currentUserIdx := -1
+	stored := userText
+	if isFirstMessage {
+		sysPrompt, err := a.systemPrompt(req.SessionId)
+		if err != nil {
+			return a.failPrompt(req.SessionId, err, nil)
+		}
+		a.mu.Lock()
+		empty := a.emptyProject
+		a.mu.Unlock()
+		prefix := sysPrompt + "\n---\n"
+		if empty {
+			prefix = emptyProjectHint + "\n---\n" + prefix
+		}
+		stored = prefix + userText
+	}
 	if sess != nil {
 		if len(images) > 0 {
-			sess.AddUserWithImages(userText, images)
+			sess.AddUserWithImages(stored, images)
 		} else {
-			sess.AddUser(userText)
+			sess.AddUser(stored)
 		}
-		currentUserIdx = len(sess.Messages) - 1
 		_ = sess.Save()
 	}
 
@@ -215,13 +230,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
-	planInput := userText
-
 	// Initial plan. Also decides whether the task is big enough to break
 	// into subtasks (plan.Subtasks). For simple tasks, this same plan is
 	// reused for attempt 0 of runTaskCycle — no double planning.
 	a.sendPhase(ctx, req.SessionId, 0, false)
-	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, planInput)
+	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, "")
 	if err != nil {
 		if isCancelled(err) {
 			return PromptResponse{StopReason: StopReasonCancelled}, nil
@@ -236,7 +249,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		// runSubtasks fires backgroundSummarise per subtask iteration so every
 		// turn pair gets a structured note; the epilogue below skips the
 		// summary call in that path to avoid double-summarising the last pair.
-		result, err = a.runSubtasks(ctx, req.SessionId, firstPlan.Subtasks, firstToolUses, currentUserIdx, isFirstMessage, images)
+		result, err = a.runSubtasks(ctx, req.SessionId, firstPlan.Subtasks)
 		if err != nil {
 			// User cancellation is a clean stop, not an error to render as red.
 			if isCancelled(err) {
@@ -246,7 +259,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	} else {
 		// Single task — reuse the initial plan on attempt 0; retries re-plan.
-		result, err = a.runTaskCycle(ctx, req.SessionId, userText, planInput, currentUserIdx, isFirstMessage, images, firstPlan, firstConn, firstToolUses)
+		result, err = a.runTaskCycle(ctx, req.SessionId, firstPlan, firstConn)
 		if err != nil {
 			if isCancelled(err) {
 				return PromptResponse{StopReason: StopReasonCancelled}, nil
@@ -255,9 +268,10 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
+	// Each phase (plan / execute / verify / document) already persisted its
+	// own response via UpsertLastAssistant. The epilogue here only fires
+	// background work that observes the now-complete transcript.
 	if sess != nil && result.Text != "" {
-		sess.UpsertLastAssistant(result.Text)
-		_ = sess.Save()
 		// Fire-and-forget per-turn summarisation onto a free LLM[1+] slot.
 		// Skipped on the subtasks path — runSubtasks already fired it for
 		// every iteration including the last, and double-firing would
@@ -280,12 +294,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 // through its own runTaskCycle. Automatic flips the session into autopilot
 // mode for the duration so inner prompts auto-answer. Returns the final
 // subtask's result.
-func (a *agent) runSubtasks(
-	ctx context.Context, sid SessionId,
-	subtasks []string, initialToolUses []ToolUse,
-	currentUserIdx int, isFirstMessage bool,
-	images []ImageData,
-) (toolLoopResult, error) {
+//
+// The decomposition planner already ran upstream — its plan response (with
+// Subtasks listed) and its tool uses are already in sess.Messages, so each
+// inner runTaskCycle sees that context naturally via buildLLMHistory.
+func (a *agent) runSubtasks(ctx context.Context, sid SessionId, subtasks []string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
 
 	var header strings.Builder
@@ -320,54 +333,31 @@ func (a *agent) runSubtasks(
 	}
 
 	var finalResult toolLoopResult
-	userIdx := currentUserIdx
-	firstInSession := isFirstMessage
 
 	for i, sub := range subtasks {
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
 			fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(subtasks), sub),
 		)))
 
-		// For subtasks after the first, append a new user message so the prior
-		// subtask's assistant reply has a clean user turn to follow.
-		if i > 0 && sess != nil {
-			sess.AddUser(sub)
-			userIdx = len(sess.Messages) - 1
+		// Append the subtask scope as a fresh user message so the inner
+		// planner has a clear, focused target. Following PLAN.md / EXECUTE.md
+		// / VERIFY.md user messages will accumulate after it.
+		if sess != nil {
+			sess.AddUser("Subtask: " + sub)
 			_ = sess.Save()
-			firstInSession = false
 		}
 
-		// Subtask 1 inherits the planning tool uses from the decomposition
-		// pass so the inner planner doesn't repeat those lookups.
-		planInput := sub
-		if i == 0 && len(initialToolUses) > 0 {
-			var buf strings.Builder
-			buf.WriteString("Context from initial task decomposition (these tools were already called — do not repeat):\n")
-			for _, tu := range initialToolUses {
-				fmt.Fprintf(&buf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncate(tu.Output, 500))
-			}
-			buf.WriteString("\nSubtask: ")
-			buf.WriteString(sub)
-			planInput = buf.String()
-		}
-
-		result, err := a.runTaskCycle(ctx, sid, sub, planInput, userIdx, firstInSession, images, nil, nil, nil)
+		result, err := a.runTaskCycle(ctx, sid, nil, nil)
 		if err != nil {
 			return finalResult, err
 		}
 		finalResult = result
 
-		// Persist this subtask's result so subtask N+1 sees it in history.
+		// Per-subtask background summary so the shadow buffer covers
+		// every turn pair, not just the final subtask's reply.
 		if sess != nil && result.Text != "" {
-			sess.UpsertLastAssistant(result.Text)
-			_ = sess.Save()
-			// Per-subtask background summary so the shadow buffer covers
-			// every turn pair, not just the final subtask's reply.
 			a.backgroundSummarise(sess)
 		}
-
-		// Images only travel with the real user message (subtask 0).
-		images = nil
 	}
 
 	return finalResult, nil
