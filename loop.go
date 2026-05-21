@@ -458,18 +458,6 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 // Document phase
 // ---------------------------------------------------------------------------
 
-// hasFileWrites reports whether any of the tool uses wrote to the filesystem.
-// The document phase is gated on this so read-only turns (questions, lookups)
-// don't trigger a doc-update LLM call.
-func hasFileWrites(uses []ToolUse) bool {
-	for _, u := range uses {
-		if u.Name == "write_file" || u.Name == "edit_file" {
-			return true
-		}
-	}
-	return false
-}
-
 // document runs after a successful verify when the turn actually wrote files.
 // It appends DOCUMENT.md as a fresh user message and runs the thinking LLM so
 // it can update (or create) the project README when the change is
@@ -520,12 +508,6 @@ func (a *agent) runTaskCycle(
 	var result toolLoopResult
 	var lastVR *verifyResult
 	var seenBags []map[string]bool
-	// wroteFilesEver tracks whether ANY attempt in this retry loop performed a
-	// file write. The document gate at the bottom must see the cumulative
-	// answer: when verify failed on attempt N (causing a re-plan) and the
-	// final successful attempt only re-read files to confirm, result.ToolUses
-	// alone misses the earlier edits and the document phase silently skips.
-	wroteFilesEver := false
 	sess := a.getSession(sid)
 
 	conn := preConn
@@ -556,24 +538,11 @@ func (a *agent) runTaskCycle(
 		if err != nil {
 			return result, err
 		}
-		if hasFileWrites(result.ToolUses) {
-			wroteFilesEver = true
-		}
-
 		a.sendPhase(ctx, sid, 2, false)
 		var vr *verifyResult
-		preVerifyToolCount := len(result.ToolUses)
 		result, vr, err = a.verify(ctx, sid, conn, plan, result)
 		if err != nil {
 			return result, err
-		}
-		// verify() runs the LLM with an unfiltered tool set, so it can
-		// invoke edit_file/write_file while re-checking the result. Capture
-		// any new file writes it produced so the cumulative wroteFilesEver
-		// flag (and the document gate downstream) sees them.
-		if len(result.ToolUses) > preVerifyToolCount &&
-			hasFileWrites(result.ToolUses[preVerifyToolCount:]) {
-			wroteFilesEver = true
 		}
 		lastVR = vr
 		if vr == nil || vr.Success || len(vr.FixSteps) == 0 {
@@ -616,12 +585,15 @@ func (a *agent) runTaskCycle(
 		replanContext = "The previous attempt failed verification (see the verify response above). Re-plan to address the failure. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it."
 	}
 
-	// Document phase: only when the executor wrote files and verify did not
-	// declare the result broken. Failures with no fix_steps still reach here
-	// (we couldn't fix it but didn't bail) — skip the doc pass for those, the
-	// change isn't trustworthy enough to advertise in the README.
+	// Document phase: run whenever verify passed. DOCUMENT.md decides for
+	// itself whether docs need updating ("No documentation change needed."
+	// short-circuit at Step 1) — cheaper than tracking edit_file/write_file
+	// calls here, which miss mutations via run_command/run_task anyway.
+	// Failures with no fix_steps still reach here (we couldn't fix it but
+	// didn't bail) — skip for those, the change isn't trustworthy enough to
+	// advertise.
 	lastPhase := 2
-	if (lastVR == nil || lastVR.Success) && wroteFilesEver && conn != nil {
+	if (lastVR == nil || lastVR.Success) && conn != nil {
 		a.sendPhase(ctx, sid, 3, false)
 		result, _ = a.document(ctx, sid, conn, result)
 		lastPhase = 3
