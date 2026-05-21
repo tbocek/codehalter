@@ -101,10 +101,16 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, replanContext str
 	// the executor either repeats them or assumes the work is already done.
 	// run_command's `sed -i` is the other edit vector; PLAN.md forbids it
 	// in prose since we can't block it at the tool layer without parsing.
+	// Also exclude launch_subagent: otherwise the planner fans its forbidden
+	// edits out to a leaf-worker subagent (which has the full edit toolkit)
+	// and reports report_only=true, papering over the loophole. Cost is real
+	// — no parallel-lookup fan-out during gathering — but planning is short
+	// enough that serial reads in one LLM turn are fine.
 	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{exclude: map[string]bool{
-		respondToolName: true,
-		"write_file":    true,
-		"edit_file":     true,
+		respondToolName:   true,
+		"write_file":      true,
+		"edit_file":       true,
+		"launch_subagent": true,
 	}}, "plan", &plan)
 	if err != nil {
 		return thinking, nil, planRes.ToolUses, nil
@@ -367,7 +373,9 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 	}
 
 	prompt := verifyPrompt
-	if plan != nil && len(plan.Verify) > 0 {
+	recipeInjected := plan != nil && len(plan.Verify) > 0
+	hintInjected := false
+	if recipeInjected {
 		var recipe strings.Builder
 		recipe.WriteString("\n\n## Verification recipe (from the planner)\n\n")
 		recipe.WriteString("The planner specified the following checks for THIS change. Run each via the appropriate tool — they replace your own judgment about what to check:\n\n")
@@ -377,6 +385,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 		prompt = prompt + recipe.String()
 	} else if hint := a.verifyTargetHint(); hint != "" {
 		prompt = prompt + "\n\n" + hint
+		hintInjected = true
 	}
 
 	sess := a.getSession(sid)
@@ -395,6 +404,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 	}
 	var result verifyResult
 	verifyRes, err := a.runToolLoopJSON(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "verify", &result)
+	verifyToolCount := len(verifyRes.ToolUses)
 	res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
 	if err != nil {
 		slog.Error("verify: skipped, treating as success", "err", err)
@@ -436,6 +446,21 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 		result.Success = true
 		result.Issues = nil
 		result.FixSteps = nil
+	}
+
+	// Skipped-verification override: when we injected a verification recipe
+	// (planner's plan.Verify) or a fallback runner:target hint, the verifier
+	// MUST have called at least one tool to actually run it. Zero verify-turn
+	// tool calls + success=true is rationalization, not verification — caught
+	// in a real run where the prompt told the verifier to run `just:verify`
+	// and it returned success in 5s without a single tool dispatch. Triggers
+	// re-plan so the next pass gets an explicit recipe.
+	if (recipeInjected || hintInjected) && verifyToolCount == 0 && result.Success {
+		result.Success = false
+		result.Issues = append(result.Issues,
+			"verifier returned success without running the prescribed verification (zero tool calls in verify turn)")
+		result.FixSteps = append(result.FixSteps,
+			"the verify phase must call the recipe/target before reporting success")
 	}
 
 	// Sustainability: a clean exit with non-sustainable fixes (e.g. an
