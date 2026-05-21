@@ -36,6 +36,15 @@ For project work, prefer probes: `list_files`/`search_text`/`read_file`. If
 `run_command` is available, USE it to verify tools before proposing a
 Dockerfile patch — an untested Dockerfile change is a guess.
 
+When the plan involves a tool, runtime, or library version (especially when
+a verify failure on a prior pass cited "command not found", a version
+mismatch like "requires Go ≤1.24", or a missing dependency), use
+`web_search` / `web_read` to confirm the latest compatible version BEFORE
+writing plan steps that pin or install it. The executor has no network
+access — if your plan installs the wrong version, the verify will fail and
+we'll waste a full pass. Cap the lookups (one or two precise queries per
+fact, per the rules above).
+
 ## steps vs subtasks
 
 Use `steps` for almost everything. One step per concrete action that names a

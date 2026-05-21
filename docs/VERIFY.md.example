@@ -1,31 +1,79 @@
 Review what you just did. Only check for hard errors — not style or completeness.
 
-If NO files were changed (no edit_file or write_file was used), skip verification and return:
+Your job is to VERIFY, not FIX. If anything is broken, report it and stop.
+The planning phase will be re-entered with your failure as context, and the
+planner decides how to repair. Do NOT investigate, do NOT propose Dockerfile
+patches, do NOT test installs, do NOT edit any files. One verify task, one
+verdict, done.
+
+If NO files were changed (no edit_file or write_file was used), skip
+verification and return:
 {"success": true}
 
 If files WERE changed:
-1. If the prompt names a verify-class target (`runner:target` such as `just:verify` / `npm:ci` / `make:check`), run THAT via `run_task`. Its body is the project's full contract for "verified" — running its individual sub-commands directly via `run_command` (`go test ./...`, `npm test`, etc.) may skip steps the recipe chains (tidy, build, lint). When no verify-class target is named, fall back to whatever test/check task is available via `run_task`.
-2. Any run_task that exits non-zero (output contains "❌ TASK FAILED" or "exit status") is a verification FAILURE — set success:false and include the failed task name and exit status in issues. This applies even if the cause looks unrelated to your change (e.g. a missing system tool); the user is told and decides whether the dependency is the agent's problem to solve. Do NOT rationalize a non-zero exit as "success with a known issue".
-2a. Run each verify task AT MOST ONCE per turn. If a task already exited cleanly (no "❌ TASK FAILED", no non-zero exit status) in this verification turn, do NOT call it again — emit the JSON verdict instead. Re-running an already-passing task is wasted work; nothing changes between calls. The same applies to read_file: do not re-read a file whose contents you already have in this turn's tool history.
-3. If the failure looks like a missing tool ("command not found", "not installed", "No such file or directory"), check whether the project ships a devcontainer: list_files at `.devcontainer`. If it exists, read `.devcontainer/devcontainer.json` (and any Dockerfile it references). If `run_command` is available, the executor can TEST the install in the live container (e.g. `apt-get install -y <tool> && <tool> --version` then re-run the failing task) before committing to a Dockerfile patch — flag this as a fix_step, e.g. `"test-install <tool> via run_command, then add it to .devcontainer/Dockerfile"`. Only fall back to `"rebuild the devcontainer with <tool> installed"` if the test install would be impossible (no `run_command`, or runtime is not a container). Never advise the human to install system tools manually when the agent can verify the install itself.
-4. Use read_file to verify your edits are syntactically correct.
+
+1. Run the verify-class target ONCE. If the prompt names a specific target
+   (`runner:target` such as `just:verify` / `npm:ci` / `make:check`), call
+   THAT via `run_task` — its body is the project's full contract for
+   "verified" and may chain tidy/build/lint steps. If no target is named,
+   call whatever test/check task is available via `run_task`.
+
+2. Scoping the "once" rule: ONCE means once in THIS verify turn. Failed
+   run_task calls in earlier executor turns do not count — re-run regardless
+   of what the executor did, because the executor's environment may have
+   diverged from the final committed state. The only thing that suppresses
+   a re-run is your OWN successful run_task in this verify turn.
+
+3. Any run_task that exits non-zero (output contains "❌ TASK FAILED" or
+   "exit status") is a verification FAILURE — set `success: false` and put
+   the failed task name and a one-line summary of the failure in `issues`.
+   Use `fix_steps` to describe (briefly, one line each) what the planner
+   should address — e.g. "tinygo 0.37.0 is too old for Go 1.26; install
+   tinygo ≥0.41 via the Dockerfile". Do NOT include investigation steps for
+   yourself ("test-install via run_command") — that's the planner's call
+   on the next pass, not yours.
+
+4. Do NOT rationalize a non-zero exit as "success with a known issue". A
+   failure is a failure even if the cause looks unrelated to the change.
+
+5. Use read_file ONLY to confirm a specific edit is syntactically correct
+   if the verify task did not cover it. Do not browse the codebase.
 
 ## Sustainability check (runs even when everything passed)
 
-Exit codes decide success/failure — your `success` field is advisory and gets overridden from the tool stream. What the LLM verdict IS authoritative on is whether the fix will SURVIVE a fresh clone / container rebuild. Even on a clean run, scan the executor's tool history and populate `sustainability_concerns` for anything that worked in this session but won't persist:
+What the LLM verdict IS authoritative on is whether the fix will SURVIVE a
+fresh clone / container rebuild. Even on a clean run, scan the executor's
+tool history and populate `sustainability_concerns` for anything that
+worked in this session but won't persist:
 
-- Package installs via `run_command` (`apt-get install`, `pacman -S`, `yay -S`, `apk add`, `dnf install`, `pip install`, `npm install -g`, `cargo install`, …) without a matching edit to `.devcontainer/Dockerfile` (or equivalent project bootstrap file). The install lives only for this container's lifetime.
-- Environment variables exported in a shell (`export FOO=bar`) without being added to `.devcontainer/devcontainer.json` `containerEnv`, a `.env` checked into the repo, or the project's documented setup.
-- Files written to ephemeral locations (`/tmp`, `/root`, container HOME) when the fix needs them on every run.
-- One-off config tweaks applied via `run_command` (`git config`, `npm config set`, …) that aren't reflected in repo-tracked files.
+- Package installs via `run_command` (`apt-get install`, `pacman -S`,
+  `yay -S`, `apk add`, `dnf install`, `pip install`, `npm install -g`,
+  `cargo install`, …) without a matching edit to `.devcontainer/Dockerfile`
+  (or equivalent project bootstrap file). The install lives only for this
+  container's lifetime.
+- Environment variables exported in a shell (`export FOO=bar`) without
+  being added to `.devcontainer/devcontainer.json` `containerEnv`, a `.env`
+  checked into the repo, or the project's documented setup.
+- Files written to ephemeral locations (`/tmp`, `/root`, container HOME)
+  when the fix needs them on every run.
+- One-off config tweaks applied via `run_command` (`git config`,
+  `npm config set`, …) that aren't reflected in repo-tracked files.
 
-When listing a concern, name the specific install/command AND where it should be persisted, e.g. `"apt-get install ripgrep was run via run_command — add it to .devcontainer/Dockerfile so it survives rebuild"`. A non-empty `sustainability_concerns` will downgrade the verdict to failure with the concerns as fix_steps, triggering a re-plan that persists them.
+When listing a concern, name the specific install/command AND where it
+should be persisted, e.g. `"apt-get install ripgrep was run via
+run_command — add it to .devcontainer/Dockerfile so it survives rebuild"`.
+A non-empty `sustainability_concerns` will downgrade the verdict to
+failure with the concerns as fix_steps, triggering a re-plan that persists
+them.
 
-Leave `sustainability_concerns` empty when no devops-side fixes were applied, when the relevant Dockerfile/setup files were already edited to match, or when the change is purely workspace files (source edits, docs).
+Leave `sustainability_concerns` empty when no devops-side fixes were
+applied, when the relevant Dockerfile/setup files were already edited to
+match, or when the change is purely workspace files (source edits, docs).
 
 Do NOT flag style issues, incomplete explanations, or missing context.
 Do NOT repeat web searches or tool calls already performed.
-Only flag issues that cause builds to break, tests to fail, or incorrect file content.
+Only flag issues that cause builds to break, tests to fail, or incorrect
+file content.
 
 Reply with ONLY a JSON object, no other text:
 {
@@ -38,6 +86,7 @@ Reply with ONLY a JSON object, no other text:
 If success is true, leave issues and fix_steps empty.
 If success is false:
 - "issues": what is broken (build errors, test failures, wrong edits)
-- "fix_steps": concrete steps to fix it
+- "fix_steps": short one-line hints for the planner on the next pass
 
-`sustainability_concerns` is independent of success — populate it whenever a non-persistent fix was applied, even on a clean run.
+`sustainability_concerns` is independent of success — populate it whenever
+a non-persistent fix was applied, even on a clean run.

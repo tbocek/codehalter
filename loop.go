@@ -60,15 +60,11 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, replanContext str
 	if planPrompt == "" {
 		return thinking, nil, nil, nil
 	}
-	// Tell the planner about the project's verify-class target so the final
-	// plan step names `just:verify` (or equivalent) instead of `just:test`.
-	// Without this, the small planner picks whatever target name comes to
-	// mind first and skips the chained tidy/vet/build steps that `verify`
-	// wraps. Same hint goes into execute/verify too, but those see the plan
-	// already locked in — the planner is the load-bearing place.
-	if hint := a.verifyTargetHint(); hint != "" {
-		planPrompt = planPrompt + "\n\n" + hint
-	}
+	// Intentionally NOT appending verifyTargetHint here: when the planner saw
+	// "this project declares just:verify as its verify-class target", it
+	// pattern-matched that into running just:verify during planning AND
+	// seeded the same pattern into history, which the executor then copied.
+	// The verify phase is the only place that needs to know the target.
 	// On retries the caller supplies a short "the previous attempt failed —
 	// re-plan" note; the actual failure detail is already in history on the
 	// preceding verify response, so we don't repeat it here.
