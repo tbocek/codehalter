@@ -36,14 +36,12 @@ For project work, prefer probes: `list_files`/`search_text`/`read_file`. If
 `run_command` is available, USE it to verify tools before proposing a
 Dockerfile patch — an untested Dockerfile change is a guess.
 
-When the plan involves a tool, runtime, or library version (especially when
-a verify failure on a prior pass cited "command not found", a version
-mismatch like "requires Go ≤1.24", or a missing dependency), use
-`web_search` / `web_read` to confirm the latest compatible version BEFORE
-writing plan steps that pin or install it. The executor has no network
-access — if your plan installs the wrong version, the verify will fail and
-we'll waste a full pass. Cap the lookups (one or two precise queries per
-fact, per the rules above).
+Do NOT edit project files in this phase. `write_file` and `edit_file` are
+not available, and you must not use `run_command` to edit either (no
+`sed -i`, no `>` redirects into tracked files, no `mv` over them, no
+`tee`). Record every intended edit as a concrete `steps` entry naming the
+file and the change — the executor will apply it. Probing the filesystem
+(`cat`, `grep`, `which`) is fine; mutating it is not.
 
 ## steps vs subtasks
 

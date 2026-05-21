@@ -87,7 +87,16 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, replanContext str
 	// Exclude respond: planning emits a JSON object as plain text, so we don't
 	// want the model to escape into the synthetic terminal-tool grammar that
 	// execute uses. Same reasoning in verify() and document() below.
-	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", &plan)
+	// Exclude write_file/edit_file: planning is information-gathering only.
+	// When the planner edits files itself, those edits leak into history and
+	// the executor either repeats them or assumes the work is already done.
+	// run_command's `sed -i` is the other edit vector; PLAN.md forbids it
+	// in prose since we can't block it at the tool layer without parsing.
+	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{exclude: map[string]bool{
+		respondToolName: true,
+		"write_file":    true,
+		"edit_file":     true,
+	}}, "plan", &plan)
 	if err != nil {
 		return thinking, nil, planRes.ToolUses, nil
 	}
