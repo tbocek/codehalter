@@ -982,8 +982,10 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 		// Distinct args don't count — surveying many files via read_file
 		// doesn't trip this. Switch to the "thinking" role's params — same
 		// URL/model so the prefix cache survives — and let the warmer
-		// sampler pick a different action. One-shot per loop.
-		if !escalated {
+		// sampler pick a different action. One-shot per loop. Skip entirely
+		// when conn.Tag is already "thinking" (plan phase): the swap would be
+		// a no-op and the warning would mislead.
+		if !escalated && conn != nil && conn.Tag != "thinking" {
 			for _, c := range calls {
 				seen := toolArgSeen[c.Function.Name]
 				if seen == nil {

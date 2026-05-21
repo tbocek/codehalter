@@ -972,14 +972,15 @@ func TestCapReadContent(t *testing.T) {
 // The append-only transcript model makes this trivial: each phase pushes a
 // new user/assistant pair onto sess.Messages and never mutates earlier
 // entries, so buildLLMHistory replays the same bytes. The test exercises the
-// load-bearing case — the first turn's user message folds in the sysPrompt
-// prefix, and that prefix must remain identical on later turns.
+// load-bearing case — the first turn populates sess.SystemPrompt (skills +
+// project context), and that leading message must remain identical on later
+// turns so the LLM's prefix cache keeps hitting.
 func TestPrefixStableAcrossTurns(t *testing.T) {
 	dir := t.TempDir()
 
 	// Seed a SKILL file so loadSkills returns a non-empty system prompt —
-	// otherwise the bug (sysPrompt prepended turn 1, dropped turn 2) is
-	// invisible because sysPrompt is empty.
+	// otherwise the bug (sysPrompt set turn 1, dropped turn 2) is invisible
+	// because sysPrompt is empty.
 	cfgDir := filepath.Join(dir, ".codehalter")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -995,16 +996,18 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 	a := &agent{sessions: map[SessionId]*Session{s.ID: s}}
 
 	// Sanity: systemPrompt must be non-empty so the bug we're guarding
-	// against (sysPrompt prepended turn 1, dropped turn 2) is observable.
+	// against (sysPrompt set turn 1, dropped turn 2) is observable.
 	sysPrompt, _ := a.systemPrompt(s.ID)
 	if sysPrompt == "" {
 		t.Fatal("expected non-empty systemPrompt — SKILL seed didn't take effect")
 	}
 
 	// --- Turn 1: first prompt of the session ---
-	// Prompt() folds sysPrompt into the user's first message; subsequent
-	// phases (PLAN/EXECUTE/VERIFY/DOCUMENT.md) get their own user turns.
-	s.AddUser(sysPrompt + "\n---\nfirst prompt")
+	// Prompt() sets sess.SystemPrompt (emitted by buildLLMHistory as the
+	// leading user message); subsequent phases (PLAN/EXECUTE/VERIFY/
+	// DOCUMENT.md) get their own user turns appended to Messages.
+	s.SystemPrompt = sysPrompt
+	s.AddUser("first prompt")
 	msgs1 := a.buildLLMHistory(s, -1)
 
 	// Assistant replies (planner JSON, executor text, etc. — collapsed to
@@ -1014,7 +1017,7 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 
 	// --- Turn 2: a follow-up prompt ---
 	// Subsequent user turns store just the raw text — sysPrompt is already
-	// in sess.Messages[0] from turn 1.
+	// in sess.SystemPrompt from turn 1.
 	s.AddUser("second prompt")
 	msgs2 := a.buildLLMHistory(s, -1)
 

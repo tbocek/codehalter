@@ -281,13 +281,6 @@ func (a *agent) verifyTargetHint() string {
 // sessions route to their pinned LLM[i] for the same reason.
 func (a *agent) execute(ctx context.Context, sid SessionId, extraExclude ...string) (toolLoopResult, error) {
 	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
-	if hint := a.verifyTargetHint(); hint != "" {
-		if executeMD != "" {
-			executeMD = executeMD + "\n\n" + hint
-		} else {
-			executeMD = hint
-		}
-	}
 	sess := a.getSession(sid)
 	if sess != nil && executeMD != "" {
 		sess.AddUser(executeMD)

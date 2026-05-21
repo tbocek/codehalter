@@ -180,6 +180,15 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Compaction failed: "+err.Error()+"\n\n")))
 		return
 	}
+	// Refresh the rendered system prompt so the next turn still sees current
+	// skills + project context. Without this, the summariser's compression of
+	// the older 80% would strip the skills + lookup-instruction paragraph
+	// from the wire, and the LLM would drift after compaction. systemPrompt()
+	// only reads sess.Cwd (immutable) and on-disk SKILL files, so it's safe
+	// to call while holding sess.mu.
+	if sysPrompt, err := a.systemPrompt(sess.ID); err == nil {
+		sess.SystemPrompt = sysPrompt
+	}
 	_ = sess.saveLocked()
 	sess.mu.Unlock()
 
@@ -230,51 +239,71 @@ const structuredTurnPrompt = "Summarise this exchange into a structured turn not
 // synchronous compaction path.
 const maxShadowInputBytes = 20 * 1024
 
-// pickBackgroundLLM selects an LLM slot for background work (per-turn
-// summary, git commit refresh). LLM[0] is always skipped — it's holding the
-// warm prefix cache for the user's next foreground turn. Subagent sessions
-// and single-LLM configurations get nil; callers self-disable.
+// pickBackgroundLLM returns an LLM entry hosting a virtual slot ≥ 1 — i.e.
+// any non-foreground background slot, picking the first reachable hosting
+// entry in entry-major order. Virtual slot 0 is reserved for the warm
+// foreground prefix cache and never selected here. Returns nil when:
+//   - sid is a subagent session (subagents pin via SubagentPinOrder instead),
+//   - no [[llm]] entries are configured,
+//   - the total slot count across all entries is < 2 (only foreground exists),
+//   - no eligible entry is reachable.
 //
-// minIdx controls which slots are eligible:
-//   - minIdx=1: any reachable LLM[1+]. Used by backgroundSummarise — it IS
-//     the shadow producer, so no shadow-wait is needed.
-//   - minIdx=2: prefer LLM[2+] (independent of LLM[1]'s summariser load);
-//     fall back to LLM[1] when no LLM[2+] is reachable. The fallback path
-//     reports waitForShadow=true so the caller can join sess.summariseJob
-//     before issuing the call — otherwise two LLM calls pile up on the same
-//     conn and starve its parallel semaphore.
+// The returned conn is the entry hosting the chosen slot; concurrency is
+// bounded by that conn's `parallel` semaphore at llmStream, so two background
+// callers landing on the same entry serialise naturally on the semaphore —
+// no explicit waitForShadow coordination needed.
 //
-// Returns (conn, waitForShadow). conn==nil means "feature self-disabled,
-// skip the background work".
-func (a *agent) pickBackgroundLLM(sid SessionId, minIdx int) (*LLMConnection, bool) {
+// Virtual slots flatten (entry, slot-within-entry) entry-major: one [[llm]]
+// with parallel=2 exposes slots [0, 1] both hosted by entry 0; adding a
+// second [[llm]] with parallel=2 adds slots [2, 3] hosted by entry 1.
+func (a *agent) pickBackgroundLLM(sid SessionId) *LLMConnection {
 	sess := a.getSession(sid)
 	if sess == nil || sess.Depth > 0 {
-		return nil, false
+		return nil
 	}
-	if len(a.settings.LLM) < 2 {
-		return nil, false
+	if len(a.settings.LLM) == 0 {
+		return nil
 	}
-	reachable := func(c *LLMConnection) bool {
+	totalSlots := 0
+	for i := range a.settings.LLM {
+		totalSlots += a.settings.LLM[i].parallelCap()
+	}
+	if totalSlots < 2 {
+		return nil
+	}
+	reachable := func(idx int) bool {
+		c := &a.settings.LLM[idx]
 		return len(a.connReachable) == 0 || a.connReachable[connKey(c)]
 	}
-	for i := minIdx; i < len(a.settings.LLM); i++ {
-		if reachable(&a.settings.LLM[i]) {
-			return a.settings.ConnAt(i, "execute"), false
+	// entryForSlot maps a virtual slot index to the [[llm]] entry that hosts
+	// it under the entry-major flattening. Returns -1 when virtSlot is beyond
+	// the total slot count.
+	entryForSlot := func(virtSlot int) int {
+		cum := 0
+		for i := range a.settings.LLM {
+			cap := a.settings.LLM[i].parallelCap()
+			if virtSlot < cum+cap {
+				return i
+			}
+			cum += cap
+		}
+		return -1
+	}
+	// Walk virtual slots [1, totalSlots) and return the first reachable host
+	// entry. Each entry is checked at most once — multiple virtual slots can
+	// map to the same entry, but they all share reachability.
+	tried := map[int]bool{}
+	for v := 1; v < totalSlots; v++ {
+		e := entryForSlot(v)
+		if e < 0 || tried[e] {
+			continue
+		}
+		tried[e] = true
+		if reachable(e) {
+			return a.settings.ConnAt(e, "execute")
 		}
 	}
-	// Fallback path is only meaningful when caller asked for LLM[2+] preference.
-	if minIdx > 1 && reachable(&a.settings.LLM[1]) {
-		return a.settings.ConnAt(1, "execute"), true
-	}
-	return nil, false
-}
-
-// pickBackgroundConn is the thin shim kept for backgroundSummarise — it never
-// needs the LLM[2+] preference or the waitForShadow signal, just any
-// reachable LLM[1+].
-func (a *agent) pickBackgroundConn(_ context.Context, sid SessionId) *LLMConnection {
-	c, _ := a.pickBackgroundLLM(sid, 1)
-	return c
+	return nil
 }
 
 // backgroundSummarise spawns a goroutine that condenses the just-completed
@@ -294,7 +323,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	if !sess.summariseJob.TryStart() {
 		return
 	}
-	conn := a.pickBackgroundConn(context.Background(), sess.ID)
+	conn := a.pickBackgroundLLM(sess.ID)
 	if conn == nil {
 		sess.summariseJob.Done()
 		return // no separate slot; falls through to sync summarize at compaction
@@ -420,12 +449,23 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 
 
 // buildLLMHistory constructs the LLM message array from the session's stored
-// summary and messages. Messages are read 1:1 from TOML — project context is
-// NOT stored and must be injected by the caller onto the current user message.
-// skipIdx is the index in sess.Messages of the current user message; the
-// caller appends it separately with the injected context.
+// system prompt, summary, and messages. Order is: SystemPrompt (skills +
+// project context), then Summary (earlier-conversation digest if any), then
+// the stored Messages. SystemPrompt and Summary are each emitted as a
+// dedicated leading user message — set once on the first turn (SystemPrompt)
+// or after a compressHistory rotation (both), so the rules and the digest
+// survive compaction independently. skipIdx is the index in sess.Messages of
+// the current user message; the caller appends it separately with the
+// injected context.
 func (a *agent) buildLLMHistory(sess *Session, skipIdx int) []llmMessage {
 	var messages []llmMessage
+
+	if sess.SystemPrompt != "" {
+		messages = append(messages, llmMessage{
+			Role:    "user",
+			Content: sess.SystemPrompt,
+		})
+	}
 
 	if sess.Summary != "" {
 		messages = append(messages, llmMessage{

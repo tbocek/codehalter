@@ -163,10 +163,13 @@ func init() {
 		}
 
 		// Dedup repeat reads. Same path + same window + file's mtime/size
-		// unchanged since the last read in this turn → refuse instead of
-		// burning another full read. Reset at Prompt() boundary (see Prompt()
-		// in prompt.go), and busted whenever edit_file / write_file touches
-		// the path so a post-edit re-read still goes through.
+		// unchanged since the last read in this turn → return the same content
+		// again with a leading note so the model sees the bytes it asked for
+		// (small MoE models at high temp don't reliably follow a "scroll back"
+		// pointer). The disk re-read is cheap and the file is guaranteed
+		// unchanged by the mtime+size guard. Reset at Prompt() boundary (see
+		// Prompt() in prompt.go), and busted whenever edit_file / write_file
+		// touches the path so a post-edit re-read still goes through.
 		sess := a.getSession(sid)
 		lineKey := 0
 		if linePtr != nil {
@@ -177,13 +180,12 @@ func init() {
 			limitKey = limit
 		}
 		dedupKey := readDedupKey(path, lineKey, limitKey)
+		var dedupNote string
 		if sess != nil {
 			sess.readDedupMu.Lock()
 			if prev, ok := sess.readDedup[dedupKey]; ok {
 				if st, statErr := os.Stat(path); statErr == nil && st.ModTime().Equal(prev.mtime) && st.Size() == prev.size {
-					sess.readDedupMu.Unlock()
-					msg := fmt.Sprintf("read_file: %s (line=%d, limit=%d) already read earlier this turn and the file has not changed since — reuse the prior tool-call result from history instead of re-reading.", path, lineKey, limitKey)
-					return msg, false
+					dedupNote = fmt.Sprintf("[note: %s (line=%d, limit=%d) was already read earlier this turn and is unchanged. Returning the same content again — scroll back next time, or pass a different `line`/`limit` to see a different window.]", path, lineKey, limitKey)
 				}
 			}
 			sess.readDedupMu.Unlock()
@@ -236,12 +238,18 @@ func init() {
 			end = start + lineCount - 1
 		}
 		resultTitle := fmt.Sprintf("Reading: %s (%d-%d)", path, start, end)
+		if dedupNote != "" {
+			resultTitle += " (re-read)"
+		}
 		if truncNote != "" {
 			resultTitle += " (truncated)"
 		}
 
 		if truncNote != "" {
 			content += "\n" + truncNote
+		}
+		if dedupNote != "" {
+			content = dedupNote + "\n" + content
 		}
 
 		a.CompleteToolCallTitled(ctx, sid, tcId, resultTitle, []ToolCallContent{TextContent(content)})

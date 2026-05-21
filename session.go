@@ -106,7 +106,14 @@ type Session struct {
 	Depth     int            `toml:"depth,omitempty"`
 	ParentID  SessionId      `toml:"parent_id,omitempty"`
 	Summary   string         `toml:"summary,omitempty"`
-	Messages  []Message      `toml:"messages"`
+	// SystemPrompt holds the rendered skills + project context that leads
+	// every LLM call. Set on the first user turn (see Prompt) and refreshed
+	// after each compressHistory rotation — so it survives the summariser
+	// (which otherwise compresses skills away) and reflects current
+	// .codehalter/SKILL-*.md content. Emitted by buildLLMHistory as the
+	// leading user message before any Summary.
+	SystemPrompt string    `toml:"system_prompt,omitempty"`
+	Messages     []Message `toml:"messages"`
 	filePath  string
 	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
 	// phaseActive=true means a phase entry is showing as in_progress and

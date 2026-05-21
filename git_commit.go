@@ -77,26 +77,20 @@ func (a *agent) cleanupGitCommitIfClean(cwd string, sid SessionId) {
 	}
 }
 
-// pickGitCommitConn selects an LLM slot for the background git-commit updater.
-// Delegates to pickBackgroundLLM with minIdx=2 so we prefer LLM[2+] (free of
-// the per-turn shadow summariser on LLM[1]) and fall back to LLM[1] with
-// waitForShadow=true to avoid piling two calls on the same conn.
-func (a *agent) pickGitCommitConn(sid SessionId) (*LLMConnection, bool) {
-	return a.pickBackgroundLLM(sid, 2)
-}
-
 // backgroundGitCommit fires after every assistant turn. Snapshots the current
 // `git diff HEAD` + `git status --porcelain` and asks the LLM to (re)write
 // .codehalter/.git_commit so it always matches the latest uncommitted state.
 // Self-skips when:
 //   - cwd has no .git directory (not a checkout, or .git not mounted),
 //   - the working tree is clean (nothing to summarise),
-//   - no eligible LLM[1+] slot is available (see pickGitCommitConn).
+//   - no eligible background slot is available (see pickBackgroundLLM).
 //
 // Multiple in-flight calls are allowed — they race on the file with
 // last-write-wins, which is fine because each LLM call's snapshot is point-in-
 // time and the freshest wins. The pre-write status re-check guards against
-// the narrow race where the user commits during the LLM call.
+// the narrow race where the user commits during the LLM call. When this and
+// the shadow summariser land on the same entry, the per-conn parallel
+// semaphore in llmStream serialises them naturally — no explicit join needed.
 func (a *agent) backgroundGitCommit(sess *Session) {
 	if sess == nil {
 		return
@@ -120,7 +114,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	if !sess.gitCommitJob.TryStart() {
 		return
 	}
-	conn, waitForShadow := a.pickGitCommitConn(sess.ID)
+	conn := a.pickBackgroundLLM(sess.ID)
 	if conn == nil {
 		sess.gitCommitJob.Done()
 		return
@@ -128,9 +122,6 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 
 	go func() {
 		defer sess.gitCommitJob.Done()
-		if waitForShadow {
-			sess.summariseJob.Wait()
-		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 

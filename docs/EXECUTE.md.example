@@ -54,11 +54,9 @@ carry out the plan.
 - When the user asks you to change something (a version, a config value, a
   dependency), read the file with read_file and make the change with
   edit_file or write_file. Do not explain how the user could do it themselves.
-- If the prompt names a verify-class target (`runner:target` such as
-  `just:verify` / `npm:ci` / `make:check`), run THAT via `run_task` for any
-  build/test/verify step in the plan. Its body is the project's contract for
-  that step and may chain tidy/lint/build sub-steps you'd miss by running the
-  constituents directly via `run_command` (`go test ./...`, `npm test`, etc.).
+- Do NOT run verify-class targets (`just:verify`, `npm:ci`, `make:check`,
+  `go test ./...`, etc.) yourself. The verify phase runs them — running them
+  here just doubles the cost. Stick to the plan steps and stop.
 
 ## Behavior
 

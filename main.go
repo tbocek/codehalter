@@ -135,7 +135,7 @@ type agent struct {
 	mode            string // "interactive" | "autopilot"
 
 	// connReachable records whether each configured LLMConnection answered
-	// the startup probe. Keyed by connKey(URL+model). pickBackgroundConn
+	// the startup probe. Keyed by connKey(URL+model). pickBackgroundLLM
 	// filters candidates against this so a dead extra slot doesn't burn a
 	// timeout on every background summarise call. Populated by checkLLM;
 	// nil before that.

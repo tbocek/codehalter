@@ -197,12 +197,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
-	// Store user message. On the very first turn of the session we fold the
-	// system prompt (skills + project dir) and the empty-project hint into
-	// the stored content — that way it lives in history as the leading user
-	// turn and every phase's buildLLMHistory call replays the same bytes.
-	// Subsequent turns store just the raw userText: sysPrompt is already in
-	// sess.Messages[0].
+	// Store user message. On the very first turn of the session we render the
+	// system prompt (skills + project dir) into sess.SystemPrompt — emitted by
+	// buildLLMHistory as a separate leading user message, so it survives the
+	// summariser when compressHistory rotates the conversation. The empty-
+	// project hint stays folded into the first user message because it's a
+	// one-shot nudge — once the project has files, we want the summariser to
+	// drop it naturally rather than re-injecting it forever.
 	sess := a.getSession(req.SessionId)
 	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
 	stored := userText
@@ -211,14 +212,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		if err != nil {
 			return a.failPrompt(req.SessionId, err, nil)
 		}
+		sess.SystemPrompt = sysPrompt
 		a.mu.Lock()
 		empty := a.emptyProject
 		a.mu.Unlock()
-		prefix := sysPrompt + "\n---\n"
 		if empty {
-			prefix = emptyProjectHint + "\n---\n" + prefix
+			stored = emptyProjectHint + "\n---\n" + userText
 		}
-		stored = prefix + userText
 	}
 	if sess != nil {
 		if len(images) > 0 {
@@ -285,9 +285,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		if !subtaskPath {
 			a.backgroundSummarise(sess)
 		}
-		// Refresh .codehalter/.git_commit on LLM[2+] (or LLM[1] after the
-		// summariseJob settles — see pickGitCommitConn). Overwrites by
-		// design, so it's safe to fire once per Prompt regardless of subtaskPath.
+		// Refresh .codehalter/.git_commit on any background slot picked by
+		// pickBackgroundLLM. Overwrites by design, so it's safe to fire once
+		// per Prompt regardless of subtaskPath.
 		a.backgroundGitCommit(sess)
 		a.compressHistory(ctx, sess)
 	}
