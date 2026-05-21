@@ -398,7 +398,7 @@ func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task 
 	// Plan. planAndRoute auto-answers clarification + "execute?" prompts
 	// (Depth > 0). It returns the planner's connection so execute/verify
 	// route to the same conn.
-	_, _, _, err := a.planAndRoute(ctx, sid, "")
+	_, plan, _, err := a.planAndRoute(ctx, sid, "")
 	if err != nil {
 		return "", err
 	}
@@ -409,7 +409,7 @@ func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task 
 	}
 
 	conn := a.pickAvailable(ctx, sid, "execute")
-	res, _, err = a.verify(ctx, sid, conn, res)
+	res, _, err = a.verify(ctx, sid, conn, plan, res)
 	if err != nil {
 		return res.Text, err
 	}

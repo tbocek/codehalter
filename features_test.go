@@ -371,7 +371,7 @@ func TestVerifyJSONParseFallback(t *testing.T) {
 	defer mock.Close()
 
 	res := toolLoopResult{Text: "my previous response"}
-	out, vr, err := a.verify(context.Background(), s.ID, mock.conn("execute"), res)
+	out, vr, err := a.verify(context.Background(), s.ID, mock.conn("execute"), nil, res)
 	if err != nil {
 		t.Fatalf("verify returned error: %v", err)
 	}

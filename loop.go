@@ -35,6 +35,15 @@ type planResult struct {
 	// plan→execute→verify cycle (see runSubtasks). Steps should be empty
 	// in this case — each subtask's own planner pass produces its steps.
 	Subtasks []string `json:"subtasks"`
+	// Verify lists the concrete checks the verify phase should run for THIS
+	// change. Decided by the planner because it has full project context
+	// (justfile/package.json/etc.) and knows what the change actually
+	// touched. The verify phase treats this as authoritative — see verify()
+	// and VERIFY.md. Empty means "no explicit verification" → verify falls
+	// back to the static verifyTargetHint or VERIFY.md's generic rule.
+	// Examples: ["Run just:verify via run_task"], ["Run npm:ci via run_task",
+	// "Confirm dist/bundle.js was regenerated"].
+	Verify []string `json:"verify"`
 	// ReportOnly is true when the planner already has the answer in hand
 	// (pure-lookup tasks: "where is X?", "what version of Y?") and the
 	// executor only needs to relay findings — no file edits, no commands.
@@ -339,7 +348,12 @@ type verifyResult struct {
 //
 // When fallbackConn is non-nil, it's used only if no LLM is configured for
 // the execute role (test path with synthetic agent and no settings).
-func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConnection, res toolLoopResult) (toolLoopResult, *verifyResult, error) {
+//
+// plan carries the verification recipe the planner specified for this
+// change (plan.Verify). When non-empty it's injected as authoritative — the
+// verify phase runs THOSE checks, not whatever it would have invented. nil
+// or empty Verify falls back to the static verifyTargetHint.
+func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConnection, plan *planResult, res toolLoopResult) (toolLoopResult, *verifyResult, error) {
 	verifyPrompt := a.loadPromptFile(sid, "VERIFY.md")
 	if verifyPrompt == "" {
 		return res, &verifyResult{Success: true}, nil
@@ -353,7 +367,15 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 	}
 
 	prompt := verifyPrompt
-	if hint := a.verifyTargetHint(); hint != "" {
+	if plan != nil && len(plan.Verify) > 0 {
+		var recipe strings.Builder
+		recipe.WriteString("\n\n## Verification recipe (from the planner)\n\n")
+		recipe.WriteString("The planner specified the following checks for THIS change. Run each via the appropriate tool — they replace your own judgment about what to check:\n\n")
+		for i, v := range plan.Verify {
+			fmt.Fprintf(&recipe, "%d. %s\n", i+1, v)
+		}
+		prompt = prompt + recipe.String()
+	} else if hint := a.verifyTargetHint(); hint != "" {
 		prompt = prompt + "\n\n" + hint
 	}
 
@@ -507,12 +529,13 @@ func (a *agent) runTaskCycle(
 	sess := a.getSession(sid)
 
 	conn := preConn
+	plan := prePlan
 	var replanContext string
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 || prePlan == nil {
 			a.sendPhase(ctx, sid, 0, false)
-			c, _, tu, err := a.planAndRoute(ctx, sid, replanContext)
+			c, p, tu, err := a.planAndRoute(ctx, sid, replanContext)
 			if err != nil {
 				if errors.Is(err, errUserCancelled) {
 					return result, err
@@ -524,6 +547,7 @@ func (a *agent) runTaskCycle(
 				return result, err
 			}
 			conn = c
+			plan = p
 		}
 
 		a.sendPhase(ctx, sid, 1, false)
@@ -539,7 +563,7 @@ func (a *agent) runTaskCycle(
 		a.sendPhase(ctx, sid, 2, false)
 		var vr *verifyResult
 		preVerifyToolCount := len(result.ToolUses)
-		result, vr, err = a.verify(ctx, sid, conn, result)
+		result, vr, err = a.verify(ctx, sid, conn, plan, result)
 		if err != nil {
 			return result, err
 		}

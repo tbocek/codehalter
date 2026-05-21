@@ -59,6 +59,26 @@ the answer in hand — no files will be edited, no commands will be run. Skips
 the "Execute this plan?" confirmation. Default `false` for anything that
 edits files, runs commands, or changes state.
 
+## Verification
+
+Every plan that edits files MUST specify how the change is verified. Fill
+`verify` with the concrete checks the verify phase should run. Examples:
+
+- `["Run just:verify via run_task"]` — when the project ships a
+  verify-class target (Justfile / package.json scripts / Makefile / etc.).
+  Read the project's task-runner file (`Justfile`, `package.json`,
+  `Makefile`) to find it — pick the most comprehensive target (often
+  `verify`, `ci`, `check`, `test`).
+- `["Run npm:ci via run_task", "Confirm dist/bundle.js exists"]` — when an
+  additional artifact check is meaningful.
+- `["Run go test ./... via run_task"]` — when there's no verify-class
+  target, fall back to whatever check task the project defines.
+
+Leave `verify` empty ONLY when the change is purely informational
+(`report_only=true`) or no files are edited (pure-report subtasks). Do NOT
+run the verification yourself during planning — record it as a `verify`
+entry; the verify phase runs it.
+
 ## Output
 
 Tool calls during gathering carry zero prose. Once you have everything, emit
@@ -71,6 +91,7 @@ the final reply as a single JSON object. The schema:
   "question":    "",            // one sentence when clear=false
   "steps":       ["..."],       // empty when clear=false or subtasks set
   "subtasks":    [],            // empty unless multi-phase
+  "verify":      ["..."],       // checks for the verify phase; empty only when no edits
   "report_only": false
 }
 ```

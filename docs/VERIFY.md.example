@@ -12,11 +12,12 @@ verification and return:
 
 If files WERE changed:
 
-1. Run the verify-class target ONCE. If the prompt names a specific target
-   (`runner:target` such as `just:verify` / `npm:ci` / `make:check`), call
-   THAT via `run_task` — its body is the project's full contract for
-   "verified" and may chain tidy/build/lint steps. If no target is named,
-   call whatever test/check task is available via `run_task`.
+1. Run the verification recipe ONCE. If a "Verification recipe (from the
+   planner)" section is appended below, follow THOSE numbered steps in
+   order — the planner has the full context for this change. Otherwise, if
+   the prompt names a `runner:target` (e.g. `just:verify` / `npm:ci` /
+   `make:check`), call it via `run_task`; if no target is named, call
+   whatever test/check task is available via `run_task`.
 
 2. Scoping the "once" rule: ONCE means once in THIS verify turn. Failed
    run_task calls in earlier executor turns do not count — re-run regardless
