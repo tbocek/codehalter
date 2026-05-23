@@ -309,7 +309,7 @@ func (a *agent) runSubtasks(ctx context.Context, sid string, subtasks []string) 
 	for i, s := range subtasks {
 		fmt.Fprintf(&header, "%d. %s\n", i+1, s)
 	}
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(header.String())})
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: header.String()}})
 
 	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
 	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Interactive", "Automatic"})
@@ -332,15 +332,13 @@ func (a *agent) runSubtasks(ctx context.Context, sid string, subtasks []string) 
 			a.mode = origMode
 			a.mu.Unlock()
 		}()
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock("[Automatic] Running all subtasks without interruption.\n\n")})
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[Automatic] Running all subtasks without interruption.\n\n"}})
 	}
 
 	var finalResult toolLoopResult
 
 	for i, sub := range subtasks {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(
-			fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(subtasks), sub),
-		)})
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(subtasks), sub)}})
 
 		// Append the subtask scope as a fresh user message so the inner
 		// planner has a clear, focused target. Following PLAN.md / EXECUTE.md

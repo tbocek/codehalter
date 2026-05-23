@@ -124,7 +124,7 @@ func (a *agent) discoverRunners(cwd string) {
 			_ = pipeW.Close()
 		}()
 
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock("\n```\n$ " + task + "\n")})
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n```\n$ " + task + "\n"}})
 
 		var collected strings.Builder
 		scanner := bufio.NewScanner(pipeR)
@@ -134,10 +134,10 @@ func (a *agent) discoverRunners(cwd string) {
 		for scanner.Scan() {
 			line := scanner.Text() + "\n"
 			collected.WriteString(line)
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(line)})
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
 		}
 		runErr := <-waitErr
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock("```\n")})
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "```\n"}})
 
 		// Surface a non-zero exit unambiguously: a banner at the TOP and
 		// bottom of the returned output (so a long stdout transcript can't

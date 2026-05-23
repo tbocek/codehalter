@@ -62,7 +62,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 		return
 	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(note + "\n")})
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: note + "\n"}})
 }
 
 // ---------------------------------------------------------------------------
@@ -86,10 +86,9 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		return
 	}
 
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(
-		"To sandbox file edits and task runs, I can write a " +
-			".devcontainer/Dockerfile and .devcontainer/devcontainer.json template " +
-			"you can then edit. Reopen the project in the container to use it.\n\n")})
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "To sandbox file edits and task runs, I can write a " +
+		".devcontainer/Dockerfile and .devcontainer/devcontainer.json template " +
+		"you can then edit. Reopen the project in the container to use it.\n\n"}})
 
 	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
 	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Debian", "Arch"})
@@ -124,7 +123,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 
 	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json. Reopen the project in the container to use them."
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(note + "\n")})
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: note + "\n"}})
 }
 
 // ---------------------------------------------------------------------------

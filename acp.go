@@ -36,13 +36,11 @@ type jsonrpcResponse struct {
 // ---------------------------------------------------------------------------
 
 const (
-	// protocolVersion is the ACP wire version we speak. Bumping breaks Zed
-	// clients pinned to the old number — keep at 1 unless Zed's side moves.
+	// ACP wire version. Bumping breaks Zed clients pinned to the old number.
 	protocolVersion = 1
-	// ACP session_update kinds for streamed content. agent_thought_chunk is
-	// reasoning_content from thinking models (Qwen3, DeepSeek-R1, GPT-OSS) —
-	// clients render it greyed/collapsible so deliberation doesn't blur with
-	// visible output.
+	// KindAgentThought is reasoning_content from thinking models
+	// (Qwen3, DeepSeek-R1, GPT-OSS) — Zed renders it greyed/collapsible so
+	// deliberation doesn't blur with visible output.
 	KindAgentMessage = "agent_message_chunk"
 	KindAgentThought = "agent_thought_chunk"
 	KindUserMessage  = "user_message_chunk"
@@ -57,9 +55,6 @@ type (
 	InitializeRequest struct {
 		ProtocolVersion int `json:"protocolVersion"`
 	}
-	// SessionCapabilities advertises list/close — each non-nil *struct{}
-	// serialises as `{}` on the wire, the shape ACP defines for
-	// "this capability is supported".
 	InitializeResponse struct {
 		ProtocolVersion   int `json:"protocolVersion"`
 		AgentCapabilities struct {
@@ -124,8 +119,6 @@ type (
 	}
 )
 
-// Session modes.
-
 type SessionModeState struct {
 	CurrentModeId  string `json:"currentModeId"`
 	AvailableModes []struct {
@@ -135,10 +128,9 @@ type SessionModeState struct {
 	} `json:"availableModes"`
 }
 
-// ContentBlock is the ACP wire shape for one prompt/response block: a flat
-// object with a "type" discriminator and per-variant fields. Type is the
-// only field always populated; the rest are set per kind. Going flat lets
-// encoding/json handle marshal/unmarshal directly — no custom methods.
+// ContentBlock is the ACP wire shape for a prompt/response block: a "type"
+// discriminator plus per-variant fields. Flat so encoding/json handles it
+// without custom Marshal/Unmarshal.
 type ContentBlock struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
@@ -146,31 +138,10 @@ type ContentBlock struct {
 	Data     string `json:"data,omitempty"` // base64-encoded image bytes
 }
 
-func TextBlock(text string) ContentBlock {
-	return ContentBlock{Type: "text", Text: text}
-}
-
-func ImageBlock(mimeType, data string) ContentBlock {
-	return ContentBlock{Type: "image", MimeType: mimeType, Data: data}
-}
-
-// Session update (agent -> client notification).
-
-// SessionNotification.Update is `any` because it's a discriminated union on
-// the wire (keyed by "sessionUpdate"): message chunks, plan updates, and
-// tool-call cards share one envelope and the right concrete struct is
-// picked at the call site.
-type SessionNotification struct {
-	SessionId string `json:"sessionId"`
-	Update    any    `json:"update"`
-}
-
 type messageChunk struct {
 	Kind    string       `json:"sessionUpdate"`
 	Content ContentBlock `json:"content"`
 }
-
-// Plan update — shown by the client as a checklist.
 
 type PlanEntry struct {
 	Content  string `json:"content"`
@@ -187,10 +158,8 @@ func PlanUpdate(entries []PlanEntry) any {
 	return planUpdate{Kind: "plan", Entries: entries}
 }
 
-// Current-mode update — informs the client UI that the active mode changed.
-// Field is "modeId" per ACP spec, distinct from "currentModeId" inside
-// SessionModeState advertised at session create/load.
-
+// currentModeUpdate notifies the client UI of an active-mode change. Field
+// is "modeId" per ACP spec — distinct from "currentModeId" in SessionModeState.
 type currentModeUpdate struct {
 	Kind   string `json:"sessionUpdate"`
 	ModeId string `json:"modeId"`
@@ -205,9 +174,6 @@ func CurrentModeUpdate(modeId string) any {
 // line protocol; the agent type is concrete (there is only one).
 // ---------------------------------------------------------------------------
 
-// AgentSideConnection routes ACP methods between the codehalter agent and a
-// connected ACP client. There is exactly one agent implementation, so the
-// previous Agent interface was abstraction without value and has been dropped.
 type AgentSideConnection struct {
 	proto *lineProtocol
 	agent *agent
@@ -234,8 +200,14 @@ func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader, log *slog.Logger
 
 func (a *AgentSideConnection) Done() <-chan struct{} { return a.done }
 
-func (a *AgentSideConnection) SessionUpdate(ctx context.Context, n SessionNotification) error {
-	return a.sendNotification("session/update", n)
+// SessionUpdate sends one agent->client notification. `update` is any of the
+// "sessionUpdate"-keyed wire shapes (message chunks, plan updates, tool-call
+// cards) — chosen at the call site.
+func (a *AgentSideConnection) SessionUpdate(ctx context.Context, sid string, update any) error {
+	return a.sendNotification("session/update", struct {
+		SessionId string `json:"sessionId"`
+		Update    any    `json:"update"`
+	}{sid, update})
 }
 
 // sendNotification writes a JSON-RPC notification (no ID, no response expected).
@@ -253,7 +225,7 @@ func (a *AgentSideConnection) sendNotification(method string, params any) error 
 
 // sendRequest writes a JSON-RPC request and blocks until the matching
 // response arrives. Returns the raw `result` bytes — callers unmarshal into
-// whatever shape they expect so this is a single non-generic entry point.
+// whatever shape they expect.
 func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id := a.nextID.Add(1)
 	idStr := fmt.Sprintf("%d", id)

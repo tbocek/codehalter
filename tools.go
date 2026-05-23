@@ -260,7 +260,7 @@ type ToolCallLocation struct {
 }
 
 func TextContent(text string) ToolCallContent {
-	b := TextBlock(text)
+	b := ContentBlock{Type: "text", Text: text}
 	return ToolCallContent{Type: "content", Content: &b}
 }
 
