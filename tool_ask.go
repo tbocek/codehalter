@@ -26,7 +26,7 @@ func (a *agent) shouldAutoAnswer(sid string) (bool, string) {
 // tool call they opened (typically via CompleteToolCall with a short note).
 func (a *agent) askYesNoAuto(ctx context.Context, sid string, tcId, yesLabel, noLabel string) (bool, error) {
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+yesLabel+"\n\n")))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("["+reason+"] "+yesLabel+"\n\n")))
 		return true, nil
 	}
 	return a.conn.AskYesNo(ctx, sid, tcId, yesLabel, noLabel)
@@ -39,7 +39,7 @@ func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId string, choi
 		if len(choices) == 0 {
 			return "abort", nil
 		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+choices[0]+"\n\n")))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("["+reason+"] "+choices[0]+"\n\n")))
 		return choices[0], nil
 	}
 	return a.conn.AskChoice(ctx, sid, tcId, choices)

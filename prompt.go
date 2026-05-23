@@ -185,7 +185,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// Extract user text and images from prompt blocks.
 	var userText string
 	var images []ImageData
-	for _, block := range req.Content {
+	for _, raw := range req.Content {
+		var block ContentBlock
+		if err := unmarshalContentBlock(raw, &block); err != nil {
+			continue
+		}
 		if block.Text != nil {
 			userText += block.Text.Text
 		}
@@ -312,7 +316,7 @@ func (a *agent) runSubtasks(ctx context.Context, sid string, subtasks []string) 
 	for i, s := range subtasks {
 		fmt.Fprintf(&header, "%d. %s\n", i+1, s)
 	}
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(header.String())))
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(header.String())))
 
 	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
 	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Interactive", "Automatic"})
@@ -335,13 +339,13 @@ func (a *agent) runSubtasks(ctx context.Context, sid string, subtasks []string) 
 			a.mode = origMode
 			a.mu.Unlock()
 		}()
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("[Automatic] Running all subtasks without interruption.\n\n")))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("[Automatic] Running all subtasks without interruption.\n\n")))
 	}
 
 	var finalResult toolLoopResult
 
 	for i, sub := range subtasks {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 			fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(subtasks), sub),
 		)))
 

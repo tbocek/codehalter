@@ -167,7 +167,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 		s, err := a.summarize(ctx, sess.ID, conn, buf.String())
 		if err != nil {
 			sess.mu.Unlock()
-			a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock(
+			a.sendUpdate(ctx, sess.ID, MessageChunk(KindAgentMessage, TextBlock(
 				"⚠ History compaction skipped (summarize failed: "+err.Error()+"). Will retry next turn.\n\n")))
 			return
 		}
@@ -177,7 +177,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	archiveID, err := sess.rotate(keepMessages, summary)
 	if err != nil {
 		sess.mu.Unlock()
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Compaction failed: "+err.Error()+"\n\n")))
+		a.sendUpdate(ctx, sess.ID, MessageChunk(KindAgentMessage, TextBlock("⚠ Compaction failed: "+err.Error()+"\n\n")))
 		return
 	}
 	// Refresh the rendered system prompt so the next turn still sees current
@@ -192,7 +192,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	_ = sess.saveLocked()
 	sess.mu.Unlock()
 
-	a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock(
+	a.sendUpdate(ctx, sess.ID, MessageChunk(KindAgentMessage, TextBlock(
 		fmt.Sprintf("🗜 History compacted — archived as %s\n\n", archiveID))))
 
 	a.retitle(ctx, sess)
@@ -392,13 +392,13 @@ func (a *agent) backgroundSummarise(sess *Session) {
 func (a *agent) generateTitle(ctx context.Context, sess *Session, userText string) {
 	conn := a.pickAvailable(ctx, sess.ID, "thinking")
 	if conn == nil {
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Cannot generate title: no LLM connections configured\n")))
+		a.sendUpdate(ctx, sess.ID, MessageChunk(KindAgentMessage, TextBlock("⚠ Cannot generate title: no LLM connections configured\n")))
 		return
 	}
 	messages := []llmMessage{{Role: "user", Content: titlePrompt + "\n\n" + userText}}
 	title, err := a.llmSimple(ctx, sess.ID, conn, messages)
 	if err != nil {
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Title generation failed: "+err.Error()+"\n")))
+		a.sendUpdate(ctx, sess.ID, MessageChunk(KindAgentMessage, TextBlock("⚠ Title generation failed: "+err.Error()+"\n")))
 		title = userText
 		if len(title) > titleFallbackLen {
 			title = title[:titleFallbackLen]
@@ -437,7 +437,7 @@ func (a *agent) retitle(ctx context.Context, sess *Session) {
 	messages := []llmMessage{{Role: "user", Content: retitlePrompt + sess.Summary}}
 	title, err := a.llmSimple(ctx, sess.ID, conn, messages)
 	if err != nil {
-		a.sendUpdate(ctx, sess.ID, AgentMessageChunk(TextBlock("⚠ Retitle failed: "+err.Error()+"\n")))
+		a.sendUpdate(ctx, sess.ID, MessageChunk(KindAgentMessage, TextBlock("⚠ Retitle failed: "+err.Error()+"\n")))
 		return
 	}
 	if title == "" {

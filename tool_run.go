@@ -76,7 +76,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 		_ = pipeW.Close()
 	}()
 
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("\n```\n$ "+cmdStr+"\n")))
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("\n```\n$ "+cmdStr+"\n")))
 
 	var collected strings.Builder
 	scanner := bufio.NewScanner(pipeR)
@@ -84,10 +84,10 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	for scanner.Scan() {
 		line := scanner.Text() + "\n"
 		collected.WriteString(line)
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(line)))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(line)))
 	}
 	runErr := <-waitErr
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("```\n")))
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("```\n")))
 
 	// Always surface the exit code. run_command is a probe: non-zero is
 	// data, not failure. Title and result both carry "(exit N)" so the

@@ -205,7 +205,11 @@ func (a *agent) sessionModes() *SessionModeState {
 	}
 	return &SessionModeState{
 		CurrentModeId: current,
-		AvailableModes: []SessionMode{
+		AvailableModes: []struct {
+			Id          string `json:"id"`
+			Name        string `json:"name"`
+			Description string `json:"description,omitempty"`
+		}{
 			{Id: modeInteractive, Name: "Interactive", Description: "Ask the user before non-trivial actions"},
 			{Id: modeAutopilot, Name: "Autopilot", Description: "Auto-answer prompts — no user interruption"},
 		},
@@ -283,10 +287,10 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	res.ProtocolVersion = protocolVersion
 	res.AgentCapabilities.LoadSession = true
 	res.AgentCapabilities.PromptCapabilities.Image = a.imagesSupported
-	res.AgentCapabilities.SessionCapabilities = &SessionCapabilities{
-		List:  &struct{}{},
-		Close: &struct{}{},
-	}
+	res.AgentCapabilities.SessionCapabilities = &struct {
+		List  *struct{} `json:"list,omitempty"`
+		Close *struct{} `json:"close,omitempty"`
+	}{List: &struct{}{}, Close: &struct{}{}}
 	res.AgentInfo = &Implementation{Name: "llama-acp", Version: "0.1.0"}
 	res.AuthMethods = []string{}
 	return res, nil
@@ -338,7 +342,7 @@ func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid string) {
 	a.ensureSettings(ctx, cwd, sid)
 
 	if a.settings.path != "" {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Using "+a.settings.path+"\n\n")))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("Using "+a.settings.path+"\n\n")))
 	}
 
 	a.checkLLM(ctx, sid)
@@ -373,12 +377,12 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid string) {
 	a.mu.Unlock()
 
 	if empty {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 			"Empty project — I'll ask about language and runner on your first message.\n\n")))
 		return
 	}
 	if len(caps.runners) == 0 {
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 			"🟡 No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")))
 		return
 	}
@@ -397,7 +401,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid string) {
 	row("lint", caps.lint, "consider adding a `lint`/`vet`/`check` target")
 	row("format", caps.format, "consider adding a `fmt`/`format` target")
 	b.WriteString("\n")
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(b.String())))
 }
 
 // checkLLM probes every configured LLMConnection in parallel, records which
@@ -409,12 +413,12 @@ func (a *agent) checkLLM(ctx context.Context, sid string) {
 	conns := a.settings.allConnections()
 	if len(conns) == 0 {
 		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("🟡 LLM: no [[llm]] in settings.toml — codehalter cannot run until you add one.\n\n")))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("🟡 LLM: no [[llm]] in settings.toml — codehalter cannot run until you add one.\n\n")))
 		return
 	}
 	if settingsLooksPlaceholder(a.settings) {
 		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 			"🟡 LLM: "+a.settings.path+" still has the placeholder model \"your-model-id\". Edit it with your real url and model, then restart this Zed session.\n\n")))
 		return
 	}
@@ -473,7 +477,7 @@ func (a *agent) checkLLM(ctx context.Context, sid string) {
 			fmt.Fprintf(&b, "🟡 Context window: unknown — server didn't report n_ctx, using default compact trigger %d\n\n", rawBufferTokens)
 		}
 	}
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(b.String())))
 }
 
 // checkEnvironment reports whether codehalter is running inside a container
@@ -500,7 +504,7 @@ func (a *agent) checkEnvironment(ctx context.Context, sid string) {
 	default:
 		fmt.Fprintf(&b, "🟡 run_command: disabled — %s\n\n", a.runCmdStatus)
 	}
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(b.String())))
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(b.String())))
 }
 
 // containerKind returns a short label identifying the container runtime, or
@@ -578,18 +582,18 @@ func (a *agent) replayHistory(ctx context.Context, sid string, s *Session) {
 	for _, m := range s.Messages {
 		if m.Role == lastRole {
 			if m.Role == "user" {
-				a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("")))
+				a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("")))
 			} else {
-				a.sendUpdate(ctx, sid, UserMessageChunk(TextBlock("")))
+				a.sendUpdate(ctx, sid, MessageChunk(KindUserMessage, TextBlock("")))
 			}
 		}
 		if m.Role == "user" {
-			a.sendUpdate(ctx, sid, UserMessageChunk(TextBlock(m.Content)))
+			a.sendUpdate(ctx, sid, MessageChunk(KindUserMessage, TextBlock(m.Content)))
 			for _, img := range m.Images {
-				a.sendUpdate(ctx, sid, UserMessageChunk(ImageBlock(img.MimeType, img.Data)))
+				a.sendUpdate(ctx, sid, MessageChunk(KindUserMessage, ImageBlock(img.MimeType, img.Data)))
 			}
 		} else {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(m.Content)))
+			a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(m.Content)))
 		}
 		lastRole = m.Role
 	}
@@ -614,7 +618,7 @@ func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) e
 	a.mode = req.ModeId
 	a.mu.Unlock()
 	a.sendUpdate(ctx, req.SessionId, CurrentModeUpdate(req.ModeId))
-	a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Mode: "+req.ModeId+"\n\n")))
+	a.sendUpdate(ctx, req.SessionId, MessageChunk(KindAgentMessage, TextBlock("Mode: "+req.ModeId+"\n\n")))
 	return nil
 }
 

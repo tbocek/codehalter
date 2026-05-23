@@ -25,12 +25,10 @@ type jsonrpcResponse struct {
 	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id"`
 	Result  any              `json:"result,omitempty"`
-	Error   *rpcError        `json:"error,omitempty"`
-}
-
-type rpcError struct {
-	Code    int    `json:"code"`
-	Message string `json:"message"`
+	Error   *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -46,18 +44,13 @@ type Implementation struct {
 	Version string `json:"version,omitempty"`
 }
 
-// SessionCapabilities advertises optional session features. Each non-nil
-// pointer is a marker — empty struct serialises as `{}` on the wire, which
-// is the shape ACP defines for "this capability is supported".
-type SessionCapabilities struct {
-	List  *struct{} `json:"list,omitempty"`
-	Close *struct{} `json:"close,omitempty"`
-}
-
 type (
 	InitializeRequest struct {
 		ProtocolVersion int `json:"protocolVersion"`
 	}
+	// SessionCapabilities advertises list/close — each non-nil *struct{}
+	// serialises as `{}` on the wire, the shape ACP defines for
+	// "this capability is supported".
 	InitializeResponse struct {
 		ProtocolVersion   int `json:"protocolVersion"`
 		AgentCapabilities struct {
@@ -65,7 +58,10 @@ type (
 			PromptCapabilities struct {
 				Image bool `json:"image,omitempty"`
 			} `json:"promptCapabilities"`
-			SessionCapabilities *SessionCapabilities `json:"sessionCapabilities,omitempty"`
+			SessionCapabilities *struct {
+				List  *struct{} `json:"list,omitempty"`
+				Close *struct{} `json:"close,omitempty"`
+			} `json:"sessionCapabilities,omitempty"`
 		} `json:"agentCapabilities"`
 		AgentInfo   *Implementation `json:"agentInfo,omitempty"`
 		AuthMethods []string        `json:"authMethods"`
@@ -111,8 +107,8 @@ type (
 	}
 
 	PromptRequest struct {
-		SessionId string      `json:"sessionId"`
-		Content   []ContentBlock `json:"prompt"`
+		SessionId string            `json:"sessionId"`
+		Content   []json.RawMessage `json:"prompt"`
 	}
 	PromptResponse struct {
 		StopReason string `json:"stopReason,omitempty"`
@@ -122,35 +118,33 @@ type (
 // Session modes.
 
 type SessionModeState struct {
-	CurrentModeId  string        `json:"currentModeId"`
-	AvailableModes []SessionMode `json:"availableModes"`
-}
-
-type SessionMode struct {
-	Id          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
+	CurrentModeId  string `json:"currentModeId"`
+	AvailableModes []struct {
+		Id          string `json:"id"`
+		Name        string `json:"name"`
+		Description string `json:"description,omitempty"`
+	} `json:"availableModes"`
 }
 
 // Content blocks — union type, serialised flat (not wrapped).
 
 type ContentBlock struct {
-	Text  *ContentBlockText
-	Image *ContentBlockImage
+	Text *struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	Image *struct {
+		Type     string `json:"type"`
+		MimeType string `json:"mimeType"`
+		Data     string `json:"data"` // base64-encoded image data
+	}
 }
 
-type ContentBlockText struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-type ContentBlockImage struct {
-	Type     string `json:"type"`
-	MimeType string `json:"mimeType"`
-	Data     string `json:"data"` // base64-encoded image data
-}
-
-func (b ContentBlock) MarshalJSON() ([]byte, error) {
+// marshalContentBlock emits the wire shape ACP defines: {"type":"text",...}
+// or {"type":"image",...} — never the Go {"Text":{...}} that the default
+// encoder would produce. Returns "null" when neither variant is set so the
+// caller can still unconditionally embed the result.
+func marshalContentBlock(b ContentBlock) ([]byte, error) {
 	if b.Text != nil {
 		return json.Marshal(b.Text)
 	}
@@ -160,7 +154,10 @@ func (b ContentBlock) MarshalJSON() ([]byte, error) {
 	return []byte("null"), nil
 }
 
-func (b *ContentBlock) UnmarshalJSON(data []byte) error {
+// unmarshalContentBlock dispatches on the "type" discriminator and fills the
+// matching variant. Unknown types are silently dropped so a future ACP block
+// shape doesn't break older agents.
+func unmarshalContentBlock(data []byte, b *ContentBlock) error {
 	var probe struct {
 		Type string `json:"type"`
 	}
@@ -169,10 +166,10 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 	}
 	switch probe.Type {
 	case "text":
-		b.Text = &ContentBlockText{}
+		*b = TextBlock("")
 		return json.Unmarshal(data, b.Text)
 	case "image":
-		b.Image = &ContentBlockImage{}
+		*b = ImageBlock("", "")
 		return json.Unmarshal(data, b.Image)
 	default:
 		return nil
@@ -180,11 +177,18 @@ func (b *ContentBlock) UnmarshalJSON(data []byte) error {
 }
 
 func TextBlock(text string) ContentBlock {
-	return ContentBlock{Text: &ContentBlockText{Type: "text", Text: text}}
+	return ContentBlock{Text: &struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}{Type: "text", Text: text}}
 }
 
 func ImageBlock(mimeType, data string) ContentBlock {
-	return ContentBlock{Image: &ContentBlockImage{Type: "image", MimeType: mimeType, Data: data}}
+	return ContentBlock{Image: &struct {
+		Type     string `json:"type"`
+		MimeType string `json:"mimeType"`
+		Data     string `json:"data"` // base64-encoded image data
+	}{Type: "image", MimeType: mimeType, Data: data}}
 }
 
 // Session update (agent -> client notification).
@@ -200,24 +204,23 @@ type SessionNotification struct {
 type SessionUpdate = any
 
 type messageChunk struct {
-	Kind    string       `json:"sessionUpdate"`
-	Content ContentBlock `json:"content"`
+	Kind    string          `json:"sessionUpdate"`
+	Content json.RawMessage `json:"content"`
 }
 
-func AgentMessageChunk(content ContentBlock) SessionUpdate {
-	return messageChunk{Kind: "agent_message_chunk", Content: content}
-}
+// ACP session_update kinds for streamed content. agent_thought_chunk is
+// reasoning_content from thinking models (Qwen3, DeepSeek-R1, GPT-OSS) —
+// clients render it greyed/collapsible so deliberation doesn't blur with
+// visible output.
+const (
+	KindAgentMessage = "agent_message_chunk"
+	KindAgentThought = "agent_thought_chunk"
+	KindUserMessage  = "user_message_chunk"
+)
 
-// AgentThoughtChunk surfaces reasoning_content (chain-of-thought from
-// thinking models — Qwen3, DeepSeek-R1, GPT-OSS) as a distinct stream.
-// Clients render it differently (greyed/collapsible) so visible output and
-// internal deliberation don't blur together in the UI.
-func AgentThoughtChunk(content ContentBlock) SessionUpdate {
-	return messageChunk{Kind: "agent_thought_chunk", Content: content}
-}
-
-func UserMessageChunk(content ContentBlock) SessionUpdate {
-	return messageChunk{Kind: "user_message_chunk", Content: content}
+func MessageChunk(kind string, content ContentBlock) SessionUpdate {
+	raw, _ := marshalContentBlock(content)
+	return messageChunk{Kind: kind, Content: raw}
 }
 
 // Plan update — shown by the client as a checklist.
@@ -342,7 +345,10 @@ func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, pa
 	case line := <-ch:
 		var resp struct {
 			Result json.RawMessage `json:"result"`
-			Error  *rpcError       `json:"error"`
+			Error  *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
 		}
 		if err := json.Unmarshal(line, &resp); err != nil {
 			return nil, err
@@ -367,7 +373,10 @@ func (a *AgentSideConnection) sendError(id *json.RawMessage, code int, message s
 	_ = a.proto.writeMessage(jsonrpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
-		Error:   &rpcError{Code: code, Message: message},
+		Error: &struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}{Code: code, Message: message},
 	})
 }
 

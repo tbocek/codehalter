@@ -247,11 +247,11 @@ type toolCallUpdate struct {
 }
 
 type ToolCallContent struct {
-	Type    string        `json:"type"`
-	Content *ContentBlock `json:"content,omitempty"`
-	Path    string        `json:"path,omitempty"`
-	OldText *string       `json:"oldText,omitempty"`
-	NewText string        `json:"newText,omitempty"`
+	Type    string          `json:"type"`
+	Content json.RawMessage `json:"content,omitempty"`
+	Path    string          `json:"path,omitempty"`
+	OldText *string         `json:"oldText,omitempty"`
+	NewText string          `json:"newText,omitempty"`
 }
 
 type ToolCallLocation struct {
@@ -260,8 +260,8 @@ type ToolCallLocation struct {
 }
 
 func TextContent(text string) ToolCallContent {
-	b := TextBlock(text)
-	return ToolCallContent{Type: "content", Content: &b}
+	raw, _ := marshalContentBlock(TextBlock(text))
+	return ToolCallContent{Type: "content", Content: raw}
 }
 
 func DiffContent(path string, oldText *string, newText string) ToolCallContent {

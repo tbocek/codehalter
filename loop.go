@@ -135,7 +135,7 @@ func (a *agent) renderSteps(ctx context.Context, sid string, steps []string, hea
 	for i, step := range steps {
 		fmt.Fprintf(&planText, "%d. %s\n", i+1, step)
 	}
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(planText.String())))
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(planText.String())))
 	return planText.String()
 }
 
@@ -186,7 +186,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid string, replanContext stri
 		if question == "" {
 			question = "I'm not sure what you mean. Which of these?"
 		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(question)))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(question)))
 
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
 		choice, err := a.askChoiceAuto(ctx, sid, tcId, plan.Choices)
@@ -204,7 +204,7 @@ func (a *agent) planAndRoute(ctx context.Context, sid string, replanContext stri
 		if sess != nil {
 			_ = sess.Save()
 		}
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("Understood: "+choice+"\n")))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("Understood: "+choice+"\n")))
 	}
 
 	// If the planner decomposed the request into subtasks, skip the per-plan
@@ -408,7 +408,7 @@ func (a *agent) verify(ctx context.Context, sid string, fallbackConn *LLMConnect
 	res.ToolUses = append(res.ToolUses, verifyRes.ToolUses...)
 	if err != nil {
 		slog.Error("verify: skipped, treating as success", "err", err)
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("⚠ Verification skipped: "+err.Error()+"\n")))
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("⚠ Verification skipped: "+err.Error()+"\n")))
 		return res, &verifyResult{Success: true}, nil
 	}
 	if sess != nil && verifyRes.Text != "" {
@@ -588,7 +588,7 @@ func (a *agent) runTaskCycle(
 			}
 		}
 		if looped {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+			a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 				fmt.Sprintf("⚠ Same verification failure as a prior attempt — retrying would loop. Giving up. Last issues:\n%s\n", strings.Join(vr.Issues, "\n")),
 			)))
 			break
@@ -596,13 +596,13 @@ func (a *agent) runTaskCycle(
 		seenBags = append(seenBags, currentBag)
 
 		if attempt == maxAttempts-1 {
-			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+			a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 				fmt.Sprintf("⚠ Verification still failing after %d attempts — giving up. Last issues:\n%s\n", maxAttempts, strings.Join(vr.Issues, "\n")),
 			)))
 			break
 		}
 
-		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 			fmt.Sprintf("⚠ Verification failed (attempt %d/%d). Re-planning with the failure context:\n%s\n", attempt+1, maxAttempts, strings.Join(vr.FixSteps, "\n")),
 		)))
 		// The full failure detail is already in history on the preceding

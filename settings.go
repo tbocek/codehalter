@@ -213,7 +213,7 @@ func (a *agent) ensureSettings(ctx context.Context, cwd string, sid string) {
 		return
 	}
 
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 		"No settings.toml found at ~/.config/codehalter/settings.toml or "+
 			".codehalter/settings.toml. Codehalter needs at least one [[llm]] "+
 			"entry pointing at your LLM server to function. I can write a "+
@@ -247,7 +247,7 @@ func (a *agent) ensureSettings(ctx context.Context, cwd string, sid string) {
 	}
 
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Wrote " + path)})
-	a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(
+	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
 		"⚠ Wrote "+path+" with placeholder values — codehalter will not be able to call the LLM until you edit it.\n\n"+
 			"1. Open the file (in Zed: Ctrl/Cmd+P → type `settings.toml`).\n"+
 			"2. Replace `url` and `model` with values that match your LLM server (run `curl <url>/v1/models` to see the model ids your server reports).\n"+
