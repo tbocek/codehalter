@@ -20,12 +20,11 @@ import (
 type lineProtocol struct {
 	w       io.Writer
 	r       io.Reader
-	log     *slog.Logger
 	writeMu sync.Mutex
 }
 
-func newLineProtocol(w io.Writer, r io.Reader, log *slog.Logger) *lineProtocol {
-	return &lineProtocol{w: w, r: r, log: log}
+func newLineProtocol(w io.Writer, r io.Reader) *lineProtocol {
+	return &lineProtocol{w: w, r: r}
 }
 
 func (p *lineProtocol) writeMessage(msg any) error {
@@ -33,7 +32,7 @@ func (p *lineProtocol) writeMessage(msg any) error {
 	if err != nil {
 		return err
 	}
-	p.log.Debug("writing", "msg", string(b))
+	slog.Debug("writing", "msg", string(b))
 	b = append(b, '\n')
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
@@ -51,7 +50,7 @@ func (p *lineProtocol) serve(onLine func([]byte)) {
 		line, err := br.ReadString('\n')
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				p.log.Debug("read error", "error", err)
+				slog.Debug("read error", "error", err)
 			}
 			return
 		}

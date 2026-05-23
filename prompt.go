@@ -76,7 +76,7 @@ func (a *agent) sendPhase(ctx context.Context, sid string, phase int, done bool)
 		sess.phaseActive = !done
 		sess.phaseMu.Unlock()
 	}
-	a.sendUpdate(ctx, sid, PlanUpdate(entries))
+	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
 // setStatus re-emits the full multi-row plan with `suffix` appended to
@@ -102,7 +102,7 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 	if entries == nil {
 		return
 	}
-	a.sendUpdate(ctx, sid, PlanUpdate(entries))
+	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
 // finalizePlan marks every phase up to and including the currently-active one
@@ -127,7 +127,7 @@ func (a *agent) finalizePlan(sid string) {
 		return
 	}
 	// Background ctx so the finalize fires even when the request ctx is cancelled.
-	a.sendUpdate(context.Background(), sid, PlanUpdate(entries))
+	a.sendUpdate(context.Background(), sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
 // failPrompt records a fatal error in the session and returns it so the ACP

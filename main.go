@@ -196,6 +196,15 @@ const (
 	modeAutopilot   = "autopilot"
 )
 
+// agentInfo is the implementation block we advertise in the initialize
+// response. Static — name and version don't change at runtime.
+func agentInfo() any {
+	return struct {
+		Name    string `json:"name,omitempty"`
+		Version string `json:"version,omitempty"`
+	}{"llama-acp", "0.1.0"}
+}
+
 // sessionModes is the mode state advertised to the client on session
 // create/load. The client uses this to render the mode selector.
 func (a *agent) sessionModes() *SessionModeState {
@@ -290,7 +299,7 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 		List  *struct{} `json:"list,omitempty"`
 		Close *struct{} `json:"close,omitempty"`
 	}{List: &struct{}{}, Close: &struct{}{}}
-	res.AgentInfo = &Implementation{Name: "llama-acp", Version: "0.1.0"}
+	res.AgentInfo = agentInfo()
 	res.AuthMethods = []string{}
 	return res, nil
 }
@@ -613,7 +622,11 @@ func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) e
 	a.mu.Lock()
 	a.mode = req.ModeId
 	a.mu.Unlock()
-	a.sendUpdate(ctx, req.SessionId, CurrentModeUpdate(req.ModeId))
+	// Field is "modeId" per ACP spec — distinct from "currentModeId" in SessionModeState.
+	a.sendUpdate(ctx, req.SessionId, struct {
+		Kind   string `json:"sessionUpdate"`
+		ModeId string `json:"modeId"`
+	}{Kind: "current_mode_update", ModeId: req.ModeId})
 	a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Mode: " + req.ModeId + "\n\n"}})
 	return nil
 }
@@ -726,15 +739,13 @@ func main() {
 	// Global slog goes to stderr only — Zed captures it for live debugging,
 	// and reproducing a session bug from a fresh shell is the session log's
 	// job, not a global file's.
-	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})
-	slog.SetDefault(slog.New(stderrHandler))
-	log := slog.New(stderrHandler)
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	a := &agent{sessions: make(map[string]*Session), mode: modeInteractive}
-	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin, log)
+	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin)
 	a.conn = conn
 
-	log.Info("waiting for connection")
+	slog.Info("waiting for connection")
 	<-conn.Done()
-	log.Info("connection closed")
+	slog.Info("connection closed")
 }

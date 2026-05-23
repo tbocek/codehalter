@@ -35,21 +35,18 @@ type jsonrpcResponse struct {
 // ACP wire types
 // ---------------------------------------------------------------------------
 
+// ACP wire version. Bumping breaks Zed clients pinned to the old number.
+const protocolVersion = 1
+
+// Session-update content-chunk kinds.
 const (
-	// ACP wire version. Bumping breaks Zed clients pinned to the old number.
-	protocolVersion = 1
-	// KindAgentThought is reasoning_content from thinking models
-	// (Qwen3, DeepSeek-R1, GPT-OSS) — Zed renders it greyed/collapsible so
-	// deliberation doesn't blur with visible output.
 	KindAgentMessage = "agent_message_chunk"
+	// KindAgentThought is reasoning_content from thinking models (Qwen3,
+	// DeepSeek-R1, GPT-OSS) — Zed renders it greyed/collapsible so
+	// deliberation doesn't blur with visible output.
 	KindAgentThought = "agent_thought_chunk"
 	KindUserMessage  = "user_message_chunk"
 )
-
-type Implementation struct {
-	Name    string `json:"name,omitempty"`
-	Version string `json:"version,omitempty"`
-}
 
 type (
 	InitializeRequest struct {
@@ -67,8 +64,8 @@ type (
 				Close *struct{} `json:"close,omitempty"`
 			} `json:"sessionCapabilities,omitempty"`
 		} `json:"agentCapabilities"`
-		AgentInfo   *Implementation `json:"agentInfo,omitempty"`
-		AuthMethods []string        `json:"authMethods"`
+		AgentInfo   any      `json:"agentInfo,omitempty"`
+		AuthMethods []string `json:"authMethods"`
 	}
 
 	NewSessionRequest struct {
@@ -154,21 +151,6 @@ type planUpdate struct {
 	Entries []PlanEntry `json:"entries"`
 }
 
-func PlanUpdate(entries []PlanEntry) any {
-	return planUpdate{Kind: "plan", Entries: entries}
-}
-
-// currentModeUpdate notifies the client UI of an active-mode change. Field
-// is "modeId" per ACP spec — distinct from "currentModeId" in SessionModeState.
-type currentModeUpdate struct {
-	Kind   string `json:"sessionUpdate"`
-	ModeId string `json:"modeId"`
-}
-
-func CurrentModeUpdate(modeId string) any {
-	return currentModeUpdate{Kind: "current_mode_update", ModeId: modeId}
-}
-
 // ---------------------------------------------------------------------------
 // AgentSideConnection — JSON-RPC dispatch + outgoing-request demux. Owns the
 // line protocol; the agent type is concrete (there is only one).
@@ -177,7 +159,6 @@ func CurrentModeUpdate(modeId string) any {
 type AgentSideConnection struct {
 	proto *lineProtocol
 	agent *agent
-	log   *slog.Logger
 
 	done chan struct{}
 
@@ -186,11 +167,10 @@ type AgentSideConnection struct {
 	pending   map[string]chan json.RawMessage
 }
 
-func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader, log *slog.Logger) *AgentSideConnection {
+func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader) *AgentSideConnection {
 	c := &AgentSideConnection{
-		proto:   newLineProtocol(w, r, log),
+		proto:   newLineProtocol(w, r),
 		agent:   a,
-		log:     log,
 		done:    make(chan struct{}),
 		pending: make(map[string]chan json.RawMessage),
 	}
@@ -199,6 +179,8 @@ func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader, log *slog.Logger
 }
 
 func (a *AgentSideConnection) Done() <-chan struct{} { return a.done }
+
+// --- outbound (codehalter → Zed) ---
 
 // SessionUpdate sends one agent->client notification. `update` is any of the
 // "sessionUpdate"-keyed wire shapes (message chunks, plan updates, tool-call
@@ -279,56 +261,7 @@ func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, pa
 	}
 }
 
-func (a *AgentSideConnection) sendResult(id *json.RawMessage, result any) {
-	_ = a.proto.writeMessage(jsonrpcResponse{JSONRPC: "2.0", ID: id, Result: result})
-}
-
-// sendError emits a JSON-RPC error response. We deliberately avoid -32000:
-// ACP reserves it for AUTH_REQUIRED, so using it for generic handler failures
-// makes Zed render a misleading "Authentication Required" red box (with an
-// Authenticate button) for unrelated problems — e.g. an LLM stream cancelled
-// mid-flight by the user.
-func (a *AgentSideConnection) sendError(id *json.RawMessage, code int, message string) {
-	_ = a.proto.writeMessage(jsonrpcResponse{
-		JSONRPC: "2.0",
-		ID:      id,
-		Error: &struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		}{Code: code, Message: message},
-	})
-}
-
-// decodeParams unmarshals req.Params into dst. Returns false (and writes a
-// -32602 "invalid params" error) when the bytes won't decode. nil params is
-// allowed and treated as an empty object.
-func (a *AgentSideConnection) decodeParams(req *jsonrpcRequest, dst any) bool {
-	if req.Params == nil {
-		return true
-	}
-	if err := json.Unmarshal(req.Params, dst); err != nil {
-		if req.ID != nil {
-			a.sendError(req.ID, -32602, fmt.Sprintf("invalid params: %v", err))
-		}
-		return false
-	}
-	return true
-}
-
-// reply finishes a handler: emit result on success, -32603 error otherwise.
-// Skips the reply entirely when req.ID is nil (notification).
-func (a *AgentSideConnection) reply(req *jsonrpcRequest, result any, err error) {
-	if err != nil {
-		a.log.Error("handler failed", "method", req.Method, "error", err)
-		if req.ID != nil {
-			a.sendError(req.ID, -32603, err.Error())
-		}
-		return
-	}
-	if req.ID != nil {
-		a.sendResult(req.ID, result)
-	}
-}
+// --- inbound (Zed → codehalter) ---
 
 // serve reads lines from the underlying transport forever. Responses to our
 // outgoing requests route to the pending map; everything else lands in
@@ -344,7 +277,7 @@ func (a *AgentSideConnection) serve() {
 			Error  *json.RawMessage `json:"error"`
 		}
 		if err := json.Unmarshal(line, &probe); err != nil {
-			a.log.Warn("failed to parse message", "error", err)
+			slog.Warn("failed to parse message", "error", err)
 			return
 		}
 
@@ -369,18 +302,15 @@ func (a *AgentSideConnection) serve() {
 		// Incoming request or notification.
 		var req jsonrpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
-			a.log.Warn("failed to parse message", "error", err)
+			slog.Warn("failed to parse message", "error", err)
 			return
 		}
-		a.log.Debug("received", "method", req.Method, "raw", string(line))
+		slog.Debug("received", "method", req.Method, "raw", string(line))
 
-		// session/prompt runs on its own goroutine so a long turn doesn't
-		// block reading the cancel notification that ends it.
-		if req.Method == "session/prompt" {
-			go a.handle(ctx, &req)
-		} else {
-			a.handle(ctx, &req)
-		}
+		// Must be async: handlers issue outbound sendRequest calls whose
+		// responses come back through this same read loop. Running handle
+		// inline would block the loop and deadlock the response routing.
+		go a.handle(ctx, &req)
 	})
 }
 
@@ -455,7 +385,59 @@ func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
 
 	default:
 		if req.ID != nil {
-			a.sendError(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
+			a.replyError(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 		}
+	}
+}
+
+// decodeParams unmarshals req.Params into dst. Returns false (and writes a
+// -32602 "invalid params" error) when the bytes won't decode. nil params is
+// allowed and treated as an empty object.
+func (a *AgentSideConnection) decodeParams(req *jsonrpcRequest, dst any) bool {
+	if req.Params == nil {
+		return true
+	}
+	if err := json.Unmarshal(req.Params, dst); err != nil {
+		if req.ID != nil {
+			a.replyError(req.ID, -32602, fmt.Sprintf("invalid params: %v", err))
+		}
+		return false
+	}
+	return true
+}
+
+// reply finishes a handler: emit result on success, -32603 error otherwise.
+// Skips entirely when req.ID is nil (notification).
+func (a *AgentSideConnection) reply(req *jsonrpcRequest, result any, err error) {
+	if err != nil {
+		slog.Error("handler failed", "method", req.Method, "error", err)
+		if req.ID != nil {
+			a.replyError(req.ID, -32603, err.Error())
+		}
+		return
+	}
+	if req.ID == nil {
+		return
+	}
+	if werr := a.proto.writeMessage(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}); werr != nil {
+		slog.Warn("write reply failed", "method", req.Method, "error", werr)
+	}
+}
+
+// replyError emits a JSON-RPC error response. We deliberately avoid -32000:
+// ACP reserves it for AUTH_REQUIRED, so using it for generic handler failures
+// makes Zed render a misleading "Authentication Required" red box (with an
+// Authenticate button) for unrelated problems — e.g. an LLM stream cancelled
+// mid-flight by the user.
+func (a *AgentSideConnection) replyError(id *json.RawMessage, code int, message string) {
+	if err := a.proto.writeMessage(jsonrpcResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error: &struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}{code, message},
+	}); err != nil {
+		slog.Warn("write error reply failed", "code", code, "error", err)
 	}
 }

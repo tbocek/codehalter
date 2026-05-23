@@ -363,7 +363,7 @@ func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit 
 		Path      string `json:"path"`
 		Line      *int   `json:"line,omitempty"`
 		Limit     *int   `json:"limit,omitempty"`
-	}{SessionId: sid, Path: path, Line: line, Limit: limit})
+	}{sid, path, line, limit})
 	if err != nil {
 		return "", err
 	}
@@ -397,7 +397,7 @@ func fsWrite(a *agent, ctx context.Context, sid string, path, content string) er
 		SessionId string `json:"sessionId"`
 		Path      string `json:"path"`
 		Content   string `json:"content"`
-	}{SessionId: sid, Path: path, Content: content})
+	}{sid, path, content})
 	return err
 }
 
