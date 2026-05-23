@@ -54,7 +54,7 @@ func gitDiffHead(cwd string) (string, error) {
 // externally — delete .codehalter/.git_commit so the next round starts
 // fresh from the next uncommitted change.
 func (a *agent) cleanupGitCommitIfClean(cwd string, sid string) {
-	if !dirExists(filepath.Join(cwd, ".git")) {
+	if info, err := os.Stat(filepath.Join(cwd, ".git")); err != nil || !info.IsDir() {
 		return
 	}
 	if sess := a.getSession(sid); sess != nil {
@@ -95,7 +95,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	if sess == nil {
 		return
 	}
-	if !dirExists(filepath.Join(sess.Cwd, ".git")) {
+	if info, err := os.Stat(filepath.Join(sess.Cwd, ".git")); err != nil || !info.IsDir() {
 		return
 	}
 	status, err := gitStatusPorcelain(sess.Cwd)

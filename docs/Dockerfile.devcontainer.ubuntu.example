@@ -1,0 +1,38 @@
+FROM ubuntu:26.04
+
+ARG USERNAME=dev
+ARG UID=1000
+ARG GID=1000
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git sudo gnupg \
+        just make \
+        golang-go \
+        nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://packages.mozilla.org/apt/repo-signing-key.gpg \
+        | tee /etc/apt/keyrings/packages.mozilla.org.asc > /dev/null \
+    && echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
+        > /etc/apt/sources.list.d/mozilla.list \
+    && printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
+        > /etc/apt/preferences.d/mozilla \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends firefox \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN userdel -r ubuntu 2>/dev/null || true \
+    && groupadd --gid ${GID} ${USERNAME} \
+    && useradd --uid ${UID} --gid ${GID} -m -s /bin/bash ${USERNAME} \
+    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
+    && install -d -o ${UID} -g ${GID} /home/${USERNAME}/.config
+
+ENV GOBIN=/usr/local/bin
+ENV GOTOOLCHAIN=auto
+RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
+
+RUN go install golang.org/x/tools/gopls@latest
+
+USER ${USERNAME}

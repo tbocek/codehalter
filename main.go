@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -45,11 +46,20 @@ var skillBash string
 //go:embed docs/SKILL-devcontainer.md.example
 var skillDevcontainer string
 
-//go:embed docs/Dockerfile.devcontainer.debian.example
-var defaultDevcontainerDockerfileDebian string
+//go:embed docs/Dockerfile.devcontainer.alpine.example
+var defaultDevcontainerDockerfileAlpine string
 
 //go:embed docs/Dockerfile.devcontainer.arch.example
 var defaultDevcontainerDockerfileArch string
+
+//go:embed docs/Dockerfile.devcontainer.debian.example
+var defaultDevcontainerDockerfileDebian string
+
+//go:embed docs/Dockerfile.devcontainer.fedora.example
+var defaultDevcontainerDockerfileFedora string
+
+//go:embed docs/Dockerfile.devcontainer.ubuntu.example
+var defaultDevcontainerDockerfileUbuntu string
 
 //go:embed docs/devcontainer.json.example
 var defaultDevcontainerJSON string
@@ -650,6 +660,47 @@ func (a *agent) Cancel(_ context.Context, _ CancelNotification) {
 	if a.cancel != nil {
 		a.cancel()
 	}
+}
+
+// loadSkills concatenates every SKILL-*.md present in .codehalter/. Detection
+// (detectStacks) decides which to seed initially, but loading honors whatever
+// the user actually has on disk — drop a SKILL-rust.md in there manually and
+// it gets picked up; delete one and it stops loading. Called once per session
+// (from systemPrompt) so the concatenated text lives in the first user
+// message and stays cache-stable thereafter.
+func loadSkills(cwd string) string {
+	dir := filepath.Join(cwd, ".codehalter")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if strings.HasPrefix(n, "SKILL-") && strings.HasSuffix(n, ".md") {
+			names = append(names, n)
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	sort.Strings(names) // deterministic order → stable cache prefix
+	var b strings.Builder
+	for _, n := range names {
+		data, err := os.ReadFile(filepath.Join(dir, n))
+		if err != nil {
+			continue
+		}
+		b.Write(data)
+		if !strings.HasSuffix(string(data), "\n") {
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 func (a *agent) systemPrompt(sid string) (string, error) {

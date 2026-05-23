@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -12,54 +11,84 @@ import (
 // .gitignore
 // ---------------------------------------------------------------------------
 
-// ensureGitignore makes sure .gitignore has an entry for .codehalter/ — either
-// a real ignore line or a comment marking it as intentionally tracked. Asks
-// the user once per repo; later sessions short-circuit because the written
-// entry is detected on next startup.
-//
-// Only runs inside a git-managed directory: requires either a .git directory
-// in cwd or an existing .gitignore.
+// ensureGitignore makes sure .gitignore mentions .codehalter/ (as an ignore
+// line or a tracked-on-purpose marker). Asks once per repo — later sessions
+// short-circuit on the existing entry. Skipped outside git-managed dirs
+// (requires .git/ or an existing .gitignore).
 func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	gitignorePath := filepath.Join(cwd, ".gitignore")
-	hasGit := dirExists(filepath.Join(cwd, ".git"))
-	hasGitignore := fileExists(gitignorePath)
+	gitInfo, gitErr := os.Stat(filepath.Join(cwd, ".git"))
+	hasGit := gitErr == nil && gitInfo.IsDir()
+	ignoreInfo, ignoreErr := os.Stat(gitignorePath)
+	hasGitignore := ignoreErr == nil && !ignoreInfo.IsDir()
 	if !hasGit && !hasGitignore {
 		return
 	}
 
-	data, _ := os.ReadFile(gitignorePath)
-	content := string(data)
-
-	for _, line := range strings.Split(content, "\n") {
-		if strings.Contains(strings.ToLower(line), "codehalter") {
+	var content string
+	if hasGitignore {
+		data, err := os.ReadFile(gitignorePath)
+		if err != nil {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Failed to read .gitignore: " + err.Error() + "\n"}})
 			return
+		}
+		content = string(data)
+		for _, line := range strings.Split(content, "\n") {
+			if strings.Contains(strings.ToLower(line), "codehalter") {
+				return
+			}
 		}
 	}
 
-	tcId := a.StartToolCall(ctx, sid, "Add .codehalter/ to .gitignore?", "think", nil)
-	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Ignore", "Track")
+	title := "Add .codehalter/ to .gitignore?"
+	labels := []string{"Ignore", "Track"}
+	if !hasGitignore {
+		title = "No .gitignore found — create one for .codehalter/?"
+		labels = []string{"Add .gitignore, ignore .codehalter", "Add .gitignore, track .codehalter"}
+	}
+	tcId := a.StartToolCall(ctx, sid, title, "think", nil)
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, labels)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
 	}
 
 	var entry, note string
-	if ok {
-		entry = ".codehalter/"
-		note = "Added .codehalter/ to .gitignore"
-	} else {
-		entry = "# .codehalter/ is intentionally tracked"
-		note = "Marked .codehalter/ as tracked in .gitignore"
-	}
-
-	if len(content) > 0 && !strings.HasSuffix(content, "\n") {
-		content += "\n"
-	}
-	content += entry + "\n"
-
-	if err := os.WriteFile(gitignorePath, []byte(content), 0o644); err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
+	switch choice {
+	case labels[0]:
+		entry, note = ".codehalter/", "Added .codehalter/ to .gitignore"
+	case labels[1]:
+		entry, note = "# .codehalter/ is intentionally tracked", "Marked .codehalter/ as tracked in .gitignore"
+	default:
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Cancelled")})
 		return
+	}
+
+	if hasGitignore {
+		sep := ""
+		if !strings.HasSuffix(content, "\n") {
+			sep = "\n"
+		}
+		f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			a.FailToolCall(ctx, sid, tcId, err.Error())
+			return
+		}
+		_, writeErr := f.WriteString(sep + entry + "\n")
+		closeErr := f.Close()
+		if writeErr != nil {
+			a.FailToolCall(ctx, sid, tcId, writeErr.Error())
+			return
+		}
+		if closeErr != nil {
+			a.FailToolCall(ctx, sid, tcId, closeErr.Error())
+			return
+		}
+	} else {
+		if err := os.WriteFile(gitignorePath, []byte(entry+"\n"), 0o644); err != nil {
+			a.FailToolCall(ctx, sid, tcId, err.Error())
+			return
+		}
 	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: note + "\n"}})
@@ -69,20 +98,16 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 // .devcontainer
 // ---------------------------------------------------------------------------
 
-// ensureDevcontainer offers to seed .devcontainer/Dockerfile and
-// .devcontainer/devcontainer.json when codehalter is running outside a
-// container and the project has no devcontainer config yet.
-//
-// Asks on every session startup so the user is reminded as long as the
-// project is unsandboxed. "Yes" creates the files (and future sessions
-// short-circuit because .devcontainer/ now exists); "Skip" just dismisses
-// the prompt for this session — opening the project again brings it back.
+// ensureDevcontainer offers to seed .devcontainer/Dockerfile +
+// devcontainer.json when codehalter runs outside a container and none exists.
+// Re-asks every session while unsandboxed — accepting creates the dir (future
+// sessions then short-circuit); skipping only dismisses for this session.
 func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) {
 	if containerKind() != "" {
 		return
 	}
 	dir := filepath.Join(cwd, ".devcontainer")
-	if dirExists(dir) {
+	if info, err := os.Stat(dir); err == nil && info.IsDir() {
 		return
 	}
 
@@ -91,7 +116,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		"you can then edit. Reopen the project in the container to use it.\n\n"}})
 
 	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Debian", "Arch"})
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
@@ -99,10 +124,16 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 
 	var dockerfile string
 	switch choice {
-	case "Debian":
-		dockerfile = defaultDevcontainerDockerfileDebian
+	case "Alpine":
+		dockerfile = defaultDevcontainerDockerfileAlpine
 	case "Arch":
 		dockerfile = defaultDevcontainerDockerfileArch
+	case "Debian":
+		dockerfile = defaultDevcontainerDockerfileDebian
+	case "Fedora":
+		dockerfile = defaultDevcontainerDockerfileFedora
+	case "Ubuntu":
+		dockerfile = defaultDevcontainerDockerfileUbuntu
 	default:
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
 		return
@@ -127,145 +158,61 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 }
 
 // ---------------------------------------------------------------------------
-// Stack detection & SKILL-*.md loading
+// Stack detection
 // ---------------------------------------------------------------------------
 
-// detectStacks returns the set of language/stack identifiers active in cwd,
-// in a stable order. Used by ensureDefaults (to seed only relevant SKILL files)
-// and loadSkills (to assemble the systemPrompt prefix).
+// detectStacks returns the language/stack identifiers active in cwd, in a
+// fixed order (load-bearing: tests assert it, and the seed loop in
+// ensureDefaults walks it). Used to seed only the relevant SKILL files.
 func detectStacks(cwd string) []string {
 	var stacks []string
 
-	if exists(filepath.Join(cwd, "go.mod")) {
+	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err == nil {
 		stacks = append(stacks, "go")
 	}
 
-	hasPkg := exists(filepath.Join(cwd, "package.json"))
-	hasTS := exists(filepath.Join(cwd, "tsconfig.json")) || hasFileWithExt(cwd, ".ts", ".tsx")
+	_, pkgErr := os.Stat(filepath.Join(cwd, "package.json"))
+	_, tsconfigErr := os.Stat(filepath.Join(cwd, "tsconfig.json"))
+	hasTS := tsconfigErr == nil || hasFileWithExt(cwd, ".ts", ".tsx")
 	if hasTS {
 		stacks = append(stacks, "ts")
 	}
-	if hasPkg && !hasTS {
+	if pkgErr == nil && !hasTS {
 		stacks = append(stacks, "js")
 	}
 
-	if exists(filepath.Join(cwd, "pom.xml")) ||
-		exists(filepath.Join(cwd, "build.gradle")) ||
-		exists(filepath.Join(cwd, "build.gradle.kts")) {
-		stacks = append(stacks, "java")
+	for _, n := range []string{"pom.xml", "build.gradle", "build.gradle.kts"} {
+		if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
+			stacks = append(stacks, "java")
+			break
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(cwd, "Cargo.toml")); err == nil {
+		stacks = append(stacks, "rust")
+	}
+
+	for _, n := range []string{"build.zig", "build.zig.zon"} {
+		if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
+			stacks = append(stacks, "zig")
+			break
+		}
 	}
 
 	if hasFileWithExt(cwd, ".sh", ".bash") {
 		stacks = append(stacks, "bash")
 	}
 
-	if dirExists(filepath.Join(cwd, ".devcontainer")) {
+	if info, err := os.Stat(filepath.Join(cwd, ".devcontainer")); err == nil && info.IsDir() {
 		stacks = append(stacks, "devcontainer")
 	}
 
 	return stacks
 }
 
-// failureSkillHint returns a short pointer to SKILL-*.md files relevant to the
-// failed tool, or "" when no skill docs exist or the tool isn't one of the
-// shell-style ones where skills typically apply. Used by runToolLoop to nudge
-// small models toward reading the skill docs after a hard failure instead of
-// blindly retrying. Returns paths relative to cwd so the model's read_file
-// call works without further escaping.
-func (a *agent) failureSkillHint(sid string, toolName string) string {
-	// Only fire on tools where a SKILL doc plausibly helps. Edit-failures
-	// usually mean the model passed wrong content, not that it needs a skill.
-	switch toolName {
-	case "run_command", "run_task":
-	default:
-		return ""
-	}
-	sess := a.getSession(sid)
-	if sess == nil {
-		return ""
-	}
-	entries, err := os.ReadDir(filepath.Join(sess.Cwd, ".codehalter"))
-	if err != nil {
-		return ""
-	}
-	var skills []string
-	for _, e := range entries {
-		n := e.Name()
-		if strings.HasPrefix(n, "SKILL-") && strings.HasSuffix(n, ".md") {
-			skills = append(skills, ".codehalter/"+n)
-		}
-	}
-	if len(skills) == 0 {
-		return ""
-	}
-	sort.Strings(skills)
-	return "[Hint: this command failed. The project ships skill docs that cover this kind of failure — read one with read_file before retrying: " +
-		strings.Join(skills, ", ") + "]"
-}
-
-// loadSkills concatenates every SKILL-*.md present in .codehalter/. Detection
-// (detectStacks) decides which to seed initially, but loading honors whatever
-// the user actually has on disk — drop a SKILL-rust.md in there manually and
-// it gets picked up; delete one and it stops loading. Called once per session
-// (from systemPrompt) so the concatenated text lives in the first user
-// message and stays cache-stable thereafter.
-func loadSkills(cwd string) string {
-	dir := filepath.Join(cwd, ".codehalter")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		n := e.Name()
-		if strings.HasPrefix(n, "SKILL-") && strings.HasSuffix(n, ".md") {
-			names = append(names, n)
-		}
-	}
-	if len(names) == 0 {
-		return ""
-	}
-	sort.Strings(names) // deterministic order → stable cache prefix
-	var b strings.Builder
-	for _, n := range names {
-		data, err := os.ReadFile(filepath.Join(dir, n))
-		if err != nil {
-			continue
-		}
-		b.Write(data)
-		if !strings.HasSuffix(string(data), "\n") {
-			b.WriteString("\n")
-		}
-		b.WriteString("\n")
-	}
-	return b.String()
-}
-
-// ---------------------------------------------------------------------------
-// Path-existence helpers (shared by bootstrap routines above)
-// ---------------------------------------------------------------------------
-
-func fileExists(p string) bool {
-	info, err := os.Stat(p)
-	return err == nil && !info.IsDir()
-}
-
-func dirExists(p string) bool {
-	info, err := os.Stat(p)
-	return err == nil && info.IsDir()
-}
-
-func exists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-// hasFileWithExt returns true if cwd contains any file (non-recursive) whose
-// extension matches one of exts. Cheap directory scan; we only care about the
-// root because deeper detection is the user's job to override.
+// hasFileWithExt reports whether cwd contains a file (non-recursive) with one
+// of the given extensions. Root-only by design — deeper detection is the
+// user's job to override.
 func hasFileWithExt(cwd string, exts ...string) bool {
 	entries, err := os.ReadDir(cwd)
 	if err != nil {

@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -721,6 +723,43 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid string, conn *LLMConnec
 		return res, fmt.Errorf("non-JSON after retry: %w", err)
 	}
 	return res, nil
+}
+
+// failureSkillHint returns a short pointer to SKILL-*.md files relevant to the
+// failed tool, or "" when no skill docs exist or the tool isn't one of the
+// shell-style ones where skills typically apply. Used by runToolLoopOn to nudge
+// small models toward reading the skill docs after a hard failure instead of
+// blindly retrying. Returns paths relative to cwd so the model's read_file
+// call works without further escaping.
+func (a *agent) failureSkillHint(sid string, toolName string) string {
+	// Only fire on tools where a SKILL doc plausibly helps. Edit-failures
+	// usually mean the model passed wrong content, not that it needs a skill.
+	switch toolName {
+	case "run_command", "run_task":
+	default:
+		return ""
+	}
+	sess := a.getSession(sid)
+	if sess == nil {
+		return ""
+	}
+	entries, err := os.ReadDir(filepath.Join(sess.Cwd, ".codehalter"))
+	if err != nil {
+		return ""
+	}
+	var skills []string
+	for _, e := range entries {
+		n := e.Name()
+		if strings.HasPrefix(n, "SKILL-") && strings.HasSuffix(n, ".md") {
+			skills = append(skills, ".codehalter/"+n)
+		}
+	}
+	if len(skills) == 0 {
+		return ""
+	}
+	sort.Strings(skills)
+	return "[Hint: this command failed. The project ships skill docs that cover this kind of failure — read one with read_file before retrying: " +
+		strings.Join(skills, ", ") + "]"
 }
 
 // runToolLoop runs the agentic tool loop with the default token-streaming

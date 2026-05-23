@@ -1,19 +1,9 @@
-# .devcontainer/Dockerfile
-# Built from golang:1-bookworm because codehalter needs a recent Go and
-# bookworm's golang-go package is too old. The base is still Debian.
 FROM golang:1-trixie
 
 ARG USERNAME=dev
 ARG UID=1000
 ARG GID=1000
 
-# Toolchain — trim what you don't use; add cargo, openjdk-17, python3, etc.
-# as your project needs them. just/make are picked up by codehalter's
-# task-runner discovery automatically; nodejs+npm covers package.json.
-# firefox-esr powers web_search/web_read; codehalter launches it with
-# -headless so no X11 forwarding is needed. run_command (probes + test
-# installs) runs commands directly under bash — the container itself is the
-# sandbox.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git sudo \
         just make \
@@ -21,37 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         firefox-esr \
     && rm -rf /var/lib/apt/lists/*
 
-# Non-root user matching host UID/GID so files written into the bind-mounted
-# workspace stay owned by your host user, not root.
 RUN groupadd --gid ${GID} ${USERNAME} \
     && useradd --uid ${UID} --gid ${GID} -m -s /bin/bash ${USERNAME} \
     && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
     && install -d -o ${UID} -g ${GID} /home/${USERNAME}/.config
 
-# Install codehalter into a system path so Zed's `command` lookup is stable
-# across container rebuilds. GOPROXY=direct fetches straight from GitHub so
-# you always get the current main; proxy.golang.org's @latest resolution can
-# lag behind by hours.
 ENV GOBIN=/usr/local/bin
 RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
 
-# gopls speaks MCP via its `mcp` subcommand and ships go_symbols /
-# go_references / go_definition / go_hover etc. as MCP tools. codehalter
-# spawns `gopls mcp` for any project with a go.mod (the auto-seeded
-# .codehalter/mcp.toml has the entry). Drop this RUN if you don't want Go
-# tooling in the container — but then also disable the gopls entry in
-# mcp.toml or codehalter will warn at startup that the binary isn't on PATH.
 RUN go install golang.org/x/tools/gopls@latest
-
-# Extra MCP servers — uncomment what you want and add a matching [[server]]
-# block to .codehalter/mcp.toml. Examples:
-#
-# Node-based servers via npx (preinstalls common ones to skip the per-session
-# download):
-#   RUN npm install -g @modelcontextprotocol/server-filesystem
-#
-# Python-based servers via uvx (install uv first):
-#   RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-#   RUN /root/.local/bin/uv tool install mcp-server-github
 
 USER ${USERNAME}

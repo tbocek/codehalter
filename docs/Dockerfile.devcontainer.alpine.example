@@ -1,16 +1,16 @@
-FROM quay.io/archlinux/archlinux:base-devel
+FROM alpine:3.23
 
 ARG USERNAME=dev
 ARG UID=1000
 ARG GID=1000
 
-RUN pacman -Syu --noconfirm --needed \
-        ca-certificates curl git \
-        just \
-        nodejs npm \
-        firefox \
+RUN apk add --no-cache \
+        ca-certificates curl git sudo \
+        bash shadow \
+        just make build-base \
         go \
-    && rm -rf /var/cache/pacman/pkg/*
+        nodejs npm \
+        firefox-esr
 
 RUN groupadd --gid ${GID} ${USERNAME} \
     && useradd --uid ${UID} --gid ${GID} -m -s /bin/bash -G wheel ${USERNAME} \
@@ -18,13 +18,9 @@ RUN groupadd --gid ${GID} ${USERNAME} \
     && install -d -o ${UID} -g ${GID} /home/${USERNAME}/.config
 
 ENV GOBIN=/usr/local/bin
+ENV GOTOOLCHAIN=auto
 RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
 
 RUN go install golang.org/x/tools/gopls@latest
 
 USER ${USERNAME}
-WORKDIR /home/${USERNAME}
-
-RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
-    && cd /tmp/yay && makepkg -si --noconfirm \
-    && cd / && rm -rf /tmp/yay

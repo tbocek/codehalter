@@ -1,16 +1,17 @@
-FROM quay.io/archlinux/archlinux:base-devel
+FROM fedora:44
 
 ARG USERNAME=dev
 ARG UID=1000
 ARG GID=1000
 
-RUN pacman -Syu --noconfirm --needed \
-        ca-certificates curl git \
-        just \
+RUN dnf install -y --setopt=install_weak_deps=False \
+        ca-certificates curl git sudo \
+        just make \
+        golang \
         nodejs npm \
         firefox \
-        go \
-    && rm -rf /var/cache/pacman/pkg/*
+        shadow-utils \
+    && dnf clean all
 
 RUN groupadd --gid ${GID} ${USERNAME} \
     && useradd --uid ${UID} --gid ${GID} -m -s /bin/bash -G wheel ${USERNAME} \
@@ -18,13 +19,9 @@ RUN groupadd --gid ${GID} ${USERNAME} \
     && install -d -o ${UID} -g ${GID} /home/${USERNAME}/.config
 
 ENV GOBIN=/usr/local/bin
+ENV GOTOOLCHAIN=auto
 RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
 
 RUN go install golang.org/x/tools/gopls@latest
 
 USER ${USERNAME}
-WORKDIR /home/${USERNAME}
-
-RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
-    && cd /tmp/yay && makepkg -si --noconfirm \
-    && cd / && rm -rf /tmp/yay
