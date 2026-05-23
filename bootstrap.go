@@ -26,6 +26,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	hasDevcontainer := statErr == nil && dirInfo.IsDir()
 
 	const reopen = "Reopen the project in the container to continue."
+	const restart = "Start a new Agent Thread (the + button at the top) to re-open the devcontainer setup menu."
 
 	if hasDevcontainer {
 		a.setAbort(ctx, sid, "codehalter is running outside the .devcontainer. "+reopen)
@@ -39,7 +40,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
 
@@ -57,23 +58,23 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		dockerfile = defaultDevcontainerDockerfileUbuntu
 	default:
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		a.setAbort(ctx, sid, "Devcontainer setup cancelled. "+restart)
 		return false
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
 	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
 	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(defaultDevcontainerJSON), 0o644); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
 

@@ -166,6 +166,20 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	defer cancel()
 	defer a.finalizePlan(req.SessionId)
 
+	// Abort wins over pending-question. Once ensureDevcontainer has decided
+	// the session can't proceed (set abortReason), the pending UI prompt is
+	// moot — the user should see the real reason, not "answer the question".
+	// Each refused turn also appends the reason to chat: Zed locks an open
+	// red box until the user dismisses it, so the error response alone is
+	// invisible after the first turn — the chat append gives fresh feedback.
+	a.mu.Lock()
+	abort := a.abortReason
+	a.mu.Unlock()
+	if abort != "" {
+		a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: abort + "\n"}})
+		return a.failPrompt(req.SessionId, errors.New(abort), nil)
+	}
+
 	// Non-blocking: if the bootstrap goroutine is still running it's parked
 	// on an interactive prompt (devcontainer OS choice, gitignore choice).
 	// Block the typed prompt with a red box so the user is told to answer
@@ -176,13 +190,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		default:
 			return a.failPrompt(req.SessionId, errors.New("Please answer the pending question above first."), nil)
 		}
-	}
-
-	a.mu.Lock()
-	abort := a.abortReason
-	a.mu.Unlock()
-	if abort != "" {
-		return a.failPrompt(req.SessionId, errors.New(abort), nil)
 	}
 
 	// Pick up anything the user edited between turns (mcp.toml today;
