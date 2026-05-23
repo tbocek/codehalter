@@ -8,6 +8,126 @@ import (
 )
 
 // ---------------------------------------------------------------------------
+// .devcontainer
+// ---------------------------------------------------------------------------
+
+// ensureDevcontainer gates the whole session on running inside a container.
+// Returns true only when we're already inside one. Otherwise it scaffolds
+// .devcontainer/ (prompting for the base OS if no template exists yet), sets
+// a.abortReason so Prompt refuses every turn, and returns false — codehalter
+// does not run unsandboxed.
+func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) bool {
+	if containerKind() != "" {
+		return true
+	}
+
+	dir := filepath.Join(cwd, ".devcontainer")
+	dirInfo, statErr := os.Stat(dir)
+	hasDevcontainer := statErr == nil && dirInfo.IsDir()
+
+	const reopen = "Reopen the project in the container to continue."
+
+	if hasDevcontainer {
+		a.setAbort(ctx, sid, "codehalter is running outside the .devcontainer. "+reopen)
+		return false
+	}
+
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "codehalter must run inside a container. I can scaffold " +
+		".devcontainer/Dockerfile and .devcontainer/devcontainer.json for you to edit, then you can reopen the project in the container.\n\n"}})
+
+	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		return false
+	}
+
+	var dockerfile string
+	switch choice {
+	case "Alpine":
+		dockerfile = defaultDevcontainerDockerfileAlpine
+	case "Arch":
+		dockerfile = defaultDevcontainerDockerfileArch
+	case "Debian":
+		dockerfile = defaultDevcontainerDockerfileDebian
+	case "Fedora":
+		dockerfile = defaultDevcontainerDockerfileFedora
+	case "Ubuntu":
+		dockerfile = defaultDevcontainerDockerfileUbuntu
+	default:
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		return false
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		return false
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		return false
+	}
+	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(defaultDevcontainerJSON), 0o644); err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+reopen)
+		return false
+	}
+
+	seeded := seedBootstraps(cwd, strings.ToLower(choice), detectStacks(cwd))
+
+	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json. " + reopen
+	if len(seeded) > 0 {
+		note += " Also seeded " + strings.Join(seeded, ", ") + " for per-stack dev-tool install."
+	}
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
+	a.setAbort(ctx, sid, note)
+	return false
+}
+
+// setAbort marks the session as do-not-run and emits the reason to chat.
+// Called from ensureDevcontainer; Prompt reads a.abortReason under mu and
+// fails every turn until the process is restarted (inside a container).
+func (a *agent) setAbort(ctx context.Context, sid, reason string) {
+	a.mu.Lock()
+	a.abortReason = reason
+	a.mu.Unlock()
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: reason + "\n"}})
+}
+
+// seedBootstraps writes BOOTSTRAP-<os>-<stack>.md into .codehalter/ for each
+// detected stack that has a template for this OS. Called only from
+// ensureDevcontainer's freshly-created-Dockerfile path, so these one-shot
+// install prompts land alongside the devcontainer they're scoped to.
+// Returns the basenames actually written (skipping stacks with no template,
+// and never overwriting an existing file).
+func seedBootstraps(cwd, osName string, stacks []string) []string {
+	var written []string
+	for _, stack := range stacks {
+		body, ok := defaultBootstraps[osName+"-"+stack]
+		if !ok {
+			continue
+		}
+		name := "BOOTSTRAP-" + osName + "-" + stack + ".md"
+		path := filepath.Join(cwd, ".codehalter", name)
+		if _, err := os.Stat(path); err == nil {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			continue
+		}
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			continue
+		}
+		written = append(written, name)
+	}
+	return written
+}
+
+// ---------------------------------------------------------------------------
 // .gitignore
 // ---------------------------------------------------------------------------
 
@@ -41,7 +161,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	}
 
 	title := "Add .codehalter/ to .gitignore?"
-	labels := []string{"Ignore", "Track"}
+	labels := []string{"Ignore, add '.codehalter' to .gitignore", "Track, add '#.codehalter' to .gitignore"}
 	if !hasGitignore {
 		title = "No .gitignore found — create one for .codehalter/?"
 		labels = []string{"Add .gitignore, ignore .codehalter", "Add .gitignore, track .codehalter"}
@@ -90,69 +210,6 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 			return
 		}
 	}
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: note + "\n"}})
-}
-
-// ---------------------------------------------------------------------------
-// .devcontainer
-// ---------------------------------------------------------------------------
-
-// ensureDevcontainer offers to seed .devcontainer/Dockerfile +
-// devcontainer.json when codehalter runs outside a container and none exists.
-// Re-asks every session while unsandboxed — accepting creates the dir (future
-// sessions then short-circuit); skipping only dismisses for this session.
-func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) {
-	if containerKind() != "" {
-		return
-	}
-	dir := filepath.Join(cwd, ".devcontainer")
-	if info, err := os.Stat(dir); err == nil && info.IsDir() {
-		return
-	}
-
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "To sandbox file edits and task runs, I can write a " +
-		".devcontainer/Dockerfile and .devcontainer/devcontainer.json template " +
-		"you can then edit. Reopen the project in the container to use it.\n\n"}})
-
-	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
-	if err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return
-	}
-
-	var dockerfile string
-	switch choice {
-	case "Alpine":
-		dockerfile = defaultDevcontainerDockerfileAlpine
-	case "Arch":
-		dockerfile = defaultDevcontainerDockerfileArch
-	case "Debian":
-		dockerfile = defaultDevcontainerDockerfileDebian
-	case "Fedora":
-		dockerfile = defaultDevcontainerDockerfileFedora
-	case "Ubuntu":
-		dockerfile = defaultDevcontainerDockerfileUbuntu
-	default:
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
-		return
-	}
-
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return
-	}
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return
-	}
-	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(defaultDevcontainerJSON), 0o644); err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return
-	}
-
-	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json. Reopen the project in the container to use them."
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: note + "\n"}})
 }

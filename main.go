@@ -13,61 +13,89 @@ import (
 	"time"
 )
 
-//go:embed docs/PLAN.md.example
+//go:embed docs/PLAN.md
 var defaultPlanMD string
 
-//go:embed docs/EXECUTE.md.example
+//go:embed docs/EXECUTE.md
 var defaultExecuteMD string
 
-//go:embed docs/VERIFY.md.example
+//go:embed docs/VERIFY.md
 var defaultVerifyMD string
 
-//go:embed docs/DOCUMENT.md.example
+//go:embed docs/DOCUMENT.md
 var defaultDocumentMD string
 
-//go:embed docs/SKILL-buildfile.md.example
+//go:embed docs/SKILL-buildfile.md
 var skillBuildfile string
 
-//go:embed docs/SKILL-go.md.example
+//go:embed docs/SKILL-go.md
 var skillGo string
 
-//go:embed docs/SKILL-ts.md.example
+//go:embed docs/SKILL-ts.md
 var skillTS string
 
-//go:embed docs/SKILL-js.md.example
+//go:embed docs/SKILL-js.md
 var skillJS string
 
-//go:embed docs/SKILL-java.md.example
+//go:embed docs/SKILL-java.md
 var skillJava string
 
-//go:embed docs/SKILL-bash.md.example
+//go:embed docs/SKILL-bash.md
 var skillBash string
 
-//go:embed docs/SKILL-devcontainer.md.example
+//go:embed docs/SKILL-devcontainer.md
 var skillDevcontainer string
 
-//go:embed docs/Dockerfile.devcontainer.alpine.example
+//go:embed docs/Dockerfile.devcontainer.alpine
 var defaultDevcontainerDockerfileAlpine string
 
-//go:embed docs/Dockerfile.devcontainer.arch.example
+//go:embed docs/Dockerfile.devcontainer.arch
 var defaultDevcontainerDockerfileArch string
 
-//go:embed docs/Dockerfile.devcontainer.debian.example
+//go:embed docs/Dockerfile.devcontainer.debian
 var defaultDevcontainerDockerfileDebian string
 
-//go:embed docs/Dockerfile.devcontainer.fedora.example
+//go:embed docs/Dockerfile.devcontainer.fedora
 var defaultDevcontainerDockerfileFedora string
 
-//go:embed docs/Dockerfile.devcontainer.ubuntu.example
+//go:embed docs/Dockerfile.devcontainer.ubuntu
 var defaultDevcontainerDockerfileUbuntu string
 
-//go:embed docs/devcontainer.json.example
+//go:embed docs/devcontainer.json
 var defaultDevcontainerJSON string
 
-//go:embed docs/settings.toml.example
+//go:embed docs/BOOTSTRAP-alpine-go.md
+var bootstrapAlpineGo string
+
+//go:embed docs/BOOTSTRAP-arch-go.md
+var bootstrapArchGo string
+
+//go:embed docs/BOOTSTRAP-debian-go.md
+var bootstrapDebianGo string
+
+//go:embed docs/BOOTSTRAP-fedora-go.md
+var bootstrapFedoraGo string
+
+//go:embed docs/BOOTSTRAP-ubuntu-go.md
+var bootstrapUbuntuGo string
+
+// defaultBootstraps is keyed by "<os>-<stack>". Used by ensureDevcontainer
+// to seed BOOTSTRAP-<os>-<stack>.md for each detected stack right after a
+// fresh .devcontainer/Dockerfile is written — never re-seeded once the
+// .devcontainer dir exists. Only Go is wired in today; add more stacks as
+// they get bootstrap templates.
+var defaultBootstraps = map[string]string{
+	"alpine-go": bootstrapAlpineGo,
+	"arch-go":   bootstrapArchGo,
+	"debian-go": bootstrapDebianGo,
+	"fedora-go": bootstrapFedoraGo,
+	"ubuntu-go": bootstrapUbuntuGo,
+}
+
+//go:embed docs/settings.toml
 var defaultSettingsTOML string
 
-//go:embed docs/mcp.toml.example
+//go:embed docs/mcp.toml
 var defaultMCPToml string
 
 var defaultSkills = map[string]string{
@@ -196,6 +224,12 @@ type agent struct {
 	// user sees in chat whether run_command is wired up — silent slog.Info
 	// was leaving users wondering why the LLM never called it.
 	runCmdStatus string
+
+	// abortReason is set by the bootstrap goroutine when codehalter must not
+	// run in this environment (today: started outside a devcontainer). Empty
+	// means proceed; non-empty causes Prompt to refuse with this message.
+	// Read under mu.
+	abortReason string
 }
 
 // connKey returns a stable map key for a connection.
@@ -347,16 +381,22 @@ func (a *agent) startIndexing(sid string, cwd string) {
 }
 
 // bootstrapSettings runs the once-per-session startup sequence: interactive
-// prompts (settings/gitignore/devcontainer) that would be hostile to repeat
+// prompts (devcontainer/settings/gitignore) that would be hostile to repeat
 // on every turn, the heavy one-time LLM probe, the project capabilities
 // banner, and the environment summary. The per-prompt re-check is delegated
 // to checkSettings, which bootstrapSettings calls in-line so the MCP
 // reconcile lands in the same flow.
 //
-// Order: config → project → tools → environment → prompts. The
-// container/firefox banner sits next to the devcontainer prompt so the
-// "container, tooling, container again" interleaving doesn't happen.
+// Order: devcontainer → LLM → gitignore → per-stack bootstrap. The
+// devcontainer gate runs first because settings (LLM, MCP) can be fixed
+// later inside the container; running unsandboxed at all is the policy
+// violation. When ensureDevcontainer returns false, abortReason is set and
+// the rest of the sequence is skipped — Prompt then refuses every turn.
 func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid string) {
+	if !a.ensureDevcontainer(ctx, cwd, sid) {
+		return
+	}
+
 	a.ensureSettings(ctx, cwd, sid)
 
 	if a.settings.path != "" {
@@ -369,7 +409,9 @@ func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid string) {
 	a.checkEnvironment(ctx, sid)
 
 	a.ensureGitignore(ctx, cwd, sid)
-	a.ensureDevcontainer(ctx, cwd, sid)
+
+	// TODO: per-stack bootstrap loop (BOOTSTRAP-<os>-<stack>.md → LLM runs
+	// the install commands, verifies). Needs the LLM, hence after checkLLM.
 }
 
 // checkSettings is the per-prompt "did anything change?" pass. Every step

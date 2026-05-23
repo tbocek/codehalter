@@ -168,6 +168,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	a.waitForIndex()
 
+	a.mu.Lock()
+	abort := a.abortReason
+	a.mu.Unlock()
+	if abort != "" {
+		return a.failPrompt(req.SessionId, errors.New(abort), nil)
+	}
+
 	// Pick up anything the user edited between turns (mcp.toml today;
 	// settings.toml / capabilities later). checkSettings is silent when
 	// nothing changed and only emits tool-call cards for real diffs, so it's

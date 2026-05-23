@@ -1,0 +1,23 @@
+# codehalter bootstrap assisted
+FROM quay.io/archlinux/archlinux:base-devel
+
+RUN pacman -Syu --noconfirm --needed \
+        ca-certificates curl git \
+        go \
+        firefox \
+    && rm -rf /var/cache/pacman/pkg/*
+
+RUN groupadd --gid 1000 dev \
+    && useradd --uid 1000 --gid 1000 -m -s /bin/bash -G wheel dev \
+    && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
+    && install -d -o 1000 -g 1000 /home/dev/.config
+
+ENV GOBIN=/usr/local/bin
+RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
+
+USER dev
+WORKDIR /home/dev
+
+RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
+    && cd /tmp/yay && makepkg -si --noconfirm \
+    && cd / && rm -rf /tmp/yay

@@ -1,15 +1,11 @@
+# codehalter bootstrap assisted
 FROM ubuntu:26.04
 
-ARG USERNAME=dev
-ARG UID=1000
-ARG GID=1000
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git sudo gnupg \
-        just make \
         golang-go \
-        nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 
 RUN install -d -m 0755 /etc/apt/keyrings \
@@ -24,15 +20,13 @@ RUN install -d -m 0755 /etc/apt/keyrings \
     && rm -rf /var/lib/apt/lists/*
 
 RUN userdel -r ubuntu 2>/dev/null || true \
-    && groupadd --gid ${GID} ${USERNAME} \
-    && useradd --uid ${UID} --gid ${GID} -m -s /bin/bash ${USERNAME} \
-    && echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME} \
-    && install -d -o ${UID} -g ${GID} /home/${USERNAME}/.config
+    && groupadd --gid 1000 dev \
+    && useradd --uid 1000 --gid 1000 -m -s /bin/bash dev \
+    && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
+    && install -d -o 1000 -g 1000 /home/dev/.config
 
 ENV GOBIN=/usr/local/bin
 ENV GOTOOLCHAIN=auto
 RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
 
-RUN go install golang.org/x/tools/gopls@latest
-
-USER ${USERNAME}
+USER dev
