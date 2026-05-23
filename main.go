@@ -583,12 +583,6 @@ func containerKind() string {
 	return ""
 }
 
-func (a *agent) waitForIndex() {
-	if a.indexDone != nil {
-		<-a.indexDone
-	}
-}
-
 func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSessionResponse, error) {
 	cwd := cwdOrDefault(req.Cwd)
 	s, err := newSession(cwd)

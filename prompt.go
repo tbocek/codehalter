@@ -166,7 +166,17 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	defer cancel()
 	defer a.finalizePlan(req.SessionId)
 
-	a.waitForIndex()
+	// Non-blocking: if the bootstrap goroutine is still running it's parked
+	// on an interactive prompt (devcontainer OS choice, gitignore choice).
+	// Block the typed prompt with a red box so the user is told to answer
+	// the pending question instead of their message hanging silently.
+	if a.indexDone != nil {
+		select {
+		case <-a.indexDone:
+		default:
+			return a.failPrompt(req.SessionId, errors.New("Please answer the pending question above first."), nil)
+		}
+	}
 
 	a.mu.Lock()
 	abort := a.abortReason
