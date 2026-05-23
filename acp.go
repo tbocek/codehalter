@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -35,11 +38,9 @@ type jsonrpcResponse struct {
 // ACP wire types
 // ---------------------------------------------------------------------------
 
-// ACP wire version. Bumping breaks Zed clients pinned to the old number.
-const protocolVersion = 1
-
 // Session-update content-chunk kinds.
 const (
+	protocolVersion  = 1
 	KindAgentMessage = "agent_message_chunk"
 	// KindAgentThought is reasoning_content from thinking models (Qwen3,
 	// DeepSeek-R1, GPT-OSS) — Zed renders it greyed/collapsible so
@@ -152,13 +153,15 @@ type planUpdate struct {
 }
 
 // ---------------------------------------------------------------------------
-// AgentSideConnection — JSON-RPC dispatch + outgoing-request demux. Owns the
-// line protocol; the agent type is concrete (there is only one).
+// AgentSideConnection — JSON-RPC dispatch + outgoing-request demux on a
+// line-delimited stdio pair. The agent type is concrete (there is only one).
 // ---------------------------------------------------------------------------
 
 type AgentSideConnection struct {
-	proto *lineProtocol
-	agent *agent
+	w       io.Writer
+	r       io.Reader
+	writeMu sync.Mutex
+	agent   *agent
 
 	done chan struct{}
 
@@ -169,7 +172,8 @@ type AgentSideConnection struct {
 
 func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader) *AgentSideConnection {
 	c := &AgentSideConnection{
-		proto:   newLineProtocol(w, r),
+		w:       w,
+		r:       r,
 		agent:   a,
 		done:    make(chan struct{}),
 		pending: make(map[string]chan json.RawMessage),
@@ -178,29 +182,40 @@ func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader) *AgentSideConnec
 	return c
 }
 
+// writeMessage emits one JSON object followed by '\n'. Writes are serialised
+// so two concurrent writers can't interleave halves of a JSON object on the
+// wire.
+func (a *AgentSideConnection) writeMessage(msg any) error {
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	slog.Debug("writing", "msg", string(b))
+	b = append(b, '\n')
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
+	_, err = a.w.Write(b)
+	return err
+}
+
 func (a *AgentSideConnection) Done() <-chan struct{} { return a.done }
 
 // --- outbound (codehalter → Zed) ---
 
-// SessionUpdate sends one agent->client notification. `update` is any of the
-// "sessionUpdate"-keyed wire shapes (message chunks, plan updates, tool-call
-// cards) — chosen at the call site.
+// SessionUpdate sends one agent->client JSON-RPC notification (no ID, no
+// response expected). `update` is any of the "sessionUpdate"-keyed wire shapes
+// (message chunks, plan updates, tool-call cards) — chosen at the call site.
 func (a *AgentSideConnection) SessionUpdate(ctx context.Context, sid string, update any) error {
-	return a.sendNotification("session/update", struct {
+	raw, err := json.Marshal(struct {
 		SessionId string `json:"sessionId"`
 		Update    any    `json:"update"`
 	}{sid, update})
-}
-
-// sendNotification writes a JSON-RPC notification (no ID, no response expected).
-func (a *AgentSideConnection) sendNotification(method string, params any) error {
-	raw, err := json.Marshal(params)
 	if err != nil {
 		return err
 	}
-	return a.proto.writeMessage(jsonrpcRequest{
+	return a.writeMessage(jsonrpcRequest{
 		JSONRPC: "2.0",
-		Method:  method,
+		Method:  "session/update",
 		Params:  raw,
 	})
 }
@@ -231,7 +246,7 @@ func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, pa
 		}
 		raw = b
 	}
-	if err := a.proto.writeMessage(jsonrpcRequest{
+	if err := a.writeMessage(jsonrpcRequest{
 		JSONRPC: "2.0",
 		ID:      &idRaw,
 		Method:  method,
@@ -249,12 +264,16 @@ func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, pa
 			Error  *struct {
 				Code    int    `json:"code"`
 				Message string `json:"message"`
+				Data    string `json:"data,omitempty"`
 			} `json:"error"`
 		}
 		if err := json.Unmarshal(line, &resp); err != nil {
 			return nil, err
 		}
 		if resp.Error != nil {
+			if resp.Error.Data != "" {
+				return nil, fmt.Errorf("rpc error %d: %s: %s", resp.Error.Code, resp.Error.Message, resp.Error.Data)
+			}
 			return nil, fmt.Errorf("rpc error %d: %s", resp.Error.Code, resp.Error.Message)
 		}
 		return resp.Result, nil
@@ -263,13 +282,28 @@ func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, pa
 
 // --- inbound (Zed → codehalter) ---
 
-// serve reads lines from the underlying transport forever. Responses to our
-// outgoing requests route to the pending map; everything else lands in
-// handle().
+// serve reads one JSON object per line forever. Responses to our outgoing
+// requests route to the pending map; everything else lands in handle().
+// ReadString is used (not bufio.Scanner) so a large MCP tool response can't
+// trip the scanner's MaxScanTokenSize cap.
 func (a *AgentSideConnection) serve() {
 	defer close(a.done)
 	ctx := context.Background()
-	a.proto.serve(func(line []byte) {
+	br := bufio.NewReader(a.r)
+	for {
+		s, err := br.ReadString('\n')
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				slog.Debug("read error", "error", err)
+			}
+			return
+		}
+		s = strings.TrimRight(s, "\r\n")
+		if s == "" {
+			continue
+		}
+		line := []byte(s)
+
 		var probe struct {
 			ID     *json.RawMessage `json:"id"`
 			Method string           `json:"method"`
@@ -278,7 +312,7 @@ func (a *AgentSideConnection) serve() {
 		}
 		if err := json.Unmarshal(line, &probe); err != nil {
 			slog.Warn("failed to parse message", "error", err)
-			return
+			continue
 		}
 
 		// Response to one of our outgoing requests.
@@ -296,14 +330,14 @@ func (a *AgentSideConnection) serve() {
 			if ok {
 				ch <- line
 			}
-			return
+			continue
 		}
 
 		// Incoming request or notification.
 		var req jsonrpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
 			slog.Warn("failed to parse message", "error", err)
-			return
+			continue
 		}
 		slog.Debug("received", "method", req.Method, "raw", string(line))
 
@@ -311,7 +345,7 @@ func (a *AgentSideConnection) serve() {
 		// responses come back through this same read loop. Running handle
 		// inline would block the loop and deadlock the response routing.
 		go a.handle(ctx, &req)
-	})
+	}
 }
 
 func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
@@ -419,7 +453,7 @@ func (a *AgentSideConnection) reply(req *jsonrpcRequest, result any, err error) 
 	if req.ID == nil {
 		return
 	}
-	if werr := a.proto.writeMessage(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}); werr != nil {
+	if werr := a.writeMessage(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}); werr != nil {
 		slog.Warn("write reply failed", "method", req.Method, "error", werr)
 	}
 }
@@ -430,7 +464,7 @@ func (a *AgentSideConnection) reply(req *jsonrpcRequest, result any, err error) 
 // Authenticate button) for unrelated problems — e.g. an LLM stream cancelled
 // mid-flight by the user.
 func (a *AgentSideConnection) replyError(id *json.RawMessage, code int, message string) {
-	if err := a.proto.writeMessage(jsonrpcResponse{
+	if err := a.writeMessage(jsonrpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
 		Error: &struct {

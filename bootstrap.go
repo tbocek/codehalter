@@ -36,8 +36,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "codehalter must run inside a container. I can scaffold " +
 		".devcontainer/Dockerfile and .devcontainer/devcontainer.json for you to edit, then you can reopen the project in the container.\n\n"}})
 
-	tcId := a.StartToolCall(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
+	choice, tcId, err := a.askChoiceWithCard(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
@@ -167,8 +166,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 		title = "No .gitignore found — create one for .codehalter/?"
 		labels = []string{"Add .gitignore, ignore .codehalter", "Add .gitignore, track .codehalter"}
 	}
-	tcId := a.StartToolCall(ctx, sid, title, "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, labels)
+	choice, tcId, err := a.askChoiceWithCard(ctx, sid, title, "think", labels)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return

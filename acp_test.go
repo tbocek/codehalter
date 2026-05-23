@@ -73,25 +73,6 @@ func TestContentBlockOmitsEmptyFields(t *testing.T) {
 	}
 }
 
-func TestSendNotificationWritesWireBytes(t *testing.T) {
-	agentW, agentR, _, peerR := pipePair(t)
-	c := NewAgentSideConnection(nil, agentW, agentR)
-	_ = c
-
-	if err := c.sendNotification("session/update", map[string]any{"sessionId": "s1"}); err != nil {
-		t.Fatal(err)
-	}
-
-	line := readLine(t, peerR)
-	var got jsonrpcRequest
-	if err := json.Unmarshal(line, &got); err != nil {
-		t.Fatalf("parse notification: %v", err)
-	}
-	if got.JSONRPC != "2.0" || got.Method != "session/update" || got.ID != nil {
-		t.Fatalf("unexpected envelope: %s", line)
-	}
-}
-
 func TestSessionUpdateWrapsPayload(t *testing.T) {
 	agentW, agentR, _, peerR := pipePair(t)
 	c := NewAgentSideConnection(nil, agentW, agentR)

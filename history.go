@@ -69,10 +69,10 @@ func estimateTokens(s string) int {
 // to absorb estimator bias. Falls back to rawBufferTokens when n_ctx is
 // unknown (offline tests, server didn't report it).
 func (a *agent) compactTriggerTokens() int {
-	if a.mainContextTokens <= 0 {
+	if a.mainSlotTokens <= 0 {
 		return rawBufferTokens
 	}
-	avail := a.mainContextTokens - compactOverheadTokens
+	avail := a.mainSlotTokens - compactOverheadTokens
 	if avail < minCompactTrigger {
 		return minCompactTrigger
 	}

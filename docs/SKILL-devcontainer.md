@@ -13,11 +13,12 @@ Dockerfile's `FROM` line (or `/etc/os-release` if you need to be sure) to
 know which one applies here, then use the matching tool from the
 examples below.
 
-**Blocked**: `git` is shimmed in `run_command`'s PATH to a stub that exits
-127. History-rewriting commands (`git reset --hard`, `git push --force`,
-`git branch -D`, `git filter-branch`) cannot destroy your recoverable
-history. Read code with `read_file`; the user runs git themselves. Absolute
-paths (`/usr/bin/git`) bypass the shim — do not use them.
+**Blocked**: `.git` is bind-mounted into the container read-only, so
+destructive history-rewriting commands (`git reset --hard`,
+`git push --force`, `git branch -D`, `git filter-branch`) fail at the
+filesystem layer — the working tree can change but the object/ref store
+cannot. Read code with `read_file`; the user runs destructive git themselves.
+Read-only git is fine (`clone`, `log`, `ls-remote`, `archive`).
 
 ## When a task fails with "command not found"
 

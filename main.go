@@ -179,12 +179,13 @@ type agent struct {
 	// nil before that.
 	connReachable map[string]bool
 
-	// mainContextTokens is LLM[0]'s context window in tokens,
-	// discovered by the startup probe (/props.n_ctx or /v1/models --ctx-size).
-	// 0 means unknown (probe failed or server didn't report it) — compaction
-	// then falls back to the rawBufferTokens constant. compressHistory reads
-	// this; nothing else should.
-	mainContextTokens int
+	// mainSlotTokens is the per-slot context window for LLM[0] in tokens —
+	// the server-reported n_ctx divided by parallelCap, since llama.cpp's
+	// `-c N -np K` splits the total across K slots. Discovered by the startup
+	// probe (/props.n_ctx or /v1/models --ctx-size). 0 means unknown (probe
+	// failed or server didn't report it) — compaction then falls back to the
+	// rawBufferTokens constant. compressHistory reads this; nothing else should.
+	mainSlotTokens int
 
 	// slotSems caps concurrent LLM calls per configured [[llm]] entry —
 	// settings.LLM[i] has a buffered channel at slotSems[i] of capacity
@@ -490,8 +491,9 @@ func (a *agent) checkLLM(ctx context.Context, sid string) {
 	// conns[0] is the main entry that owns the foreground session's KV cache.
 	// Its context size drives compaction sizing; extra slots' sizes aren't
 	// used for that because subagent sessions have their own short lifetimes.
+	// llama.cpp's `-c N -np K` splits the total across slots, so divide.
 	if len(results) > 0 && results[0].ContextSize > 0 {
-		a.mainContextTokens = results[0].ContextSize
+		a.mainSlotTokens = results[0].ContextSize / conns[0].parallelCap()
 	}
 	var b strings.Builder
 	firstReachable := -1
@@ -528,8 +530,12 @@ func (a *agent) checkLLM(ctx context.Context, sid string) {
 		} else {
 			b.WriteString("Image support: disabled\n\n")
 		}
-		if a.mainContextTokens > 0 {
-			fmt.Fprintf(&b, "✅ Context window: %d tokens (compact at ~%d)\n\n", a.mainContextTokens, a.compactTriggerTokens())
+		if a.mainSlotTokens > 0 {
+			if pc := conns[0].parallelCap(); pc > 1 {
+				fmt.Fprintf(&b, "✅ Context window: %d tokens/slot (n_ctx %d ÷ %d slots, compact at ~%d)\n\n", a.mainSlotTokens, results[0].ContextSize, pc, a.compactTriggerTokens())
+			} else {
+				fmt.Fprintf(&b, "✅ Context window: %d tokens (compact at ~%d)\n\n", a.mainSlotTokens, a.compactTriggerTokens())
+			}
 		} else {
 			fmt.Fprintf(&b, "🟡 Context window: unknown — server didn't report n_ctx, using default compact trigger %d\n\n", rawBufferTokens)
 		}
@@ -554,7 +560,7 @@ func (a *agent) checkEnvironment(ctx context.Context, sid string) {
 	}
 	switch a.runCmdStatus {
 	case "available":
-		b.WriteString("✅ run_command: available (probes and test installs; `git` is shimmed to exit 127)\n\n")
+		b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only — destructive git commands fail at the FS layer)\n\n")
 	case "":
 		// discoverSandbox never ran. Should not happen — initSession calls it
 		// unconditionally. Stay silent rather than print misleading info.

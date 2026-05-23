@@ -220,8 +220,7 @@ func (a *agent) ensureSettings(ctx context.Context, cwd string, sid string) {
 		"you've edited it, move it to ~/.config/codehalter/ to share it " +
 		"across every project on this machine.\n\n"}})
 
-	tcId := a.StartToolCall(ctx, sid, "Write skeleton .codehalter/settings.toml?", "think", nil)
-	ok, err := a.askYesNoAuto(ctx, sid, tcId, "Create", "Skip")
+	ok, tcId, err := a.askYesNoWithCard(ctx, sid, "Write skeleton .codehalter/settings.toml?", "think", "Create", "Skip")
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return

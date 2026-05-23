@@ -2,7 +2,7 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
-  "runArgs": ["--add-host", "host.docker.internal:host-gateway", "--name", "codehalter-${localWorkspaceFolderBasename}`"],
+  "runArgs": ["--add-host", "host.docker.internal:host-gateway", "--name", "codehalter-${localWorkspaceFolderBasename}"],
   "containerEnv": { "DEVCONTAINER": "true" },
   "remoteUser": "dev",
   "mounts": [
