@@ -18,7 +18,7 @@ import (
 //   - head — first N lines (default 100)
 //   - tail — last  N lines (default 100)
 //   - grep — every line matching `pattern` (RE2 regex), each prefixed with
-//            its 1-based line number so the model can identify location
+//     its 1-based line number so the model can identify location
 //
 // Output itself is subject to the regular truncateForLLM ceiling — a grep
 // that matches thousands of lines will get truncated and the model is

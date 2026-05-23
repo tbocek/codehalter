@@ -295,9 +295,9 @@ func TestHistoryMessageImageHandling(t *testing.T) {
 	// Combined: tool uses + images together. The tool-call summary should be
 	// inlined into the text block; the image URLs follow.
 	combined := Message{
-		Role:    "assistant",
-		Content: "done",
-		Images:  []ImageData{img},
+		Role:     "assistant",
+		Content:  "done",
+		Images:   []ImageData{img},
 		ToolUses: []ToolUse{{Name: "read_file", Input: `{"path":"x"}`, Output: "ok"}},
 	}
 	parts, ok = a.historyMessage(combined).Content.([]any)
@@ -563,7 +563,6 @@ func TestEmptyProjectFlag(t *testing.T) {
 	}
 }
 
-
 // ---------------------------------------------------------------------------
 // search_text matcher (literal vs regex)
 // ---------------------------------------------------------------------------
@@ -725,4 +724,3 @@ func TestJaccardSimilarity(t *testing.T) {
 		t.Errorf("expected jaccard to be symmetric")
 	}
 }
-

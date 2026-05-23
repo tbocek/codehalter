@@ -729,12 +729,12 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid string, conn *LLMConnec
 func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string) (toolLoopResult, error) {
 	on := func(token string) {
 		if sid != "" {
-			a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(token)))
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(token)})
 		}
 	}
 	think := func(token string) {
 		if sid != "" {
-			a.sendUpdate(ctx, sid, MessageChunk(KindAgentThought, TextBlock(token)))
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: TextBlock(token)})
 		}
 	}
 	return a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, on, think)
@@ -871,9 +871,9 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 		if nudgeThisIter {
 			nudged = true
 			if sid != "" {
-				a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(
 					"⚠ Repeated tool call detected — nudging the model to try a different action.\n",
-				)))
+				)})
 			}
 		}
 
@@ -895,8 +895,8 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 			// tool call. Gives the user a live feed of what each subagent is
 			// up to instead of just "Starting…" → 5 minutes → "Done".
 			if sess := a.getSession(sid); sess != nil && sess.ParentID != "" && sess.DisplayLabel != "" {
-				a.sendUpdate(ctx, sess.ParentID, MessageChunk(KindAgentMessage, TextBlock(
-					fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80)))))
+				a.sendUpdate(ctx, sess.ParentID, messageChunk{Kind: KindAgentMessage, Content: TextBlock(
+					fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80)))})
 			}
 			a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
 			started := time.Now()
@@ -1019,8 +1019,8 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 				conn = thinkConn
 				escalated = true
 				if sid != "" {
-					a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
-						fmt.Sprintf("⚠ Tool '%s' invoked %d× this loop — switching to thinking sampler to break out.\n", name, n))))
+					a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(
+						fmt.Sprintf("⚠ Tool '%s' invoked %d× this loop — switching to thinking sampler to break out.\n", name, n))})
 				}
 				break
 			}

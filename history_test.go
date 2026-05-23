@@ -216,8 +216,8 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 		"choices": []map[string]any{{
 			"delta": map[string]any{
 				"tool_calls": []map[string]any{{
-					"id":   "call_1",
-					"type": "function",
+					"id":       "call_1",
+					"type":     "function",
 					"function": map[string]any{"name": "read_file", "arguments": `{"pa`},
 				}},
 			},

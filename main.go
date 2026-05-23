@@ -258,8 +258,7 @@ func (a *agent) deleteSession(id string) {
 	delete(a.sessions, id)
 }
 
-
-func (a *agent) sendUpdate(ctx context.Context, sid string, u SessionUpdate) {
+func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 	if a.conn == nil {
 		return
 	}
@@ -342,7 +341,7 @@ func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid string) {
 	a.ensureSettings(ctx, cwd, sid)
 
 	if a.settings.path != "" {
-		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("Using "+a.settings.path+"\n\n")))
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock("Using " + a.settings.path + "\n\n")})
 	}
 
 	a.checkLLM(ctx, sid)
@@ -377,13 +376,13 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid string) {
 	a.mu.Unlock()
 
 	if empty {
-		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
-			"Empty project — I'll ask about language and runner on your first message.\n\n")))
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(
+			"Empty project — I'll ask about language and runner on your first message.\n\n")})
 		return
 	}
 	if len(caps.runners) == 0 {
-		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
-			"🟡 No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")))
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(
+			"🟡 No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")})
 		return
 	}
 
@@ -401,7 +400,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid string) {
 	row("lint", caps.lint, "consider adding a `lint`/`vet`/`check` target")
 	row("format", caps.format, "consider adding a `fmt`/`format` target")
 	b.WriteString("\n")
-	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(b.String())))
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(b.String())})
 }
 
 // checkLLM probes every configured LLMConnection in parallel, records which
@@ -413,13 +412,13 @@ func (a *agent) checkLLM(ctx context.Context, sid string) {
 	conns := a.settings.allConnections()
 	if len(conns) == 0 {
 		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("🟡 LLM: no [[llm]] in settings.toml — codehalter cannot run until you add one.\n\n")))
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock("🟡 LLM: no [[llm]] in settings.toml — codehalter cannot run until you add one.\n\n")})
 		return
 	}
 	if settingsLooksPlaceholder(a.settings) {
 		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(
-			"🟡 LLM: "+a.settings.path+" still has the placeholder model \"your-model-id\". Edit it with your real url and model, then restart this Zed session.\n\n")))
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(
+			"🟡 LLM: " + a.settings.path + " still has the placeholder model \"your-model-id\". Edit it with your real url and model, then restart this Zed session.\n\n")})
 		return
 	}
 
@@ -477,7 +476,7 @@ func (a *agent) checkLLM(ctx context.Context, sid string) {
 			fmt.Fprintf(&b, "🟡 Context window: unknown — server didn't report n_ctx, using default compact trigger %d\n\n", rawBufferTokens)
 		}
 	}
-	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(b.String())))
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(b.String())})
 }
 
 // checkEnvironment reports whether codehalter is running inside a container
@@ -504,7 +503,7 @@ func (a *agent) checkEnvironment(ctx context.Context, sid string) {
 	default:
 		fmt.Fprintf(&b, "🟡 run_command: disabled — %s\n\n", a.runCmdStatus)
 	}
-	a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(b.String())))
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(b.String())})
 }
 
 // containerKind returns a short label identifying the container runtime, or
@@ -582,18 +581,18 @@ func (a *agent) replayHistory(ctx context.Context, sid string, s *Session) {
 	for _, m := range s.Messages {
 		if m.Role == lastRole {
 			if m.Role == "user" {
-				a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("")))
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock("")})
 			} else {
-				a.sendUpdate(ctx, sid, MessageChunk(KindUserMessage, TextBlock("")))
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: TextBlock("")})
 			}
 		}
 		if m.Role == "user" {
-			a.sendUpdate(ctx, sid, MessageChunk(KindUserMessage, TextBlock(m.Content)))
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: TextBlock(m.Content)})
 			for _, img := range m.Images {
-				a.sendUpdate(ctx, sid, MessageChunk(KindUserMessage, ImageBlock(img.MimeType, img.Data)))
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ImageBlock(img.MimeType, img.Data)})
 			}
 		} else {
-			a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(m.Content)))
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(m.Content)})
 		}
 		lastRole = m.Role
 	}
@@ -618,7 +617,7 @@ func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) e
 	a.mode = req.ModeId
 	a.mu.Unlock()
 	a.sendUpdate(ctx, req.SessionId, CurrentModeUpdate(req.ModeId))
-	a.sendUpdate(ctx, req.SessionId, MessageChunk(KindAgentMessage, TextBlock("Mode: "+req.ModeId+"\n\n")))
+	a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: TextBlock("Mode: " + req.ModeId + "\n\n")})
 	return nil
 }
 

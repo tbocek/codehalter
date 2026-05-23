@@ -142,7 +142,7 @@ func (a *agent) registerSubagentTool() {
 			h := subagentTaskHash(task)
 			if cached, ok := sess.recallSubagent(h); ok {
 				results[i] = subagentResult{Index: i, Success: true, Result: cached}
-				ag.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(fmt.Sprintf("[subagent %d] Reusing prior result for identical task\n\n", i+1))))
+				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(fmt.Sprintf("[subagent %d] Reusing prior result for identical task\n\n", i+1))})
 				continue
 			}
 			if p, ok := uniq[h]; ok {
@@ -187,7 +187,7 @@ func (a *agent) registerSubagentTool() {
 			ag.putSession(subSess)
 			defer ag.deleteSession(subSess.ID)
 
-			ag.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(fmt.Sprintf("[%s] Starting: %s\n\n", subSess.DisplayLabel, truncate(task.Instructions, 100)))))
+			ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(fmt.Sprintf("[%s] Starting: %s\n\n", subSess.DisplayLabel, truncate(task.Instructions, 100)))})
 
 			// All internal plan/execute/verify calls use the subagent's own
 			// session id. That keeps plan steps, tool uses, and assistant
@@ -212,9 +212,9 @@ func (a *agent) registerSubagentTool() {
 			mu.Unlock()
 
 			if len(p.indices) > 1 {
-				ag.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(fmt.Sprintf("[%s] Done (shared with %d duplicate task(s))\n\n", subSess.DisplayLabel, len(p.indices)-1))))
+				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(fmt.Sprintf("[%s] Done (shared with %d duplicate task(s))\n\n", subSess.DisplayLabel, len(p.indices)-1))})
 			} else {
-				ag.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock(fmt.Sprintf("[%s] Done\n\n", subSess.DisplayLabel))))
+				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock(fmt.Sprintf("[%s] Done\n\n", subSess.DisplayLabel))})
 			}
 		})
 

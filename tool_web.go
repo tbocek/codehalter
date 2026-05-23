@@ -436,7 +436,7 @@ func init() {
 			[]ToolCallContent{TextContent(formatted)})
 		// Surface the list inline in the chat too, so the user can see the
 		// URLs and snippets without expanding the tool card.
-		a.sendUpdate(ctx, sid, MessageChunk(KindAgentMessage, TextBlock("\n"+formatted+"\n")))
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: TextBlock("\n" + formatted + "\n")})
 		a.logSession(sid, "WEB", "results (%d):\n%s", len(results), formatted)
 		return formatted, false
 	}})

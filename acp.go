@@ -35,9 +35,18 @@ type jsonrpcResponse struct {
 // ACP wire types
 // ---------------------------------------------------------------------------
 
-// protocolVersion is the ACP wire version we speak. Bumping breaks Zed
-// clients pinned to the old number — keep at 1 unless Zed's side moves.
-const protocolVersion = 1
+const (
+	// protocolVersion is the ACP wire version we speak. Bumping breaks Zed
+	// clients pinned to the old number — keep at 1 unless Zed's side moves.
+	protocolVersion = 1
+	// ACP session_update kinds for streamed content. agent_thought_chunk is
+	// reasoning_content from thinking models (Qwen3, DeepSeek-R1, GPT-OSS) —
+	// clients render it greyed/collapsible so deliberation doesn't blur with
+	// visible output.
+	KindAgentMessage = "agent_message_chunk"
+	KindAgentThought = "agent_thought_chunk"
+	KindUserMessage  = "user_message_chunk"
+)
 
 type Implementation struct {
 	Name    string `json:"name,omitempty"`
@@ -71,21 +80,21 @@ type (
 		Cwd string `json:"cwd,omitempty"`
 	}
 	NewSessionResponse struct {
-		SessionId string         `json:"sessionId"`
+		SessionId string            `json:"sessionId"`
 		Modes     *SessionModeState `json:"modes,omitempty"`
 	}
 
 	SetSessionModeRequest struct {
 		SessionId string `json:"sessionId"`
-		ModeId    string    `json:"modeId"`
+		ModeId    string `json:"modeId"`
 	}
 
 	LoadSessionRequest struct {
 		SessionId string `json:"sessionId"`
-		Cwd       string    `json:"cwd"`
+		Cwd       string `json:"cwd"`
 	}
 	LoadSessionResponse struct {
-		SessionId string         `json:"sessionId,omitempty"`
+		SessionId string            `json:"sessionId,omitempty"`
 		Modes     *SessionModeState `json:"modes,omitempty"`
 	}
 
@@ -107,8 +116,8 @@ type (
 	}
 
 	PromptRequest struct {
-		SessionId string            `json:"sessionId"`
-		Content   []json.RawMessage `json:"prompt"`
+		SessionId string         `json:"sessionId"`
+		Content   []ContentBlock `json:"prompt"`
 	}
 	PromptResponse struct {
 		StopReason string `json:"stopReason,omitempty"`
@@ -126,101 +135,39 @@ type SessionModeState struct {
 	} `json:"availableModes"`
 }
 
-// Content blocks — union type, serialised flat (not wrapped).
-
+// ContentBlock is the ACP wire shape for one prompt/response block: a flat
+// object with a "type" discriminator and per-variant fields. Type is the
+// only field always populated; the rest are set per kind. Going flat lets
+// encoding/json handle marshal/unmarshal directly — no custom methods.
 type ContentBlock struct {
-	Text *struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	Image *struct {
-		Type     string `json:"type"`
-		MimeType string `json:"mimeType"`
-		Data     string `json:"data"` // base64-encoded image data
-	}
-}
-
-// marshalContentBlock emits the wire shape ACP defines: {"type":"text",...}
-// or {"type":"image",...} — never the Go {"Text":{...}} that the default
-// encoder would produce. Returns "null" when neither variant is set so the
-// caller can still unconditionally embed the result.
-func marshalContentBlock(b ContentBlock) ([]byte, error) {
-	if b.Text != nil {
-		return json.Marshal(b.Text)
-	}
-	if b.Image != nil {
-		return json.Marshal(b.Image)
-	}
-	return []byte("null"), nil
-}
-
-// unmarshalContentBlock dispatches on the "type" discriminator and fills the
-// matching variant. Unknown types are silently dropped so a future ACP block
-// shape doesn't break older agents.
-func unmarshalContentBlock(data []byte, b *ContentBlock) error {
-	var probe struct {
-		Type string `json:"type"`
-	}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return err
-	}
-	switch probe.Type {
-	case "text":
-		*b = TextBlock("")
-		return json.Unmarshal(data, b.Text)
-	case "image":
-		*b = ImageBlock("", "")
-		return json.Unmarshal(data, b.Image)
-	default:
-		return nil
-	}
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+	Data     string `json:"data,omitempty"` // base64-encoded image bytes
 }
 
 func TextBlock(text string) ContentBlock {
-	return ContentBlock{Text: &struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}{Type: "text", Text: text}}
+	return ContentBlock{Type: "text", Text: text}
 }
 
 func ImageBlock(mimeType, data string) ContentBlock {
-	return ContentBlock{Image: &struct {
-		Type     string `json:"type"`
-		MimeType string `json:"mimeType"`
-		Data     string `json:"data"` // base64-encoded image data
-	}{Type: "image", MimeType: mimeType, Data: data}}
+	return ContentBlock{Type: "image", MimeType: mimeType, Data: data}
 }
 
 // Session update (agent -> client notification).
 
+// SessionNotification.Update is `any` because it's a discriminated union on
+// the wire (keyed by "sessionUpdate"): message chunks, plan updates, and
+// tool-call cards share one envelope and the right concrete struct is
+// picked at the call site.
 type SessionNotification struct {
-	SessionId string     `json:"sessionId"`
-	Update    SessionUpdate `json:"update"`
+	SessionId string `json:"sessionId"`
+	Update    any    `json:"update"`
 }
-
-// SessionUpdate is the "update" field in session/update notifications — a
-// discriminated union keyed by "sessionUpdate". Using `any` lets message
-// chunks, plan updates, and tool-call cards share one shape.
-type SessionUpdate = any
 
 type messageChunk struct {
-	Kind    string          `json:"sessionUpdate"`
-	Content json.RawMessage `json:"content"`
-}
-
-// ACP session_update kinds for streamed content. agent_thought_chunk is
-// reasoning_content from thinking models (Qwen3, DeepSeek-R1, GPT-OSS) —
-// clients render it greyed/collapsible so deliberation doesn't blur with
-// visible output.
-const (
-	KindAgentMessage = "agent_message_chunk"
-	KindAgentThought = "agent_thought_chunk"
-	KindUserMessage  = "user_message_chunk"
-)
-
-func MessageChunk(kind string, content ContentBlock) SessionUpdate {
-	raw, _ := marshalContentBlock(content)
-	return messageChunk{Kind: kind, Content: raw}
+	Kind    string       `json:"sessionUpdate"`
+	Content ContentBlock `json:"content"`
 }
 
 // Plan update — shown by the client as a checklist.
@@ -236,7 +183,7 @@ type planUpdate struct {
 	Entries []PlanEntry `json:"entries"`
 }
 
-func PlanUpdate(entries []PlanEntry) SessionUpdate {
+func PlanUpdate(entries []PlanEntry) any {
 	return planUpdate{Kind: "plan", Entries: entries}
 }
 
@@ -249,7 +196,7 @@ type currentModeUpdate struct {
 	ModeId string `json:"modeId"`
 }
 
-func CurrentModeUpdate(modeId string) SessionUpdate {
+func CurrentModeUpdate(modeId string) any {
 	return currentModeUpdate{Kind: "current_mode_update", ModeId: modeId}
 }
 
