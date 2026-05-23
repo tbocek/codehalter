@@ -219,8 +219,6 @@ func (a *agent) isAutopilot() bool {
 	return a.mode == modeAutopilot
 }
 
-var _ Agent = (*agent)(nil)
-
 // cwdOrDefault resolves the session's working directory to a clean absolute
 // path. Clients may pass "." (bench harness) or any relative path; resolvePath
 // then prefix-checks against sess.Cwd, and the check breaks when Cwd isn't
@@ -265,6 +263,9 @@ func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) 
 }
 
 func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
+	if req.ProtocolVersion != protocolVersion {
+		return InitializeResponse{}, fmt.Errorf("unsupported protocol version %d (this agent speaks %d)", req.ProtocolVersion, protocolVersion)
+	}
 	// Probe the execute/thinking LLM cheaply (metadata endpoints, no
 	// inference) to advertise image support in capabilities. We load the
 	// global settings only here — project-local settings live under a cwd
@@ -278,26 +279,22 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 			a.imagesSupported = a.probeLLM(ctx, conn).ImageSupport
 		}
 	}
-	return InitializeResponse{
-		ProtocolVersion: ProtocolVersionNumber,
-		AgentCapabilities: AgentCapabilities{
-			LoadSession:        true,
-			PromptCapabilities: PromptCapabilities{Image: a.imagesSupported},
-			SessionCapabilities: &SessionCapabilities{
-				List: &SessionListCapabilities{},
-			},
-		},
-		AgentInfo: &Implementation{
-			Name:    "llama-acp",
-			Version: "0.1.0",
-		},
-		AuthMethods: []string{},
-	}, nil
+	var res InitializeResponse
+	res.ProtocolVersion = protocolVersion
+	res.AgentCapabilities.LoadSession = true
+	res.AgentCapabilities.PromptCapabilities.Image = a.imagesSupported
+	res.AgentCapabilities.SessionCapabilities = &SessionCapabilities{
+		List:  &struct{}{},
+		Close: &struct{}{},
+	}
+	res.AgentInfo = &Implementation{Name: "llama-acp", Version: "0.1.0"}
+	res.AuthMethods = []string{}
+	return res, nil
 }
 
-func (a *agent) Authenticate(_ context.Context, _ AuthenticateRequest) (AuthenticateResponse, error) {
+func (a *agent) Authenticate(_ context.Context) error {
 	// No auth needed for local llama.cpp.
-	return AuthenticateResponse{}, nil
+	return nil
 }
 
 func (a *agent) initSession(cwd string, s *Session) error {
@@ -609,24 +606,29 @@ func (a *agent) ListSessions(_ context.Context, req ListSessionsRequest) (ListSe
 	return ListSessionsResponse{Sessions: sessions}, nil
 }
 
-func (a *agent) SetSessionConfigOption(_ context.Context, req SetSessionConfigOptionRequest) (SetSessionConfigOptionResponse, error) {
-	return SetSessionConfigOptionResponse{ConfigOptions: []SessionConfigOption{}}, nil
-}
-
-func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) (SetSessionModeResponse, error) {
+func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) error {
 	if req.ModeId != modeInteractive && req.ModeId != modeAutopilot {
-		return SetSessionModeResponse{}, nil
+		return nil
 	}
 	a.mu.Lock()
 	a.mode = req.ModeId
 	a.mu.Unlock()
 	a.sendUpdate(ctx, req.SessionId, CurrentModeUpdate(req.ModeId))
 	a.sendUpdate(ctx, req.SessionId, AgentMessageChunk(TextBlock("Mode: "+req.ModeId+"\n\n")))
-	return SetSessionModeResponse{}, nil
+	return nil
 }
 
-func (a *agent) SetSessionModel(_ context.Context, req SetSessionModelRequest) (SetSessionModelResponse, error) {
-	return SetSessionModelResponse{}, nil
+// CloseSession cancels any in-flight turn for sid and drops the session from
+// the live map. The on-disk TOML is preserved so /session resume still works
+// — close is a "this client is done watching" signal, not a delete.
+func (a *agent) CloseSession(_ context.Context, req CloseSessionRequest) error {
+	a.mu.Lock()
+	if a.cancel != nil {
+		a.cancel()
+	}
+	a.mu.Unlock()
+	a.deleteSession(req.SessionId)
+	return nil
 }
 
 func (a *agent) Cancel(_ context.Context, _ CancelNotification) {

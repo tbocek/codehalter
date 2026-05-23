@@ -6,52 +6,72 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 )
 
-const ProtocolVersionNumber ProtocolVersion = 1
-const (
-	StopReasonEndTurn   StopReason = "end_turn"
-	StopReasonCancelled StopReason = "cancelled"
-)
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 message envelopes used over the ACP line protocol.
+// ---------------------------------------------------------------------------
 
-type ProtocolVersion int
+type jsonrpcRequest struct {
+	JSONRPC string           `json:"jsonrpc"`
+	ID      *json.RawMessage `json:"id,omitempty"`
+	Method  string           `json:"method"`
+	Params  json.RawMessage  `json:"params,omitempty"`
+}
+
+type jsonrpcResponse struct {
+	JSONRPC string           `json:"jsonrpc"`
+	ID      *json.RawMessage `json:"id"`
+	Result  any              `json:"result,omitempty"`
+	Error   *rpcError        `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// ---------------------------------------------------------------------------
+// ACP wire types
+// ---------------------------------------------------------------------------
+
+// protocolVersion is the ACP wire version we speak. Bumping breaks Zed
+// clients pinned to the old number — keep at 1 unless Zed's side moves.
+const protocolVersion = 1
+
 type SessionId string
-type StopReason string
 
 type Implementation struct {
 	Name    string `json:"name,omitempty"`
 	Version string `json:"version,omitempty"`
 }
 
-type AgentCapabilities struct {
-	LoadSession         bool                 `json:"loadSession"`
-	PromptCapabilities  PromptCapabilities   `json:"promptCapabilities"`
-	SessionCapabilities *SessionCapabilities `json:"sessionCapabilities,omitempty"`
-}
-
-type PromptCapabilities struct {
-	Image bool `json:"image,omitempty"`
-}
-
+// SessionCapabilities advertises optional session features. Each non-nil
+// pointer is a marker — empty struct serialises as `{}` on the wire, which
+// is the shape ACP defines for "this capability is supported".
 type SessionCapabilities struct {
-	List *SessionListCapabilities `json:"list,omitempty"`
+	List  *struct{} `json:"list,omitempty"`
+	Close *struct{} `json:"close,omitempty"`
 }
-
-type SessionListCapabilities struct{}
 
 type (
 	InitializeRequest struct {
-		ProtocolVersion ProtocolVersion `json:"protocolVersion"`
+		ProtocolVersion int `json:"protocolVersion"`
 	}
 	InitializeResponse struct {
-		ProtocolVersion   ProtocolVersion   `json:"protocolVersion"`
-		AgentCapabilities AgentCapabilities `json:"agentCapabilities"`
-		AgentInfo         *Implementation   `json:"agentInfo,omitempty"`
-		AuthMethods       []string          `json:"authMethods"`
+		ProtocolVersion   int `json:"protocolVersion"`
+		AgentCapabilities struct {
+			LoadSession        bool `json:"loadSession"`
+			PromptCapabilities struct {
+				Image bool `json:"image,omitempty"`
+			} `json:"promptCapabilities"`
+			SessionCapabilities *SessionCapabilities `json:"sessionCapabilities,omitempty"`
+		} `json:"agentCapabilities"`
+		AgentInfo   *Implementation `json:"agentInfo,omitempty"`
+		AuthMethods []string        `json:"authMethods"`
 	}
-
-	AuthenticateRequest  struct{}
-	AuthenticateResponse struct{}
 
 	NewSessionRequest struct {
 		Cwd string `json:"cwd,omitempty"`
@@ -65,12 +85,6 @@ type (
 		SessionId SessionId `json:"sessionId"`
 		ModeId    string    `json:"modeId"`
 	}
-	SetSessionModeResponse struct{}
-
-	SetSessionModelRequest struct {
-		SessionId SessionId `json:"sessionId"`
-	}
-	SetSessionModelResponse struct{}
 
 	LoadSessionRequest struct {
 		SessionId SessionId `json:"sessionId"`
@@ -90,13 +104,8 @@ type (
 		NextCursor string        `json:"nextCursor,omitempty"`
 	}
 
-	SetSessionConfigOptionRequest struct {
+	CloseSessionRequest struct {
 		SessionId SessionId `json:"sessionId"`
-		ConfigId  string    `json:"configId"`
-		Value     string    `json:"value"`
-	}
-	SetSessionConfigOptionResponse struct {
-		ConfigOptions []SessionConfigOption `json:"configOptions"`
 	}
 
 	CancelNotification struct {
@@ -108,7 +117,7 @@ type (
 		Content   []ContentBlock `json:"prompt"`
 	}
 	PromptResponse struct {
-		StopReason StopReason `json:"stopReason,omitempty"`
+		StopReason string `json:"stopReason,omitempty"`
 	}
 )
 
@@ -121,23 +130,6 @@ type SessionModeState struct {
 
 type SessionMode struct {
 	Id          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-}
-
-// Session config options (dropdown selectors in client UI).
-
-type SessionConfigOption struct {
-	Type         string                      `json:"type"`
-	Id           string                      `json:"id"`
-	Name         string                      `json:"name"`
-	Description  string                      `json:"description,omitempty"`
-	CurrentValue string                      `json:"currentValue"`
-	Options      []SessionConfigSelectOption `json:"options"`
-}
-
-type SessionConfigSelectOption struct {
-	Value       string `json:"value"`
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 }
@@ -204,9 +196,9 @@ type SessionNotification struct {
 	Update    SessionUpdate `json:"update"`
 }
 
-// SessionUpdate is sent as the "update" field in session/update notifications.
-// It's a discriminated union keyed by "sessionUpdate". We use any so that
-// different update shapes (message chunks, tool calls, etc.) all work.
+// SessionUpdate is the "update" field in session/update notifications — a
+// discriminated union keyed by "sessionUpdate". Using `any` lets message
+// chunks, plan updates, and tool-call cards share one shape.
 type SessionUpdate = any
 
 type messageChunk struct {
@@ -216,6 +208,14 @@ type messageChunk struct {
 
 func AgentMessageChunk(content ContentBlock) SessionUpdate {
 	return messageChunk{Kind: "agent_message_chunk", Content: content}
+}
+
+// AgentThoughtChunk surfaces reasoning_content (chain-of-thought from
+// thinking models — Qwen3, DeepSeek-R1, GPT-OSS) as a distinct stream.
+// Clients render it differently (greyed/collapsible) so visible output and
+// internal deliberation don't blur together in the UI.
+func AgentThoughtChunk(content ContentBlock) SessionUpdate {
+	return messageChunk{Kind: "agent_thought_chunk", Content: content}
 }
 
 func UserMessageChunk(content ContentBlock) SessionUpdate {
@@ -240,8 +240,8 @@ func PlanUpdate(entries []PlanEntry) SessionUpdate {
 }
 
 // Current-mode update — informs the client UI that the active mode changed.
-// Field name is "modeId" (per ACP spec), distinct from the "currentModeId"
-// field inside SessionModeState advertised at session create/load.
+// Field is "modeId" per ACP spec, distinct from "currentModeId" inside
+// SessionModeState advertised at session create/load.
 
 type currentModeUpdate struct {
 	Kind   string `json:"sessionUpdate"`
@@ -252,70 +252,284 @@ func CurrentModeUpdate(modeId string) SessionUpdate {
 	return currentModeUpdate{Kind: "current_mode_update", ModeId: modeId}
 }
 
-// Agent is the interface an ACP agent must implement.
+// ---------------------------------------------------------------------------
+// AgentSideConnection — JSON-RPC dispatch + outgoing-request demux. Owns the
+// line protocol; the agent type is concrete (there is only one).
+// ---------------------------------------------------------------------------
 
-type Agent interface {
-	Initialize(context.Context, InitializeRequest) (InitializeResponse, error)
-	Authenticate(context.Context, AuthenticateRequest) (AuthenticateResponse, error)
-	NewSession(context.Context, NewSessionRequest) (NewSessionResponse, error)
-	LoadSession(context.Context, LoadSessionRequest) (LoadSessionResponse, error)
-	ListSessions(context.Context, ListSessionsRequest) (ListSessionsResponse, error)
-	SetSessionMode(context.Context, SetSessionModeRequest) (SetSessionModeResponse, error)
-	SetSessionModel(context.Context, SetSessionModelRequest) (SetSessionModelResponse, error)
-	SetSessionConfigOption(context.Context, SetSessionConfigOptionRequest) (SetSessionConfigOptionResponse, error)
-	Cancel(context.Context, CancelNotification)
-	Prompt(context.Context, PromptRequest) (PromptResponse, error)
-}
-
-// AgentSideConnection routes ACP methods over a JSON-RPC connection.
-
+// AgentSideConnection routes ACP methods between the codehalter agent and a
+// connected ACP client. There is exactly one agent implementation, so the
+// previous Agent interface was abstraction without value and has been dropped.
 type AgentSideConnection struct {
-	conn  *Connection
-	agent Agent
+	proto *lineProtocol
+	agent *agent
+	log   *slog.Logger
+
+	done chan struct{}
+
+	nextID    atomic.Uint64
+	pendingMu sync.Mutex
+	pending   map[string]chan json.RawMessage
 }
 
-func NewAgentSideConnection(agent Agent, w io.Writer, r io.Reader, log *slog.Logger) *AgentSideConnection {
-	a := &AgentSideConnection{agent: agent}
-	a.conn = NewConnection(w, r, a.handle, log)
-	return a
+func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader, log *slog.Logger) *AgentSideConnection {
+	c := &AgentSideConnection{
+		proto:   newLineProtocol(w, r, log),
+		agent:   a,
+		log:     log,
+		done:    make(chan struct{}),
+		pending: make(map[string]chan json.RawMessage),
+	}
+	go c.serve()
+	return c
 }
 
-func (a *AgentSideConnection) Done() <-chan struct{} { return a.conn.Done() }
-func (a *AgentSideConnection) RPC() *Connection      { return a.conn }
+func (a *AgentSideConnection) Done() <-chan struct{} { return a.done }
 
 func (a *AgentSideConnection) SessionUpdate(ctx context.Context, n SessionNotification) error {
-	return a.conn.SendNotification("session/update", n)
+	return a.sendNotification("session/update", n)
+}
+
+// sendNotification writes a JSON-RPC notification (no ID, no response expected).
+func (a *AgentSideConnection) sendNotification(method string, params any) error {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	return a.proto.writeMessage(jsonrpcRequest{
+		JSONRPC: "2.0",
+		Method:  method,
+		Params:  raw,
+	})
+}
+
+// sendRequest writes a JSON-RPC request and blocks until the matching
+// response arrives. Returns the raw `result` bytes — callers unmarshal into
+// whatever shape they expect so this is a single non-generic entry point.
+func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	id := a.nextID.Add(1)
+	idStr := fmt.Sprintf("%d", id)
+	idRaw := json.RawMessage(`"` + idStr + `"`)
+
+	ch := make(chan json.RawMessage, 1)
+	a.pendingMu.Lock()
+	a.pending[idStr] = ch
+	a.pendingMu.Unlock()
+	defer func() {
+		a.pendingMu.Lock()
+		delete(a.pending, idStr)
+		a.pendingMu.Unlock()
+	}()
+
+	var raw json.RawMessage
+	if params != nil {
+		b, err := json.Marshal(params)
+		if err != nil {
+			return nil, err
+		}
+		raw = b
+	}
+	if err := a.proto.writeMessage(jsonrpcRequest{
+		JSONRPC: "2.0",
+		ID:      &idRaw,
+		Method:  method,
+		Params:  raw,
+	}); err != nil {
+		return nil, err
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case line := <-ch:
+		var resp struct {
+			Result json.RawMessage `json:"result"`
+			Error  *rpcError       `json:"error"`
+		}
+		if err := json.Unmarshal(line, &resp); err != nil {
+			return nil, err
+		}
+		if resp.Error != nil {
+			return nil, fmt.Errorf("rpc error %d: %s", resp.Error.Code, resp.Error.Message)
+		}
+		return resp.Result, nil
+	}
+}
+
+func (a *AgentSideConnection) sendResult(id *json.RawMessage, result any) {
+	_ = a.proto.writeMessage(jsonrpcResponse{JSONRPC: "2.0", ID: id, Result: result})
+}
+
+// sendError emits a JSON-RPC error response. We deliberately avoid -32000:
+// ACP reserves it for AUTH_REQUIRED, so using it for generic handler failures
+// makes Zed render a misleading "Authentication Required" red box (with an
+// Authenticate button) for unrelated problems — e.g. an LLM stream cancelled
+// mid-flight by the user.
+func (a *AgentSideConnection) sendError(id *json.RawMessage, code int, message string) {
+	_ = a.proto.writeMessage(jsonrpcResponse{
+		JSONRPC: "2.0",
+		ID:      id,
+		Error:   &rpcError{Code: code, Message: message},
+	})
+}
+
+// decodeParams unmarshals req.Params into dst. Returns false (and writes a
+// -32602 "invalid params" error) when the bytes won't decode. nil params is
+// allowed and treated as an empty object.
+func (a *AgentSideConnection) decodeParams(req *jsonrpcRequest, dst any) bool {
+	if req.Params == nil {
+		return true
+	}
+	if err := json.Unmarshal(req.Params, dst); err != nil {
+		if req.ID != nil {
+			a.sendError(req.ID, -32602, fmt.Sprintf("invalid params: %v", err))
+		}
+		return false
+	}
+	return true
+}
+
+// reply finishes a handler: emit result on success, -32603 error otherwise.
+// Skips the reply entirely when req.ID is nil (notification).
+func (a *AgentSideConnection) reply(req *jsonrpcRequest, result any, err error) {
+	if err != nil {
+		a.log.Error("handler failed", "method", req.Method, "error", err)
+		if req.ID != nil {
+			a.sendError(req.ID, -32603, err.Error())
+		}
+		return
+	}
+	if req.ID != nil {
+		a.sendResult(req.ID, result)
+	}
+}
+
+// serve reads lines from the underlying transport forever. Responses to our
+// outgoing requests route to the pending map; everything else lands in
+// handle().
+func (a *AgentSideConnection) serve() {
+	defer close(a.done)
+	ctx := context.Background()
+	a.proto.serve(func(line []byte) {
+		var probe struct {
+			ID     *json.RawMessage `json:"id"`
+			Method string           `json:"method"`
+			Result *json.RawMessage `json:"result"`
+			Error  *json.RawMessage `json:"error"`
+		}
+		if err := json.Unmarshal(line, &probe); err != nil {
+			a.log.Warn("failed to parse message", "error", err)
+			return
+		}
+
+		// Response to one of our outgoing requests.
+		if probe.Method == "" && probe.ID != nil {
+			id := string(*probe.ID)
+			if len(id) >= 2 && id[0] == '"' {
+				id = id[1 : len(id)-1]
+			}
+			a.pendingMu.Lock()
+			ch, ok := a.pending[id]
+			if ok {
+				delete(a.pending, id)
+			}
+			a.pendingMu.Unlock()
+			if ok {
+				ch <- line
+			}
+			return
+		}
+
+		// Incoming request or notification.
+		var req jsonrpcRequest
+		if err := json.Unmarshal(line, &req); err != nil {
+			a.log.Warn("failed to parse message", "error", err)
+			return
+		}
+		a.log.Debug("received", "method", req.Method, "raw", string(line))
+
+		// session/prompt runs on its own goroutine so a long turn doesn't
+		// block reading the cancel notification that ends it.
+		if req.Method == "session/prompt" {
+			go a.handle(ctx, &req)
+		} else {
+			a.handle(ctx, &req)
+		}
+	})
 }
 
 func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
 	switch req.Method {
 	case "initialize":
-		Dispatch(a.conn, ctx, req, a.agent.Initialize)
-	case "authenticate":
-		Dispatch(a.conn, ctx, req, a.agent.Authenticate)
-	case "session/new":
-		Dispatch(a.conn, ctx, req, a.agent.NewSession)
-	case "session/load":
-		Dispatch(a.conn, ctx, req, a.agent.LoadSession)
-	case "session/list":
-		Dispatch(a.conn, ctx, req, a.agent.ListSessions)
-	case "session/set_config_option":
-		Dispatch(a.conn, ctx, req, a.agent.SetSessionConfigOption)
-	case "session/set_mode":
-		Dispatch(a.conn, ctx, req, a.agent.SetSessionMode)
-	case "session/set_model":
-		Dispatch(a.conn, ctx, req, a.agent.SetSessionModel)
-	case "session/prompt":
-		Dispatch(a.conn, ctx, req, a.agent.Prompt)
-	case "session/cancel":
-		var params CancelNotification
-		if req.Params != nil {
-			_ = json.Unmarshal(req.Params, &params)
+		var p InitializeRequest
+		if !a.decodeParams(req, &p) {
+			return
 		}
-		a.agent.Cancel(ctx, params)
+		res, err := a.agent.Initialize(ctx, p)
+		a.reply(req, res, err)
+
+	case "authenticate":
+		err := a.agent.Authenticate(ctx)
+		a.reply(req, struct{}{}, err)
+
+	case "session/new":
+		var p NewSessionRequest
+		if !a.decodeParams(req, &p) {
+			return
+		}
+		res, err := a.agent.NewSession(ctx, p)
+		a.reply(req, res, err)
+
+	case "session/load":
+		var p LoadSessionRequest
+		if !a.decodeParams(req, &p) {
+			return
+		}
+		res, err := a.agent.LoadSession(ctx, p)
+		a.reply(req, res, err)
+
+	case "session/list":
+		var p ListSessionsRequest
+		if !a.decodeParams(req, &p) {
+			return
+		}
+		res, err := a.agent.ListSessions(ctx, p)
+		a.reply(req, res, err)
+
+	case "session/set_mode":
+		var p SetSessionModeRequest
+		if !a.decodeParams(req, &p) {
+			return
+		}
+		err := a.agent.SetSessionMode(ctx, p)
+		a.reply(req, struct{}{}, err)
+
+	case "session/close":
+		var p CloseSessionRequest
+		if !a.decodeParams(req, &p) {
+			return
+		}
+		err := a.agent.CloseSession(ctx, p)
+		a.reply(req, struct{}{}, err)
+
+	case "session/prompt":
+		var p PromptRequest
+		if !a.decodeParams(req, &p) {
+			return
+		}
+		res, err := a.agent.Prompt(ctx, p)
+		a.reply(req, res, err)
+
+	case "session/cancel":
+		var p CancelNotification
+		if req.Params != nil {
+			_ = json.Unmarshal(req.Params, &p)
+		}
+		a.agent.Cancel(ctx, p)
+
 	default:
 		if req.ID != nil {
-			a.conn.SendError(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
+			a.sendError(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
 		}
 	}
 }

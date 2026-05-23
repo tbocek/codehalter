@@ -1,18 +1,29 @@
 # Codehalter MCP server registry — edit this file, then restart the Zed session.
 #
-# Each [[server]] entry spawns one long-lived child process speaking the Model
-# Context Protocol (MCP) over stdio. Codehalter calls `tools/list` once on
-# startup and registers every advertised tool into the agent's tool registry,
-# namespaced as `<server-name>__<tool>` so multiple servers can ship a tool
-# called "search" without colliding. Tool descriptions come from the MCP
-# server itself, so the model gets whatever the server author wrote — keep an
-# eye on token cost when enabling chatty servers.
+# Each [[server]] entry connects to one Model Context Protocol (MCP) server.
+# Two transports are supported:
+#   stdio — codehalter spawns the command and speaks line-delimited JSON-RPC
+#           over its stdin/stdout. Use this for local tools (gopls, npx, uvx).
+#   http  — codehalter POSTs JSON-RPC envelopes to a URL per the Streamable
+#           HTTP transport (spec 2025-06-18). Use this for remote/hosted servers.
 #
-# Schema per entry:
+# Codehalter calls `tools/list` once on startup and registers every advertised
+# tool into the agent's tool registry, namespaced as `<server-name>__<tool>` so
+# multiple servers can ship a tool called "search" without colliding. Tool
+# descriptions come from the MCP server itself, so the model gets whatever the
+# server author wrote — keep an eye on token cost when enabling chatty servers.
+#
+# Schema per entry — set EITHER the stdio fields OR the http fields, never both:
 #   name      = "short-id"        # required; used as the namespace prefix
-#   command   = "executable"      # required; resolved via $PATH
+#
+#   # stdio transport
+#   command   = "executable"      # resolved via $PATH
 #   args      = ["..."]           # optional; arguments passed to the command
 #   env       = { KEY = "value" } # optional; merged into the child's env
+#
+#   # http transport (MCP Streamable HTTP)
+#   url       = "https://host/mcp"      # full POST target
+#   headers   = { Authorization = "Bearer ..." } # optional; sent on every request
 #
 # To disable an entry, comment out its lines — there's no `enabled = false`
 # switch on purpose, keeps the schema and reconciler logic small.
@@ -55,3 +66,8 @@
 # command = "uvx"
 # args = ["mcp-server-github"]
 # env = { GITHUB_TOKEN = "ghp_..." }
+#
+# [[server]]
+# name = "hosted"
+# url = "https://mcp.example.com/v1"
+# headers = { Authorization = "Bearer sk-..." }

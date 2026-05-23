@@ -17,8 +17,8 @@ import (
 
 // errUserCancelled flags a deliberate stop initiated by the user (e.g. they
 // chose Abort in a tool-choice prompt). It's NOT an error to surface as a
-// red box — the prompt returns a clean PromptResponse with StopReasonCancelled
-// when this sentinel reaches the top level.
+// red box — the prompt returns a clean PromptResponse with stopReason
+// "cancelled" when this sentinel reaches the top level.
 var errUserCancelled = errors.New("user cancelled")
 
 // isCancelled returns true for both the deliberate-cancel sentinel and a
@@ -26,7 +26,7 @@ var errUserCancelled = errors.New("user cancelled")
 // stream / HTTP client surface when the user hits the red Cancel button
 // mid-request — surfacing it as a JSON-RPC error makes Zed render the
 // AUTH_REQUIRED red box (because ACP reserves -32000 for that). All three
-// must collapse to a clean StopReasonCancelled at the top of Prompt.
+// must collapse to a clean "cancelled" stopReason at the top of Prompt.
 func isCancelled(err error) bool {
 	return errors.Is(err, errUserCancelled) ||
 		errors.Is(err, context.Canceled) ||
@@ -151,11 +151,11 @@ func (a *agent) failPrompt(sid SessionId, err error, toolUses []ToolUse) (Prompt
 // stopReasonFor reports `cancelled` if the prompt's context was cancelled
 // (user hit Cancel in the client), else `end_turn`. ACP clients use the
 // stop reason to distinguish a clean turn from a user-initiated abort.
-func stopReasonFor(ctx context.Context) StopReason {
+func stopReasonFor(ctx context.Context) string {
 	if ctx.Err() != nil {
-		return StopReasonCancelled
+		return "cancelled"
 	}
-	return StopReasonEndTurn
+	return "end_turn"
 }
 
 func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
@@ -243,7 +243,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, "")
 	if err != nil {
 		if isCancelled(err) {
-			return PromptResponse{StopReason: StopReasonCancelled}, nil
+			return PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, firstToolUses)
 	}
@@ -259,7 +259,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		if err != nil {
 			// User cancellation is a clean stop, not an error to render as red.
 			if isCancelled(err) {
-				return PromptResponse{StopReason: StopReasonCancelled}, nil
+				return PromptResponse{StopReason: "cancelled"}, nil
 			}
 			return a.failPrompt(req.SessionId, err, nil)
 		}
@@ -268,7 +268,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		result, err = a.runTaskCycle(ctx, req.SessionId, firstPlan, firstConn)
 		if err != nil {
 			if isCancelled(err) {
-				return PromptResponse{StopReason: StopReasonCancelled}, nil
+				return PromptResponse{StopReason: "cancelled"}, nil
 			}
 			return a.failPrompt(req.SessionId, err, nil)
 		}

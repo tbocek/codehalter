@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 )
 
@@ -109,8 +110,12 @@ type permissionResponse struct {
 func (a *AgentSideConnection) requestPermission(ctx context.Context, sid SessionId, toolCallId string, options []permissionOption) (string, error) {
 	r := permissionRequest{SessionId: sid, Options: options}
 	r.ToolCall.ToolCallId = toolCallId
-	resp, err := SendRequest[permissionResponse](a.conn, ctx, "session/request_permission", r)
+	raw, err := a.sendRequest(ctx, "session/request_permission", r)
 	if err != nil {
+		return "", err
+	}
+	var resp permissionResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
 		return "", err
 	}
 	// "cancelled" means the dialog was dismissed without a button click

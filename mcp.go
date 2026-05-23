@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,16 +25,18 @@ import (
 // MCP settings
 // ---------------------------------------------------------------------------
 
-// MCPServerConfig is one [[server]] entry from .codehalter/mcp.toml. There's
-// no `enabled` field — to disable an entry, comment out the lines (TOML's
-// only "off" switch). Keeping the schema small means fewer ways for the
-// reconciler to interpret a config and fewer states the user has to reason
-// about.
+// MCPServerConfig is one [[server]] entry from .codehalter/mcp.toml. Each
+// entry is exactly one of stdio (command/args/env) OR HTTP (url/headers) —
+// the reconciler rejects entries that set both. There is no `enabled` field;
+// commenting out an entry is the only way to disable it. Keeping the schema
+// small means fewer states the reconciler can interpret.
 type MCPServerConfig struct {
 	Name    string            `toml:"name"`
 	Command string            `toml:"command"`
 	Args    []string          `toml:"args"`
 	Env     map[string]string `toml:"env"`
+	URL     string            `toml:"url"`
+	Headers map[string]string `toml:"headers"`
 }
 
 type mcpSettingsFile struct {
@@ -61,25 +65,8 @@ func loadMCPSettings(cwd string) ([]MCPServerConfig, time.Time, error) {
 }
 
 // ---------------------------------------------------------------------------
-// MCP client (JSON-RPC 2.0 over stdio, newline-delimited)
+// JSON-RPC envelopes (MCP uses 2.0 over its chosen transport)
 // ---------------------------------------------------------------------------
-
-// MCPClient drives a long-lived child process speaking the Model Context
-// Protocol. One instance per [[server]] entry, shared across tool calls so
-// the child's startup cost is paid once. Concurrent Send calls serialise on
-// writes and multiplex on responses via the pending map.
-type MCPClient struct {
-	name   string
-	cmd    *exec.Cmd
-	stdin  io.WriteCloser
-	stdout io.ReadCloser
-
-	writeMu sync.Mutex
-	nextID  atomic.Int64
-
-	pendingMu sync.Mutex
-	pending   map[int64]chan mcpResponse
-}
 
 type mcpRequest struct {
 	JSONRPC string `json:"jsonrpc"`
@@ -108,11 +95,121 @@ type mcpError struct {
 	Data    json.RawMessage `json:"data,omitempty"`
 }
 
-// StartMCPClient spawns the configured command, runs the MCP initialize
-// handshake, and returns a ready client. The child's stderr is dropped — MCP
-// servers tend to log liveness chatter that would otherwise drown the agent
-// log.
+// ---------------------------------------------------------------------------
+// Transport abstraction
+// ---------------------------------------------------------------------------
+
+// mcpTransport hides whether the server is reached over stdio or Streamable
+// HTTP from the rest of the client. send blocks until the response arrives
+// (or the context is cancelled); notify is fire-and-forget; close shuts the
+// transport down (and for HTTP, releases the session id).
+type mcpTransport interface {
+	send(ctx context.Context, req mcpRequest) (mcpResponse, error)
+	notify(ctx context.Context, n mcpNotification) error
+	close()
+}
+
+// ---------------------------------------------------------------------------
+// MCP client
+// ---------------------------------------------------------------------------
+
+// MCPClient drives a long-lived MCP server. One instance per [[server]]
+// entry, shared across tool calls so initialize cost is paid once. send is
+// safe to call concurrently — the underlying transport serialises writes
+// and demultiplexes responses by id.
+type MCPClient struct {
+	name      string
+	transport mcpTransport
+	nextID    atomic.Int64
+}
+
+// StartMCPClient brings up the server described by cfg and runs the MCP
+// initialize handshake. The returned client is ready for tools/list and
+// tools/call. cwd scopes a stdio child's working directory; HTTP transports
+// ignore it.
 func StartMCPClient(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPClient, error) {
+	if cfg.Command != "" && cfg.URL != "" {
+		return nil, fmt.Errorf("mcp config %q sets both command and url — pick one", cfg.Name)
+	}
+	var t mcpTransport
+	switch {
+	case cfg.URL != "":
+		t = newHTTPTransport(cfg)
+	case cfg.Command != "":
+		st, err := newStdioTransport(cfg, cwd)
+		if err != nil {
+			return nil, err
+		}
+		t = st
+	default:
+		return nil, fmt.Errorf("mcp config %q has neither command nor url", cfg.Name)
+	}
+
+	c := &MCPClient{name: cfg.Name, transport: t}
+	if err := c.initialize(ctx); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("initialize %s: %w", cfg.Name, err)
+	}
+	slog.Info("mcp ready", "name", cfg.Name)
+	return c, nil
+}
+
+// initialize completes the MCP handshake: send `initialize`, wait for the
+// server's capabilities response, then send the `notifications/initialized`
+// notification. After that the server is ready for tools/list and tools/call.
+func (c *MCPClient) initialize(ctx context.Context) error {
+	_, err := c.send(ctx, "initialize", map[string]any{
+		"protocolVersion": "2025-06-18",
+		"capabilities":    map[string]any{},
+		"clientInfo": map[string]any{
+			"name":    "codehalter",
+			"version": "0.1.0",
+		},
+	})
+	if err != nil {
+		return err
+	}
+	return c.transport.notify(ctx, mcpNotification{
+		JSONRPC: "2.0",
+		Method:  "notifications/initialized",
+		Params:  map[string]any{},
+	})
+}
+
+func (c *MCPClient) send(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	id := c.nextID.Add(1)
+	resp, err := c.transport.send(ctx, mcpRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("mcp error %d: %s", resp.Error.Code, resp.Error.Message)
+	}
+	return resp.Result, nil
+}
+
+func (c *MCPClient) Close() {
+	c.transport.close()
+	slog.Info("mcp closed", "name", c.name)
+}
+
+// ---------------------------------------------------------------------------
+// stdioTransport — line-delimited JSON-RPC over a child's stdin/stdout
+// ---------------------------------------------------------------------------
+
+type stdioTransport struct {
+	name   string
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	stdout io.ReadCloser
+
+	writeMu sync.Mutex
+
+	pendingMu sync.Mutex
+	pending   map[int64]chan mcpResponse
+}
+
+func newStdioTransport(cfg MCPServerConfig, cwd string) (*stdioTransport, error) {
 	bin, err := exec.LookPath(cfg.Command)
 	if err != nil {
 		return nil, fmt.Errorf("command %q not found in PATH", cfg.Command)
@@ -134,60 +231,34 @@ func StartMCPClient(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPC
 	if err != nil {
 		return nil, fmt.Errorf("mcp stdout: %w", err)
 	}
+	// Drop stderr — MCP servers tend to log liveness chatter that would
+	// otherwise drown the agent log.
 	cmd.Stderr = io.Discard
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting %s: %w", cfg.Command, err)
 	}
-
-	c := &MCPClient{
+	t := &stdioTransport{
 		name:    cfg.Name,
 		cmd:     cmd,
 		stdin:   stdin,
 		stdout:  stdout,
 		pending: make(map[int64]chan mcpResponse),
 	}
-	go c.readLoop()
-
-	if err := c.initialize(ctx); err != nil {
-		c.Close()
-		return nil, fmt.Errorf("initialize %s: %w", cfg.Name, err)
-	}
-	slog.Info("mcp ready", "name", cfg.Name, "pid", cmd.Process.Pid, "cmd", cfg.Command)
-	return c, nil
-}
-
-// initialize completes the MCP handshake: send `initialize`, wait for the
-// server's capabilities response, then send the `notifications/initialized`
-// notification. After that the server is ready for tools/list and tools/call.
-func (c *MCPClient) initialize(ctx context.Context) error {
-	_, err := c.send(ctx, "initialize", map[string]any{
-		"protocolVersion": "2025-06-18",
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "codehalter",
-			"version": "0.1.0",
-		},
-	})
-	if err != nil {
-		return err
-	}
-	return c.notify("notifications/initialized", map[string]any{})
+	go t.readLoop()
+	return t, nil
 }
 
 // readLoop reads one JSON-RPC message per line, forever. Responses with an id
 // route to the pending caller; notifications and server-originated requests
 // are dropped (we don't register for any).
-func (c *MCPClient) readLoop() {
-	br := bufio.NewReader(c.stdout)
-	// MCP messages can be large (tool descriptions, search results); raise the
-	// bufio.Scanner default so a 64KB line doesn't truncate. Using ReadString
-	// instead of Scanner avoids the token-size limit entirely.
+func (t *stdioTransport) readLoop() {
+	br := bufio.NewReader(t.stdout)
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				slog.Debug("mcp read error", "name", c.name, "error", err)
+				slog.Debug("mcp read error", "name", t.name, "error", err)
 			}
 			return
 		}
@@ -197,16 +268,15 @@ func (c *MCPClient) readLoop() {
 		}
 		var resp mcpResponse
 		if err := json.Unmarshal([]byte(line), &resp); err != nil {
-			slog.Debug("mcp decode error", "name", c.name, "error", err, "line", truncate(line, 200))
+			slog.Debug("mcp decode error", "name", t.name, "error", err, "line", truncate(line, 200))
 			continue
 		}
 		if resp.ID == nil {
-			// Notification or server-originated request — ignore.
 			continue
 		}
-		c.pendingMu.Lock()
-		ch, ok := c.pending[*resp.ID]
-		c.pendingMu.Unlock()
+		t.pendingMu.Lock()
+		ch, ok := t.pending[*resp.ID]
+		t.pendingMu.Unlock()
 		if !ok {
 			continue
 		}
@@ -214,74 +284,237 @@ func (c *MCPClient) readLoop() {
 	}
 }
 
-// send issues a JSON-RPC request and waits for the matching response.
-func (c *MCPClient) send(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	id := c.nextID.Add(1)
+func (t *stdioTransport) send(ctx context.Context, req mcpRequest) (mcpResponse, error) {
 	ch := make(chan mcpResponse, 1)
-	c.pendingMu.Lock()
-	c.pending[id] = ch
-	c.pendingMu.Unlock()
+	t.pendingMu.Lock()
+	t.pending[req.ID] = ch
+	t.pendingMu.Unlock()
 	defer func() {
-		c.pendingMu.Lock()
-		delete(c.pending, id)
-		c.pendingMu.Unlock()
+		t.pendingMu.Lock()
+		delete(t.pending, req.ID)
+		t.pendingMu.Unlock()
 	}()
 
-	if err := c.writeMessage(mcpRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params}); err != nil {
-		return nil, err
+	if err := t.writeMessage(req); err != nil {
+		return mcpResponse{}, err
 	}
-
 	select {
 	case <-ctx.Done():
-		return nil, ctx.Err()
+		return mcpResponse{}, ctx.Err()
 	case resp := <-ch:
-		if resp.Error != nil {
-			return nil, fmt.Errorf("mcp error %d: %s", resp.Error.Code, resp.Error.Message)
-		}
-		return resp.Result, nil
+		return resp, nil
 	}
 }
 
-func (c *MCPClient) notify(method string, params any) error {
-	return c.writeMessage(mcpNotification{JSONRPC: "2.0", Method: method, Params: params})
+func (t *stdioTransport) notify(_ context.Context, n mcpNotification) error {
+	return t.writeMessage(n)
 }
 
-func (c *MCPClient) writeMessage(msg any) error {
+func (t *stdioTransport) writeMessage(msg any) error {
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if _, err := c.stdin.Write(data); err != nil {
+	t.writeMu.Lock()
+	defer t.writeMu.Unlock()
+	if _, err := t.stdin.Write(data); err != nil {
 		return err
 	}
-	_, err = c.stdin.Write([]byte{'\n'})
+	_, err = t.stdin.Write([]byte{'\n'})
 	return err
 }
 
-// Close shuts the child down. We don't bother with a graceful shutdown
+// close shuts the child down. We don't bother with a graceful shutdown
 // request — closing stdin signals EOF to a well-behaved MCP server, and a
 // hard Kill catches any that don't take the hint.
-func (c *MCPClient) Close() {
-	if c.stdin != nil {
-		c.stdin.Close()
+func (t *stdioTransport) close() {
+	if t.stdin != nil {
+		t.stdin.Close()
 	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		// Give the server a moment to exit on its own before SIGKILL.
+	if t.cmd != nil && t.cmd.Process != nil {
 		done := make(chan struct{})
 		go func() {
-			c.cmd.Wait()
+			t.cmd.Wait()
 			close(done)
 		}()
 		select {
 		case <-done:
 		case <-time.After(500 * time.Millisecond):
-			c.cmd.Process.Kill()
+			t.cmd.Process.Kill()
 			<-done
 		}
 	}
-	slog.Info("mcp closed", "name", c.name)
+}
+
+// ---------------------------------------------------------------------------
+// httpTransport — MCP Streamable HTTP (spec 2025-06-18)
+// ---------------------------------------------------------------------------
+
+// httpTransport speaks MCP over HTTP per the 2025-06-18 spec. Each request
+// is a POST whose body is the JSON-RPC envelope; the server replies with
+// either a single JSON object or an SSE stream. The first server response
+// carries the Mcp-Session-Id header (if the server is session-aware), and
+// every subsequent request must echo it. close DELETEs the URL to release
+// the server-side session before returning.
+type httpTransport struct {
+	name      string
+	url       string
+	headers   map[string]string
+	client    *http.Client
+	sessionMu sync.Mutex
+	sessionId string
+}
+
+func newHTTPTransport(cfg MCPServerConfig) *httpTransport {
+	return &httpTransport{
+		name:    cfg.Name,
+		url:     cfg.URL,
+		headers: cfg.Headers,
+		// Per-server timeout protects against a hung server holding up the
+		// agent indefinitely; tools/call for long-running operations should
+		// be wrapped in the request ctx for finer control.
+		client: &http.Client{Timeout: 60 * time.Second},
+	}
+}
+
+func (t *httpTransport) send(ctx context.Context, req mcpRequest) (mcpResponse, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return mcpResponse{}, err
+	}
+	resp, err := t.do(ctx, body)
+	if err != nil {
+		return mcpResponse{}, err
+	}
+	return resp, nil
+}
+
+func (t *httpTransport) notify(ctx context.Context, n mcpNotification) error {
+	body, err := json.Marshal(n)
+	if err != nil {
+		return err
+	}
+	// Per spec the server may return 202 Accepted with an empty body for
+	// notifications. We still issue the round trip so the session id flows
+	// through; an empty/202 response decodes to a zero mcpResponse, which
+	// we just discard.
+	_, err = t.do(ctx, body)
+	return err
+}
+
+// do issues one HTTP request and decodes the response. Handles both JSON
+// and SSE response bodies and captures any Mcp-Session-Id the server emits.
+func (t *httpTransport) do(ctx context.Context, body []byte) (mcpResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, bytes.NewReader(body))
+	if err != nil {
+		return mcpResponse{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/json, text/event-stream")
+	for k, v := range t.headers {
+		httpReq.Header.Set(k, v)
+	}
+	t.sessionMu.Lock()
+	if t.sessionId != "" {
+		httpReq.Header.Set("Mcp-Session-Id", t.sessionId)
+	}
+	t.sessionMu.Unlock()
+
+	httpResp, err := t.client.Do(httpReq)
+	if err != nil {
+		return mcpResponse{}, err
+	}
+	defer httpResp.Body.Close()
+
+	if sid := httpResp.Header.Get("Mcp-Session-Id"); sid != "" {
+		t.sessionMu.Lock()
+		t.sessionId = sid
+		t.sessionMu.Unlock()
+	}
+
+	if httpResp.StatusCode == http.StatusAccepted || httpResp.StatusCode == http.StatusNoContent {
+		return mcpResponse{}, nil
+	}
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		buf, _ := io.ReadAll(io.LimitReader(httpResp.Body, 2048))
+		return mcpResponse{}, fmt.Errorf("mcp http %d: %s", httpResp.StatusCode, string(buf))
+	}
+
+	contentType := httpResp.Header.Get("Content-Type")
+	if strings.HasPrefix(contentType, "text/event-stream") {
+		return t.readSSEResponse(httpResp.Body)
+	}
+	// Default: a single JSON-RPC envelope in the body.
+	var resp mcpResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
+		if errors.Is(err, io.EOF) {
+			return mcpResponse{}, nil
+		}
+		return mcpResponse{}, fmt.Errorf("decode response: %w", err)
+	}
+	return resp, nil
+}
+
+// readSSEResponse drains an event stream looking for the final JSON-RPC
+// response. Per spec the server may emit progress notifications first; we
+// keep reading "data:" frames and return the first envelope that carries an
+// id (i.e. is a response, not a notification).
+func (t *httpTransport) readSSEResponse(body io.Reader) (mcpResponse, error) {
+	br := bufio.NewReader(body)
+	var data strings.Builder
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return mcpResponse{}, fmt.Errorf("read sse: %w", err)
+		}
+		trimmed := strings.TrimRight(line, "\r\n")
+		if trimmed == "" {
+			// End of event — try to decode whatever we've accumulated.
+			if data.Len() > 0 {
+				var env mcpResponse
+				if jerr := json.Unmarshal([]byte(data.String()), &env); jerr == nil {
+					if env.ID != nil {
+						return env, nil
+					}
+				}
+				data.Reset()
+			}
+			if errors.Is(err, io.EOF) {
+				return mcpResponse{}, fmt.Errorf("sse stream ended without response")
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "data:") {
+			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(trimmed, "data:"), " "))
+		}
+		// Ignore event:, id:, retry: lines.
+	}
+}
+
+// close releases the server-side session by DELETEing the endpoint with the
+// session id, then drops the local id. Best-effort: errors are logged but
+// not surfaced — reconcile is already replacing this transport.
+func (t *httpTransport) close() {
+	t.sessionMu.Lock()
+	sid := t.sessionId
+	t.sessionId = ""
+	t.sessionMu.Unlock()
+	if sid == "" {
+		return
+	}
+	req, err := http.NewRequest(http.MethodDelete, t.url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Mcp-Session-Id", sid)
+	for k, v := range t.headers {
+		req.Header.Set(k, v)
+	}
+	if resp, err := t.client.Do(req); err == nil {
+		resp.Body.Close()
+	} else {
+		slog.Debug("mcp http delete failed", "name", t.name, "err", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +662,7 @@ func registerMCPTools(c *MCPClient, tools []mcpTool) {
 // mcpConfigsEqual compares two server configs by all fields that matter for
 // runtime behavior. A `false` here means the server must be restarted.
 func mcpConfigsEqual(a, b MCPServerConfig) bool {
-	if a.Name != b.Name || a.Command != b.Command {
+	if a.Name != b.Name || a.Command != b.Command || a.URL != b.URL {
 		return false
 	}
 	if len(a.Args) != len(b.Args) {
@@ -440,11 +673,21 @@ func mcpConfigsEqual(a, b MCPServerConfig) bool {
 			return false
 		}
 	}
-	if len(a.Env) != len(b.Env) {
+	if !stringMapsEqual(a.Env, b.Env) {
 		return false
 	}
-	for k, v := range a.Env {
-		if b.Env[k] != v {
+	if !stringMapsEqual(a.Headers, b.Headers) {
+		return false
+	}
+	return true
+}
+
+func stringMapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
 			return false
 		}
 	}
@@ -498,7 +741,10 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 	// behavior here, and the user probably meant the second entry to override.
 	desired := make(map[string]MCPServerConfig, len(cfgs))
 	for _, c := range cfgs {
-		if c.Name == "" || c.Command == "" {
+		if c.Name == "" {
+			continue
+		}
+		if c.Command == "" && c.URL == "" {
 			continue
 		}
 		desired[c.Name] = c
@@ -576,7 +822,10 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 	// sees it as "missing" and retries the start.
 	a.mcpApplied = a.mcpApplied[:0]
 	for _, c := range cfgs {
-		if c.Name == "" || c.Command == "" {
+		if c.Name == "" {
+			continue
+		}
+		if c.Command == "" && c.URL == "" {
 			continue
 		}
 		a.mu.Lock()
@@ -630,4 +879,3 @@ func (a *agent) renderMCPChanges(ctx context.Context, sid SessionId, changes []m
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(body)})
 	}
 }
-

@@ -249,6 +249,7 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 		[]llmMessage{{Role: "user", Content: "hi"}},
 		nil,
 		func(tok string) { collected.WriteString(tok) },
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("llmStream: %v", err)

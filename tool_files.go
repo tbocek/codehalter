@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -358,15 +359,19 @@ func fsRead(a *agent, ctx context.Context, sid SessionId, path string, line, lim
 	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
 		return directRead(path, line, limit)
 	}
-	resp, err := SendRequest[struct {
-		Content string `json:"content"`
-	}](a.conn.RPC(), ctx, "fs/read_text_file", struct {
+	raw, err := a.conn.sendRequest(ctx, "fs/read_text_file", struct {
 		SessionId SessionId `json:"sessionId"`
 		Path      string    `json:"path"`
 		Line      *int      `json:"line,omitempty"`
 		Limit     *int      `json:"limit,omitempty"`
 	}{SessionId: sid, Path: path, Line: line, Limit: limit})
 	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
 		return "", err
 	}
 	return resp.Content, nil
@@ -389,7 +394,7 @@ func fsWrite(a *agent, ctx context.Context, sid SessionId, path, content string)
 			return os.WriteFile(path, []byte(content), 0644)
 		}
 	}
-	_, err := SendRequest[struct{}](a.conn.RPC(), ctx, "fs/write_text_file", struct {
+	_, err := a.conn.sendRequest(ctx, "fs/write_text_file", struct {
 		SessionId SessionId `json:"sessionId"`
 		Path      string    `json:"path"`
 		Content   string    `json:"content"`

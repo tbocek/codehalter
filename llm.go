@@ -74,8 +74,10 @@ const defaultMaxTokens = 8192
 // sid scopes the debug log: req body and raw SSE response are appended to
 // .codehalter/session_<sid>.log so a single file captures everything that
 // went over the wire for a session. Pass "" to disable logging (used by tests
-// and pre-session probes).
-func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on onToken) (string, []toolCall, error) {
+// and pre-session probes). think (nil to discard) receives reasoning_content
+// tokens — kept separate from `on` so callers can surface chain-of-thought to
+// the UI as agent_thought_chunk without polluting agent_message_chunk.
+func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on onToken, think onToken) (string, []toolCall, error) {
 	// Seed with extra_body (per-role sampler/reasoning overrides), then write
 	// core fields last so model/messages/stream/tools can't be hijacked from
 	// settings.toml.
@@ -229,6 +231,9 @@ func (a *agent) llmStream(ctx context.Context, sid SessionId, conn *LLMConnectio
 
 		if delta.ReasoningContent != "" {
 			reasoningText.WriteString(delta.ReasoningContent)
+			if think != nil {
+				think(delta.ReasoningContent)
+			}
 		}
 
 		if delta.Content != "" {
@@ -546,7 +551,7 @@ func deriveServerURL(rawURL, suffix string) (string, bool) {
 func (a *agent) llmSimple(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage) (string, error) {
 	text, _, err := a.llmStream(ctx, sid, conn, messages, nil, func(token string) {
 		fmt.Fprint(os.Stderr, token)
-	})
+	}, nil)
 	fmt.Fprintln(os.Stderr)
 	return text, err
 }
@@ -692,7 +697,7 @@ func toolCallSig(calls []toolCall) string {
 // what the planner/verifier is probing.
 func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, dst any) (toolLoopResult, error) {
 	noop := func(string) {}
-	res, err := a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, noop)
+	res, err := a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, noop, nil)
 	if err != nil {
 		return res, err
 	}
@@ -705,7 +710,7 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid SessionId, conn *LLMCon
 		llmMessage{Role: "assistant", Content: res.Text},
 		llmMessage{Role: "user", Content: "Your previous reply was not valid JSON. Reply with ONLY the JSON object — first character `{`, last character `}`, nothing before or after. No prose, no markdown fences."},
 	)
-	res2, err := a.runToolLoopOn(ctx, sid, conn, fixMsgs, filter, phase, noop)
+	res2, err := a.runToolLoopOn(ctx, sid, conn, fixMsgs, filter, phase, noop, nil)
 	res.Text = res2.Text
 	res.ToolUses = append(res.ToolUses, res2.ToolUses...)
 	res.DurationMs += res2.DurationMs
@@ -727,7 +732,12 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 			a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock(token)))
 		}
 	}
-	return a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, on)
+	think := func(token string) {
+		if sid != "" {
+			a.sendUpdate(ctx, sid, AgentThoughtChunk(TextBlock(token)))
+		}
+	}
+	return a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, on, think)
 }
 
 // runToolLoopOn is the core agentic tool loop: send to LLM, execute tool
@@ -737,7 +747,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid SessionId, conn *LLMConnect
 // assistant message via MarkLastAssistantTiming together with the
 // cumulative llmStream wall-clock — so session.toml records who ran the
 // turn and how much of its time was model generation vs tool execution.
-func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, on func(string)) (toolLoopResult, error) {
+func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, on, think func(string)) (toolLoopResult, error) {
 	tools := llmToolDefinitionsFiltered(filter)
 
 	// termName is the registered Terminal tool exposed in this phase ("" when
@@ -801,7 +811,7 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid SessionId, conn *LLMConne
 		if res.StartedAt.IsZero() {
 			res.StartedAt = streamStart
 		}
-		text, calls, err := a.llmStream(ctx, sid, conn, messages, tools, on)
+		text, calls, err := a.llmStream(ctx, sid, conn, messages, tools, on, think)
 		genElapsed += time.Since(streamStart)
 		if err != nil {
 			res.Text = allText.String()
