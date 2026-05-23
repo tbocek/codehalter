@@ -53,7 +53,7 @@ func gitDiffHead(cwd string) (string, error) {
 // `git status --porcelain`. Empty status means everything was committed
 // externally — delete .codehalter/.git_commit so the next round starts
 // fresh from the next uncommitted change.
-func (a *agent) cleanupGitCommitIfClean(cwd string, sid SessionId) {
+func (a *agent) cleanupGitCommitIfClean(cwd string, sid string) {
 	if !dirExists(filepath.Join(cwd, ".git")) {
 		return
 	}

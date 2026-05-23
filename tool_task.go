@@ -70,7 +70,7 @@ func (a *agent) discoverRunners(cwd string) {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		task := args["task"]
 		parts := strings.SplitN(task, ":", 2)

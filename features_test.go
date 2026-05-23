@@ -20,7 +20,7 @@ func newTestAgent(t *testing.T) (*agent, *Session) {
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
-	return &agent{sessions: map[SessionId]*Session{s.ID: s}}, s
+	return &agent{sessions: map[string]*Session{s.ID: s}}, s
 }
 
 // withFreshToolRegistry saves and restores the package-global registeredTools
@@ -107,7 +107,7 @@ func TestResolvePath(t *testing.T) {
 		})
 	}
 
-	if _, err := a.resolvePath(SessionId("missing"), "foo.go"); err == nil {
+	if _, err := a.resolvePath("missing", "foo.go"); err == nil {
 		t.Error("expected error for unknown session id, got nil")
 	}
 }
@@ -535,7 +535,7 @@ func TestEmptyProjectFlag(t *testing.T) {
 		t.Error("expected dir with only .codehalter/ to still count as empty")
 	}
 
-	a := &agent{sessions: map[SessionId]*Session{s.ID: s}}
+	a := &agent{sessions: map[string]*Session{s.ID: s}}
 	a.discoverRunners(dir)
 
 	if !a.emptyProject {
@@ -556,7 +556,7 @@ func TestEmptyProjectFlag(t *testing.T) {
 	if isEmptyProject(populated) {
 		t.Error("expected dir with main.go to not be empty")
 	}
-	a2 := &agent{sessions: map[SessionId]*Session{}}
+	a2 := &agent{sessions: map[string]*Session{}}
 	a2.discoverRunners(populated)
 	if a2.emptyProject {
 		t.Error("expected emptyProject=false when source files are present")

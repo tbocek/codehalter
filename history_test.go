@@ -295,7 +295,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 				},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 			args := parseArgs(rawArgs)
 			return "echo: " + args["msg"], false
 		},
@@ -320,7 +320,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 
 	a := &agent{
-		sessions: map[SessionId]*Session{s.ID: s},
+		sessions: map[string]*Session{s.ID: s},
 	}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
@@ -396,7 +396,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	a := &agent{sessions: map[SessionId]*Session{s.ID: s}}
+	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "answer me"}}, toolFilter{}, "execute")
@@ -435,7 +435,7 @@ func TestToolLoopRespondExcludedFromJSONPhases(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	a := &agent{sessions: map[SessionId]*Session{s.ID: s}}
+	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "plan something"}},
@@ -470,7 +470,7 @@ func TestToolLoopNoDedup(t *testing.T) {
 				"parameters": map[string]any{"type": "object"},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 			reads++
 			return "read-ok", false
 		},
@@ -483,7 +483,7 @@ func TestToolLoopNoDedup(t *testing.T) {
 				"parameters": map[string]any{"type": "object"},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 			writes++
 			return "wrote", false
 		},
@@ -537,7 +537,7 @@ func TestToolLoopRepeatNudgeAndBail(t *testing.T) {
 				"parameters": map[string]any{"type": "object"},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 			execs++
 			return "result", false
 		},
@@ -602,7 +602,7 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 				"parameters": map[string]any{"type": "object"},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 			execs++
 			return "no match", false
 		},
@@ -678,7 +678,7 @@ func TestToolLoopEscalatesOnRepeatedArgs(t *testing.T) {
 				"parameters": map[string]any{"type": "object"},
 			},
 		},
-		Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 			execs++
 			return "no match", false
 		},
@@ -785,7 +785,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	originalMsgCount := len(s.Messages)
 
 	a := &agent{
-		sessions: map[SessionId]*Session{s.ID: s},
+		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
 			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
 		},
@@ -817,7 +817,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		t.Fatalf("expected 1 archive file, got %d: %v", len(archives), archives)
 	}
 	archiveID := strings.TrimSuffix(strings.TrimPrefix(filepath.Base(archives[0]), "session_"), ".toml")
-	archived, err := loadSession(dir, SessionId(archiveID))
+	archived, err := loadSession(dir, archiveID)
 	if err != nil {
 		t.Fatalf("loadSession archive: %v", err)
 	}
@@ -994,7 +994,7 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
-	a := &agent{sessions: map[SessionId]*Session{s.ID: s}}
+	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
 	// Sanity: systemPrompt must be non-empty so the bug we're guarding
 	// against (sysPrompt set turn 1, dropped turn 2) is observable.
@@ -1093,7 +1093,7 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 	s.AddAssistant("also short")
 
 	a := &agent{
-		sessions: map[SessionId]*Session{s.ID: s},
+		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
 			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
 		},
@@ -1141,7 +1141,7 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 	s.appendShadow("Goal: do thing\nProgress: refined thing")
 
 	a := &agent{
-		sessions: map[SessionId]*Session{s.ID: s},
+		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
 			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
 		},
@@ -1187,7 +1187,7 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 	s.appendShadow("Goal: x\nProgress: y")
 
 	a := &agent{
-		sessions: map[SessionId]*Session{s.ID: s},
+		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
 			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
 		},

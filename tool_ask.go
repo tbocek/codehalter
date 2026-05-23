@@ -10,7 +10,7 @@ import (
 // global autopilot mode is on, or the session is a subagent (Depth > 0). Zed
 // doesn't know subagent session ids, so any permission request sent for one
 // would hang forever — auto-answering keeps the subagent moving.
-func (a *agent) shouldAutoAnswer(sid SessionId) (bool, string) {
+func (a *agent) shouldAutoAnswer(sid string) (bool, string) {
 	if a.isAutopilot() {
 		return true, "autopilot"
 	}
@@ -24,7 +24,7 @@ func (a *agent) shouldAutoAnswer(sid SessionId) (bool, string) {
 // subagent it returns yes immediately and sends a chat note so the user sees
 // what was auto-answered. Callers are still responsible for completing the
 // tool call they opened (typically via CompleteToolCall with a short note).
-func (a *agent) askYesNoAuto(ctx context.Context, sid SessionId, tcId, yesLabel, noLabel string) (bool, error) {
+func (a *agent) askYesNoAuto(ctx context.Context, sid string, tcId, yesLabel, noLabel string) (bool, error) {
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
 		a.sendUpdate(ctx, sid, AgentMessageChunk(TextBlock("["+reason+"] "+yesLabel+"\n\n")))
 		return true, nil
@@ -34,7 +34,7 @@ func (a *agent) askYesNoAuto(ctx context.Context, sid SessionId, tcId, yesLabel,
 
 // askChoiceAuto asks the user in interactive mode; in autopilot or from a
 // subagent it returns choices[0] (or "abort" if empty).
-func (a *agent) askChoiceAuto(ctx context.Context, sid SessionId, tcId string, choices []string) (string, error) {
+func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId string, choices []string) (string, error) {
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
 		if len(choices) == 0 {
 			return "abort", nil
@@ -61,7 +61,7 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		question, yesLabel, noLabel := args["question"], args["yes_label"], args["no_label"]
 		tcId := a.StartToolCall(ctx, sid, question, "think", nil)
@@ -93,7 +93,7 @@ type permissionOption struct {
 }
 
 type permissionRequest struct {
-	SessionId SessionId `json:"sessionId"`
+	SessionId string `json:"sessionId"`
 	ToolCall  struct {
 		ToolCallId string `json:"toolCallId"`
 	} `json:"toolCall"`
@@ -107,7 +107,7 @@ type permissionResponse struct {
 	} `json:"outcome"`
 }
 
-func (a *AgentSideConnection) requestPermission(ctx context.Context, sid SessionId, toolCallId string, options []permissionOption) (string, error) {
+func (a *AgentSideConnection) requestPermission(ctx context.Context, sid string, toolCallId string, options []permissionOption) (string, error) {
 	r := permissionRequest{SessionId: sid, Options: options}
 	r.ToolCall.ToolCallId = toolCallId
 	raw, err := a.sendRequest(ctx, "session/request_permission", r)
@@ -130,7 +130,7 @@ func (a *AgentSideConnection) requestPermission(ctx context.Context, sid Session
 var errPermissionCancelled = errors.New("permission dialog dismissed")
 
 // AskChoice shows up to 2 choices (green) + abort (red). Returns the chosen optionId.
-func (a *AgentSideConnection) AskChoice(ctx context.Context, sid SessionId, toolCallId string, choices []string) (string, error) {
+func (a *AgentSideConnection) AskChoice(ctx context.Context, sid string, toolCallId string, choices []string) (string, error) {
 	var options []permissionOption
 	for _, c := range choices {
 		options = append(options, permissionOption{OptionId: c, Name: c, Kind: "allow_once"})
@@ -144,7 +144,7 @@ func (a *AgentSideConnection) AskChoice(ctx context.Context, sid SessionId, tool
 	return choice, nil
 }
 
-func (a *AgentSideConnection) AskYesNo(ctx context.Context, sid SessionId, toolCallId, yesLabel, noLabel string) (bool, error) {
+func (a *AgentSideConnection) AskYesNo(ctx context.Context, sid string, toolCallId, yesLabel, noLabel string) (bool, error) {
 	choice, err := a.requestPermission(ctx, sid, toolCallId, []permissionOption{
 		{OptionId: "yes", Name: yesLabel, Kind: "allow_once"},
 		{OptionId: "no", Name: noLabel, Kind: "reject_once"},

@@ -41,8 +41,6 @@ type rpcError struct {
 // clients pinned to the old number — keep at 1 unless Zed's side moves.
 const protocolVersion = 1
 
-type SessionId string
-
 type Implementation struct {
 	Name    string `json:"name,omitempty"`
 	Version string `json:"version,omitempty"`
@@ -77,21 +75,21 @@ type (
 		Cwd string `json:"cwd,omitempty"`
 	}
 	NewSessionResponse struct {
-		SessionId SessionId         `json:"sessionId"`
+		SessionId string         `json:"sessionId"`
 		Modes     *SessionModeState `json:"modes,omitempty"`
 	}
 
 	SetSessionModeRequest struct {
-		SessionId SessionId `json:"sessionId"`
+		SessionId string `json:"sessionId"`
 		ModeId    string    `json:"modeId"`
 	}
 
 	LoadSessionRequest struct {
-		SessionId SessionId `json:"sessionId"`
+		SessionId string `json:"sessionId"`
 		Cwd       string    `json:"cwd"`
 	}
 	LoadSessionResponse struct {
-		SessionId SessionId         `json:"sessionId,omitempty"`
+		SessionId string         `json:"sessionId,omitempty"`
 		Modes     *SessionModeState `json:"modes,omitempty"`
 	}
 
@@ -105,15 +103,15 @@ type (
 	}
 
 	CloseSessionRequest struct {
-		SessionId SessionId `json:"sessionId"`
+		SessionId string `json:"sessionId"`
 	}
 
 	CancelNotification struct {
-		SessionId SessionId `json:"sessionId"`
+		SessionId string `json:"sessionId"`
 	}
 
 	PromptRequest struct {
-		SessionId SessionId      `json:"sessionId"`
+		SessionId string      `json:"sessionId"`
 		Content   []ContentBlock `json:"prompt"`
 	}
 	PromptResponse struct {
@@ -192,7 +190,7 @@ func ImageBlock(mimeType, data string) ContentBlock {
 // Session update (agent -> client notification).
 
 type SessionNotification struct {
-	SessionId SessionId     `json:"sessionId"`
+	SessionId string     `json:"sessionId"`
 	Update    SessionUpdate `json:"update"`
 }
 

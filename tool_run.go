@@ -27,7 +27,7 @@ func (a *agent) discoverSandbox() {
 	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name":        "run_command",
+			"name": "run_command",
 			"description": "Run a shell command directly inside this devcontainer. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. Use this for: (1) PROBE — `which <tool>`, `cargo check`, `node --version`, `apt list --installed | grep <pkg>` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install <pkg>`), first run the same install via run_command, then verify it works (e.g. `<tool> --version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which <tool>` exiting 1 means <tool> is missing, not that the tool failed. " +
 				"For project-file edits prefer `edit_file` / `write_file` — they go through the agent's diff/approval UI, raw `>` or `sed -i` do not. " +
 				"The `.git` directory is bind-mounted read-only; destructive git commands (push, reset --hard, etc.) will fail at the filesystem layer. Read-only git is fine (clone, log, ls-remote, archive).",
@@ -45,7 +45,7 @@ func (a *agent) discoverSandbox() {
 	}, Execute: runCmdExecute})
 }
 
-func runCmdExecute(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
 	cmdStr := args["command"]
 	if cmdStr == "" {

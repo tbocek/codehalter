@@ -99,13 +99,13 @@ func (j *bgJob) Done() {
 func (j *bgJob) Wait() { j.pending.Wait() }
 
 type Session struct {
-	ID        SessionId      `toml:"id"`
-	Cwd       string         `toml:"cwd"`
-	Title     string         `toml:"title"`
-	CreatedAt time.Time      `toml:"created_at"`
-	Depth     int            `toml:"depth,omitempty"`
-	ParentID  SessionId      `toml:"parent_id,omitempty"`
-	Summary   string         `toml:"summary,omitempty"`
+	ID        string    `toml:"id"`
+	Cwd       string    `toml:"cwd"`
+	Title     string    `toml:"title"`
+	CreatedAt time.Time `toml:"created_at"`
+	Depth     int       `toml:"depth,omitempty"`
+	ParentID  string    `toml:"parent_id,omitempty"`
+	Summary   string    `toml:"summary,omitempty"`
 	// SystemPrompt holds the rendered skills + project context that leads
 	// every LLM call. Set on the first user turn (see Prompt) and refreshed
 	// after each compressHistory rotation — so it survives the summariser
@@ -114,7 +114,7 @@ type Session struct {
 	// leading user message before any Summary.
 	SystemPrompt string    `toml:"system_prompt,omitempty"`
 	Messages     []Message `toml:"messages"`
-	filePath  string
+	filePath     string
 	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
 	// phaseActive=true means a phase entry is showing as in_progress and
 	// must be marked completed before Prompt returns; phaseCurrent is the
@@ -282,7 +282,7 @@ func (s *Session) rememberWebResult(url string, summarize bool, out string) {
 	s.webResults[webResultKey(url, summarize)] = out
 }
 
-func loadSession(cwd string, id SessionId) (*Session, error) {
+func loadSession(cwd string, id string) (*Session, error) {
 	filename := fmt.Sprintf("session_%s.toml", id)
 	path := filepath.Join(cwd, sessionDir, filename)
 
@@ -302,7 +302,7 @@ func loadSession(cwd string, id SessionId) (*Session, error) {
 // connection per editor tab; if a tab is opened and never prompted, this
 // avoids leaving an empty stub session on disk that would clutter
 // listSessions.
-func newSessionWithID(cwd string, id SessionId) *Session {
+func newSessionWithID(cwd string, id string) *Session {
 	filename := fmt.Sprintf("session_%s.toml", id)
 	path := filepath.Join(cwd, sessionDir, filename)
 	return &Session{
@@ -318,7 +318,7 @@ func newSession(cwd string) (*Session, error) {
 		return nil, fmt.Errorf("creating session dir: %w", err)
 	}
 	now := time.Now()
-	id := SessionId(now.Format("20060102_150405"))
+	id := now.Format("20060102_150405")
 	filename := fmt.Sprintf("session_%s.toml", id)
 	path := filepath.Join(cwd, sessionDir, filename)
 	return &Session{
@@ -329,12 +329,12 @@ func newSession(cwd string) (*Session, error) {
 	}, nil
 }
 
-func newSubagentSession(cwd string, parentID SessionId, index, depth, pinnedLLMIdx int) *Session {
+func newSubagentSession(cwd string, parentID string, index, depth, pinnedLLMIdx int) *Session {
 	os.MkdirAll(filepath.Join(cwd, sessionDir), 0755)
 	// Nanosecond suffix so sequential launch_subagent calls from the same
 	// parent don't collide on id (each call re-starts index at 0).
 	now := time.Now()
-	id := SessionId(fmt.Sprintf("sub_%s_%d_%d", parentID, now.UnixNano(), index))
+	id := fmt.Sprintf("sub_%s_%d_%d", parentID, now.UnixNano(), index)
 	filename := fmt.Sprintf("session_%s.toml", id)
 	path := filepath.Join(cwd, sessionDir, filename)
 	s := &Session{
@@ -483,8 +483,8 @@ func (s *Session) Save() error {
 // as the rolled-up prior context. The live session keeps its own ID and
 // filePath; only its on-disk contents change. Returns the archive's id.
 // Caller must hold s.mu.
-func (s *Session) rotate(keep []Message, summary string) (SessionId, error) {
-	archiveID := SessionId(fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano()))
+func (s *Session) rotate(keep []Message, summary string) (string, error) {
+	archiveID := fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano())
 	archivePath := filepath.Join(s.Cwd, sessionDir, fmt.Sprintf("session_%s.toml", archiveID))
 	archive := &Session{
 		ID:        archiveID,
@@ -551,7 +551,7 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 		_, _ = toml.DecodeFile(filepath.Join(dir, e.Name()), &header)
 
 		sessions = append(sessions, SessionInfo{
-			SessionId: SessionId(id),
+			SessionId: id,
 			Cwd:       cwd,
 			Title:     header.Title,
 			UpdatedAt: info.ModTime().Format(time.RFC3339),
@@ -567,8 +567,8 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 
 // SessionInfo is returned by session/list.
 type SessionInfo struct {
-	SessionId SessionId `json:"sessionId"`
-	Cwd       string    `json:"cwd"`
-	Title     string    `json:"title,omitempty"`
-	UpdatedAt string    `json:"updatedAt,omitempty"`
+	SessionId string `json:"sessionId"`
+	Cwd       string `json:"cwd"`
+	Title     string `json:"title,omitempty"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
 }

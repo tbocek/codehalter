@@ -96,7 +96,7 @@ func (a *agent) registerSubagentTool() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, ag *agent, sid SessionId, rawArgs string) (string, bool) {
+	}, Execute: func(ctx context.Context, ag *agent, sid string, rawArgs string) (string, bool) {
 		// Parse tasks from raw JSON arguments.
 		var parsed struct {
 			Tasks []subagentTask `json:"tasks"`

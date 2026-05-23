@@ -103,7 +103,7 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		sess := a.getSession(sid)
 		if sess == nil {
@@ -142,7 +142,7 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
@@ -271,7 +271,7 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
@@ -307,7 +307,7 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
@@ -347,7 +347,6 @@ func init() {
 	}})
 }
 
-
 // fsRead reads a text file. For top-level sessions known to the ACP client
 // (Zed), the call goes over the wire so the editor can render diffs and
 // honour unsaved buffer state. Subagent sessions were never announced to
@@ -355,15 +354,15 @@ func init() {
 // hit -32603 Internal error — we fall back to direct disk I/O for them.
 // line/limit are optional: pass nil for both to read the whole file, or
 // non-nil pointers to bound the response to a 1-indexed line window.
-func fsRead(a *agent, ctx context.Context, sid SessionId, path string, line, limit *int) (string, error) {
+func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit *int) (string, error) {
 	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
 		return directRead(path, line, limit)
 	}
 	raw, err := a.conn.sendRequest(ctx, "fs/read_text_file", struct {
-		SessionId SessionId `json:"sessionId"`
-		Path      string    `json:"path"`
-		Line      *int      `json:"line,omitempty"`
-		Limit     *int      `json:"limit,omitempty"`
+		SessionId string `json:"sessionId"`
+		Path      string `json:"path"`
+		Line      *int   `json:"line,omitempty"`
+		Limit     *int   `json:"limit,omitempty"`
 	}{SessionId: sid, Path: path, Line: line, Limit: limit})
 	if err != nil {
 		return "", err
@@ -381,7 +380,7 @@ func fsRead(a *agent, ctx context.Context, sid SessionId, path string, line, lim
 // record of a sub_* session id, so ACP writes are dead and we go straight
 // to disk. Any cached read-dedup entries for this path are dropped here
 // because the file just changed — a subsequent read_file must run.
-func fsWrite(a *agent, ctx context.Context, sid SessionId, path, content string) error {
+func fsWrite(a *agent, ctx context.Context, sid string, path, content string) error {
 	if sess := a.getSession(sid); sess != nil {
 		sess.readDedupMu.Lock()
 		for k := range sess.readDedup {
@@ -395,9 +394,9 @@ func fsWrite(a *agent, ctx context.Context, sid SessionId, path, content string)
 		}
 	}
 	_, err := a.conn.sendRequest(ctx, "fs/write_text_file", struct {
-		SessionId SessionId `json:"sessionId"`
-		Path      string    `json:"path"`
-		Content   string    `json:"content"`
+		SessionId string `json:"sessionId"`
+		Path      string `json:"path"`
+		Content   string `json:"content"`
 	}{SessionId: sid, Path: path, Content: content})
 	return err
 }

@@ -60,7 +60,7 @@ type planResult struct {
 // when there's no PLAN.md, the tool loop fails, or the response can't be
 // parsed even after one corrective retry — callers treat any of those as
 // "no plan, proceed without one".
-func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, replanContext string) (*LLMConnection, *planResult, []ToolUse, error) {
+func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string) (*LLMConnection, *planResult, []ToolUse, error) {
 	thinking := a.pickAvailable(ctx, sid, "thinking")
 	if thinking == nil {
 		return nil, nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
@@ -126,7 +126,7 @@ func (a *agent) runPlanLLM(ctx context.Context, sid SessionId, replanContext str
 // text so the caller can fold it into the session transcript on cancel.
 // header is the section heading ("Plan:" for actionable plans, "Findings:"
 // for report-only plans where the executor will just relay the answer).
-func (a *agent) renderSteps(ctx context.Context, sid SessionId, steps []string, header string) string {
+func (a *agent) renderSteps(ctx context.Context, sid string, steps []string, header string) string {
 	if len(steps) == 0 {
 		return ""
 	}
@@ -173,7 +173,7 @@ func appendAssistantNote(sess *Session, note string) {
 // replanContext is "" on the first planning pass; on re-plan it's a short
 // "the previous attempt failed verification — re-plan" note (the failure
 // detail itself is already in history on the preceding verify response).
-func (a *agent) planAndRoute(ctx context.Context, sid SessionId, replanContext string) (*LLMConnection, *planResult, []ToolUse, error) {
+func (a *agent) planAndRoute(ctx context.Context, sid string, replanContext string) (*LLMConnection, *planResult, []ToolUse, error) {
 	thinking, plan, toolUses, err := a.runPlanLLM(ctx, sid, replanContext)
 	if err != nil || plan == nil {
 		return thinking, plan, toolUses, err
@@ -299,7 +299,7 @@ func (a *agent) verifyTargetHint() string {
 // cache consistency — every phase (plan/execute/verify/document) hits the
 // same slot so the prefix cache stays warm across the whole turn. Subagent
 // sessions route to their pinned LLM[i] for the same reason.
-func (a *agent) execute(ctx context.Context, sid SessionId, extraExclude ...string) (toolLoopResult, error) {
+func (a *agent) execute(ctx context.Context, sid string, extraExclude ...string) (toolLoopResult, error) {
 	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
 	sess := a.getSession(sid)
 	if sess != nil && executeMD != "" {
@@ -359,7 +359,7 @@ type verifyResult struct {
 // change (plan.Verify). When non-empty it's injected as authoritative — the
 // verify phase runs THOSE checks, not whatever it would have invented. nil
 // or empty Verify falls back to the static verifyTargetHint.
-func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConnection, plan *planResult, res toolLoopResult) (toolLoopResult, *verifyResult, error) {
+func (a *agent) verify(ctx context.Context, sid string, fallbackConn *LLMConnection, plan *planResult, res toolLoopResult) (toolLoopResult, *verifyResult, error) {
 	verifyPrompt := a.loadPromptFile(sid, "VERIFY.md")
 	if verifyPrompt == "" {
 		return res, &verifyResult{Success: true}, nil
@@ -487,7 +487,7 @@ func (a *agent) verify(ctx context.Context, sid SessionId, fallbackConn *LLMConn
 // It appends DOCUMENT.md as a fresh user message and runs the thinking LLM so
 // it can update (or create) the project README when the change is
 // user-visible.
-func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection, exec toolLoopResult) (toolLoopResult, error) {
+func (a *agent) document(ctx context.Context, sid string, conn *LLMConnection, exec toolLoopResult) (toolLoopResult, error) {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
 	if docPrompt == "" {
 		return exec, nil
@@ -526,7 +526,7 @@ func (a *agent) document(ctx context.Context, sid SessionId, conn *LLMConnection
 // re-plan, with a short replanContext nudging the planner toward the prior
 // verify failure that's already in history.
 func (a *agent) runTaskCycle(
-	ctx context.Context, sid SessionId,
+	ctx context.Context, sid string,
 	prePlan *planResult, preConn *LLMConnection,
 ) (toolLoopResult, error) {
 	const maxAttempts = 20

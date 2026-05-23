@@ -19,7 +19,7 @@ import (
 //
 // Only runs inside a git-managed directory: requires either a .git directory
 // in cwd or an existing .gitignore.
-func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid SessionId) {
+func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	gitignorePath := filepath.Join(cwd, ".gitignore")
 	hasGit := dirExists(filepath.Join(cwd, ".git"))
 	hasGitignore := fileExists(gitignorePath)
@@ -77,7 +77,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid SessionId) 
 // project is unsandboxed. "Yes" creates the files (and future sessions
 // short-circuit because .devcontainer/ now exists); "Skip" just dismisses
 // the prompt for this session — opening the project again brings it back.
-func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid SessionId) {
+func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) {
 	if containerKind() != "" {
 		return
 	}
@@ -173,7 +173,7 @@ func detectStacks(cwd string) []string {
 // small models toward reading the skill docs after a hard failure instead of
 // blindly retrying. Returns paths relative to cwd so the model's read_file
 // call works without further escaping.
-func (a *agent) failureSkillHint(sid SessionId, toolName string) string {
+func (a *agent) failureSkillHint(sid string, toolName string) string {
 	// Only fire on tools where a SKILL doc plausibly helps. Edit-failures
 	// usually mean the model passed wrong content, not that it needs a skill.
 	switch toolName {

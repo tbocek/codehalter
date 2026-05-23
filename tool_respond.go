@@ -35,7 +35,7 @@ func init() {
 				},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		var args struct {
 			Message string `json:"message"`
 		}

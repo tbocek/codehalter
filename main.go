@@ -125,7 +125,7 @@ type agent struct {
 	conn            *AgentSideConnection
 	mu              sync.Mutex
 	cancel          context.CancelFunc
-	sessions        map[SessionId]*Session
+	sessions        map[string]*Session
 	settings        Settings
 	runners         []taskRunner
 	capabilities    capabilities
@@ -235,7 +235,7 @@ func cwdOrDefault(cwd string) string {
 	return cwd
 }
 
-func (a *agent) getSession(id SessionId) *Session {
+func (a *agent) getSession(id string) *Session {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.sessions[id]
@@ -248,14 +248,14 @@ func (a *agent) putSession(s *Session) {
 	a.sessions[s.ID] = s
 }
 
-func (a *agent) deleteSession(id SessionId) {
+func (a *agent) deleteSession(id string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.sessions, id)
 }
 
 
-func (a *agent) sendUpdate(ctx context.Context, sid SessionId, u SessionUpdate) {
+func (a *agent) sendUpdate(ctx context.Context, sid string, u SessionUpdate) {
 	if a.conn == nil {
 		return
 	}
@@ -315,7 +315,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	return nil
 }
 
-func (a *agent) startIndexing(sid SessionId, cwd string) {
+func (a *agent) startIndexing(sid string, cwd string) {
 	a.indexDone = make(chan struct{})
 	go func() {
 		defer close(a.indexDone)
@@ -334,7 +334,7 @@ func (a *agent) startIndexing(sid SessionId, cwd string) {
 // Order: config → project → tools → environment → prompts. The
 // container/firefox banner sits next to the devcontainer prompt so the
 // "container, tooling, container again" interleaving doesn't happen.
-func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid SessionId) {
+func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid string) {
 	a.ensureSettings(ctx, cwd, sid)
 
 	if a.settings.path != "" {
@@ -357,7 +357,7 @@ func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid SessionId
 // reconciles .codehalter/mcp.toml (mtime-gated); future mid-session checks
 // (settings.toml reload triggering an LLM re-probe, capability re-detection
 // when a Makefile appears) belong here too.
-func (a *agent) checkSettings(ctx context.Context, cwd string, sid SessionId) {
+func (a *agent) checkSettings(ctx context.Context, cwd string, sid string) {
 	changes := a.reconcileMCP(ctx, cwd)
 	a.renderMCPChanges(ctx, sid, changes)
 	a.cleanupGitCommitIfClean(cwd, sid)
@@ -366,7 +366,7 @@ func (a *agent) checkSettings(ctx context.Context, cwd string, sid SessionId) {
 // notifyCapabilities emits a summary of discovered build/test/lint/format
 // runners at session start, flagging any category where nothing was found so
 // the user knows to either configure their runner or accept the gap.
-func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
+func (a *agent) notifyCapabilities(ctx context.Context, sid string) {
 	a.mu.Lock()
 	caps := a.capabilities
 	empty := a.emptyProject
@@ -405,7 +405,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid SessionId) {
 // then skips the unreachable extras instead of eating a timeout per call.
 // Image support is taken from LLM[0] — that's the one the main session's
 // turns land on, so its capabilities are the ones the user sees.
-func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
+func (a *agent) checkLLM(ctx context.Context, sid string) {
 	conns := a.settings.allConnections()
 	if len(conns) == 0 {
 		a.imagesSupported = false
@@ -479,7 +479,7 @@ func (a *agent) checkLLM(ctx context.Context, sid SessionId) {
 // checkEnvironment reports whether codehalter is running inside a container
 // and whether Firefox (required for web_search/web_read) is available, so
 // devcontainer users see at startup whether the toolchain is wired up.
-func (a *agent) checkEnvironment(ctx context.Context, sid SessionId) {
+func (a *agent) checkEnvironment(ctx context.Context, sid string) {
 	var b strings.Builder
 	if kind := containerKind(); kind != "" {
 		fmt.Fprintf(&b, "✅ Container: %s\n\n", kind)
@@ -573,7 +573,7 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 	return LoadSessionResponse{Modes: a.sessionModes()}, nil
 }
 
-func (a *agent) replayHistory(ctx context.Context, sid SessionId, s *Session) {
+func (a *agent) replayHistory(ctx context.Context, sid string, s *Session) {
 	lastRole := ""
 	for _, m := range s.Messages {
 		if m.Role == lastRole {
@@ -639,7 +639,7 @@ func (a *agent) Cancel(_ context.Context, _ CancelNotification) {
 	}
 }
 
-func (a *agent) systemPrompt(sid SessionId) (string, error) {
+func (a *agent) systemPrompt(sid string) (string, error) {
 	sess := a.getSession(sid)
 	if sess == nil {
 		return "", fmt.Errorf("no session found")
@@ -670,7 +670,7 @@ func (a *agent) systemPrompt(sid SessionId) (string, error) {
 // .codehalter/session_<sid>.log. Returns nil if sid is empty, the session is
 // unknown, or the file can't be opened — callers must nil-check. The log is
 // strictly diagnostic: codehalter never reads it back.
-func (a *agent) sessionLog(sid SessionId) *os.File {
+func (a *agent) sessionLog(sid string) *os.File {
 	if sid == "" {
 		return nil
 	}
@@ -690,7 +690,7 @@ func (a *agent) sessionLog(sid SessionId) *os.File {
 // No-op when sid is unknown or the log can't be opened. The body is written
 // verbatim — caller decides whether to truncate. Use a short tag like "WEB"
 // or "TOOL" so the log stays grep-friendly.
-func (a *agent) logSession(sid SessionId, tag, format string, args ...any) {
+func (a *agent) logSession(sid string, tag, format string, args ...any) {
 	logF := a.sessionLog(sid)
 	if logF == nil {
 		return
@@ -703,7 +703,7 @@ func (a *agent) logSession(sid SessionId, tag, format string, args ...any) {
 	}
 }
 
-func (a *agent) loadPromptFile(sid SessionId, filename string) string {
+func (a *agent) loadPromptFile(sid string, filename string) string {
 	sess := a.getSession(sid)
 	if sess != nil {
 		if data, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", filename)); err == nil {
@@ -730,7 +730,7 @@ func main() {
 	slog.SetDefault(slog.New(stderrHandler))
 	log := slog.New(stderrHandler)
 
-	a := &agent{sessions: make(map[SessionId]*Session), mode: modeInteractive}
+	a := &agent{sessions: make(map[string]*Session), mode: modeInteractive}
 	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin, log)
 	a.conn = conn
 

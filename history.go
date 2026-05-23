@@ -212,7 +212,7 @@ func clipBytes(s string, max int) string {
 // summarize calls the LLM to compress text. Returns an error on LLM failure
 // so the caller can decide whether to proceed — we never silently substitute
 // truncated raw text for a real summary.
-func (a *agent) summarize(ctx context.Context, sid SessionId, conn *LLMConnection, text string) (string, error) {
+func (a *agent) summarize(ctx context.Context, sid string, conn *LLMConnection, text string) (string, error) {
 	prompt := fmt.Sprintf("%s\n\nTarget length: ~%d tokens.\n\n<conversation>\n%s\n</conversation>", summarizePrompt, summaryBudget, text)
 	return a.llmSimple(ctx, sid, conn, []llmMessage{{Role: "user", Content: prompt}})
 }
@@ -256,7 +256,7 @@ const maxShadowInputBytes = 20 * 1024
 // Virtual slots flatten (entry, slot-within-entry) entry-major: one [[llm]]
 // with parallel=2 exposes slots [0, 1] both hosted by entry 0; adding a
 // second [[llm]] with parallel=2 adds slots [2, 3] hosted by entry 1.
-func (a *agent) pickBackgroundLLM(sid SessionId) *LLMConnection {
+func (a *agent) pickBackgroundLLM(sid string) *LLMConnection {
 	sess := a.getSession(sid)
 	if sess == nil || sess.Depth > 0 {
 		return nil

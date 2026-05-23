@@ -65,7 +65,7 @@ func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
 // current phase is in_progress (or completed when done=true); earlier phases
 // are completed. The session tracks in-progress state so finalizePlan can
 // mark whatever phase was running as completed if Prompt exits early.
-func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bool) {
+func (a *agent) sendPhase(ctx context.Context, sid string, phase int, done bool) {
 	entries := phaseEntries(phase, done, "")
 	if entries == nil {
 		return
@@ -86,7 +86,7 @@ func (a *agent) sendPhase(ctx context.Context, sid SessionId, phase int, done bo
 // executes. Pass "" to revert to the bare phase name. No-op when no phase is
 // active so background calls (history compaction, per-turn summariser) don't
 // clobber the UI.
-func (a *agent) setStatus(ctx context.Context, sid SessionId, suffix string) {
+func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 	sess := a.getSession(sid)
 	if sess == nil {
 		return
@@ -109,7 +109,7 @@ func (a *agent) setStatus(ctx context.Context, sid SessionId, suffix string) {
 // as completed so the UI stops spinning. Idempotent and safe to call when no
 // phase is active. Used from a Prompt-level defer to cover every exit path:
 // errors mid-phase (LLM 500, tool failure), user cancel, or panic.
-func (a *agent) finalizePlan(sid SessionId) {
+func (a *agent) finalizePlan(sid string) {
 	sess := a.getSession(sid)
 	if sess == nil {
 		return
@@ -136,7 +136,7 @@ func (a *agent) finalizePlan(sid SessionId) {
 // (LLM auth / out-of-credits / planAndRoute crash). Pass any tool uses
 // captured before the failure so they're preserved in history. Recoverable
 // warnings should keep using sendUpdate with a "⚠ ..." chunk.
-func (a *agent) failPrompt(sid SessionId, err error, toolUses []ToolUse) (PromptResponse, error) {
+func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptResponse, error) {
 	if sess := a.getSession(sid); sess != nil {
 		if len(toolUses) > 0 {
 			sess.AddAssistantWithTools("❌ "+err.Error(), toolUses)
@@ -304,7 +304,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 // The decomposition planner already ran upstream — its plan response (with
 // Subtasks listed) and its tool uses are already in sess.Messages, so each
 // inner runTaskCycle sees that context naturally via buildLLMHistory.
-func (a *agent) runSubtasks(ctx context.Context, sid SessionId, subtasks []string) (toolLoopResult, error) {
+func (a *agent) runSubtasks(ctx context.Context, sid string, subtasks []string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
 
 	var header strings.Builder

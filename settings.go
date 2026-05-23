@@ -208,7 +208,7 @@ func (s *Settings) SubagentPinOrder() []PinSlot {
 // settings the agent can't do anything useful, so re-prompting is the right
 // behaviour. On the next session, the user either has a global file (no
 // prompt) or still doesn't (prompt again).
-func (a *agent) ensureSettings(ctx context.Context, cwd string, sid SessionId) {
+func (a *agent) ensureSettings(ctx context.Context, cwd string, sid string) {
 	if a.settings.path != "" {
 		return
 	}

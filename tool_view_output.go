@@ -62,7 +62,7 @@ func init() {
 	}, Execute: viewOutputExecute})
 }
 
-func viewOutputExecute(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+func viewOutputExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	var args struct {
 		ID      string `json:"id"`
 		Mode    string `json:"mode"`

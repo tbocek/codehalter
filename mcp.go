@@ -636,7 +636,7 @@ func registerMCPTools(c *MCPClient, tools []mcpTool) {
 					"parameters":  params,
 				},
 			},
-			Execute: func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool) {
+			Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 				tcId := a.StartToolCall(ctx, sid, toolName, "search", nil)
 				output, isErr, err := client.callTool(ctx, remoteName, json.RawMessage(rawArgs))
 				if err != nil {
@@ -844,7 +844,7 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 // restarted/failed distinctly. Failures use FailToolCall, which Zed renders
 // with a red status icon — the closest visual to a "red box" that doesn't
 // abort the user's turn.
-func (a *agent) renderMCPChanges(ctx context.Context, sid SessionId, changes []mcpChange) {
+func (a *agent) renderMCPChanges(ctx context.Context, sid string, changes []mcpChange) {
 	for _, ch := range changes {
 		var title string
 		switch ch.action {

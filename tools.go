@@ -16,7 +16,7 @@ import (
 // Path security
 // ---------------------------------------------------------------------------
 
-func (a *agent) resolvePath(sid SessionId, path string) (string, error) {
+func (a *agent) resolvePath(sid string, path string) (string, error) {
 	sess := a.getSession(sid)
 	if sess == nil {
 		return "", fmt.Errorf("no session found")
@@ -63,7 +63,7 @@ type Tool struct {
 	// when codehalter itself saw the call fail. Most handlers return
 	// (output, false); only run_task and similar truth-bearing tools set
 	// failed=true.
-	Execute func(ctx context.Context, a *agent, sid SessionId, rawArgs string) (string, bool)
+	Execute func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
 	// Terminal marks a tool as the loop's exit point: when the model invokes
 	// it, the agentic tool loop returns after this batch completes, with the
 	// tool's Output (one Execute return value) becoming the assistant's final
@@ -186,7 +186,7 @@ func parseArgs(rawArgs string) map[string]string {
 	return args
 }
 
-func (a *agent) executeTool(ctx context.Context, sid SessionId, tc toolCall) (string, bool) {
+func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (string, bool) {
 	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 
 	// Snapshot the registry under the lock so Execute can run without holding
@@ -268,7 +268,7 @@ func DiffContent(path string, oldText *string, newText string) ToolCallContent {
 	return ToolCallContent{Type: "diff", Path: path, OldText: oldText, NewText: newText}
 }
 
-func (a *agent) StartToolCall(ctx context.Context, sid SessionId, title, kind string, locations []ToolCallLocation) string {
+func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []ToolCallLocation) string {
 	id := nextToolCallID()
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call",
@@ -282,7 +282,7 @@ func (a *agent) StartToolCall(ctx context.Context, sid SessionId, title, kind st
 	return id
 }
 
-func (a *agent) CompleteToolCall(ctx context.Context, sid SessionId, id string, content []ToolCallContent) {
+func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, content []ToolCallContent) {
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
@@ -295,7 +295,7 @@ func (a *agent) CompleteToolCall(ctx context.Context, sid SessionId, id string, 
 // tool-call's title. Use this to surface a result preview in the panel
 // without requiring the user to expand the disclosure (e.g. change
 // "go_symbols: Foo" → "go_symbols: Foo → router.go:27 (+1)").
-func (a *agent) CompleteToolCallTitled(ctx context.Context, sid SessionId, id, title string, content []ToolCallContent) {
+func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, title string, content []ToolCallContent) {
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
@@ -305,7 +305,7 @@ func (a *agent) CompleteToolCallTitled(ctx context.Context, sid SessionId, id, t
 	})
 }
 
-func (a *agent) FailToolCall(ctx context.Context, sid SessionId, id, errMsg string) {
+func (a *agent) FailToolCall(ctx context.Context, sid string, id, errMsg string) {
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
