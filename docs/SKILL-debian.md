@@ -6,6 +6,12 @@ C library is glibc. Stable repos prioritise stability over freshness, so
 versions can be months or years behind upstream. The codename above
 determines which suites apt sees.
 
+You are running as the non-root user `dev` (sudo is configured NOPASSWD).
+Prefix all package-management commands (`apt update`, `apt install`,
+`apt remove`, `apt-get ...`, `dpkg -i`) and any other root-only operation
+with `sudo`. Read-only probes (`apt-cache search`, `apt-cache policy`,
+`dpkg -l`, `dpkg -s`) do NOT need sudo.
+
 ## Probe (only if needed)
 
 `/etc/os-release` is already reflected in the header above — do NOT re-run

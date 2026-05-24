@@ -5,6 +5,12 @@ Package manager is `dnf` (the `yum` alias still works for legacy
 commands). Fedora releases every ~6 months, so packages stay relatively
 fresh.
 
+You are running as the non-root user `dev` (sudo is configured NOPASSWD).
+Prefix all package-management commands (`dnf install`, `dnf remove`,
+`dnf check-update`, `dnf clean`, `dnf copr enable`) and any other
+root-only operation with `sudo`. Read-only probes (`dnf info`,
+`dnf search`, `dnf provides`, `rpm -qa`, `rpm -q`) do NOT need sudo.
+
 ## Probe (only if needed)
 
 `/etc/os-release` is already reflected in the header above — do NOT re-run

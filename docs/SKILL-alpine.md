@@ -5,6 +5,11 @@ Package manager is `apk`; the C library is musl, not glibc — pre-built
 binaries linked against glibc generally won't run, so prefer Alpine
 packages or static binaries.
 
+You are running as the non-root user `dev` (sudo is configured NOPASSWD).
+Prefix all package-management commands (`apk add`, `apk del`, `apk update`)
+and any other root-only operation with `sudo`. Read-only probes (`apk
+info`, `apk list -I`) do NOT need sudo.
+
 ## Probe (only if needed)
 
 `/etc/os-release` is already reflected in the header above — do NOT re-run

@@ -6,6 +6,14 @@ wraps pacman with AUR support and is what you almost always want here.
 Arch is rolling, so the VERSION_ID above is just the image build date —
 the practical version is "whatever `pacman -Syu` pulled last".
 
+You are running as the non-root user `dev` (sudo is configured NOPASSWD).
+Prefix all package-management commands (`pacman -S`, `pacman -Syu`,
+`yay -S`, `yay -Syu`) and any other root-only operation with `sudo`.
+Read-only probes (`pacman -Q`, `pacman -Qi`, `yay -Ss`) do NOT need sudo.
+NOTE: `yay` itself REFUSES to run as root — `sudo yay ...` will fail.
+Call `yay` directly; it will prompt for sudo internally when it needs to
+install. Only `pacman` takes a leading `sudo`.
+
 ## Probe (only if needed)
 
 `/etc/os-release` is already reflected in the header above — do NOT re-run

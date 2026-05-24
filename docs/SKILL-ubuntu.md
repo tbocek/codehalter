@@ -6,6 +6,12 @@ codename={{UBUNTU_CODENAME}}). Tooling is Debian-derived: `apt` /
 the suite codenames (jammy, noble, oracular, …) and PPAs as an additional
 source of fresher packages.
 
+You are running as the non-root user `dev` (sudo is configured NOPASSWD).
+Prefix all package-management commands (`apt update`, `apt install`,
+`apt remove`, `apt-get ...`, `add-apt-repository`, `dpkg -i`) and any
+other root-only operation with `sudo`. Read-only probes (`apt-cache
+search`, `apt-cache policy`, `dpkg -l`, `dpkg -s`) do NOT need sudo.
+
 ## Probe (only if needed)
 
 `/etc/os-release` is already reflected in the header above — do NOT re-run
