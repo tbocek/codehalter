@@ -43,8 +43,29 @@ var skillJava string
 //go:embed docs/SKILL-bash.md
 var skillBash string
 
-//go:embed docs/SKILL-devcontainer.md
-var skillDevcontainer string
+//go:embed docs/SKILL-container.md
+var skillContainer string
+
+//go:embed docs/SKILL-makefile.md
+var skillMakefile string
+
+//go:embed docs/SKILL-justfile.md
+var skillJustfile string
+
+//go:embed docs/SKILL-alpine.md
+var skillAlpine string
+
+//go:embed docs/SKILL-arch.md
+var skillArch string
+
+//go:embed docs/SKILL-debian.md
+var skillDebian string
+
+//go:embed docs/SKILL-fedora.md
+var skillFedora string
+
+//go:embed docs/SKILL-ubuntu.md
+var skillUbuntu string
 
 //go:embed docs/Dockerfile.devcontainer.alpine
 var defaultDevcontainerDockerfileAlpine string
@@ -70,19 +91,34 @@ var defaultSettingsTOML string
 //go:embed docs/mcp.toml
 var defaultMCPToml string
 
+// defaultSkills maps a per-stack key (language stack from detectStacks)
+// to the embedded skill body. The container / per-OS / per-runner skills
+// live in their own seed paths inside ensureSkills, not here, because
+// they're not driven by detectStacks.
 var defaultSkills = map[string]string{
-	"go":           skillGo,
-	"ts":           skillTS,
-	"js":           skillJS,
-	"java":         skillJava,
-	"bash":         skillBash,
-	"devcontainer": skillDevcontainer,
+	"go":   skillGo,
+	"ts":   skillTS,
+	"js":   skillJS,
+	"java": skillJava,
+	"bash": skillBash,
+}
+
+// osSkills maps an /etc/os-release ID (as returned by osID) to the
+// embedded skill body. Only IDs we have a SKILL-<id>.md for are present;
+// osID() filters everything else to "" before lookup.
+var osSkills = map[string]string{
+	"alpine": skillAlpine,
+	"arch":   skillArch,
+	"debian": skillDebian,
+	"fedora": skillFedora,
+	"ubuntu": skillUbuntu,
 }
 
 // ensureDefaults copies embedded default files into .codehalter/ if they don't exist.
-// Phase prompts (PLAN/EXECUTE/VERIFY) are always seeded; SKILL files are seeded
-// only for stacks detected in cwd, so polyglot projects get the relevant ones
-// and single-language projects don't accumulate noise.
+// Phase prompts (PLAN/EXECUTE/VERIFY) and the always-on skills (container,
+// buildfile) are seeded here. Per-stack / per-runner / per-OS SKILL files
+// are handled by ensureSkills on every prepare turn so a stack or runner
+// added mid-session takes effect on the next prompt.
 func ensureDefaults(cwd string) {
 	dir := filepath.Join(cwd, ".codehalter")
 	os.MkdirAll(dir, 0o755)
@@ -92,23 +128,14 @@ func ensureDefaults(cwd string) {
 		{"VERIFY.md", defaultVerifyMD},
 		{"DOCUMENT.md", defaultDocumentMD},
 		{"SKILL-buildfile.md", skillBuildfile},
+		{"SKILL-container.md", skillContainer},
 	} {
 		path := filepath.Join(dir, f.name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
 			os.WriteFile(path, []byte(f.content), 0o644)
 		}
 	}
-	stacks := detectStacks(cwd)
-	for _, stack := range stacks {
-		body, ok := defaultSkills[stack]
-		if !ok {
-			continue
-		}
-		path := filepath.Join(dir, "SKILL-"+stack+".md")
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			os.WriteFile(path, []byte(body), 0o644)
-		}
-	}
+	ensureSkills(cwd, detectStacks(cwd), osID())
 
 	// mcp.toml — only seeded on first run with the bare placeholder. Per-stack
 	// MCP wiring (e.g. gopls for Go) is the prepare phase's job: it asks the
@@ -118,6 +145,55 @@ func ensureDefaults(cwd string) {
 	mcpPath := filepath.Join(dir, "mcp.toml")
 	if _, err := os.Stat(mcpPath); os.IsNotExist(err) {
 		os.WriteFile(mcpPath, []byte(defaultMCPToml), 0o644)
+	}
+}
+
+// ensureSkills seeds SKILL-*.md files into .codehalter/ based on what is
+// PRESENT in the project tree (justfile / Makefile / language stacks) and
+// in the container (/etc/os-release ID), NOT on what tooling is installed
+// on PATH. This is load-bearing: the LLM needs SKILL-justfile.md loaded
+// BEFORE it installs `just` for the user, otherwise the fix-dispatch turn
+// has no idea what justfile syntax looks like.
+//
+// Idempotent — only writes when the file is missing, so user edits to any
+// SKILL file are preserved across re-runs. Called from ensureDefaults at
+// session start AND from checkEnv on every prepare turn so a config file
+// that appears mid-session gets its skill loaded on the next prompt
+// without needing a restart.
+func ensureSkills(cwd string, stacks []string, osid string) {
+	dir := filepath.Join(cwd, ".codehalter")
+	seed := func(name, body string) {
+		if body == "" {
+			return
+		}
+		path := filepath.Join(dir, name)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			os.WriteFile(path, []byte(body), 0o644)
+		}
+	}
+	exists := func(names ...string) bool {
+		for _, n := range names {
+			if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
+				return true
+			}
+		}
+		return false
+	}
+	for _, stack := range stacks {
+		if body, ok := defaultSkills[stack]; ok {
+			seed("SKILL-"+stack+".md", body)
+		}
+	}
+	if exists("justfile", "Justfile", ".justfile") {
+		seed("SKILL-justfile.md", skillJustfile)
+	}
+	if exists("Makefile", "makefile", "GNUmakefile") {
+		seed("SKILL-makefile.md", skillMakefile)
+	}
+	if osid != "" {
+		if body, ok := osSkills[osid]; ok {
+			seed("SKILL-"+osid+".md", body)
+		}
 	}
 }
 
@@ -412,6 +488,40 @@ func containerKind() string {
 	}
 	if v := os.Getenv("container"); v != "" {
 		return v
+	}
+	return ""
+}
+
+// osID reads /etc/os-release and returns the distro ID we have a SKILL-*.md
+// for ("alpine", "arch", "debian", "fedora", "ubuntu"), or "" when the file
+// is missing / unparseable / unsupported. ID_LIKE is consulted as a
+// fallback so Linux Mint maps to ubuntu, Manjaro to arch, etc. Cheap file
+// read — safe to call from prepare on every turn.
+func osID() string {
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return ""
+	}
+	supported := map[string]bool{"alpine": true, "arch": true, "debian": true, "fedora": true, "ubuntu": true}
+	parse := func(key string) string {
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, key+"=") {
+				continue
+			}
+			v := strings.TrimPrefix(line, key+"=")
+			v = strings.Trim(v, `"'`)
+			return strings.ToLower(v)
+		}
+		return ""
+	}
+	if id := parse("ID"); supported[id] {
+		return id
+	}
+	for _, alt := range strings.Fields(parse("ID_LIKE")) {
+		if supported[alt] {
+			return alt
+		}
 	}
 	return ""
 }

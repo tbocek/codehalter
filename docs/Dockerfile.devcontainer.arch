@@ -1,5 +1,5 @@
 # codehalter bootstrap assisted
-FROM quay.io/archlinux/archlinux:base-devel
+FROM quay.io/archlinux/archlinux:base
 
 RUN pacman -Syu --noconfirm --needed \
         ca-certificates curl git \

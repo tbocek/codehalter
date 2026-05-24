@@ -38,6 +38,59 @@ func stackProbeBinary(stack string) string {
 	return ""
 }
 
+// detectRunnerConfigs returns runner-kind names purely from config-file
+// presence in cwd, regardless of whether the runner binary is installed.
+// Used by checkEnv to flag "user has a justfile but `just` isn't on PATH"
+// so the consolidated install card can offer to install the missing tool.
+// Order is deterministic so envSnapshot diffs don't false-positive on
+// reordering. go.mod is included unconditionally (the user wants to run
+// `go vet` / `go test` even when a justfile or Makefile is also present —
+// missing `go` blocks the verify phase regardless).
+func detectRunnerConfigs(cwd string) []string {
+	var kinds []string
+	for _, name := range []string{"justfile", "Justfile", ".justfile"} {
+		if _, err := os.Stat(filepath.Join(cwd, name)); err == nil {
+			kinds = append(kinds, "just")
+			break
+		}
+	}
+	for _, name := range []string{"Makefile", "makefile", "GNUmakefile"} {
+		if _, err := os.Stat(filepath.Join(cwd, name)); err == nil {
+			kinds = append(kinds, "make")
+			break
+		}
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "package.json")); err == nil {
+		kinds = append(kinds, "npm")
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "Cargo.toml")); err == nil {
+		kinds = append(kinds, "cargo")
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err == nil {
+		kinds = append(kinds, "go")
+	}
+	return kinds
+}
+
+// runnerProbeBinary returns the binary that must be on PATH for a runner
+// kind to be usable. Mirrors stackProbeBinary's shape — kept as a switch
+// rather than a map so adding a new runner is one obvious place to edit.
+func runnerProbeBinary(kind string) string {
+	switch kind {
+	case "just":
+		return "just"
+	case "make":
+		return "make"
+	case "npm":
+		return "npm"
+	case "cargo":
+		return "cargo"
+	case "go":
+		return "go"
+	}
+	return ""
+}
+
 // ---------------------------------------------------------------------------
 // Orchestrator
 // ---------------------------------------------------------------------------
@@ -287,8 +340,8 @@ func (a *agent) renderLLMStatus() string {
 // envSnapshot builds the canonical string that represents the entire
 // environment as currently observable. Two calls return identical strings
 // iff nothing the user can see in the capabilities banner has changed.
-// Stack list is taken in detectStacks's fixed order so reordering can't
-// false-positive a diff.
+// Stack and runner-config lists are taken in their detection functions'
+// fixed orders so reordering can't false-positive a diff.
 func (a *agent) envSnapshot(sess *Session) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "container=%s\n", containerKind())
@@ -310,16 +363,38 @@ func (a *agent) envSnapshot(sess *Session) string {
 			fmt.Fprintf(&b, "tool[%s]=missing\n", bin)
 		}
 	}
+	fmt.Fprintf(&b, "runners=%s\n", strings.Join(sess.knownRunners, ","))
+	for _, k := range sess.knownRunners {
+		bin := runnerProbeBinary(k)
+		if bin == "" {
+			continue
+		}
+		if _, err := exec.LookPath(bin); err == nil {
+			fmt.Fprintf(&b, "runner[%s]=ok\n", bin)
+		} else {
+			fmt.Fprintf(&b, "runner[%s]=missing\n", bin)
+		}
+	}
 	return b.String()
 }
 
-// checkEnv refreshes sess.knownStacks, probes the environment (container,
-// firefox, run_command, per-stack dev-tool binaries on PATH), and reports
-// whether anything is different from sess.envSnapshot. Missing per-stack
-// binaries come back as fixProblems so prepare can offer the user a one-
-// click install via the normal plan/execute pipeline. Strictly silent —
-// emits no chat output of its own. Bash and devcontainer are filtered out
-// of knownStacks because they're meta-tooling, not stacks.
+// missingTool pairs a binary name with the human-readable reason it is
+// needed. checkEnv collects one per missing stack-probe / runner-probe so
+// the consolidated fixProblem can render "gopls (go stack), make
+// (Makefile), just (justfile)" in a single card.
+type missingTool struct {
+	bin    string
+	reason string
+}
+
+// checkEnv refreshes sess.knownStacks and sess.knownRunners, probes the
+// environment (container, firefox, run_command, per-stack dev-tool
+// binaries, runner-config binaries on PATH), and reports whether anything
+// is different from sess.envSnapshot. All missing binaries are collapsed
+// into ONE fixProblem so the user sees a single "Install fix? gopls,
+// make, just" card instead of one card per tool. Strictly silent — emits
+// no chat output of its own. Bash and devcontainer are filtered out of
+// knownStacks because they're meta-tooling, not stacks.
 func (a *agent) checkEnv(sess *Session) (bool, []fixProblem) {
 	var stacks []string
 	for _, s := range detectStacks(sess.Cwd) {
@@ -329,31 +404,60 @@ func (a *agent) checkEnv(sess *Session) (bool, []fixProblem) {
 		stacks = append(stacks, s)
 	}
 	sess.knownStacks = stacks
+	sess.knownRunners = detectRunnerConfigs(sess.Cwd)
+
+	// Re-seed SKILL-*.md so a stack / runner config / distro added since
+	// session start has its skill on disk before the next turn's
+	// systemPrompt loads it. Keyed on FILE presence (justfile / Makefile /
+	// go.mod / ...), not on installed tools — the LLM needs the skill to
+	// know how to install the missing tool. Idempotent.
+	ensureSkills(sess.Cwd, sess.knownStacks, osID())
 
 	snap := a.envSnapshot(sess)
 	changed := snap != sess.envSnapshot
 	sess.envSnapshot = snap
 
-	var problems []fixProblem
+	var missing []missingTool
 	for _, s := range stacks {
 		bin := stackProbeBinary(s)
 		if bin == "" {
 			continue
 		}
-		if _, err := exec.LookPath(bin); err == nil {
+		if _, err := exec.LookPath(bin); err != nil {
+			missing = append(missing, missingTool{bin: bin, reason: s + " stack"})
+		}
+	}
+	for _, k := range sess.knownRunners {
+		bin := runnerProbeBinary(k)
+		if bin == "" {
 			continue
 		}
-		problems = append(problems, fixProblem{
-			desc: fmt.Sprintf("🟡 %s not on PATH (required for the %s stack)", bin, s),
-			prompt: fmt.Sprintf("Install %s and any related %s-stack dev tooling into this devcontainer. "+
-				"Detect the OS from /etc/os-release, run the install via run_command, verify the binary "+
-				"is on PATH, then persist the install in .devcontainer/Dockerfile so a container rebuild "+
-				"keeps it. If %s integrates as an MCP server (e.g. gopls via mcp-language-server), wire "+
-				"it into .codehalter/mcp.toml as a [[server]] entry so codehalter can call it on the "+
-				"next prompt.", bin, s, bin),
-		})
+		if _, err := exec.LookPath(bin); err != nil {
+			missing = append(missing, missingTool{bin: bin, reason: k + " runner"})
+		}
 	}
-	return changed, problems
+	if len(missing) == 0 {
+		return changed, nil
+	}
+
+	var names, detail strings.Builder
+	for i, m := range missing {
+		if i > 0 {
+			names.WriteString(", ")
+			detail.WriteString(", ")
+		}
+		names.WriteString(m.bin)
+		fmt.Fprintf(&detail, "%s (%s)", m.bin, m.reason)
+	}
+	return changed, []fixProblem{{
+		desc: fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
+		prompt: fmt.Sprintf("Install the following missing dev tools into this devcontainer: %s. "+
+			"For each one: detect the OS from /etc/os-release, run the install via run_command, "+
+			"verify the binary is on PATH, then persist the install in .devcontainer/Dockerfile so "+
+			"a container rebuild keeps it. If any of these integrates as an MCP server (e.g. gopls "+
+			"via mcp-language-server), wire it into .codehalter/mcp.toml as a [[server]] entry so "+
+			"codehalter can call it on the next prompt.", detail.String()),
+	}}
 }
 
 // ---------------------------------------------------------------------------
@@ -417,39 +521,8 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	}
 	b.WriteString(a.renderLLMStatus())
 
-	a.mu.Lock()
-	caps := a.capabilities
-	empty := a.emptyProject
-	a.mu.Unlock()
-
-	if empty {
-		b.WriteString("Empty project — I'll ask about language and runner on your first message.\n\n")
-	} else if len(caps.runners) == 0 {
-		b.WriteString("🟡 No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")
-	} else {
-		fmt.Fprintf(&b, "Project tooling (%s):\n", strings.Join(caps.runners, ", "))
-		row := func(label string, entries []string, hint string) {
-			if len(entries) > 0 {
-				fmt.Fprintf(&b, "  %-7s %s\n", label+":", strings.Join(entries, ", "))
-			} else {
-				fmt.Fprintf(&b, "  %-7s (none — %s)\n", label+":", hint)
-			}
-		}
-		row("build", caps.build, "consider adding a `build` target")
-		row("test", caps.test, "consider adding a `test` target")
-		row("lint", caps.lint, "consider adding a `lint`/`vet`/`check` target")
-		row("format", caps.format, "consider adding a `fmt`/`format` target")
-		b.WriteString("\n")
-	}
-
-	if len(sess.knownStacks) > 0 {
-		fmt.Fprintf(&b, "Stacks: %s", strings.Join(sess.knownStacks, ", "))
-		if len(sess.knownStacks) > 1 {
-			b.WriteString(" (monorepo)")
-		}
-		b.WriteString("\n\n")
-	}
-
+	// Sandbox / browser / shell — these gate everything else, so they
+	// belong above project-specific state.
 	if kind := containerKind(); kind != "" {
 		fmt.Fprintf(&b, "✅ Container: %s\n\n", kind)
 	} else {
@@ -470,6 +543,68 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 		fmt.Fprintf(&b, "🟡 run_command: disabled — %s\n\n", a.runCmdStatus)
 	}
 
+	// Stacks paired with their probe binary so the user sees stack →
+	// required-binary status on consecutive lines.
+	if len(sess.knownStacks) > 0 {
+		fmt.Fprintf(&b, "Stacks: %s", strings.Join(sess.knownStacks, ", "))
+		if len(sess.knownStacks) > 1 {
+			b.WriteString(" (monorepo)")
+		}
+		b.WriteString("\n\n")
+		for _, s := range sess.knownStacks {
+			bin := stackProbeBinary(s)
+			if bin == "" {
+				continue
+			}
+			if _, err := exec.LookPath(bin); err == nil {
+				fmt.Fprintf(&b, "✅ %s: found (%s stack)\n\n", bin, s)
+			} else {
+				fmt.Fprintf(&b, "🟡 %s: not on PATH — required for the %s stack\n\n", bin, s)
+			}
+		}
+	}
+
+	// Task-runner block. Three states:
+	//   - empty project → bootstrap hint
+	//   - no runner config at all → "add one" nudge
+	//   - one or more runner configs detected → list populated runners + per-
+	//     kind 🟡 lines for any kind whose binary is missing.
+	a.mu.Lock()
+	caps := a.capabilities
+	empty := a.emptyProject
+	a.mu.Unlock()
+
+	if empty {
+		b.WriteString("Empty project — I'll ask about language and runner on your first message.\n\n")
+	} else if len(sess.knownRunners) == 0 {
+		b.WriteString("🟡 No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")
+	} else {
+		if len(caps.runners) > 0 {
+			fmt.Fprintf(&b, "Project tooling (%s):\n", strings.Join(caps.runners, ", "))
+			row := func(label string, entries []string, hint string) {
+				if len(entries) > 0 {
+					fmt.Fprintf(&b, "  %-7s %s\n", label+":", strings.Join(entries, ", "))
+				} else {
+					fmt.Fprintf(&b, "  %-7s (none — %s)\n", label+":", hint)
+				}
+			}
+			row("build", caps.build, "consider adding a `build` target")
+			row("test", caps.test, "consider adding a `test` target")
+			row("lint", caps.lint, "consider adding a `lint`/`vet`/`check` target")
+			row("format", caps.format, "consider adding a `fmt`/`format` target")
+			b.WriteString("\n")
+		}
+		for _, k := range sess.knownRunners {
+			bin := runnerProbeBinary(k)
+			if bin == "" {
+				continue
+			}
+			if _, err := exec.LookPath(bin); err != nil {
+				fmt.Fprintf(&b, "🟡 %s config detected but `%s` not on PATH\n\n", k, bin)
+			}
+		}
+	}
+
 	a.mu.Lock()
 	var mcpRunning []string
 	for name := range a.mcpClients {
@@ -479,18 +614,6 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	if len(mcpRunning) > 0 {
 		sort.Strings(mcpRunning)
 		fmt.Fprintf(&b, "✅ MCP: %s\n\n", strings.Join(mcpRunning, ", "))
-	}
-
-	for _, s := range sess.knownStacks {
-		bin := stackProbeBinary(s)
-		if bin == "" {
-			continue
-		}
-		if _, err := exec.LookPath(bin); err == nil {
-			fmt.Fprintf(&b, "✅ %s: found (%s stack)\n\n", bin, s)
-		} else {
-			fmt.Fprintf(&b, "🟡 %s: not on PATH — required for the %s stack\n\n", bin, s)
-		}
 	}
 
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})

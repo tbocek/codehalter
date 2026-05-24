@@ -214,11 +214,17 @@ type Session struct {
 	// uses. Populated by checkEnv on every Prompt turn so a stack appearing
 	// or disappearing mid-session takes effect on the next turn.
 	knownStacks []string `toml:"-"`
+	// knownRunners is the set of runner-config kinds detectRunnerConfigs
+	// reports for cwd (just/make/npm/cargo/go) — driven purely by config-
+	// file presence so we can flag "user has a justfile but `just` not on
+	// PATH" as a fixable problem, distinct from "no runner at all".
+	knownRunners []string `toml:"-"`
 	// envSnapshot is the canonical string from checkEnv covering everything
 	// the consolidated banner can display (container, firefox, run_command,
-	// stacks, per-stack probe binaries). checkEnv compares against it to
-	// decide whether to flag envChanged so prepare re-emits the banner. Not
-	// persisted — restart re-emits the banner once on the first turn.
+	// stacks, runner configs, per-tool probe binaries). checkEnv compares
+	// against it to decide whether to flag envChanged so prepare re-emits
+	// the banner. Not persisted — restart re-emits the banner once on the
+	// first turn.
 	envSnapshot string `toml:"-"`
 }
 
