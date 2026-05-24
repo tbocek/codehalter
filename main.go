@@ -64,34 +64,6 @@ var defaultDevcontainerDockerfileUbuntu string
 //go:embed docs/devcontainer.json
 var defaultDevcontainerJSON string
 
-//go:embed docs/BOOTSTRAP-alpine-go.md
-var bootstrapAlpineGo string
-
-//go:embed docs/BOOTSTRAP-arch-go.md
-var bootstrapArchGo string
-
-//go:embed docs/BOOTSTRAP-debian-go.md
-var bootstrapDebianGo string
-
-//go:embed docs/BOOTSTRAP-fedora-go.md
-var bootstrapFedoraGo string
-
-//go:embed docs/BOOTSTRAP-ubuntu-go.md
-var bootstrapUbuntuGo string
-
-// defaultBootstraps is keyed by "<os>-<stack>". Used by ensureDevcontainer
-// to seed BOOTSTRAP-<os>-<stack>.md for each detected stack right after a
-// fresh .devcontainer/Dockerfile is written — never re-seeded once the
-// .devcontainer dir exists. Only Go is wired in today; add more stacks as
-// they get bootstrap templates.
-var defaultBootstraps = map[string]string{
-	"alpine-go": bootstrapAlpineGo,
-	"arch-go":   bootstrapArchGo,
-	"debian-go": bootstrapDebianGo,
-	"fedora-go": bootstrapFedoraGo,
-	"ubuntu-go": bootstrapUbuntuGo,
-}
-
 //go:embed docs/settings.toml
 var defaultSettingsTOML string
 
@@ -138,23 +110,14 @@ func ensureDefaults(cwd string) {
 		}
 	}
 
-	// mcp.toml — only seeded on first run. If go.mod is present at seed
-	// time, append an uncommented gopls entry so go_symbols / go_references
-	// (now provided by `gopls mcp`) are wired up out of the box. Once the
-	// file exists we never touch it again — the user owns it.
+	// mcp.toml — only seeded on first run with the bare placeholder. Per-stack
+	// MCP wiring (e.g. gopls for Go) is the prepare phase's job: it asks the
+	// user before installing tools, and the same flow appends the matching
+	// [[server]] entry to this file. Once it exists we never touch it again —
+	// the user owns it.
 	mcpPath := filepath.Join(dir, "mcp.toml")
 	if _, err := os.Stat(mcpPath); os.IsNotExist(err) {
-		content := defaultMCPToml
-		for _, s := range stacks {
-			if s == "go" {
-				if !strings.HasSuffix(content, "\n") {
-					content += "\n"
-				}
-				content += "\n[[server]]\nname = \"gopls\"\ncommand = \"gopls\"\nargs = [\"mcp\"]\n"
-				break
-			}
-		}
-		os.WriteFile(mcpPath, []byte(content), 0o644)
+		os.WriteFile(mcpPath, []byte(defaultMCPToml), 0o644)
 	}
 }
 
@@ -173,10 +136,10 @@ type agent struct {
 	mode            string // "interactive" | "autopilot"
 
 	// connReachable records whether each configured LLMConnection answered
-	// the startup probe. Keyed by connKey(URL+model). pickBackgroundLLM
+	// the prepare-phase probe. Keyed by connKey(URL+model). pickBackgroundLLM
 	// filters candidates against this so a dead extra slot doesn't burn a
-	// timeout on every background summarise call. Populated by checkLLM;
-	// nil before that.
+	// timeout on every background summarise call. Populated by probeAllLLMs;
+	// nil before the first prepare runs.
 	connReachable map[string]bool
 
 	// mainSlotTokens is the per-slot context window for LLM[0] in tokens —
@@ -337,8 +300,8 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	// inference) to advertise image support in capabilities. We load the
 	// global settings only here — project-local settings live under a cwd
 	// we do not yet have. If project-local settings override the LLM later,
-	// startIndexing → checkLLM re-probes and updates the flag plus the
-	// startup banner.
+	// the first Prompt's prepare phase re-probes and updates the flag plus
+	// the LLM banner.
 	if gs, err := loadGlobalSettings(); err == nil {
 		a.settings = gs
 		a.buildSlotSems()
@@ -371,9 +334,10 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	if err != nil {
 		return err
 	}
-	// Empty settings are tolerated (path == "") — startIndexing prompts the
-	// user to write a skeleton on first run; running with no LLM until then
-	// is graceful (checkLLM prints a warning instead of crashing).
+	// Empty settings are tolerated (path == "") — the first Prompt's prepare
+	// phase scaffolds the skeleton and blocks on a Retry card until the user
+	// fills it in. Running with no LLM until then is graceful (renderLLMStatus
+	// prints a warning instead of crashing).
 	a.settings = settings
 	a.buildSlotSems()
 	a.discoverRunners(cwd)
@@ -392,37 +356,27 @@ func (a *agent) startIndexing(sid string, cwd string) {
 }
 
 // bootstrapSettings runs the once-per-session startup sequence: interactive
-// prompts (devcontainer/settings/gitignore) that would be hostile to repeat
-// on every turn, the heavy one-time LLM probe, the project capabilities
-// banner, and the environment summary. The per-prompt re-check is delegated
-// to checkSettings, which bootstrapSettings calls in-line so the MCP
-// reconcile lands in the same flow.
+// prompts (devcontainer/gitignore) that would be hostile to repeat on every
+// turn, the project capabilities banner, the environment summary, and the
+// MCP reconcile. LLM probing and settings scaffolding have moved to the
+// per-prompt prepare phase — they may need to re-run mid-session when the
+// user edits settings.toml, and forcing the user to restart Zed for that
+// was annoying.
 //
-// Order: devcontainer → LLM → gitignore → per-stack bootstrap. The
-// devcontainer gate runs first because settings (LLM, MCP) can be fixed
-// later inside the container; running unsandboxed at all is the policy
-// violation. When ensureDevcontainer returns false, abortReason is set and
-// the rest of the sequence is skipped — Prompt then refuses every turn.
+// Order: devcontainer → capabilities → MCP → environment → gitignore. The
+// devcontainer gate runs first because everything else assumes the sandbox
+// exists. When ensureDevcontainer returns false, abortReason is set and the
+// rest of the sequence is skipped — Prompt then refuses every turn.
 func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid string) {
 	if !a.ensureDevcontainer(ctx, cwd, sid) {
 		return
 	}
 
-	a.ensureSettings(ctx, cwd, sid)
-
-	if a.settings.path != "" {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Using " + a.settings.path + "\n\n"}})
-	}
-
-	a.checkLLM(ctx, sid)
 	a.notifyCapabilities(ctx, sid)
 	a.checkSettings(ctx, cwd, sid)
 	a.checkEnvironment(ctx, sid)
 
 	a.ensureGitignore(ctx, cwd, sid)
-
-	// TODO: per-stack bootstrap loop (BOOTSTRAP-<os>-<stack>.md → LLM runs
-	// the install commands, verifies). Needs the LLM, hence after checkLLM.
 }
 
 // checkSettings is the per-prompt "did anything change?" pass. Every step
@@ -470,86 +424,6 @@ func (a *agent) notifyCapabilities(ctx context.Context, sid string) {
 	row("lint", caps.lint, "consider adding a `lint`/`vet`/`check` target")
 	row("format", caps.format, "consider adding a `fmt`/`format` target")
 	b.WriteString("\n")
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
-}
-
-// checkLLM probes every configured LLMConnection in parallel, records which
-// ones answered, and reports each line to the user. Background summarisation
-// then skips the unreachable extras instead of eating a timeout per call.
-// Image support is taken from LLM[0] — that's the one the main session's
-// turns land on, so its capabilities are the ones the user sees.
-func (a *agent) checkLLM(ctx context.Context, sid string) {
-	conns := a.settings.allConnections()
-	if len(conns) == 0 {
-		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "🟡 LLM: no [[llm]] in settings.toml — codehalter cannot run until you add one.\n\n"}})
-		return
-	}
-	if settingsLooksPlaceholder(a.settings) {
-		a.imagesSupported = false
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "🟡 LLM: " + a.settings.path + " still has the placeholder model \"your-model-id\". Edit it with your real url and model, then restart this Zed session.\n\n"}})
-		return
-	}
-
-	results := make([]probeResult, len(conns))
-	parallel(len(conns), maxParallel, func(i int) {
-		c := conns[i]
-		results[i] = a.probeLLM(ctx, &c)
-	})
-
-	a.connReachable = make(map[string]bool, len(conns))
-	// conns[0] is the main entry that owns the foreground session's KV cache.
-	// Its context size drives compaction sizing; extra slots' sizes aren't
-	// used for that because subagent sessions have their own short lifetimes.
-	// llama.cpp's `-c N -np K` splits the total across slots, so divide.
-	if len(results) > 0 && results[0].ContextSize > 0 {
-		a.mainSlotTokens = results[0].ContextSize / conns[0].parallelCap()
-	}
-	var b strings.Builder
-	firstReachable := -1
-	// Each LLM gets its own paragraph (\n\n) — markdown collapses single
-	// newlines to spaces, so "llm[0]: ...\nllm[1]: ..." would render on one
-	// wrapped line and obscure that there are two separate connections.
-	for i, r := range results {
-		c := conns[i]
-		a.connReachable[connKey(&c)] = r.Reachable
-		label := fmt.Sprintf("llm[%d]", i)
-		if i > 0 && c.Tag != "" {
-			label += " " + c.Tag
-		}
-		switch {
-		case !r.Reachable:
-			fmt.Fprintf(&b, "🟡 %s: unreachable at %s — start your server or fix the url.\n\n", label, c.URL)
-		case r.ModelKnown && !r.ModelLoaded:
-			fmt.Fprintf(&b, "🟡 %s: %s reachable but model %q not loaded.\n\n", label, c.URL, c.Model)
-		default:
-			fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.URL, c.parallelCap())
-		}
-		if r.Reachable && firstReachable < 0 {
-			firstReachable = i
-		}
-	}
-
-	if firstReachable < 0 {
-		a.imagesSupported = false
-		b.WriteString("🟡 No LLM reachable — every connection above failed. Codehalter cannot run any prompt until at least one comes back.\n\n")
-	} else {
-		a.imagesSupported = results[firstReachable].ImageSupport
-		if a.imagesSupported {
-			b.WriteString("✅ Image support: enabled\n\n")
-		} else {
-			b.WriteString("Image support: disabled\n\n")
-		}
-		if a.mainSlotTokens > 0 {
-			if pc := conns[0].parallelCap(); pc > 1 {
-				fmt.Fprintf(&b, "✅ Context window: %d tokens/slot (n_ctx %d ÷ %d slots, compact at ~%d)\n\n", a.mainSlotTokens, results[0].ContextSize, pc, a.compactTriggerTokens())
-			} else {
-				fmt.Fprintf(&b, "✅ Context window: %d tokens (compact at ~%d)\n\n", a.mainSlotTokens, a.compactTriggerTokens())
-			}
-		} else {
-			fmt.Fprintf(&b, "🟡 Context window: unknown — server didn't report n_ctx, using default compact trigger %d\n\n", rawBufferTokens)
-		}
-	}
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
 }
 

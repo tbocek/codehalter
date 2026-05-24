@@ -53,9 +53,9 @@ func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId string, choi
 // tool_call SessionUpdate was dropped (the session-registration race), Zed
 // can still register the card from the permission request alone.
 //
-// Use this in the bootstrap phase (ensureDevcontainer, ensureGitignore,
-// ensureSettings); the execute-phase tools open a card first and only
-// sometimes ask for permission, so they keep the split API.
+// Use this in the bootstrap phase (ensureDevcontainer, ensureGitignore); the
+// execute-phase tools open a card first and only sometimes ask for permission,
+// so they keep the split API.
 func (a *agent) askChoiceWithCard(ctx context.Context, sid, title, kind string, choices []string) (string, string, error) {
 	tcId := a.StartToolCall(ctx, sid, title, kind, nil)
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
@@ -78,6 +78,22 @@ func (a *agent) askYesNoWithCard(ctx context.Context, sid, title, kind, yesLabel
 	}
 	ok, err := a.conn.AskYesNoWithCard(ctx, sid, tcId, title, kind, yesLabel, noLabel)
 	return ok, tcId, err
+}
+
+// askAcknowledgeWithCard is a single-button card — the user clicks `label` to
+// acknowledge, no decline path. Used by the Prepare phase's LLM-unreachable
+// Retry loop: codehalter can't proceed without an LLM, so the only useful
+// option is "I've edited the file, try again". In auto-answer modes the card
+// completes immediately (callers cap retries themselves). Returns the tcId so
+// the caller can Complete/Fail it after acting on the acknowledgement.
+func (a *agent) askAcknowledgeWithCard(ctx context.Context, sid, title, kind, label string) (string, error) {
+	tcId := a.StartToolCall(ctx, sid, title, kind, nil)
+	if auto, reason := a.shouldAutoAnswer(sid); auto {
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[" + reason + "] " + label + "\n\n"}})
+		return tcId, nil
+	}
+	err := a.conn.AskAcknowledgeWithCard(ctx, sid, tcId, title, kind, label)
+	return tcId, err
 }
 
 func init() {
@@ -275,4 +291,19 @@ func (a *AgentSideConnection) AskYesNoWithCard(ctx context.Context, sid, toolCal
 		return false, err
 	}
 	return choice == "yes", nil
+}
+
+// AskAcknowledgeWithCard shows a single-button card and waits for the user to
+// click it. There's no decline path — the discarded outcomeId is implicit
+// (only one option exists). Used for unrecoverable-but-fixable states where
+// the only useful user action is "I fixed it, retry".
+func (a *AgentSideConnection) AskAcknowledgeWithCard(ctx context.Context, sid, toolCallId, title, kind, label string) error {
+	_, err := a.doPermissionRequest(ctx, permissionRequest{
+		SessionId: sid,
+		ToolCall:  permissionToolCall{ToolCallId: toolCallId, Title: title, Kind: kind, Status: "in_progress"},
+		Options: []permissionOption{
+			{OptionId: "ack", Name: label, Kind: "allow_once"},
+		},
+	})
+	return err
 }

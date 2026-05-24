@@ -218,6 +218,18 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
+	// Prepare phase: re-verify the LLM is reachable (blocks on a Retry card
+	// when none is), and build a PREPARE composite for any detected stack
+	// whose dev tooling is missing AND the user hasn't already declined.
+	// The composite is folded into the user's first message of the turn so
+	// the LLM sees install instructions inline with the request — no extra
+	// user turn that would break PLAN.md's expected message structure.
+	sess := a.getSession(req.SessionId)
+	var preparePrefix string
+	if sess != nil {
+		preparePrefix = a.prepare(ctx, sess, req.SessionId)
+	}
+
 	// Store user message. On the very first turn of the session we render the
 	// system prompt (skills + project dir) into sess.SystemPrompt — emitted by
 	// buildLLMHistory as a separate leading user message, so it survives the
@@ -225,7 +237,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// project hint stays folded into the first user message because it's a
 	// one-shot nudge — once the project has files, we want the summariser to
 	// drop it naturally rather than re-injecting it forever.
-	sess := a.getSession(req.SessionId)
 	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
 	stored := userText
 	if isFirstMessage {
@@ -240,6 +251,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		if empty {
 			stored = emptyProjectHint + "\n---\n" + userText
 		}
+	}
+	if preparePrefix != "" {
+		stored = preparePrefix + stored
 	}
 	if sess != nil {
 		if len(images) > 0 {

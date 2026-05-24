@@ -506,7 +506,7 @@ func (a *agent) connSlot(conn *LLMConnection) int {
 
 // buildSlotSems sizes one buffered channel per LLM entry to its parallelCap.
 // Called once on agent startup after settings load. Re-init on settings
-// reload is handled by the caller (ensureSettings invokes loadSettings →
+// reload is handled by the caller (ensureLLM invokes loadSettings →
 // re-init slotSems).
 func (a *agent) buildSlotSems() {
 	sems := make([]chan struct{}, len(a.settings.LLM))

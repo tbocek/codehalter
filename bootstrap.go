@@ -77,35 +77,10 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		return false
 	}
 
-	// Seed BOOTSTRAP-<os>-<stack>.md alongside the devcontainer for each
-	// detected stack that has a template. Skip stacks with no template, and
-	// never overwrite — these are one-shot install prompts scoped to a
-	// freshly-scaffolded devcontainer.
-	osName := strings.ToLower(choice)
-	var seeded []string
-	for _, stack := range detectStacks(cwd) {
-		body, ok := defaultBootstraps[osName+"-"+stack]
-		if !ok {
-			continue
-		}
-		name := "BOOTSTRAP-" + osName + "-" + stack + ".md"
-		path := filepath.Join(cwd, ".codehalter", name)
-		if _, err := os.Stat(path); err == nil {
-			continue
-		}
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			continue
-		}
-		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-			continue
-		}
-		seeded = append(seeded, name)
-	}
-
+	// Per-stack dev-tool installs are handled by the prepare phase on the
+	// next session (inside the container) — it asks the user, installs live,
+	// persists in this Dockerfile, and wires MCP. Nothing to seed here.
 	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json. " + reopen
-	if len(seeded) > 0 {
-		note += " Also seeded " + strings.Join(seeded, ", ") + " for per-stack dev-tool install."
-	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
 	a.sendUpdateAndAbort(ctx, sid, note)
 	return false
