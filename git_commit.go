@@ -47,7 +47,7 @@ func gitDiffHead(cwd string) (string, error) {
 	return string(out), nil
 }
 
-// cleanupGitCommitIfClean is called from checkSettings on every user prompt.
+// cleanupGitCommitIfClean is called from checkMCP on every user prompt.
 // Waits for any in-flight backgroundGitCommit to finish (otherwise its late
 // write would resurrect a file we are about to delete), then checks
 // `git status --porcelain`. Empty status means everything was committed

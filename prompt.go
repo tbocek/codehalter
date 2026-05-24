@@ -198,13 +198,31 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		slog.Debug("Prompt: indexDone nil, no gate", "sid", req.SessionId)
 	}
 
-	// Pick up anything the user edited between turns (mcp.toml today;
-	// settings.toml / capabilities later). checkSettings is silent when
-	// nothing changed and only emits tool-call cards for real diffs, so it's
-	// safe to run on every prompt without spamming the chat.
-	if sess := a.getSession(req.SessionId); sess != nil {
-		slog.Debug("Prompt: pre-prepare getSession ok", "sid", req.SessionId, "cwd", sess.Cwd)
-		a.checkSettings(ctx, sess.Cwd, req.SessionId)
+	// Capture isFirstMessage and seed sess.SystemPrompt BEFORE prepare runs.
+	// prepare may dispatch proposeFix → AddUser → runTaskCycle to install a
+	// missing dev tool, which both fills sess.Messages (flipping isFirstMessage)
+	// and triggers an LLM call that needs sess.SystemPrompt to carry the
+	// skills / cwd context. Seeding sess.SystemPrompt here also makes
+	// generateTitle pick the user's actual request as the title — not the
+	// synthetic install prompt.
+	sess := a.getSession(req.SessionId)
+	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
+	if sess != nil && sess.SystemPrompt == "" {
+		sysPrompt, err := a.systemPrompt(req.SessionId)
+		if err != nil {
+			return a.failPrompt(req.SessionId, err, nil)
+		}
+		sess.SystemPrompt = sysPrompt
+	}
+
+	// Prepare phase: re-verifies the LLM (loops forever on a Retry card when
+	// unreachable), refreshes the env snapshot + MCP reconcile, emits one
+	// consolidated capabilities banner only when something changed, and offers
+	// ack-card "fix it for me?" proposals for missing tools / broken MCP
+	// entries. Strictly silent in steady state so it's safe to call every turn.
+	slog.Debug("Prompt: about to call prepare", "sid", req.SessionId, "sessNil", sess == nil)
+	if sess != nil {
+		a.prepare(ctx, sess, req.SessionId)
 		// Clear per-turn read-dedup. Dedup is scoped to a single Prompt()
 		// turn so that across-turn re-reads (after a user reply, edits made
 		// outside our process, etc.) still go through.
@@ -227,44 +245,17 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
-	// Prepare phase: re-verify the LLM is reachable (blocks on a Retry card
-	// when none is), and build a PREPARE composite for any detected stack
-	// whose dev tooling is missing AND the user hasn't already declined.
-	// The composite is folded into the user's first message of the turn so
-	// the LLM sees install instructions inline with the request — no extra
-	// user turn that would break PLAN.md's expected message structure.
-	sess := a.getSession(req.SessionId)
-	slog.Debug("Prompt: about to call prepare", "sid", req.SessionId, "sessNil", sess == nil)
-	var preparePrefix string
-	if sess != nil {
-		preparePrefix = a.prepare(ctx, sess, req.SessionId)
-	}
-	slog.Debug("Prompt: prepare returned", "sid", req.SessionId, "prefixLen", len(preparePrefix))
-
-	// Store user message. On the very first turn of the session we render the
-	// system prompt (skills + project dir) into sess.SystemPrompt — emitted by
-	// buildLLMHistory as a separate leading user message, so it survives the
-	// summariser when compressHistory rotates the conversation. The empty-
-	// project hint stays folded into the first user message because it's a
-	// one-shot nudge — once the project has files, we want the summariser to
-	// drop it naturally rather than re-injecting it forever.
-	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
+	// The empty-project hint stays folded into the first user message because
+	// it's a one-shot nudge — once the project has files, we want the
+	// summariser to drop it naturally rather than re-injecting it forever.
 	stored := userText
 	if isFirstMessage {
-		sysPrompt, err := a.systemPrompt(req.SessionId)
-		if err != nil {
-			return a.failPrompt(req.SessionId, err, nil)
-		}
-		sess.SystemPrompt = sysPrompt
 		a.mu.Lock()
 		empty := a.emptyProject
 		a.mu.Unlock()
 		if empty {
 			stored = emptyProjectHint + "\n---\n" + userText
 		}
-	}
-	if preparePrefix != "" {
-		stored = preparePrefix + stored
 	}
 	if sess != nil {
 		if len(images) > 0 {

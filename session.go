@@ -208,30 +208,18 @@ type Session struct {
 	// Reset to "" by failed probes so the next prompt re-probes from scratch.
 	// In-memory only; a restart pays one extra probe on the first turn.
 	llmHash string `toml:"-"`
-	// llmStatusSnapshot is the last rendered output of renderLLMStatus that
-	// the user actually saw. notifyCapabilitiesLLM diffs against it so a
-	// no-change probe (the steady-state case) emits zero chat noise. Not
-	// persisted — restart re-renders the banner once, which is fine.
-	llmStatusSnapshot string `toml:"-"`
 	// knownStacks is the set of language stacks detectStacks reports for
 	// this session's cwd, with the meta-tooling entries (bash, devcontainer)
 	// filtered out — those aren't stacks, they're scaffolding every project
-	// uses. Populated by prepareStacks on every Prompt turn so a stack
-	// appearing or disappearing mid-session takes effect on the next turn.
+	// uses. Populated by checkEnv on every Prompt turn so a stack appearing
+	// or disappearing mid-session takes effect on the next turn.
 	knownStacks []string `toml:"-"`
-	// monorepo is true when knownStacks has more than one real stack.
-	// prepareStacks consults this to prepend PREPARE-monorepo.md (telling
-	// the LLM to consolidate Dockerfile + mcp.toml edits across stacks
-	// rather than re-editing the same files per stack).
-	monorepo bool `toml:"-"`
-	// preparedStacks is the per-session list of stack names whose PREPARE-*
-	// template prepareStacks has already injected into a user message during
-	// this session. Prevents the LLM from being asked the same install
-	// question on every turn — once we've handed it the install template,
-	// it should be running the commands, not waiting for us to nag again.
-	// Cleared on restart by design (a new session = a fresh chance to
-	// re-ask, in case the user wiped the container and lost the binary).
-	preparedStacks []string `toml:"-"`
+	// envSnapshot is the canonical string from checkEnv covering everything
+	// the consolidated banner can display (container, firefox, run_command,
+	// stacks, per-stack probe binaries). checkEnv compares against it to
+	// decide whether to flag envChanged so prepare re-emits the banner. Not
+	// persisted — restart re-emits the banner once on the first turn.
+	envSnapshot string `toml:"-"`
 }
 
 // recallSubagent returns a prior result for the given task hash if one exists.

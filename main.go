@@ -184,9 +184,10 @@ type agent struct {
 
 	// runCmdStatus is the human-readable outcome of discoverSandbox: either
 	// "available" (tool registered) or a specific reason it wasn't (not in a
-	// container, shim install failed). checkEnvironment surfaces it so the
-	// user sees in chat whether run_command is wired up — silent slog.Info
-	// was leaving users wondering why the LLM never called it.
+	// container, shim install failed). notifyCapabilities surfaces it in the
+	// consolidated banner so the user sees in chat whether run_command is
+	// wired up — silent slog.Info was leaving users wondering why the LLM
+	// never called it.
 	runCmdStatus string
 
 	// abortReason is set by the bootstrap goroutine when codehalter must not
@@ -346,6 +347,13 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	return nil
 }
 
+// startIndexing kicks off the once-per-session bootstrap: interactive
+// devcontainer / gitignore prompts that would be hostile to repeat on every
+// turn. Everything else (LLM probing, capabilities banner, env probes, MCP
+// reconcile) belongs to the per-prompt prepare phase — see prepare.go.
+// Ordering: devcontainer first because the gitignore prompt assumes a
+// sandbox exists. When ensureDevcontainer returns false, abortReason is set
+// and gitignore is skipped — Prompt refuses every turn after that.
 func (a *agent) startIndexing(sid string, cwd string) {
 	a.indexDone = make(chan struct{})
 	slog.Debug("startIndexing: spawning bootstrap goroutine", "sid", sid, "cwd", cwd)
@@ -353,112 +361,14 @@ func (a *agent) startIndexing(sid string, cwd string) {
 		defer close(a.indexDone)
 		defer slog.Debug("startIndexing: bootstrap goroutine done", "sid", sid)
 		ctx := context.Background()
-		a.bootstrapSettings(ctx, cwd, sid)
-	}()
-}
-
-// bootstrapSettings runs the once-per-session startup sequence: interactive
-// prompts (devcontainer/gitignore) that would be hostile to repeat on every
-// turn, the project capabilities banner, the environment summary, and the
-// MCP reconcile. LLM probing and settings scaffolding have moved to the
-// per-prompt prepare phase — they may need to re-run mid-session when the
-// user edits settings.toml, and forcing the user to restart Zed for that
-// was annoying.
-//
-// Order: devcontainer → capabilities → MCP → environment → gitignore. The
-// devcontainer gate runs first because everything else assumes the sandbox
-// exists. When ensureDevcontainer returns false, abortReason is set and the
-// rest of the sequence is skipped — Prompt then refuses every turn.
-func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid string) {
-	slog.Debug("bootstrapSettings: enter", "sid", sid, "cwd", cwd)
-	if !a.ensureDevcontainer(ctx, cwd, sid) {
-		slog.Debug("bootstrapSettings: ensureDevcontainer false, aborting", "sid", sid)
-		return
-	}
-	slog.Debug("bootstrapSettings: devcontainer ok", "sid", sid)
-
-	a.notifyCapabilities(ctx, sid)
-	a.checkSettings(ctx, cwd, sid)
-	a.checkEnvironment(ctx, sid)
-
-	slog.Debug("bootstrapSettings: about to ensureGitignore", "sid", sid)
-	a.ensureGitignore(ctx, cwd, sid)
-	slog.Debug("bootstrapSettings: done", "sid", sid)
-}
-
-// checkSettings is the per-prompt "did anything change?" pass. Every step
-// here MUST be silent when nothing has changed — running this on every user
-// turn should add zero chat noise during a steady-state conversation, only
-// emitting cards when there's something the user needs to see. Today it
-// reconciles .codehalter/mcp.toml (mtime-gated); future mid-session checks
-// (settings.toml reload triggering an LLM re-probe, capability re-detection
-// when a Makefile appears) belong here too.
-func (a *agent) checkSettings(ctx context.Context, cwd string, sid string) {
-	changes := a.reconcileMCP(ctx, cwd)
-	a.renderMCPChanges(ctx, sid, changes)
-	a.cleanupGitCommitIfClean(cwd, sid)
-}
-
-// notifyCapabilities emits a summary of discovered build/test/lint/format
-// runners at session start, flagging any category where nothing was found so
-// the user knows to either configure their runner or accept the gap.
-func (a *agent) notifyCapabilities(ctx context.Context, sid string) {
-	a.mu.Lock()
-	caps := a.capabilities
-	empty := a.emptyProject
-	a.mu.Unlock()
-
-	if empty {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Empty project — I'll ask about language and runner on your first message.\n\n"}})
-		return
-	}
-	if len(caps.runners) == 0 {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "🟡 No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n"}})
-		return
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "Project tooling (%s):\n", strings.Join(caps.runners, ", "))
-	row := func(label string, entries []string, hint string) {
-		if len(entries) > 0 {
-			fmt.Fprintf(&b, "  %-7s %s\n", label+":", strings.Join(entries, ", "))
-		} else {
-			fmt.Fprintf(&b, "  %-7s (none — %s)\n", label+":", hint)
+		if !a.ensureDevcontainer(ctx, cwd, sid) {
+			slog.Debug("startIndexing: ensureDevcontainer false, aborting", "sid", sid)
+			return
 		}
-	}
-	row("build", caps.build, "consider adding a `build` target")
-	row("test", caps.test, "consider adding a `test` target")
-	row("lint", caps.lint, "consider adding a `lint`/`vet`/`check` target")
-	row("format", caps.format, "consider adding a `fmt`/`format` target")
-	b.WriteString("\n")
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
-}
-
-// checkEnvironment reports whether codehalter is running inside a container
-// and whether Firefox (required for web_search/web_read) is available, so
-// devcontainer users see at startup whether the toolchain is wired up.
-func (a *agent) checkEnvironment(ctx context.Context, sid string) {
-	var b strings.Builder
-	if kind := containerKind(); kind != "" {
-		fmt.Fprintf(&b, "✅ Container: %s\n\n", kind)
-	} else {
-		b.WriteString("🟡 Container: none (running on host — file edits and tasks hit your real filesystem)\n\n")
-	}
-	if _, err := findFirefox(); err == nil {
-		b.WriteString("✅ Firefox: found (web_search/web_read enabled)\n\n")
-	} else {
-		b.WriteString("🟡 Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
-	}
-	switch a.runCmdStatus {
-	case "available":
-		b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only — destructive git commands fail at the FS layer)\n\n")
-	case "":
-		// discoverSandbox never ran. Should not happen — initSession calls it
-		// unconditionally. Stay silent rather than print misleading info.
-	default:
-		fmt.Fprintf(&b, "🟡 run_command: disabled — %s\n\n", a.runCmdStatus)
-	}
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
+		slog.Debug("startIndexing: devcontainer ok, about to ensureGitignore", "sid", sid)
+		a.ensureGitignore(ctx, cwd, sid)
+		slog.Debug("startIndexing: bootstrap done", "sid", sid)
+	}()
 }
 
 // containerKind returns a short label identifying the container runtime, or
