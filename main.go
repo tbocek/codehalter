@@ -348,8 +348,10 @@ func (a *agent) initSession(cwd string, s *Session) error {
 
 func (a *agent) startIndexing(sid string, cwd string) {
 	a.indexDone = make(chan struct{})
+	slog.Debug("startIndexing: spawning bootstrap goroutine", "sid", sid, "cwd", cwd)
 	go func() {
 		defer close(a.indexDone)
+		defer slog.Debug("startIndexing: bootstrap goroutine done", "sid", sid)
 		ctx := context.Background()
 		a.bootstrapSettings(ctx, cwd, sid)
 	}()
@@ -368,15 +370,20 @@ func (a *agent) startIndexing(sid string, cwd string) {
 // exists. When ensureDevcontainer returns false, abortReason is set and the
 // rest of the sequence is skipped — Prompt then refuses every turn.
 func (a *agent) bootstrapSettings(ctx context.Context, cwd string, sid string) {
+	slog.Debug("bootstrapSettings: enter", "sid", sid, "cwd", cwd)
 	if !a.ensureDevcontainer(ctx, cwd, sid) {
+		slog.Debug("bootstrapSettings: ensureDevcontainer false, aborting", "sid", sid)
 		return
 	}
+	slog.Debug("bootstrapSettings: devcontainer ok", "sid", sid)
 
 	a.notifyCapabilities(ctx, sid)
 	a.checkSettings(ctx, cwd, sid)
 	a.checkEnvironment(ctx, sid)
 
+	slog.Debug("bootstrapSettings: about to ensureGitignore", "sid", sid)
 	a.ensureGitignore(ctx, cwd, sid)
+	slog.Debug("bootstrapSettings: done", "sid", sid)
 }
 
 // checkSettings is the per-prompt "did anything change?" pass. Every step
@@ -475,23 +482,29 @@ func containerKind() string {
 
 func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSessionResponse, error) {
 	cwd := cwdOrDefault(req.Cwd)
+	slog.Debug("NewSession: enter", "cwd", cwd)
 	s, err := newSession(cwd)
 	if err != nil {
+		slog.Debug("NewSession: newSession err", "err", err)
 		return NewSessionResponse{}, err
 	}
 	if err := a.initSession(cwd, s); err != nil {
+		slog.Debug("NewSession: initSession err", "err", err, "sid", s.ID)
 		a.deleteSession(s.ID)
 		return NewSessionResponse{}, err
 	}
 	a.startIndexing(s.ID, cwd)
+	slog.Debug("NewSession: returning", "sid", s.ID)
 	return NewSessionResponse{SessionId: s.ID, Modes: a.sessionModes()}, nil
 }
 
 func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
 	cwd := cwdOrDefault(req.Cwd)
+	slog.Debug("LoadSession: enter", "cwd", cwd, "sid", req.SessionId)
 	s, err := loadSession(cwd, req.SessionId)
 	if err != nil {
 		if os.IsNotExist(err) {
+			slog.Debug("LoadSession: not found, treating as new", "sid", req.SessionId)
 			// Zed cached an ID from an earlier session/new that never
 			// wrote a file (no prompt). It then sends session/load with
 			// that ID, and subsequently session/prompt under the same

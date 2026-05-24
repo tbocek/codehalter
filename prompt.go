@@ -159,6 +159,7 @@ func stopReasonFor(ctx context.Context) string {
 }
 
 func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
+	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
 	ctx, cancel := context.WithCancel(ctx)
 	a.mu.Lock()
 	a.cancel = cancel
@@ -175,6 +176,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	a.mu.Lock()
 	abort := a.abortReason
 	a.mu.Unlock()
+	slog.Debug("Prompt: abort gate", "sid", req.SessionId, "abortReason", abort)
 	if abort != "" {
 		a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: abort + "\n"}})
 		return a.failPrompt(req.SessionId, errors.New(abort), nil)
@@ -187,9 +189,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	if a.indexDone != nil {
 		select {
 		case <-a.indexDone:
+			slog.Debug("Prompt: indexDone gate passed", "sid", req.SessionId)
 		default:
+			slog.Debug("Prompt: indexDone gate refused (bootstrap still running)", "sid", req.SessionId)
 			return a.failPrompt(req.SessionId, errors.New("Please answer the pending question above first."), nil)
 		}
+	} else {
+		slog.Debug("Prompt: indexDone nil, no gate", "sid", req.SessionId)
 	}
 
 	// Pick up anything the user edited between turns (mcp.toml today;
@@ -197,6 +203,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// nothing changed and only emits tool-call cards for real diffs, so it's
 	// safe to run on every prompt without spamming the chat.
 	if sess := a.getSession(req.SessionId); sess != nil {
+		slog.Debug("Prompt: pre-prepare getSession ok", "sid", req.SessionId, "cwd", sess.Cwd)
 		a.checkSettings(ctx, sess.Cwd, req.SessionId)
 		// Clear per-turn read-dedup. Dedup is scoped to a single Prompt()
 		// turn so that across-turn re-reads (after a user reply, edits made
@@ -204,6 +211,8 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		sess.readDedupMu.Lock()
 		sess.readDedup = nil
 		sess.readDedupMu.Unlock()
+	} else {
+		slog.Debug("Prompt: pre-prepare getSession NIL", "sid", req.SessionId, "knownSessions", len(a.sessions))
 	}
 
 	// Extract user text and images from prompt blocks.
@@ -225,10 +234,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// the LLM sees install instructions inline with the request — no extra
 	// user turn that would break PLAN.md's expected message structure.
 	sess := a.getSession(req.SessionId)
+	slog.Debug("Prompt: about to call prepare", "sid", req.SessionId, "sessNil", sess == nil)
 	var preparePrefix string
 	if sess != nil {
 		preparePrefix = a.prepare(ctx, sess, req.SessionId)
 	}
+	slog.Debug("Prompt: prepare returned", "sid", req.SessionId, "prefixLen", len(preparePrefix))
 
 	// Store user message. On the very first turn of the session we render the
 	// system prompt (skills + project dir) into sess.SystemPrompt — emitted by
