@@ -112,7 +112,7 @@ func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
 	}
 	slog.Debug("prepare: start", "sid", sid, "cwd", sess.Cwd)
 	llmChanged := a.ensureLLM(ctx, sess, sid)
-	envChanged, envProblems := a.checkEnv(sess)
+	envChanged, envProblems := a.checkEnv(sess, sid)
 	mcpChanged, mcpProblems := a.checkMCP(ctx, sess, sid)
 	if llmChanged || envChanged || mcpChanged {
 		a.notifyCapabilities(ctx, sess, sid)
@@ -395,7 +395,7 @@ type missingTool struct {
 // make, just" card instead of one card per tool. Strictly silent — emits
 // no chat output of its own. Bash and devcontainer are filtered out of
 // knownStacks because they're meta-tooling, not stacks.
-func (a *agent) checkEnv(sess *Session) (bool, []fixProblem) {
+func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	var stacks []string
 	for _, s := range detectStacks(sess.Cwd) {
 		if s == "bash" || s == "devcontainer" {
@@ -410,8 +410,16 @@ func (a *agent) checkEnv(sess *Session) (bool, []fixProblem) {
 	// session start has its skill on disk before the next turn's
 	// systemPrompt loads it. Keyed on FILE presence (justfile / Makefile /
 	// go.mod / ...), not on installed tools — the LLM needs the skill to
-	// know how to install the missing tool. Idempotent.
-	ensureSkills(sess.Cwd, sess.knownStacks, osID())
+	// know how to install the missing tool. Idempotent for stacks /
+	// runners; per-OS pruning is unconditional, and when any other-OS
+	// SKILL was removed we rebuild sess.SystemPrompt right now so the
+	// next LLM call (including proposeFix's runTaskCycle below) sees the
+	// cleaned-up skill set instead of the stale prefix.
+	if pruned := ensureSkills(sess.Cwd, sess.knownStacks, osID()); len(pruned) > 0 {
+		if sp, err := a.systemPrompt(sid); err == nil {
+			sess.SystemPrompt = sp
+		}
+	}
 
 	snap := a.envSnapshot(sess)
 	changed := snap != sess.envSnapshot
@@ -449,14 +457,20 @@ func (a *agent) checkEnv(sess *Session) (bool, []fixProblem) {
 		names.WriteString(m.bin)
 		fmt.Fprintf(&detail, "%s (%s)", m.bin, m.reason)
 	}
+	// Embed the OS we already detected so the LLM doesn't waste a tool
+	// call rediscovering it. The bootstrap step (ensureDevcontainer) only
+	// scaffolds containers based on one of the five supported distros, so
+	// osID() returns a non-empty supported value by the time prepare runs.
+	osid := osID()
 	return changed, []fixProblem{{
 		desc: fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
-		prompt: fmt.Sprintf("Install the following missing dev tools into this devcontainer: %s. "+
-			"For each one: detect the OS from /etc/os-release, run the install via run_command, "+
-			"verify the binary is on PATH, then persist the install in .devcontainer/Dockerfile so "+
-			"a container rebuild keeps it. If any of these integrates as an MCP server (e.g. gopls "+
-			"via mcp-language-server), wire it into .codehalter/mcp.toml as a [[server]] entry so "+
-			"codehalter can call it on the next prompt.", detail.String()),
+		prompt: fmt.Sprintf("Plan installing the missing dev tools (%s) into this %s devcontainer. "+
+			"The plan must produce execute-phase steps (install each tool, persist the install across "+
+			"container rebuilds, wire any MCP-capable tool — e.g. gopls via mcp-language-server — "+
+			"into .codehalter/mcp.toml as a [[server]] entry) AND verify-phase checks (each tool on "+
+			"PATH, persistence in place). The execute phase will run the steps; the verify phase will "+
+			"run the checks.",
+			detail.String(), strings.ToUpper(osid[:1])+osid[1:]),
 	}}
 }
 

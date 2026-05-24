@@ -155,12 +155,16 @@ func ensureDefaults(cwd string) {
 // BEFORE it installs `just` for the user, otherwise the fix-dispatch turn
 // has no idea what justfile syntax looks like.
 //
-// Idempotent — only writes when the file is missing, so user edits to any
-// SKILL file are preserved across re-runs. Called from ensureDefaults at
-// session start AND from checkEnv on every prepare turn so a config file
-// that appears mid-session gets its skill loaded on the next prompt
-// without needing a restart.
-func ensureSkills(cwd string, stacks []string, osid string) {
+// Per-stack and per-runner seeding is idempotent (writes only when the
+// file is missing, so user edits survive). Per-OS handling is stricter:
+// every SKILL-<other-os>.md is deleted unconditionally — codehalter
+// supports exactly one OS per session, and a stale skill from a prior
+// run on a different host would otherwise keep getting concatenated into
+// every system prompt. User edits to the wrong-OS skill are discarded;
+// the returned []string lists what was deleted so the caller can rebuild
+// sess.SystemPrompt from the cleaned-up directory before the next LLM
+// call dispatches.
+func ensureSkills(cwd string, stacks []string, osid string) []string {
 	dir := filepath.Join(cwd, ".codehalter")
 	seed := func(name, body string) {
 		if body == "" {
@@ -190,11 +194,26 @@ func ensureSkills(cwd string, stacks []string, osid string) {
 	if exists("Makefile", "makefile", "GNUmakefile") {
 		seed("SKILL-makefile.md", skillMakefile)
 	}
-	if osid != "" {
-		if body, ok := osSkills[osid]; ok {
-			seed("SKILL-"+osid+".md", body)
+	var pruned []string
+	if osid == "" {
+		return pruned
+	}
+	for other := range osSkills {
+		if other == osid {
+			continue
+		}
+		path := filepath.Join(dir, "SKILL-"+other+".md")
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		if err := os.Remove(path); err == nil {
+			pruned = append(pruned, "SKILL-"+other+".md")
 		}
 	}
+	if body, ok := osSkills[osid]; ok {
+		seed("SKILL-"+osid+".md", body)
+	}
+	return pruned
 }
 
 // agent implements acp.Agent.
@@ -366,6 +385,15 @@ func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 	if a.conn == nil {
 		return
 	}
+	// Zed only knows the parent session id; SessionUpdate for a "sub_*"
+	// sid produces a "Received session notification for unknown session"
+	// warning on every emit. Subagent activity is intentionally not
+	// surfaced to the parent UI (only the final tool result is), so drop
+	// the notification entirely here. The per-session TOML log still
+	// captures the subagent's full message history.
+	if strings.HasPrefix(sid, "sub_") {
+		return
+	}
 	_ = a.conn.SessionUpdate(ctx, sid, u)
 }
 
@@ -407,6 +435,15 @@ func (a *agent) Authenticate(_ context.Context) error {
 func (a *agent) initSession(cwd string, s *Session) error {
 	a.putSession(s)
 	ensureDefaults(cwd)
+	// Always rebuild SystemPrompt from the freshly-seeded .codehalter/
+	// directory. NewSession starts with SystemPrompt == "" so this is the
+	// first-and-only build; LoadSession has a possibly-stale SystemPrompt
+	// from a prior run on a different host (different OS skill set), and
+	// we must overwrite it BEFORE prepare's proposeFix can dispatch an
+	// LLM call carrying the stale prefix.
+	if sp, err := a.systemPrompt(s.ID); err == nil {
+		s.SystemPrompt = sp
+	}
 	settings, err := loadSettings(cwd)
 	if err != nil {
 		return err
@@ -455,16 +492,7 @@ func (a *agent) startIndexing(sid string, cwd string) {
 		slog.Debug("startIndexing: devcontainer ok, about to ensureGitignore", "sid", sid)
 		a.ensureGitignore(ctx, cwd, sid)
 
-		// Seed SystemPrompt before prepare so any proposeFix → runTaskCycle
-		// dispatch sees skills + cwd context, and generateTitle on the first
-		// real user message still picks that message (not the synthetic
-		// install prompt) as the title.
 		sess := a.getSession(sid)
-		if sess != nil && sess.SystemPrompt == "" {
-			if sp, err := a.systemPrompt(sid); err == nil {
-				sess.SystemPrompt = sp
-			}
-		}
 		if sess != nil {
 			slog.Debug("startIndexing: gitignore done, about to prepare", "sid", sid)
 			a.prepare(ctx, sess, sid)
