@@ -1,64 +1,53 @@
 # Debian skill
 
-Container base is Debian ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}},
-codename={{VERSION_CODENAME}}). Package manager is `apt` / `apt-get`; the
-C library is glibc. Stable repos prioritise stability over freshness, so
-versions can be months or years behind upstream. The codename above
-determines which suites apt sees.
+Base is Debian ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}},
+codename={{VERSION_CODENAME}}). Pkg manager is `apt`/`apt-get`; libc is
+glibc. Stable repos prioritise stability over freshness — versions can be
+months/years behind upstream.
 
-You are running as the non-root user `dev` (sudo is configured NOPASSWD).
-Prefix all package-management commands (`apt update`, `apt install`,
-`apt remove`, `apt-get ...`, `dpkg -i`) and any other root-only operation
-with `sudo`. Read-only probes (`apt-cache search`, `apt-cache policy`,
-`dpkg -l`, `dpkg -s`) do NOT need sudo.
+Run as non-root `dev` (sudo NOPASSWD). Prefix `apt update`/`install`/
+`remove`/`apt-get`/`dpkg -i` with `sudo`. Read-only probes (`apt-cache
+search`/`policy`, `dpkg -l`/`-s`) don't need it.
 
 ## Probe (only if needed)
 
-`/etc/os-release` is already reflected in the header above — do NOT re-run
-`cat /etc/os-release`. The remaining probes ARE worth running on demand:
+`/etc/os-release` is reflected in the header — do NOT re-run. Session-
+invariant:
 
-- `apt --version` — apt version.
-- `dpkg -l` — every package currently installed (long; pipe to grep).
-- `dpkg -l <pkg>` — installed version + arch for one package, or "no
-  packages found" if absent.
+- `apt --version`
+- `dpkg -l` — every installed package (long; pipe to grep).
+- `dpkg -l <pkg>` — installed version + arch, or "no packages found".
 - `dpkg -s <pkg>` — detailed status (depends, conflicts, size).
-
-These are session-invariant for the life of the container — once you see
-the answer in a tool result this turn, don't re-run them.
 
 ## Search and install
 
-- `apt update` — refresh the index. Required after any change to
-  `/etc/apt/sources.list*`; otherwise occasional. Cheap.
-- `apt-cache search <pkg>` — fuzzy search across names and descriptions.
-- `apt-cache policy <pkg>` — installed version + candidate version + which
-  source suite ships it. Use this BEFORE installing to see what you'd get.
+- `apt update` — refresh index. Required after editing sources; cheap.
+- `apt-cache search <pkg>` — fuzzy search.
+- `apt-cache policy <pkg>` — installed + candidate + source suite. Check
+  this BEFORE installing to see what you'd get.
 - `apt-cache show <pkg>` — full record.
-- `apt install -y <pkg>` — install (the `-y` skips the y/n prompt).
-- `apt remove <pkg>`, `apt purge <pkg>` — uninstall (purge removes config too).
+- `apt install -y <pkg>` — install (`-y` skips prompt).
+- `apt remove`/`purge <pkg>` — uninstall (purge removes config too).
 
 ## Version staleness
 
-`apt-cache policy <pkg>` is the source of truth — if the Candidate looks
-old for a fast-moving tool (Go, Node, gopls, language servers), check the
-upstream release page with `web_search` first. Common workarounds:
+`apt-cache policy <pkg>` is source of truth. If the Candidate looks old
+for a fast-moving tool, check upstream with `web_search`. Workarounds:
 
-- **Backports**: enable in `/etc/apt/sources.list.d/` then
+- **Backports**: enable in `/etc/apt/sources.list.d/`, then
   `apt install -t bookworm-backports <pkg>`.
-- **Upstream apt repo**: many projects publish a `.list` file + GPG key
-  (Node via NodeSource, Go via various, etc.) — fetch and install per their
-  docs.
-- **Direct download**: tarball / .deb from the upstream release page.
+- **Upstream apt repo**: NodeSource for Node, official Go, etc. — fetch
+  the `.list` + GPG key per their docs.
+- **Direct download**: tarball / .deb from the release page.
 
-Don't claim "version X is not available" without checking the candidate
-and considering backports.
+Don't claim "version X unavailable" without checking the candidate and
+backports.
 
 ## Common gotchas
 
-- `apt` (the friendly CLI) and `apt-get` (the scriptable CLI) overlap but
-  `apt` adds a "Reading package lists..." progress line that breaks naive
-  parsing. Use `apt-get` in scripts.
-- `DEBIAN_FRONTEND=noninteractive apt-get install -y` if a package config
-  prompt would otherwise hang the install.
-- `apt install <pkg>=<version>` to pin a specific version when the
-  candidate isn't what you want.
+- `apt` (friendly) vs `apt-get` (scriptable) — `apt` adds a
+  "Reading package lists..." line that breaks naive parsing. Use
+  `apt-get` in scripts.
+- `DEBIAN_FRONTEND=noninteractive apt-get install -y` if a config prompt
+  would hang.
+- `apt install <pkg>=<version>` to pin a version.
