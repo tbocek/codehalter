@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -72,10 +73,14 @@ func stackProbeBinary(stack string) string {
 // nothing has changed since the previous cycle.
 func (a *agent) prepare(ctx context.Context, sess *Session, sid string) string {
 	if sess == nil {
+		slog.Debug("prepare: nil sess, skipping")
 		return ""
 	}
+	slog.Debug("prepare: start", "sid", sid, "cwd", sess.Cwd)
 	a.ensureLLM(ctx, sess, sid)
-	return a.prepareStacks(sess)
+	out := a.prepareStacks(sess)
+	slog.Debug("prepare: done", "sid", sid, "hasLLM", a.hasReachableLLM(), "stacks", sess.knownStacks, "monorepo", sess.monorepo, "prefixLen", len(out))
+	return out
 }
 
 // ---------------------------------------------------------------------------
