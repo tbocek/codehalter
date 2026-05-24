@@ -233,6 +233,16 @@ type agent struct {
 	abortReason string
 }
 
+// sendUpdateAndAbort marks the session as do-not-run and emits the reason to
+// chat. Prompt reads a.abortReason under mu and fails every turn until the
+// process is restarted (inside a container).
+func (a *agent) sendUpdateAndAbort(ctx context.Context, sid, reason string) {
+	a.mu.Lock()
+	a.abortReason = reason
+	a.mu.Unlock()
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: reason + "\n"}})
+}
+
 // connKey returns a stable map key for a connection.
 func connKey(c *LLMConnection) string { return c.URL + "\x00" + c.Model }
 

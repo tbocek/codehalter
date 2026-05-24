@@ -29,7 +29,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	const restart = "Start a new Agent Thread (the + button at the top) to re-open the devcontainer setup menu."
 
 	if hasDevcontainer {
-		a.setAbort(ctx, sid, "codehalter is running outside the .devcontainer. "+reopen)
+		a.sendUpdateAndAbort(ctx, sid, "codehalter is running outside the .devcontainer. "+reopen)
 		return false
 	}
 
@@ -39,7 +39,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	choice, tcId, err := a.askChoiceWithCard(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
+		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
 
@@ -57,56 +57,33 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		dockerfile = defaultDevcontainerDockerfileUbuntu
 	default:
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
-		a.setAbort(ctx, sid, "Devcontainer setup cancelled. "+restart)
+		a.sendUpdateAndAbort(ctx, sid, "Devcontainer setup cancelled. "+restart)
 		return false
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
+		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
 	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
+		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
 	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(defaultDevcontainerJSON), 0o644); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.setAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
+		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
 
-	seeded := seedBootstraps(cwd, strings.ToLower(choice), detectStacks(cwd))
-
-	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json. " + reopen
-	if len(seeded) > 0 {
-		note += " Also seeded " + strings.Join(seeded, ", ") + " for per-stack dev-tool install."
-	}
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
-	a.setAbort(ctx, sid, note)
-	return false
-}
-
-// setAbort marks the session as do-not-run and emits the reason to chat.
-// Called from ensureDevcontainer; Prompt reads a.abortReason under mu and
-// fails every turn until the process is restarted (inside a container).
-func (a *agent) setAbort(ctx context.Context, sid, reason string) {
-	a.mu.Lock()
-	a.abortReason = reason
-	a.mu.Unlock()
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: reason + "\n"}})
-}
-
-// seedBootstraps writes BOOTSTRAP-<os>-<stack>.md into .codehalter/ for each
-// detected stack that has a template for this OS. Called only from
-// ensureDevcontainer's freshly-created-Dockerfile path, so these one-shot
-// install prompts land alongside the devcontainer they're scoped to.
-// Returns the basenames actually written (skipping stacks with no template,
-// and never overwriting an existing file).
-func seedBootstraps(cwd, osName string, stacks []string) []string {
-	var written []string
-	for _, stack := range stacks {
+	// Seed BOOTSTRAP-<os>-<stack>.md alongside the devcontainer for each
+	// detected stack that has a template. Skip stacks with no template, and
+	// never overwrite — these are one-shot install prompts scoped to a
+	// freshly-scaffolded devcontainer.
+	osName := strings.ToLower(choice)
+	var seeded []string
+	for _, stack := range detectStacks(cwd) {
 		body, ok := defaultBootstraps[osName+"-"+stack]
 		if !ok {
 			continue
@@ -122,9 +99,16 @@ func seedBootstraps(cwd, osName string, stacks []string) []string {
 		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 			continue
 		}
-		written = append(written, name)
+		seeded = append(seeded, name)
 	}
-	return written
+
+	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json. " + reopen
+	if len(seeded) > 0 {
+		note += " Also seeded " + strings.Join(seeded, ", ") + " for per-stack dev-tool install."
+	}
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
+	a.sendUpdateAndAbort(ctx, sid, note)
+	return false
 }
 
 // ---------------------------------------------------------------------------
