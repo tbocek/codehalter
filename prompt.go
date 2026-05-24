@@ -323,7 +323,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	sess := a.getSession(sid)
 
 	a.sendPhase(ctx, sid, 0, false)
-	firstConn, plan, firstToolUses, err := a.planAndAsk(ctx, sid, "")
+	plan, firstToolUses, err := a.planAndAsk(ctx, sid, "")
 	if err != nil {
 		if isCancelled(err) {
 			return toolLoopResult{}, err
@@ -408,7 +408,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		}
 
 		a.sendPhase(ctx, sid, 0, false)
-		_, newPlan, _, err := a.planAndAsk(ctx, sid, replanCtx)
+		newPlan, _, err := a.planAndAsk(ctx, sid, replanCtx)
 		if err != nil {
 			if isCancelled(err) {
 				return lastResult, err
@@ -426,14 +426,12 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		plan = newPlan
 	}
 
-	// Document phase: fire once at the end of a successful prompt.
-	if firstConn != nil {
-		a.sendPhase(ctx, sid, 2, false)
-		lastResult, _ = a.document(ctx, sid, firstConn, lastResult)
-		a.sendPhase(ctx, sid, 2, true)
-	} else {
-		a.sendPhase(ctx, sid, 1, true)
-	}
+	// Document phase: fire once at the end of a successful prompt. Routes
+	// to a non-foreground LLM entry internally so llm[0]'s prefix cache
+	// isn't evicted by a one-shot README update.
+	a.sendPhase(ctx, sid, 2, false)
+	lastResult, _ = a.document(ctx, sid, lastResult)
+	a.sendPhase(ctx, sid, 2, true)
 
 	return lastResult, nil
 }

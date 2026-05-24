@@ -458,6 +458,15 @@ func (s *Session) drainShadow() string {
 	return out
 }
 
+// peekShadow returns the accumulated structured notes WITHOUT draining the
+// buffer. Used by the document phase to read per-turn summaries while still
+// letting compressHistory drain them at the next compaction.
+func (s *Session) peekShadow() string {
+	s.shadowMu.Lock()
+	defer s.shadowMu.Unlock()
+	return s.shadowSummary.String()
+}
+
 // SetTitle updates the session title under the lock. Used by generateTitle
 // (background goroutine) and retitle (from compressHistory).
 func (s *Session) SetTitle(t string) {

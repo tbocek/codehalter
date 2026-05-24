@@ -396,7 +396,7 @@ func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task 
 	subSess.AddUser(instructions)
 	_ = subSess.Save()
 
-	_, plan, _, err := a.planAndAsk(ctx, sid, "")
+	plan, _, err := a.planAndAsk(ctx, sid, "")
 	if err != nil {
 		return "", err
 	}

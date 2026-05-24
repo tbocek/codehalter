@@ -51,24 +51,24 @@ type planResult struct {
 // runPlanLLM appends PLAN.md (plus an optional replanContext on retries) as a
 // fresh user message, runs the planning LLM, persists the JSON response as
 // the trailing assistant turn, and returns the parsed plan. Returns
-// (nil, nil, nil, err) when no LLM is configured. Returns (thinking, nil, ...)
-// when there's no PLAN.md, the tool loop fails, or the response can't be
-// parsed even after one corrective retry — callers treat any of those as
-// "no plan, proceed without one".
+// (nil, nil, err) when no LLM is configured. Returns (nil, ...) when there's
+// no PLAN.md, the tool loop fails, or the response can't be parsed even
+// after one corrective retry — callers treat any of those as "no plan,
+// proceed without one".
 //
 // replanContext is "" on the first planning pass; on a replan the orchestrator
 // supplies a short note (e.g. "REPLAN: prior attempt failed — see history.
 // Same failure surfaced N times — try a structurally different approach.")
 // The actual failure detail is already in history on the preceding executor
 // response, so we don't repeat it here.
-func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string) (*LLMConnection, *planResult, []ToolUse, error) {
+func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
 	thinking := a.pickAvailable(ctx, sid, "thinking")
 	if thinking == nil {
-		return nil, nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
+		return nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
 	}
 	planPrompt := a.loadPromptFile(sid, "PLAN.md")
 	if planPrompt == "" {
-		return thinking, nil, nil, nil
+		return nil, nil, nil
 	}
 	if replanContext != "" {
 		planPrompt = planPrompt + "\n\n" + replanContext
@@ -104,13 +104,13 @@ func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string
 		"launch_subagent": true,
 	}}, "plan", &plan)
 	if err != nil {
-		return thinking, nil, planRes.ToolUses, nil
+		return nil, planRes.ToolUses, nil
 	}
 	if sess != nil && planRes.Text != "" {
 		sess.UpsertLastAssistant(planRes.Text)
 		_ = sess.Save()
 	}
-	return thinking, &plan, planRes.ToolUses, nil
+	return &plan, planRes.ToolUses, nil
 }
 
 // renderSubtasks shows the planned subtask list to the user and returns the
@@ -158,14 +158,13 @@ func appendAssistantNote(sess *Session, note string) {
 // confirmation per plan / per replan so the user sees the full subtask list
 // before deciding.
 //
-// Returns the LLM connection, the parsed plan (may be nil if parsing failed
-// or there is no PLAN.md), the tool uses performed during planning, and an
-// error. errUserCancelled fires when the user aborts on a clarification
-// prompt.
-func (a *agent) planAndAsk(ctx context.Context, sid string, replanContext string) (*LLMConnection, *planResult, []ToolUse, error) {
-	thinking, plan, toolUses, err := a.runPlanLLM(ctx, sid, replanContext)
+// Returns the parsed plan (may be nil if parsing failed or there is no
+// PLAN.md), the tool uses performed during planning, and an error.
+// errUserCancelled fires when the user aborts on a clarification prompt.
+func (a *agent) planAndAsk(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
+	plan, toolUses, err := a.runPlanLLM(ctx, sid, replanContext)
 	if err != nil || plan == nil {
-		return thinking, plan, toolUses, err
+		return plan, toolUses, err
 	}
 	sess := a.getSession(sid)
 
@@ -185,7 +184,7 @@ func (a *agent) planAndAsk(ctx context.Context, sid string, replanContext string
 			if sess != nil {
 				_ = sess.Save()
 			}
-			return nil, nil, toolUses, errUserCancelled
+			return nil, toolUses, errUserCancelled
 		}
 
 		appendAssistantNote(sess, "User chose: "+choice)
@@ -195,7 +194,7 @@ func (a *agent) planAndAsk(ctx context.Context, sid string, replanContext string
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Understood: " + choice + "\n"}})
 	}
 
-	return thinking, plan, toolUses, nil
+	return plan, toolUses, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -285,26 +284,63 @@ func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx,
 // Document phase (runs once at end of a successful prompt)
 // ---------------------------------------------------------------------------
 
-// document runs after every subtask in the prompt has succeeded. It appends
-// DOCUMENT.md as a fresh user message and runs the thinking LLM so it can
-// update (or create) the project README when the change is user-visible.
+// document runs after every subtask in the prompt has succeeded. It routes
+// to a non-foreground LLM entry (falling back to llm[0] on single-LLM
+// setups) with a minimal stateless input: DOCUMENT.md as the instructions,
+// plus the per-turn shadow notes and earlier-conversation summary as the
+// only context. No system prompt, no conversation history — llm[0]'s prefix
+// cache stays warm and the documenter sees a small focused message.
 // DOCUMENT.md self-skips when no documentation update is warranted.
-func (a *agent) document(ctx context.Context, sid string, conn *LLMConnection, exec toolLoopResult) (toolLoopResult, error) {
+func (a *agent) document(ctx context.Context, sid string, exec toolLoopResult) (toolLoopResult, error) {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
 	if docPrompt == "" {
 		return exec, nil
 	}
 
 	sess := a.getSession(sid)
+
+	// Prefer a non-foreground slot so llm[0]'s warm cache isn't evicted.
+	// Falls back to MainLLM when only one entry is configured.
+	conn := a.pickBackgroundLLM(sid)
+	if conn == nil {
+		conn = a.settings.MainLLM("thinking")
+	}
+	if conn == nil {
+		return exec, nil
+	}
+
+	// Wait for in-flight per-turn shadow notes so the summary we feed the
+	// documenter reflects everything that happened on this turn — without
+	// the wait, the most recent subtask's note may not have landed yet.
+	if sess != nil {
+		sess.summariseJob.Wait()
+	}
+
+	var summaryParts []string
+	if sess != nil {
+		if sess.Summary != "" {
+			summaryParts = append(summaryParts, "## Earlier conversation summary\n\n"+sess.Summary)
+		}
+		if shadow := sess.peekShadow(); shadow != "" {
+			summaryParts = append(summaryParts, "## Per-turn notes\n\n"+shadow)
+		}
+	}
+	summaryBlock := strings.Join(summaryParts, "\n\n")
+	if summaryBlock == "" {
+		summaryBlock = "(no turn summary available — assume nothing user-visible changed)"
+	}
+
+	userMsg := docPrompt + "\n\n---\n\n# Turn summary (your only context)\n\n" + summaryBlock
+
+	// Mirror the document instruction into session history for display so
+	// the user can see the documenter ran. The LLM call itself does not see
+	// this message — it sees only `messages` below.
 	if sess != nil {
 		sess.AddUser(docPrompt)
 		_ = sess.Save()
 	}
 
-	var messages []llmMessage
-	if sess != nil {
-		messages = a.buildLLMHistory(sess, -1)
-	}
+	messages := []llmMessage{{Role: "user", Content: userMsg}}
 	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "document", 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
