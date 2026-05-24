@@ -22,6 +22,12 @@ var defaultExecuteMD string
 //go:embed docs/DOCUMENT.md
 var defaultDocumentMD string
 
+//go:embed docs/SUMMARIZE.md
+var summarizePrompt string
+
+//go:embed docs/TITLE.md
+var titlePrompt string
+
 //go:embed docs/SKILL-go.md
 var skillGo string
 
@@ -266,8 +272,10 @@ type agent struct {
 	// the server-reported n_ctx divided by parallelCap, since llama.cpp's
 	// `-c N -np K` splits the total across K slots. Discovered by the startup
 	// probe (/props.n_ctx or /v1/models --ctx-size). 0 means unknown (probe
-	// failed or server didn't report it) — compaction then falls back to the
-	// rawBufferTokens constant. compressHistory reads this; nothing else should.
+	// failed or server didn't report it); ensureLLM treats that as a hard
+	// failure and loops on a Retry card until n_ctx is discoverable, so any
+	// turn that runs can assume this is > 0. compressHistory reads this;
+	// nothing else should.
 	mainSlotTokens int
 
 	// slotSems caps concurrent LLM calls per configured [[llm]] entry —

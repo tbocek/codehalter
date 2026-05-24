@@ -130,20 +130,21 @@ func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
 // ensureLLM — settings load, probe, Retry-card loop
 // ---------------------------------------------------------------------------
 
-// ensureLLM blocks until at least one [[llm]] connection answers a probe.
-// First call scaffolds .codehalter/settings.toml if neither the global nor
-// the project-local file exists. The probe is skipped when both the merged
-// settings-file hash matches sess.llmHash AND at least one connection
-// answered the previous probe — i.e. the file the user could have edited
-// hasn't actually changed AND we know we have a working route. A single
-// "Retry" tool card is shown when no connection is reachable; clicking it
-// always re-probes regardless of hash (the user may have changed network
-// settings outside the file).
+// ensureLLM blocks until at least one [[llm]] connection answers a probe
+// AND llm[0] reports its context window. First call scaffolds
+// .codehalter/settings.toml if neither the global nor the project-local
+// file exists. The probe is skipped when both the merged settings-file
+// hash matches sess.llmHash AND the previous probe satisfied both gates
+// (reachability and known n_ctx) — i.e. the file the user could have
+// edited hasn't actually changed AND we know we have a working route.
+// A single "Retry" tool card is shown when either gate fails; clicking
+// it always re-probes regardless of hash (the user may have changed
+// network or launch settings outside the file).
 //
 // Returns true when something observable changed since the last call
-// (new hash, new reachability) — prepare uses this to decide whether to
-// re-emit the consolidated capabilities banner. Steady-state turns
-// short-circuit and return false.
+// (new hash, new reachability, or n_ctx newly discovered) — prepare uses
+// this to decide whether to re-emit the consolidated capabilities banner.
+// Steady-state turns short-circuit and return false.
 //
 // There is no Abort: codehalter cannot function without an LLM. In auto-
 // answer modes (autopilot, subagents) we cap retries at 3 to avoid
@@ -153,7 +154,7 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 	auto, _ := a.shouldAutoAnswer(sid)
 	const autoCap = 3
 	prevHash := sess.llmHash
-	prevReachable := a.hasReachableLLM()
+	prevReady := a.hasReachableLLM() && a.mainSlotTokens > 0
 	forceRetry := false
 	for attempt := 0; ; attempt++ {
 		if loaded, err := loadSettings(sess.Cwd); err == nil {
@@ -168,21 +169,29 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 			}
 		}
 		currentHash := hashSettingsFiles(sess.Cwd)
-		if !forceRetry && currentHash != "" && currentHash == sess.llmHash && a.hasReachableLLM() {
+		if !forceRetry && currentHash != "" && currentHash == sess.llmHash && a.hasReachableLLM() && a.mainSlotTokens > 0 {
 			return false
 		}
 		a.probeAllLLMs(ctx)
 		sess.llmHash = currentHash
-		if a.hasReachableLLM() {
-			return sess.llmHash != prevHash || !prevReachable
+		ready := a.hasReachableLLM() && a.mainSlotTokens > 0
+		if ready {
+			return sess.llmHash != prevHash || !prevReady
 		}
 		if auto && attempt >= autoCap-1 {
-			return sess.llmHash != prevHash || prevReachable
+			return sess.llmHash != prevHash || prevReady
 		}
-		tcId, err := a.askAcknowledgeWithCard(ctx, sid, "LLM not reachable — edit settings.toml, then click Retry", "think", "Retry")
+		var msg string
+		switch {
+		case !a.hasReachableLLM():
+			msg = "LLM not reachable — edit settings.toml, then click Retry"
+		default:
+			msg = "LLM reachable but server didn't report a context size (n_ctx). Codehalter needs this to size compaction safely. Restart your server with the context size set on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`, llama-server: ensure /props is enabled), then click Retry."
+		}
+		tcId, err := a.askAcknowledgeWithCard(ctx, sid, msg, "think", "Retry")
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return sess.llmHash != prevHash || prevReachable
+			return sess.llmHash != prevHash || prevReady
 		}
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Retrying LLM probe")})
 		forceRetry = true
@@ -328,7 +337,7 @@ func (a *agent) renderLLMStatus() string {
 			fmt.Fprintf(&b, "✅ Context window: %d tokens (compact at ~%d)\n\n", a.mainSlotTokens, a.compactTriggerTokens())
 		}
 	} else {
-		fmt.Fprintf(&b, "🟡 Context window: unknown — server didn't report n_ctx, using default compact trigger %d\n\n", rawBufferTokens)
+		b.WriteString("🟡 Context window: unknown — server didn't report n_ctx. Restart with the context size set on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`) so codehalter can size compaction.\n\n")
 	}
 	return b.String()
 }

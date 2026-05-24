@@ -468,7 +468,7 @@ func (s *Session) peekShadow() string {
 }
 
 // SetTitle updates the session title under the lock. Used by generateTitle
-// (background goroutine) and retitle (from compressHistory).
+// (background goroutine).
 func (s *Session) SetTitle(t string) {
 	s.mu.Lock()
 	s.Title = t

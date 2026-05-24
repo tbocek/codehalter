@@ -140,11 +140,20 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// parse the stream and write a single aggregated RESPONSE block at the
 	// end. Mid-stream events (HTTP errors, partial state on transport
 	// failure) are appended inline below. Closed on return.
+	// Header records llm[<slot>] alongside the role+model so a grep for
+	// "llm[1]" surfaces every request routed to a given entry — useful for
+	// confirming that document / summarise / git_commit landed off the
+	// foreground prefix cache. slot=-1 (test mocks, probes) renders as "?".
+	slotLabel := "?"
+	if slot >= 0 {
+		slotLabel = fmt.Sprintf("%d", slot)
+	}
+	connLabel := fmt.Sprintf("llm[%s] %s model=%s", slotLabel, conn.Tag, conn.Model)
 	logF := a.sessionLog(sid)
 	if logF != nil {
 		defer logF.Close()
 		fmt.Fprintf(logF, "\n=== %s [%s] REQUEST ===\n%s\n",
-			time.Now().Format(time.RFC3339), conn.Tag, string(body))
+			time.Now().Format(time.RFC3339), connLabel, string(body))
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", conn.URL, bytes.NewReader(body))
@@ -255,7 +264,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		writeResponseLog(logF, fullText.String(), reasoningText.String(), calls, err)
+		writeResponseLog(logF, connLabel, fullText.String(), reasoningText.String(), calls, err)
 		return fullText.String(), calls, fmt.Errorf("reading SSE stream: %w", err)
 	}
 
@@ -272,11 +281,11 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	if finishReason == "length" {
 		err := fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
 			conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)
-		writeResponseLog(logF, fullText.String(), reasoningText.String(), calls, err)
+		writeResponseLog(logF, connLabel, fullText.String(), reasoningText.String(), calls, err)
 		return fullText.String(), calls, err
 	}
 
-	writeResponseLog(logF, fullText.String(), reasoningText.String(), calls, nil)
+	writeResponseLog(logF, connLabel, fullText.String(), reasoningText.String(), calls, nil)
 	return fullText.String(), calls, nil
 }
 
@@ -285,11 +294,11 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 // tool-call argument blob) — useless for skimming. This collapses all the
 // deltas into the reconstructed text and tool calls so the log reads like a
 // transcript instead of a packet capture.
-func writeResponseLog(logF *os.File, text, reasoning string, calls []toolCall, streamErr error) {
+func writeResponseLog(logF *os.File, connLabel, text, reasoning string, calls []toolCall, streamErr error) {
 	if logF == nil {
 		return
 	}
-	fmt.Fprintln(logF, "=== RESPONSE ===")
+	fmt.Fprintf(logF, "=== [%s] RESPONSE ===\n", connLabel)
 	if reasoning != "" {
 		fmt.Fprintf(logF, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
 	}
@@ -318,7 +327,8 @@ type probeResult struct {
 	ImageSupport bool
 	// ContextSize is the model's max prompt+output tokens as reported by
 	// /props (n_ctx) or /v1/models launch args (--ctx-size / -c). 0 means
-	// unknown — caller falls back to rawBufferTokens for compaction sizing.
+	// unknown — ensureLLM blocks the session on a Retry card until the
+	// server starts reporting this.
 	ContextSize int
 }
 

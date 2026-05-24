@@ -70,7 +70,10 @@ func readDedupKey(path string, line, limit int) string {
 	return fmt.Sprintf("%s|%d|%d", path, line, limit)
 }
 
-// listProjectFiles returns relative paths of all files under root, skipping common junk dirs.
+// listProjectFiles returns relative paths of all files under root, skipping
+// common junk dirs. The skipDirs filter only applies to descendants — if the
+// caller explicitly points us at e.g. `.codehalter`, they want its contents,
+// not an empty result because the dir name matches the junk list.
 func listProjectFiles(root string) []string {
 	var files []string
 	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -78,7 +81,7 @@ func listProjectFiles(root string) []string {
 			return nil
 		}
 		if d.IsDir() {
-			if skipDirs[d.Name()] {
+			if path != root && skipDirs[d.Name()] {
 				return filepath.SkipDir
 			}
 			return nil

@@ -8,13 +8,6 @@ import (
 )
 
 const (
-	// rawBufferTokens is the FALLBACK compaction trigger used only when the
-	// startup probe couldn't discover the model's context window. When n_ctx
-	// is known, compactTriggerTokens computes the trigger from it instead so
-	// the threshold scales to the actual model. Keep this conservative — a
-	// fallback firing too late costs more than firing slightly early.
-	rawBufferTokens = 60000
-
 	// compactOverheadTokens reserves space for everything that isn't the
 	// Messages array: system prompt + tool schemas (~5-6k), pending user
 	// turn (1-3k), output budget (4-8k). Subtracted from the model's n_ctx
@@ -39,24 +32,15 @@ const (
 	titleFallbackLen  = 50
 
 	// maxSummaryItemBytes caps any single message's content when it's fed
-	// to the summarize LLM. Without this, one giant message (e.g. a tool
-	// dump bigger than rawBufferTokens) would blow through the summarize
-	// model's own context window.
+	// to the summarize LLM. Without this, one giant message (e.g. a huge
+	// tool dump) would blow through the summarize model's own context
+	// window.
 	maxSummaryItemBytes = 20 * 1024
-
-	summarizePrompt = "You are a context summarization assistant. Read the conversation in <conversation>…</conversation> and output a structured summary following the exact format below.\n\n" +
-		"Do NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.\n\n" +
-		"Preserve exact file paths, function names, identifiers, versions, and error messages. Do NOT include source code verbatim — reference the file path and describe what changed. Drop pleasantries and redundant detail.\n\n" +
-		"Format (use these EXACT H2 sections; omit a section by leaving its body empty, but keep the heading):\n\n" +
-		"## Goal\n<what the user wants overall>\n\n" +
-		"## Constraints & Preferences\n<rules / preferences the user has stated>\n\n" +
-		"## Progress\n### Done\n- [x] <completed item>\n### In Progress\n- [ ] <item being worked on>\n### Blocked\n- [ ] <item blocked, with reason>\n\n" +
-		"## Key Decisions\n<decisions already made — what + why>\n\n" +
-		"## Next Steps\n<what's queued or open>\n\n" +
-		"## Critical Context\n<paths, identifiers, versions, error strings that must not be lost>"
-	titlePrompt   = "Generate a very short title (max 6 words) for this conversation. Reply with only the title, nothing else."
-	retitlePrompt = "Generate a very short title (max 6 words) for this conversation based on the summary below. Reply with only the title, nothing else.\n\n"
 )
+
+// summarizePrompt and titlePrompt are embedded from docs/SUMMARIZE.md and
+// docs/TITLE.md (see main.go go:embed directives) — kept in plain markdown
+// so the prompt can be edited without touching Go source.
 
 // estimateTokens gives a rough token count for a string.
 func estimateTokens(s string) int {
@@ -66,12 +50,10 @@ func estimateTokens(s string) int {
 // compactTriggerTokens returns the estimated-token threshold at which
 // compressHistory should fire. Derived from llm[0]'s n_ctx (discovered by
 // the startup probe): subtract fixed overhead, then apply compactSafetyPct
-// to absorb estimator bias. Falls back to rawBufferTokens when n_ctx is
-// unknown (offline tests, server didn't report it).
+// to absorb estimator bias. ensureLLM guarantees a.mainSlotTokens > 0
+// before any turn runs, so there is no fallback path here — an unknown
+// context size is a hard prepare-time failure.
 func (a *agent) compactTriggerTokens() int {
-	if a.mainSlotTokens <= 0 {
-		return rawBufferTokens
-	}
 	avail := a.mainSlotTokens - compactOverheadTokens
 	if avail < minCompactTrigger {
 		return minCompactTrigger
@@ -108,8 +90,7 @@ func estimateMessagesTokens(msgs []Message) int {
 //
 // sess.mu is held across the whole routine so the background generateTitle
 // goroutine cannot interleave a Save() (or read stale Messages while they're
-// being resliced). retitle reacquires the lock via SetTitle, so we release
-// before calling it.
+// being resliced).
 func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	sess.mu.Lock()
 	if estimateMessagesTokens(sess.Messages) <= a.compactTriggerTokens() {
@@ -192,8 +173,6 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	sess.mu.Unlock()
 
 	a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("🗜 History compacted — archived as %s\n\n", archiveID)}})
-
-	a.retitle(ctx, sess)
 }
 
 // clipBytes truncates s to at most max bytes, leaving a marker in the middle
@@ -420,29 +399,6 @@ func trimTitle(title string) string {
 		title = title[:maxTitleLen]
 	}
 	return title
-}
-
-// retitle updates the session title based on the current summary. Same
-// routing as generateTitle — main → LLM[0], subagent → pinned LLM[i].
-func (a *agent) retitle(ctx context.Context, sess *Session) {
-	if sess.Summary == "" {
-		return
-	}
-	conn := a.pickAvailable(ctx, sess.ID, "thinking")
-	if conn == nil {
-		return // already warned in compressHistory
-	}
-	messages := []llmMessage{{Role: "user", Content: retitlePrompt + sess.Summary}}
-	title, err := a.llmSimple(ctx, sess.ID, conn, messages)
-	if err != nil {
-		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Retitle failed: " + err.Error() + "\n"}})
-		return
-	}
-	if title == "" {
-		return
-	}
-	sess.SetTitle(trimTitle(title))
-	_ = sess.Save()
 }
 
 // buildLLMHistory constructs the LLM message array from the session's stored
