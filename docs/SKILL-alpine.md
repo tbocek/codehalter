@@ -1,13 +1,15 @@
 # Alpine skill
 
-Container base is Alpine Linux (`/etc/os-release` ID=alpine). Package
-manager is `apk`; the C library is musl, not glibc — pre-built binaries
-linked against glibc generally won't run, so prefer Alpine packages or
-static binaries.
+Container base is Alpine Linux ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}}).
+Package manager is `apk`; the C library is musl, not glibc — pre-built
+binaries linked against glibc generally won't run, so prefer Alpine
+packages or static binaries.
 
-## Probe first
+## Probe (only if needed)
 
-- `cat /etc/os-release` — version (VERSION_ID), pretty name.
+`/etc/os-release` is already reflected in the header above — do NOT re-run
+`cat /etc/os-release`. The remaining probes ARE worth running on demand:
+
 - `apk --version` — apk-tools version.
 - `apk list -I` — every package currently installed (long; pipe to grep).
 - `apk info <pkg>` — installed version + description for one package.

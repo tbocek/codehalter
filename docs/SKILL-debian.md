@@ -1,14 +1,16 @@
 # Debian skill
 
-Container base is Debian (`/etc/os-release` ID=debian). Package manager
-is `apt` / `apt-get`; the C library is glibc. Stable repos prioritise
-stability over freshness, so versions can be months or years behind
-upstream.
+Container base is Debian ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}},
+codename={{VERSION_CODENAME}}). Package manager is `apt` / `apt-get`; the
+C library is glibc. Stable repos prioritise stability over freshness, so
+versions can be months or years behind upstream. The codename above
+determines which suites apt sees.
 
-## Probe first
+## Probe (only if needed)
 
-- `cat /etc/os-release` — version codename (VERSION_CODENAME: bookworm,
-  bullseye, trixie, sid) determines which suites apt sees.
+`/etc/os-release` is already reflected in the header above — do NOT re-run
+`cat /etc/os-release`. The remaining probes ARE worth running on demand:
+
 - `apt --version` — apt version.
 - `dpkg -l` — every package currently installed (long; pipe to grep).
 - `dpkg -l <pkg>` — installed version + arch for one package, or "no

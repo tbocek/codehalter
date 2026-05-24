@@ -1,12 +1,15 @@
 # Fedora skill
 
-Container base is Fedora (`/etc/os-release` ID=fedora). Package manager
-is `dnf` (the `yum` alias still works for legacy commands). Fedora
-releases every ~6 months, so packages stay relatively fresh.
+Container base is Fedora ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}}).
+Package manager is `dnf` (the `yum` alias still works for legacy
+commands). Fedora releases every ~6 months, so packages stay relatively
+fresh.
 
-## Probe first
+## Probe (only if needed)
 
-- `cat /etc/os-release` — version (VERSION_ID like "40", "41").
+`/etc/os-release` is already reflected in the header above — do NOT re-run
+`cat /etc/os-release`. The remaining probes ARE worth running on demand:
+
 - `dnf --version` — dnf + python-dnf versions.
 - `rpm -qa` — every installed package (long; pipe to grep).
 - `rpm -q <pkg>` — installed version, or "package not installed".

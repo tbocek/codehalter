@@ -103,9 +103,9 @@ var defaultSkills = map[string]string{
 	"bash": skillBash,
 }
 
-// osSkills maps an /etc/os-release ID (as returned by osID) to the
+// osSkills maps an /etc/os-release ID (as returned by readOSInfo) to the
 // embedded skill body. Only IDs we have a SKILL-<id>.md for are present;
-// osID() filters everything else to "" before lookup.
+// readOSInfo filters everything else to "" before lookup.
 var osSkills = map[string]string{
 	"alpine": skillAlpine,
 	"arch":   skillArch,
@@ -135,7 +135,7 @@ func ensureDefaults(cwd string) {
 			os.WriteFile(path, []byte(f.content), 0o644)
 		}
 	}
-	ensureSkills(cwd, detectStacks(cwd), osID())
+	ensureSkills(cwd, detectStacks(cwd), readOSInfo())
 
 	// mcp.toml — only seeded on first run with the bare placeholder. Per-stack
 	// MCP wiring (e.g. gopls for Go) is the prepare phase's job: it asks the
@@ -160,11 +160,15 @@ func ensureDefaults(cwd string) {
 // every SKILL-<other-os>.md is deleted unconditionally — codehalter
 // supports exactly one OS per session, and a stale skill from a prior
 // run on a different host would otherwise keep getting concatenated into
-// every system prompt. User edits to the wrong-OS skill are discarded;
-// the returned []string lists what was deleted so the caller can rebuild
+// every system prompt. The matching SKILL-<osid>.md is always (re)written
+// from the embed with {{KEY}} placeholders substituted from osi.Fields,
+// because the resolved version values change whenever the container is
+// rebuilt and the LLM needs the current ones to skip the os-release probe.
+// User edits to per-OS skills are discarded; the returned []string lists
+// what other-OS files were deleted so the caller can rebuild
 // sess.SystemPrompt from the cleaned-up directory before the next LLM
 // call dispatches.
-func ensureSkills(cwd string, stacks []string, osid string) []string {
+func ensureSkills(cwd string, stacks []string, osi osInfo) []string {
 	dir := filepath.Join(cwd, ".codehalter")
 	seed := func(name, body string) {
 		if body == "" {
@@ -195,11 +199,11 @@ func ensureSkills(cwd string, stacks []string, osid string) []string {
 		seed("SKILL-makefile.md", skillMakefile)
 	}
 	var pruned []string
-	if osid == "" {
+	if osi.ID == "" {
 		return pruned
 	}
 	for other := range osSkills {
-		if other == osid {
+		if other == osi.ID {
 			continue
 		}
 		path := filepath.Join(dir, "SKILL-"+other+".md")
@@ -210,10 +214,39 @@ func ensureSkills(cwd string, stacks []string, osid string) []string {
 			pruned = append(pruned, "SKILL-"+other+".md")
 		}
 	}
-	if body, ok := osSkills[osid]; ok {
-		seed("SKILL-"+osid+".md", body)
+	if body, ok := osSkills[osi.ID]; ok {
+		rendered := renderOSSkill(body, osi.Fields)
+		path := filepath.Join(dir, "SKILL-"+osi.ID+".md")
+		if cur, err := os.ReadFile(path); err != nil || string(cur) != rendered {
+			os.WriteFile(path, []byte(rendered), 0o644)
+		}
 	}
 	return pruned
+}
+
+// renderOSSkill substitutes {{KEY}} placeholders in the per-OS skill body
+// with the matching /etc/os-release field. Unknown placeholders are
+// replaced with the empty string so the LLM doesn't see literal `{{X}}`
+// when a field is missing on a non-standard image.
+func renderOSSkill(body string, fields map[string]string) string {
+	var b strings.Builder
+	b.Grow(len(body))
+	for {
+		i := strings.Index(body, "{{")
+		if i < 0 {
+			b.WriteString(body)
+			return b.String()
+		}
+		j := strings.Index(body[i+2:], "}}")
+		if j < 0 {
+			b.WriteString(body)
+			return b.String()
+		}
+		b.WriteString(body[:i])
+		key := body[i+2 : i+2+j]
+		b.WriteString(fields[key])
+		body = body[i+2+j+2:]
+	}
 }
 
 // agent implements acp.Agent.
@@ -520,38 +553,48 @@ func containerKind() string {
 	return ""
 }
 
-// osID reads /etc/os-release and returns the distro ID we have a SKILL-*.md
-// for ("alpine", "arch", "debian", "fedora", "ubuntu"), or "" when the file
-// is missing / unparseable / unsupported. ID_LIKE is consulted as a
-// fallback so Linux Mint maps to ubuntu, Manjaro to arch, etc. Cheap file
-// read — safe to call from prepare on every turn.
-func osID() string {
+// osInfo holds the result of parsing /etc/os-release. ID is the
+// supported-distro slug we use to pick a SKILL-*.md (one of "alpine",
+// "arch", "debian", "fedora", "ubuntu"; "" when missing/unsupported).
+// Fields is every key=value pair from the file (un-lowercased values,
+// quotes stripped) — used to substitute {{VERSION_ID}}, {{PRETTY_NAME}},
+// etc. into the per-OS skill body so the LLM doesn't have to probe.
+type osInfo struct {
+	ID     string
+	Fields map[string]string
+}
+
+// readOSInfo parses /etc/os-release. ID_LIKE is consulted as a fallback
+// so Linux Mint maps to ubuntu, Manjaro to arch, etc. Cheap file read —
+// safe to call from prepare on every turn.
+func readOSInfo() osInfo {
+	info := osInfo{Fields: map[string]string{}}
 	data, err := os.ReadFile("/etc/os-release")
 	if err != nil {
-		return ""
+		return info
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		k := line[:eq]
+		v := strings.Trim(line[eq+1:], `"'`)
+		info.Fields[k] = v
 	}
 	supported := map[string]bool{"alpine": true, "arch": true, "debian": true, "fedora": true, "ubuntu": true}
-	parse := func(key string) string {
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, key+"=") {
-				continue
-			}
-			v := strings.TrimPrefix(line, key+"=")
-			v = strings.Trim(v, `"'`)
-			return strings.ToLower(v)
-		}
-		return ""
+	if id := strings.ToLower(info.Fields["ID"]); supported[id] {
+		info.ID = id
+		return info
 	}
-	if id := parse("ID"); supported[id] {
-		return id
-	}
-	for _, alt := range strings.Fields(parse("ID_LIKE")) {
+	for _, alt := range strings.Fields(strings.ToLower(info.Fields["ID_LIKE"])) {
 		if supported[alt] {
-			return alt
+			info.ID = alt
+			return info
 		}
 	}
-	return ""
+	return info
 }
 
 func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSessionResponse, error) {

@@ -415,7 +415,8 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	// SKILL was removed we rebuild sess.SystemPrompt right now so the
 	// next LLM call (including proposeFix's runTaskCycle below) sees the
 	// cleaned-up skill set instead of the stale prefix.
-	if pruned := ensureSkills(sess.Cwd, sess.knownStacks, osID()); len(pruned) > 0 {
+	osi := readOSInfo()
+	if pruned := ensureSkills(sess.Cwd, sess.knownStacks, osi); len(pruned) > 0 {
 		if sp, err := a.systemPrompt(sid); err == nil {
 			sess.SystemPrompt = sp
 		}
@@ -460,8 +461,11 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	// Embed the OS we already detected so the LLM doesn't waste a tool
 	// call rediscovering it. The bootstrap step (ensureDevcontainer) only
 	// scaffolds containers based on one of the five supported distros, so
-	// osID() returns a non-empty supported value by the time prepare runs.
-	osid := osID()
+	// osi.ID is a non-empty supported value by the time prepare runs.
+	distro := osi.Fields["PRETTY_NAME"]
+	if distro == "" {
+		distro = strings.ToUpper(osi.ID[:1]) + osi.ID[1:]
+	}
 	return changed, []fixProblem{{
 		desc: fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
 		prompt: fmt.Sprintf("Plan installing the missing dev tools (%s) into this %s devcontainer. "+
@@ -470,7 +474,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 			"into .codehalter/mcp.toml as a [[server]] entry) AND verify-phase checks (each tool on "+
 			"PATH, persistence in place). The execute phase will run the steps; the verify phase will "+
 			"run the checks.",
-			detail.String(), strings.ToUpper(osid[:1])+osid[1:]),
+			detail.String(), distro),
 	}}
 }
 
@@ -619,6 +623,10 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 		}
 	}
 
+	if skills := listSkills(sess.Cwd); len(skills) > 0 {
+		fmt.Fprintf(&b, "🧠 Skills: %s\n\n", strings.Join(skills, ", "))
+	}
+
 	a.mu.Lock()
 	var mcpRunning []string
 	for name := range a.mcpClients {
@@ -631,6 +639,31 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	}
 
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
+}
+
+// listSkills returns the bare names (no "SKILL-" prefix, no ".md" suffix)
+// of every SKILL-*.md present in .codehalter/, sorted. notifyCapabilities
+// uses this so the user sees in chat which skill bodies got concatenated
+// into the system prompt this turn — implicitly revealing what was
+// pruned (anything missing from the list).
+func listSkills(cwd string) []string {
+	entries, err := os.ReadDir(filepath.Join(cwd, ".codehalter"))
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		n := e.Name()
+		if !strings.HasPrefix(n, "SKILL-") || !strings.HasSuffix(n, ".md") {
+			continue
+		}
+		names = append(names, strings.TrimSuffix(strings.TrimPrefix(n, "SKILL-"), ".md"))
+	}
+	sort.Strings(names)
+	return names
 }
 
 // ---------------------------------------------------------------------------

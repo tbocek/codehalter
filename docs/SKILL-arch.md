@@ -1,13 +1,16 @@
 # Arch skill
 
-Container base is Arch Linux (`/etc/os-release` ID=arch). Package manager
-is `pacman` for the official repos; `yay` (or `paru`) wraps pacman with
-AUR support and is what you almost always want here.
+Container base is Arch Linux ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}}).
+Package manager is `pacman` for the official repos; `yay` (or `paru`)
+wraps pacman with AUR support and is what you almost always want here.
+Arch is rolling, so the VERSION_ID above is just the image build date —
+the practical version is "whatever `pacman -Syu` pulled last".
 
-## Probe first
+## Probe (only if needed)
 
-- `cat /etc/os-release` — Arch is rolling, so VERSION_ID is "TEMPLATE_VERSION_ID"
-  or a date; the practical version is "whatever pacman -Syu pulled last".
+`/etc/os-release` is already reflected in the header above — do NOT re-run
+`cat /etc/os-release`. The remaining probes ARE worth running on demand:
+
 - `pacman --version` — pacman version.
 - `pacman -Q` — every package currently installed (long; pipe to grep).
 - `pacman -Qi <pkg>` — detailed info (version, install reason, depends, size)

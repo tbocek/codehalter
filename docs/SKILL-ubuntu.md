@@ -1,14 +1,16 @@
 # Ubuntu skill
 
-Container base is Ubuntu (`/etc/os-release` ID=ubuntu). Tooling is
-Debian-derived: `apt` / `apt-get` / `dpkg` work identically. The main
-differences from Debian are the suite codenames (jammy, noble, oracular,
-…) and PPAs as an additional source of fresher packages.
+Container base is Ubuntu ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}},
+codename={{UBUNTU_CODENAME}}). Tooling is Debian-derived: `apt` /
+`apt-get` / `dpkg` work identically. The main differences from Debian are
+the suite codenames (jammy, noble, oracular, …) and PPAs as an additional
+source of fresher packages.
 
-## Probe first
+## Probe (only if needed)
 
-- `cat /etc/os-release` — version (VERSION_ID like "24.04") and codename
-  (UBUNTU_CODENAME like "noble").
+`/etc/os-release` is already reflected in the header above — do NOT re-run
+`cat /etc/os-release`. The remaining probes ARE worth running on demand:
+
 - `apt --version`.
 - `dpkg -l` — every installed package (long; pipe to grep).
 - `dpkg -l <pkg>` — installed version, or "no packages found".
