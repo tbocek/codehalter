@@ -631,13 +631,20 @@ func trimJSON(s string) string {
 type toolLoopResult struct {
 	Text     string
 	ToolUses []ToolUse
+	// RespondCalled is true when the loop exited because the model invoked
+	// the registered terminal tool (typically `respond`). False when the
+	// loop exited via the legacy empty-tool-calls path, hit the soft cap,
+	// or returned an error. Subtask runners use this as the primary
+	// success signal — a loop that ran out of turns without calling
+	// `respond` is a failed subtask regardless of what's in res.Text.
+	RespondCalled bool
 	// StartedAt is when the first llmStream call of this loop began.
 	// DurationMs is the cumulative wall-clock time spent in llmStream calls
 	// across all iterations (excludes tool execution). Phase is the pipeline
-	// stage tag passed in by the caller ("plan", "execute", "verify",
-	// "document", "subagent"). Callers that own the final assistant message
-	// (prompt.go, runSubagent) use these to stamp the message they create
-	// after the loop returns.
+	// stage tag passed in by the caller ("plan", "execute", "document",
+	// "subagent"). Callers that own the final assistant message (prompt.go,
+	// runSubagent) use these to stamp the message they create after the
+	// loop returns.
 	StartedAt  time.Time
 	DurationMs int64
 	Phase      string
@@ -694,12 +701,11 @@ func toolCallSig(calls []toolCall) string {
 // merged tool uses from both passes so callers don't lose visibility.
 //
 // Text tokens never stream to the UI here — JSON is internal machinery, and
-// the caller renders the parsed result (renderSteps for plans, verify
-// outcome for verify). Tool calls still surface as cards so the user sees
-// what the planner/verifier is probing.
+// the caller renders the parsed result (renderSteps for plans). Tool calls
+// still surface as cards so the user sees what the planner is probing.
 func (a *agent) runToolLoopJSON(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, dst any) (toolLoopResult, error) {
 	noop := func(string) {}
-	res, err := a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, noop, nil)
+	res, err := a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, noop, nil, 0)
 	if err != nil {
 		return res, err
 	}
@@ -712,7 +718,7 @@ func (a *agent) runToolLoopJSON(ctx context.Context, sid string, conn *LLMConnec
 		llmMessage{Role: "assistant", Content: res.Text},
 		llmMessage{Role: "user", Content: "Your previous reply was not valid JSON. Reply with ONLY the JSON object — first character `{`, last character `}`, nothing before or after. No prose, no markdown fences."},
 	)
-	res2, err := a.runToolLoopOn(ctx, sid, conn, fixMsgs, filter, phase, noop, nil)
+	res2, err := a.runToolLoopOn(ctx, sid, conn, fixMsgs, filter, phase, noop, nil, 0)
 	res.Text = res2.Text
 	res.ToolUses = append(res.ToolUses, res2.ToolUses...)
 	res.DurationMs += res2.DurationMs
@@ -764,8 +770,11 @@ func (a *agent) failureSkillHint(sid string, toolName string) string {
 
 // runToolLoop runs the agentic tool loop with the default token-streaming
 // callback so the user sees execute / document phases live. The internal
-// JSON phases (planner, verifier) call runToolLoopOn directly with a no-op.
-func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string) (toolLoopResult, error) {
+// JSON phases (planner) call runToolLoopOn directly with a no-op. softCap
+// is the per-call soft iteration cap (0 = use the maxToolLoopIterations
+// hard backstop only); when the soft cap is hit, the loop exits gracefully
+// with RespondCalled=false so the caller can treat it as a failed turn.
+func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, softCap int) (toolLoopResult, error) {
 	on := func(token string) {
 		if sid != "" {
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: token}})
@@ -776,17 +785,22 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: token}})
 		}
 	}
-	return a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, on, think)
+	return a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, on, think, softCap)
 }
 
 // runToolLoopOn is the core agentic tool loop: send to LLM, execute tool
 // calls, repeat. Callers supply the per-token callback (default streaming
 // for runToolLoop, no-op for runToolLoopJSON). The phase string ("plan",
-// "execute", "verify", "document", "subagent") flows onto the trailing
-// assistant message via MarkLastAssistantTiming together with the
-// cumulative llmStream wall-clock — so session.toml records who ran the
-// turn and how much of its time was model generation vs tool execution.
-func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, on, think func(string)) (toolLoopResult, error) {
+// "execute", "document", "subagent") flows onto the trailing assistant
+// message via MarkLastAssistantTiming together with the cumulative
+// llmStream wall-clock — so session.toml records who ran the turn and how
+// much of its time was model generation vs tool execution.
+//
+// softCap is an optional per-call soft iteration ceiling. When > 0 and the
+// loop reaches it without the terminal tool firing, the function returns
+// (res, nil) with RespondCalled=false instead of erroring. 0 means "no
+// soft cap — only the maxToolLoopIterations runaway backstop applies".
+func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, on, think func(string), softCap int) (toolLoopResult, error) {
 	tools := llmToolDefinitionsFiltered(filter)
 
 	// termName is the registered Terminal tool exposed in this phase ("" when
@@ -845,6 +859,15 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 			res.Text = allText.String()
 			stampTiming()
 			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
+		}
+		// Soft cap: exit gracefully with RespondCalled=false so the caller
+		// (e.g. the subtask runner) can treat "ran out of turns without
+		// calling respond" as a failure to replan against, rather than as
+		// a hard error.
+		if softCap > 0 && iter >= softCap {
+			res.Text = allText.String()
+			stampTiming()
+			return res, nil
 		}
 		streamStart := time.Now()
 		if res.StartedAt.IsZero() {
@@ -1006,6 +1029,7 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 				on(terminalMessage)
 			}
 			res.Text = terminalMessage
+			res.RespondCalled = true
 			stampTiming()
 			return res, nil
 		}

@@ -324,7 +324,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "please echo hello"}}, toolFilter{}, "execute")
+		[]llmMessage{{Role: "user", Content: "please echo hello"}}, toolFilter{}, "execute", 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "answer me"}}, toolFilter{}, "execute")
+		[]llmMessage{{Role: "user", Content: "answer me"}}, toolFilter{}, "execute", 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -439,7 +439,7 @@ func TestToolLoopRespondExcludedFromJSONPhases(t *testing.T) {
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "plan something"}},
-		toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan")
+		toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -500,7 +500,7 @@ func TestToolLoopNoDedup(t *testing.T) {
 
 	a, s := newTestAgent(t)
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute")
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -552,7 +552,7 @@ func TestToolLoopRepeatNudgeAndBail(t *testing.T) {
 
 	a, s := newTestAgent(t)
 	_, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute")
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
 	if err == nil {
 		t.Fatalf("runToolLoop: want error, got nil")
 	}
@@ -636,7 +636,7 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		t.Fatalf("pickAvailable(execute) returned nil")
 	}
 	_, err := a.runToolLoop(context.Background(), s.ID, conn,
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute")
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -717,7 +717,7 @@ func TestToolLoopEscalatesOnRepeatedArgs(t *testing.T) {
 		t.Fatalf("pickAvailable(execute) returned nil")
 	}
 	_, err := a.runToolLoop(context.Background(), s.ID, conn,
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute")
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}

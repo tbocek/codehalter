@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -348,68 +347,47 @@ func TestEstimateMessagesTokensCountsToolUses(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// verify.go JSON parse fallback
+// Plan schema deserialisation
 // ---------------------------------------------------------------------------
 
-// TestVerifyJSONParseFallback exercises the graceful-degradation path: when
-// the verify LLM returns non-JSON, we issue one corrective retry; if that
-// also fails to parse, we swallow the error and treat verification as
-// successful so the pipeline still progresses.
-func TestVerifyJSONParseFallback(t *testing.T) {
-	a, s := newTestAgent(t)
-
-	// Drop a VERIFY.md into the session's .codehalter dir.
-	verifyPath := filepath.Join(s.Cwd, ".codehalter", "VERIFY.md")
-	if err := os.WriteFile(verifyPath, []byte("Check that X is true."), 0644); err != nil {
-		t.Fatalf("write VERIFY.md: %v", err)
-	}
-
-	mock := newMockLLM(t,
-		sseText("this is not JSON at all"),
-		sseText("still not JSON"),
-	)
-	defer mock.Close()
-
-	res := toolLoopResult{Text: "my previous response"}
-	out, vr, err := a.verify(context.Background(), s.ID, mock.conn("execute"), nil, res)
-	if err != nil {
-		t.Fatalf("verify returned error: %v", err)
-	}
-	if vr == nil || !vr.Success {
-		t.Errorf("expected Success=true fallback, got %+v", vr)
-	}
-	if out.Text != res.Text {
-		t.Errorf("expected res unchanged, got %q", out.Text)
-	}
-	if mock.callCount() != 2 {
-		t.Errorf("expected 2 LLM calls (initial + retry), got %d", mock.callCount())
-	}
-}
-
-// TestPlanResultSubtasksDeserialize ensures the new `subtasks` field on
-// planResult round-trips from the JSON the planner emits. This is the seam
-// Prompt branches on to enter the decomposed plan→execute→verify flow.
+// TestPlanResultSubtasksDeserialize ensures the planner's JSON output (an
+// array of `{description, verify}` objects under `subtasks`) round-trips into
+// the planResult / subtask structs the orchestrator consumes. This is the
+// contract between PLAN.md and runSubtaskLoop.
 func TestPlanResultSubtasksDeserialize(t *testing.T) {
-	raw := `{"clear":true,"complexity":"complex","steps":[],"subtasks":["refactor storage","update API","write migration"]}`
+	raw := `{
+		"clear": true,
+		"subtasks": [
+			{"description": "refactor storage", "verify": ["go build ./...", "go test ./storage/..."]},
+			{"description": "update API", "verify": ["curl /healthz"]},
+			{"description": "write migration"}
+		]
+	}`
 	var p planResult
 	if err := json.Unmarshal([]byte(raw), &p); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if !slices.Equal(p.Subtasks, []string{"refactor storage", "update API", "write migration"}) {
-		t.Errorf("subtasks: got %v", p.Subtasks)
+	if len(p.Subtasks) != 3 {
+		t.Fatalf("subtasks: want 3, got %d", len(p.Subtasks))
 	}
-	if len(p.Steps) != 0 {
-		t.Errorf("steps should be empty when subtasks set, got %v", p.Steps)
+	if p.Subtasks[0].Description != "refactor storage" {
+		t.Errorf("subtasks[0].Description = %q", p.Subtasks[0].Description)
+	}
+	if !slices.Equal(p.Subtasks[0].Verify, []string{"go build ./...", "go test ./storage/..."}) {
+		t.Errorf("subtasks[0].Verify = %v", p.Subtasks[0].Verify)
+	}
+	if len(p.Subtasks[2].Verify) != 0 {
+		t.Errorf("subtasks[2].Verify should be empty (omitempty), got %v", p.Subtasks[2].Verify)
 	}
 
-	// Backward-compat: old-style plan with only steps leaves Subtasks nil.
-	rawOld := `{"clear":true,"complexity":"simple","steps":["edit foo.go"]}`
+	// report_only round-trips so confirmPlan can skip the gate.
+	rawReport := `{"clear": true, "report_only": true, "subtasks": [{"description": "summarise X"}]}`
 	var p2 planResult
-	if err := json.Unmarshal([]byte(rawOld), &p2); err != nil {
-		t.Fatalf("unmarshal legacy: %v", err)
+	if err := json.Unmarshal([]byte(rawReport), &p2); err != nil {
+		t.Fatalf("unmarshal report_only: %v", err)
 	}
-	if len(p2.Subtasks) != 0 {
-		t.Errorf("expected no subtasks for legacy plan, got %v", p2.Subtasks)
+	if !p2.ReportOnly {
+		t.Errorf("expected report_only=true")
 	}
 }
 

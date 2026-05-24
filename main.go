@@ -19,9 +19,6 @@ var defaultPlanMD string
 //go:embed docs/EXECUTE.md
 var defaultExecuteMD string
 
-//go:embed docs/VERIFY.md
-var defaultVerifyMD string
-
 //go:embed docs/DOCUMENT.md
 var defaultDocumentMD string
 
@@ -112,9 +109,9 @@ var osSkills = map[string]string{
 }
 
 // ensureDefaults copies embedded default files into .codehalter/ if they don't exist.
-// Phase prompts (PLAN/EXECUTE/VERIFY/DOCUMENT) and the always-on container
-// skill are seeded here. Per-stack / per-runner / per-OS SKILL files are
-// handled by ensureSkills on every prepare turn so a stack or runner added
+// Phase prompts (PLAN/EXECUTE/DOCUMENT) and the always-on container skill
+// are seeded here. Per-stack / per-runner / per-OS SKILL files are handled
+// by ensureSkills on every prepare turn so a stack or runner added
 // mid-session takes effect on the next prompt.
 func ensureDefaults(cwd string) {
 	dir := filepath.Join(cwd, ".codehalter")
@@ -122,7 +119,6 @@ func ensureDefaults(cwd string) {
 	for _, f := range []struct{ name, content string }{
 		{"PLAN.md", defaultPlanMD},
 		{"EXECUTE.md", defaultExecuteMD},
-		{"VERIFY.md", defaultVerifyMD},
 		{"DOCUMENT.md", defaultDocumentMD},
 		{"SKILL-container.md", skillContainer},
 	} {
@@ -506,7 +502,7 @@ func (a *agent) startIndexing(sid string, cwd string) {
 		defer close(a.indexDone)
 		defer slog.Debug("startIndexing: bootstrap goroutine done", "sid", sid)
 		// Install a.cancel so Zed's Cancel button can interrupt a fix-install
-		// runTaskCycle that prepare may dispatch via proposeFix. Same pattern
+		// orchestrate that prepare may dispatch via proposeFix. Same pattern
 		// as Prompt(): one cancel slot, last-writer-wins.
 		ctx, cancel := context.WithCancel(context.Background())
 		a.mu.Lock()

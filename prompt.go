@@ -5,15 +5,31 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 )
 
-// This file owns the prompt orchestrator: Prompt is the ACP entry point, it
-// dispatches each user turn to either runTaskCycle (simple request, in
-// loop.go) or runSubtasks (big-task decomposition with one cycle per
-// subtask). The phase UI helpers (sendPhase, setStatus, finalizePlan) and
-// the request-level error shaper (failPrompt, stopReasonFor) also live here
-// — they're orchestrator concerns, not part of the loop body.
+// This file owns the prompt orchestrator. Prompt() is the ACP entry point.
+// The pipeline per turn is:
+//
+//   1. Plan once (read-only, decomposes into subtasks each with a verify
+//      recipe). User confirms (skipped in autopilot).
+//   2. For each subtask, run a single bounded tool-calling loop where the
+//      executor self-verifies before calling respond.
+//   3. If any subtask fails, re-plan with the failure context — up to
+//      maxReplans times. User confirms each replan (skipped in autopilot).
+//      Jaccard similarity over failure reasons escalates the replan note
+//      ("same problem N times — try a structurally different approach").
+//   4. Once every subtask in the current plan succeeds, fire the document
+//      phase exactly once.
+//
+// The phase UI helpers (sendPhase, setStatus, finalizePlan) and the
+// request-level error shaper (failPrompt, stopReasonFor) live here.
+
+// maxReplans caps the number of planner retries per Prompt. The planner
+// has the conversation history (showing what's been tried and what failed)
+// plus the orchestrator's REPLAN note; 10 budget is generous enough that
+// any feasible request resolves within it, while bounding the cost when
+// a request is infeasible.
+const maxReplans = 10
 
 // errUserCancelled flags a deliberate stop initiated by the user (e.g. they
 // chose Abort in a tool-choice prompt). It's NOT an error to surface as a
@@ -35,15 +51,15 @@ func isCancelled(err error) bool {
 
 // phaseNames are the pipeline stages; only the current one is shown to the
 // client at a time (the plan UI updates in place as phases progress).
-var phaseNames = []string{"Planning", "Executing", "Verifying", "Documenting"}
+var phaseNames = []string{"Planning", "Working", "Documenting"}
 
 // phaseEntries builds the multi-row plan entries to render in the client: all
 // phases up to and including `phase`, with prior phases marked completed and
 // phase `phase` marked in_progress or completed depending on `done`. Optional
 // `suffix` is appended to whichever row is in_progress (used by setStatus to
 // surface transient lifecycle markers like " (thinking…)" or " (running
-// read_file…)"). Document (phase 3) only appears once it actually starts, so
-// a no-doc run ends with three rows.
+// read_file…)"). Document (phase 2) only appears once it actually starts,
+// so a no-doc run ends with two rows.
 func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
 	if phase < 0 || phase >= len(phaseNames) {
 		return nil
@@ -133,7 +149,7 @@ func (a *agent) finalizePlan(sid string) {
 // failPrompt records a fatal error in the session and returns it so the ACP
 // dispatcher emits a JSON-RPC error response — Zed renders that as a red
 // error box in the chat. Use only for failures that abort the prompt
-// (LLM auth / out-of-credits / planAndRoute crash). Pass any tool uses
+// (LLM auth / out-of-credits / planAndAsk crash). Pass any tool uses
 // captured before the failure so they're preserved in history. Recoverable
 // warnings should keep using sendUpdate with a "⚠ ..." chunk.
 func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptResponse, error) {
@@ -199,7 +215,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	}
 
 	// Capture isFirstMessage and seed sess.SystemPrompt BEFORE prepare runs.
-	// prepare may dispatch proposeFix → AddUser → runTaskCycle to install a
+	// prepare may dispatch proposeFix → AddUser → orchestrator to install a
 	// missing dev tool, which both fills sess.Messages (flipping isFirstMessage)
 	// and triggers an LLM call that needs sess.SystemPrompt to carry the
 	// skills / cwd context. Seeding sess.SystemPrompt here also makes
@@ -266,58 +282,21 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
-	// Initial plan. Also decides whether the task is big enough to break
-	// into subtasks (plan.Subtasks). For simple tasks, this same plan is
-	// reused for attempt 0 of runTaskCycle — no double planning.
-	a.sendPhase(ctx, req.SessionId, 0, false)
-	firstConn, firstPlan, firstToolUses, err := a.planAndRoute(ctx, req.SessionId, "")
+	result, err := a.orchestrate(ctx, req.SessionId)
 	if err != nil {
 		if isCancelled(err) {
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
-		return a.failPrompt(req.SessionId, err, firstToolUses)
+		return a.failPrompt(req.SessionId, err, nil)
 	}
 
-	var result toolLoopResult
-	subtaskPath := firstPlan != nil && len(firstPlan.Subtasks) > 0
-	if subtaskPath {
-		// Big task — iterate each subtask through its own plan→execute→verify.
-		// runSubtasks fires backgroundSummarise per subtask iteration so every
-		// turn pair gets a structured note; the epilogue below skips the
-		// summary call in that path to avoid double-summarising the last pair.
-		result, err = a.runSubtasks(ctx, req.SessionId, firstPlan.Subtasks)
-		if err != nil {
-			// User cancellation is a clean stop, not an error to render as red.
-			if isCancelled(err) {
-				return PromptResponse{StopReason: "cancelled"}, nil
-			}
-			return a.failPrompt(req.SessionId, err, nil)
-		}
-	} else {
-		// Single task — reuse the initial plan on attempt 0; retries re-plan.
-		result, err = a.runTaskCycle(ctx, req.SessionId, firstPlan, firstConn)
-		if err != nil {
-			if isCancelled(err) {
-				return PromptResponse{StopReason: "cancelled"}, nil
-			}
-			return a.failPrompt(req.SessionId, err, nil)
-		}
-	}
-
-	// Each phase (plan / execute / verify / document) already persisted its
-	// own response via UpsertLastAssistant. The epilogue here only fires
-	// background work that observes the now-complete transcript.
+	// Each phase already persisted its own response via UpsertLastAssistant.
+	// The epilogue here only fires background work that observes the
+	// now-complete transcript.
 	if sess != nil && result.Text != "" {
-		// Fire-and-forget per-turn summarisation onto a free LLM[1+] slot.
-		// Skipped on the subtasks path — runSubtasks already fired it for
-		// every iteration including the last, and double-firing would
-		// duplicate the final pair's structured note in the shadow buffer.
-		if !subtaskPath {
-			a.backgroundSummarise(sess)
-		}
-		// Refresh .codehalter/.git_commit on any background slot picked by
-		// pickBackgroundLLM. Overwrites by design, so it's safe to fire once
-		// per Prompt regardless of subtaskPath.
+		// Per-subtask backgroundSummarise already fires inside orchestrate
+		// for every subtask iteration; the final pair is covered too, so we
+		// don't double-summarise here.
 		a.backgroundGitCommit(sess)
 		a.compressHistory(ctx, sess)
 	}
@@ -336,74 +315,170 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
 }
 
-// runSubtasks shows the decomposed subtask list, asks the user how to run
-// the batch (Interactive / Automatic / Cancel), and iterates each subtask
-// through its own runTaskCycle. Automatic flips the session into autopilot
-// mode for the duration so inner prompts auto-answer. Returns the final
-// subtask's result.
-//
-// The decomposition planner already ran upstream — its plan response (with
-// Subtasks listed) and its tool uses are already in sess.Messages, so each
-// inner runTaskCycle sees that context naturally via buildLLMHistory.
-func (a *agent) runSubtasks(ctx context.Context, sid string, subtasks []string) (toolLoopResult, error) {
+// orchestrate drives the plan → subtasks → replan → document pipeline for
+// one user turn. Returns the final subtask's result (used for the
+// background epilogue) and the first error that isn't recoverable via
+// replan. User cancellation surfaces as errUserCancelled.
+func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
 
-	var header strings.Builder
-	fmt.Fprintf(&header, "This looks like a big task. I'd break it into %d subtasks:\n", len(subtasks))
-	for i, s := range subtasks {
-		fmt.Fprintf(&header, "%d. %s\n", i+1, s)
-	}
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: header.String()}})
-
-	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Interactive", "Automatic"})
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
-	if err != nil || choice == "abort" {
-		if sess != nil {
-			sess.AddAssistant(header.String() + "\nUser cancelled.")
+	a.sendPhase(ctx, sid, 0, false)
+	firstConn, plan, firstToolUses, err := a.planAndAsk(ctx, sid, "")
+	if err != nil {
+		if isCancelled(err) {
+			return toolLoopResult{}, err
+		}
+		if sess != nil && len(firstToolUses) > 0 {
+			sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
 			_ = sess.Save()
 		}
-		return toolLoopResult{}, errUserCancelled
+		return toolLoopResult{}, err
+	}
+	if plan == nil {
+		// No PLAN.md or unparseable response — pipeline cannot proceed.
+		return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
+	}
+	if len(plan.Subtasks) == 0 {
+		// Clarification path: planner asked a question via clear=false +
+		// choices, planAndAsk resolved it; if subtasks still empty, the
+		// user's pick implied "no work needed".
+		return toolLoopResult{}, nil
+	}
+
+	if err := a.confirmPlan(ctx, sid, plan, false); err != nil {
+		return toolLoopResult{}, err
+	}
+
+	var lastResult toolLoopResult
+	var failureBags []map[string]bool
+	replans := 0
+
+	for {
+		allOk := true
+		var failedAt int
+		var failedReason string
+
+		for i, st := range plan.Subtasks {
+			a.sendPhase(ctx, sid, 1, false)
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(plan.Subtasks), st.Description)}})
+
+			outcome := a.runSubtaskLoop(ctx, sid, st, i, len(plan.Subtasks))
+			lastResult = outcome.Result
+
+			if sess != nil && outcome.Result.Text != "" {
+				a.backgroundSummarise(sess)
+			}
+
+			if outcome.Success {
+				continue
+			}
+			allOk = false
+			failedAt = i
+			failedReason = outcome.Reason
+			break
+		}
+
+		if allOk {
+			break
+		}
+
+		// Jaccard escalation: same failure surfaced before?
+		bag := issueBag([]string{failedReason})
+		dupCount := 1
+		for _, prev := range failureBags {
+			if jaccard(bag, prev) >= failureSimilarityThreshold {
+				dupCount++
+			}
+		}
+		failureBags = append(failureBags, bag)
+
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Subtask %d/%d failed: %s\n", failedAt+1, len(plan.Subtasks), failedReason)}})
+
+		replans++
+		if replans >= maxReplans {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Replan budget (%d) exhausted — giving up.\n", maxReplans)}})
+			return lastResult, nil
+		}
+
+		var replanCtx string
+		if dupCount >= 2 {
+			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. Same failure has surfaced %d times — the prior fix didn't work; propose a structurally different approach. See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason, dupCount)
+		} else {
+			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason)
+		}
+
+		a.sendPhase(ctx, sid, 0, false)
+		_, newPlan, _, err := a.planAndAsk(ctx, sid, replanCtx)
+		if err != nil {
+			if isCancelled(err) {
+				return lastResult, err
+			}
+			return lastResult, err
+		}
+		if newPlan == nil || len(newPlan.Subtasks) == 0 {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Replan produced no further subtasks — stopping.\n"}})
+			return lastResult, nil
+		}
+
+		if err := a.confirmPlan(ctx, sid, newPlan, true); err != nil {
+			return lastResult, err
+		}
+		plan = newPlan
+	}
+
+	// Document phase: fire once at the end of a successful prompt.
+	if firstConn != nil {
+		a.sendPhase(ctx, sid, 2, false)
+		lastResult, _ = a.document(ctx, sid, firstConn, lastResult)
+		a.sendPhase(ctx, sid, 2, true)
+	} else {
+		a.sendPhase(ctx, sid, 1, true)
+	}
+
+	return lastResult, nil
+}
+
+// confirmPlan renders the planned subtasks and asks the user how to run
+// them. Three-way: Execute (one subtask at a time), Automatic (flip to
+// autopilot for the rest of this Prompt), Cancel. Skipped entirely when
+// already in autopilot mode. Skipped for report_only plans where no
+// mutating work happens. Replan plans use the same gate so the user sees
+// the new approach before it runs.
+func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, isReplan bool) error {
+	header := "Plan:"
+	if isReplan {
+		header = "Replan:"
+	}
+	if plan.ReportOnly {
+		header = "Findings:"
+	}
+	a.renderSubtasks(ctx, sid, plan.Subtasks, header)
+
+	if plan.ReportOnly {
+		return nil
+	}
+	if a.isAutopilot() {
+		return nil
+	}
+
+	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Execute", "Automatic"})
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
+
+	sess := a.getSession(sid)
+	if err != nil || choice == "abort" {
+		appendAssistantNote(sess, "User declined execution.")
+		if sess != nil {
+			_ = sess.Save()
+		}
+		return errUserCancelled
 	}
 
 	if choice == "Automatic" {
 		a.mu.Lock()
-		origMode := a.mode
 		a.mode = modeAutopilot
 		a.mu.Unlock()
-		defer func() {
-			a.mu.Lock()
-			a.mode = origMode
-			a.mu.Unlock()
-		}()
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[Automatic] Running all subtasks without interruption.\n\n"}})
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[Automatic] Running without further interruption.\n\n"}})
 	}
-
-	var finalResult toolLoopResult
-
-	for i, sub := range subtasks {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(subtasks), sub)}})
-
-		// Append the subtask scope as a fresh user message so the inner
-		// planner has a clear, focused target. Following PLAN.md / EXECUTE.md
-		// / VERIFY.md user messages will accumulate after it.
-		if sess != nil {
-			sess.AddUser("Subtask: " + sub)
-			_ = sess.Save()
-		}
-
-		result, err := a.runTaskCycle(ctx, sid, nil, nil)
-		if err != nil {
-			return finalResult, err
-		}
-		finalResult = result
-
-		// Per-subtask background summary so the shadow buffer covers
-		// every turn pair, not just the final subtask's reply.
-		if sess != nil && result.Text != "" {
-			a.backgroundSummarise(sess)
-		}
-	}
-
-	return finalResult, nil
+	return nil
 }

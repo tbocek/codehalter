@@ -20,7 +20,7 @@ import (
 // fixProblem describes a missing tool or environmental gap that prepare
 // detected and wants to offer the user a one-click fix for. The desc is
 // the human-readable banner line; the prompt is the synthetic user
-// message dispatched through runTaskCycle when the user accepts the card.
+// message dispatched through orchestrate when the user accepts the card.
 type fixProblem struct {
 	desc   string
 	prompt string
@@ -45,7 +45,7 @@ func stackProbeBinary(stack string) string {
 // Order is deterministic so envSnapshot diffs don't false-positive on
 // reordering. go.mod is included unconditionally (the user wants to run
 // `go vet` / `go test` even when a justfile or Makefile is also present —
-// missing `go` blocks the verify phase regardless).
+// missing `go` blocks the executor's self-verify recipe regardless).
 func detectRunnerConfigs(cwd string) []string {
 	var kinds []string
 	for _, name := range []string{"justfile", "Justfile", ".justfile"} {
@@ -413,7 +413,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	// know how to install the missing tool. Idempotent for stacks /
 	// runners; per-OS pruning is unconditional, and when any other-OS
 	// SKILL was removed we rebuild sess.SystemPrompt right now so the
-	// next LLM call (including proposeFix's runTaskCycle below) sees the
+	// next LLM call (including proposeFix's orchestrate below) sees the
 	// cleaned-up skill set instead of the stale prefix.
 	osi := readOSInfo()
 	if pruned := ensureSkills(sess.Cwd, sess.knownStacks, osi); len(pruned) > 0 {
@@ -669,15 +669,16 @@ func listSkills(cwd string) []string {
 }
 
 // ---------------------------------------------------------------------------
-// proposeFix — ack card + synthetic prompt → runTaskCycle
+// proposeFix — ack card + synthetic prompt → orchestrate
 // ---------------------------------------------------------------------------
 
 // proposeFix shows the user a single yes/no card carrying the problem
 // description. On accept we synthesise a user message with the proposed
-// prompt and dispatch it through runTaskCycle exactly as if the user had
-// typed it — full plan / execute / verify / document phases, real tool
-// calls, real cards. Skip just closes the card; the problem stays visible
-// in the banner so the user can address it manually whenever they choose.
+// prompt and dispatch it through orchestrate exactly as if the user had
+// typed it — full plan / per-subtask self-verifying loop / document phases,
+// real tool calls, real cards. Skip just closes the card; the problem stays
+// visible in the banner so the user can address it manually whenever they
+// choose.
 func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 	title := p.desc + " — install fix?"
 	ok, tcId, err := a.askYesNoWithCard(ctx, sid, title, "think", "Install fix", "Skip")
@@ -696,7 +697,7 @@ func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 	}
 	sess.AddUser(p.prompt)
 	_ = sess.Save()
-	if _, err := a.runTaskCycle(ctx, sid, nil, nil); err != nil {
-		slog.Debug("proposeFix: runTaskCycle returned error", "sid", sid, "err", err)
+	if _, err := a.orchestrate(ctx, sid); err != nil {
+		slog.Debug("proposeFix: orchestrate returned error", "sid", sid, "err", err)
 	}
 }

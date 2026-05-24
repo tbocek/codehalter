@@ -238,9 +238,10 @@ func (a *agent) registerSubagentTool() {
 // investigators. They must do exactly what `instructions` says — no extra
 // `run_task` "to verify", no re-reading files they just wrote, no chasing
 // failures that aren't their job. The parent already planned the work and
-// runs the verify phase on the overall result; a subagent that goes broader
-// wastes the parallelism it was forked for. Thinking-mode subagents do NOT
-// see these rules — they run their own plan/execute/verify cycle.
+// the parent's executor runs its own self-verify recipe on the overall
+// result; a subagent that goes broader wastes the parallelism it was
+// forked for. Thinking-mode subagents do NOT see these rules — they run
+// their own plan + per-subtask cycle.
 const subagentRules = `You are a subagent in EXECUTE mode. Do exactly the task in "Task:" — nothing more.
 
 Hard rules:
@@ -339,7 +340,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 		exclude["launch_subagent"] = true
 	}
 
-	result, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "subagent")
+	result, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "subagent", 0)
 	if err != nil {
 		return result.Text, err
 	}
@@ -359,25 +360,32 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 	return result.Text, nil
 }
 
-// runSubagentThinking runs a slimmed plan → execute → verify cycle on
-// subSess. Unlike runTaskCycle (which retries up to 20 times and runs the
-// document phase), this is a single pass: one plan, one execute, one verify,
-// then return whatever execute produced. Replan-on-failure and DOCUMENT.md
-// belong to the parent — a thinking subagent surfaces its result and lets
-// the parent decide what to do with a verification failure.
+// runSubagentThinking runs a plan + per-subtask cycle on subSess. Unlike the
+// parent's orchestrate, this is a single pass: plan, then each subtask loop
+// in order, then return whatever the last subtask produced. Replan-on-failure
+// and DOCUMENT.md belong to the parent — a thinking subagent surfaces its
+// result and lets the parent decide what to do with a subtask failure.
 //
-// The subagent's session is seeded like the parent's: the systemPrompt is
-// folded into the first user message so buildLLMHistory replays the same
-// bytes on every phase. We do NOT inherit the parent's message history here
-// — thinking subagents own their cycle and shouldn't get confused by the
-// parent's open task. Cache warmth on LLM[0] is sacrificed for clarity; if
-// it becomes a problem we can revisit by copying parent messages.
+// The subagent's session is seeded like the parent's: SystemPrompt is stored
+// on subSess so buildLLMHistory folds it into LLM[0]'s first message. We do
+// NOT inherit the parent's message history here — thinking subagents own
+// their cycle and shouldn't get confused by the parent's open task. Cache
+// warmth on LLM[0] is sacrificed for clarity; if it becomes a problem we can
+// revisit by copying parent messages.
 //
-// User-facing prompts inside planAndRoute (clarification / "execute this
-// plan?") auto-confirm because shouldAutoAnswer returns true for any session
-// with Depth > 0 (see tool_ask.go).
+// User-facing prompts inside planAndAsk (clarification choices) auto-confirm
+// because shouldAutoAnswer returns true for any session with Depth > 0 (see
+// tool_ask.go). The orchestrator's "Execute / Automatic / Cancel" gate is
+// skipped here — subagents are dispatched by the parent and never gate on
+// the user.
 func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
 	sid := subSess.ID
+
+	if subSess.SystemPrompt == "" {
+		if sysPrompt, err := a.systemPrompt(sid); err == nil {
+			subSess.SystemPrompt = sysPrompt
+		}
+	}
 
 	instructions := task.Instructions
 	if task.Context != "" {
@@ -385,34 +393,24 @@ func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task 
 	} else {
 		instructions = "Task:\n" + task.Instructions
 	}
-
-	var b strings.Builder
-	if sysPrompt, err := a.systemPrompt(sid); err == nil && sysPrompt != "" {
-		b.WriteString(sysPrompt)
-		b.WriteString("\n---\n")
-	}
-	b.WriteString(instructions)
-	subSess.AddUser(b.String())
+	subSess.AddUser(instructions)
 	_ = subSess.Save()
 
-	// Plan. planAndRoute auto-answers clarification + "execute?" prompts
-	// (Depth > 0). It returns the planner's connection so execute/verify
-	// route to the same conn.
-	_, plan, _, err := a.planAndRoute(ctx, sid, "")
+	_, plan, _, err := a.planAndAsk(ctx, sid, "")
 	if err != nil {
 		return "", err
 	}
-
-	res, err := a.execute(ctx, sid)
-	if err != nil {
-		return res.Text, err
+	if plan == nil || len(plan.Subtasks) == 0 {
+		return "", nil
 	}
 
-	conn := a.pickAvailable(ctx, sid, "execute")
-	res, _, err = a.verify(ctx, sid, conn, plan, res)
-	if err != nil {
-		return res.Text, err
+	var last toolLoopResult
+	for i, st := range plan.Subtasks {
+		outcome := a.runSubtaskLoop(ctx, sid, st, i, len(plan.Subtasks))
+		last = outcome.Result
+		if !outcome.Success {
+			return last.Text, fmt.Errorf("subtask %d/%d failed: %s", i+1, len(plan.Subtasks), outcome.Reason)
+		}
 	}
-
-	return res.Text, nil
+	return last.Text, nil
 }

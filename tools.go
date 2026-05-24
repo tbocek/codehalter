@@ -59,10 +59,10 @@ type Tool struct {
 	// Execute returns the tool's output and a `failed` flag. `failed` is the
 	// authoritative signal that the underlying operation reported a hard
 	// failure (e.g. run_task observed a non-zero exit). It's surfaced as
-	// ToolUse.Failed so the verify phase can override an LLM "success=true"
-	// when codehalter itself saw the call fail. Most handlers return
-	// (output, false); only run_task and similar truth-bearing tools set
-	// failed=true.
+	// ToolUse.Failed so the subtask orchestrator can override an LLM
+	// "success=true" when codehalter itself saw the call fail. Most handlers
+	// return (output, false); only run_task and similar truth-bearing tools
+	// set failed=true.
 	Execute func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
 	// Terminal marks a tool as the loop's exit point: when the model invokes
 	// it, the agentic tool loop returns after this batch completes, with the

@@ -90,13 +90,12 @@ With the caps above (1 + 3) one `launch_subagent` batch can run up to 4 tasks at
 
 ### Prompt files
 
-On first run, `ensureDefaults` drops four phase templates into `.codehalter/`:
+On first run, `ensureDefaults` drops three phase templates into `.codehalter/`:
 
 | File | Role |
 |------|------|
-| `PLAN.md` | Planning-phase instructions (clarity check, info retrieval, steps/subtasks JSON schema) |
-| `EXECUTE.md` | Execution-phase directives prepended to the user message |
-| `VERIFY.md` | Self-verification rubric applied to execute output |
+| `PLAN.md` | Planning-phase instructions (clarity check, info retrieval, subtask JSON schema with per-subtask verify recipe) |
+| `EXECUTE.md` | Execution-phase directives prepended to the user message; instructs the executor to run the verify recipe itself before calling `respond` |
 | `DOCUMENT.md` | Decides when the change is user-visible enough to update the README, then edits it minimally |
 
 Plus per-stack `SKILL-{lang}.md` files for any language detected in the project root (`go.mod` → SKILL-go.md, `package.json`+`tsconfig.json` → SKILL-ts.md, plain `package.json` → SKILL-js.md, `pom.xml`/`build.gradle` → SKILL-java.md, `*.sh`/`*.bash` files → SKILL-bash.md). Skills are concatenated into the system prompt on the first turn so they ride along in cached history. Designed for smaller local models (Qwen3, Gemma) that need explicit language conventions; larger models can usually have them deleted.
@@ -182,11 +181,11 @@ Because `.git` is read-only, the agent can never commit or push. When you ask fo
 1. Zed spawns `codehalter` as a subprocess and communicates via JSON-RPC 2.0 over stdio.
 2. On session start, the agent indexes project files, probes image support on the configured LLM, discovers task runners, and reports which of build/test/lint/format are covered.
 3. Each prompt runs through the pipeline:
-   - **Plan** — the `thinking` LLM analyzes the request with read-only tools, gathers external info via web tools if needed, and emits either `steps` (simple task) or `subtasks` (big task). In Interactive mode the user confirms before execution.
-   - **Execute** — the `execute` LLM runs the agentic tool loop; file edits are shown as diffs and require user approval in Interactive mode.
-   - **Verify** — the output is self-checked against `VERIFY.md`. On failure with fix steps, the loop re-plans with failure context (up to 20 attempts total; the loop also bails early if a new failure looks like a near-duplicate of an earlier one).
-   - **Document** — only when the executor wrote files and verify succeeded: the `thinking` LLM checks against `DOCUMENT.md` whether the change is user-visible (new feature/flag/API/dep, install or config change) and, if so, updates or creates the project README. Routine refactors and bug fixes are skipped.
-4. For big tasks, each subtask repeats the plan → execute → verify cycle independently; prior subtasks' assistant replies stay in history so later subtasks have context.
+   - **Plan** — the `thinking` LLM analyzes the request with read-only tools, gathers external info via web tools if needed, and emits an array of `subtasks`, each with its own `verify` recipe. In Interactive mode the user confirms before execution (Execute / Automatic / Cancel).
+   - **Work** — for each subtask the `execute` LLM runs a single bounded tool-calling loop (≤10 turns) where it edits, runs commands, and then runs the verify recipe itself before calling `respond`. File edits are shown as diffs and require user approval in Interactive mode.
+   - **Replan on failure** — if a subtask hits the turn cap, the executor returns without calling `respond`, or a tool exits non-zero, the orchestrator records the failure reason and re-plans (up to 10 replans per prompt). When the same failure recurs (Jaccard over issue words ≥ 0.6), the replan note escalates to "the prior fix didn't work; propose a structurally different approach."
+   - **Document** — fires once at the end of a successful prompt: the `thinking` LLM checks against `DOCUMENT.md` whether the change is user-visible (new feature/flag/API/dep, install or config change) and, if so, updates or creates the project README. Routine refactors and bug fixes are skipped.
+4. Prior subtasks' assistant replies stay in history so later subtasks have context.
 5. Conversation history is persisted to `.codehalter/session_<id>.toml`. After every turn a background goroutine on a free `llm[1+]` slot condenses the user/assistant pair into a six-section structured note that accumulates in a shadow buffer; when message tokens exceed the model's context budget (minus overhead and safety margin), the shadow buffer is installed as the new summary and older messages rotate into an archive file. Falls back to a synchronous summarise pass when only one `[[llm]]` entry is configured.
 
 ## Compared to forge and pi/coding-agent
@@ -196,8 +195,8 @@ Codehalter borrows two building blocks: the synthetic `respond` terminal tool fr
 - **Container-first sandboxing posture** — auto-scaffolded Debian or Arch `.devcontainer/`, host `.gitconfig` and project `.git` bind-mounted read-only, plus a `.codehalter/.git_commit` drafter so commits/pushes are always the human's job (forge and pi don't ship a devcontainer story or a git-write firewall).
 - **Native MCP client** — `.codehalter/mcp.toml` spawns each `[[server]]` as a long-lived child, registers its tools under `<name>__<tool>`, and reconciles on every prompt; gopls is pre-seeded for Go projects.
 - **Multi-slot parallel LLM architecture for local servers** — `[[llm]]` array with per-conn `parallel = N` semaphores, breadth-first subagent pinning, and background work (per-turn summariser on `llm[1]`, git-commit drafter on `llm[2+]`) routed off the foreground KV-cache slot so the main session's prefix cache stays warm.
-- **Plan → Execute → Verify → Document pipeline** built in, not delegated to an extension — verify re-plans on failure with fuzzy duplicate-failure detection (Jaccard over issue words), and the document pass updates the README only when the change is user-visible.
-- **Big-task decomposition** with a once-per-batch Interactive / Automatic / Cancel choice; each subtask runs its own full plan/execute/verify cycle.
+- **Plan → per-subtask self-verifying loop → Document pipeline** built in, not delegated to an extension — the planner decomposes into subtasks each carrying its own verify recipe; the executor runs the recipe itself before declaring done; failed subtasks trigger a replan (≤10 per prompt) with fuzzy duplicate-failure detection (Jaccard over issue words) escalating the note when the same problem recurs; the document pass updates the README only when the change is user-visible.
+- **Big-task decomposition** with a once-per-plan Interactive / Automatic / Cancel choice; the same gate re-fires on each replan so the user sees the new approach before it runs.
 - **Web tools restricted to the planning phase** (`web_search` via DuckDuckGo + `web_read[_raw]` via headless Firefox) so execution stays offline.
 - **ACP / Zed-native** integration with file-edit diffs, permission prompts, and per-session mode switching from Zed's UI.
 - **Empty-project bootstrap, stuck-tool-loop detection, dynamic `n_ctx`-aware compaction trigger, bench harness with isolated devcontainer per test.**
