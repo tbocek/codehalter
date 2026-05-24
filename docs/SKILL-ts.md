@@ -24,4 +24,4 @@
 - Prefer immutable updates (`{...obj, field: x}`, `[...arr, x]`) over mutation.
 
 ## Tooling
-- Type-check and lint through the project's build target (see SKILL-buildfile) — `npm run typecheck`/`build`/`lint` or whatever the `package.json` scripts declare. Don't call `tsc` or eslint directly.
+- Type-check and lint through the project's task runner — `npm run typecheck`/`build`/`lint` or whatever the `package.json` scripts declare. Don't call `tsc` or eslint directly.

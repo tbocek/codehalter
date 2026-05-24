@@ -600,8 +600,10 @@ func (a *agent) runTaskCycle(
 
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Verification failed (attempt %d/%d). Re-planning with the failure context:\n%s\n", attempt+1, maxAttempts, strings.Join(vr.FixSteps, "\n"))}})
 		// The full failure detail is already in history on the preceding
-		// verify response — point the planner at it without re-stitching.
-		replanContext = "The previous attempt failed verification (see the verify response above). Re-plan to address the failure. If the fix steps conflict with the original request or the task is infeasible, say so instead of attempting it."
+		// verify response — the REPLAN keyword tells the planner to follow
+		// PLAN.md's "Replanning after a verify failure" section, which
+		// describes how to reuse that history instead of restarting.
+		replanContext = "REPLAN: the previous attempt failed verification (see the verify response above). Follow the 'Replanning after a verify failure' section in PLAN.md. If the fix steps conflict with the original request or the task is infeasible, say so via clear=false instead of attempting it."
 	}
 
 	// Document phase: run whenever verify passed. DOCUMENT.md decides for

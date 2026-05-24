@@ -25,9 +25,6 @@ var defaultVerifyMD string
 //go:embed docs/DOCUMENT.md
 var defaultDocumentMD string
 
-//go:embed docs/SKILL-buildfile.md
-var skillBuildfile string
-
 //go:embed docs/SKILL-go.md
 var skillGo string
 
@@ -115,10 +112,10 @@ var osSkills = map[string]string{
 }
 
 // ensureDefaults copies embedded default files into .codehalter/ if they don't exist.
-// Phase prompts (PLAN/EXECUTE/VERIFY) and the always-on skills (container,
-// buildfile) are seeded here. Per-stack / per-runner / per-OS SKILL files
-// are handled by ensureSkills on every prepare turn so a stack or runner
-// added mid-session takes effect on the next prompt.
+// Phase prompts (PLAN/EXECUTE/VERIFY/DOCUMENT) and the always-on container
+// skill are seeded here. Per-stack / per-runner / per-OS SKILL files are
+// handled by ensureSkills on every prepare turn so a stack or runner added
+// mid-session takes effect on the next prompt.
 func ensureDefaults(cwd string) {
 	dir := filepath.Join(cwd, ".codehalter")
 	os.MkdirAll(dir, 0o755)
@@ -127,7 +124,6 @@ func ensureDefaults(cwd string) {
 		{"EXECUTE.md", defaultExecuteMD},
 		{"VERIFY.md", defaultVerifyMD},
 		{"DOCUMENT.md", defaultDocumentMD},
-		{"SKILL-buildfile.md", skillBuildfile},
 		{"SKILL-container.md", skillContainer},
 	} {
 		path := filepath.Join(dir, f.name)

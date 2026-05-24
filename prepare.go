@@ -468,13 +468,15 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	}
 	return changed, []fixProblem{{
 		desc: fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
-		prompt: fmt.Sprintf("Plan installing the missing dev tools (%s) into this %s devcontainer. "+
-			"The plan must produce execute-phase steps (install each tool, persist the install across "+
-			"container rebuilds, wire any MCP-capable tool — e.g. gopls via mcp-language-server — "+
-			"into .codehalter/mcp.toml as a [[server]] entry) AND verify-phase checks (each tool on "+
-			"PATH, persistence in place). The execute phase will run the steps; the verify phase will "+
-			"run the checks.",
-			detail.String(), distro),
+		prompt: fmt.Sprintf("Missing dev tools in this %s devcontainer: %s. "+
+			"PLAN ONLY — do not install anything yourself. Produce execute-phase "+
+			"steps in this order for each tool: (1) install via the OS package "+
+			"manager, (2) verify it runs (e.g. `<tool> --version`), (3) persist "+
+			"by editing .devcontainer/Dockerfile, (4) if the tool is MCP-capable "+
+			"(e.g. gopls via `gopls mcp`), add a [[server]] entry to "+
+			".codehalter/mcp.toml. Verify-phase checks: each tool on PATH, "+
+			"Dockerfile contains the persist line.",
+			distro, detail.String()),
 	}}
 }
 

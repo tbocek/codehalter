@@ -24,6 +24,9 @@ yourself, the FS layer will block you and the error is unhelpful.
 
 ## When a task fails with "command not found"
 
+This applies in execute and verify-failure replans. In plan, the equivalent
+is "emit install + Dockerfile-edit steps and let execute run them."
+
 1. Confirm with `run_command`: `which <tool>` (or `command -v <tool>`).
    Exit 1 = missing.
 2. Read `.devcontainer/devcontainer.json` and any `Dockerfile` it references.
@@ -39,6 +42,9 @@ for the right tool. Fall back to `/etc/os-release` if you're not sure which
 one applies here.
 
 ## Test installs in the live container before patching the Dockerfile
+
+**Execute phase only.** Plan must stay read-only; this section applies when
+you are already in execute and need to add a tool.
 
 When you're about to write `RUN <pkg-manager> install <pkg>` (or `pip
 install`, `npm install -g`, etc.) into the Dockerfile, first run the same
