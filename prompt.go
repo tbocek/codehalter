@@ -215,22 +215,15 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		sess.SystemPrompt = sysPrompt
 	}
 
-	// Prepare phase: re-verifies the LLM (loops forever on a Retry card when
-	// unreachable), refreshes the env snapshot + MCP reconcile, emits one
-	// consolidated capabilities banner only when something changed, and offers
-	// ack-card "fix it for me?" proposals for missing tools / broken MCP
-	// entries. Strictly silent in steady state so it's safe to call every turn.
-	slog.Debug("Prompt: about to call prepare", "sid", req.SessionId, "sessNil", sess == nil)
+	// Clear per-turn read-dedup. Dedup is scoped to a single Prompt() turn
+	// so that across-turn re-reads (after a user reply, edits made outside
+	// our process, etc.) still go through.
 	if sess != nil {
-		a.prepare(ctx, sess, req.SessionId)
-		// Clear per-turn read-dedup. Dedup is scoped to a single Prompt()
-		// turn so that across-turn re-reads (after a user reply, edits made
-		// outside our process, etc.) still go through.
 		sess.readDedupMu.Lock()
 		sess.readDedup = nil
 		sess.readDedupMu.Unlock()
 	} else {
-		slog.Debug("Prompt: pre-prepare getSession NIL", "sid", req.SessionId, "knownSessions", len(a.sessions))
+		slog.Debug("Prompt: pre-turn getSession NIL", "sid", req.SessionId, "knownSessions", len(a.sessions))
 	}
 
 	// Extract user text and images from prompt blocks.
@@ -327,6 +320,17 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		// per Prompt regardless of subtaskPath.
 		a.backgroundGitCommit(sess)
 		a.compressHistory(ctx, sess)
+	}
+
+	// Prepare phase runs at the end of every turn so the capabilities banner /
+	// missing-tool fix cards are ready BEFORE the next user prompt arrives.
+	// Bootstrap's first prepare (startIndexing) covers turn #1; this covers
+	// turns #2+. Re-verifies the LLM (loops on a Retry card if unreachable),
+	// refreshes env snapshot + MCP reconcile, emits one consolidated banner
+	// only when something changed. Silent in steady state.
+	slog.Debug("Prompt: about to call prepare (post-turn)", "sid", req.SessionId, "sessNil", sess == nil)
+	if sess != nil {
+		a.prepare(ctx, sess, req.SessionId)
 	}
 
 	return PromptResponse{StopReason: stopReasonFor(ctx)}, nil

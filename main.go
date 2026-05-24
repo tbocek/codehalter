@@ -349,24 +349,50 @@ func (a *agent) initSession(cwd string, s *Session) error {
 
 // startIndexing kicks off the once-per-session bootstrap: interactive
 // devcontainer / gitignore prompts that would be hostile to repeat on every
-// turn. Everything else (LLM probing, capabilities banner, env probes, MCP
-// reconcile) belongs to the per-prompt prepare phase — see prepare.go.
-// Ordering: devcontainer first because the gitignore prompt assumes a
-// sandbox exists. When ensureDevcontainer returns false, abortReason is set
-// and gitignore is skipped — Prompt refuses every turn after that.
+// turn, followed by the first prepare() so the capabilities banner appears
+// at session open instead of only after the user's first typed prompt.
+// Everything in prepare (LLM probe, env snapshot, MCP reconcile) is also
+// re-run from Prompt — calling it here is just the "show the user something
+// immediately" entry point. Ordering: devcontainer first because the
+// gitignore prompt assumes a sandbox exists. When ensureDevcontainer returns
+// false, abortReason is set and the rest is skipped — Prompt refuses every
+// turn after that.
 func (a *agent) startIndexing(sid string, cwd string) {
 	a.indexDone = make(chan struct{})
 	slog.Debug("startIndexing: spawning bootstrap goroutine", "sid", sid, "cwd", cwd)
 	go func() {
 		defer close(a.indexDone)
 		defer slog.Debug("startIndexing: bootstrap goroutine done", "sid", sid)
-		ctx := context.Background()
+		// Install a.cancel so Zed's Cancel button can interrupt a fix-install
+		// runTaskCycle that prepare may dispatch via proposeFix. Same pattern
+		// as Prompt(): one cancel slot, last-writer-wins.
+		ctx, cancel := context.WithCancel(context.Background())
+		a.mu.Lock()
+		a.cancel = cancel
+		a.mu.Unlock()
+		defer cancel()
+
 		if !a.ensureDevcontainer(ctx, cwd, sid) {
 			slog.Debug("startIndexing: ensureDevcontainer false, aborting", "sid", sid)
 			return
 		}
 		slog.Debug("startIndexing: devcontainer ok, about to ensureGitignore", "sid", sid)
 		a.ensureGitignore(ctx, cwd, sid)
+
+		// Seed SystemPrompt before prepare so any proposeFix → runTaskCycle
+		// dispatch sees skills + cwd context, and generateTitle on the first
+		// real user message still picks that message (not the synthetic
+		// install prompt) as the title.
+		sess := a.getSession(sid)
+		if sess != nil && sess.SystemPrompt == "" {
+			if sp, err := a.systemPrompt(sid); err == nil {
+				sess.SystemPrompt = sp
+			}
+		}
+		if sess != nil {
+			slog.Debug("startIndexing: gitignore done, about to prepare", "sid", sid)
+			a.prepare(ctx, sess, sid)
+		}
 		slog.Debug("startIndexing: bootstrap done", "sid", sid)
 	}()
 }
