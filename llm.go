@@ -56,6 +56,15 @@ type sseChunk struct {
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	// Usage is the OpenAI-compatible token count block. With
+	// stream_options.include_usage=true the server emits one final chunk
+	// (choices empty) carrying this — the prompt_tokens count is ground
+	// truth for what the server actually packed into n_ctx, and replaces
+	// the chars/4 estimator on the compaction trigger.
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
 }
 
 // onToken is called for each text token. nil means discard.
@@ -92,6 +101,11 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	}
 	reqBody["model"] = conn.Model
 	reqBody["stream"] = true
+	// stream_options.include_usage asks the server to emit a final SSE chunk
+	// carrying prompt_tokens / completion_tokens. The chars/4 estimator can be
+	// 30% wrong on tool-heavy JSON; this gives us the server's own count so
+	// compressHistory triggers on ground truth instead of a guess.
+	reqBody["stream_options"] = map[string]any{"include_usage": true}
 	reqBody["messages"] = messages
 	if tools != nil {
 		reqBody["tools"] = tools
@@ -205,6 +219,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	var reasoningText strings.Builder
 	var calls []toolCall
 	var finishReason string
+	var promptTokens int
 	firstToken := true
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -224,6 +239,12 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		var chunk sseChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+		// Usage arrives in its own trailing chunk (choices empty) when
+		// stream_options.include_usage=true. Capture and keep going — there
+		// may still be a [DONE] line after it.
+		if chunk.Usage != nil && chunk.Usage.PromptTokens > 0 {
+			promptTokens = chunk.Usage.PromptTokens
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -266,6 +287,17 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	if err := scanner.Err(); err != nil {
 		writeResponseLog(logF, connLabel, fullText.String(), reasoningText.String(), calls, err)
 		return fullText.String(), calls, fmt.Errorf("reading SSE stream: %w", err)
+	}
+
+	// Record the server's reported prompt_tokens on the session so
+	// compressHistory can trigger on ground truth. Only the main session
+	// owns the foreground prefix cache, but storing on every session is
+	// harmless and keeps subagent telemetry honest. sid="" (probes/tests)
+	// has no session, skip.
+	if promptTokens > 0 {
+		if sess := a.getSession(sid); sess != nil {
+			sess.SetLastCompletePromptTokens(promptTokens)
+		}
 	}
 
 	// finish_reason="length" means the server stopped because we hit
@@ -499,6 +531,31 @@ func (a *agent) pickAvailable(_ context.Context, sid string, role string) *LLMCo
 		}
 	}
 	return a.settings.MainLLM(role)
+}
+
+// pickBackgroundLLM returns the connection that should host background work
+// (per-turn summariser, git-commit, document). Walks LLM[1..x] — the
+// background tier — and returns the first entry whose semaphore reports
+// free capacity, so a 3-LLM setup spreads concurrent calls across servers
+// instead of stacking them on LLM[1]. When every background entry is busy
+// we fall back to LLM[0]: ensureLLM has gated startup on parallelCap >= 2
+// so its server's slot allocator gives background a different KV cache
+// slot, and one cache-pollution turn is preferable to stalling the
+// background queue waiting for a [1..x] slot. The free-capacity peek is
+// racy by design — by the time llmStream re-acquires the same slot,
+// another caller may have grabbed it; llmStream's per-conn semaphore
+// queues in that case, which is still no worse than the simple "always
+// LLM[1]" fallback. Session-independent: every caller is on the foreground
+// path (call sites filter on Depth==0), and the picking is the same
+// regardless of which session triggered it.
+func (a *agent) pickBackgroundLLM() *LLMConnection {
+	for i := 1; i < len(a.settings.LLM); i++ {
+		if i < len(a.slotSems) && a.slotSems[i] != nil &&
+			len(a.slotSems[i]) < cap(a.slotSems[i]) {
+			return a.settings.ConnAt(i, "execute")
+		}
+	}
+	return a.settings.ConnAt(0, "execute")
 }
 
 // connSlot returns the index into settings.LLM that this connection
@@ -1021,10 +1078,11 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 		// iteration's tool batch. Without this, a planner that spends 17
 		// minutes in one tool loop produces zero shadow notes and a stale
 		// .codehalter/.git_commit — the existing Prompt() epilogue only runs
-		// after the whole task finishes. Coalesced via summariseJob /
-		// gitCommitJob (bgJob) so 50 iterations don't queue 50 LLM[1] jobs.
-		// Subagents (Depth>0) skip — they already route via their pinned slot
-		// and don't own the shadow buffer.
+		// after the whole task finishes. Summariser enqueues every fire so a
+		// 50-iteration loop produces 50 progress notes; git commit coalesces
+		// via gitCommitJob (bgJob) since gitCommitLastHash already dedupes
+		// identical snapshots. Subagents (Depth>0) skip — they already route
+		// via their pinned slot and don't own the shadow buffer.
 		if sess := a.getSession(sid); sess != nil && sess.Depth == 0 {
 			a.backgroundSummarise(sess)
 			a.backgroundGitCommit(sess)

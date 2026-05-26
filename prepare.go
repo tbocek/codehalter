@@ -130,16 +130,42 @@ func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
 // ensureLLM — settings load, probe, Retry-card loop
 // ---------------------------------------------------------------------------
 
-// ensureLLM blocks until at least one [[llm]] connection answers a probe
-// AND llm[0] reports its context window. First call scaffolds
-// .codehalter/settings.toml if neither the global nor the project-local
-// file exists. The probe is skipped when both the merged settings-file
-// hash matches sess.llmHash AND the previous probe satisfied both gates
-// (reachability and known n_ctx) — i.e. the file the user could have
-// edited hasn't actually changed AND we know we have a working route.
-// A single "Retry" tool card is shown when either gate fails; clicking
-// it always re-probes regardless of hash (the user may have changed
-// network or launch settings outside the file).
+// minSlotTokens is the smallest per-slot n_ctx codehalter accepts at startup.
+// Below this, even a single turn's system prompt + skills + a normal-sized
+// reply doesn't leave room for a useful compaction tail, so the agent refuses
+// to run and surfaces a Retry card the same way an unreachable LLM does.
+const minSlotTokens = 32 * 1024
+
+// minTotalSlots is the smallest total slot count (summed across every [[llm]]
+// entry's parallelCap) codehalter accepts at startup. Compaction folds older
+// turns into Summary via the background summariser, which must run on a slot
+// separate from the foreground turn to keep the foreground's prefix cache
+// warm. Below 2 slots there is nowhere to run it and compaction has no path.
+const minTotalSlots = 2
+
+// totalSlots returns the configured slot count summed across every [[llm]]
+// entry's parallelCap. Used by ensureLLM to gate startup on having a slot
+// for the background summariser separate from the foreground turn.
+func (a *agent) totalSlots() int {
+	n := 0
+	for i := range a.settings.LLM {
+		n += a.settings.LLM[i].parallelCap()
+	}
+	return n
+}
+
+// ensureLLM blocks until every startup gate passes: at least one [[llm]]
+// connection answers a probe, llm[0] reports a per-slot context window of at
+// least minSlotTokens, AND the configured slot count totals at least
+// minTotalSlots (so the background summariser has somewhere to run separate
+// from the foreground). First call scaffolds .codehalter/settings.toml if
+// neither the global nor the project-local file exists. The probe is skipped
+// when the merged settings-file hash matches sess.llmHash AND every gate is
+// already satisfied — i.e. the file the user could have edited hasn't
+// actually changed AND we know we have a working route. A single "Retry"
+// tool card is shown when any gate fails; clicking it always re-probes
+// regardless of hash (the user may have changed network or launch settings
+// outside the file).
 //
 // Returns true when something observable changed since the last call
 // (new hash, new reachability, or n_ctx newly discovered) — prepare uses
@@ -154,7 +180,10 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 	auto, _ := a.shouldAutoAnswer(sid)
 	const autoCap = 3
 	prevHash := sess.llmHash
-	prevReady := a.hasReachableLLM() && a.mainSlotTokens > 0
+	ready := func() bool {
+		return a.hasReachableLLM() && a.mainSlotTokens >= minSlotTokens && a.totalSlots() >= minTotalSlots
+	}
+	prevReady := ready()
 	forceRetry := false
 	for attempt := 0; ; attempt++ {
 		if loaded, err := loadSettings(sess.Cwd); err == nil {
@@ -169,13 +198,12 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 			}
 		}
 		currentHash := hashSettingsFiles(sess.Cwd)
-		if !forceRetry && currentHash != "" && currentHash == sess.llmHash && a.hasReachableLLM() && a.mainSlotTokens > 0 {
+		if !forceRetry && currentHash != "" && currentHash == sess.llmHash && ready() {
 			return false
 		}
 		a.probeAllLLMs(ctx)
 		sess.llmHash = currentHash
-		ready := a.hasReachableLLM() && a.mainSlotTokens > 0
-		if ready {
+		if ready() {
 			return sess.llmHash != prevHash || !prevReady
 		}
 		if auto && attempt >= autoCap-1 {
@@ -185,8 +213,12 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 		switch {
 		case !a.hasReachableLLM():
 			msg = "LLM not reachable — edit settings.toml, then click Retry"
-		default:
+		case a.mainSlotTokens == 0:
 			msg = "LLM reachable but server didn't report a context size (n_ctx). Codehalter needs this to size compaction safely. Restart your server with the context size set on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`, llama-server: ensure /props is enabled), then click Retry."
+		case a.mainSlotTokens < minSlotTokens:
+			msg = fmt.Sprintf("LLM reachable but per-slot context window is only %d tokens — codehalter requires at least %d. Restart your server with a larger `-c N` (llama.cpp) / `--max-model-len N` (vLLM), or reduce the `parallel` slot count in settings.toml, then click Retry.", a.mainSlotTokens, minSlotTokens)
+		default:
+			msg = fmt.Sprintf("LLM reachable but only %d total slot(s) — codehalter requires at least %d so the background summariser can run separate from the foreground turn. Set `parallel = 2` (or more) on your [[llm]] entry, or add a second [[llm]] entry, then click Retry.", a.totalSlots(), minTotalSlots)
 		}
 		tcId, err := a.askAcknowledgeWithCard(ctx, sid, msg, "think", "Retry")
 		if err != nil {
@@ -330,14 +362,21 @@ func (a *agent) renderLLMStatus() string {
 	} else {
 		b.WriteString("Image support: disabled\n\n")
 	}
-	if a.mainSlotTokens > 0 {
-		if pc := conns[0].parallelCap(); pc > 1 {
-			fmt.Fprintf(&b, "✅ Context window: %d tokens/slot (n_ctx %d ÷ %d slots, compact at ~%d)\n\n", a.mainSlotTokens, a.mainSlotTokens*pc, pc, a.compactTriggerTokens())
-		} else {
-			fmt.Fprintf(&b, "✅ Context window: %d tokens (compact at ~%d)\n\n", a.mainSlotTokens, a.compactTriggerTokens())
-		}
-	} else {
+	switch {
+	case a.mainSlotTokens == 0:
 		b.WriteString("🟡 Context window: unknown — server didn't report n_ctx. Restart with the context size set on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`) so codehalter can size compaction.\n\n")
+	case a.mainSlotTokens < minSlotTokens:
+		fmt.Fprintf(&b, "🟡 Context window: only %d tokens/slot — codehalter requires at least %d. Restart with a larger `-c N` (llama.cpp) / `--max-model-len N` (vLLM), or reduce `parallel` in settings.toml.\n\n", a.mainSlotTokens, minSlotTokens)
+	default:
+		trigger := a.mainSlotTokens * compactTriggerPct / 100
+		if pc := conns[0].parallelCap(); pc > 1 {
+			fmt.Fprintf(&b, "✅ Context window: %d tokens/slot (n_ctx %d ÷ %d slots, compact at %d)\n\n", a.mainSlotTokens, a.mainSlotTokens*pc, pc, trigger)
+		} else {
+			fmt.Fprintf(&b, "✅ Context window: %d tokens (compact at %d)\n\n", a.mainSlotTokens, trigger)
+		}
+	}
+	if total := a.totalSlots(); total < minTotalSlots {
+		fmt.Fprintf(&b, "🟡 Slots: only %d configured — codehalter requires at least %d so the background summariser has a slot separate from the foreground. Set `parallel = 2` on your [[llm]] entry or add a second [[llm]].\n\n", total, minTotalSlots)
 	}
 	return b.String()
 }

@@ -49,6 +49,26 @@ var errUserCancelled = errors.New("user cancelled")
 // mid-request — surfacing it as a JSON-RPC error makes Zed render the
 // AUTH_REQUIRED red box (because ACP reserves -32000 for that). All three
 // must collapse to a clean "cancelled" stopReason at the top of Prompt.
+// maxShadowInputBytes caps the bytes any single payload contributes to a
+// background LLM call (per-turn summaries via backgroundSummarise, git diffs
+// via backgroundGitCommit). Without this, a turn that produced megabytes of
+// tool output (huge run_command dumps) would blow through the background
+// LLM's own context window.
+const maxShadowInputBytes = 20 * 1024
+
+// clipBytes truncates s to at most max bytes, leaving a marker in the middle
+// when it had to cut. Used to bound any single payload's contribution to a
+// background LLM call (turn summaries via backgroundSummarise, git diffs via
+// backgroundGitCommit) so one giant tool output can't blow the summariser's
+// own context window.
+func clipBytes(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	half := max / 2
+	return s[:half] + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + s[len(s)-half:]
+}
+
 func isCancelled(err error) bool {
 	return errors.Is(err, errUserCancelled) ||
 		errors.Is(err, context.Canceled) ||
@@ -224,9 +244,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// prepare may dispatch proposeFix → AddUser → orchestrator to install a
 	// missing dev tool, which both fills sess.Messages (flipping isFirstMessage)
 	// and triggers an LLM call that needs sess.SystemPrompt to carry the
-	// skills / cwd context. Seeding sess.SystemPrompt here also makes
-	// generateTitle pick the user's actual request as the title — not the
-	// synthetic install prompt.
+	// skills / cwd context.
 	sess := a.getSession(req.SessionId)
 	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
 	if sess != nil && sess.SystemPrompt == "" {
@@ -256,7 +274,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		case "text":
 			userText += block.Text
 		case "image":
-			images = append(images, ImageData{MimeType: block.MimeType, Data: block.Data})
+			images = append(images, ImageData{ID: nextImageID(), MimeType: block.MimeType, Data: block.Data})
 		}
 	}
 
@@ -281,9 +299,18 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		_ = sess.Save()
 	}
 
-	// Generate title for new sessions.
-	if isFirstMessage {
-		go a.generateTitle(context.Background(), sess, userText)
+	// Reject prompts whose text alone would breach the compaction trigger.
+	// Even on a fresh session, system prompt + skills + the assistant
+	// reply won't fit alongside a user message that big, and letting
+	// llmStream error out mid-stream is worse UX than refusing up front.
+	// bytes/4 is a rough chars-per-token estimate; precision doesn't matter
+	// here since the trigger leaves ~20% headroom anyway.
+	if a.mainSlotTokens > 0 {
+		estTokens := len(userText) / 4
+		triggerTokens := a.mainSlotTokens * compactTriggerPct / 100
+		if estTokens > triggerTokens {
+			return a.failPrompt(req.SessionId, fmt.Errorf("message too large: ~%d tokens estimated, exceeds the %d-token compaction trigger (per-slot n_ctx %d × %d%%). Trim the prompt or restart your server with a larger -c N / --max-model-len N", estTokens, triggerTokens, a.mainSlotTokens, compactTriggerPct), nil)
+		}
 	}
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
@@ -591,7 +618,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	if !sess.gitCommitJob.TryStart() {
 		return
 	}
-	conn := a.pickBackgroundLLM(sess.ID)
+	conn := a.pickBackgroundLLM()
 	if conn == nil {
 		sess.gitCommitJob.Done()
 		return

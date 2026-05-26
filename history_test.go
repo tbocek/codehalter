@@ -124,7 +124,6 @@ func TestSessionRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
-	s.Title = "round trip"
 	s.AddUser("hello")
 	s.AddAssistant("hi there")
 	s.AppendToolUse(ToolUse{Name: "read_file", Input: `{"path":"x.go"}`, Output: "file content"})
@@ -136,9 +135,6 @@ func TestSessionRoundtrip(t *testing.T) {
 	loaded, err := loadSession(dir, s.ID)
 	if err != nil {
 		t.Fatalf("loadSession: %v", err)
-	}
-	if loaded.Title != "round trip" {
-		t.Errorf("Title: got %q, want %q", loaded.Title, "round trip")
 	}
 	if got := len(loaded.Messages); got != 2 {
 		t.Fatalf("Messages len: got %d, want 2", got)
@@ -754,16 +750,15 @@ func TestToolLoopEscalatesOnRepeatedArgs(t *testing.T) {
 	}
 }
 
-// TestCompressHistoryRecordsSummary is the headline history test: once raw
-// messages exceed compactTriggerTokens, compressHistory should rotate the
-// session — freeze the pre-rotation state to a "session_archive_*" file,
-// push the new Summary into the live session, trim raw messages to the
-// recent 20%, and persist everything. The title is set once from the first
-// prompt (generateTitle) and never changed by compaction.
+// TestCompressHistoryRecordsSummary is the headline history test: once the
+// server-reported prompt_tokens crosses the trigger, compressHistory should
+// rotate the session — freeze the pre-rotation state to a "session_archive_*"
+// file, push the drained shadow entries into Summary, trim raw messages to
+// the single most-recent one, and persist everything. The mock LLM has zero
+// responses queued: the shadow fast path is fully local and any LLM call
+// would fail the test.
 func TestCompressHistoryRecordsSummary(t *testing.T) {
-	mock := newMockLLM(t,
-		sseText("SUMMARY-OF-OLD-MESSAGES"),
-	)
+	mock := newMockLLM(t)
 	defer mock.Close()
 
 	dir := t.TempDir()
@@ -771,13 +766,10 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
-	s.Title = "ORIGINAL TITLE"
 
-	// With mainSlotTokens = 90_000 the trigger is
-	// (90_000 - compactOverheadTokens) * 80 / 100 = 60_000 tokens.
-	// charsPerToken = 4 → need > 240_000 chars. 20 messages × ~22_000 chars =
-	// ~440_000 chars = ~110_000 tokens, comfortably over the trigger.
-	filler := strings.Repeat("lorem ipsum ", 1834) // ~22_000 chars
+	// Build 10 user+assistant pairs so the rotation trims 19 messages into
+	// the summary and leaves exactly 1 verbatim (the trailing assistant reply).
+	filler := strings.Repeat("lorem ipsum ", 100)
 	for i := 0; i < 10; i++ {
 		s.AddUser(fmt.Sprintf("user msg %d %s", i, filler))
 		s.AddAssistant(fmt.Sprintf("asst msg %d %s", i, filler))
@@ -786,6 +778,16 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 	originalMsgCount := len(s.Messages)
+
+	// Seed shadow with two notes covering the older turns plus one anchor
+	// that must stay in the buffer for the next compaction.
+	s.appendShadow("Goal: ship feature\nProgress: scaffolded module")
+	s.appendShadow("Goal: ship feature\nProgress: wired up handler")
+	s.appendShadow("Goal: ship feature\nProgress: anchor entry")
+
+	// mainSlotTokens = 90_000 → trigger at 72_000. Set LastCompletePromptTokens
+	// past the trigger to simulate the server's most recent /usage chunk.
+	s.SetLastCompletePromptTokens(80_000)
 
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
@@ -797,18 +799,17 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 
 	a.compressHistory(context.Background(), s)
 
-	if s.Summary != "SUMMARY-OF-OLD-MESSAGES" {
-		t.Errorf("summary: got %q, want %q", s.Summary, "SUMMARY-OF-OLD-MESSAGES")
+	if !strings.Contains(s.Summary, "scaffolded module") || !strings.Contains(s.Summary, "wired up handler") {
+		t.Errorf("summary missing drained shadow entries; got %q", s.Summary)
+	}
+	if strings.Contains(s.Summary, "anchor entry") {
+		t.Errorf("anchor entry leaked into Summary; should still be in shadow: %q", s.Summary)
 	}
 	if len(s.Messages) >= originalMsgCount {
 		t.Errorf("Messages not trimmed: before %d, after %d", originalMsgCount, len(s.Messages))
 	}
-	// 20/80 split: only the recent 20% stays raw.
-	if want := originalMsgCount - (originalMsgCount*4)/5; len(s.Messages) != want {
-		t.Errorf("Messages after trim: got %d, want %d", len(s.Messages), want)
-	}
-	if s.Title != "ORIGINAL TITLE" {
-		t.Errorf("Title must not change during compaction: got %q, want %q", s.Title, "ORIGINAL TITLE")
+	if len(s.Messages) != 1 {
+		t.Errorf("Messages after trim: got %d, want 1", len(s.Messages))
 	}
 
 	// An archive file should exist holding the pre-rotation full state, and
@@ -829,36 +830,17 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		t.Errorf("archive Messages: got %d, want %d", len(archived.Messages), originalMsgCount)
 	}
 
-	// Persistence.
+	// Persistence — the drained shadow must survive a reload.
 	loaded, err := loadSession(dir, s.ID)
 	if err != nil {
 		t.Fatalf("loadSession: %v", err)
 	}
-	if loaded.Summary != "SUMMARY-OF-OLD-MESSAGES" {
-		t.Errorf("persisted summary: got %q", loaded.Summary)
-	}
-	if loaded.Title != "ORIGINAL TITLE" {
-		t.Errorf("persisted title: got %q", loaded.Title)
+	if !strings.Contains(loaded.Summary, "wired up handler") {
+		t.Errorf("persisted summary missing drained shadow entries; got %q", loaded.Summary)
 	}
 
-	// Exactly one LLM call (summarize). Retitle is gone.
-	if mock.callCount() != 1 {
-		t.Errorf("LLM calls: got %d, want 1", mock.callCount())
-	}
-
-	// The summary prompt should reference the older half of the conversation.
-	if body := mock.request(0); body != nil {
-		msgs, _ := body["messages"].([]any)
-		if len(msgs) == 0 {
-			t.Error("summary request had no messages")
-		} else {
-			m0, _ := msgs[0].(map[string]any)
-			content, _ := m0["content"].(string)
-			if !strings.Contains(content, "user msg 0") {
-				t.Errorf("summary prompt missing oldest user message; got snippet: %q",
-					truncate(content, 200))
-			}
-		}
+	if mock.callCount() != 0 {
+		t.Errorf("LLM calls: got %d, want 0 (shadow fast path is fully local)", mock.callCount())
 	}
 }
 
@@ -875,7 +857,7 @@ func TestConcurrentSessionWritesAreRaceFree(t *testing.T) {
 	const workers = 8
 	const perWorker = 50
 	var wg sync.WaitGroup
-	wg.Add(workers * 4)
+	wg.Add(workers * 3)
 
 	// Writers: exercise each mutator type concurrently.
 	for i := 0; i < workers; i++ {
@@ -889,12 +871,6 @@ func TestConcurrentSessionWritesAreRaceFree(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < perWorker; j++ {
 				s.AppendToolUse(ToolUse{Name: "x", Input: "{}", Output: "ok"})
-			}
-		}()
-		go func() {
-			defer wg.Done()
-			for j := 0; j < perWorker; j++ {
-				s.SetTitle(fmt.Sprintf("title-%d", j))
 			}
 		}()
 		go func() {
@@ -976,7 +952,7 @@ func TestCapReadContent(t *testing.T) {
 //
 // The append-only transcript model makes this trivial: each phase pushes a
 // new user/assistant pair onto sess.Messages and never mutates earlier
-// entries, so buildLLMHistory replays the same bytes. The test exercises the
+// entries, so buildLLMContext replays the same bytes. The test exercises the
 // load-bearing case — the first turn populates sess.SystemPrompt (skills +
 // project context), and that leading message must remain identical on later
 // turns so the LLM's prefix cache keeps hitting.
@@ -1008,12 +984,12 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 	}
 
 	// --- Turn 1: first prompt of the session ---
-	// Prompt() sets sess.SystemPrompt (emitted by buildLLMHistory as the
+	// Prompt() sets sess.SystemPrompt (emitted by buildLLMContext as the
 	// leading user message); subsequent phases (PLAN/EXECUTE/VERIFY/
 	// DOCUMENT.md) get their own user turns appended to Messages.
 	s.SystemPrompt = sysPrompt
 	s.AddUser("first prompt")
-	msgs1 := a.buildLLMHistory(s, -1)
+	msgs1 := a.buildLLMContext(s)
 
 	// Assistant replies (planner JSON, executor text, etc. — collapsed to
 	// one assistant message here since the test only cares about the
@@ -1024,7 +1000,7 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 	// Subsequent user turns store just the raw text — sysPrompt is already
 	// in sess.SystemPrompt from turn 1.
 	s.AddUser("second prompt")
-	msgs2 := a.buildLLMHistory(s, -1)
+	msgs2 := a.buildLLMContext(s)
 
 	if len(msgs2) <= len(msgs1) {
 		t.Fatalf("turn 2 should extend turn 1's history; got len1=%d len2=%d",
@@ -1082,8 +1058,9 @@ func TestLoadSkillsDeterministic(t *testing.T) {
 	}
 }
 
-// TestCompressHistoryNoopWhenBelowBudget verifies that small sessions don't
-// call the LLM at all — no summary.
+// TestCompressHistoryNoopWhenBelowBudget verifies that sessions with a
+// prompt_tokens reading below the trigger don't call the LLM at all — no
+// summary.
 func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 	mock := newMockLLM(t) // zero responses queued → any call fails the test.
 	defer mock.Close()
@@ -1095,6 +1072,8 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 	}
 	s.AddUser("short")
 	s.AddAssistant("also short")
+	// Well below the 72_000 trigger.
+	s.SetLastCompletePromptTokens(5_000)
 
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
@@ -1132,7 +1111,7 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 		t.Fatalf("newSession: %v", err)
 	}
 
-	filler := strings.Repeat("lorem ipsum ", 1834)
+	filler := strings.Repeat("lorem ipsum ", 100)
 	for i := 0; i < 10; i++ {
 		s.AddUser(fmt.Sprintf("user msg %d %s", i, filler))
 		s.AddAssistant(fmt.Sprintf("asst msg %d %s", i, filler))
@@ -1140,9 +1119,11 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 	if err := s.Save(); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
+	s.SetLastCompletePromptTokens(80_000)
 
 	s.appendShadow("Goal: do thing\nProgress: did thing")
 	s.appendShadow("Goal: do thing\nProgress: refined thing")
+	s.appendShadow("Goal: do thing\nProgress: anchor entry")
 
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
@@ -1154,15 +1135,20 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 
 	a.compressHistory(context.Background(), s)
 
+	// Older entries fold into Summary; the most-recent stays in the buffer
+	// as the anchor covering the verbatim trailing message.
 	if !strings.Contains(s.Summary, "did thing") || !strings.Contains(s.Summary, "refined thing") {
-		t.Errorf("expected Summary to contain both shadow chunks, got %q", s.Summary)
+		t.Errorf("expected Summary to contain the older shadow chunks, got %q", s.Summary)
+	}
+	if strings.Contains(s.Summary, "anchor entry") {
+		t.Errorf("Summary swallowed the anchor entry; should still be in the shadow buffer: %q", s.Summary)
 	}
 	if mock.callCount() != 0 {
 		t.Errorf("LLM calls: got %d, want 0 (shadow fast path is fully local)", mock.callCount())
 	}
-	// Drain again — buffer must be empty after compaction.
-	if remaining := s.drainShadow(); remaining != "" {
-		t.Errorf("shadow buffer not drained after compaction: %q", remaining)
+	// The anchor entry is still in the buffer; a follow-up peek must see it.
+	if peek := s.peekShadow(); !strings.Contains(peek, "anchor entry") {
+		t.Errorf("anchor entry missing from shadow buffer after compaction; got %q", peek)
 	}
 }
 
@@ -1178,7 +1164,8 @@ func contentString(t *testing.T, m llmMessage) string {
 }
 
 // TestBuildLLMHistoryShape verifies the header injection when a summary
-// exists (one user message), message ordering, and that skipIdx is honoured.
+// exists (one leading user message) and that stored messages follow in
+// order. The no-summary case verifies the header is omitted.
 func TestBuildLLMHistoryShape(t *testing.T) {
 	a := &agent{}
 	s := &Session{
@@ -1190,10 +1177,10 @@ func TestBuildLLMHistoryShape(t *testing.T) {
 		},
 	}
 
-	msgs := a.buildLLMHistory(s, 2)
+	msgs := a.buildLLMContext(s)
 
-	if len(msgs) != 3 {
-		t.Fatalf("got %d messages, want 3: %+v", len(msgs), msgs)
+	if len(msgs) != 4 {
+		t.Fatalf("got %d messages, want 4: %+v", len(msgs), msgs)
 	}
 	if msgs[0].Role != "user" {
 		t.Errorf("header role: got %q, want user", msgs[0].Role)
@@ -1207,36 +1194,102 @@ func TestBuildLLMHistoryShape(t *testing.T) {
 	if got := contentString(t, msgs[2]); got != "a1" {
 		t.Errorf("msgs[2]: got %q, want a1", got)
 	}
+	if got := contentString(t, msgs[3]); got != "q2" {
+		t.Errorf("msgs[3]: got %q, want q2", got)
+	}
 
-	// No summary → no header; skipIdx still honoured.
+	// No summary → no header; stored messages pass through unchanged.
 	s2 := &Session{Messages: []Message{
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},
 	}}
-	msgs2 := a.buildLLMHistory(s2, 0)
-	if len(msgs2) != 1 {
-		t.Fatalf("no-summary case: got %d, want 1", len(msgs2))
+	msgs2 := a.buildLLMContext(s2)
+	if len(msgs2) != 2 {
+		t.Fatalf("no-summary case: got %d, want 2", len(msgs2))
 	}
-	if got := contentString(t, msgs2[0]); got != "a1" {
-		t.Errorf("no-summary case content: got %q, want a1", got)
+	if got := contentString(t, msgs2[0]); got != "q1" {
+		t.Errorf("no-summary case msgs2[0]: got %q, want q1", got)
+	}
+	if got := contentString(t, msgs2[1]); got != "a1" {
+		t.Errorf("no-summary case msgs2[1]: got %q, want a1", got)
 	}
 }
 
-// TestHistoryMessageImageHandling covers the imagesSupported branch: text
-// fallback when false, structured content blocks when true.
-func TestHistoryMessageImageHandling(t *testing.T) {
-	img := ImageData{MimeType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("pngbytes"))}
-	msg := Message{Role: "user", Content: "look at this", Images: []ImageData{img, img}}
+// TestBuildLLMHistoryToolUseProtocolShape verifies that a stored assistant
+// message with ToolUses is rebuilt in the OpenAI protocol shape — assistant
+// with ToolCalls field, followed by one tool-role message per call carrying
+// the truncated output and a ToolCallID pointer back. tu.ID is reused as
+// tool_call_id.
+func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
+	a := &agent{}
+	s := &Session{Messages: []Message{
+		{Role: "user", Content: "do it"},
+		{Role: "assistant", Content: "running", ToolUses: []ToolUse{
+			{ID: "tu_1", Name: "read_file", Input: `{"path":"x"}`, Output: "file content"},
+			{ID: "tu_2", Name: "search", Input: `{"q":"foo"}`, Output: "match line"},
+		}},
+	}}
 
-	// images not supported → text with annotation.
-	a := &agent{imagesSupported: false}
-	if got := contentString(t, a.historyMessage(msg)); !strings.Contains(got, "[Images: 2 attached]") {
-		t.Errorf("expected '[Images: 2 attached]' in %q", got)
+	msgs := a.buildLLMContext(s)
+	if len(msgs) != 4 {
+		t.Fatalf("got %d messages, want 4 (user + assistant + 2 tool): %+v", len(msgs), msgs)
+	}
+	if msgs[0].Role != "user" || contentString(t, msgs[0]) != "do it" {
+		t.Errorf("msgs[0] wrong: %+v", msgs[0])
 	}
 
-	// images supported → []any with one text block + N image_url blocks.
+	asst := msgs[1]
+	if asst.Role != "assistant" || contentString(t, asst) != "running" {
+		t.Errorf("assistant Role/Content wrong: %+v", asst)
+	}
+	if len(asst.ToolCalls) != 2 {
+		t.Fatalf("assistant ToolCalls len: got %d, want 2", len(asst.ToolCalls))
+	}
+	if asst.ToolCalls[0].ID != "tu_1" || asst.ToolCalls[0].Type != "function" ||
+		asst.ToolCalls[0].Function.Name != "read_file" || asst.ToolCalls[0].Function.Arguments != `{"path":"x"}` {
+		t.Errorf("ToolCalls[0] wrong: %+v", asst.ToolCalls[0])
+	}
+	if asst.ToolCalls[1].ID != "tu_2" || asst.ToolCalls[1].Function.Name != "search" {
+		t.Errorf("ToolCalls[1] wrong: %+v", asst.ToolCalls[1])
+	}
+
+	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "tu_1" || contentString(t, msgs[2]) != "file content" {
+		t.Errorf("tool message [0] wrong: %+v", msgs[2])
+	}
+	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "tu_2" || contentString(t, msgs[3]) != "match line" {
+		t.Errorf("tool message [1] wrong: %+v", msgs[3])
+	}
+}
+
+// TestBuildLLMHistoryImageHandling covers the imagesSupported branch and the
+// trailing-message vs older-message split: only the trailing message gets
+// inline data: URLs; older messages collapse to a text placeholder that
+// references the image id so the model can call view_image to re-fetch.
+func TestBuildLLMHistoryImageHandling(t *testing.T) {
+	img1 := ImageData{ID: "img_1", MimeType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("pngbytes"))}
+	img2 := ImageData{ID: "img_2", MimeType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("pngbytes"))}
+
+	// Trailing message with images, images NOT supported → text fallback with
+	// the per-image placeholder (no inline data: URL).
+	a := &agent{imagesSupported: false}
+	s := &Session{Messages: []Message{{Role: "user", Content: "look at this", Images: []ImageData{img1, img2}}}}
+	out := a.buildLLMContext(s)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(out))
+	}
+	got := contentString(t, out[0])
+	if !strings.Contains(got, "[Image img_1 (image/png,") || !strings.Contains(got, "[Image img_2 (image/png,") {
+		t.Errorf("expected per-image placeholders in %q", got)
+	}
+	if !strings.Contains(got, "view_image id=img_1") || !strings.Contains(got, "view_image id=img_2") {
+		t.Errorf("expected view_image hints in %q", got)
+	}
+
+	// Trailing message with images, images supported → []any with one text
+	// block + N image_url blocks containing the actual data: URLs.
 	a.imagesSupported = true
-	parts, ok := a.historyMessage(msg).Content.([]any)
+	out = a.buildLLMContext(s)
+	parts, ok := out[0].Content.([]any)
 	if !ok {
 		t.Fatalf("expected []any content, got different type")
 	}
@@ -1258,59 +1311,73 @@ func TestHistoryMessageImageHandling(t *testing.T) {
 		}
 	}
 
+	// Older message with images + a fresh trailing message: images supported,
+	// but the older image collapses to a text placeholder (no data: URL on the
+	// wire) while the trailing message stays inline.
+	s4 := &Session{Messages: []Message{
+		{Role: "user", Content: "earlier", Images: []ImageData{img1}},
+		{Role: "user", Content: "now look at this one", Images: []ImageData{img2}},
+	}}
+	out = a.buildLLMContext(s4)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 messages, got %d", len(out))
+	}
+	older := contentString(t, out[0])
+	if !strings.Contains(older, "[Image img_1") || !strings.Contains(older, "view_image id=img_1") {
+		t.Errorf("older message missing placeholder + hint: %q", older)
+	}
+	if strings.Contains(older, "data:image/png;base64,") {
+		t.Errorf("older message must NOT inline data: URL, got %q", older)
+	}
+	trailingParts, ok := out[1].Content.([]any)
+	if !ok || len(trailingParts) != 2 {
+		t.Fatalf("trailing: expected []any of len 2, got %+v", out[1].Content)
+	}
+
+	// Legacy session file: image with no ID → placeholder notes that it can't
+	// be re-fetched. images NOT supported so we land in the text branch.
+	a.imagesSupported = false
+	legacy := ImageData{MimeType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("pngbytes"))}
+	s5 := &Session{Messages: []Message{{Role: "user", Content: "old", Images: []ImageData{legacy}}}}
+	if got := contentString(t, a.buildLLMContext(s5)[0]); !strings.Contains(got, "id missing, cannot re-fetch") {
+		t.Errorf("legacy placeholder missing: %q", got)
+	}
+
 	// Message with no images → plain string, untouched.
-	if got := contentString(t, a.historyMessage(Message{Role: "user", Content: "no imgs"})); got != "no imgs" {
+	a.imagesSupported = true
+	s2 := &Session{Messages: []Message{{Role: "user", Content: "no imgs"}}}
+	if got := contentString(t, a.buildLLMContext(s2)[0]); got != "no imgs" {
 		t.Errorf("plain: got %q, want 'no imgs'", got)
 	}
 
-	// Combined: tool uses + images together. The tool-call summary should be
-	// inlined into the text block; the image URLs follow.
+	// Combined: tool uses + images on the trailing message. The image is
+	// inlined as an image_url part; the tool use lives in ToolCalls on the
+	// assistant message and produces a follow-up tool-role message.
 	combined := Message{
 		Role:     "assistant",
 		Content:  "done",
-		Images:   []ImageData{img},
-		ToolUses: []ToolUse{{Name: "read_file", Input: `{"path":"x"}`, Output: "ok"}},
+		Images:   []ImageData{img1},
+		ToolUses: []ToolUse{{ID: "tu_77", Name: "read_file", Input: `{"path":"x"}`, Output: "ok"}},
 	}
-	parts, ok = a.historyMessage(combined).Content.([]any)
+	s3 := &Session{Messages: []Message{combined}}
+	outCombined := a.buildLLMContext(s3)
+	if len(outCombined) != 2 {
+		t.Fatalf("combined: expected 2 messages (assistant + tool), got %d: %+v", len(outCombined), outCombined)
+	}
+	parts, ok = outCombined[0].Content.([]any)
 	if !ok || len(parts) != 2 {
-		t.Fatalf("combined: expected []any of len 2, got %+v", parts)
+		t.Fatalf("combined assistant Content: expected []any of len 2, got %+v", outCombined[0].Content)
 	}
 	text, _ = parts[0].(map[string]any)
 	textStr, _ := text["text"].(string)
-	if !strings.Contains(textStr, "done") || !strings.Contains(textStr, "read_file") {
-		t.Errorf("combined text block missing content or tool summary: %q", textStr)
+	if textStr != "done" {
+		t.Errorf("combined text block: got %q, want %q", textStr, "done")
 	}
-}
-
-// TestEstimateMessagesTokensCountsToolUses guards the fix where tool Name +
-// Input + Output each contribute to the budget, not just Content. Tests each
-// field individually so a regression that drops any one of them is caught.
-func TestEstimateMessagesTokensCountsToolUses(t *testing.T) {
-	baseline := estimateMessagesTokens([]Message{{Role: "assistant", Content: "hello"}})
-	big := strings.Repeat("x", 1000) // 250 tokens @ 4 chars/token
-	mkMsg := func(tu ToolUse) []Message {
-		return []Message{{Role: "assistant", Content: "hello", ToolUses: []ToolUse{tu}}}
+	if len(outCombined[0].ToolCalls) != 1 || outCombined[0].ToolCalls[0].ID != "tu_77" || outCombined[0].ToolCalls[0].Function.Name != "read_file" {
+		t.Errorf("combined ToolCalls wrong: %+v", outCombined[0].ToolCalls)
 	}
-
-	// Each tool-use field, in isolation, must push the count past baseline.
-	cases := []struct {
-		field string
-		msg   []Message
-	}{
-		{"Name", mkMsg(ToolUse{Name: big})},
-		{"Input", mkMsg(ToolUse{Input: big})},
-		{"Output", mkMsg(ToolUse{Output: big})},
-	}
-	for _, tc := range cases {
-		t.Run(tc.field, func(t *testing.T) {
-			got := estimateMessagesTokens(tc.msg)
-			// -roleTokenOverhead accounts for the per-tool-use overhead
-			// added on top of the field contents.
-			if got-baseline < 250 {
-				t.Errorf("ToolUse.%s not counted: baseline=%d, got=%d, want delta >=250",
-					tc.field, baseline, got)
-			}
-		})
+	if outCombined[1].Role != "tool" || outCombined[1].ToolCallID != "tu_77" || outCombined[1].Content.(string) != "ok" {
+		t.Errorf("combined tool message wrong: %+v", outCombined[1])
 	}
 }
 
@@ -1328,13 +1395,15 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 	}
 	s.Summary = "PRIOR SUMMARY FROM AN EARLIER COMPACTION"
 
-	filler := strings.Repeat("lorem ipsum ", 1834)
+	filler := strings.Repeat("lorem ipsum ", 100)
 	for i := 0; i < 10; i++ {
 		s.AddUser(fmt.Sprintf("user %d %s", i, filler))
 		s.AddAssistant(fmt.Sprintf("asst %d %s", i, filler))
 	}
+	s.SetLastCompletePromptTokens(80_000)
 
 	s.appendShadow("Goal: x\nProgress: y")
+	s.appendShadow("Goal: x\nProgress: anchor")
 
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},

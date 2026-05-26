@@ -39,6 +39,12 @@ type Message struct {
 }
 
 type ImageData struct {
+	// ID is a per-session stable handle ("img_<n>") generated when the image
+	// is captured from the user prompt. Surfaced in the text placeholder that
+	// replaces inline data: URLs for older messages so the model can call
+	// view_image id=img_N to re-fetch the bytes. Empty for ImageData loaded
+	// from older session files.
+	ID       string `toml:"id,omitempty"`
 	MimeType string `toml:"mime_type"`
 	Data     string `toml:"data"` // base64-encoded
 }
@@ -98,10 +104,18 @@ func (j *bgJob) Done() {
 // Done. Used by joiners that need fresh state.
 func (j *bgJob) Wait() { j.pending.Wait() }
 
+// summariseTask is one queued background-summariser job: the user/assistant
+// snapshot to feed the structured-turn prompt. The connection is picked at
+// enqueue time so the runner doesn't have to reach back into the agent.
+type summariseTask struct {
+	User      Message
+	Assistant Message
+	Conn      *LLMConnection
+}
+
 type Session struct {
 	ID        string    `toml:"id"`
 	Cwd       string    `toml:"cwd"`
-	Title     string    `toml:"title"`
 	CreatedAt time.Time `toml:"created_at"`
 	Depth     int       `toml:"depth,omitempty"`
 	ParentID  string    `toml:"parent_id,omitempty"`
@@ -110,7 +124,7 @@ type Session struct {
 	// every LLM call. Set on the first user turn (see Prompt) and refreshed
 	// after each compressHistory rotation — so it survives the summariser
 	// (which otherwise compresses skills away) and reflects current
-	// .codehalter/SKILL-*.md content. Emitted by buildLLMHistory as the
+	// .codehalter/SKILL-*.md content. Emitted by buildLLMContext as the
 	// leading user message before any Summary.
 	SystemPrompt string    `toml:"system_prompt,omitempty"`
 	Messages     []Message `toml:"messages"`
@@ -148,27 +162,49 @@ type Session struct {
 	// this and go through webBodies/sliceWebBody.
 	webResultsMu sync.Mutex
 	webResults   map[string]string
-	// mu serialises mutations of the persisted fields (Title, Messages,
-	// Summary, …) and the Save() encoder. Prompt runs synchronously per
-	// session, but generateTitle runs as a background goroutine and would
-	// otherwise race on Title + the TOML file. The phaseMu and
-	// launchedSubagentsMu fields above intentionally have their own locks —
-	// they don't touch persisted state and must not block on the long-held
-	// mu (compressHistory in particular).
+	// mu serialises the Save() encoder write against concurrent mutators —
+	// AddUser/AddAssistant/etc. acquire it before touching persisted fields
+	// so a Save() landing in parallel doesn't observe a torn slice. Prompt
+	// runs synchronously per session so contention is rare; the lock mainly
+	// exists for the background summariser path (which reads Messages while
+	// the foreground turn may be appending) and for the encoder invariant
+	// inside saveLocked. The phaseMu and launchedSubagentsMu fields above
+	// intentionally have their own locks — they don't touch persisted state
+	// and must not block on mu.
 	mu sync.Mutex
-	// shadowSummary accumulates structured per-turn notes (Goal / Constraints
-	// / Progress / Decisions / Next Steps / Critical Context) produced by the
-	// background summariser fired after each llmStream response. compressHistory
-	// drains this into Session.Summary instead of running the synchronous
-	// summarize pass. In-memory only — process restart loses it and the next
-	// compaction falls through to the synchronous path.
+	// shadowEntries holds one structured per-turn note per element (Goal /
+	// Constraints / Progress / Decisions / Next Steps / Critical Context)
+	// produced by the background summariser fired after each llmStream
+	// response. compressHistory drains all-but-the-most-recent entry into
+	// Session.Summary and leaves the trailing entry behind as the anchor
+	// covering the verbatim "last message" the live session keeps. In-memory
+	// only — process restart loses it and the next compaction falls through
+	// to the synchronous path.
 	shadowMu      sync.Mutex
-	shadowSummary strings.Builder
-	// summariseJob / gitCommitJob coalesce per-LLM-call fan-out: TryStart
-	// drops the call when a prior one is in-flight, and Wait() lets callers
-	// (compressHistory, cleanupGitCommitIfClean) join any pending goroutine
-	// before they read the resulting state.
-	summariseJob bgJob
+	shadowEntries []string
+	// summariseQueue is a FIFO of per-turn snapshots waiting for the
+	// background summariser. Every llmStream response in the tool loop
+	// enqueues one — none are dropped, so a 50-iteration loop produces 50
+	// shadow notes (one per assistant snapshot). A single worker goroutine
+	// drains the queue sequentially; the LLM connection's slot semaphore
+	// would serialise concurrent runners anyway, so a worker is simpler
+	// than fire-and-forget. summariseUndone counts enqueued-minus-finished;
+	// waitSummarise blocks while it exceeds 1 (the most-recent task is
+	// always allowed to ride the next compaction so end-of-turn doesn't
+	// stall on it). summariseCond is lazy-initialised under summariseMu on
+	// first use so tests that construct Session{} directly don't need to
+	// know about it.
+	summariseMu      sync.Mutex
+	summariseQueue   []summariseTask
+	summariseRunning bool
+	summariseUndone  int
+	summariseCond    *sync.Cond
+	// gitCommitJob coalesces per-LLM-call fan-out: TryStart drops the call
+	// when a prior one is in-flight, and Wait() lets callers
+	// (cleanupGitCommitIfClean) join any pending goroutine before they
+	// read the resulting state. Drop-on-busy is appropriate here because
+	// gitCommitLastHash already short-circuits identical snapshots — there
+	// is no value in committing intermediate file states.
 	gitCommitJob bgJob
 	// gitCommitLastHash is the sha256 of (status + diff) from the last
 	// successful backgroundGitCommit write. Subsequent calls short-circuit
@@ -226,6 +262,39 @@ type Session struct {
 	// the banner. Not persisted — restart re-emits the banner once on the
 	// first turn.
 	envSnapshot string `toml:"-"`
+	// lastCompletePromptTokens is the server-reported prompt_tokens count
+	// from the most recent llmStream call on this session, captured via
+	// stream_options.include_usage. "Complete" because every llmStream call
+	// re-sends the whole conversation prefix (system prompt + summary +
+	// every prior message + the new turn) — this single reading is the
+	// cumulative context size, not a per-message delta. Drives the
+	// compressHistory trigger: once it crosses ~80% of mainSlotTokens we
+	// rotate, no estimator required. In-memory only — a restart resets to
+	// 0, which is correct (the first turn after restart cannot exceed
+	// n_ctx, and the next llmStream call will refresh the count). Guarded
+	// by lastTokensMu so llmStream's background-thread writes don't race
+	// compressHistory's read.
+	lastTokensMu             sync.Mutex
+	lastCompletePromptTokens int
+}
+
+// SetLastCompletePromptTokens records the server-reported prompt_tokens for
+// the most recent llmStream call on this session. Called from llmStream's
+// hot path.
+func (s *Session) SetLastCompletePromptTokens(n int) {
+	s.lastTokensMu.Lock()
+	s.lastCompletePromptTokens = n
+	s.lastTokensMu.Unlock()
+}
+
+// LastCompletePromptTokens returns the server-reported prompt_tokens for the
+// most recent llmStream call, or 0 when no call has run yet on this session.
+// "Complete" because the value already covers the whole conversation prefix
+// re-sent on that call — callers should NOT sum across calls.
+func (s *Session) LastCompletePromptTokens() int {
+	s.lastTokensMu.Lock()
+	defer s.lastTokensMu.Unlock()
+	return s.lastCompletePromptTokens
 }
 
 // recallSubagent returns a prior result for the given task hash if one exists.
@@ -431,9 +500,86 @@ func (s *Session) FindToolUseOutput(id string) string {
 	return ""
 }
 
+// FindImage scans every message's images for one matching id and returns a
+// copy. Used by view_image to re-deliver an attachment after buildLLMContext
+// has elided its data: URL into a text placeholder. Returns nil when no match.
+func (s *Session) FindImage(id string) *ImageData {
+	if id == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.Messages {
+		for j := range s.Messages[i].Images {
+			if s.Messages[i].Images[j].ID == id {
+				img := s.Messages[i].Images[j]
+				return &img
+			}
+		}
+	}
+	return nil
+}
+
+// enqueueSummarise appends a task to the summariser queue and starts the
+// single worker goroutine if one isn't already draining it. runner is called
+// sequentially for each task in FIFO order; the worker exits when the queue
+// empties. summariseUndone tracks queued + in-flight tasks for the joiner
+// (waitSummarise). Caller holds no session locks; this method manages its
+// own.
+func (s *Session) enqueueSummarise(t summariseTask, runner func(summariseTask)) {
+	s.summariseMu.Lock()
+	s.summariseQueue = append(s.summariseQueue, t)
+	s.summariseUndone++
+	if s.summariseRunning {
+		s.summariseMu.Unlock()
+		return
+	}
+	s.summariseRunning = true
+	s.summariseMu.Unlock()
+
+	go func() {
+		for {
+			s.summariseMu.Lock()
+			if len(s.summariseQueue) == 0 {
+				s.summariseRunning = false
+				s.summariseMu.Unlock()
+				return
+			}
+			next := s.summariseQueue[0]
+			s.summariseQueue = s.summariseQueue[1:]
+			s.summariseMu.Unlock()
+
+			runner(next)
+
+			s.summariseMu.Lock()
+			s.summariseUndone--
+			if s.summariseCond != nil {
+				s.summariseCond.Broadcast()
+			}
+			s.summariseMu.Unlock()
+		}
+	}()
+}
+
+// waitSummarise blocks until at most one summariser task remains outstanding
+// (queued or in-flight). compressHistory uses it at end-of-turn: the older
+// notes must be in the shadow buffer before we drain them into Summary, but
+// the very latest task is allowed to ride the next compaction so the user
+// isn't stalled waiting for a fresh background LLM call to come back.
+func (s *Session) waitSummarise() {
+	s.summariseMu.Lock()
+	defer s.summariseMu.Unlock()
+	if s.summariseCond == nil {
+		s.summariseCond = sync.NewCond(&s.summariseMu)
+	}
+	for s.summariseUndone > 1 {
+		s.summariseCond.Wait()
+	}
+}
+
 // appendShadow adds a structured per-turn note to the shadow buffer. Each
-// chunk is separated by a blank line so compressHistory can dump the buffer
-// directly into Summary. Caller must NOT hold s.mu (shadowMu is independent).
+// note is stored as its own slice entry so drainShadow can leave the last one
+// behind as an anchor. Caller must NOT hold s.mu (shadowMu is independent).
 func (s *Session) appendShadow(chunk string) {
 	chunk = strings.TrimSpace(chunk)
 	if chunk == "" {
@@ -441,38 +587,34 @@ func (s *Session) appendShadow(chunk string) {
 	}
 	s.shadowMu.Lock()
 	defer s.shadowMu.Unlock()
-	if s.shadowSummary.Len() > 0 {
-		s.shadowSummary.WriteString("\n\n")
-	}
-	s.shadowSummary.WriteString(chunk)
+	s.shadowEntries = append(s.shadowEntries, chunk)
 }
 
-// drainShadow returns the accumulated structured notes and resets the buffer.
-// Called by compressHistory after joining sess.summariseJob — at that point
-// the buffer holds every per-turn note since the last compaction.
+// drainShadow returns the accumulated structured notes EXCEPT the most recent
+// one, joined with blank-line separators. The trailing entry stays in the
+// buffer as an anchor covering the verbatim "last message" that compressHistory
+// keeps — without this, the kept message and the freshly-drained note would
+// duplicate each other in the next prompt. Returns "" when there's fewer than
+// 2 entries, falling the caller through to the synchronous summarize path.
 func (s *Session) drainShadow() string {
 	s.shadowMu.Lock()
 	defer s.shadowMu.Unlock()
-	out := s.shadowSummary.String()
-	s.shadowSummary.Reset()
+	if len(s.shadowEntries) < 2 {
+		return ""
+	}
+	out := strings.Join(s.shadowEntries[:len(s.shadowEntries)-1], "\n\n")
+	s.shadowEntries = s.shadowEntries[len(s.shadowEntries)-1:]
 	return out
 }
 
-// peekShadow returns the accumulated structured notes WITHOUT draining the
-// buffer. Used by the document phase to read per-turn summaries while still
-// letting compressHistory drain them at the next compaction.
+// peekShadow returns every accumulated structured note (including the anchor)
+// joined with blank-line separators, WITHOUT draining the buffer. Used by the
+// document phase to read per-turn summaries while still letting compressHistory
+// drain the older ones at the next compaction.
 func (s *Session) peekShadow() string {
 	s.shadowMu.Lock()
 	defer s.shadowMu.Unlock()
-	return s.shadowSummary.String()
-}
-
-// SetTitle updates the session title under the lock. Used by generateTitle
-// (background goroutine).
-func (s *Session) SetTitle(t string) {
-	s.mu.Lock()
-	s.Title = t
-	s.mu.Unlock()
+	return strings.Join(s.shadowEntries, "\n\n")
 }
 
 // UpsertLastAssistant sets the content of the trailing assistant message,
@@ -517,22 +659,25 @@ func (s *Session) Save() error {
 // file, then resets s in place to carry only `keep` raw messages and `summary`
 // as the rolled-up prior context. The live session keeps its own ID and
 // filePath; only its on-disk contents change. Returns the archive's id.
-// Caller must hold s.mu.
+// Called only from compressHistory in the post-orchestrate epilogue, where
+// no concurrent writer exists for the session — so the in-place mutation of
+// s.Summary/s.Messages here doesn't take the lock; the follow-up Save() does.
 func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	archiveID := fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano())
 	archivePath := filepath.Join(s.Cwd, sessionDir, fmt.Sprintf("session_%s.toml", archiveID))
 	archive := &Session{
-		ID:        archiveID,
-		Cwd:       s.Cwd,
-		Title:     s.Title,
-		CreatedAt: s.CreatedAt,
-		Depth:     s.Depth,
-		Summary:   s.Summary,
-		Messages:  s.Messages,
-		filePath:  archivePath,
+		ID:           archiveID,
+		Cwd:          s.Cwd,
+		CreatedAt:    s.CreatedAt,
+		Depth:        s.Depth,
+		ParentID:     s.ParentID,
+		Summary:      s.Summary,
+		SystemPrompt: s.SystemPrompt,
+		Messages:     s.Messages,
+		filePath:     archivePath,
 	}
-	// Fresh struct, no concurrent access — saveLocked's "caller holds mu"
-	// invariant is vacuously satisfied.
+	// Fresh struct, no concurrent access — the encoder invariant on
+	// saveLocked is vacuously satisfied.
 	if err := archive.saveLocked(); err != nil {
 		return "", err
 	}
@@ -541,7 +686,8 @@ func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	return archiveID, nil
 }
 
-// saveLocked writes the session to disk. Caller must hold s.mu.
+// saveLocked writes the session to disk. Caller must hold s.mu (or own the
+// session exclusively, e.g. a freshly-constructed archive in rotate()).
 func (s *Session) saveLocked() error {
 	f, err := os.Create(s.filePath)
 	if err != nil {
@@ -579,16 +725,9 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 		id := strings.TrimPrefix(e.Name(), "session_")
 		id = strings.TrimSuffix(id, ".toml")
 
-		// Read title from file.
-		var header struct {
-			Title string `toml:"title"`
-		}
-		_, _ = toml.DecodeFile(filepath.Join(dir, e.Name()), &header)
-
 		sessions = append(sessions, SessionInfo{
 			SessionId: id,
 			Cwd:       cwd,
-			Title:     header.Title,
 			UpdatedAt: info.ModTime().Format(time.RFC3339),
 		})
 	}
@@ -604,6 +743,5 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 type SessionInfo struct {
 	SessionId string `json:"sessionId"`
 	Cwd       string `json:"cwd"`
-	Title     string `json:"title,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"`
 }

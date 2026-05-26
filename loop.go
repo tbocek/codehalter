@@ -82,7 +82,7 @@ func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string
 
 	var messages []llmMessage
 	if sess != nil {
-		messages = a.buildLLMHistory(sess, -1)
+		messages = a.buildLLMContext(sess)
 	}
 
 	var plan planResult
@@ -240,7 +240,7 @@ func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx,
 
 	var messages []llmMessage
 	if sess != nil {
-		messages = a.buildLLMHistory(sess, -1)
+		messages = a.buildLLMContext(sess)
 	}
 
 	exclude := map[string]bool{
@@ -301,19 +301,12 @@ func (a *agent) document(ctx context.Context, sid string, exec toolLoopResult) (
 
 	// Prefer a non-foreground slot so llm[0]'s warm cache isn't evicted.
 	// Falls back to MainLLM when only one entry is configured.
-	conn := a.pickBackgroundLLM(sid)
+	conn := a.pickBackgroundLLM()
 	if conn == nil {
 		conn = a.settings.MainLLM("thinking")
 	}
 	if conn == nil {
 		return exec, nil
-	}
-
-	// Wait for in-flight per-turn shadow notes so the summary we feed the
-	// documenter reflects everything that happened on this turn — without
-	// the wait, the most recent subtask's note may not have landed yet.
-	if sess != nil {
-		sess.summariseJob.Wait()
 	}
 
 	var summaryParts []string

@@ -321,7 +321,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 		// session's lock is acquired briefly to copy; tool dispatch keeps
 		// running on the parent in parallel, but we only read the snapshot.
 		if parent := a.getSession(subSess.ParentID); parent != nil {
-			messages = a.buildLLMHistory(parent, -1)
+			messages = a.buildLLMContext(parent)
 		}
 	}
 	messages = append(messages, llmMessage{Role: "user", Content: b.String()})
@@ -367,7 +367,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 // result and lets the parent decide what to do with a subtask failure.
 //
 // The subagent's session is seeded like the parent's: SystemPrompt is stored
-// on subSess so buildLLMHistory folds it into LLM[0]'s first message. We do
+// on subSess so buildLLMContext folds it into LLM[0]'s first message. We do
 // NOT inherit the parent's message history here — thinking subagents own
 // their cycle and shouldn't get confused by the parent's open task. Cache
 // warmth on LLM[0] is sacrificed for clarity; if it becomes a problem we can

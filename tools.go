@@ -236,6 +236,15 @@ func nextToolUseID() string {
 	return fmt.Sprintf("tu_%d", toolUseCounter.Add(1))
 }
 
+// imageCounter assigns each captured ImageData a stable per-process handle so
+// the LLM can call view_image to retrieve an older attachment after
+// buildLLMContext has replaced its inline data: URL with a text placeholder.
+var imageCounter atomic.Uint64
+
+func nextImageID() string {
+	return fmt.Sprintf("img_%d", imageCounter.Add(1))
+}
+
 type toolCallUpdate struct {
 	Kind       string             `json:"sessionUpdate"`
 	ToolCallId string             `json:"toolCallId"`
