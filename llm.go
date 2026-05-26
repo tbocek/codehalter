@@ -1026,7 +1026,27 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 			}
 			a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
 			started := time.Now()
-			result, failed := a.executeTool(ctx, sid, tc)
+
+			// view_image short-circuit: when the server supports images, we
+			// read the bytes off the content-addressed store and deliver them
+			// as multimodal tool content in the SAME turn (so the next
+			// llmStream call sees the image). The standard executeTool path
+			// only returns text, which would defeat the point.
+			var result string
+			var failed bool
+			var multimodalContent any
+			if tc.Function.Name == "view_image" && a.imagesSupported {
+				sess := a.getSession(sid)
+				text, parts, ferr := dispatchViewImage(sess, tc.Function.Arguments)
+				result = text
+				failed = ferr
+				if !ferr {
+					multimodalContent = parts
+				}
+			} else {
+				result, failed = a.executeTool(ctx, sid, tc)
+			}
+
 			if hasTerminal && tc.Function.Name == termName && !terminalCalled {
 				terminalCalled = true
 				terminalMessage = result
@@ -1067,9 +1087,13 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 					content = content + "\n\n" + hint
 				}
 			}
+			var toolContent any = content
+			if multimodalContent != nil {
+				toolContent = multimodalContent
+			}
 			messages = append(messages, llmMessage{
 				Role:       "tool",
-				Content:    content,
+				Content:    toolContent,
 				ToolCallID: tc.ID,
 			})
 		}

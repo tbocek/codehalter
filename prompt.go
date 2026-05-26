@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -266,7 +267,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		slog.Debug("Prompt: pre-turn getSession NIL", "sid", req.SessionId, "knownSessions", len(a.sessions))
 	}
 
-	// Extract user text and images from prompt blocks.
+	// Extract user text and images from prompt blocks. Image bytes are
+	// content-addressed (sha256[:8]) and written under .codehalter/images so
+	// the ACP wire-side base64 doesn't get persisted in session.toml; what
+	// stays on Message.Images is just {id, mime}. Re-pasting the same
+	// screenshot collides on id and skips the write.
 	var userText string
 	var images []ImageData
 	for _, block := range req.Content {
@@ -274,7 +279,19 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		case "text":
 			userText += block.Text
 		case "image":
-			images = append(images, ImageData{ID: nextImageID(), MimeType: block.MimeType, Data: block.Data})
+			bytes, err := base64.StdEncoding.DecodeString(block.Data)
+			if err != nil {
+				slog.Warn("prompt: skipping image with undecodable base64", "err", err)
+				continue
+			}
+			id := imageHashID(bytes)
+			if sess != nil {
+				if err := writeImageFile(sess.Cwd, id, block.MimeType, bytes); err != nil {
+					slog.Warn("prompt: writing image file failed", "id", id, "err", err)
+					continue
+				}
+			}
+			images = append(images, ImageData{ID: id, MimeType: block.MimeType})
 		}
 	}
 

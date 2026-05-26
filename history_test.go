@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -14,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // mockLLM stands up an httptest server that accepts OpenAI chat-completions
@@ -1218,22 +1218,31 @@ func TestBuildLLMHistoryShape(t *testing.T) {
 // TestBuildLLMHistoryToolUseProtocolShape verifies that a stored assistant
 // message with ToolUses is rebuilt in the OpenAI protocol shape — assistant
 // with ToolCalls field, followed by one tool-role message per call carrying
-// the truncated output and a ToolCallID pointer back. tu.ID is reused as
-// tool_call_id.
+// the (truncated) output and a ToolCallID pointer back. tu.ID is reused as
+// tool_call_id. Also covers the empty-assistant-content path (model emitted
+// only tool calls) and the long-output truncation path.
 func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
+	long := strings.Repeat("X", truncateThreshold+500)
+
 	a := &agent{}
 	s := &Session{Messages: []Message{
 		{Role: "user", Content: "do it"},
 		{Role: "assistant", Content: "running", ToolUses: []ToolUse{
 			{ID: "tu_1", Name: "read_file", Input: `{"path":"x"}`, Output: "file content"},
-			{ID: "tu_2", Name: "search", Input: `{"q":"foo"}`, Output: "match line"},
+			{ID: "tu_2", Name: "search", Input: `{"q":"foo"}`, Output: long},
+		}},
+		{Role: "user", Content: "thanks"},
+		{Role: "assistant", Content: "", ToolUses: []ToolUse{
+			{ID: "tu_3", Name: "respond", Input: `{}`, Output: "done"},
 		}},
 	}}
 
 	msgs := a.buildLLMContext(s)
-	if len(msgs) != 4 {
-		t.Fatalf("got %d messages, want 4 (user + assistant + 2 tool): %+v", len(msgs), msgs)
+	// user + (assistant + 2 tool) + user + (assistant + 1 tool) = 7
+	if len(msgs) != 7 {
+		t.Fatalf("got %d messages, want 7: %+v", len(msgs), msgs)
 	}
+
 	if msgs[0].Role != "user" || contentString(t, msgs[0]) != "do it" {
 		t.Errorf("msgs[0] wrong: %+v", msgs[0])
 	}
@@ -1256,37 +1265,68 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "tu_1" || contentString(t, msgs[2]) != "file content" {
 		t.Errorf("tool message [0] wrong: %+v", msgs[2])
 	}
-	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "tu_2" || contentString(t, msgs[3]) != "match line" {
-		t.Errorf("tool message [1] wrong: %+v", msgs[3])
+	// Long output runs through truncateForLLM — the wire copy is shorter than
+	// the stored Output and carries the view_output hint.
+	tool2Content := contentString(t, msgs[3])
+	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "tu_2" {
+		t.Errorf("tool message [1] Role/ID wrong: %+v", msgs[3])
+	}
+	if len(tool2Content) >= len(long) {
+		t.Errorf("long tool output not truncated: wire len %d >= stored len %d", len(tool2Content), len(long))
+	}
+	if !strings.Contains(tool2Content, "view_output id=\"tu_2\"") {
+		t.Errorf("truncated tool message missing view_output hint: %q", tool2Content)
+	}
+
+	if msgs[4].Role != "user" || contentString(t, msgs[4]) != "thanks" {
+		t.Errorf("msgs[4] wrong: %+v", msgs[4])
+	}
+	// Empty-content assistant turn (model emitted only tool calls) still
+	// gets a properly-shaped assistant message.
+	if msgs[5].Role != "assistant" || contentString(t, msgs[5]) != "" || len(msgs[5].ToolCalls) != 1 {
+		t.Errorf("empty-content assistant wrong: %+v", msgs[5])
+	}
+	if msgs[6].Role != "tool" || msgs[6].ToolCallID != "tu_3" {
+		t.Errorf("tool message [2] wrong: %+v", msgs[6])
 	}
 }
 
 // TestBuildLLMHistoryImageHandling covers the imagesSupported branch and the
-// trailing-message vs older-message split: only the trailing message gets
-// inline data: URLs; older messages collapse to a text placeholder that
-// references the image id so the model can call view_image to re-fetch.
+// cache-consistency rule: every stored image gets its bytes inlined every turn
+// — there is no trailing-vs-older split. After compaction the image lives in
+// Summary as a reference and view_image fetches it on demand.
 func TestBuildLLMHistoryImageHandling(t *testing.T) {
-	img1 := ImageData{ID: "img_1", MimeType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("pngbytes"))}
-	img2 := ImageData{ID: "img_2", MimeType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("pngbytes"))}
+	dir := t.TempDir()
+	bytes1 := []byte("pngbytes-1")
+	bytes2 := []byte("pngbytes-2-different")
+	id1 := imageHashID(bytes1)
+	id2 := imageHashID(bytes2)
+	if err := writeImageFile(dir, id1, "image/png", bytes1); err != nil {
+		t.Fatalf("writeImageFile id1: %v", err)
+	}
+	if err := writeImageFile(dir, id2, "image/png", bytes2); err != nil {
+		t.Fatalf("writeImageFile id2: %v", err)
+	}
+	img1 := ImageData{ID: id1, MimeType: "image/png"}
+	img2 := ImageData{ID: id2, MimeType: "image/png"}
 
-	// Trailing message with images, images NOT supported → text fallback with
-	// the per-image placeholder (no inline data: URL).
+	// Images NOT supported → text fallback with per-image placeholders.
 	a := &agent{imagesSupported: false}
-	s := &Session{Messages: []Message{{Role: "user", Content: "look at this", Images: []ImageData{img1, img2}}}}
+	s := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "look at this", Images: []ImageData{img1, img2}}}}
 	out := a.buildLLMContext(s)
 	if len(out) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(out))
 	}
 	got := contentString(t, out[0])
-	if !strings.Contains(got, "[Image img_1 (image/png,") || !strings.Contains(got, "[Image img_2 (image/png,") {
+	if !strings.Contains(got, "[Image "+id1) || !strings.Contains(got, "[Image "+id2) {
 		t.Errorf("expected per-image placeholders in %q", got)
 	}
-	if !strings.Contains(got, "view_image id=img_1") || !strings.Contains(got, "view_image id=img_2") {
+	if !strings.Contains(got, "view_image id="+id1) || !strings.Contains(got, "view_image id="+id2) {
 		t.Errorf("expected view_image hints in %q", got)
 	}
 
-	// Trailing message with images, images supported → []any with one text
-	// block + N image_url blocks containing the actual data: URLs.
+	// Images supported → []any with one text block + N image_url blocks
+	// containing the actual data: URLs read from disk.
 	a.imagesSupported = true
 	out = a.buildLLMContext(s)
 	parts, ok := out[0].Content.([]any)
@@ -1311,10 +1351,10 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 		}
 	}
 
-	// Older message with images + a fresh trailing message: images supported,
-	// but the older image collapses to a text placeholder (no data: URL on the
-	// wire) while the trailing message stays inline.
-	s4 := &Session{Messages: []Message{
+	// Cache-consistency: two messages with images both inline bytes every
+	// turn. No trailing/older split — the older image is NOT degraded to a
+	// text placeholder.
+	s4 := &Session{Cwd: dir, Messages: []Message{
 		{Role: "user", Content: "earlier", Images: []ImageData{img1}},
 		{Role: "user", Content: "now look at this one", Images: []ImageData{img2}},
 	}}
@@ -1322,44 +1362,67 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("expected 2 messages, got %d", len(out))
 	}
-	older := contentString(t, out[0])
-	if !strings.Contains(older, "[Image img_1") || !strings.Contains(older, "view_image id=img_1") {
-		t.Errorf("older message missing placeholder + hint: %q", older)
+	olderParts, ok := out[0].Content.([]any)
+	if !ok || len(olderParts) != 2 {
+		t.Fatalf("older: expected []any of len 2 (text + image_url), got %+v", out[0].Content)
 	}
-	if strings.Contains(older, "data:image/png;base64,") {
-		t.Errorf("older message must NOT inline data: URL, got %q", older)
+	olderImg, _ := olderParts[1].(map[string]any)
+	if olderImg["type"] != "image_url" {
+		t.Errorf("older parts[1] type: got %v, want image_url", olderImg["type"])
 	}
 	trailingParts, ok := out[1].Content.([]any)
 	if !ok || len(trailingParts) != 2 {
 		t.Fatalf("trailing: expected []any of len 2, got %+v", out[1].Content)
 	}
 
-	// Legacy session file: image with no ID → placeholder notes that it can't
-	// be re-fetched. images NOT supported so we land in the text branch.
-	a.imagesSupported = false
-	legacy := ImageData{MimeType: "image/png", Data: base64.StdEncoding.EncodeToString([]byte("pngbytes"))}
-	s5 := &Session{Messages: []Message{{Role: "user", Content: "old", Images: []ImageData{legacy}}}}
-	if got := contentString(t, a.buildLLMContext(s5)[0]); !strings.Contains(got, "id missing, cannot re-fetch") {
-		t.Errorf("legacy placeholder missing: %q", got)
+	// Wire bytes for the same stored message must be identical turn-over-turn.
+	first := a.buildLLMContext(s4)
+	second := a.buildLLMContext(s4)
+	firstJSON, err := json.Marshal(first)
+	if err != nil {
+		t.Fatalf("marshal first: %v", err)
+	}
+	secondJSON, err := json.Marshal(second)
+	if err != nil {
+		t.Fatalf("marshal second: %v", err)
+	}
+	if string(firstJSON) != string(secondJSON) {
+		t.Errorf("cache consistency: wire bytes differ between consecutive rebuilds\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
+	}
+
+	// Missing file on disk → text fallback for that image only, no panic and
+	// the rest of the request still goes through.
+	imgMissing := ImageData{ID: "img_deadbeef00000000", MimeType: "image/png"}
+	sMissing := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "missing", Images: []ImageData{imgMissing}}}}
+	outMissing := a.buildLLMContext(sMissing)
+	missingParts, ok := outMissing[0].Content.([]any)
+	if !ok || len(missingParts) != 2 {
+		t.Fatalf("missing: expected []any of len 2 (text + fallback), got %+v", outMissing[0].Content)
+	}
+	fallback, _ := missingParts[1].(map[string]any)
+	if fallback["type"] != "text" {
+		t.Errorf("missing image fallback type: got %v, want text", fallback["type"])
+	}
+	if fallbackText, _ := fallback["text"].(string); !strings.Contains(fallbackText, "img_deadbeef00000000") {
+		t.Errorf("missing image fallback missing id reference: %q", fallbackText)
 	}
 
 	// Message with no images → plain string, untouched.
-	a.imagesSupported = true
-	s2 := &Session{Messages: []Message{{Role: "user", Content: "no imgs"}}}
+	s2 := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "no imgs"}}}
 	if got := contentString(t, a.buildLLMContext(s2)[0]); got != "no imgs" {
 		t.Errorf("plain: got %q, want 'no imgs'", got)
 	}
 
-	// Combined: tool uses + images on the trailing message. The image is
-	// inlined as an image_url part; the tool use lives in ToolCalls on the
-	// assistant message and produces a follow-up tool-role message.
+	// Combined: tool uses + images on a message. The image is inlined as an
+	// image_url part; the tool use lives in ToolCalls on the assistant message
+	// and produces a follow-up tool-role message.
 	combined := Message{
 		Role:     "assistant",
 		Content:  "done",
 		Images:   []ImageData{img1},
 		ToolUses: []ToolUse{{ID: "tu_77", Name: "read_file", Input: `{"path":"x"}`, Output: "ok"}},
 	}
-	s3 := &Session{Messages: []Message{combined}}
+	s3 := &Session{Cwd: dir, Messages: []Message{combined}}
 	outCombined := a.buildLLMContext(s3)
 	if len(outCombined) != 2 {
 		t.Fatalf("combined: expected 2 messages (assistant + tool), got %d: %+v", len(outCombined), outCombined)
@@ -1378,6 +1441,76 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 	}
 	if outCombined[1].Role != "tool" || outCombined[1].ToolCallID != "tu_77" || outCombined[1].Content.(string) != "ok" {
 		t.Errorf("combined tool message wrong: %+v", outCombined[1])
+	}
+}
+
+// TestBackgroundSummariseAppendsImageRefsThroughCompaction is the end-to-end
+// post-compaction view_image story: a user turn with images + an assistant
+// turn → backgroundSummarise produces a shadow chunk that includes the
+// `Attached images:` ref block → compressHistory folds it into Session.Summary
+// so the handle survives even after the original message rotates out.
+func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
+	mock := newMockLLM(t, sseText("Goal: inspect screenshot\nProgress: looked at it"))
+	defer mock.Close()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
+		t.Fatalf("mkdir .codehalter: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".codehalter", "SUMMARISE.md"), []byte("SUMMARISE PROMPT\n"), 0o644); err != nil {
+		t.Fatalf("write SUMMARISE.md: %v", err)
+	}
+
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	bytes := []byte("PNG screenshot bytes")
+	imgID := imageHashID(bytes)
+	if err := writeImageFile(dir, imgID, "image/png", bytes); err != nil {
+		t.Fatalf("writeImageFile: %v", err)
+	}
+	s.AddUserWithImages("look at this", []ImageData{{ID: imgID, MimeType: "image/png"}})
+	s.AddAssistant("I see a screenshot.")
+
+	a := &agent{
+		sessions: map[string]*Session{s.ID: s},
+		settings: Settings{
+			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
+		},
+		mainSlotTokens: 90_000,
+	}
+
+	a.backgroundSummarise(s)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if peek := s.peekShadow(); strings.Contains(peek, "Attached images:") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("backgroundSummarise never appended image refs to shadow; got %q", s.peekShadow())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	peek := s.peekShadow()
+	if !strings.Contains(peek, "Goal: inspect screenshot") {
+		t.Errorf("shadow chunk missing summariser output: %q", peek)
+	}
+	if !strings.Contains(peek, "view_image id="+imgID) {
+		t.Errorf("shadow chunk missing view_image handle %q: %q", imgID, peek)
+	}
+
+	// Drive the full compaction. drainShadow requires 2+ entries (the last
+	// stays as anchor), so append a second chunk; then exercise compressHistory
+	// and confirm the image reference lands in Summary.
+	s.appendShadow("Goal: anchor\nProgress: follow-up turn")
+	s.SetLastCompletePromptTokens(80_000)
+	a.compressHistory(context.Background(), s)
+
+	if !strings.Contains(s.Summary, "view_image id="+imgID) {
+		t.Errorf("Summary lost the image handle after compaction; got %q", s.Summary)
 	}
 }
 

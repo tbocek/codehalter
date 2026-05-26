@@ -39,14 +39,13 @@ type Message struct {
 }
 
 type ImageData struct {
-	// ID is a per-session stable handle ("img_<n>") generated when the image
-	// is captured from the user prompt. Surfaced in the text placeholder that
-	// replaces inline data: URLs for older messages so the model can call
-	// view_image id=img_N to re-fetch the bytes. Empty for ImageData loaded
-	// from older session files.
+	// ID is the content-addressed handle ("img_<sha256[:8] hex>") assigned at
+	// extraction. The bytes themselves live in <cwd>/.codehalter/images/<id>.<ext>;
+	// buildLLMContext re-reads them every turn (so the wire shape stays
+	// byte-identical for the prefix cache) and view_image fetches them after
+	// compaction has dropped the owning message.
 	ID       string `toml:"id,omitempty"`
 	MimeType string `toml:"mime_type"`
-	Data     string `toml:"data"` // base64-encoded
 }
 
 type ToolUse struct {
@@ -498,26 +497,6 @@ func (s *Session) FindToolUseOutput(id string) string {
 		}
 	}
 	return ""
-}
-
-// FindImage scans every message's images for one matching id and returns a
-// copy. Used by view_image to re-deliver an attachment after buildLLMContext
-// has elided its data: URL into a text placeholder. Returns nil when no match.
-func (s *Session) FindImage(id string) *ImageData {
-	if id == "" {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.Messages {
-		for j := range s.Messages[i].Images {
-			if s.Messages[i].Images[j].ID == id {
-				img := s.Messages[i].Images[j]
-				return &img
-			}
-		}
-	}
-	return nil
 }
 
 // enqueueSummarise appends a task to the summariser queue and starts the

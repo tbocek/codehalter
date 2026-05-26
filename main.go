@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"os"
@@ -659,7 +660,15 @@ func (a *agent) replayHistory(ctx context.Context, sid string, s *Session) {
 		if m.Role == "user" {
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: m.Content}})
 			for _, img := range m.Images {
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "image", MimeType: img.MimeType, Data: img.Data}})
+				data, mime, err := readImageFile(s.Cwd, img.ID)
+				if err != nil {
+					a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[image %s missing on disk]", img.ID)}})
+					continue
+				}
+				if mime == "" {
+					mime = img.MimeType
+				}
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}})
 			}
 		} else {
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: m.Content}})
