@@ -18,42 +18,19 @@ func imageHashID(data []byte) string {
 	return "img_" + hex.EncodeToString(h[:8])
 }
 
-func extForMime(mime string) string {
+func writeImageFile(cwd, id, mime string, data []byte) error {
+	ext := "bin"
 	switch mime {
 	case "image/png":
-		return "png"
+		ext = "png"
 	case "image/jpeg":
-		return "jpg"
+		ext = "jpg"
 	case "image/gif":
-		return "gif"
+		ext = "gif"
 	case "image/webp":
-		return "webp"
-	default:
-		return "bin"
+		ext = "webp"
 	}
-}
-
-func mimeForExt(ext string) string {
-	switch strings.TrimPrefix(ext, ".") {
-	case "png":
-		return "image/png"
-	case "jpg", "jpeg":
-		return "image/jpeg"
-	case "gif":
-		return "image/gif"
-	case "webp":
-		return "image/webp"
-	default:
-		return "application/octet-stream"
-	}
-}
-
-func imageFilePath(cwd, id, mime string) string {
-	return filepath.Join(cwd, ".codehalter", "images", id+"."+extForMime(mime))
-}
-
-func writeImageFile(cwd, id, mime string, data []byte) error {
-	path := imageFilePath(cwd, id, mime)
+	path := filepath.Join(cwd, ".codehalter", "images", id+"."+ext)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -74,5 +51,16 @@ func readImageFile(cwd, id string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	return data, mimeForExt(filepath.Ext(matches[0])), nil
+	mime := "application/octet-stream"
+	switch strings.TrimPrefix(filepath.Ext(matches[0]), ".") {
+	case "png":
+		mime = "image/png"
+	case "jpg", "jpeg":
+		mime = "image/jpeg"
+	case "gif":
+		mime = "image/gif"
+	case "webp":
+		mime = "image/webp"
+	}
+	return data, mime, nil
 }
