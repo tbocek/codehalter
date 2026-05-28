@@ -82,6 +82,9 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	for k, v := range conn.ExtraBody {
 		reqBody[k] = v
 	}
+	if _, ok := reqBody["max_tokens"]; !ok {
+		reqBody["max_tokens"] = defaultMaxTokens
+	}
 	reqBody["model"] = conn.Model
 	reqBody["stream"] = true
 	// stream_options.include_usage asks the server to emit a final SSE chunk

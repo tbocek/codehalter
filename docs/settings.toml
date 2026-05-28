@@ -40,12 +40,12 @@
 # between params_thinking and params_execute on the same server hits the same
 # cache — no warm-up cost.
 #
-# `max_tokens` caps a single completion and is REQUIRED in every params block
-# (settings.toml fails to load without it). Bounds the worst case where a
-# small model loops forever inside one completion — the per-tool-loop
+# `max_tokens` caps a single completion. If you don't set it, codehalter
+# injects 8192 (defaultMaxTokens in settings.go). Bounds the worst case where
+# a small model loops forever inside one completion — the per-tool-loop
 # iteration cap can't help there because the runaway happens within ONE LLM
 # round-trip. Healthy turns are well under it (execute ~2-4k, plan/verify
-# <1k), so 4-8k is generous headroom. If the server returns
+# <1k), so the 8192 default is generous headroom. If the server returns
 # finish_reason="length", codehalter surfaces a clear error rather than
 # retrying — raise it only if a legitimate turn is being truncated.
 

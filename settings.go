@@ -8,6 +8,13 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// defaultMaxTokens is the max_tokens injected into an LLM request when the
+// user's params block doesn't set one. Bounds a runaway completion that loops
+// inside a single LLM round-trip — the per-tool-loop iteration cap can't help
+// there. 8192 is generous headroom (execute ~2-4k, plan/verify <1k); override
+// per-role with `max_tokens` inside params_thinking / params_execute.
+const defaultMaxTokens = 8192
+
 type Settings struct {
 	// LLM is the ordered list of OpenAI-compatible endpoints codehalter can
 	// dispatch to. LLM[0] is the "main" connection: the foreground session
@@ -129,27 +136,6 @@ func decodeSettings(path string) (Settings, error) {
 	var s Settings
 	if _, err := toml.DecodeFile(path, &s); err != nil {
 		return s, fmt.Errorf("loading %s: %w", path, err)
-	}
-	// max_tokens is required in every params block the user defines. Bounds a
-	// runaway completion that loops inside one LLM round-trip (the tool-loop
-	// iteration cap can't help there), and forces an explicit choice instead
-	// of a silent codehalter default.
-	for i := range s.LLM {
-		for _, p := range []struct {
-			name string
-			m    map[string]any
-		}{
-			{"params", s.LLM[i].Params},
-			{"params_thinking", s.LLM[i].ParamsThinking},
-			{"params_execute", s.LLM[i].ParamsExecute},
-		} {
-			if len(p.m) == 0 {
-				continue
-			}
-			if _, ok := p.m["max_tokens"]; !ok {
-				return s, fmt.Errorf("loading %s: llm (model=%q): %s missing max_tokens", path, s.LLM[i].Model, p.name)
-			}
-		}
 	}
 	s.path = path
 	return s, nil
