@@ -130,6 +130,27 @@ func decodeSettings(path string) (Settings, error) {
 	if _, err := toml.DecodeFile(path, &s); err != nil {
 		return s, fmt.Errorf("loading %s: %w", path, err)
 	}
+	// max_tokens is required in every params block the user defines. Bounds a
+	// runaway completion that loops inside one LLM round-trip (the tool-loop
+	// iteration cap can't help there), and forces an explicit choice instead
+	// of a silent codehalter default.
+	for i := range s.LLM {
+		for _, p := range []struct {
+			name string
+			m    map[string]any
+		}{
+			{"params", s.LLM[i].Params},
+			{"params_thinking", s.LLM[i].ParamsThinking},
+			{"params_execute", s.LLM[i].ParamsExecute},
+		} {
+			if len(p.m) == 0 {
+				continue
+			}
+			if _, ok := p.m["max_tokens"]; !ok {
+				return s, fmt.Errorf("loading %s: llm (model=%q): %s missing max_tokens", path, s.LLM[i].Model, p.name)
+			}
+		}
+	}
 	s.path = path
 	return s, nil
 }
