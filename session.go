@@ -275,6 +275,24 @@ type Session struct {
 	// compressHistory's read.
 	lastTokensMu             sync.Mutex
 	lastCompletePromptTokens int
+
+	// bytesUp is the cumulative number of request-body bytes sent to the LLM
+	// over this session's lifetime — the upload figure on the live phase-row
+	// meter. Monotonic by construction: every llmStream call adds its full
+	// body (each call re-sends the whole prefix, so this is real wire volume,
+	// not a per-turn delta), and the displayed total only ever climbs. In-
+	// memory only; a restart resets to 0. Guarded by bytesUpMu.
+	bytesUpMu sync.Mutex
+	bytesUp   int64
+}
+
+// AddBytesUp adds n request-body bytes to this session's cumulative upload
+// total and returns the new total. Called once per llmStream call as it sends.
+func (s *Session) AddBytesUp(n int) int64 {
+	s.bytesUpMu.Lock()
+	defer s.bytesUpMu.Unlock()
+	s.bytesUp += int64(n)
+	return s.bytesUp
 }
 
 // SetLastCompletePromptTokens records the server-reported prompt_tokens for

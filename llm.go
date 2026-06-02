@@ -135,14 +135,17 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// "(thinking…)" the moment streaming starts. setStatus is a no-op when no
 	// phase is active so summarisation calls between phases don't flash
 	// anything.
-	// sentEst is a rough chars/4 estimate of the prompt size for the live
-	// token meter — the server's exact prompt_tokens only arrives in the
-	// trailing usage chunk, too late to show while we wait for the first
-	// token. len(body) includes the tool-schema JSON, so this slightly
-	// overcounts vs the tokenised prompt; it's display-only, never used for
-	// budget math.
-	sentEst := len(body) / 4
-	a.setStatus(ctx, sid, fmt.Sprintf(" (↑%s sent…)", fmtTokens(sentEst)))
+	// Upload meter: the precise request-body size in bytes, accumulated into a
+	// per-session cumulative total and shown in kB. Monotonic — every call
+	// adds its full body, so the figure only ever climbs (a small background
+	// call can't make it drop). sid=="" (probes/tests) has no session; fall
+	// back to this call's bytes so the display still reads sensibly.
+	bytesUp := int64(len(body))
+	if sess := a.getSession(sid); sess != nil {
+		bytesUp = sess.AddBytesUp(len(body))
+	}
+	upLabel := fmtKB(bytesUp)
+	a.setStatus(ctx, sid, fmt.Sprintf(" (↑%s sent…)", upLabel))
 	defer a.setStatus(ctx, sid, "")
 
 	// Per-session log: request header + body. The raw SSE wire is too noisy
@@ -293,7 +296,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		// long planner / reasoning stretches instead of a frozen "sent…".
 		if genChars > 0 && (lastMeterChars == 0 || genChars-lastMeterChars >= statusMeterChars) {
 			lastMeterChars = genChars
-			a.setStatus(ctx, sid, fmt.Sprintf(" (↑%s ↓%s…)", fmtTokens(sentEst), fmtTokens(genChars/4)))
+			a.setStatus(ctx, sid, fmt.Sprintf(" (↑%s ↓%s…)", upLabel, fmtTokens(genChars/4)))
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -338,6 +341,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 // visibly climbs, large enough that we re-emit the plan a few dozen times for
 // a long response instead of once per SSE event.
 const statusMeterChars = 80
+
+// fmtKB renders a byte count as kilobytes with two decimals for the upload
+// meter, e.g. 12_636 → "12.34kb". Uses 1024-byte KiB; always "kb" (no MB
+// rollover) so the cumulative upload total reads consistently as it climbs.
+// Display-only.
+func fmtKB(n int64) string {
+	return fmt.Sprintf("%.2fkb", float64(n)/1024)
+}
 
 // fmtTokens renders an approximate token count compactly for the live status
 // meter: <1000 prints as-is, ≥1000 collapses to a "k" suffix (1234 → "1.2k",

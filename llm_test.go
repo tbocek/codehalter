@@ -26,3 +26,19 @@ func TestTrimJSON(t *testing.T) {
 		})
 	}
 }
+
+// TestFmtKB pins the upload-meter format: bytes → two-decimal KiB with a "kb"
+// suffix, no MB rollover so the cumulative total reads consistently.
+func TestFmtKB(t *testing.T) {
+	cases := map[int64]string{
+		0:       "0.00kb",
+		512:     "0.50kb",
+		12636:   "12.34kb",
+		1048576: "1024.00kb",
+	}
+	for in, want := range cases {
+		if got := fmtKB(in); got != want {
+			t.Errorf("fmtKB(%d) = %q, want %q", in, got, want)
+		}
+	}
+}
