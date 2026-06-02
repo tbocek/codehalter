@@ -114,8 +114,15 @@ func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
 	llmChanged := a.ensureLLM(ctx, sess, sid)
 	envChanged, envProblems := a.checkEnv(sess, sid)
 	mcpChanged, mcpProblems := a.checkMCP(ctx, sess, sid)
-	if llmChanged || envChanged || mcpChanged {
+	// Full capabilities banner: emit it ONCE per session (the first prepare,
+	// at bootstrap, when state is established). After that, suppress the re-dump
+	// on routine changes — a tool getting installed, an MCP server starting, a
+	// re-probe — those are surfaced as one-line notices (checkMCP) or fix cards
+	// (proposeFix below), not by re-printing the whole setup screen in the
+	// middle of an unrelated turn.
+	if !sess.capabilitiesShown && (llmChanged || envChanged || mcpChanged) {
 		a.notifyCapabilities(ctx, sess, sid)
+		sess.capabilitiesShown = true
 	}
 	for _, p := range append(envProblems, mcpProblems...) {
 		if ctx.Err() != nil {

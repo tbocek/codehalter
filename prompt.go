@@ -410,6 +410,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	var userText string
 	var images []ImageData
 	for _, block := range req.Content {
+		slog.Debug("prompt: content block", "type", block.Type, "uri", block.URI, "hasResource", block.Resource != nil)
 		switch block.Type {
 		case "text":
 			userText += block.Text

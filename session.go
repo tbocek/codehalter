@@ -261,6 +261,12 @@ type Session struct {
 	// the banner. Not persisted — restart re-emits the banner once on the
 	// first turn.
 	envSnapshot string `toml:"-"`
+	// capabilitiesShown gates the full capabilities banner to once per session.
+	// The first prepare (bootstrap) emits it to establish state; afterwards
+	// routine changes (a tool installed, an MCP server starting, a re-probe)
+	// surface as one-line notices / fix cards instead of re-dumping the whole
+	// setup screen mid-conversation. Not persisted — a restart re-shows it once.
+	capabilitiesShown bool `toml:"-"`
 	// lastCompletePromptTokens is the server-reported prompt_tokens count
 	// from the most recent llmStream call on this session, captured via
 	// stream_options.include_usage. "Complete" because every llmStream call
