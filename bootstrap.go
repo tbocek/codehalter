@@ -25,7 +25,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	dirInfo, statErr := os.Stat(dir)
 	hasDevcontainer := statErr == nil && dirInfo.IsDir()
 
-	const reopen = "Reopen the project in the container to continue."
+	const reopen = "Reopen the project in the container to continue. In Zed, press Ctrl-Alt-Shift-O and choose \"Connect Dev Container\"."
 	const restart = "Start a new Agent Thread (the + button at the top) to re-open the devcontainer setup menu."
 
 	if hasDevcontainer {
