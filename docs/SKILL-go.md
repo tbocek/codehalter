@@ -38,8 +38,11 @@
 - gopls 0.20+ ships a built-in MCP server. Start as stdio child with
   `gopls mcp` (serves go_symbols / go_references / go_definition / go_hover).
 - To wire it: add a `[[server]]` block to `.codehalter/mcp.toml` with
-  `name = "gopls"`, `command = "gopls"`, `args = ["mcp"]` — codehalter
-  spawns it on the next session.
+  `name = "gopls"`, `command = "gopls"`, `args = ["mcp"]`. codehalter
+  reconciles `mcp.toml` automatically at the end of the turn — it starts the
+  server and registers its tools on its own, so they are live on the next
+  prompt. Do NOT tell the user to restart Zed or start a new session to
+  activate it; no restart is needed.
 
 ## Mutating commands — never during planning
 These rewrite files in place. They are NOT probes. Do not run during PLAN

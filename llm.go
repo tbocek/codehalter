@@ -129,23 +129,25 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		defer func() { <-a.slotSems[slot] }()
 	}
 
-	// Drive the lifecycle suffix on the active phase entry across the LLM
-	// round-trip: "(sent to llm…)" while we wait for the first SSE token (cache
-	// misses, queueing on a busy llama-server, slow TTFT), then flip to
-	// "(thinking…)" the moment streaming starts. setStatus is a no-op when no
-	// phase is active so summarisation calls between phases don't flash
-	// anything.
-	// Upload meter: the precise request-body size in bytes, accumulated into a
-	// per-session cumulative total and shown in kB. Monotonic — every call
-	// adds its full body, so the figure only ever climbs (a small background
-	// call can't make it drop). sid=="" (probes/tests) has no session; fall
-	// back to this call's bytes so the display still reads sensibly.
-	bytesUp := int64(len(body))
-	if sess := a.getSession(sid); sess != nil {
-		bytesUp = sess.AddBytesUp(len(body))
+	// slotLabel names which [[llm]] entry handles this call (llm[0] foreground,
+	// llm[1+] background/subagent). slot=-1 (test mocks, probes) renders "?".
+	// Used both in the live meter and the session-log header below.
+	slotLabel := "?"
+	if slot >= 0 {
+		slotLabel = fmt.Sprintf("%d", slot)
 	}
-	upLabel := fmtKB(bytesUp)
-	a.setStatus(ctx, sid, fmt.Sprintf(" (↑%s sent…)", upLabel))
+
+	// Drive the lifecycle suffix on the active phase entry across the LLM
+	// round-trip: "(sent…)" while we wait for the first SSE token (cache
+	// misses, queueing, slow TTFT), then the live ↑/↓ meter once streaming
+	// starts. setStatus is a no-op when no phase is active so summarisation
+	// calls between phases don't flash anything.
+	//
+	// Upload (↑) is just THIS call's request-body size in kB — what we sent to
+	// the LLM right now, not a running total or peak. Paired with llm[<slot>]
+	// so a background summarise visibly routes off the foreground slot.
+	upLabel := fmtKB(int64(len(body)))
+	a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent…)", slotLabel, upLabel))
 	defer a.setStatus(ctx, sid, "")
 
 	// Per-session log: request header + body. The raw SSE wire is too noisy
@@ -156,11 +158,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// Header records llm[<slot>] alongside the role+model so a grep for
 	// "llm[1]" surfaces every request routed to a given entry — useful for
 	// confirming that document / summarise / git_commit landed off the
-	// foreground prefix cache. slot=-1 (test mocks, probes) renders as "?".
-	slotLabel := "?"
-	if slot >= 0 {
-		slotLabel = fmt.Sprintf("%d", slot)
-	}
+	// foreground prefix cache.
 	connLabel := fmt.Sprintf("llm[%s] %s model=%s", slotLabel, conn.Tag, conn.Model)
 	logF := a.sessionLog(sid)
 	if logF != nil {
@@ -296,7 +294,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		// long planner / reasoning stretches instead of a frozen "sent…".
 		if genChars > 0 && (lastMeterChars == 0 || genChars-lastMeterChars >= statusMeterChars) {
 			lastMeterChars = genChars
-			a.setStatus(ctx, sid, fmt.Sprintf(" (↑%s ↓%s…)", upLabel, fmtTokens(genChars/4)))
+			a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s ↓%s…)", slotLabel, upLabel, fmtTokens(genChars/4)))
 		}
 	}
 	if err := scanner.Err(); err != nil {
