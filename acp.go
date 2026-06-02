@@ -127,13 +127,39 @@ type SessionModeState struct {
 }
 
 // ContentBlock is the ACP wire shape for a prompt/response block: a "type"
-// discriminator plus per-variant fields. Flat so encoding/json handles it
-// without custom Marshal/Unmarshal.
+// discriminator plus per-variant fields. encoding/json handles every variant
+// without a custom Unmarshal — the embedded-resource variant nests under
+// Resource, the rest are flat.
+//
+// Variants we read off the wire:
+//   - "text"          → Text
+//   - "image"         → MimeType + Data (base64)
+//   - "resource"      → Resource (embedded snippet, e.g. an editor selection
+//     attached via Zed's "@ include context")
+//   - "resource_link" → URI + Name (a pointer to a file, no inline content)
 type ContentBlock struct {
 	Type     string `json:"type"`
 	Text     string `json:"text,omitempty"`
 	MimeType string `json:"mimeType,omitempty"`
 	Data     string `json:"data,omitempty"` // base64-encoded image bytes
+
+	// resource_link fields (a bare pointer to a file/resource).
+	URI  string `json:"uri,omitempty"`
+	Name string `json:"name,omitempty"`
+
+	// Embedded "resource" block — carries the actual attached content inline.
+	Resource *EmbeddedResource `json:"resource,omitempty"`
+}
+
+// EmbeddedResource is the nested payload of a "resource" content block. Text is
+// set for textual resources (code selections, file excerpts); Blob holds
+// base64 bytes for binary ones. URI identifies the source so we can label the
+// attachment and the model knows what it's looking at.
+type EmbeddedResource struct {
+	URI      string `json:"uri,omitempty"`
+	MimeType string `json:"mimeType,omitempty"`
+	Text     string `json:"text,omitempty"`
+	Blob     string `json:"blob,omitempty"`
 }
 
 type messageChunk struct {

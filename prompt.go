@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,6 +70,36 @@ func clipBytes(s string, max int) string {
 	}
 	half := max / 2
 	return s[:half] + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + s[len(s)-half:]
+}
+
+// resourcePath returns the local filesystem path an ACP resource URI points
+// at: a file:// URI collapses to its percent-decoded path with any fragment
+// (e.g. an editor line range "#L801-836") stripped, so the model can pass it
+// straight to read_file. Non-file or unparseable URIs are returned verbatim.
+func resourcePath(uri string) string {
+	if uri == "" {
+		return ""
+	}
+	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
+		return u.Path
+	}
+	return strings.TrimPrefix(uri, "file://")
+}
+
+// resourceLabel is resourcePath plus the URI fragment in parentheses when
+// present — used as a human-readable header for an attached snippet so the
+// model sees which file (and line range) the context came from.
+func resourceLabel(uri string) string {
+	if uri == "" {
+		return "attachment"
+	}
+	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
+		if u.Fragment != "" {
+			return u.Path + " (" + u.Fragment + ")"
+		}
+		return u.Path
+	}
+	return strings.TrimPrefix(uri, "file://")
 }
 
 func isCancelled(err error) bool {
@@ -297,6 +328,37 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 				}
 			}
 			images = append(images, ImageData{ID: id, MimeType: block.MimeType})
+		case "resource":
+			// Embedded resource: an editor selection / file excerpt attached via
+			// Zed's "@ include context". The snippet text lives inline; without
+			// this case it was silently dropped and the model saw only the bare
+			// prompt, so a reference like "why do we need this?" had no referent.
+			if block.Resource == nil {
+				slog.Debug("prompt: resource block with no embedded resource")
+				continue
+			}
+			label := resourceLabel(block.Resource.URI)
+			switch {
+			case block.Resource.Text != "":
+				userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, block.Resource.Text)
+			case block.Resource.Blob != "":
+				// Binary embedded resource (rare from editors — images arrive as
+				// "image" blocks). Note it rather than inlining opaque bytes.
+				userText += fmt.Sprintf("\n\n[Attached binary resource %s (%s) — not inlined]\n", label, block.Resource.MimeType)
+			default:
+				slog.Debug("prompt: empty embedded resource", "uri", block.Resource.URI)
+			}
+		case "resource_link":
+			// A pointer to a file with no inline content. Surface the path so the
+			// model can read_file it and so a "this"/"that" reference resolves.
+			name := block.Name
+			path := resourcePath(block.URI)
+			if name == "" {
+				name = path
+			}
+			userText += fmt.Sprintf("\n\n[Referenced file: %s (%s)]\n", name, path)
+		default:
+			slog.Debug("prompt: ignoring unsupported content block", "type", block.Type)
 		}
 	}
 
