@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 )
 
 // respondToolName is the synthetic terminal tool that captures the model's
@@ -39,7 +40,13 @@ func init() {
 		var args struct {
 			Message string `json:"message"`
 		}
-		_ = json.Unmarshal([]byte(rawArgs), &args)
+		if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
+			// Malformed JSON from the model: fall back to the raw payload so
+			// the user still sees the model's final text instead of an empty
+			// reply, and don't drop the parse error silently.
+			slog.Debug("respond: arguments not valid JSON, using raw text", "err", err)
+			return rawArgs, false
+		}
 		return args.Message, false
 	}})
 }

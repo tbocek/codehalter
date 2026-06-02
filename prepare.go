@@ -478,8 +478,14 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	// next LLM call (including proposeFix's orchestrate below) sees the
 	// cleaned-up skill set instead of the stale prefix.
 	osi := readOSInfo()
-	if pruned := ensureSkills(sess.Cwd, sess.knownStacks, osi); len(pruned) > 0 {
-		if sp, err := a.systemPrompt(sid); err == nil {
+	pruned, err := ensureSkills(sess.Cwd, sess.knownStacks, osi)
+	if err != nil {
+		slog.Warn("prepare: ensureSkills failed", "sid", sid, "err", err)
+	}
+	if len(pruned) > 0 {
+		if sp, err := a.systemPrompt(sid); err != nil {
+			slog.Warn("prepare: systemPrompt rebuild failed after skill prune", "sid", sid, "err", err)
+		} else {
 			sess.SystemPrompt = sp
 		}
 	}

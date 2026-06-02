@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -108,7 +109,12 @@ func loadSettings(cwd string) (Settings, error) {
 	// Ensure project .codehalter dir exists so scaffoldSettings can write a
 	// skeleton into it later.
 	projectDir := filepath.Join(cwd, sessionDir)
-	_ = os.MkdirAll(projectDir, 0755)
+	if err := os.MkdirAll(projectDir, 0755); err != nil {
+		// Non-fatal here: a global settings.toml (checked next) makes the
+		// project dir irrelevant, and the project-local write path surfaces
+		// its own error. Log so a genuine permission problem isn't silent.
+		slog.Warn("loadSettings: could not create project .codehalter dir", "dir", projectDir, "err", err)
+	}
 
 	// Global first — once a user has a global config it serves every project,
 	// so we don't need to nag with the project-local prompt anymore.

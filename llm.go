@@ -97,7 +97,10 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		reqBody["tools"] = tools
 	}
 
-	body, _ := json.Marshal(reqBody)
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", nil, fmt.Errorf("marshalling LLM request body: %w", err)
+	}
 
 	// Per-conn slot semaphore: cap concurrent in-flight calls to this conn's
 	// configured `parallel`. The token is released on llmStream return, NOT for

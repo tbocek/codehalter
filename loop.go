@@ -100,7 +100,7 @@ func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string
 		"launch_subagent": true,
 	}}, "plan", &plan)
 	if err != nil {
-		return nil, planRes.ToolUses, nil
+		return nil, planRes.ToolUses, err
 	}
 	if sess != nil && planRes.Text != "" {
 		sess.UpsertLastAssistant(planRes.Text)

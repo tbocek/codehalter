@@ -117,9 +117,11 @@ var osSkills = map[string]string{
 // are seeded here. Per-stack / per-runner / per-OS SKILL files are handled
 // by ensureSkills on every prepare turn so a stack or runner added
 // mid-session takes effect on the next prompt.
-func ensureDefaults(cwd string) {
+func ensureDefaults(cwd string) error {
 	dir := filepath.Join(cwd, ".codehalter")
-	os.MkdirAll(dir, 0o755)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", dir, err)
+	}
 	for _, f := range []struct{ name, content string }{
 		{"PLAN.md", defaultPlanMD},
 		{"EXECUTE.md", defaultExecuteMD},
@@ -129,10 +131,14 @@ func ensureDefaults(cwd string) {
 	} {
 		path := filepath.Join(dir, f.name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
-			os.WriteFile(path, []byte(f.content), 0o644)
+			if err := os.WriteFile(path, []byte(f.content), 0o644); err != nil {
+				return fmt.Errorf("seeding %s: %w", path, err)
+			}
 		}
 	}
-	ensureSkills(cwd, detectStacks(cwd), readOSInfo())
+	if _, err := ensureSkills(cwd, detectStacks(cwd), readOSInfo()); err != nil {
+		return err
+	}
 
 	// mcp.toml — only seeded on first run with the bare placeholder. Per-stack
 	// MCP wiring (e.g. gopls for Go) is the prepare phase's job: it asks the
@@ -141,8 +147,11 @@ func ensureDefaults(cwd string) {
 	// the user owns it.
 	mcpPath := filepath.Join(dir, "mcp.toml")
 	if _, err := os.Stat(mcpPath); os.IsNotExist(err) {
-		os.WriteFile(mcpPath, []byte(defaultMCPToml), 0o644)
+		if err := os.WriteFile(mcpPath, []byte(defaultMCPToml), 0o644); err != nil {
+			return fmt.Errorf("seeding %s: %w", mcpPath, err)
+		}
 	}
+	return nil
 }
 
 // ensureSkills seeds SKILL-*.md files into .codehalter/ based on what is
@@ -165,16 +174,19 @@ func ensureDefaults(cwd string) {
 // what other-OS files were deleted so the caller can rebuild
 // sess.SystemPrompt from the cleaned-up directory before the next LLM
 // call dispatches.
-func ensureSkills(cwd string, stacks []string, osi osInfo) []string {
+func ensureSkills(cwd string, stacks []string, osi osInfo) ([]string, error) {
 	dir := filepath.Join(cwd, ".codehalter")
-	seed := func(name, body string) {
+	seed := func(name, body string) error {
 		if body == "" {
-			return
+			return nil
 		}
 		path := filepath.Join(dir, name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
-			os.WriteFile(path, []byte(body), 0o644)
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				return fmt.Errorf("seeding %s: %w", path, err)
+			}
 		}
+		return nil
 	}
 	exists := func(names ...string) bool {
 		for _, n := range names {
@@ -186,18 +198,24 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) []string {
 	}
 	for _, stack := range stacks {
 		if body, ok := defaultSkills[stack]; ok {
-			seed("SKILL-"+stack+".md", body)
+			if err := seed("SKILL-"+stack+".md", body); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if exists("justfile", "Justfile", ".justfile") {
-		seed("SKILL-justfile.md", skillJustfile)
+		if err := seed("SKILL-justfile.md", skillJustfile); err != nil {
+			return nil, err
+		}
 	}
 	if exists("Makefile", "makefile", "GNUmakefile") {
-		seed("SKILL-makefile.md", skillMakefile)
+		if err := seed("SKILL-makefile.md", skillMakefile); err != nil {
+			return nil, err
+		}
 	}
 	var pruned []string
 	if osi.ID == "" {
-		return pruned
+		return pruned, nil
 	}
 	for other := range osSkills {
 		if other == osi.ID {
@@ -207,18 +225,21 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) []string {
 		if _, err := os.Stat(path); err != nil {
 			continue
 		}
-		if err := os.Remove(path); err == nil {
-			pruned = append(pruned, "SKILL-"+other+".md")
+		if err := os.Remove(path); err != nil {
+			return pruned, fmt.Errorf("pruning stale %s: %w", path, err)
 		}
+		pruned = append(pruned, "SKILL-"+other+".md")
 	}
 	if body, ok := osSkills[osi.ID]; ok {
 		rendered := renderOSSkill(body, osi.Fields)
 		path := filepath.Join(dir, "SKILL-"+osi.ID+".md")
 		if cur, err := os.ReadFile(path); err != nil || string(cur) != rendered {
-			os.WriteFile(path, []byte(rendered), 0o644)
+			if err := os.WriteFile(path, []byte(rendered), 0o644); err != nil {
+				return pruned, fmt.Errorf("seeding %s: %w", path, err)
+			}
 		}
 	}
-	return pruned
+	return pruned, nil
 }
 
 // renderOSSkill substitutes {{KEY}} placeholders in the per-OS skill body
@@ -426,7 +447,13 @@ func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 	if strings.HasPrefix(sid, "sub_") {
 		return
 	}
-	_ = a.conn.SessionUpdate(ctx, sid, u)
+	if err := a.conn.SessionUpdate(ctx, sid, u); err != nil {
+		// Best-effort UI sync: a write failure here means the client
+		// transport is broken, which surfaces on the next request read. Log
+		// at debug so it's visible during diagnosis without flooding the
+		// steady-state token stream.
+		slog.Debug("sendUpdate: SessionUpdate write failed", "sid", sid, "err", err)
+	}
 }
 
 func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
@@ -466,14 +493,18 @@ func (a *agent) Authenticate(_ context.Context) error {
 
 func (a *agent) initSession(cwd string, s *Session) error {
 	a.putSession(s)
-	ensureDefaults(cwd)
+	if err := ensureDefaults(cwd); err != nil {
+		return err
+	}
 	// Always rebuild SystemPrompt from the freshly-seeded .codehalter/
 	// directory. NewSession starts with SystemPrompt == "" so this is the
 	// first-and-only build; LoadSession has a possibly-stale SystemPrompt
 	// from a prior run on a different host (different OS skill set), and
 	// we must overwrite it BEFORE prepare's proposeFix can dispatch an
 	// LLM call carrying the stale prefix.
-	if sp, err := a.systemPrompt(s.ID); err == nil {
+	if sp, err := a.systemPrompt(s.ID); err != nil {
+		slog.Warn("initSession: systemPrompt build failed", "sid", s.ID, "err", err)
+	} else {
 		s.SystemPrompt = sp
 	}
 	settings, err := loadSettings(cwd)

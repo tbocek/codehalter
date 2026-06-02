@@ -593,7 +593,9 @@ func (a *agent) cleanupGitCommitIfClean(cwd string, sid string) {
 	if strings.TrimSpace(status) != "" {
 		return
 	}
-	_ = os.Remove(filepath.Join(cwd, gitCommitFile))
+	if err := os.Remove(filepath.Join(cwd, gitCommitFile)); err != nil && !os.IsNotExist(err) {
+		slog.Debug("cleanupGitCommitIfClean: remove failed", "err", err)
+	}
 	// Reset hash so the next non-empty status regenerates the file, even
 	// if (rarely) the new status+diff hashes identical to the prior one.
 	if sess := a.getSession(sid); sess != nil {
@@ -628,7 +630,13 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	if err != nil || strings.TrimSpace(status) == "" {
 		return
 	}
-	diff, _ := gitDiffHead(sess.Cwd)
+	diff, err := gitDiffHead(sess.Cwd)
+	if err != nil {
+		// Diff is best-effort enrichment for the commit-message prompt;
+		// status (already validated above) is the primary signal. Proceed
+		// with an empty diff but don't drop the error silently.
+		slog.Debug("backgroundGitCommit: git diff failed", "sid", sess.ID, "err", err)
+	}
 	hash := sha256.Sum256([]byte(status + "\x00" + diff))
 	sess.gitCommitMu.Lock()
 	unchanged := hash == sess.gitCommitLastHash

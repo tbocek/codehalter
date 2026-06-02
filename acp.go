@@ -413,7 +413,12 @@ func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
 	case "session/cancel":
 		var p CancelNotification
 		if req.Params != nil {
-			_ = json.Unmarshal(req.Params, &p)
+			if err := json.Unmarshal(req.Params, &p); err != nil {
+				// Cancel anyway — a malformed params object still signals
+				// intent to abort the current turn — but don't lose the parse
+				// error silently.
+				slog.Debug("session/cancel: malformed params", "err", err)
+			}
 		}
 		a.agent.Cancel(ctx, p)
 

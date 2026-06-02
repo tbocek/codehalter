@@ -5,6 +5,7 @@
   `fmt.Errorf("context: %w", err)`.
 - Do NOT `panic` for control flow. Reserve panics for unrecoverable bugs.
 - No `try`/`catch`; Go has neither.
+- Never swallow error.
 
 ## Idioms
 - `:=` to declare-and-assign; `=` to reassign.

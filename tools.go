@@ -179,7 +179,9 @@ func llmToolDefinitionsFiltered(f toolFilter) []map[string]any {
 // parseArgs extracts string arguments from raw JSON. For simple string params.
 func parseArgs(rawArgs string) map[string]string {
 	var args map[string]string
-	_ = json.Unmarshal([]byte(rawArgs), &args)
+	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
+		slog.Debug("parseArgs: tool arguments are not valid JSON", "err", err, "raw", truncate(rawArgs, 200))
+	}
 	if args == nil {
 		args = make(map[string]string)
 	}
