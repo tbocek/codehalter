@@ -1,8 +1,10 @@
 # codehalter bootstrap assisted
-FROM quay.io/archlinux/archlinux:base
+FROM quay.io/archlinux/archlinux:base-devel
 
 RUN pacman -Syu --noconfirm --needed \
-        ca-certificates curl git \
+        ca-certificates \
+        curl \
+        git \
         go \
         firefox \
     && rm -rf /var/cache/pacman/pkg/*
