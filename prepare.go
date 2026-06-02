@@ -567,6 +567,7 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) (bool, 
 		return false, nil
 	}
 	var problems []fixProblem
+	var notices []string
 	for _, ch := range changes {
 		switch ch.action {
 		case "parse_error":
@@ -585,9 +586,23 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) (bool, 
 					"runs by hand, then persist the install in .devcontainer/Dockerfile so it survives a "+
 					"container rebuild.", ch.name, ch.err),
 			})
+		case "started":
+			notices = append(notices, fmt.Sprintf("✅ MCP server %q started", ch.name))
+		case "restarted":
+			notices = append(notices, fmt.Sprintf("✅ MCP server %q restarted", ch.name))
+		case "stopped":
+			notices = append(notices, fmt.Sprintf("MCP server %q stopped", ch.name))
 		}
 	}
-	return true, problems
+	// Benign starts/stops/restarts get a one-line notice, NOT a re-dump of the
+	// whole capabilities banner — that full re-emit on a routine server start
+	// (e.g. gopls coming up the turn after it was added) was pure noise. Only
+	// an actionable problem (failed / parse_error) forces the consolidated
+	// banner, via the changed=true return below.
+	for _, n := range notices {
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: n + "\n"}})
+	}
+	return len(problems) > 0, problems
 }
 
 // ---------------------------------------------------------------------------

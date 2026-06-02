@@ -1,6 +1,58 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+// TestParseLineRange covers the line-range encodings Zed may put in a
+// resource_link fragment.
+func TestParseLineRange(t *testing.T) {
+	cases := []struct {
+		frag             string
+		wantStart, wantE int
+	}{
+		{"L810-845", 810, 845},
+		{"810:845", 810, 845},
+		{"810-845", 810, 845},
+		{"L810", 810, 810},
+		{"", 0, 0},
+		{"nodigits", 0, 0},
+	}
+	for _, c := range cases {
+		if s, e := parseLineRange(c.frag); s != c.wantStart || e != c.wantE {
+			t.Errorf("parseLineRange(%q) = %d,%d, want %d,%d", c.frag, s, e, c.wantStart, c.wantE)
+		}
+	}
+}
+
+// TestReadLinkedResource verifies a resource_link is inlined with its line
+// range, full-file when no range, and refused outside the workspace.
+func TestReadLinkedResource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f.go")
+	if err := os.WriteFile(path, []byte("a\nb\nc\nd\ne\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Line range 2-4 → "b\nc\nd".
+	if snip, label, ok := readLinkedResource(dir, "file://"+path+"#L2-4"); !ok || snip != "b\nc\nd" || label != "f.go:2-4" {
+		t.Errorf("range read = %q,%q,%v", snip, label, ok)
+	}
+	// No range → whole file, label is basename.
+	if snip, label, ok := readLinkedResource(dir, "file://"+path); !ok || snip != "a\nb\nc\nd\ne\n" || label != "f.go" {
+		t.Errorf("full read = %q,%q,%v", snip, label, ok)
+	}
+	// Outside cwd → refused.
+	if _, _, ok := readLinkedResource(dir, "file:///etc/passwd"); ok {
+		t.Errorf("expected refusal for path outside workspace")
+	}
+	// Missing file → refused.
+	if _, _, ok := readLinkedResource(dir, "file://"+filepath.Join(dir, "nope.go")); ok {
+		t.Errorf("expected refusal for missing file")
+	}
+}
 
 // TestResourcePath pins the URI → read_file path mapping used when an embedded
 // "resource" / "resource_link" block is folded into the prompt: file:// URIs

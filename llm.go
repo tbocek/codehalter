@@ -129,12 +129,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		defer func() { <-a.slotSems[slot] }()
 	}
 
-	// slotLabel names which [[llm]] entry handles this call (llm[0] foreground,
-	// llm[1+] background/subagent). slot=-1 (test mocks, probes) renders "?".
-	// Used both in the live meter and the session-log header below.
+	// slotLabel is the flat display slot for this call: llm[0] for the
+	// foreground turn, llm[1] for background work (summariser/git-commit) even
+	// when it's the same connection — see LLMConnection.Slot / pickBackgroundLLM.
+	// `slot` above is the *semaphore* index (the configured [[llm]] entry);
+	// conn.Slot is what the user reads. slot=-1 (test mocks, probes) → "?".
 	slotLabel := "?"
 	if slot >= 0 {
-		slotLabel = fmt.Sprintf("%d", slot)
+		slotLabel = fmt.Sprintf("%d", conn.Slot)
 	}
 
 	// Drive the lifecycle suffix on the active phase entry across the LLM
@@ -606,7 +608,15 @@ func (a *agent) pickBackgroundLLM() *LLMConnection {
 			return a.settings.ConnAt(i, "execute")
 		}
 	}
-	return a.settings.ConnAt(0, "execute")
+	// No separate background entry (or all busy): fall back to llm[0]. When it
+	// has >= 2 parallel slots, label this as llm[1] — same connection and
+	// semaphore, but a distinct display slot so the meter shows background
+	// routed off the foreground turn (the server picks the real KV slot).
+	c := a.settings.ConnAt(0, "execute")
+	if c != nil && a.settings.LLM[0].parallelCap() >= 2 {
+		c.Slot = 1
+	}
+	return c
 }
 
 // connSlot returns the index into settings.LLM that this connection

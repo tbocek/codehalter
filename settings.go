@@ -70,6 +70,14 @@ type LLMConnection struct {
 	// pickAvailable so callers don't have to know which of Params /
 	// ParamsThinking / ParamsExecute applies.
 	ExtraBody map[string]any `toml:"-"`
+
+	// Slot is the flat display index shown in the live meter and the session-
+	// log header as llm[<Slot>]. The foreground turn runs as llm[0]; background
+	// work (summariser / git-commit) runs as llm[1] — the same physical
+	// connection when there's a single [[llm]] entry with parallel >= 2, a
+	// distinct slot so you can see which is in use (llama.cpp assigns the real
+	// KV slot). Stamped by MainLLM / ConnAt / pickBackgroundLLM; runtime-only.
+	Slot int `toml:"-"`
 }
 
 // paramsFor returns the sampler params for the given role, falling back to
@@ -169,6 +177,7 @@ func (s *Settings) MainLLM(role string) *LLMConnection {
 	c := s.LLM[0]
 	c.ExtraBody = c.paramsFor(role)
 	c.Tag = role
+	c.Slot = 0
 	return &c
 }
 
@@ -181,6 +190,7 @@ func (s *Settings) ConnAt(idx int, role string) *LLMConnection {
 	c := s.LLM[idx]
 	c.ExtraBody = c.paramsFor(role)
 	c.Tag = role
+	c.Slot = idx
 	return &c
 }
 

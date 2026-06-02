@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -100,6 +101,108 @@ func resourceLabel(uri string) string {
 		return u.Path
 	}
 	return strings.TrimPrefix(uri, "file://")
+}
+
+// maxLinkedResourceBytes bounds how much of a whole-file resource_link we inline
+// when it carries no line range — enough for a normal source file, capped so a
+// huge attachment can't blow the prompt.
+const maxLinkedResourceBytes = 32 * 1024
+
+// readLinkedResource reads the file a resource_link / embedded-resource URI
+// points at and returns it as an inline snippet plus a display label, honouring
+// a #L<start>-<end> line-range fragment. ok is false (caller falls back to just
+// noting the path) when the file is outside cwd, missing, or the URI isn't a
+// readable local file — so the model never read-loops hunting for content the
+// editor already handed us. Only files inside cwd are inlined.
+func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
+	if cwd == "" || uri == "" {
+		return "", "", false
+	}
+	path, start, end := parseResourceURI(uri)
+	if path == "" {
+		return "", "", false
+	}
+	clean := filepath.Clean(path)
+	if !filepath.IsAbs(clean) {
+		clean = filepath.Join(cwd, clean)
+	}
+	root := filepath.Clean(cwd)
+	if clean != root && !strings.HasPrefix(clean, root+string(filepath.Separator)) {
+		return "", "", false
+	}
+	data, err := os.ReadFile(clean)
+	if err != nil {
+		return "", "", false
+	}
+	base := filepath.Base(clean)
+	if start > 0 {
+		lines := strings.Split(string(data), "\n")
+		if start > len(lines) {
+			start = len(lines)
+		}
+		if end < start || end > len(lines) {
+			end = len(lines)
+		}
+		return strings.Join(lines[start-1:end], "\n"), fmt.Sprintf("%s:%d-%d", base, start, end), true
+	}
+	s := string(data)
+	if len(s) > maxLinkedResourceBytes {
+		s = s[:maxLinkedResourceBytes] + "\n[... truncated ...]"
+	}
+	return s, base, true
+}
+
+// parseResourceURI splits a resource URI into its local path and an optional
+// line range from the fragment (file:///x/llm.go#L810-845 → "/x/llm.go", 810,
+// 845). Non-file or unparseable URIs return an empty path.
+func parseResourceURI(uri string) (path string, start, end int) {
+	if uri == "" {
+		return "", 0, 0
+	}
+	var frag string
+	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
+		path = u.Path
+		frag = u.Fragment
+	} else {
+		path = strings.TrimPrefix(uri, "file://")
+		if i := strings.IndexByte(path, '#'); i >= 0 {
+			frag, path = path[i+1:], path[:i]
+		}
+	}
+	start, end = parseLineRange(frag)
+	return path, start, end
+}
+
+// parseLineRange pulls a 1- or 2-number line range out of a URI fragment,
+// tolerating the common encodings: "L810-845", "810:845", "810-845", "L810".
+// Returns 0,0 when the fragment carries no digits (whole-file reference).
+func parseLineRange(frag string) (int, int) {
+	var nums []int
+	var cur strings.Builder
+	flush := func() {
+		if cur.Len() > 0 {
+			if n, err := strconv.Atoi(cur.String()); err == nil {
+				nums = append(nums, n)
+			}
+			cur.Reset()
+		}
+	}
+	for _, r := range frag {
+		if r >= '0' && r <= '9' {
+			cur.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+	switch len(nums) {
+	case 0:
+		return 0, 0
+	case 1:
+		return nums[0], nums[0]
+	default:
+		return nums[0], nums[1]
+	}
 }
 
 func isCancelled(err error) bool {
@@ -346,17 +449,39 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 				// "image" blocks). Note it rather than inlining opaque bytes.
 				userText += fmt.Sprintf("\n\n[Attached binary resource %s (%s) — not inlined]\n", label, block.Resource.MimeType)
 			default:
-				slog.Debug("prompt: empty embedded resource", "uri", block.Resource.URI)
+				// No inline text/blob but a URI — same fallback as resource_link:
+				// read the linked file so the reference still resolves.
+				cwd := ""
+				if sess != nil {
+					cwd = sess.Cwd
+				}
+				if snippet, l, ok := readLinkedResource(cwd, block.Resource.URI); ok {
+					userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", l, snippet)
+				} else {
+					slog.Debug("prompt: empty embedded resource", "uri", block.Resource.URI)
+				}
 			}
 		case "resource_link":
-			// A pointer to a file with no inline content. Surface the path so the
-			// model can read_file it and so a "this"/"that" reference resolves.
-			name := block.Name
-			path := resourcePath(block.URI)
-			if name == "" {
-				name = path
+			// A pointer to a file (no inline content). Pull the linked file in —
+			// honouring a #L<start>-<end> line range — so a bare reference like
+			// "why do we need this?" resolves immediately instead of forcing the
+			// model to read_file and risk a read-loop hunting for the snippet.
+			// Falls back to noting the path when the file is outside the
+			// workspace or unreadable.
+			cwd := ""
+			if sess != nil {
+				cwd = sess.Cwd
 			}
-			userText += fmt.Sprintf("\n\n[Referenced file: %s (%s)]\n", name, path)
+			if snippet, label, ok := readLinkedResource(cwd, block.URI); ok {
+				userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, snippet)
+			} else {
+				name := block.Name
+				path := resourcePath(block.URI)
+				if name == "" {
+					name = path
+				}
+				userText += fmt.Sprintf("\n\n[Referenced file: %s (%s)]\n", name, path)
+			}
 		default:
 			slog.Debug("prompt: ignoring unsupported content block", "type", block.Type)
 		}
