@@ -46,3 +46,26 @@ func TestCwdOrDefaultAbsolutes(t *testing.T) {
 		}
 	}
 }
+
+// TestCwdAvailable pins the guard that stops session/new and session/load from
+// scaffolding .codehalter under a workspace root that isn't mounted here — the
+// case where Zed restores an agent thread pinned to another project's cwd.
+func TestCwdAvailable(t *testing.T) {
+	dir := t.TempDir()
+	if err := cwdAvailable(dir); err != nil {
+		t.Errorf("cwdAvailable(existing dir) = %v, want nil", err)
+	}
+
+	missing := filepath.Join(dir, "does-not-exist")
+	if err := cwdAvailable(missing); err == nil {
+		t.Errorf("cwdAvailable(missing) = nil, want error")
+	}
+
+	file := filepath.Join(dir, "afile")
+	if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	if err := cwdAvailable(file); err == nil {
+		t.Errorf("cwdAvailable(file) = nil, want error")
+	}
+}

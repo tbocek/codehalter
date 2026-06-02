@@ -415,6 +415,28 @@ func cwdOrDefault(cwd string) string {
 	return cwd
 }
 
+// cwdAvailable reports whether the client-supplied workspace root actually
+// exists as a directory in this environment. Zed restores agent threads with
+// the cwd they were created under; when that workspace isn't mounted here
+// (e.g. a thread from another project's devcontainer), every later step —
+// scaffolding .codehalter, reading the session .toml — fails with a confusing
+// low-level mkdir/permission error against a path the user never chose. Gate
+// session/new and session/load on this up front so they refuse with a clear
+// message instead of trying to create .codehalter under an unavailable root.
+func cwdAvailable(cwd string) error {
+	info, err := os.Stat(cwd)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("workspace %s is not available in this environment (mount it, or open the project from a path that exists here)", cwd)
+		}
+		return fmt.Errorf("workspace %s: %w", cwd, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("workspace %s is not a directory", cwd)
+	}
+	return nil
+}
+
 func (a *agent) getSession(id string) *Session {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -630,6 +652,9 @@ func readOSInfo() osInfo {
 func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSessionResponse, error) {
 	cwd := cwdOrDefault(req.Cwd)
 	slog.Debug("NewSession: enter", "cwd", cwd)
+	if err := cwdAvailable(cwd); err != nil {
+		return NewSessionResponse{}, err
+	}
 	s, err := newSession(cwd)
 	if err != nil {
 		slog.Debug("NewSession: newSession err", "err", err)
@@ -648,6 +673,9 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
 	cwd := cwdOrDefault(req.Cwd)
 	slog.Debug("LoadSession: enter", "cwd", cwd, "sid", req.SessionId)
+	if err := cwdAvailable(cwd); err != nil {
+		return LoadSessionResponse{}, err
+	}
 	s, err := loadSession(cwd, req.SessionId)
 	if err != nil {
 		if os.IsNotExist(err) {
