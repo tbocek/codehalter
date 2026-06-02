@@ -1299,8 +1299,8 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 	dir := t.TempDir()
 	bytes1 := []byte("pngbytes-1")
 	bytes2 := []byte("pngbytes-2-different")
-	id1 := imageHashID(bytes1)
-	id2 := imageHashID(bytes2)
+	id1 := "img_test_a"
+	id2 := "img_test_b"
 	if err := writeImageFile(dir, id1, "image/png", bytes1); err != nil {
 		t.Fatalf("writeImageFile id1: %v", err)
 	}
@@ -1466,7 +1466,7 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 		t.Fatalf("newSession: %v", err)
 	}
 	bytes := []byte("PNG screenshot bytes")
-	imgID := imageHashID(bytes)
+	imgID := "img_test_compaction"
 	if err := writeImageFile(dir, imgID, "image/png", bytes); err != nil {
 		t.Fatalf("writeImageFile: %v", err)
 	}

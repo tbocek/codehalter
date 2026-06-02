@@ -12,7 +12,7 @@ import (
 func TestDispatchViewImageHappyPath(t *testing.T) {
 	dir := t.TempDir()
 	payload := []byte("PNG bytes here")
-	id := imageHashID(payload)
+	id := "img_test_happy"
 	if err := writeImageFile(dir, id, "image/png", payload); err != nil {
 		t.Fatalf("writeImageFile: %v", err)
 	}

@@ -52,6 +52,18 @@ type LLMConnection struct {
 	ParamsThinking map[string]any `toml:"params_thinking,omitempty"`
 	ParamsExecute  map[string]any `toml:"params_execute,omitempty"`
 
+	// ContextSize is the model's max prompt+output tokens. Optional — when
+	// set, codehalter trusts this and skips metadata-endpoint probing for
+	// ctx size. Required for backends that don't expose llama.cpp-style
+	// discovery (OpenAI, Ollama, vLLM, OpenWebUI, LiteLLM, …).
+	ContextSize int `toml:"context_size,omitempty"`
+	// ImageSupport declares whether the model accepts image inputs.
+	// Optional — *bool so unset (probe), true (force on), and false (force
+	// off) are distinct. nil falls through to discovery via /props or
+	// /v1/models launch args; everywhere else the user must set it
+	// explicitly to enable inline image_url blocks.
+	ImageSupport *bool `toml:"image_support,omitempty"`
+
 	// ExtraBody is the runtime alias for the role-resolved Params used by
 	// llmStream when assembling the OpenAI request body. Populated by
 	// pickAvailable so callers don't have to know which of Params /

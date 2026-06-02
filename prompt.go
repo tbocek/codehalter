@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -284,7 +285,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 				slog.Warn("prompt: skipping image with undecodable base64", "err", err)
 				continue
 			}
-			id := imageHashID(bytes)
+			// Content-addressed id ("img_<sha256[:8] hex>") — same bytes →
+			// same id → same file path, so a re-pasted screenshot doesn't
+			// re-write the store.
+			h := sha256.Sum256(bytes)
+			id := "img_" + hex.EncodeToString(h[:8])
 			if sess != nil {
 				if err := writeImageFile(sess.Cwd, id, block.MimeType, bytes); err != nil {
 					slog.Warn("prompt: writing image file failed", "id", id, "err", err)

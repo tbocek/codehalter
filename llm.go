@@ -350,19 +350,14 @@ type probeResult struct {
 	ContextSize int
 }
 
-// probeLLM checks reachability, model presence, and image support in a single
-// HTTP call against cheap metadata endpoints (no inference). Works against two
-// llama.cpp topologies:
-//
-//  1. A llama-swap-style router in front of multiple llama-server instances —
-//     GET /v1/models lists every model with its launch args; vision models
-//     were started with --mmproj.
-//  2. A single llama-server — GET /props reports modalities.vision once an
-//     mmproj is loaded.
-//
-// /v1/models is preferred (it identifies the specific configured model even
-// when the router hasn't loaded it yet); /props is the fallback when the
-// router endpoint is missing.
+// probeLLM checks reachability, model presence, and (best-effort) image
+// support + context size via cheap metadata endpoints. /v1/models is the
+// universal reachability endpoint — every OpenAI-compatible backend exposes
+// it. /props is a llama.cpp-specific enrichment step that fills in image /
+// ctx metadata when /v1/models returns the bare OpenAI shape. Backends
+// without /props (OpenAI, Ollama, vLLM, OpenWebUI, LiteLLM, …) leave those
+// fields unset and the user supplies them via settings.toml (probeAllLLMs
+// applies that precedence).
 func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	if conn == nil {
 		return probeResult{}
@@ -370,23 +365,40 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	if r, ok := a.probeViaModels(probeCtx, conn); ok {
-		slog.Info("probeLLM: /v1/models", "model", conn.Model, "reachable", r.Reachable, "loaded", r.ModelLoaded, "image", r.ImageSupport)
-		return r
+	r, _ := a.probeViaModels(probeCtx, conn)
+	// Enrich missing metadata from /props when /v1/models was bare. Skip
+	// when /v1/models was unreachable too and try /props on its own — some
+	// llama-server builds don't expose /v1/models.
+	if r.Reachable && (!r.ImageSupport || r.ContextSize == 0) {
+		if p, ok := a.probeViaProps(probeCtx, conn); ok {
+			if !r.ImageSupport {
+				r.ImageSupport = p.ImageSupport
+			}
+			if r.ContextSize == 0 {
+				r.ContextSize = p.ContextSize
+			}
+		}
+	} else if !r.Reachable {
+		if p, ok := a.probeViaProps(probeCtx, conn); ok {
+			r = p
+		}
 	}
-	if r, ok := a.probeViaProps(probeCtx, conn); ok {
-		slog.Info("probeLLM: /props", "model", conn.Model, "reachable", r.Reachable, "image", r.ImageSupport)
-		return r
+
+	if r.Reachable {
+		slog.Info("probeLLM", "model", conn.Model, "loaded", r.ModelLoaded, "image", r.ImageSupport, "ctx", r.ContextSize)
+	} else {
+		slog.Info("probeLLM: unreachable", "url", conn.URL, "model", conn.Model)
 	}
-	slog.Info("probeLLM: unreachable", "url", conn.URL, "model", conn.Model)
-	return probeResult{}
+	return r
 }
 
-// probeViaModels asks the router's /v1/models for the configured model and
-// (when present) its launch args. `--mmproj` in those args means the server
-// loaded a multimodal projector. Returns (result, ok) — ok=false means this
-// endpoint could not answer at all (network error / non-200 / model present
-// but launch args missing); caller should fall back to /props.
+// probeViaModels asks /v1/models for the configured model. Always confirms
+// reachability + model presence; image_support / context_size only land
+// when the response carries llama-swap-style `status.args` (--mmproj /
+// --ctx-size). OpenAI/Ollama/vLLM/LiteLLM all 200 here but return the bare
+// OpenAI shape, so the caller's /props enrichment + settings.toml fallback
+// fills the gap. ok=false only on network / non-200 — a bare response still
+// returns ok=true so the caller knows the server is up.
 func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
 	modelsURL, ok := deriveServerURL(conn.URL, "/v1/models")
 	if !ok {
@@ -417,11 +429,6 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 		if m.ID != conn.Model {
 			continue
 		}
-		if len(m.Status.Args) == 0 {
-			// Plain llama-server: /v1/models returns the model but no args.
-			// Fall back to /props for image support.
-			return probeResult{}, false
-		}
 		r.ModelLoaded = true
 		// Scan launch args for two facts: --mmproj (vision) and the
 		// context-size flag (--ctx-size / -c, either spaced or =-joined).
@@ -448,10 +455,8 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 				}
 			}
 		}
-		return r, true
+		break
 	}
-	// 200 OK, server enumerated models, but the configured one was not in
-	// the list — that's a definitive "not loaded", no fallback needed.
 	return r, true
 }
 
@@ -611,16 +616,11 @@ func (a *agent) llmSimple(ctx context.Context, sid string, conn *LLMConnection, 
 	return text, err
 }
 
-const maxParallel = 10
-
 // parallel runs fn for each index [0, n) with up to `cap` concurrent
-// goroutines. cap<=0 falls back to maxParallel. Callers that know an upper
-// bound (e.g. launch_subagent's SubagentPinOrder length) pass it explicitly
+// goroutines. Callers pass an explicit upper bound matched to the work-list
+// (e.g. launch_subagent's SubagentPinOrder length, probeAllLLMs's len(conns))
 // so excess work queues instead of contending for slots.
 func parallel(n, cap int, fn func(i int)) {
-	if cap <= 0 {
-		cap = maxParallel
-	}
 	if cap > n {
 		cap = n
 	}
@@ -706,11 +706,11 @@ type toolLoopResult struct {
 // maxToolLoopIterations bounds runToolLoop so a model that keeps producing
 // "different enough" tool calls (e.g. path variations to dodge perceived
 // repetition) can't spin forever. One iteration is one LLM round-trip; a
-// complex execute pass is usually 10-20, so 200 leaves generous headroom
+// complex execute pass is usually 10-20, so 100 leaves comfortable headroom
 // for unusually long but legitimate runs while still bailing on genuine
 // runaways. The signature nudge and per-name escalation above catch the
 // common stuck patterns earlier, so this cap is the last-resort backstop.
-const maxToolLoopIterations = 200
+const maxToolLoopIterations = 100
 
 // toolNameEscalateThreshold is the number of *redundant* calls to a single
 // tool name in one loop after which the connection switches from the

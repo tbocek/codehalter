@@ -286,9 +286,13 @@ func (a *agent) hasReachableLLM() bool {
 }
 
 // probeAllLLMs probes every configured [[llm]] in parallel and updates
-// a.connReachable, a.mainSlotTokens, and a.imagesSupported. The human-
-// readable status is rendered separately by renderLLMStatus so the
-// consolidated banner can diff and re-emit when state changes.
+// a.connReachable, a.mainSlotTokens, and a.imagesSupported. Config values
+// (context_size / image_support on [[llm]]) take precedence over probe
+// discovery — the probe is the auto-detect shortcut for llama.cpp/llama-swap;
+// every other backend (OpenAI, Ollama, vLLM, LiteLLM, …) configures
+// explicitly. The human-readable status is rendered separately by
+// renderLLMStatus so the consolidated banner can diff and re-emit when
+// state changes.
 func (a *agent) probeAllLLMs(ctx context.Context) {
 	conns := a.settings.allConnections()
 	a.connReachable = make(map[string]bool, len(conns))
@@ -298,7 +302,7 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 		return
 	}
 	results := make([]probeResult, len(conns))
-	parallel(len(conns), maxParallel, func(i int) {
+	parallel(len(conns), len(conns), func(i int) {
 		c := conns[i]
 		results[i] = a.probeLLM(ctx, &c)
 	})
@@ -313,12 +317,19 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// LLM[0] owns the foreground session's KV cache, so its context size
 	// drives compaction sizing. llama.cpp's `-c N -np K` splits the total
 	// across K slots, so divide.
-	if results[0].ContextSize > 0 {
-		a.mainSlotTokens = results[0].ContextSize / conns[0].parallelCap()
+	ctxSize := conns[0].ContextSize
+	if ctxSize == 0 {
+		ctxSize = results[0].ContextSize
 	}
-	if firstReachable < 0 {
+	if ctxSize > 0 {
+		a.mainSlotTokens = ctxSize / conns[0].parallelCap()
+	}
+	switch {
+	case firstReachable < 0:
 		a.imagesSupported = false
-	} else {
+	case conns[firstReachable].ImageSupport != nil:
+		a.imagesSupported = *conns[firstReachable].ImageSupport
+	default:
 		a.imagesSupported = results[firstReachable].ImageSupport
 	}
 }
@@ -357,16 +368,19 @@ func (a *agent) renderLLMStatus() string {
 		b.WriteString("🟡 No LLM reachable — every connection above failed. Codehalter cannot run any prompt until at least one comes back.\n\n")
 		return b.String()
 	}
-	if a.imagesSupported {
+	switch {
+	case a.imagesSupported:
 		b.WriteString("✅ Image support: enabled\n\n")
-	} else {
-		b.WriteString("Image support: disabled\n\n")
+	case conns[firstReachable].ImageSupport != nil:
+		b.WriteString("Image support: disabled (declared image_support = false in settings.toml)\n\n")
+	default:
+		b.WriteString("🟡 Image support: undetected — codehalter assumed disabled. If your model accepts images, set `image_support = true` on the [[llm]] entry in settings.toml.\n\n")
 	}
 	switch {
 	case a.mainSlotTokens == 0:
-		b.WriteString("🟡 Context window: unknown — server didn't report n_ctx. Restart with the context size set on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`) so codehalter can size compaction.\n\n")
+		b.WriteString("🟡 Context window: unknown — set `context_size = N` on the [[llm]] entry in settings.toml. For llama.cpp/vLLM you can also restart with the launch flag (`-c N` / `--max-model-len N`) so the probe discovers it.\n\n")
 	case a.mainSlotTokens < minSlotTokens:
-		fmt.Fprintf(&b, "🟡 Context window: only %d tokens/slot — codehalter requires at least %d. Restart with a larger `-c N` (llama.cpp) / `--max-model-len N` (vLLM), or reduce `parallel` in settings.toml.\n\n", a.mainSlotTokens, minSlotTokens)
+		fmt.Fprintf(&b, "🟡 Context window: only %d tokens/slot — codehalter requires at least %d. Raise `context_size` in settings.toml, increase your server's launch flag (`-c N` / `--max-model-len N`), or reduce `parallel`.\n\n", a.mainSlotTokens, minSlotTokens)
 	default:
 		trigger := a.mainSlotTokens * compactTriggerPct / 100
 		if pc := conns[0].parallelCap(); pc > 1 {

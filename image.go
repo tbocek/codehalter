@@ -1,22 +1,11 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
-
-// imageHashID returns the per-image handle "img_<sha256[:8] hex>". Content
-// addressed: the same bytes always produce the same id, so a re-paste of the
-// same screenshot collides with the existing file in the image store and
-// nothing extra is written.
-func imageHashID(data []byte) string {
-	h := sha256.Sum256(data)
-	return "img_" + hex.EncodeToString(h[:8])
-}
 
 func writeImageFile(cwd, id, mime string, data []byte) error {
 	ext := "bin"

@@ -12,15 +12,11 @@ import (
 // once-at-end document phase.
 //
 // The plan phase produces a list of subtasks; each subtask carries its
-// own verify recipe. Every subtask runs as ONE bounded tool-calling
-// loop (≤maxSubtaskTurns) where the executor can read, edit, install,
-// and self-verify before declaring done via `respond`. No separate
-// verify-phase LLM call — the executor runs the recipe itself.
-
-// maxSubtaskTurns caps a single subtask loop. Hitting it without the
-// model calling `respond` is a failed subtask — the orchestrator records
-// the outcome and triggers a replan.
-const maxSubtaskTurns = 10
+// own verify recipe. Every subtask runs as ONE tool-calling loop where
+// the executor can read, edit, install, and self-verify before declaring
+// done via `respond`. No separate verify-phase LLM call — the executor
+// runs the recipe itself. The loop's only ceiling is the hard
+// maxToolLoopIterations backstop in llm.go.
 
 // ---------------------------------------------------------------------------
 // Plan phase
@@ -211,11 +207,11 @@ type subtaskOutcome struct {
 	Reason  string
 }
 
-// runSubtaskLoop runs one subtask as a single bounded tool-calling loop.
-// EXECUTE.md plus the subtask description and verify recipe are appended as
-// the user message that opens the loop; the executor runs with all execute
-// tools (web tools excluded — those live in planning), up to maxSubtaskTurns.
-// The executor self-verifies via the recipe before calling respond.
+// runSubtaskLoop runs one subtask as a single tool-calling loop. EXECUTE.md
+// plus the subtask description and verify recipe open the loop; the
+// executor runs with all execute tools (web tools excluded — those live in
+// planning). The executor self-verifies via the recipe before calling
+// respond. Bounded only by the hard maxToolLoopIterations backstop in llm.go.
 func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx, total int) subtaskOutcome {
 	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
 	sess := a.getSession(sid)
@@ -248,7 +244,7 @@ func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx,
 		"web_read":     true,
 		"web_read_raw": true,
 	}
-	res, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", maxSubtaskTurns)
+	res, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", 0)
 	if sess != nil && res.Text != "" {
 		sess.UpsertLastAssistant(res.Text)
 		_ = sess.Save()
@@ -260,7 +256,7 @@ func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx,
 		return out
 	}
 	if !res.RespondCalled {
-		out.Reason = fmt.Sprintf("executor did not call respond within %d turns", maxSubtaskTurns)
+		out.Reason = "executor exited without calling respond"
 		return out
 	}
 	// Exit-code authority: typed Failed flags override whatever the model

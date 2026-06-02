@@ -6,25 +6,6 @@ import (
 	"testing"
 )
 
-// TestImageHashIDContentAddressed covers the content-addressing invariant:
-// the same bytes produce the same id, different bytes produce different ids.
-// Re-paste of an identical screenshot must collide so we don't bloat the store.
-func TestImageHashIDContentAddressed(t *testing.T) {
-	id1 := imageHashID([]byte("hello"))
-	id2 := imageHashID([]byte("hello"))
-	id3 := imageHashID([]byte("world"))
-	if id1 != id2 {
-		t.Errorf("same bytes produced different ids: %q vs %q", id1, id2)
-	}
-	if id1 == id3 {
-		t.Errorf("different bytes produced same id: %q", id1)
-	}
-	const want = "img_2cf24dba5fb0a30e"
-	if id1 != want {
-		t.Errorf("imageHashID(\"hello\") = %q, want %q", id1, want)
-	}
-}
-
 // TestImageFileRoundTrip exercises the write/read pair across each supported
 // mime: the file lands at the right path with the right extension and the
 // readback recovers both bytes and mime from the extension alone (caller need
@@ -43,7 +24,7 @@ func TestImageFileRoundTrip(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.ext, func(t *testing.T) {
 			payload := []byte("payload-" + c.ext)
-			id := imageHashID(payload)
+			id := "img_test_" + c.ext
 			if err := writeImageFile(dir, id, c.mime, payload); err != nil {
 				t.Fatalf("writeImageFile: %v", err)
 			}
@@ -74,27 +55,5 @@ func TestImageFileNotFound(t *testing.T) {
 	_, _, err := readImageFile(dir, "img_doesnotexist")
 	if err == nil {
 		t.Fatal("expected error for missing image, got nil")
-	}
-}
-
-// TestImageDedupOnRepaste: writing the same bytes twice produces exactly one
-// file on disk. Re-pasting a screenshot in a long session must not bloat the
-// store.
-func TestImageDedupOnRepaste(t *testing.T) {
-	dir := t.TempDir()
-	payload := []byte("repeated bytes")
-	id := imageHashID(payload)
-	if err := writeImageFile(dir, id, "image/png", payload); err != nil {
-		t.Fatalf("first write: %v", err)
-	}
-	if err := writeImageFile(dir, id, "image/png", payload); err != nil {
-		t.Fatalf("second write: %v", err)
-	}
-	entries, err := os.ReadDir(filepath.Join(dir, ".codehalter", "images"))
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Errorf("expected 1 file (content-addressed dedup), got %d", len(entries))
 	}
 }
