@@ -283,6 +283,19 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
+// phaseActive reports whether a foreground phase is currently in progress for
+// this session — used to gate the waiting-meter's stall warning so a slow
+// background call (summariser / git-commit) doesn't emit a "server busy" line.
+func (a *agent) phaseActive(sid string) bool {
+	sess := a.getSession(sid)
+	if sess == nil {
+		return false
+	}
+	sess.phaseMu.Lock()
+	defer sess.phaseMu.Unlock()
+	return sess.phaseActive
+}
+
 // finalizePlan marks every phase up to and including the currently-active one
 // as completed so the UI stops spinning. Idempotent and safe to call when no
 // phase is active. Used from a Prompt-level defer to cover every exit path:

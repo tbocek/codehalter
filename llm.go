@@ -152,6 +152,18 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent…)", slotLabel, upLabel))
 	defer a.setStatus(ctx, sid, "")
 
+	// Waiting meter: a busy/queuing server holds the request open without
+	// responding, and there's no client timeout (by design — a slow generation
+	// is legitimate), so without this the phase row would sit frozen at
+	// "(sent…)" with no sign of life. Tick elapsed seconds onto it until the
+	// first token arrives, and warn once after a long silence — the request
+	// keeps waiting, the user just learns the server is the bottleneck.
+	firstByte := make(chan struct{})
+	var firstByteOnce sync.Once
+	waitDone := make(chan struct{})
+	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), firstByte, waitDone)
+	defer close(waitDone)
+
 	// Per-session log: request header + body. The raw SSE wire is too noisy
 	// to read (one event per token, each repeating the full envelope), so we
 	// parse the stream and write a single aggregated RESPONSE block at the
@@ -295,6 +307,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		// running received estimate so the user sees "↑3.4k ↓120…" climb during
 		// long planner / reasoning stretches instead of a frozen "sent…".
 		if genChars > 0 && (lastMeterChars == 0 || genChars-lastMeterChars >= statusMeterChars) {
+			firstByteOnce.Do(func() { close(firstByte) }) // stop the waiting meter
 			lastMeterChars = genChars
 			a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s ↓%s…)", slotLabel, upLabel, fmtTokens(genChars/4)))
 		}
@@ -341,6 +354,42 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 // visibly climbs, large enough that we re-emit the plan a few dozen times for
 // a long response instead of once per SSE event.
 const statusMeterChars = 80
+
+// llmStallWarnSeconds is how long the LLM may stay silent (no first token)
+// before the waiting meter emits a one-line "server may be busy" warning. The
+// request is NOT aborted — a large prompt on a slow model can legitimately take
+// this long; the warning just tells the user the wait is on the server, not a
+// freeze.
+const llmStallWarnSeconds = 60
+
+// streamWaitMeter ticks an elapsed-seconds suffix onto the active phase row
+// while llmStream waits for the first token, so a busy/queuing server reads as
+// "(sent… 25s)" instead of a frozen "(sent…)". After llmStallWarnSeconds of
+// total silence it emits one soft warning (foreground turns only). Returns when
+// the first byte arrives (firstByte closed), the call ends (done closed), or
+// ctx is cancelled — it never aborts the request.
+func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel string, start time.Time, firstByte, done <-chan struct{}) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	warned := false
+	for {
+		select {
+		case <-firstByte:
+			return
+		case <-done:
+			return
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			elapsed := int(time.Since(start).Seconds())
+			a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent… %ds)", slotLabel, upLabel, elapsed))
+			if !warned && elapsed >= llmStallWarnSeconds && a.phaseActive(sid) {
+				warned = true
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ No response from llm[%s] after %ds — the server may be busy or queuing the request. Still waiting (no timeout)…\n", slotLabel, elapsed)}})
+			}
+		}
+	}
+}
 
 // fmtKB renders a byte count as kilobytes with two decimals for the upload
 // meter, e.g. 12_636 → "12.34kb". Uses 1024-byte KiB; always "kb" (no MB
