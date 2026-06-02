@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -81,7 +82,6 @@ func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string
 		messages = a.buildLLMContext(sess)
 	}
 
-	var plan planResult
 	// Exclude respond: planning emits a JSON object as plain text, so we don't
 	// want the model to escape into the synthetic terminal-tool grammar that
 	// execute uses.
@@ -93,15 +93,45 @@ func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string
 	// Also exclude launch_subagent: otherwise the planner fans its forbidden
 	// edits out to a leaf-worker subagent (which has the full edit toolkit)
 	// and reports report_only=true, papering over the loophole.
-	planRes, err := a.runToolLoopJSON(ctx, sid, thinking, messages, toolFilter{exclude: map[string]bool{
+	filter := toolFilter{exclude: map[string]bool{
 		respondToolName:   true,
 		"write_file":      true,
 		"edit_file":       true,
 		"launch_subagent": true,
-	}}, "plan", &plan)
+	}}
+
+	// Run the tool loop, then parse its JSON reply. Text never streams to the
+	// UI (JSON is internal machinery — orchestrate renders the parsed plan via
+	// renderSteps); tool calls still surface as cards so the user sees what the
+	// planner probes. On a parse failure — small models routinely wrap JSON in
+	// prose — send one corrective follow-up and retry before giving up. The
+	// returned ToolUses always merge both passes so the caller keeps full
+	// visibility.
+	var plan planResult
+	noop := func(string) {}
+	planRes, err := a.runToolLoopOn(ctx, sid, thinking, messages, filter, "plan", noop, nil, 0)
 	if err != nil {
 		return nil, planRes.ToolUses, err
 	}
+	if err := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan); err != nil {
+		slog.Info("planner JSON parse failed; retrying with corrective", "snippet", truncate(planRes.Text, 200))
+		fixMsgs := append([]llmMessage(nil), messages...)
+		fixMsgs = append(fixMsgs,
+			llmMessage{Role: "assistant", Content: planRes.Text},
+			llmMessage{Role: "user", Content: "Your previous reply was not valid JSON. Reply with ONLY the JSON object — first character `{`, last character `}`, nothing before or after. No prose, no markdown fences."},
+		)
+		retry, retryErr := a.runToolLoopOn(ctx, sid, thinking, fixMsgs, filter, "plan", noop, nil, 0)
+		planRes.Text = retry.Text
+		planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
+		planRes.DurationMs += retry.DurationMs
+		if retryErr != nil {
+			return nil, planRes.ToolUses, retryErr
+		}
+		if err := json.Unmarshal([]byte(trimJSON(retry.Text)), &plan); err != nil {
+			return nil, planRes.ToolUses, fmt.Errorf("non-JSON after retry: %w", err)
+		}
+	}
+
 	if sess != nil && planRes.Text != "" {
 		sess.UpsertLastAssistant(planRes.Text)
 		_ = sess.Save()
