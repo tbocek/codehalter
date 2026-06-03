@@ -316,7 +316,7 @@ func (b *Browser) readLoop() {
 // waitReady polls the TCP port until Firefox accepts connections.
 func (b *Browser) waitReady(ctx context.Context) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", b.port)
-	for i := 0; i < 30; i++ {
+	for range 30 {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -419,7 +419,7 @@ func init() {
 		// instead of being indistinguishable from "DDG returned nothing".
 		var results []ddgResult
 		var extractErr error
-		for i := 0; i < 30; i++ {
+		for range 30 {
 			results, extractErr = extractDDGResults(ctx, browser, searchTab)
 			if len(results) > 0 {
 				break

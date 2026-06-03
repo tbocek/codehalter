@@ -221,7 +221,7 @@ func (s *Settings) SubagentPinOrder() []PinSlot {
 		}
 	}
 	var out []PinSlot
-	for slot := 0; slot < maxCap; slot++ {
+	for slot := range maxCap {
 		for i := range s.LLM {
 			if slot < s.LLM[i].parallelCap() {
 				out = append(out, PinSlot{Conn: i, Slot: slot})
