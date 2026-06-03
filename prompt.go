@@ -842,7 +842,7 @@ func (a *agent) cleanupGitCommitIfClean(cwd string, sid string) {
 // Self-skips when:
 //   - cwd has no .git directory (not a checkout, or .git not mounted),
 //   - the working tree is clean (nothing to summarise),
-//   - no eligible background slot is available (see pickBackgroundLLM).
+//   - no eligible background slot is available (see connForBackgroundLLM).
 //
 // Multiple in-flight calls are allowed — they race on the file with
 // last-write-wins, which is fine because each LLM call's snapshot is point-in-
@@ -879,7 +879,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 	if !sess.gitCommitJob.TryStart() {
 		return
 	}
-	conn := a.pickBackgroundLLM()
+	conn := a.connForBackgroundLLM()
 	if conn == nil {
 		sess.gitCommitJob.Done()
 		return
@@ -901,7 +901,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 			buf.WriteString("\n</git_diff>\n")
 		}
 
-		out, err := a.llmSimple(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: buf.String()}})
+		out, _, err := a.llmStream(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: buf.String()}}, nil, nil, nil)
 		if err != nil {
 			slog.Debug("backgroundGitCommit: llm call failed", "sid", sess.ID, "err", err)
 			return

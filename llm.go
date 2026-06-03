@@ -10,11 +10,9 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
-	"net/url"
-	"os"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -66,25 +64,6 @@ type sseChunk struct {
 	} `json:"usage"`
 }
 
-// llmHTTPClient is the dedicated client for LLM completion calls. It owns its
-// timeouts instead of inheriting http.DefaultClient/DefaultTransport's, whose
-// defaults bite an LLM workload in surprising ways:
-//   - DefaultTransport.TLSHandshakeTimeout = 10s — a hammered HTTPS endpoint can
-//     be too busy to complete the handshake inside 10s; we lift it to 60s so a
-//     slow-but-alive server isn't killed at exactly 10s.
-//   - No Client.Timeout and ResponseHeaderTimeout left at 0: a long generation,
-//     or a server queuing the request before it answers, is legitimate and must
-//     NOT be capped — cancellation is driven by the request ctx only.
-//
-// The 30s dial timeout (TCP connect) is kept: a connection that can't even be
-// established should fail fast and visibly rather than hang.
-var llmHTTPClient = func() *http.Client {
-	t := http.DefaultTransport.(*http.Transport).Clone()
-	t.TLSHandshakeTimeout = 60 * time.Second
-	t.ResponseHeaderTimeout = 0
-	return &http.Client{Transport: t}
-}()
-
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
 // sid scopes the debug log: req body and raw SSE response are appended to
 // .codehalter/session_<sid>.log so a single file captures everything that
@@ -118,77 +97,70 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		return "", nil, fmt.Errorf("marshalling LLM request body: %w", err)
 	}
 
-	// Per-conn slot semaphore: cap concurrent in-flight calls to this conn's
-	// configured `parallel`. The token is released on llmStream return, NOT for
-	// the lifetime of a subagent — so during the tool-dispatch gap between two
-	// llmStream calls the conn is free for another caller. With pool size 1
-	// this naturally serialises everything (no deadlock even when a subagent
-	// nests another), and with N>1 fan-out fills the pool until full and queues
-	// the rest. Surface the wait as a status suffix so the UI shows "(queued…)"
-	// instead of looking frozen while a slot is busy.
-	slot := a.connSlot(conn)
-	if slot >= 0 && slot < len(a.slotSems) {
+	// Per-conn concurrency gate: cap in-flight calls to this conn at its
+	// configured `parallel`. The token is held only for this call (released on
+	// return), not a subagent's lifetime — so between calls the conn frees up,
+	// and pool size 1 serialises without deadlocking nested subagents; the wait
+	// shows as "(queued…)". Find the conn's semaphore index by matching
+	// server+model; -1 (test mocks / probes not in settings.LLM) means "no gate,
+	// dispatch directly".
+	slot := -1
+	for i := range a.settings.LLM {
+		if a.settings.LLM[i].Server == conn.Server && a.settings.LLM[i].Model == conn.Model {
+			slot = i
+			break
+		}
+	}
+	if slot >= 0 && slot < len(a.connSems) {
 		// Try non-blocking first; only emit the queued suffix when we're
 		// actually about to wait. Avoids flashing the wrong status on the
 		// common hot path where the slot is free.
 		select {
-		case a.slotSems[slot] <- struct{}{}:
+		case a.connSems[slot] <- struct{}{}:
 		default:
 			a.setStatus(ctx, sid, " (queued…)")
 			select {
-			case a.slotSems[slot] <- struct{}{}:
+			case a.connSems[slot] <- struct{}{}:
 			case <-ctx.Done():
 				a.setStatus(ctx, sid, "")
 				return "", nil, ctx.Err()
 			}
 		}
-		defer func() { <-a.slotSems[slot] }()
+		defer func() { <-a.connSems[slot] }()
 	}
 
-	// slotLabel is the flat display slot for this call: llm[0] for the
-	// foreground turn, llm[1] for background work (summariser/git-commit) even
-	// when it's the same connection — see LLMConnection.Slot / pickBackgroundLLM.
-	// `slot` above is the *semaphore* index (the configured [[llm]] entry);
-	// conn.Slot is what the user reads. slot=-1 (test mocks, probes) → "?".
+	// slotLabel is the *display* index the user reads in the meter (llm[0]
+	// foreground, llm[1] background) — distinct from `slot` above, the semaphore
+	// index into settings.LLM. slot=-1 (test mocks, probes) → "?".
 	slotLabel := "?"
 	if slot >= 0 {
 		slotLabel = fmt.Sprintf("%d", conn.Slot)
 	}
 
-	// Drive the lifecycle suffix on the active phase entry across the LLM
-	// round-trip: "(sent…)" while we wait for the first SSE token (cache
-	// misses, queueing, slow TTFT), then the live ↑/↓ meter once streaming
-	// starts. setStatus is a no-op when no phase is active so summarisation
-	// calls between phases don't flash anything.
-	//
-	// Upload (↑) is just THIS call's request-body size in kB — what we sent to
-	// the LLM right now, not a running total or peak. Paired with llm[<slot>]
-	// so a background summarise visibly routes off the foreground slot.
-	upLabel := fmtKB(int64(len(body)))
+	// Drive the phase-row suffix across the round-trip: "(sent…)" until the first
+	// token, then the live ↑/↓ meter (setStatus is a no-op when no phase active).
+	// ↑ is THIS call's request-body size as two-decimal KiB — display-only.
+	upLabel := fmt.Sprintf("%.2fkb", float64(len(body))/1024)
 	a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent…)", slotLabel, upLabel))
 	defer a.setStatus(ctx, sid, "")
 
-	// Waiting meter: a busy/queuing server holds the request open without
-	// responding, and there's no client timeout (by design — a slow generation
-	// is legitimate), so without this the phase row would sit frozen at
-	// "(sent…)" with no sign of life. Tick elapsed seconds onto it until the
-	// first token arrives, and warn once after a long silence — the request
-	// keeps waiting, the user just learns the server is the bottleneck.
-	firstByte := make(chan struct{})
-	var firstByteOnce sync.Once
+	// One meter, one cadence: streamWaitMeter refreshes the phase row once per
+	// second for the whole call. Before the first token it shows "(sent… Ns)" so
+	// a busy/queuing server isn't a frozen "(sent…)"; once bytes arrive it shows
+	// the live "↑up ↓tokens…" estimate. genChars is the running generated-byte
+	// count it reads each tick — written by the scanner loop below, read by the
+	// meter goroutine, so it's atomic. There's no client timeout (a slow
+	// generation is legitimate); if the server drops the connection the scanner
+	// surfaces the transport error directly.
+	var genChars int64
 	waitDone := make(chan struct{})
-	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), firstByte, waitDone)
+	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), &genChars, waitDone)
 	defer close(waitDone)
 
-	// Per-session log: request header + body. The raw SSE wire is too noisy
-	// to read (one event per token, each repeating the full envelope), so we
-	// parse the stream and write a single aggregated RESPONSE block at the
-	// end. Mid-stream events (HTTP errors, partial state on transport
-	// failure) are appended inline below. Closed on return.
-	// Header records llm[<slot>] alongside the role+model so a grep for
-	// "llm[1]" surfaces every request routed to a given entry — useful for
-	// confirming that document / summarise / git_commit landed off the
-	// foreground prefix cache.
+	// Per-session log: a REQUEST block now, one aggregated RESPONSE block at the
+	// end (the per-token SSE wire is too noisy to skim). connLabel carries
+	// llm[<slot>] + role + model so grepping "llm[1]" finds every request routed
+	// to a given entry.
 	connLabel := fmt.Sprintf("llm[%s] %s model=%s", slotLabel, conn.Tag, conn.Model)
 	logF := a.sessionLog(sid)
 	if logF != nil {
@@ -197,7 +169,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 			time.Now().Format(time.RFC3339), connLabel, string(body))
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", conn.URL, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", conn.endpoint("/v1/chat/completions"), bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err
 	}
@@ -206,7 +178,12 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		httpReq.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
 
-	resp, err := llmHTTPClient.Do(httpReq)
+	// http.DefaultClient already has no Client.Timeout and DefaultTransport
+	// leaves ResponseHeaderTimeout at 0, so a long generation or a server that
+	// queues the request before answering is never capped — cancellation is
+	// driven by the request ctx only. The 30s dial timeout (TCP connect) is the
+	// only ceiling, which is what we want: an unreachable server fails fast.
+	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		if logF != nil {
 			fmt.Fprintf(logF, "[transport error] %v\n", err)
@@ -216,7 +193,6 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		// 1. Read the body
 		bodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return "", nil, fmt.Errorf("HTTP %d, failed to read body: %w", resp.StatusCode, err)
@@ -224,22 +200,17 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		if logF != nil {
 			fmt.Fprintf(logF, "[HTTP %d] %s\n", resp.StatusCode, string(bodyBytes))
 		}
-
-		// 2. Try to parse the JSON to find a specific error message
-		var apiErr map[string]any
-		if jsonErr := json.Unmarshal(bodyBytes, &apiErr); jsonErr == nil {
-			if errMsg, ok := apiErr["error"]; ok {
-				if errMap, ok := errMsg.(map[string]any); ok {
-					if msg, ok := errMap["message"].(string); ok {
-						// Include the URL in the error
-						return "", nil, fmt.Errorf("LLM returned %d: %s [URL: %s]", resp.StatusCode, msg, resp.Request.URL.String())
-					}
-				}
-			}
+		// Prefer the OpenAI-style {"error":{"message":…}} text; fall back to raw body.
+		msg := string(bodyBytes)
+		var apiErr struct {
+			Error struct {
+				Message string `json:"message"`
+			} `json:"error"`
 		}
-
-		// 3. Fallback: If JSON parsing failed, show raw body and URL
-		return "", nil, fmt.Errorf("LLM returned %d: %s [URL: %s]", resp.StatusCode, string(bodyBytes), resp.Request.URL.String())
+		if json.Unmarshal(bodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
+			msg = apiErr.Error.Message
+		}
+		return "", nil, fmt.Errorf("LLM returned %d: %s [URL: %s]", resp.StatusCode, msg, resp.Request.URL.String())
 	}
 
 	var fullText strings.Builder
@@ -247,11 +218,6 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	var calls []toolCall
 	var finishReason string
 	var promptTokens, completionTokens int
-	// Live token meter: genChars accumulates every generated byte (content +
-	// reasoning + tool-call args); lastMeterChars is the genChars value at the
-	// last status re-emit so we refresh roughly once per statusMeterChars
-	// bytes (~20 tokens) instead of on every SSE event.
-	genChars, lastMeterChars := 0, 0
 
 	scanner := bufio.NewScanner(resp.Body)
 	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
@@ -294,7 +260,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 
 		if delta.ReasoningContent != "" {
 			reasoningText.WriteString(delta.ReasoningContent)
-			genChars += len(delta.ReasoningContent)
+			atomic.AddInt64(&genChars, int64(len(delta.ReasoningContent)))
 			if think != nil {
 				think(delta.ReasoningContent)
 			}
@@ -302,14 +268,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 
 		if delta.Content != "" {
 			fullText.WriteString(delta.Content)
-			genChars += len(delta.Content)
+			atomic.AddInt64(&genChars, int64(len(delta.Content)))
 			if on != nil {
 				on(delta.Content)
 			}
 		}
 
 		for _, tc := range delta.ToolCalls {
-			genChars += len(tc.Function.Name) + len(tc.Function.Arguments)
+			atomic.AddInt64(&genChars, int64(len(tc.Function.Name)+len(tc.Function.Arguments)))
 			if tc.ID != "" {
 				calls = append(calls, tc)
 			} else if len(calls) > 0 {
@@ -317,147 +283,105 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 				last.Function.Arguments += tc.Function.Arguments
 			}
 		}
-
-		// Refresh the live meter on the first generated byte and then once per
-		// statusMeterChars thereafter. Shows sent (estimated up front) and the
-		// running received estimate so the user sees "↑3.4k ↓120…" climb during
-		// long planner / reasoning stretches instead of a frozen "sent…".
-		if genChars > 0 && (lastMeterChars == 0 || genChars-lastMeterChars >= statusMeterChars) {
-			firstByteOnce.Do(func() { close(firstByte) }) // stop the waiting meter
-			lastMeterChars = genChars
-			a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s ↓%s…)", slotLabel, upLabel, fmtTokens(genChars/4)))
-		}
 	}
-	if err := scanner.Err(); err != nil {
-		writeResponseLog(logF, connLabel, fullText.String(), reasoningText.String(), calls, promptTokens, completionTokens, err)
-		return fullText.String(), calls, fmt.Errorf("reading SSE stream: %w", err)
-	}
+	scanErr := scanner.Err()
 
 	// Record the server's reported prompt_tokens on the session so
 	// compressHistory can trigger on ground truth. Only the main session
 	// owns the foreground prefix cache, but storing on every session is
 	// harmless and keeps subagent telemetry honest. sid="" (probes/tests)
-	// has no session, skip.
-	if promptTokens > 0 {
+	// has no session, skip. On a scan failure the stream broke before the
+	// usage chunk, so promptTokens is 0 and this is a no-op anyway.
+	if scanErr == nil && promptTokens > 0 {
 		if sess := a.getSession(sid); sess != nil {
 			sess.SetLastCompletePromptTokens(promptTokens)
 		}
 	}
 
-	// finish_reason="length" means the server stopped because we hit
-	// max_tokens, not because the model emitted a stop token. The output is
-	// truncated mid-thought (or mid-tool-call JSON) and almost always means
-	// the model was looping or rambling. Bail out cleanly rather than
-	// retrying — the planner's JSON corrective retry is for malformed
-	// prose, not for runaways, and prompt.go's retry loop would just hit
-	// the same wall on the next attempt. The reasoning-byte count is
-	// surfaced so an "empty response" cap-hit is recognisable as "the model
-	// spent its whole budget thinking" vs an actual runaway in the visible
-	// stream.
-	if finishReason == "length" {
-		err := fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
+	// One outcome error, shared by the RESPONSE log block and the return:
+	//   - scanErr: stream broke mid-flight (e.g. a router model swap force-kills
+	//     the connection).
+	//   - finish_reason="length": hit max_tokens, not a stop token — output is
+	//     truncated and usually means the model looped. We bail rather than retry
+	//     (prompt.go's retry would hit the same wall); the message guides tuning.
+	switch {
+	case scanErr != nil:
+		err = fmt.Errorf("reading SSE stream: %w", scanErr)
+	case finishReason == "length":
+		err = fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
 			conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)
-		writeResponseLog(logF, connLabel, fullText.String(), reasoningText.String(), calls, promptTokens, completionTokens, err)
-		return fullText.String(), calls, err
+	default:
+		err = nil
 	}
 
-	writeResponseLog(logF, connLabel, fullText.String(), reasoningText.String(), calls, promptTokens, completionTokens, nil)
-	return fullText.String(), calls, nil
+	// One RESPONSE block per call, on every exit path. The raw SSE wire is one
+	// event per token (~100 lines for a short reply, thousands for a tool-call
+	// argument blob) — useless for skimming; this collapses the deltas into the
+	// reconstructed transcript. promptTokens/completionTokens are the server's
+	// exact counts from the trailing usage chunk (0 when the backend didn't
+	// report them).
+	if logF != nil {
+		text, reasoning := fullText.String(), reasoningText.String()
+		fmt.Fprintf(logF, "=== [%s] RESPONSE ===\n", connLabel)
+		if promptTokens > 0 || completionTokens > 0 {
+			fmt.Fprintf(logF, "tokens: prompt=%d completion=%d\n", promptTokens, completionTokens)
+		}
+		if reasoning != "" {
+			fmt.Fprintf(logF, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
+		}
+		if text != "" {
+			fmt.Fprintf(logF, "content:\n%s\n", text)
+		}
+		for i, c := range calls {
+			fmt.Fprintf(logF, "tool_call[%d] %s id=%s args=%s\n", i, c.Function.Name, c.ID, c.Function.Arguments)
+		}
+		if text == "" && reasoning == "" && len(calls) == 0 {
+			fmt.Fprintln(logF, "(empty response)")
+		}
+		if err != nil {
+			fmt.Fprintf(logF, "[stream error] %v\n", err)
+		}
+	}
+	return fullText.String(), calls, err
 }
 
-// statusMeterChars is how many generated bytes accumulate between live
-// token-meter refreshes (~20 tokens at chars/4). Small enough that the count
-// visibly climbs, large enough that we re-emit the plan a few dozen times for
-// a long response instead of once per SSE event.
-const statusMeterChars = 80
-
-// llmStallWarnSeconds is how long the LLM may stay silent (no first token)
-// before the waiting meter emits a one-line "server may be busy" warning. The
-// request is NOT aborted — a large prompt on a slow model can legitimately take
-// this long; the warning just tells the user the wait is on the server, not a
-// freeze.
-const llmStallWarnSeconds = 60
-
-// streamWaitMeter ticks an elapsed-seconds suffix onto the active phase row
-// while llmStream waits for the first token, so a busy/queuing server reads as
-// "(sent… 25s)" instead of a frozen "(sent…)". After llmStallWarnSeconds of
-// total silence it emits one soft warning (foreground turns only). Returns when
-// the first byte arrives (firstByte closed), the call ends (done closed), or
-// ctx is cancelled — it never aborts the request.
-func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel string, start time.Time, firstByte, done <-chan struct{}) {
+// streamWaitMeter refreshes the active phase row once per second for the whole
+// LLM call. Until the first generated byte (genChars==0) it shows "(sent… Ns)"
+// so a busy/queuing server reads as "(sent… 25s)" instead of a frozen
+// "(sent…)"; once bytes arrive it shows the live "↑up ↓tokens…" estimate.
+// genChars is read atomically — the scanner loop writes it concurrently.
+// Returns when the call ends (done closed) or ctx is cancelled; it never aborts
+// the request. No warning is emitted: while the call is alive the climbing
+// counter is the signal, and if it dies (e.g. a router model swap force-kills
+// the connection) llmStream surfaces the transport error directly.
+func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel string, start time.Time, genChars *int64, done <-chan struct{}) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
-	warned := false
 	for {
 		select {
-		case <-firstByte:
-			return
 		case <-done:
 			return
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			elapsed := int(time.Since(start).Seconds())
-			a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent… %ds)", slotLabel, upLabel, elapsed))
-			if !warned && elapsed >= llmStallWarnSeconds && a.phaseActive(sid) {
-				warned = true
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ No response from llm[%s] after %ds — the server may be busy or queuing the request. Still waiting (no timeout)…\n", slotLabel, elapsed)}})
+			if g := atomic.LoadInt64(genChars); g > 0 {
+				// approx tokens, compact: <1000 as-is, else "k" suffix
+				// (1234 → "1.2k", 12000 → "12k"). Display-only.
+				n := int(g) / 4
+				tok := strconv.Itoa(n)
+				if n >= 1000 {
+					if v := float64(n) / 1000; v >= 10 {
+						tok = fmt.Sprintf("%.0fk", v)
+					} else {
+						tok = fmt.Sprintf("%.1fk", v)
+					}
+				}
+				a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s ↓%s…)", slotLabel, upLabel, tok))
+			} else {
+				elapsed := int(time.Since(start).Seconds())
+				a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent… %ds)", slotLabel, upLabel, elapsed))
 			}
 		}
-	}
-}
-
-// fmtKB renders a byte count as kilobytes with two decimals for the upload
-// meter, e.g. 12_636 → "12.34kb". Uses 1024-byte KiB; always "kb" (no MB
-// rollover) so the cumulative upload total reads consistently as it climbs.
-// Display-only.
-func fmtKB(n int64) string {
-	return fmt.Sprintf("%.2fkb", float64(n)/1024)
-}
-
-// fmtTokens renders an approximate token count compactly for the live status
-// meter: <1000 prints as-is, ≥1000 collapses to a "k" suffix (1234 → "1.2k",
-// 12000 → "12k"). Display-only — never used for budget or compaction math.
-func fmtTokens(n int) string {
-	if n < 1000 {
-		return strconv.Itoa(n)
-	}
-	v := float64(n) / 1000
-	if v >= 10 {
-		return fmt.Sprintf("%.0fk", v)
-	}
-	return fmt.Sprintf("%.1fk", v)
-}
-
-// writeResponseLog emits one compact RESPONSE block per LLM call. The raw SSE
-// wire is one event per token (~100 lines for a short reply, thousands for a
-// tool-call argument blob) — useless for skimming. This collapses all the
-// deltas into the reconstructed text and tool calls so the log reads like a
-// transcript instead of a packet capture. promptTokens/completionTokens are
-// the server's exact counts from the trailing usage chunk (0 when the backend
-// didn't report them).
-func writeResponseLog(logF *os.File, connLabel, text, reasoning string, calls []toolCall, promptTokens, completionTokens int, streamErr error) {
-	if logF == nil {
-		return
-	}
-	fmt.Fprintf(logF, "=== [%s] RESPONSE ===\n", connLabel)
-	if promptTokens > 0 || completionTokens > 0 {
-		fmt.Fprintf(logF, "tokens: prompt=%d completion=%d\n", promptTokens, completionTokens)
-	}
-	if reasoning != "" {
-		fmt.Fprintf(logF, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
-	}
-	if text != "" {
-		fmt.Fprintf(logF, "content:\n%s\n", text)
-	}
-	for i, c := range calls {
-		fmt.Fprintf(logF, "tool_call[%d] %s id=%s args=%s\n", i, c.Function.Name, c.ID, c.Function.Arguments)
-	}
-	if text == "" && len(calls) == 0 && reasoning == "" {
-		fmt.Fprintln(logF, "(empty response)")
-	}
-	if streamErr != nil {
-		fmt.Fprintf(logF, "[stream error] %v\n", streamErr)
 	}
 }
 
@@ -514,7 +438,7 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	if r.Reachable {
 		slog.Info("probeLLM", "model", conn.Model, "loaded", r.ModelLoaded, "image", r.ImageSupport, "ctx", r.ContextSize)
 	} else {
-		slog.Info("probeLLM: unreachable", "url", conn.URL, "model", conn.Model)
+		slog.Info("probeLLM: unreachable", "server", conn.Server, "model", conn.Model)
 	}
 	return r
 }
@@ -527,11 +451,15 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 // fills the gap. ok=false only on network / non-200 — a bare response still
 // returns ok=true so the caller knows the server is up.
 func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
-	modelsURL, ok := deriveServerURL(conn.URL, "/v1/models")
-	if !ok {
-		return probeResult{}, false
+	modelsURL := conn.endpoint("/v1/models")
+	req, err := http.NewRequestWithContext(ctx, "GET", modelsURL, nil)
+	if err == nil && conn.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
-	resp, err := getWithAuth(ctx, modelsURL, conn.APIKey)
+	var resp *http.Response
+	if err == nil {
+		resp, err = http.DefaultClient.Do(req)
+	}
 	if err != nil {
 		slog.Info("probeViaModels: request failed", "url", modelsURL, "err", err)
 		return probeResult{}, false
@@ -591,11 +519,15 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 // and (via modalities.vision) whether the loaded model supports image input,
 // but cannot tell us *which* model is loaded — so ModelKnown stays false.
 func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
-	propsURL, ok := deriveServerURL(conn.URL, "/props")
-	if !ok {
-		return probeResult{}, false
+	propsURL := conn.endpoint("/props")
+	req, err := http.NewRequestWithContext(ctx, "GET", propsURL, nil)
+	if err == nil && conn.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
-	resp, err := getWithAuth(ctx, propsURL, conn.APIKey)
+	var resp *http.Response
+	if err == nil {
+		resp, err = http.DefaultClient.Do(req)
+	}
 	if err != nil {
 		slog.Info("probeViaProps: request failed", "url", propsURL, "err", err)
 		return probeResult{}, false
@@ -634,16 +566,15 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 	return r, true
 }
 
-// pickAvailable resolves the connection for the session and role. The main
+// connForSession resolves the connection for the session and role. The main
 // session always uses LLM[0] — its KV cache owns the parent's conversation
 // prefix. Subagent sessions carry a PinnedLLMIdx assigned at launch by
 // launch_subagent; every call from that session routes back to the same
 // entry so the conn's prefix cache stays warm across plan/execute switches.
 // Concurrency is enforced by per-conn semaphores in llmStream; this picker
 // just resolves the routing target.
-func (a *agent) pickAvailable(_ context.Context, sid string, role string) *LLMConnection {
-	sess := a.getSession(sid)
-	if sess != nil && sess.Depth > 0 && sess.PinnedLLMIdx >= 0 {
+func (a *agent) connForSession(_ context.Context, sid string, role string) *LLMConnection {
+	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 && sess.PinnedLLMIdx >= 0 {
 		if c := a.settings.ConnAt(sess.PinnedLLMIdx, role); c != nil {
 			return c
 		}
@@ -651,25 +582,17 @@ func (a *agent) pickAvailable(_ context.Context, sid string, role string) *LLMCo
 	return a.settings.MainLLM(role)
 }
 
-// pickBackgroundLLM returns the connection that should host background work
-// (per-turn summariser, git-commit, document). Walks LLM[1..x] — the
-// background tier — and returns the first entry whose semaphore reports
-// free capacity, so a 3-LLM setup spreads concurrent calls across servers
-// instead of stacking them on LLM[1]. When every background entry is busy
-// we fall back to LLM[0]: ensureLLM has gated startup on parallelCap >= 2
-// so its server's slot allocator gives background a different KV cache
-// slot, and one cache-pollution turn is preferable to stalling the
-// background queue waiting for a [1..x] slot. The free-capacity peek is
-// racy by design — by the time llmStream re-acquires the same slot,
-// another caller may have grabbed it; llmStream's per-conn semaphore
-// queues in that case, which is still no worse than the simple "always
-// LLM[1]" fallback. Session-independent: every caller is on the foreground
-// path (call sites filter on Depth==0), and the picking is the same
-// regardless of which session triggered it.
-func (a *agent) pickBackgroundLLM() *LLMConnection {
+// connForBackgroundLLM returns the connection to host background work (per-turn
+// summariser, git-commit, document). It walks the background tier LLM[1..x] and
+// returns the first with free semaphore capacity, spreading load across servers
+// instead of stacking on LLM[1]. If all are busy (or none exist) it falls back
+// to LLM[0], labelled llm[1] when that conn has >=2 slots so the meter shows the
+// work routed off the foreground turn. The capacity peek is racy by design —
+// llmStream's semaphore just queues if the slot was taken meanwhile.
+func (a *agent) connForBackgroundLLM() *LLMConnection {
 	for i := 1; i < len(a.settings.LLM); i++ {
-		if i < len(a.slotSems) && a.slotSems[i] != nil &&
-			len(a.slotSems[i]) < cap(a.slotSems[i]) {
+		if i < len(a.connSems) && a.connSems[i] != nil &&
+			len(a.connSems[i]) < cap(a.connSems[i]) {
 			return a.settings.ConnAt(i, "execute")
 		}
 	}
@@ -684,91 +607,14 @@ func (a *agent) pickBackgroundLLM() *LLMConnection {
 	return c
 }
 
-// connSlot returns the index into settings.LLM that this connection
-// corresponds to, used by llmStream to find the matching semaphore. Returns
-// -1 when the conn is not in the configured list (test mocks, probe-only
-// stubs); the caller treats -1 as "no semaphore" and dispatches directly.
-func (a *agent) connSlot(conn *LLMConnection) int {
-	for i := range a.settings.LLM {
-		if a.settings.LLM[i].URL == conn.URL && a.settings.LLM[i].Model == conn.Model {
-			return i
-		}
-	}
-	return -1
-}
-
-// buildSlotSems sizes one buffered channel per LLM entry to its parallelCap.
+// buildConnSems sizes one buffered channel per LLM entry to its parallelCap.
 // Called once on agent startup after settings load. Re-init on settings
 // reload is handled by the caller (ensureLLM invokes loadSettings →
-// re-init slotSems).
-func (a *agent) buildSlotSems() {
+// re-init connSems).
+func (a *agent) buildConnSems() {
 	sems := make([]chan struct{}, len(a.settings.LLM))
 	for i := range a.settings.LLM {
 		sems[i] = make(chan struct{}, a.settings.LLM[i].parallelCap())
 	}
-	a.slotSems = sems
-}
-
-// getWithAuth issues a GET with an optional bearer token and follows redirects
-// (http.DefaultClient follows up to 10 by default, needed for http→https).
-func getWithAuth(ctx context.Context, rawURL, token string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	return http.DefaultClient.Do(req)
-}
-
-// deriveServerURL strips a chat-completions-style path from rawURL and appends
-// suffix. Handles "…/v1/chat/completions" and bare "…/chat/completions".
-func deriveServerURL(rawURL, suffix string) (string, bool) {
-	u, err := url.Parse(rawURL)
-	if err != nil || u.Host == "" {
-		return "", false
-	}
-	path := u.Path
-	if i := strings.Index(path, "/v1/"); i >= 0 {
-		path = path[:i]
-	} else if j := strings.LastIndex(path, "/chat/completions"); j >= 0 {
-		path = path[:j]
-	}
-	u.Path = strings.TrimRight(path, "/") + suffix
-	u.RawQuery = ""
-	u.Fragment = ""
-	return u.String(), true
-}
-
-// llmSimple sends a no-tools LLM call, logs to stderr. sid scopes per-session
-// debug logging (see llmStream); pass "" for unscoped calls.
-func (a *agent) llmSimple(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage) (string, error) {
-	text, _, err := a.llmStream(ctx, sid, conn, messages, nil, func(token string) {
-		fmt.Fprint(os.Stderr, token)
-	}, nil)
-	fmt.Fprintln(os.Stderr)
-	return text, err
-}
-
-// parallel runs fn for each index [0, n) with up to `cap` concurrent
-// goroutines. Callers pass an explicit upper bound matched to the work-list
-// (e.g. launch_subagent's SubagentPinOrder length, probeAllLLMs's len(conns))
-// so excess work queues instead of contending for slots.
-func parallel(n, cap int, fn func(i int)) {
-	if cap > n {
-		cap = n
-	}
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, cap)
-	for i := range n {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			fn(i)
-		}(i)
-	}
-	wg.Wait()
+	a.connSems = sems
 }

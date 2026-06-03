@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -44,7 +45,12 @@ type Settings struct {
 // per subagent — between calls (during local tool dispatch) the conn is free
 // for another caller, so nested subagents on the same conn just queue.
 type LLMConnection struct {
-	URL            string         `toml:"url"`
+	// Server is the base URL of the OpenAI-compatible server — host root plus
+	// any reverse-proxy path prefix, e.g. "http://localhost:8080" or
+	// "https://gw.example/myllm". codehalter appends the API paths itself
+	// (see endpoint): /v1/chat/completions for completions, /v1/models and the
+	// root-level /props for probing. Do NOT put /v1/chat/completions here.
+	Server         string         `toml:"server"`
 	APIKey         string         `toml:"api_key,omitempty"`
 	Model          string         `toml:"model"`
 	Tag            string         `toml:"tag,omitempty"`
@@ -67,7 +73,7 @@ type LLMConnection struct {
 
 	// ExtraBody is the runtime alias for the role-resolved Params used by
 	// llmStream when assembling the OpenAI request body. Populated by
-	// pickAvailable so callers don't have to know which of Params /
+	// connForSession so callers don't have to know which of Params /
 	// ParamsThinking / ParamsExecute applies.
 	ExtraBody map[string]any `toml:"-"`
 
@@ -76,7 +82,7 @@ type LLMConnection struct {
 	// work (summariser / git-commit) runs as llm[1] — the same physical
 	// connection when there's a single [[llm]] entry with parallel >= 2, a
 	// distinct slot so you can see which is in use (llama.cpp assigns the real
-	// KV slot). Stamped by MainLLM / ConnAt / pickBackgroundLLM; runtime-only.
+	// KV slot). Stamped by MainLLM / ConnAt / connForBackgroundLLM; runtime-only.
 	Slot int `toml:"-"`
 }
 
@@ -95,6 +101,15 @@ func (c *LLMConnection) paramsFor(role string) map[string]any {
 		}
 	}
 	return c.Params
+}
+
+// endpoint joins the configured server base with an API path, e.g.
+// endpoint("/v1/models") → "http://host:8080/v1/models". The user configures
+// only Server (the host root); codehalter owns the path layout — the
+// OpenAI-compatible /v1/chat/completions and /v1/models, plus llama.cpp's
+// root-level /props. Trailing slashes on Server are tolerated.
+func (c *LLMConnection) endpoint(path string) string {
+	return strings.TrimRight(c.Server, "/") + path
 }
 
 // parallelCap returns the effective concurrent-call cap for this conn,
@@ -171,18 +186,11 @@ func decodeSettings(path string) (Settings, error) {
 // ExtraBody and Tag, or nil when no LLM is configured. Used by startup probes
 // and the main session's tool loop.
 func (s *Settings) MainLLM(role string) *LLMConnection {
-	if len(s.LLM) == 0 {
-		return nil
-	}
-	c := s.LLM[0]
-	c.ExtraBody = c.paramsFor(role)
-	c.Tag = role
-	c.Slot = 0
-	return &c
+	return s.ConnAt(0, role)
 }
 
 // ConnAt returns LLM[idx] with role-resolved ExtraBody, or nil when idx is
-// out of range. Used by pickAvailable to resolve pinned subagent sessions.
+// out of range. Used by connForSession to resolve pinned subagent sessions.
 func (s *Settings) ConnAt(idx int, role string) *LLMConnection {
 	if idx < 0 || idx >= len(s.LLM) {
 		return nil

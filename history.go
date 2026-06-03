@@ -83,7 +83,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	if prompt == "" {
 		return
 	}
-	conn := a.pickBackgroundLLM()
+	conn := a.connForBackgroundLLM()
 	if conn == nil {
 		return
 	}
@@ -129,7 +129,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 			buf.WriteString("</tool_calls>")
 		}
 
-		out, err := a.llmSimple(ctx, sess.ID, t.Conn, []llmMessage{{Role: "user", Content: buf.String()}})
+		out, _, err := a.llmStream(ctx, sess.ID, t.Conn, []llmMessage{{Role: "user", Content: buf.String()}}, nil, nil, nil)
 		if err != nil {
 			slog.Debug("backgroundSummarise: llm call failed — turn note lost for this pair", "sid", sess.ID, "err", err)
 			return

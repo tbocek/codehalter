@@ -56,7 +56,10 @@
 # warns when either signal couldn't be discovered.
 
 [[llm]]
-url = "http://localhost:8080/v1/chat/completions"
+# server is the base URL of your OpenAI-compatible server (host root only).
+# codehalter appends the API paths itself — /v1/chat/completions for
+# completions, /v1/models and /props for probing. Do NOT include a path here.
+server = "http://localhost:8080"
 # api_key = "..."        # uncomment if your server requires bearer auth
 model = "your-model-id"  # must match the model name your server reports at /v1/models
 parallel = 1
@@ -72,7 +75,7 @@ params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, ma
 # off the main slot.
 #
 # [[llm]]
-# url = "http://your-other-server:9001/v1/chat/completions"
+# server = "http://your-other-server:9001"
 # model = "your-larger-model-id"
 # tag = "execute"        # informational only — shown in the startup banner
 # parallel = 3

@@ -182,7 +182,7 @@ func (a *agent) totalSlots() int {
 // There is no Abort: codehalter cannot function without an LLM. In auto-
 // answer modes (autopilot, subagents) we cap retries at 3 to avoid
 // spinning forever — those callers handle "no LLM" gracefully via
-// pickAvailable.
+// connForSession.
 func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 	auto, _ := a.shouldAutoAnswer(sid)
 	const autoCap = 3
@@ -195,13 +195,13 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 	for attempt := 0; ; attempt++ {
 		if loaded, err := loadSettings(sess.Cwd); err == nil {
 			a.settings = loaded
-			a.buildSlotSems()
+			a.buildConnSems()
 		}
 		if a.settings.path == "" {
 			a.scaffoldSettings(ctx, sess.Cwd, sid)
 			if loaded, err := loadSettings(sess.Cwd); err == nil {
 				a.settings = loaded
-				a.buildSlotSems()
+				a.buildConnSems()
 			}
 		}
 		currentHash := hashSettingsFiles(sess.Cwd)
@@ -255,7 +255,7 @@ func (a *agent) scaffoldSettings(ctx context.Context, cwd string, sid string) {
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Failed to write " + path + ": " + err.Error() + "\n"}})
 		return
 	}
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " with placeholder values. Edit `url` and `model` to match your LLM server, then click Retry below. Optional: move the edited file to ~/.config/codehalter/settings.toml to share it across every project.\n\n"}})
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " with placeholder values. Edit `server` and `model` to match your LLM server, then click Retry below. Optional: move the edited file to ~/.config/codehalter/settings.toml to share it across every project.\n\n"}})
 }
 
 // hashSettingsFiles returns hex sha256 of the concatenated contents of the
@@ -363,10 +363,10 @@ func (a *agent) renderLLMStatus() string {
 			label += " " + c.Tag
 		}
 		if !a.connReachable[connKey(&c)] {
-			fmt.Fprintf(&b, "🟡 %s: unreachable at %s — start your server or fix the url.\n\n", label, c.URL)
+			fmt.Fprintf(&b, "🟡 %s: unreachable at %s — start your server or fix the server url.\n\n", label, c.Server)
 			continue
 		}
-		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.URL, c.parallelCap())
+		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.Server, c.parallelCap())
 		if firstReachable < 0 {
 			firstReachable = i
 		}

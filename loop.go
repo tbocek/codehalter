@@ -60,7 +60,7 @@ type planResult struct {
 // The actual failure detail is already in history on the preceding executor
 // response, so we don't repeat it here.
 func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
-	thinking := a.pickAvailable(ctx, sid, "thinking")
+	thinking := a.connForSession(ctx, sid, "thinking")
 	if thinking == nil {
 		return nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
 	}
@@ -275,7 +275,7 @@ func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx,
 		"web_read":     true,
 		"web_read_raw": true,
 	}
-	res, err := a.runToolLoop(ctx, sid, a.pickAvailable(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", 0)
+	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", 0)
 	if sess != nil && res.Text != "" {
 		sess.UpsertLastAssistant(res.Text)
 		_ = sess.Save()
@@ -328,7 +328,7 @@ func (a *agent) document(ctx context.Context, sid string, exec toolLoopResult) (
 
 	// Prefer a non-foreground slot so llm[0]'s warm cache isn't evicted.
 	// Falls back to MainLLM when only one entry is configured.
-	conn := a.pickBackgroundLLM()
+	conn := a.connForBackgroundLLM()
 	if conn == nil {
 		conn = a.settings.MainLLM("thinking")
 	}
@@ -861,7 +861,7 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 				if n < toolNameEscalateThreshold {
 					continue
 				}
-				thinkConn := a.pickAvailable(ctx, sid, "thinking")
+				thinkConn := a.connForSession(ctx, sid, "thinking")
 				if thinkConn == nil {
 					break
 				}

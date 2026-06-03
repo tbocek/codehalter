@@ -63,16 +63,18 @@ One `[[llm]]` array. Order matters: `llm[0]` is the main connection, `llm[1+]` a
 
 `params` is forwarded verbatim as the OpenAI request's extra body — put samplers and any model-specific knobs (`enable_thinking`, `reasoning_mode`, …) there. Core fields (`model`, `messages`, `stream`, `tools`) always win over `params`.
 
+`server` is the base URL of your OpenAI-compatible server — the host root only (e.g. `http://localhost:8080`). codehalter appends the API paths itself: `/v1/chat/completions` for completions, plus `/v1/models` and `/props` for probing. Don't include a path.
+
 ```toml
 [[llm]]
-url = "http://localhost:8080/v1/chat/completions"
+server = "http://localhost:8080"
 model = "qwen3.6-27b"
 parallel = 1
 params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
 params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0 }
 
 [[llm]]
-url = "http://other-host:9001/v1/chat/completions"
+server = "http://other-host:9001"
 model = "qwen3.5-122b"
 parallel = 3
 params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
@@ -159,7 +161,7 @@ After the container is built, point Zed at the in-container codehalter binary:
 "Codehalter": { "type": "custom", "command": "/usr/local/bin/codehalter", "args": [], "env": {} }
 ```
 
-If your LLM server runs on the host, change the URL in `~/.config/codehalter/settings.toml` to `http://host.docker.internal:8080/v1/chat/completions`. For an existing language-stack devcontainer (e.g. `mcr.microsoft.com/devcontainers/go:1`), copy the four mounts above into its `devcontainer.json` and `go install github.com/tbocek/codehalter@latest` in its image — no need to start from the Debian/Arch base.
+If your LLM server runs on the host, change `server` in `~/.config/codehalter/settings.toml` to `http://host.docker.internal:8080`. For an existing language-stack devcontainer (e.g. `mcr.microsoft.com/devcontainers/go:1`), copy the four mounts above into its `devcontainer.json` and `go install github.com/tbocek/codehalter@latest` in its image — no need to start from the Debian/Arch base.
 
 ### Commits and pushes from inside the container
 

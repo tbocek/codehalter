@@ -32,7 +32,7 @@ func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
 	a := &agent{
 		settings: Settings{
 			LLM: []LLMConnection{{
-				URL:          ts.URL + "/v1/chat/completions",
+				Server:       ts.URL,
 				Model:        "gpt-4o",
 				Parallel:     1,
 				ContextSize:  128000,
@@ -68,7 +68,7 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 	a := &agent{
 		settings: Settings{
 			LLM: []LLMConnection{{
-				URL:      ts.URL + "/v1/chat/completions",
+				Server:   ts.URL,
 				Model:    "gpt-4o",
 				Parallel: 1,
 			}},
@@ -104,7 +104,7 @@ func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
 	a := &agent{
 		settings: Settings{
 			LLM: []LLMConnection{{
-				URL:          ts.URL + "/v1/chat/completions",
+				Server:       ts.URL,
 				Model:        "qwen-vl",
 				Parallel:     1,
 				ImageSupport: &no,

@@ -282,7 +282,7 @@ type agent struct {
 	mode            string // "interactive" | "autopilot"
 
 	// connReachable records whether each configured LLMConnection answered
-	// the prepare-phase probe. Keyed by connKey(URL+model). pickBackgroundLLM
+	// the prepare-phase probe. Keyed by connKey(URL+model). connForBackgroundLLM
 	// filters candidates against this so a dead extra slot doesn't burn a
 	// timeout on every background summarise call. Populated by probeAllLLMs;
 	// nil before the first prepare runs.
@@ -298,13 +298,13 @@ type agent struct {
 	// ≥ minSlotTokens. compressHistory reads this; nothing else should.
 	mainSlotTokens int
 
-	// slotSems caps concurrent LLM calls per configured [[llm]] entry —
-	// settings.LLM[i] has a buffered channel at slotSems[i] of capacity
+	// connSems caps concurrent LLM calls per configured [[llm]] entry —
+	// settings.LLM[i] has a buffered channel at connSems[i] of capacity
 	// LLM[i].parallelCap(). llmStream acquires on entry and releases on exit,
 	// so a busy conn naturally queues excess calls instead of over-dispatching
-	// to its server. Sized by buildSlotSems on startup and after any settings
+	// to its server. Sized by buildConnSems on startup and after any settings
 	// reload. nil entry → no semaphore (test mocks).
-	slotSems []chan struct{}
+	connSems []chan struct{}
 
 	// mcpClients holds the spawned MCP server children, keyed by their
 	// configured `name`. Tools they advertise are registered into the
@@ -356,7 +356,7 @@ func (a *agent) sendUpdateAndAbort(ctx context.Context, sid, reason string) {
 }
 
 // connKey returns a stable map key for a connection.
-func connKey(c *LLMConnection) string { return c.URL + "\x00" + c.Model }
+func connKey(c *LLMConnection) string { return c.Server + "\x00" + c.Model }
 
 const (
 	modeInteractive = "interactive"
@@ -490,7 +490,7 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	// the LLM banner.
 	if gs, err := loadGlobalSettings(); err == nil {
 		a.settings = gs
-		a.buildSlotSems()
+		a.buildConnSems()
 		if conn := a.settings.MainLLM("execute"); conn != nil {
 			a.imagesSupported = a.probeLLM(ctx, conn).ImageSupport
 		}
@@ -538,7 +538,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	// fills it in. Running with no LLM until then is graceful (renderLLMStatus
 	// prints a warning instead of crashing).
 	a.settings = settings
-	a.buildSlotSems()
+	a.buildConnSems()
 	a.discoverRunners(cwd)
 	a.discoverSandbox()
 	a.registerSubagentTool()

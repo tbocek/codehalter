@@ -34,7 +34,7 @@ func newMockLLM(t *testing.T, responses ...string) *mockLLM {
 	m := &mockLLM{resps: responses, t: t}
 	m.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Runtime callers probe /slots before each LLM call. Mock doesn't
-		// implement it — 404 lets pickAvailable treat the server as "unknown,
+		// implement it — 404 lets connForSession treat the server as "unknown,
 		// assume available" so the chat-completions path still runs.
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
@@ -66,7 +66,7 @@ func newMockLLM(t *testing.T, responses ...string) *mockLLM {
 func (m *mockLLM) Close() { m.ts.Close() }
 
 func (m *mockLLM) conn(name string) *LLMConnection {
-	return &LLMConnection{Tag: name, URL: m.ts.URL, Model: "test-model"}
+	return &LLMConnection{Tag: name, Server: m.ts.URL, Model: "test-model"}
 }
 
 func (m *mockLLM) callCount() int { return int(m.idx.Load()) }
@@ -621,16 +621,16 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.settings = Settings{
 		LLM: []LLMConnection{{
-			URL:            mock.ts.URL,
+			Server:         mock.ts.URL,
 			Model:          "test-model",
 			ParamsExecute:  map[string]any{"temperature": 0.3},
 			ParamsThinking: map[string]any{"temperature": 1.0},
 		}},
 	}
 
-	conn := a.pickAvailable(context.Background(), s.ID, "execute")
+	conn := a.connForSession(context.Background(), s.ID, "execute")
 	if conn == nil {
-		t.Fatalf("pickAvailable(execute) returned nil")
+		t.Fatalf("connForSession(execute) returned nil")
 	}
 	_, err := a.runToolLoop(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
@@ -702,16 +702,16 @@ func TestToolLoopEscalatesOnRepeatedArgs(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.settings = Settings{
 		LLM: []LLMConnection{{
-			URL:            mock.ts.URL,
+			Server:         mock.ts.URL,
 			Model:          "test-model",
 			ParamsExecute:  map[string]any{"temperature": 0.3},
 			ParamsThinking: map[string]any{"temperature": 1.0},
 		}},
 	}
 
-	conn := a.pickAvailable(context.Background(), s.ID, "execute")
+	conn := a.connForSession(context.Background(), s.ID, "execute")
 	if conn == nil {
-		t.Fatalf("pickAvailable(execute) returned nil")
+		t.Fatalf("connForSession(execute) returned nil")
 	}
 	_, err := a.runToolLoop(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
@@ -792,7 +792,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
+			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -1078,7 +1078,7 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
+			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -1128,7 +1128,7 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
+			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -1476,7 +1476,7 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
+			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -1541,7 +1541,7 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{URL: mock.ts.URL, Model: "m"}},
+			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}

@@ -638,7 +638,7 @@ func sliceWebBody(body string, offset, limit int) string {
 // from a web page. sid scopes the per-session debug log. Routes via the
 // session's pin: main → LLM[0], subagent → its pinned LLM[i] entry.
 func (a *agent) summarizePage(ctx context.Context, sid string, query, url, pageText string) string {
-	conn := a.pickAvailable(ctx, sid, "execute")
+	conn := a.connForSession(ctx, sid, "execute")
 
 	// Truncate input to avoid overwhelming the LLM.
 	const maxInput = 8000
@@ -652,7 +652,7 @@ func (a *agent) summarizePage(ctx context.Context, sid string, query, url, pageT
 	)
 
 	messages := []llmMessage{{Role: "user", Content: prompt}}
-	summary, err := a.llmSimple(ctx, sid, conn, messages)
+	summary, _, err := a.llmStream(ctx, sid, conn, messages, nil, nil, nil)
 	if err != nil {
 		const maxLen = 2000
 		if len(pageText) > maxLen {

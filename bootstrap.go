@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -237,11 +238,8 @@ func hasFileWithExt(cwd string, exts ...string) bool {
 		if e.IsDir() {
 			continue
 		}
-		ext := filepath.Ext(e.Name())
-		for _, want := range exts {
-			if ext == want {
-				return true
-			}
+		if slices.Contains(exts, filepath.Ext(e.Name())) {
+			return true
 		}
 	}
 	return false
