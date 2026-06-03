@@ -92,13 +92,14 @@ With the caps above (1 + 3) one `launch_subagent` batch can run up to 4 tasks at
 
 ### Prompt files
 
-On first run, `ensureDefaults` drops three phase templates into `.codehalter/`:
+On first run, codehalter drops the phase templates into `.codehalter/`:
 
 | File | Role |
 |------|------|
 | `PLAN.md` | Planning-phase instructions (clarity check, info retrieval, subtask JSON schema with per-subtask verify recipe) |
 | `EXECUTE.md` | Execution-phase directives prepended to the user message; instructs the executor to run the verify recipe itself before calling `respond` |
 | `DOCUMENT.md` | Decides when the change is user-visible enough to update the README, then edits it minimally |
+| `SYSTEM.md` | Appended to the system prompt every turn — project-first investigation guidance (check how a technology is configured here before assuming/searching) |
 
 Plus per-stack `SKILL-{lang}.md` files for any language detected in the project root (`go.mod` → SKILL-go.md, `package.json`+`tsconfig.json` → SKILL-ts.md, plain `package.json` → SKILL-js.md, `pom.xml`/`build.gradle` → SKILL-java.md, `*.sh`/`*.bash` files → SKILL-bash.md). Skills are concatenated into the system prompt on the first turn so they ride along in cached history. Designed for smaller local models (Qwen3, Gemma) that need explicit language conventions; larger models can usually have them deleted.
 

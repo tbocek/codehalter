@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -115,5 +116,53 @@ func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
 
 	if a.imagesSupported {
 		t.Errorf("imagesSupported: probe detected vision but user explicitly disabled — config must win")
+	}
+}
+
+// llamaCppServer mocks a llama.cpp endpoint: a bare /v1/models plus a /props
+// carrying a PER-SLOT n_ctx (default_generation_settings.n_ctx) and total_slots.
+func llamaCppServer(perSlotCtx, totalSlots int) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v1/models"):
+			_, _ = w.Write([]byte(`{"data":[{"id":"qwen"}]}`))
+		case strings.HasSuffix(r.URL.Path, "/props"):
+			fmt.Fprintf(w, `{"default_generation_settings":{"n_ctx":%d},"total_slots":%d}`, perSlotCtx, totalSlots)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+// TestProbeAllLLMsAutoDetectsSlots: with `parallel` unset, the slot count is
+// back-filled from /props total_slots and the per-slot n_ctx is used directly
+// (no division), so the user no longer has to declare -np in settings.toml.
+func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
+	ts := llamaCppServer(16384, 2)
+	defer ts.Close()
+
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen"}}}}
+	a.probeAllLLMs(context.Background())
+
+	if got := a.settings.LLM[0].Parallel; got != 2 {
+		t.Errorf("Parallel: got %d, want 2 (auto-detected from /props total_slots)", got)
+	}
+	if a.mainSlotTokens != 16384 {
+		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx used directly, no division)", a.mainSlotTokens)
+	}
+}
+
+// TestProbeAllLLMsExplicitParallelWins: an explicit `parallel` is never
+// overwritten by the probed total_slots.
+func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
+	ts := llamaCppServer(16384, 4)
+	defer ts.Close()
+
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen", Parallel: 1}}}}
+	a.probeAllLLMs(context.Background())
+
+	if got := a.settings.LLM[0].Parallel; got != 1 {
+		t.Errorf("Parallel: got %d, want 1 (explicit value must not be overwritten by total_slots)", got)
 	}
 }

@@ -1,6 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -121,6 +125,78 @@ func trimJSON(s string) string {
 				return s[start : i+1]
 			}
 		}
+	}
+	return s
+}
+
+// cwdOrDefault resolves the session's working directory to a clean absolute
+// path. Clients may pass "." (bench harness) or any relative path; resolvePath
+// then prefix-checks against sess.Cwd, and the check breaks when Cwd isn't
+// absolute because filepath.Clean drops the leading "./" — read_file("go.mod")
+// would resolve to "go.mod" and fail the "outside project directory" check
+// even though it's inside the project.
+func cwdOrDefault(cwd string) string {
+	if cwd == "" {
+		cwd, _ = os.Getwd()
+	}
+	if abs, err := filepath.Abs(cwd); err == nil {
+		return abs
+	}
+	return cwd
+}
+
+// cwdAvailable reports whether the client-supplied workspace root actually
+// exists as a directory in this environment. Zed restores agent threads with
+// the cwd they were created under; when that workspace isn't mounted here
+// (e.g. a thread from another project's devcontainer), every later step —
+// scaffolding .codehalter, reading the session .toml — fails with a confusing
+// low-level mkdir/permission error against a path the user never chose. Gate
+// session/new and session/load on this up front so they refuse with a clear
+// message instead of trying to create .codehalter under an unavailable root.
+func cwdAvailable(cwd string) error {
+	info, err := os.Stat(cwd)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("workspace %s is not available in this environment (mount it, or open the project from a path that exists here)", cwd)
+		}
+		return fmt.Errorf("workspace %s: %w", cwd, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("workspace %s is not a directory", cwd)
+	}
+	return nil
+}
+
+// usableCwd resolves the client-supplied req.Cwd to an absolute workspace root
+// that actually exists in this environment. It prefers the requested path, but
+// when that isn't mounted here (e.g. Zed restoring a thread created under
+// another project's devcontainer — /workspaces/codehalter while the user has
+// since switched to preveltekit) it falls back to the directory the agent
+// process was launched in rather than refusing to start. The substitution is
+// logged for diagnosis. The bool is true when a fallback was substituted, so
+// the caller can tell the user this is a fresh session rather than a restored
+// one. Returns an error only when neither the requested cwd nor the process cwd
+// is a usable directory.
+func usableCwd(reqCwd string) (string, bool, error) {
+	cwd := cwdOrDefault(reqCwd)
+	err := cwdAvailable(cwd)
+	if err == nil {
+		return cwd, false, nil
+	}
+	fallback := cwdOrDefault("")
+	if cwdAvailable(fallback) != nil {
+		return "", false, err
+	}
+	slog.Info("workspace unavailable; opening a new session under the process cwd",
+		"requested", cwd, "fallback", fallback, "err", err)
+	return fallback, true, nil
+}
+
+// truncate shortens s to maxLen runes-ish (bytes) with an ellipsis suffix when
+// it overflows; shorter strings pass through unchanged.
+func truncate(s string, maxLen int) string {
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
 	}
 	return s
 }

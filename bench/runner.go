@@ -441,7 +441,7 @@ func runAgent(ctx context.Context, workDir, testName, inContainerBin, prompt str
 	var smResp setSessionModeResponse
 	if err := client.call(ctx, "session/set_mode", setSessionModeRequest{
 		SessionId: nsResp.SessionId,
-		ModeId:    "autopilot",
+		ModeId:    "Autopilot",
 	}, &smResp); err != nil {
 		return "", fmt.Errorf("session/set_mode autopilot: %w", err)
 	}

@@ -51,7 +51,7 @@ type promptResponse struct {
 	StopReason StopReason `json:"stopReason,omitempty"`
 }
 
-// setSessionModeRequest flips the session into "autopilot" so codehalter
+// setSessionModeRequest flips the session into "Autopilot" so codehalter
 // auto-answers every session/request_permission instead of blocking on us.
 // Without this, codehalter would hang waiting for the bench to click
 // Execute/Cancel on plan-execution and similar prompts.

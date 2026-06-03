@@ -41,9 +41,12 @@ type Settings struct {
 //
 // Parallel is the per-conn concurrent-call cap. Each in-flight llmStream
 // acquires one of N tokens from this conn's semaphore; excess calls block
-// until a token is released. Default 1 when zero. Holds *per LLM call*, not
-// per subagent — between calls (during local tool dispatch) the conn is free
-// for another caller, so nested subagents on the same conn just queue.
+// until a token is released. Holds *per LLM call*, not per subagent — between
+// calls (during local tool dispatch) the conn is free for another caller, so
+// nested subagents on the same conn just queue. Optional for llama.cpp:
+// probeAllLLMs auto-fills it from /props total_slots (-np) when left at 0. Set
+// it explicitly only for backends that don't report slots (vLLM, OpenAI, …) or
+// to cap concurrency below the server's capacity; 0 with no detection means 1.
 type LLMConnection struct {
 	// Server is the base URL of the OpenAI-compatible server — host root plus
 	// any reverse-proxy path prefix, e.g. "http://localhost:8080" or

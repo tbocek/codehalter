@@ -385,8 +385,10 @@ func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
 		a.reply(req, res, err)
 
 	case "authenticate":
-		err := a.agent.Authenticate(ctx)
-		a.reply(req, struct{}{}, err)
+		// No auth needed for local llama.cpp — Initialize advertises empty
+		// authMethods, so a client should never send this. Ack it anyway
+		// rather than reply method-not-found.
+		a.reply(req, struct{}{}, nil)
 
 	case "session/new":
 		var p NewSessionRequest

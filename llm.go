@@ -162,12 +162,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// llm[<slot>] + role + model so grepping "llm[1]" finds every request routed
 	// to a given entry.
 	connLabel := fmt.Sprintf("llm[%s] %s model=%s", slotLabel, conn.Tag, conn.Model)
-	logF := a.sessionLog(sid)
-	if logF != nil {
-		defer logF.Close()
-		fmt.Fprintf(logF, "\n=== %s [%s] REQUEST ===\n%s\n",
-			time.Now().Format(time.RFC3339), connLabel, string(body))
-	}
+	a.logSession(sid, connLabel+" REQUEST", "%s", string(body))
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", conn.endpoint("/v1/chat/completions"), bytes.NewReader(body))
 	if err != nil {
@@ -185,9 +180,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// only ceiling, which is what we want: an unreachable server fails fast.
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
-		if logF != nil {
-			fmt.Fprintf(logF, "[transport error] %v\n", err)
-		}
+		a.logSession(sid, connLabel, "[transport error] %v", err)
 		return "", nil, err
 	}
 	defer resp.Body.Close()
@@ -197,9 +190,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		if err != nil {
 			return "", nil, fmt.Errorf("HTTP %d, failed to read body: %w", resp.StatusCode, err)
 		}
-		if logF != nil {
-			fmt.Fprintf(logF, "[HTTP %d] %s\n", resp.StatusCode, string(bodyBytes))
-		}
+		a.logSession(sid, connLabel, "[HTTP %d] %s", resp.StatusCode, string(bodyBytes))
 		// Prefer the OpenAI-style {"error":{"message":…}} text; fall back to raw body.
 		msg := string(bodyBytes)
 		var apiErr struct {
@@ -320,28 +311,27 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// reconstructed transcript. promptTokens/completionTokens are the server's
 	// exact counts from the trailing usage chunk (0 when the backend didn't
 	// report them).
-	if logF != nil {
-		text, reasoning := fullText.String(), reasoningText.String()
-		fmt.Fprintf(logF, "=== [%s] RESPONSE ===\n", connLabel)
-		if promptTokens > 0 || completionTokens > 0 {
-			fmt.Fprintf(logF, "tokens: prompt=%d completion=%d\n", promptTokens, completionTokens)
-		}
-		if reasoning != "" {
-			fmt.Fprintf(logF, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
-		}
-		if text != "" {
-			fmt.Fprintf(logF, "content:\n%s\n", text)
-		}
-		for i, c := range calls {
-			fmt.Fprintf(logF, "tool_call[%d] %s id=%s args=%s\n", i, c.Function.Name, c.ID, c.Function.Arguments)
-		}
-		if text == "" && reasoning == "" && len(calls) == 0 {
-			fmt.Fprintln(logF, "(empty response)")
-		}
-		if err != nil {
-			fmt.Fprintf(logF, "[stream error] %v\n", err)
-		}
+	text, reasoning := fullText.String(), reasoningText.String()
+	var rb strings.Builder
+	if promptTokens > 0 || completionTokens > 0 {
+		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d\n", promptTokens, completionTokens)
 	}
+	if reasoning != "" {
+		fmt.Fprintf(&rb, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
+	}
+	if text != "" {
+		fmt.Fprintf(&rb, "content:\n%s\n", text)
+	}
+	for i, c := range calls {
+		fmt.Fprintf(&rb, "tool_call[%d] %s id=%s args=%s\n", i, c.Function.Name, c.ID, c.Function.Arguments)
+	}
+	if text == "" && reasoning == "" && len(calls) == 0 {
+		rb.WriteString("(empty response)\n")
+	}
+	if err != nil {
+		fmt.Fprintf(&rb, "[stream error] %v\n", err)
+	}
+	a.logSession(sid, connLabel+" RESPONSE", "%s", rb.String())
 	return fullText.String(), calls, err
 }
 
@@ -394,11 +384,20 @@ type probeResult struct {
 	ModelKnown   bool // /v1/models enumerated models — ModelLoaded is meaningful
 	ModelLoaded  bool // the configured model was in the enumeration
 	ImageSupport bool
-	// ContextSize is the model's max prompt+output tokens as reported by
-	// /props (n_ctx) or /v1/models launch args (--ctx-size / -c). 0 means
-	// unknown — ensureLLM blocks the session on a Retry card until the
-	// server starts reporting this.
+	// ContextSize is the TOTAL n_ctx (prompt+output) the server was launched
+	// with — from /v1/models' -c / --ctx-size launch arg, or older llama.cpp
+	// /props top-level n_ctx. 0 = unknown. probeAllLLMs divides it by the slot
+	// count to get the per-slot window.
 	ContextSize int
+	// SlotCtx is the PER-SLOT n_ctx reported directly by modern llama.cpp /props
+	// (default_generation_settings.n_ctx — already total ÷ -np). Preferred over
+	// ContextSize when set: no division, robust to how the server splits. 0 =
+	// not reported.
+	SlotCtx int
+	// TotalSlots is llama.cpp's -np concurrent slot count from /props
+	// total_slots. probeAllLLMs back-fills it into any [[llm]] that left
+	// `parallel` unset. 0 = not reported (non-llama backends).
+	TotalSlots int
 }
 
 // probeLLM checks reachability, model presence, and (best-effort) image
@@ -417,21 +416,24 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	defer cancel()
 
 	r, _ := a.probeViaModels(probeCtx, conn)
-	// Enrich missing metadata from /props when /v1/models was bare. Skip
-	// when /v1/models was unreachable too and try /props on its own — some
-	// llama-server builds don't expose /v1/models.
-	if r.Reachable && (!r.ImageSupport || r.ContextSize == 0) {
-		if p, ok := a.probeViaProps(probeCtx, conn); ok {
-			if !r.ImageSupport {
-				r.ImageSupport = p.ImageSupport
-			}
-			if r.ContextSize == 0 {
-				r.ContextSize = p.ContextSize
-			}
+	// Always enrich via /props when reachable: it carries image + ctx metadata
+	// AND llama.cpp's per-slot n_ctx / total_slots, none of which /v1/models
+	// exposes. Non-llama backends 404 here (ok=false) and we keep the
+	// /v1/models result; /props also serves as a reachability fallback for
+	// llama-server builds that don't expose /v1/models.
+	if p, ok := a.probeViaProps(probeCtx, conn); ok {
+		r.Reachable = true
+		if !r.ImageSupport {
+			r.ImageSupport = p.ImageSupport
 		}
-	} else if !r.Reachable {
-		if p, ok := a.probeViaProps(probeCtx, conn); ok {
-			r = p
+		if r.ContextSize == 0 {
+			r.ContextSize = p.ContextSize
+		}
+		if r.SlotCtx == 0 {
+			r.SlotCtx = p.SlotCtx
+		}
+		if r.TotalSlots == 0 {
+			r.TotalSlots = p.TotalSlots
 		}
 	}
 
@@ -542,26 +544,25 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeRe
 		Modalities *struct {
 			Vision bool `json:"vision"`
 		} `json:"modalities"`
-		// llama.cpp's /props exposes n_ctx in two shapes across releases:
-		// recent builds nest it under default_generation_settings, older
-		// ones surface it at the top level. We accept either.
+		// llama.cpp's /props exposes n_ctx in two shapes across releases, and
+		// they mean different things: modern builds nest a PER-SLOT n_ctx under
+		// default_generation_settings (already total ÷ -np), older ones surface
+		// the TOTAL at the top level. total_slots is the -np slot count.
 		DefaultGenerationSettings *struct {
 			NCtx int `json:"n_ctx"`
 		} `json:"default_generation_settings"`
-		NCtx int `json:"n_ctx"`
+		NCtx       int `json:"n_ctx"`
+		TotalSlots int `json:"total_slots"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&props); err != nil {
 		return probeResult{}, false
 	}
-	r := probeResult{Reachable: true}
+	r := probeResult{Reachable: true, ContextSize: props.NCtx, TotalSlots: props.TotalSlots}
 	if props.Modalities != nil {
 		r.ImageSupport = props.Modalities.Vision
 	}
 	if props.DefaultGenerationSettings != nil {
-		r.ContextSize = props.DefaultGenerationSettings.NCtx
-	}
-	if r.ContextSize == 0 {
-		r.ContextSize = props.NCtx
+		r.SlotCtx = props.DefaultGenerationSettings.NCtx
 	}
 	return r, true
 }

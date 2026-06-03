@@ -770,7 +770,7 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 
 	if choice == "Automatic" {
 		a.mu.Lock()
-		a.mode = modeAutopilot
+		a.mode = "Autopilot"
 		a.mu.Unlock()
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[Automatic] Running without further interruption.\n\n"}})
 	}
@@ -934,4 +934,41 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 		sess.gitCommitLastHash = hash
 		sess.gitCommitMu.Unlock()
 	}()
+}
+
+// ---------------------------------------------------------------------------
+// System prompt + prompt-file loading
+// ---------------------------------------------------------------------------
+
+func (a *agent) systemPrompt(sid string) (string, error) {
+	sess := a.getSession(sid)
+	if sess == nil {
+		return "", fmt.Errorf("no session found")
+	}
+
+	var b strings.Builder
+	if skills := loadSkills(sess.Cwd); skills != "" {
+		b.WriteString(skills)
+	}
+	fmt.Fprintf(&b, "Project directory: %s\n", sess.Cwd)
+	// Local/older models often have training data ending well before today —
+	// without this they reason about "future" releases as unreleased and give
+	// stale conclusions. Captured at session start; resumed sessions inherit
+	// that day's date, which is good enough for typical use.
+	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
+	// Project-first investigation guidance — a user-editable prompt seeded to
+	// .codehalter/SYSTEM.md (see docs/SYSTEM.md), not a Go string const.
+	b.WriteString(a.loadPromptFile(sid, "SYSTEM.md"))
+
+	return b.String(), nil
+}
+
+func (a *agent) loadPromptFile(sid string, filename string) string {
+	sess := a.getSession(sid)
+	if sess != nil {
+		if data, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", filename)); err == nil {
+			return string(data)
+		}
+	}
+	return ""
 }

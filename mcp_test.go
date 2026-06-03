@@ -70,11 +70,12 @@ func TestHTTPTransportRoundTrip(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tr := newHTTPTransport(MCPServerConfig{
-		Name:    "test",
-		URL:     srv.URL,
-		Headers: map[string]string{"X-Test": "yes"},
-	})
+	tr := &httpTransport{
+		name:    "test",
+		url:     srv.URL,
+		headers: map[string]string{"X-Test": "yes"},
+		client:  &http.Client{},
+	}
 
 	ctx := context.Background()
 

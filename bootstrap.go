@@ -178,8 +178,8 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 // ---------------------------------------------------------------------------
 
 // detectStacks returns the language/stack identifiers active in cwd, in a
-// fixed order (load-bearing: tests assert it, and the seed loop in
-// ensureDefaults walks it). Used to seed only the relevant SKILL files.
+// fixed order (load-bearing: tests assert it, and ensureSkills walks it).
+// Used to seed only the relevant SKILL files.
 func detectStacks(cwd string) []string {
 	var stacks []string
 
@@ -243,4 +243,71 @@ func hasFileWithExt(cwd string, exts ...string) bool {
 		}
 	}
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// Environment detection
+// ---------------------------------------------------------------------------
+
+// containerKind reports the sandbox kind codehalter is running inside ("" when
+// on the bare host). discoverSandbox gates run_command on this, and
+// ensureDevcontainer aborts the session when it's empty.
+func containerKind() string {
+	if os.Getenv("REMOTE_CONTAINERS") == "true" || os.Getenv("DEVCONTAINER") == "true" {
+		return "devcontainer"
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return "docker"
+	}
+	if _, err := os.Stat("/run/.containerenv"); err == nil {
+		return "podman"
+	}
+	if v := os.Getenv("container"); v != "" {
+		return v
+	}
+	return ""
+}
+
+// osInfo holds the result of parsing /etc/os-release. ID is the
+// supported-distro slug we use to pick a SKILL-*.md (one of "alpine",
+// "arch", "debian", "fedora", "ubuntu"; "" when missing/unsupported).
+// Fields is every key=value pair from the file (un-lowercased values,
+// quotes stripped) — used to substitute {{VERSION_ID}}, {{PRETTY_NAME}},
+// etc. into the per-OS skill body so the LLM doesn't have to probe.
+type osInfo struct {
+	ID     string
+	Fields map[string]string
+}
+
+// readOSInfo parses /etc/os-release. ID_LIKE is consulted as a fallback
+// so Linux Mint maps to ubuntu, Manjaro to arch, etc. Cheap file read —
+// safe to call from prepare on every turn.
+func readOSInfo() osInfo {
+	info := osInfo{Fields: map[string]string{}}
+	data, err := os.ReadFile("/etc/os-release")
+	if err != nil {
+		return info
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		eq := strings.IndexByte(line, '=')
+		if eq <= 0 {
+			continue
+		}
+		k := line[:eq]
+		v := strings.Trim(line[eq+1:], `"'`)
+		info.Fields[k] = v
+	}
+	supported := map[string]bool{"alpine": true, "arch": true, "debian": true, "fedora": true, "ubuntu": true}
+	if id := strings.ToLower(info.Fields["ID"]); supported[id] {
+		info.ID = id
+		return info
+	}
+	for _, alt := range strings.Fields(strings.ToLower(info.Fields["ID_LIKE"])) {
+		if supported[alt] {
+			info.ID = alt
+			return info
+		}
+	}
+	return info
 }

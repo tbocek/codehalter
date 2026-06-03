@@ -313,31 +313,47 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 		c := conns[i]
 		results[i] = a.probeLLM(ctx, &c)
 	})
-	firstReachable := -1
-	for i, r := range results {
-		c := conns[i]
-		a.connReachable[connKey(&c)] = r.Reachable
-		if r.Reachable && firstReachable < 0 {
-			firstReachable = i
+	// Record reachability and auto-detect the slot count: when an [[llm]] left
+	// `parallel` unset, adopt llama.cpp's reported total_slots (-np) so connSems,
+	// totalSlots, the summariser's separate-slot gate, and subagent pinning all
+	// see real server capacity without the user declaring it. An explicit
+	// `parallel` always wins. Re-detected each probe — ensureLLM reloads settings
+	// (resetting Parallel to the file value) right before calling us.
+	for i := range conns {
+		a.connReachable[conns[i].Server+"\x00"+conns[i].Model] = results[i].Reachable
+		if a.settings.LLM[i].Parallel == 0 && results[i].TotalSlots > 0 {
+			a.settings.LLM[i].Parallel = results[i].TotalSlots
 		}
 	}
-	// LLM[0] owns the foreground session's KV cache, so its context size
-	// drives compaction sizing. llama.cpp's `-c N -np K` splits the total
-	// across K slots, so divide.
-	ctxSize := conns[0].ContextSize
-	if ctxSize == 0 {
-		ctxSize = results[0].ContextSize
-	}
-	if ctxSize > 0 {
-		a.mainSlotTokens = ctxSize / conns[0].parallelCap()
-	}
+	a.buildConnSems() // resize the per-conn semaphores to the back-filled caps
+
+	// LLM[0] owns the foreground session's KV cache, so its per-slot context
+	// window drives compaction sizing. Prefer the server's directly-reported
+	// per-slot n_ctx (no division, robust to the total ÷ -np split); else divide
+	// a known total — an explicit context_size (the total the user declared) or
+	// /v1/models' -c launch arg — by the slot count.
+	slots := a.settings.LLM[0].parallelCap()
 	switch {
-	case firstReachable < 0:
-		a.imagesSupported = false
-	case conns[firstReachable].ImageSupport != nil:
-		a.imagesSupported = *conns[firstReachable].ImageSupport
+	case conns[0].ContextSize > 0:
+		a.mainSlotTokens = conns[0].ContextSize / slots
+	case results[0].SlotCtx > 0:
+		a.mainSlotTokens = results[0].SlotCtx
+	case results[0].ContextSize > 0:
+		a.mainSlotTokens = results[0].ContextSize / slots
+	}
+	slog.Info("probeAllLLMs", "slots", slots, "mainSlotTokens", a.mainSlotTokens,
+		"slotCtx", results[0].SlotCtx, "totalCtx", results[0].ContextSize, "totalSlots", results[0].TotalSlots)
+	// Image support is a property of LLM[0] alone: the foreground model is the
+	// only image consumer (view_image and the execute loop route there), and ACP
+	// advertises a single agent-wide image capability. Explicit config wins over
+	// probe discovery; a down LLM[0] with no declared value falls back to false.
+	switch {
+	case conns[0].ImageSupport != nil:
+		a.imagesSupported = *conns[0].ImageSupport
+	case results[0].Reachable:
+		a.imagesSupported = results[0].ImageSupport
 	default:
-		a.imagesSupported = results[firstReachable].ImageSupport
+		a.imagesSupported = false
 	}
 }
 
@@ -352,7 +368,7 @@ func (a *agent) renderLLMStatus() string {
 		return b.String()
 	}
 	if settingsLooksPlaceholder(a.settings) {
-		b.WriteString("🟡 LLM: " + a.settings.path + " still has the placeholder model \"your-model-id\". Edit it with your real url and model, then click Retry below.\n\n")
+		fmt.Fprintf(&b, "🟡 LLM: %s still has the placeholder model \"your-model-id\". Edit it with your real url and model, then click Retry below.\n\n", a.settings.path)
 		return b.String()
 	}
 	firstReachable := -1
@@ -362,7 +378,7 @@ func (a *agent) renderLLMStatus() string {
 		if i > 0 && c.Tag != "" {
 			label += " " + c.Tag
 		}
-		if !a.connReachable[connKey(&c)] {
+		if !a.connReachable[c.Server+"\x00"+c.Model] {
 			fmt.Fprintf(&b, "🟡 %s: unreachable at %s — start your server or fix the server url.\n\n", label, c.Server)
 			continue
 		}
@@ -378,7 +394,7 @@ func (a *agent) renderLLMStatus() string {
 	switch {
 	case a.imagesSupported:
 		b.WriteString("✅ Image support: enabled\n\n")
-	case conns[firstReachable].ImageSupport != nil:
+	case conns[0].ImageSupport != nil:
 		b.WriteString("Image support: disabled (declared image_support = false in settings.toml)\n\n")
 	default:
 		b.WriteString("❕ Image support: undetected — codehalter assumed disabled. If your model accepts images, set `image_support = true` on the [[llm]] entry in settings.toml.\n\n")
@@ -419,7 +435,8 @@ func (a *agent) envSnapshot(sess *Session) string {
 	} else {
 		b.WriteString("firefox=missing\n")
 	}
-	fmt.Fprintf(&b, "runcmd=%s\n", a.runCmdStatus)
+	// run_command availability is fully determined by container= above (it's
+	// registered iff in a container), so it needs no separate snapshot line.
 	fmt.Fprintf(&b, "stacks=%s\n", strings.Join(sess.knownStacks, ","))
 	for _, s := range sess.knownStacks {
 		bin := stackProbeBinary(s)
@@ -476,25 +493,25 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	sess.knownRunners = detectRunnerConfigs(sess.Cwd)
 
 	// Re-seed SKILL-*.md so a stack / runner config / distro added since
-	// session start has its skill on disk before the next turn's
-	// systemPrompt loads it. Keyed on FILE presence (justfile / Makefile /
-	// go.mod / ...), not on installed tools — the LLM needs the skill to
-	// know how to install the missing tool. Idempotent for stacks /
-	// runners; per-OS pruning is unconditional, and when any other-OS
-	// SKILL was removed we rebuild sess.SystemPrompt right now so the
-	// next LLM call (including proposeFix's orchestrate below) sees the
-	// cleaned-up skill set instead of the stale prefix.
+	// session start has its skill on disk before the next turn's systemPrompt
+	// loads it. Keyed on FILE presence (justfile / Makefile / go.mod / ...),
+	// not on installed tools — the LLM needs the skill to know how to install
+	// the missing tool. ensureSkills also refreshes un-edited skills from
+	// updated embeds and prunes other-OS copies.
 	osi := readOSInfo()
-	pruned, err := ensureSkills(sess.Cwd, sess.knownStacks, osi)
-	if err != nil {
+	if err := ensureSkills(sess.Cwd, sess.knownStacks, osi); err != nil {
 		slog.Warn("prepare: ensureSkills failed", "sid", sid, "err", err)
 	}
-	if len(pruned) > 0 {
-		if sp, err := a.systemPrompt(sid); err != nil {
-			slog.Warn("prepare: systemPrompt rebuild failed after skill prune", "sid", sid, "err", err)
-		} else {
-			sess.SystemPrompt = sp
-		}
+	// Rebuild the system prompt every turn but assign only on an actual byte
+	// diff. An unchanged prompt keeps the LLM's KV prefix cache warm; a skill
+	// added/edited/removed on disk this turn — whether codehalter-managed or a
+	// SKILL-*.md the user hand-dropped — gets picked up for the next LLM call
+	// (including proposeFix's orchestrate below) instead of waiting for a new
+	// session.
+	if sp, err := a.systemPrompt(sid); err != nil {
+		slog.Warn("prepare: systemPrompt rebuild failed", "sid", sid, "err", err)
+	} else if sp != sess.SystemPrompt {
+		sess.SystemPrompt = sp
 	}
 
 	snap := a.envSnapshot(sess)
@@ -524,13 +541,11 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 		return changed, nil
 	}
 
-	var names, detail strings.Builder
+	var detail strings.Builder
 	for i, m := range missing {
 		if i > 0 {
-			names.WriteString(", ")
 			detail.WriteString(", ")
 		}
-		names.WriteString(m.bin)
 		fmt.Fprintf(&detail, "%s (%s)", m.bin, m.reason)
 	}
 	// Embed the OS we already detected so the LLM doesn't waste a tool
@@ -627,7 +642,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	var b strings.Builder
 
 	if a.settings.path != "" {
-		b.WriteString("Using " + a.settings.path + "\n\n")
+		fmt.Fprintf(&b, "Using %s\n\n", a.settings.path)
 	}
 	b.WriteString(a.renderLLMStatus())
 
@@ -643,15 +658,10 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	} else {
 		b.WriteString("🟡 Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
 	}
-	switch a.runCmdStatus {
-	case "available":
-		b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only — destructive git commands fail at the FS layer)\n\n")
-	case "":
-		// discoverSandbox never ran. Should not happen — initSession calls
-		// it unconditionally. Stay silent rather than print misleading info.
-	default:
-		fmt.Fprintf(&b, "🟡 run_command: disabled — %s\n\n", a.runCmdStatus)
-	}
+	// Reaching this banner means the session is actually running, which only
+	// happens inside a container (ensureDevcontainer aborts otherwise), so
+	// run_command is always registered by discoverSandbox at this point.
+	b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only — destructive git commands fail at the FS layer)\n\n")
 
 	// Stacks paired with their probe binary so the user sees stack →
 	// required-binary status on consecutive lines.
@@ -721,7 +731,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 
 	a.mu.Lock()
 	var mcpRunning []string
-	for name := range a.mcpClients {
+	for name := range a.mcp.clients {
 		mcpRunning = append(mcpRunning, name)
 	}
 	a.mu.Unlock()

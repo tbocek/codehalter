@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,8 +30,7 @@ import (
 // MCPServerConfig is one [[server]] entry from .codehalter/mcp.toml. Each
 // entry is exactly one of stdio (command/args/env) OR HTTP (url/headers) —
 // the reconciler rejects entries that set both. There is no `enabled` field;
-// commenting out an entry is the only way to disable it. Keeping the schema
-// small means fewer states the reconciler can interpret.
+// comment an entry out to disable it.
 type MCPServerConfig struct {
 	Name    string            `toml:"name"`
 	Command string            `toml:"command"`
@@ -37,31 +38,6 @@ type MCPServerConfig struct {
 	Env     map[string]string `toml:"env"`
 	URL     string            `toml:"url"`
 	Headers map[string]string `toml:"headers"`
-}
-
-type mcpSettingsFile struct {
-	Server []MCPServerConfig `toml:"server"`
-}
-
-// loadMCPSettings reads .codehalter/mcp.toml from cwd. Missing file returns
-// (nil, zero time, nil) — MCP is opt-in, so absence is silently fine. The
-// returned mtime lets reconcileMCP skip the diff when the file is unchanged
-// since the last pass, so a persistent start failure doesn't re-emit the
-// same failed card on every prompt.
-func loadMCPSettings(cwd string) ([]MCPServerConfig, time.Time, error) {
-	path := filepath.Join(cwd, sessionDir, "mcp.toml")
-	info, err := os.Stat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, time.Time{}, nil
-		}
-		return nil, time.Time{}, err
-	}
-	var f mcpSettingsFile
-	if _, err := toml.DecodeFile(path, &f); err != nil {
-		return nil, info.ModTime(), fmt.Errorf("loading %s: %w", path, err)
-	}
-	return f.Server, info.ModTime(), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -86,13 +62,11 @@ type mcpResponse struct {
 	ID      *int64          `json:"id,omitempty"`
 	Method  string          `json:"method,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
-	Error   *mcpError       `json:"error,omitempty"`
-}
-
-type mcpError struct {
-	Code    int             `json:"code"`
-	Message string          `json:"message"`
-	Data    json.RawMessage `json:"data,omitempty"`
+	Error   *struct {
+		Code    int             `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data,omitempty"`
+	} `json:"error,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +108,15 @@ func StartMCPClient(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPC
 	var t mcpTransport
 	switch {
 	case cfg.URL != "":
-		t = newHTTPTransport(cfg)
+		t = &httpTransport{
+			name:    cfg.Name,
+			url:     cfg.URL,
+			headers: cfg.Headers,
+			// Per-server timeout protects against a hung server holding up the
+			// agent indefinitely; tools/call for long-running operations should
+			// be wrapped in the request ctx for finer control.
+			client: &http.Client{Timeout: 60 * time.Second},
+		}
 	case cfg.Command != "":
 		st, err := newStdioTransport(cfg, cwd)
 		if err != nil {
@@ -146,34 +128,26 @@ func StartMCPClient(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPC
 	}
 
 	c := &MCPClient{name: cfg.Name, transport: t}
-	if err := c.initialize(ctx); err != nil {
+	// MCP handshake: send `initialize`, then the `notifications/initialized`
+	// notification. After both succeed the server accepts tools/list and tools/call.
+	_, err := c.send(ctx, "initialize", map[string]any{
+		"protocolVersion": "2025-06-18",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "codehalter", "version": "0.1.0"},
+	})
+	if err == nil {
+		err = c.transport.notify(ctx, mcpNotification{
+			JSONRPC: "2.0",
+			Method:  "notifications/initialized",
+			Params:  map[string]any{},
+		})
+	}
+	if err != nil {
 		c.Close()
 		return nil, fmt.Errorf("initialize %s: %w", cfg.Name, err)
 	}
 	slog.Info("mcp ready", "name", cfg.Name)
 	return c, nil
-}
-
-// initialize completes the MCP handshake: send `initialize`, wait for the
-// server's capabilities response, then send the `notifications/initialized`
-// notification. After that the server is ready for tools/list and tools/call.
-func (c *MCPClient) initialize(ctx context.Context) error {
-	_, err := c.send(ctx, "initialize", map[string]any{
-		"protocolVersion": "2025-06-18",
-		"capabilities":    map[string]any{},
-		"clientInfo": map[string]any{
-			"name":    "codehalter",
-			"version": "0.1.0",
-		},
-	})
-	if err != nil {
-		return err
-	}
-	return c.transport.notify(ctx, mcpNotification{
-		JSONRPC: "2.0",
-		Method:  "notifications/initialized",
-		Params:  map[string]any{},
-	})
 }
 
 func (c *MCPClient) send(ctx context.Context, method string, params any) (json.RawMessage, error) {
@@ -365,28 +339,12 @@ type httpTransport struct {
 	sessionId string
 }
 
-func newHTTPTransport(cfg MCPServerConfig) *httpTransport {
-	return &httpTransport{
-		name:    cfg.Name,
-		url:     cfg.URL,
-		headers: cfg.Headers,
-		// Per-server timeout protects against a hung server holding up the
-		// agent indefinitely; tools/call for long-running operations should
-		// be wrapped in the request ctx for finer control.
-		client: &http.Client{Timeout: 60 * time.Second},
-	}
-}
-
 func (t *httpTransport) send(ctx context.Context, req mcpRequest) (mcpResponse, error) {
 	body, err := json.Marshal(req)
 	if err != nil {
 		return mcpResponse{}, err
 	}
-	resp, err := t.do(ctx, body)
-	if err != nil {
-		return mcpResponse{}, err
-	}
-	return resp, nil
+	return t.do(ctx, body)
 }
 
 func (t *httpTransport) notify(ctx context.Context, n mcpNotification) error {
@@ -528,11 +486,6 @@ type mcpTool struct {
 	InputSchema map[string]any `json:"inputSchema"`
 }
 
-type mcpToolsListResult struct {
-	Tools      []mcpTool `json:"tools"`
-	NextCursor string    `json:"nextCursor,omitempty"`
-}
-
 // listTools enumerates every tool the server exposes. Some servers paginate
 // via `nextCursor`; we follow until empty.
 func (c *MCPClient) listTools(ctx context.Context) ([]mcpTool, error) {
@@ -547,7 +500,10 @@ func (c *MCPClient) listTools(ctx context.Context) ([]mcpTool, error) {
 		if err != nil {
 			return nil, err
 		}
-		var page mcpToolsListResult
+		var page struct {
+			Tools      []mcpTool `json:"tools"`
+			NextCursor string    `json:"nextCursor,omitempty"`
+		}
 		if err := json.Unmarshal(raw, &page); err != nil {
 			return nil, fmt.Errorf("tools/list decode: %w", err)
 		}
@@ -560,21 +516,9 @@ func (c *MCPClient) listTools(ctx context.Context) ([]mcpTool, error) {
 	return all, nil
 }
 
-// mcpCallResultContent is one block from a tools/call result. We only care
-// about the text variant — image/resource blocks are summarised down to a
-// "[non-text content of type X]" placeholder.
-type mcpCallResultContent struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
-}
-
-type mcpCallResult struct {
-	Content []mcpCallResultContent `json:"content"`
-	IsError bool                   `json:"isError,omitempty"`
-}
-
-// callTool invokes a remote tool and renders the response into a single
-// string suitable for surfacing back to the LLM.
+// callTool invokes a remote tool and renders the response into a single string
+// suitable for surfacing back to the LLM. Only text content blocks are kept;
+// image/resource blocks collapse to a "[non-text content of type X]" placeholder.
 func (c *MCPClient) callTool(ctx context.Context, name string, args json.RawMessage) (string, bool, error) {
 	argsField := any(map[string]any{})
 	if len(args) > 0 && string(args) != "null" {
@@ -590,7 +534,13 @@ func (c *MCPClient) callTool(ctx context.Context, name string, args json.RawMess
 	if err != nil {
 		return "", false, err
 	}
-	var result mcpCallResult
+	var result struct {
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text,omitempty"`
+		} `json:"content"`
+		IsError bool `json:"isError,omitempty"`
+	}
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return "", false, fmt.Errorf("tools/call decode: %w", err)
 	}
@@ -659,41 +609,6 @@ func registerMCPTools(c *MCPClient, tools []mcpTool) {
 // Lifecycle wired into the agent
 // ---------------------------------------------------------------------------
 
-// mcpConfigsEqual compares two server configs by all fields that matter for
-// runtime behavior. A `false` here means the server must be restarted.
-func mcpConfigsEqual(a, b MCPServerConfig) bool {
-	if a.Name != b.Name || a.Command != b.Command || a.URL != b.URL {
-		return false
-	}
-	if len(a.Args) != len(b.Args) {
-		return false
-	}
-	for i := range a.Args {
-		if a.Args[i] != b.Args[i] {
-			return false
-		}
-	}
-	if !stringMapsEqual(a.Env, b.Env) {
-		return false
-	}
-	if !stringMapsEqual(a.Headers, b.Headers) {
-		return false
-	}
-	return true
-}
-
-func stringMapsEqual(a, b map[string]string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if b[k] != v {
-			return false
-		}
-	}
-	return true
-}
-
 // mcpChange describes one outcome of a reconciliation pass. The reconciler
 // turns these into tool-call cards in the chat so the user sees additions,
 // removals, restarts, and failures distinctly.
@@ -714,28 +629,47 @@ type mcpChange struct {
 // (initialize + tools/list both succeeded). That way a typo in args doesn't
 // take down a working server.
 func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
-	a.mcpReconcileMu.Lock()
-	defer a.mcpReconcileMu.Unlock()
+	a.mcp.mu.Lock()
+	defer a.mcp.mu.Unlock()
 
-	cfgs, mtime, err := loadMCPSettings(cwd)
+	// Read .codehalter/mcp.toml (MCP is opt-in, so a missing file is silently
+	// fine). mtime lets the unchanged-file check below skip the diff so a
+	// persistent start failure doesn't re-emit the same failed card every turn.
+	path := filepath.Join(cwd, sessionDir, "mcp.toml")
+	var cfgs []MCPServerConfig
+	var mtime time.Time
+	var err error
+	if info, serr := os.Stat(path); serr == nil {
+		mtime = info.ModTime()
+		var f struct {
+			Server []MCPServerConfig `toml:"server"`
+		}
+		if _, derr := toml.DecodeFile(path, &f); derr != nil {
+			err = fmt.Errorf("loading %s: %w", path, derr)
+		} else {
+			cfgs = f.Server
+		}
+	} else if !os.IsNotExist(serr) {
+		err = serr
+	}
 	if err != nil {
 		// Parse errors are reported once per mtime change. If the user's
 		// editor saved a half-written file at t0, we surface it once; if
 		// they don't touch it again, we don't keep nagging on every prompt.
-		if !mtime.IsZero() && mtime.Equal(a.mcpAppliedMtime) {
+		if !mtime.IsZero() && mtime.Equal(a.mcp.appliedMtime) {
 			return nil
 		}
-		a.mcpAppliedMtime = mtime
+		a.mcp.appliedMtime = mtime
 		return []mcpChange{{action: "parse_error", err: err}}
 	}
 	// File unchanged since last reconcile — skip the diff entirely. This
 	// also suppresses re-emitting a failed-start card every turn when the
 	// user has a server configured incorrectly; they have to actually edit
 	// the file (which bumps mtime) to trigger another attempt.
-	if !mtime.IsZero() && mtime.Equal(a.mcpAppliedMtime) {
+	if !mtime.IsZero() && mtime.Equal(a.mcp.appliedMtime) {
 		return nil
 	}
-	a.mcpAppliedMtime = mtime
+	a.mcp.appliedMtime = mtime
 
 	// Last-write-wins on duplicate names. The mcp.toml schema doesn't define
 	// behavior here, and the user probably meant the second entry to override.
@@ -750,8 +684,8 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 		desired[c.Name] = c
 	}
 
-	applied := make(map[string]MCPServerConfig, len(a.mcpApplied))
-	for _, c := range a.mcpApplied {
+	applied := make(map[string]MCPServerConfig, len(a.mcp.applied))
+	for _, c := range a.mcp.applied {
 		applied[c.Name] = c
 	}
 
@@ -761,8 +695,11 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 	// verify the new client works before tearing down the old one.
 	for name, want := range desired {
 		old, existed := applied[name]
-		if existed && mcpConfigsEqual(old, want) {
-			continue // no-op
+		// Unchanged in every field that affects runtime behavior → no-op.
+		if existed && old.Command == want.Command && old.URL == want.URL &&
+			slices.Equal(old.Args, want.Args) &&
+			maps.Equal(old.Env, want.Env) && maps.Equal(old.Headers, want.Headers) {
+			continue
 		}
 
 		newClient, err := StartMCPClient(ctx, want, cwd)
@@ -780,11 +717,11 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 		// New client is ready. Atomically swap: unregister old tools, register
 		// new tools, replace the client handle, close the old client.
 		a.mu.Lock()
-		if a.mcpClients == nil {
-			a.mcpClients = make(map[string]*MCPClient)
+		if a.mcp.clients == nil {
+			a.mcp.clients = make(map[string]*MCPClient)
 		}
-		oldClient := a.mcpClients[name]
-		a.mcpClients[name] = newClient
+		oldClient := a.mcp.clients[name]
+		a.mcp.clients[name] = newClient
 		a.mu.Unlock()
 
 		if oldClient != nil {
@@ -805,8 +742,8 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 			continue
 		}
 		a.mu.Lock()
-		oldClient := a.mcpClients[name]
-		delete(a.mcpClients, name)
+		oldClient := a.mcp.clients[name]
+		delete(a.mcp.clients, name)
 		a.mu.Unlock()
 
 		UnregisterToolsByPrefix(name + "__")
@@ -816,26 +753,19 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 		changes = append(changes, mcpChange{action: "stopped", name: name})
 	}
 
-	// Snapshot the current applied set for the next diff. Only entries that
-	// are actually running go in — a server that failed to start stays out,
-	// so when the user fixes the file (bumping mtime) the next reconcile
-	// sees it as "missing" and retries the start.
-	a.mcpApplied = a.mcpApplied[:0]
-	for _, c := range cfgs {
-		if c.Name == "" {
-			continue
-		}
-		if c.Command == "" && c.URL == "" {
-			continue
-		}
+	// Snapshot the running set for the next diff. Only entries that actually
+	// started go in — a server that failed to start stays out, so once the user
+	// fixes the file (bumping mtime) the next reconcile sees it as "missing" and
+	// retries the start. desired is already the validated, deduped set.
+	a.mcp.applied = a.mcp.applied[:0]
+	for name, c := range desired {
 		a.mu.Lock()
-		_, running := a.mcpClients[c.Name]
+		_, running := a.mcp.clients[name]
 		a.mu.Unlock()
 		if running {
-			a.mcpApplied = append(a.mcpApplied, c)
+			a.mcp.applied = append(a.mcp.applied, c)
 		}
 	}
 
 	return changes
 }
-

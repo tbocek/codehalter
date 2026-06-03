@@ -17,12 +17,14 @@ import (
 // are expected to bind-mount `.git` read-only so destructive git commands fail
 // at the OS layer; we no longer install a PATH shim for `git`.
 func (a *agent) discoverSandbox() {
+	// Only register run_command inside a container — the container IS the
+	// sandbox. Outside one, ensureDevcontainer aborts the session before any
+	// prompt runs, so there is no "running on host with run_command disabled"
+	// state to report; just skip registration.
 	if containerKind() == "" {
-		a.runCmdStatus = "not inside a container (codehalter runs on host)"
-		slog.Info("run_command: " + a.runCmdStatus)
+		slog.Info("run_command: not registered (not inside a container)")
 		return
 	}
-	a.runCmdStatus = "available"
 
 	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
