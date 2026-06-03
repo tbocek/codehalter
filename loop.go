@@ -574,67 +574,22 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 				a.sendUpdate(ctx, sess.ParentID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80))}})
 			}
 			a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
-			started := time.Now()
 
-			// view_image short-circuit: when the server supports images, we
-			// read the bytes off the content-addressed store and deliver them
-			// as multimodal tool content in the SAME turn (so the next
-			// llmStream call sees the image). The standard executeTool path
-			// only returns text, which would defeat the point.
-			var result string
-			var failed bool
-			var multimodalContent any
-			if tc.Function.Name == "view_image" && a.imagesSupported {
-				sess := a.getSession(sid)
-				text, parts, ferr := dispatchViewImage(sess, tc.Function.Arguments)
-				result = text
-				failed = ferr
-				if !ferr {
-					multimodalContent = parts
-				}
-			} else {
-				result, failed = a.executeTool(ctx, sid, tc)
-			}
-			if failed {
+			// runToolCall (tools.go) executes the tool, caches its full output
+			// for view_output, and hands back the model-visible content (the
+			// output truncated past truncateThreshold, or inline image parts).
+			tu, content := a.runToolCall(ctx, sid, tc)
+			res.ToolUses = append(res.ToolUses, tu)
+			if tu.Failed {
 				failedThisRound = true
 			}
-
 			if hasTerminal && tc.Function.Name == termName && !terminalCalled {
 				terminalCalled = true
-				terminalMessage = result
-			}
-			useID := nextToolUseID()
-			tu := ToolUse{
-				ID:         useID,
-				Name:       tc.Function.Name,
-				Input:      tc.Function.Arguments,
-				Output:     result,
-				Failed:     failed,
-				StartedAt:  started,
-				DurationMs: time.Since(started).Milliseconds(),
-			}
-			res.ToolUses = append(res.ToolUses, tu)
-
-			// Save incrementally so tool results survive crashes.
-			if sess := a.getSession(sid); sess != nil {
-				sess.AppendToolUse(tu)
-				_ = sess.Save()
-			}
-			// Shrink the model-visible tool result before it enters the
-			// message stream: anything past truncateThreshold is replaced
-			// with head/tail + a per-tool "to see more" hint. session.toml
-			// still records the full output via tu.Output above — only the
-			// in-flight messages[] that get re-sent every turn shrink. The
-			// hint embeds useID so the model can `view_output id=useID …`
-			// to retrieve any portion of the original without re-running.
-			content := truncateForLLM(useID, tc.Function.Name, tc.Function.Arguments, result)
-			var toolContent any = content
-			if multimodalContent != nil {
-				toolContent = multimodalContent
+				terminalMessage = tu.Output
 			}
 			messages = append(messages, llmMessage{
 				Role:       "tool",
-				Content:    toolContent,
+				Content:    content,
 				ToolCallID: tc.ID,
 			})
 		}
