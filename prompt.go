@@ -34,12 +34,14 @@ import (
 // The phase UI helpers (sendPhase, setStatus, finalizePlan) and the
 // request-level error shaper (failPrompt, stopReasonFor) live here.
 
-// maxReplans caps the number of planner retries per Prompt. The planner
-// has the conversation history (showing what's been tried and what failed)
-// plus the orchestrator's REPLAN note; 10 budget is generous enough that
-// any feasible request resolves within it, while bounding the cost when
-// a request is infeasible.
-const maxReplans = 10
+// maxReplans caps the number of planner retries per Prompt. The planner has
+// the conversation history (showing what's been tried and what failed) plus the
+// orchestrator's REPLAN note. The budget is deliberately generous: the execute
+// loop now caps failed rounds low (executeFailCap) and bounces stuck subtasks
+// here, and replans are the only place web_search/web_read run — so most hard problems
+// resolve across several cheap, web-capable replan rounds rather than one long
+// web-blind execute loop. Still bounds total cost when a request is infeasible.
+const maxReplans = 20
 
 // errUserCancelled flags a deliberate stop initiated by the user (e.g. they
 // chose Abort in a tool-choice prompt). It's NOT an error to surface as a

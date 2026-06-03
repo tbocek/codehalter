@@ -5,10 +5,12 @@ manager is `pacman`; `yay` (or `paru`) wraps it with AUR support and is
 what you almost always want. Arch is rolling, so VERSION_ID is just the
 image build date.
 
-Run as non-root `dev` (sudo NOPASSWD). Prefix `pacman -S`/`-Syu` with
-`sudo`. Read-only probes (`pacman -Q`, `pacman -Qi`, `yay -Ss`) don't
-need it. **`yay` REFUSES to run as root** — call `yay` directly; it
-prompts for sudo when needed. Only `pacman` takes leading `sudo`.
+Run as non-root `dev` (sudo NOPASSWD). To install, call **`yay`
+directly with NO `sudo`** — it elevates itself when needed and in fact
+**REFUSES to run as root**, so `sudo yay` fails. Read-only probes
+(`pacman -Q`, `pacman -Qi`, `yay -Ss`) need no elevation. `sudo pacman`
+is the fallback-only install path (see below); it is NOT how you
+normally install.
 
 ## Probe (only if needed)
 
@@ -27,11 +29,13 @@ carries fresher versions and tools not in official repos. Starting with
 
 - `yay -Ss <pkg>` — search official + AUR.
 - `yay -Si <pkg>` — detailed info.
-- `yay -S --noconfirm <pkg>` — install.
+- `yay -S --noconfirm <pkg>` — install. NO leading `sudo` — yay elevates
+  itself. Do NOT reach for `sudo pacman -S` to install; that is the
+  fallback below, not the default, even though installing needs root.
 - `yay -Syu --noconfirm` — full update (rarely needed here).
 
-If yay isn't on PATH (rare): `pacman -Ss`/`-Si`/`-S --noconfirm` (official
-only, misses AUR).
+If yay isn't on PATH (rare): `sudo pacman -Ss`/`-Si`/`-S --noconfirm`
+(official only, misses AUR).
 
 ## Version staleness
 

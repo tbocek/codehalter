@@ -46,20 +46,25 @@ type planResult struct {
 	ReportOnly bool `json:"report_only"`
 }
 
-// runPlanner appends PLAN.md (plus an optional replanContext on retries) as a
-// fresh user message, runs the planning LLM, persists the JSON response as
-// the trailing assistant turn, and returns the parsed plan. Returns
-// (nil, nil, err) when no LLM is configured. Returns (nil, ...) when there's
-// no PLAN.md, the tool loop fails, or the response can't be parsed even
-// after one corrective retry — callers treat any of those as "no plan,
-// proceed without one".
+// runPlanPhase appends PLAN.md (plus an optional replanContext on retries) as a
+// fresh user message, runs the planning LLM, persists the JSON response as the
+// trailing assistant turn, parses the plan, and resolves any clarification
+// round-trip. It does NOT ask "Execute this plan?" — the orchestrator owns the
+// single confirmation per plan / per replan so the user sees the full subtask
+// list before deciding.
+//
+// Returns (nil, nil, err) when no LLM is configured. Returns (nil, ...) when
+// there's no PLAN.md, the tool loop fails, or the response can't be parsed even
+// after one corrective retry — callers treat any of those as "no plan, proceed
+// without one". errUserCancelled fires when the user aborts on a clarification
+// prompt.
 //
 // replanContext is "" on the first planning pass; on a replan the orchestrator
 // supplies a short note (e.g. "REPLAN: prior attempt failed — see history.
 // Same failure surfaced N times — try a structurally different approach.")
 // The actual failure detail is already in history on the preceding executor
 // response, so we don't repeat it here.
-func (a *agent) runPlanner(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
+func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
 	thinking := a.connForSession(ctx, sid, "thinking")
 	if thinking == nil {
 		return nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
@@ -135,24 +140,8 @@ func (a *agent) runPlanner(ctx context.Context, sid string, replanContext string
 		sess.UpsertLastAssistant(planRes.Text)
 		_ = sess.Save()
 	}
-	return &plan, planRes.ToolUses, nil
-}
 
-// runPlanPhase runs the planner and resolves any clarification round-trip. It
-// does NOT ask "Execute this plan?" — the orchestrator owns the single
-// confirmation per plan / per replan so the user sees the full subtask list
-// before deciding.
-//
-// Returns the parsed plan (may be nil if parsing failed or there is no
-// PLAN.md), the tool uses performed during planning, and an error.
-// errUserCancelled fires when the user aborts on a clarification prompt.
-func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
-	plan, toolUses, err := a.runPlanner(ctx, sid, replanContext)
-	if err != nil || plan == nil {
-		return plan, toolUses, err
-	}
-	sess := a.getSession(sid)
-
+	toolUses := planRes.ToolUses
 	if !plan.Clear && len(plan.Choices) > 0 {
 		question := plan.Question
 		if question == "" {
@@ -179,7 +168,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Understood: " + choice + "\n"}})
 	}
 
-	return plan, toolUses, nil
+	return &plan, toolUses, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +222,7 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		"web_read":     true,
 		"web_read_raw": true,
 	}
-	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", true, 0)
+	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", true, executeFailCap)
 	if sess != nil && res.Text != "" {
 		sess.UpsertLastAssistant(res.Text)
 		_ = sess.Save()
@@ -248,13 +237,29 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		out.Reason = "executor exited without calling respond"
 		return out
 	}
-	// Exit-code authority: typed Failed flags override whatever the model
-	// said in its respond message. Small models routinely declare success
-	// while a run_task call exited non-zero; we trust the tool stream.
-	var failedNames []string
+	// Exit-code authority, last state only: typed Failed flags override
+	// whatever the model claimed in its respond message — small models
+	// routinely declare success while a command exited non-zero, so we trust
+	// the tool stream. But we honour only the LAST invocation of each distinct
+	// call (same tool name + same arguments): a verify command that failed, got
+	// fixed, and then re-ran green leaves an early Failed=true in the history
+	// that must NOT condemn the subtask. Keying on name+input means re-running
+	// the exact same command updates its verdict, while a different command
+	// keeps its own.
+	type callKey struct{ name, input string }
+	lastFailed := map[callKey]bool{}
+	var order []callKey
 	for _, u := range res.ToolUses {
-		if u.Failed {
-			failedNames = append(failedNames, u.Name)
+		k := callKey{u.Name, u.Input}
+		if _, seen := lastFailed[k]; !seen {
+			order = append(order, k)
+		}
+		lastFailed[k] = u.Failed
+	}
+	var failedNames []string
+	for _, k := range order {
+		if lastFailed[k] {
+			failedNames = append(failedNames, k.name)
 		}
 	}
 	if len(failedNames) > 0 {
@@ -339,6 +344,19 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 // and per-name escalation catch the common stuck patterns earlier.
 const maxToolLoopIterations = 100
 
+// executeFailCap is the per-subtask budget of FAILED rounds (iterations whose
+// tool batch produced a failure). Successful work is uncounted, so a long but
+// productive subtask runs unhindered; only one that keeps hitting failures it
+// can't clear burns the budget. A healthy verify-fix cycle costs 1-2 failures
+// (red build → fix → green), so this leaves room for a few bumps before
+// concluding the loop is stuck and bouncing it to a replan — where
+// web_search/web_read and a fresh decomposition are available, unlike this
+// web-blind execute loop. maxToolLoopIterations stays above it as the absolute
+// runaway backstop (and still solely governs the plan/subagent loops, which
+// pass no cap). Small fail budget + larger maxReplans deliberately shifts work
+// from one web-blind loop toward more web-capable replan rounds.
+const executeFailCap = 8
+
 // toolNameEscalateThreshold is how many *redundant* calls to one tool name in a
 // loop trigger a switch from the "execute" role to "thinking" — same server
 // (sampler params don't enter the KV cache key, so the prefix cache stays warm),
@@ -354,8 +372,8 @@ type toolLoopResult struct {
 	ToolUses []ToolUse
 	// RespondCalled is true when the loop exited because the model invoked
 	// the registered terminal tool (typically `respond`). False when the
-	// loop exited via the legacy empty-tool-calls path, hit the soft cap,
-	// or returned an error. Subtask runners use this as the primary
+	// loop exited via the legacy empty-tool-calls path, hit the failed-round
+	// soft cap, or returned an error. Subtask runners use this as the primary
 	// success signal — a loop that ran out of turns without calling
 	// `respond` is a failed subtask regardless of what's in res.Text.
 	RespondCalled bool
@@ -379,10 +397,15 @@ type toolLoopResult struct {
 // the trailing assistant message via MarkLastAssistantTiming, so session.toml
 // records who ran the turn and how much time was generation vs tool execution.
 //
-// softCap is an optional soft iteration ceiling: when > 0 and reached without
-// the terminal tool firing, returns (res, nil) with RespondCalled=false instead
-// of erroring. 0 means only the maxToolLoopIterations backstop applies.
-func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, stream bool, softCap int) (toolLoopResult, error) {
+// failSoftCap is an optional soft ceiling on FAILED rounds — iterations whose
+// tool batch produced at least one failed tool. When > 0 and that count is
+// reached without the terminal tool firing, returns (res, nil) with
+// RespondCalled=false instead of erroring, so a subtask runner bounces to a
+// replan. Counting failures (not total iterations) lets a long-but-productive
+// subtask run freely while a stuck one — one that keeps hitting red builds/tests
+// this web-blind loop can't resolve — exits early. 0 means only the
+// maxToolLoopIterations backstop applies.
+func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
 	// Stream model text/reasoning to the UI unless this is a silent internal
 	// pass (the planner's JSON). nil callbacks are no-ops in the loop below.
 	var on, think func(string)
@@ -439,20 +462,14 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 	// gets one nudge to call it; a second empty list falls through to the legacy
 	// text exit so a model that refuses the terminal can't spin forever.
 	var respondNudged bool
+	// failedRounds counts iterations whose tool batch produced a failure; the
+	// failSoftCap check below bounces the loop once it accumulates too many.
+	var failedRounds int
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			res.Text = allText.String()
 			stampTiming()
 			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
-		}
-		// Soft cap: exit gracefully with RespondCalled=false so the caller
-		// (e.g. the subtask runner) can treat "ran out of turns without
-		// calling respond" as a failure to replan against, rather than as
-		// a hard error.
-		if softCap > 0 && iter >= softCap {
-			res.Text = allText.String()
-			stampTiming()
-			return res, nil
 		}
 		streamStart := time.Now()
 		if res.StartedAt.IsZero() {
@@ -544,6 +561,9 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		// for postmortem) and then exit with the message as res.Text.
 		var terminalCalled bool
 		var terminalMessage string
+		// failedThisRound flips when any tool in this batch returns Failed=true,
+		// feeding the failSoftCap counter once the batch is done.
+		var failedThisRound bool
 
 		for _, tc := range calls {
 			// Subagent sessions don't surface their own UI (Zed doesn't know
@@ -574,6 +594,9 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 				}
 			} else {
 				result, failed = a.executeTool(ctx, sid, tc)
+			}
+			if failed {
+				failedThisRound = true
 			}
 
 			if hasTerminal && tc.Function.Name == termName && !terminalCalled {
@@ -642,6 +665,21 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			res.RespondCalled = true
 			stampTiming()
 			return res, nil
+		}
+
+		// Failed-round soft cap: this non-terminal batch had a tool failure, so
+		// count it. Once a subtask racks up failSoftCap failed rounds it is stuck
+		// on something this web-blind execute loop can't clear; exit gracefully
+		// (RespondCalled=false) so runExecutePhase records a failure to replan
+		// against — replans are where web_search/web_read and a fresh
+		// decomposition become available.
+		if failedThisRound && failSoftCap > 0 {
+			failedRounds++
+			if failedRounds >= failSoftCap {
+				res.Text = allText.String()
+				stampTiming()
+				return res, nil
+			}
 		}
 
 		// If this iteration was flagged as a repeat, append a corrective

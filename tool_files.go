@@ -134,7 +134,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": fmt.Sprintf("Read a text file. Output is truncated to %d lines or %d KB — a truncation note will tell you to re-call with line+limit to continue. Do NOT re-read a file whose contents you already have in this turn's tool history AND which you have not modified since; scroll back instead. A literal-repeat read (same path, same line/limit, file unchanged) is rejected with a pointer to the prior result. Once you call edit_file or write_file on a path, re-reading IS allowed (and expected). Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go) — both are resolved.", defaultReadLines, maxReadBytes/1024),
+			"description": fmt.Sprintf("Read a text file. Output is truncated to %d lines or %d KB — a truncation note will tell you to re-call with line+limit to continue. If instead the output ends with an end-of-file marker, you have the WHOLE file; there is nothing more to read, so do not re-read or shell out to sed/cat for the same content. Do NOT re-read a file whose contents you already have in this turn's tool history AND which you have not modified since; scroll back instead. A literal-repeat read (same path, same line/limit, file unchanged) is rejected with a pointer to the prior result. Once you call edit_file or write_file on a path, re-reading IS allowed (and expected). Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go) — both are resolved.", defaultReadLines, maxReadBytes/1024),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
@@ -241,16 +241,36 @@ func init() {
 		if lineCount > 0 {
 			end = start + lineCount - 1
 		}
+		// When nothing was truncated, the slice ran to EOF — say so explicitly.
+		// Without a positive "this is the whole file" marker a small model can't
+		// tell a complete short file from a truncated one, so it re-reads (hits
+		// dedup), misreads the dedup note as confirmation of truncation, and
+		// eventually escapes read_file for `sed`. The marker stops that loop
+		// before it starts.
+		eofNote := ""
+		if truncNote == "" {
+			if content == "" {
+				eofNote = "[file is empty]"
+			} else {
+				eofNote = fmt.Sprintf("[end of file — line %d is the last line; you have the complete file from line %d, do not re-read]", end, start)
+			}
+		}
+
 		resultTitle := fmt.Sprintf("Reading: %s (%d-%d)", path, start, end)
 		if dedupNote != "" {
 			resultTitle += " (re-read)"
 		}
 		if truncNote != "" {
 			resultTitle += " (truncated)"
+		} else {
+			resultTitle += " (complete)"
 		}
 
 		if truncNote != "" {
 			content += "\n" + truncNote
+		}
+		if eofNote != "" {
+			content += "\n" + eofNote
 		}
 		if dedupNote != "" {
 			content = dedupNote + "\n" + content

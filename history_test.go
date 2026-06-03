@@ -415,7 +415,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 // TestToolLoopRespondExcludedFromJSONPhases verifies that the plan/verify/
 // document filter (excluding respond) keeps the legacy text-only exit: a
 // no-tool-calls turn returns immediately instead of nudging for respond. This
-// is what lets runPlanner parse the assistant text as JSON.
+// is what lets runPlanPhase parse the assistant text as JSON.
 func TestToolLoopRespondExcludedFromJSONPhases(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText(`{"clear": true, "steps": ["do x"]}`),

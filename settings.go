@@ -175,8 +175,17 @@ func loadGlobalSettings() (Settings, error) {
 
 func decodeSettings(path string) (Settings, error) {
 	var s Settings
-	if _, err := toml.DecodeFile(path, &s); err != nil {
+	md, err := toml.DecodeFile(path, &s)
+	if err != nil {
 		return s, fmt.Errorf("loading %s: %w", path, err)
+	}
+	// BurntSushi silently drops keys that don't map to a struct field, so a
+	// typo like `url = ...` (the field is `server`) leaves Server empty and the
+	// LLM probe later fails with an opaque `unsupported protocol scheme ""`.
+	// Surface every unmatched key here so the misconfiguration is named at load
+	// time instead of misdiagnosed three layers down.
+	for _, key := range md.Undecoded() {
+		slog.Warn("unknown settings key (ignored — check for a typo)", "key", key.String(), "file", path)
 	}
 	s.path = path
 	return s, nil
