@@ -281,7 +281,6 @@ type Session struct {
 	// compressHistory's read.
 	lastTokensMu             sync.Mutex
 	lastCompletePromptTokens int
-
 }
 
 // SetLastCompletePromptTokens records the server-reported prompt_tokens for
@@ -615,9 +614,31 @@ func (s *Session) UpsertLastAssistant(content string) {
 	s.Messages = append(s.Messages, Message{Role: "assistant", Content: content, StartedAt: time.Now()})
 }
 
+// appendAssistantNote concatenates a short note (e.g. "Understood: A",
+// "User declined execution") onto the trailing assistant message instead of
+// creating a fresh assistant turn. Two consecutive assistant messages would
+// break strict role alternation; UpsertLastAssistant overwrites in place,
+// preserving the planner's JSON content plus any prior tool uses.
+func appendAssistantNote(sess *Session, note string) {
+	if sess == nil || note == "" {
+		return
+	}
+	sess.mu.Lock()
+	var existing string
+	if len(sess.Messages) > 0 && sess.Messages[len(sess.Messages)-1].Role == "assistant" {
+		existing = sess.Messages[len(sess.Messages)-1].Content
+	}
+	sess.mu.Unlock()
+	if existing != "" {
+		sess.UpsertLastAssistant(existing + "\n\n" + note)
+	} else {
+		sess.UpsertLastAssistant(note)
+	}
+}
+
 // MarkLastAssistantTiming stamps timing and phase onto the trailing assistant
 // message, creating one if no assistant turn is currently the latest entry.
-// Used by runToolLoopOn at the end of an assistant turn so the .toml records
+// Used by runToolLoop at the end of an assistant turn so the .toml records
 // when generation started, how much wall-clock the LLM calls took, and which
 // phase produced the turn. started.IsZero() preserves any existing stamp
 // (idempotent — repeated calls with a zero start time don't clobber).

@@ -343,7 +343,7 @@ func (a *agent) finalizePlan(sid string) {
 // failPrompt records a fatal error in the session and returns it so the ACP
 // dispatcher emits a JSON-RPC error response — Zed renders that as a red
 // error box in the chat. Use only for failures that abort the prompt
-// (LLM auth / out-of-credits / planAndAsk crash). Pass any tool uses
+// (LLM auth / out-of-credits / runPlanPhase crash). Pass any tool uses
 // captured before the failure so they're preserved in history. Recoverable
 // warnings should keep using sendUpdate with a "⚠ ..." chunk.
 func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptResponse, error) {
@@ -606,7 +606,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	sess := a.getSession(sid)
 
 	a.sendPhase(ctx, sid, 0, false)
-	plan, firstToolUses, err := a.planAndAsk(ctx, sid, "")
+	plan, firstToolUses, err := a.runPlanPhase(ctx, sid, "")
 	if err != nil {
 		if isCancelled(err) {
 			return toolLoopResult{}, err
@@ -623,7 +623,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	}
 	if len(plan.Subtasks) == 0 {
 		// Clarification path: planner asked a question via clear=false +
-		// choices, planAndAsk resolved it; if subtasks still empty, the
+		// choices, runPlanPhase resolved it; if subtasks still empty, the
 		// user's pick implied "no work needed".
 		return toolLoopResult{}, nil
 	}
@@ -645,7 +645,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			a.sendPhase(ctx, sid, 1, false)
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(plan.Subtasks), st.Description)}})
 
-			outcome := a.runSubtaskLoop(ctx, sid, st, i, len(plan.Subtasks))
+			outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 			lastResult = outcome.Result
 
 			if sess != nil && outcome.Result.Text != "" {
@@ -691,7 +691,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		}
 
 		a.sendPhase(ctx, sid, 0, false)
-		newPlan, _, err := a.planAndAsk(ctx, sid, replanCtx)
+		newPlan, _, err := a.runPlanPhase(ctx, sid, replanCtx)
 		if err != nil {
 			if isCancelled(err) {
 				return lastResult, err
@@ -713,10 +713,10 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	// to a non-foreground LLM entry internally so llm[0]'s prefix cache
 	// isn't evicted by a one-shot README update.
 	a.sendPhase(ctx, sid, 2, false)
-	// document logs its own failures at Warn and always returns (exec, nil) —
+	// runDocumentPhase logs its own failures at Warn and always returns (exec, nil) —
 	// a failed README update must not fail the whole turn — so the discarded
 	// error is intentional and never non-nil, not a silent swallow.
-	lastResult, _ = a.document(ctx, sid, lastResult)
+	lastResult, _ = a.runDocumentPhase(ctx, sid, lastResult)
 	a.sendPhase(ctx, sid, 2, true)
 
 	return lastResult, nil
@@ -736,7 +736,15 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 	if plan.ReportOnly {
 		header = "Findings:"
 	}
-	a.renderSubtasks(ctx, sid, plan.Subtasks, header)
+	// Render the planned subtask list (header + numbered descriptions).
+	if len(plan.Subtasks) > 0 {
+		var planText strings.Builder
+		planText.WriteString(header + "\n")
+		for i, st := range plan.Subtasks {
+			fmt.Fprintf(&planText, "%d. %s\n", i+1, st.Description)
+		}
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: planText.String()}})
+	}
 
 	if plan.ReportOnly {
 		return nil

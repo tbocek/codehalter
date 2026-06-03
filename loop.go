@@ -46,7 +46,7 @@ type planResult struct {
 	ReportOnly bool `json:"report_only"`
 }
 
-// runPlanLLM appends PLAN.md (plus an optional replanContext on retries) as a
+// runPlanner appends PLAN.md (plus an optional replanContext on retries) as a
 // fresh user message, runs the planning LLM, persists the JSON response as
 // the trailing assistant turn, and returns the parsed plan. Returns
 // (nil, nil, err) when no LLM is configured. Returns (nil, ...) when there's
@@ -59,7 +59,7 @@ type planResult struct {
 // Same failure surfaced N times — try a structurally different approach.")
 // The actual failure detail is already in history on the preceding executor
 // response, so we don't repeat it here.
-func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
+func (a *agent) runPlanner(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
 	thinking := a.connForSession(ctx, sid, "thinking")
 	if thinking == nil {
 		return nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
@@ -101,16 +101,14 @@ func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string
 		"launch_subagent": true,
 	}}
 
-	// Run the tool loop, then parse its JSON reply. Text never streams to the
-	// UI (JSON is internal machinery — orchestrate renders the parsed plan via
-	// renderSteps); tool calls still surface as cards so the user sees what the
-	// planner probes. On a parse failure — small models routinely wrap JSON in
-	// prose — send one corrective follow-up and retry before giving up. The
-	// returned ToolUses always merge both passes so the caller keeps full
-	// visibility.
+	// Run the tool loop (stream=false: the JSON reply is internal machinery —
+	// confirmPlan renders it to the user as a subtask list, it isn't streamed),
+	// then parse it. Tool calls still surface as cards so the user sees what the
+	// planner probes. Small models routinely wrap JSON in prose, so on a parse
+	// failure send one corrective follow-up and retry before giving up; the
+	// returned ToolUses merge both passes so the caller keeps full visibility.
 	var plan planResult
-	noop := func(string) {}
-	planRes, err := a.runToolLoopOn(ctx, sid, thinking, messages, filter, "plan", noop, nil, 0)
+	planRes, err := a.runToolLoop(ctx, sid, thinking, messages, filter, "plan", false, 0)
 	if err != nil {
 		return nil, planRes.ToolUses, err
 	}
@@ -121,7 +119,7 @@ func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string
 			llmMessage{Role: "assistant", Content: planRes.Text},
 			llmMessage{Role: "user", Content: "Your previous reply was not valid JSON. Reply with ONLY the JSON object — first character `{`, last character `}`, nothing before or after. No prose, no markdown fences."},
 		)
-		retry, retryErr := a.runToolLoopOn(ctx, sid, thinking, fixMsgs, filter, "plan", noop, nil, 0)
+		retry, retryErr := a.runToolLoop(ctx, sid, thinking, fixMsgs, filter, "plan", false, 0)
 		planRes.Text = retry.Text
 		planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
 		planRes.DurationMs += retry.DurationMs
@@ -140,47 +138,7 @@ func (a *agent) runPlanLLM(ctx context.Context, sid string, replanContext string
 	return &plan, planRes.ToolUses, nil
 }
 
-// renderSubtasks shows the planned subtask list to the user and returns the
-// rendered text so the caller can fold it into the session transcript on
-// cancel. header is the section heading ("Plan:" for actionable plans,
-// "Findings:" for report-only plans where every subtask just relays
-// information).
-func (a *agent) renderSubtasks(ctx context.Context, sid string, subs []subtask, header string) string {
-	if len(subs) == 0 {
-		return ""
-	}
-	var planText strings.Builder
-	planText.WriteString(header + "\n")
-	for i, st := range subs {
-		fmt.Fprintf(&planText, "%d. %s\n", i+1, st.Description)
-	}
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: planText.String()}})
-	return planText.String()
-}
-
-// appendAssistantNote concatenates a short note (e.g. "Understood: A",
-// "User declined execution") onto the trailing assistant message instead of
-// creating a fresh assistant turn. Two consecutive assistant messages would
-// break strict role alternation; UpsertLastAssistant overwrites in place,
-// preserving the planner's JSON content plus any prior tool uses.
-func appendAssistantNote(sess *Session, note string) {
-	if sess == nil || note == "" {
-		return
-	}
-	sess.mu.Lock()
-	var existing string
-	if len(sess.Messages) > 0 && sess.Messages[len(sess.Messages)-1].Role == "assistant" {
-		existing = sess.Messages[len(sess.Messages)-1].Content
-	}
-	sess.mu.Unlock()
-	if existing != "" {
-		sess.UpsertLastAssistant(existing + "\n\n" + note)
-	} else {
-		sess.UpsertLastAssistant(note)
-	}
-}
-
-// planAndAsk runs the planner and resolves any clarification round-trip. It
+// runPlanPhase runs the planner and resolves any clarification round-trip. It
 // does NOT ask "Execute this plan?" — the orchestrator owns the single
 // confirmation per plan / per replan so the user sees the full subtask list
 // before deciding.
@@ -188,8 +146,8 @@ func appendAssistantNote(sess *Session, note string) {
 // Returns the parsed plan (may be nil if parsing failed or there is no
 // PLAN.md), the tool uses performed during planning, and an error.
 // errUserCancelled fires when the user aborts on a clarification prompt.
-func (a *agent) planAndAsk(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
-	plan, toolUses, err := a.runPlanLLM(ctx, sid, replanContext)
+func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
+	plan, toolUses, err := a.runPlanner(ctx, sid, replanContext)
 	if err != nil || plan == nil {
 		return plan, toolUses, err
 	}
@@ -228,7 +186,7 @@ func (a *agent) planAndAsk(ctx context.Context, sid string, replanContext string
 // Subtask loop: one bounded tool-calling pass that self-verifies
 // ---------------------------------------------------------------------------
 
-// subtaskOutcome captures what runSubtaskLoop produced. Success is true only
+// subtaskOutcome captures what runExecutePhase produced. Success is true only
 // when the model called respond AND no tool in the loop returned Failed=true.
 // Reason summarises why a failed subtask failed — it feeds the orchestrator's
 // replan context and the Jaccard duplicate-failure check.
@@ -238,12 +196,12 @@ type subtaskOutcome struct {
 	Reason  string
 }
 
-// runSubtaskLoop runs one subtask as a single tool-calling loop. EXECUTE.md
+// runExecutePhase runs one subtask as a single tool-calling loop. EXECUTE.md
 // plus the subtask description and verify recipe open the loop; the
 // executor runs with all execute tools (web tools excluded — those live in
 // planning). The executor self-verifies via the recipe before calling
 // respond. Bounded only by the hard maxToolLoopIterations backstop in this file.
-func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx, total int) subtaskOutcome {
+func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx, total int) subtaskOutcome {
 	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
 	sess := a.getSession(sid)
 
@@ -275,7 +233,7 @@ func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx,
 		"web_read":     true,
 		"web_read_raw": true,
 	}
-	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", 0)
+	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", true, 0)
 	if sess != nil && res.Text != "" {
 		sess.UpsertLastAssistant(res.Text)
 		_ = sess.Save()
@@ -311,14 +269,14 @@ func (a *agent) runSubtaskLoop(ctx context.Context, sid string, st subtask, idx,
 // Document phase (runs once at end of a successful prompt)
 // ---------------------------------------------------------------------------
 
-// document runs after every subtask in the prompt has succeeded. It routes
-// to a non-foreground LLM entry (falling back to llm[0] on single-LLM
+// runDocumentPhase runs after every subtask in the prompt has succeeded. It
+// routes to a non-foreground LLM entry (falling back to llm[0] on single-LLM
 // setups) with a minimal stateless input: DOCUMENT.md as the instructions,
 // plus the per-turn shadow notes and earlier-conversation summary as the
 // only context. No system prompt, no conversation history — llm[0]'s prefix
 // cache stays warm and the documenter sees a small focused message.
 // DOCUMENT.md self-skips when no documentation update is warranted.
-func (a *agent) document(ctx context.Context, sid string, exec toolLoopResult) (toolLoopResult, error) {
+func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopResult) (toolLoopResult, error) {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
 	if docPrompt == "" {
 		return exec, nil
@@ -361,7 +319,7 @@ func (a *agent) document(ctx context.Context, sid string, exec toolLoopResult) (
 	}
 
 	messages := []llmMessage{{Role: "user", Content: userMsg}}
-	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "document", 0)
+	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "document", true, 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil
@@ -374,153 +332,23 @@ func (a *agent) document(ctx context.Context, sid string, exec toolLoopResult) (
 	return exec, nil
 }
 
-// ---------------------------------------------------------------------------
-// Jaccard duplicate-failure detection (orchestrator-side)
-// ---------------------------------------------------------------------------
-
-// failureSimilarityThreshold is the Jaccard ratio above which two failed-
-// subtask reason bags are considered "the same problem." Tuned empirically
-// for short LLM-generated strings: 0.6 catches "missing import" /
-// "import is missing" (Jaccard 0.67) without collapsing genuinely different
-// files. The orchestrator uses this to escalate the replan context — same
-// failure recurring N times tells the planner the prior fix didn't work
-// and a structurally different approach is needed.
-const failureSimilarityThreshold = 0.6
-
-// issueBag tokenises a list of issue strings into a single set of distinct
-// lowercase alphanumeric words. Punctuation, casing and ordering are all
-// discarded so two attempts reporting the same root cause in different
-// phrasing collapse to comparable bags.
-func issueBag(issues []string) map[string]bool {
-	bag := make(map[string]bool)
-	var cur strings.Builder
-	flush := func() {
-		if cur.Len() > 0 {
-			bag[cur.String()] = true
-			cur.Reset()
-		}
-	}
-	for _, iss := range issues {
-		for _, r := range strings.ToLower(iss) {
-			switch {
-			case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
-				cur.WriteRune(r)
-			default:
-				flush()
-			}
-		}
-		flush()
-	}
-	return bag
-}
-
-// jaccard returns |A ∩ B| / |A ∪ B| for two word sets. 1.0 = identical,
-// 0.0 = disjoint. Two empty bags are treated as identical.
-func jaccard(a, b map[string]bool) float64 {
-	if len(a) == 0 && len(b) == 0 {
-		return 1
-	}
-	inter := 0
-	for w := range a {
-		if b[w] {
-			inter++
-		}
-	}
-	union := len(a) + len(b) - inter
-	if union == 0 {
-		return 0
-	}
-	return float64(inter) / float64(union)
-}
-
-// trimJSON extracts a JSON object from an LLM response. Small models often
-// wrap the JSON in prose ("Sure, here's the JSON: { … } Let me know!") or
-// markdown fences; we just locate the first `{` and the matching `}` and
-// keep that slice. Brace counting respects strings + escapes so braces inside
-// string values don't confuse the scan. Returns the trimmed input unchanged
-// if no balanced object is found — caller surfaces the parse error.
-func trimJSON(s string) string {
-	s = strings.TrimSpace(s)
-	start := strings.IndexByte(s, '{')
-	if start < 0 {
-		return s
-	}
-	depth := 0
-	inStr := false
-	esc := false
-	for i := start; i < len(s); i++ {
-		c := s[i]
-		if inStr {
-			switch {
-			case esc:
-				esc = false
-			case c == '\\':
-				esc = true
-			case c == '"':
-				inStr = false
-			}
-			continue
-		}
-		switch c {
-		case '"':
-			inStr = true
-		case '{':
-			depth++
-		case '}':
-			depth--
-			if depth == 0 {
-				return s[start : i+1]
-			}
-		}
-	}
-	return s
-}
-
-// maxToolLoopIterations bounds runToolLoop so a model that keeps producing
-// "different enough" tool calls (e.g. path variations to dodge perceived
-// repetition) can't spin forever. One iteration is one LLM round-trip; a
-// complex execute pass is usually 10-20, so 100 leaves comfortable headroom
-// for unusually long but legitimate runs while still bailing on genuine
-// runaways. The signature nudge and per-name escalation above catch the
-// common stuck patterns earlier, so this cap is the last-resort backstop.
+// maxToolLoopIterations is runToolLoop's hard runaway backstop: a model
+// emitting "different enough" tool calls forever can't spin past it. One
+// iteration is one LLM round-trip; a complex execute pass is usually 10-20, so
+// 100 leaves headroom while still bailing genuine runaways. The signature nudge
+// and per-name escalation catch the common stuck patterns earlier.
 const maxToolLoopIterations = 100
 
-// toolNameEscalateThreshold is the number of *redundant* calls to a single
-// tool name in one loop after which the connection switches from the
-// "execute" role to "thinking". Same server (so the KV prefix cache stays
-// warm — sampler params never enter the cache key), warmer sampler. A call
-// is redundant when its (name, arguments) pair has already been seen this
-// loop; legitimate fan-out across distinct files/queries (e.g. surveying
-// every go.mod in a multi-module repo) does NOT count, so broad read
-// passes no longer trip the escalation. Complementary to the signature-
-// based nudge above: that one catches byte-for-byte consecutive repeats,
-// this one catches interleaved revisits to the same args. One-shot per
-// loop.
+// toolNameEscalateThreshold is how many *redundant* calls to one tool name in a
+// loop trigger a switch from the "execute" role to "thinking" — same server
+// (sampler params don't enter the KV cache key, so the prefix cache stays warm),
+// warmer sampler. A call is redundant only when its (name, arguments) pair was
+// already seen this loop, so legitimate fan-out across distinct files doesn't
+// count. Complements the signature nudge (byte-for-byte consecutive repeats);
+// this catches interleaved revisits. One-shot per loop.
 const toolNameEscalateThreshold = 5
 
-// toolCallSig produces a stable signature for the tool calls emitted in one
-// iteration: byte-for-byte name + arguments, joined when there's more than
-// one. Used to spot tight repetition where the model keeps re-running the
-// same call (same `grep`, same `read_file`) without doing anything with the
-// result — the most common pathology when small models get stuck.
-func toolCallSig(calls []toolCall) string {
-	if len(calls) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	for i, c := range calls {
-		if i > 0 {
-			b.WriteByte('|')
-		}
-		b.WriteString(c.Function.Name)
-		b.WriteByte('(')
-		b.WriteString(c.Function.Arguments)
-		b.WriteByte(')')
-	}
-	return b.String()
-}
-
-// toolLoopResult is what an agentic tool loop (runToolLoopOn) returns.
+// toolLoopResult is what an agentic tool loop (runToolLoop) returns.
 type toolLoopResult struct {
 	Text     string
 	ToolUses []ToolUse
@@ -543,43 +371,33 @@ type toolLoopResult struct {
 	Phase      string
 }
 
-// runToolLoop runs the agentic tool loop with the default token-streaming
-// callback so the user sees execute / document phases live. The internal
-// JSON phases (planner) call runToolLoopOn directly with a no-op. softCap
-// is the per-call soft iteration cap (0 = use the maxToolLoopIterations
-// hard backstop only); when the soft cap is hit, the loop exits gracefully
-// with RespondCalled=false so the caller can treat it as a failed turn.
-func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, softCap int) (toolLoopResult, error) {
-	on := func(token string) {
-		if sid != "" {
+// runToolLoop is the core agentic tool loop: send to LLM, execute tool calls,
+// repeat. When stream is true the model's text/reasoning tokens are forwarded to
+// the UI live (execute / document phases); the planner's internal JSON pass
+// passes false so its tokens stay silent. The phase tag ("plan"/"execute"/
+// "document"/"subagent") and cumulative llmStream wall-clock are stamped onto
+// the trailing assistant message via MarkLastAssistantTiming, so session.toml
+// records who ran the turn and how much time was generation vs tool execution.
+//
+// softCap is an optional soft iteration ceiling: when > 0 and reached without
+// the terminal tool firing, returns (res, nil) with RespondCalled=false instead
+// of erroring. 0 means only the maxToolLoopIterations backstop applies.
+func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, stream bool, softCap int) (toolLoopResult, error) {
+	// Stream model text/reasoning to the UI unless this is a silent internal
+	// pass (the planner's JSON). nil callbacks are no-ops in the loop below.
+	var on, think func(string)
+	if stream && sid != "" {
+		on = func(token string) {
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: token}})
 		}
-	}
-	think := func(token string) {
-		if sid != "" {
+		think = func(token string) {
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: token}})
 		}
 	}
-	return a.runToolLoopOn(ctx, sid, conn, messages, filter, phase, on, think, softCap)
-}
-
-// runToolLoopOn is the core agentic tool loop: send to LLM, execute tool
-// calls, repeat. Callers supply the per-token callback (default streaming
-// for runToolLoop, no-op for the planner's JSON pass in runPlanLLM). The phase string ("plan",
-// "execute", "document", "subagent") flows onto the trailing assistant
-// message via MarkLastAssistantTiming together with the cumulative
-// llmStream wall-clock — so session.toml records who ran the turn and how
-// much of its time was model generation vs tool execution.
-//
-// softCap is an optional per-call soft iteration ceiling. When > 0 and the
-// loop reaches it without the terminal tool firing, the function returns
-// (res, nil) with RespondCalled=false instead of erroring. 0 means "no
-// soft cap — only the maxToolLoopIterations runaway backstop applies".
-func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, on, think func(string), softCap int) (toolLoopResult, error) {
 	tools := llmToolDefinitionsFiltered(filter)
 
 	// termName is the registered Terminal tool exposed in this phase ("" when
-	// none — e.g. plan/verify/document filter respond out). When non-empty,
+	// none — e.g. plan/document filter respond out). When non-empty,
 	// the empty-tool-calls branch below stops meaning "model finished" and
 	// starts meaning "model dropped out of tool-calling grammar" — see the
 	// nudge + fallback there.
@@ -610,24 +428,16 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 	var lastSig string
 	var sameSigCount int
 	var nudged bool
-	// Per-name cumulative counts across the whole loop. When any single tool
-	// name crosses toolNameEscalateThreshold we swap conn to the "thinking"
-	// role on the same server (sampler-only change; KV prefix cache key is
-	// derived from prompt tokens, not sampler params, so the cache stays
-	// warm). One-shot per loop — if the warmer sampler doesn't help, the
-	// signature nudge / 50-iter cap will still bail us out.
+	// Per-name redundant-call counts; crossing toolNameEscalateThreshold swaps
+	// conn to the "thinking" role (see the const). toolArgSeen[name] tracks which
+	// argument strings have already been seen, so only genuine revisits count as
+	// redundant — fan-out across distinct files doesn't. One-shot per loop.
 	toolNameCounts := map[string]int{}
-	// toolArgSeen[name] is the set of (already-seen) argument strings for a
-	// given tool name. The per-name escalation only counts a call as
-	// redundant when its args have been seen before — fan-out across
-	// distinct files (e.g. read_file on go.mod, examples/go.mod, …) doesn't
-	// trip the escalation; only genuine revisits do.
 	toolArgSeen := map[string]map[string]bool{}
 	var escalated bool
-	// respondNudged: when respondEnabled and the model returns an empty tool
-	// call list, we nudge once to call respond. If the next turn still has no
-	// tool calls we fall through to the legacy text-only exit so the loop
-	// can't spin forever on a model that refuses the synthetic terminal.
+	// respondNudged: with a terminal tool (hasTerminal), an empty tool-call list
+	// gets one nudge to call it; a second empty list falls through to the legacy
+	// text exit so a model that refuses the terminal can't spin forever.
 	var respondNudged bool
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
@@ -680,7 +490,20 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 			return res, nil
 		}
 
-		sig := toolCallSig(calls)
+		// Signature of this iteration's calls: byte-for-byte name(args), joined
+		// by "|". Identical consecutive signatures are the tight-repetition
+		// pathology (same grep / read_file re-run without acting on the result).
+		var sigB strings.Builder
+		for i, c := range calls {
+			if i > 0 {
+				sigB.WriteByte('|')
+			}
+			sigB.WriteString(c.Function.Name)
+			sigB.WriteByte('(')
+			sigB.WriteString(c.Function.Arguments)
+			sigB.WriteByte(')')
+		}
+		sig := sigB.String()
 		if sig != "" && sig == lastSig {
 			sameSigCount++
 		} else {
@@ -689,10 +512,8 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 		}
 		lastSig = sig
 
-		// Third identical call after a nudge → give up. The model had its
-		// recovery chance and didn't take it; further iterations will burn
-		// the same time. Surfaces as a clean error rather than waiting for
-		// the 50-iter cap.
+		// Third identical call after a nudge → give up: the model had its
+		// recovery chance. A clean error beats waiting for the iteration cap.
 		if sameSigCount >= 3 && nudged {
 			res.Text = allText.String()
 			stampTiming()

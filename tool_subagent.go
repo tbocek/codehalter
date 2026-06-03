@@ -340,7 +340,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 		exclude["launch_subagent"] = true
 	}
 
-	result, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "subagent", 0)
+	result, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "subagent", true, 0)
 	if err != nil {
 		return result.Text, err
 	}
@@ -373,7 +373,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 // warmth on LLM[0] is sacrificed for clarity; if it becomes a problem we can
 // revisit by copying parent messages.
 //
-// User-facing prompts inside planAndAsk (clarification choices) auto-confirm
+// User-facing prompts inside runPlanPhase (clarification choices) auto-confirm
 // because shouldAutoAnswer returns true for any session with Depth > 0 (see
 // tool_ask.go). The orchestrator's "Execute / Automatic / Cancel" gate is
 // skipped here — subagents are dispatched by the parent and never gate on
@@ -396,7 +396,7 @@ func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task 
 	subSess.AddUser(instructions)
 	_ = subSess.Save()
 
-	plan, _, err := a.planAndAsk(ctx, sid, "")
+	plan, _, err := a.runPlanPhase(ctx, sid, "")
 	if err != nil {
 		return "", err
 	}
@@ -406,7 +406,7 @@ func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task 
 
 	var last toolLoopResult
 	for i, st := range plan.Subtasks {
-		outcome := a.runSubtaskLoop(ctx, sid, st, i, len(plan.Subtasks))
+		outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 		last = outcome.Result
 		if !outcome.Success {
 			return last.Text, fmt.Errorf("subtask %d/%d failed: %s", i+1, len(plan.Subtasks), outcome.Reason)

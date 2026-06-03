@@ -73,7 +73,7 @@ type Tool struct {
 }
 
 // terminalToolName returns the name of the first registered tool with
-// Terminal=true that is NOT in the exclude filter. Used by runToolLoopOn to
+// Terminal=true that is NOT in the exclude filter. Used by runToolLoop to
 // decide whether the synthetic-respond exit applies for this phase: plan,
 // verify, and document exclude the respond tool because they parse JSON
 // output, so for those filters this returns "" and the loop falls back to the

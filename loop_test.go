@@ -9,7 +9,7 @@ import (
 // TestPlanResultSubtasksDeserialize ensures the planner's JSON output (an
 // array of `{description, verify}` objects under `subtasks`) round-trips into
 // the planResult / subtask structs the orchestrator consumes. This is the
-// contract between PLAN.md and runSubtaskLoop.
+// contract between PLAN.md and runExecutePhase.
 func TestPlanResultSubtasksDeserialize(t *testing.T) {
 	raw := `{
 		"clear": true,

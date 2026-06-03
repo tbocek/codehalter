@@ -321,7 +321,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "please echo hello"}}, toolFilter{}, "execute", 0)
+		[]llmMessage{{Role: "user", Content: "please echo hello"}}, toolFilter{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "answer me"}}, toolFilter{}, "execute", 0)
+		[]llmMessage{{Role: "user", Content: "answer me"}}, toolFilter{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 // TestToolLoopRespondExcludedFromJSONPhases verifies that the plan/verify/
 // document filter (excluding respond) keeps the legacy text-only exit: a
 // no-tool-calls turn returns immediately instead of nudging for respond. This
-// is what lets runPlanLLM parse the assistant text as JSON.
+// is what lets runPlanner parse the assistant text as JSON.
 func TestToolLoopRespondExcludedFromJSONPhases(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText(`{"clear": true, "steps": ["do x"]}`),
@@ -436,7 +436,7 @@ func TestToolLoopRespondExcludedFromJSONPhases(t *testing.T) {
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "plan something"}},
-		toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", 0)
+		toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -497,7 +497,7 @@ func TestToolLoopNoDedup(t *testing.T) {
 
 	a, s := newTestAgent(t)
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -549,7 +549,7 @@ func TestToolLoopRepeatNudgeAndBail(t *testing.T) {
 
 	a, s := newTestAgent(t)
 	_, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
 	if err == nil {
 		t.Fatalf("runToolLoop: want error, got nil")
 	}
@@ -633,7 +633,7 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		t.Fatalf("connForSession(execute) returned nil")
 	}
 	_, err := a.runToolLoop(context.Background(), s.ID, conn,
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -714,7 +714,7 @@ func TestToolLoopEscalatesOnRepeatedArgs(t *testing.T) {
 		t.Fatalf("connForSession(execute) returned nil")
 	}
 	_, err := a.runToolLoop(context.Background(), s.ID, conn,
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", 0)
+		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}

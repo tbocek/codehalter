@@ -11,7 +11,7 @@ import (
 // store is content-addressed at <cwd>/.codehalter/images/<id>.<ext>, so a
 // reference surviving in Summary (after compaction has rotated the owning
 // message out) is enough to fetch the bytes back. Dispatch is special-cased
-// in runToolLoopOn: instead of the usual text Role:"tool" message, the loop
+// in runToolLoop: instead of the usual text Role:"tool" message, the loop
 // appends a multimodal Role:"tool" message whose content is [text, image_url]
 // — that delivers the bytes within the current turn so the next llmStream
 // call sees the image as fresh context (NOT "next turn").
