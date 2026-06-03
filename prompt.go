@@ -211,6 +211,25 @@ func isCancelled(err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
+// cancelReason renders a short human explanation for a cancelled turn so the
+// stop is never silent. errUserCancelled is the in-app Abort/clarification
+// path; a bare context.Canceled means the editor aborted the request (Cancel
+// button, session switch, or — the case that bit us — a client-side request
+// timeout while we were waiting on a busy LLM); DeadlineExceeded is a context
+// deadline (codehalter sets none on the foreground, so it's the client's).
+func cancelReason(err error) string {
+	switch {
+	case errors.Is(err, errUserCancelled):
+		return "you stopped it"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "a deadline was exceeded (client-side timeout)"
+	case errors.Is(err, context.Canceled):
+		return "the editor aborted the request (Cancel button, or a client-side timeout while the LLM was busy)"
+	default:
+		return "cancelled"
+	}
+}
+
 // phaseNames are the pipeline stages; only the current one is shown to the
 // client at a time (the plan UI updates in place as phases progress).
 var phaseNames = []string{"Planning", "Working", "Documenting"}
@@ -541,6 +560,14 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	result, err := a.orchestrate(ctx, req.SessionId)
 	if err != nil {
 		if isCancelled(err) {
+			// Never silent: log the cancellation and tell the user why. Covers
+			// the in-app Abort/Cancel button AND the editor aborting the turn
+			// (e.g. a client-side request-deadline timeout while the LLM was
+			// busy) — the latter used to vanish with no trace at all. Background
+			// ctx for the notice since the request ctx is already cancelled.
+			reason := cancelReason(err)
+			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "reason", reason, "err", err)
+			a.sendUpdate(context.Background(), req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⏹ Turn cancelled — " + reason + ".\n"}})
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, nil)
@@ -686,6 +713,9 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	// to a non-foreground LLM entry internally so llm[0]'s prefix cache
 	// isn't evicted by a one-shot README update.
 	a.sendPhase(ctx, sid, 2, false)
+	// document logs its own failures at Warn and always returns (exec, nil) —
+	// a failed README update must not fail the whole turn — so the discarded
+	// error is intentional and never non-nil, not a silent swallow.
 	lastResult, _ = a.document(ctx, sid, lastResult)
 	a.sendPhase(ctx, sid, 2, true)
 
@@ -873,6 +903,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 
 		out, err := a.llmSimple(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: buf.String()}})
 		if err != nil {
+			slog.Debug("backgroundGitCommit: llm call failed", "sid", sess.ID, "err", err)
 			return
 		}
 
@@ -886,6 +917,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 		path := filepath.Join(sess.Cwd, gitCommitFile)
 		_ = os.MkdirAll(filepath.Dir(path), 0o755)
 		if err := os.WriteFile(path, []byte(strings.TrimSpace(out)+"\n"), 0o644); err != nil {
+			slog.Debug("backgroundGitCommit: writing .git_commit failed", "path", path, "err", err)
 			return
 		}
 		sess.gitCommitMu.Lock()

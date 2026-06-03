@@ -11,8 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,6 +64,25 @@ type sseChunk struct {
 		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"`
 }
+
+// llmHTTPClient is the dedicated client for LLM completion calls. It owns its
+// timeouts instead of inheriting http.DefaultClient/DefaultTransport's, whose
+// defaults bite an LLM workload in surprising ways:
+//   - DefaultTransport.TLSHandshakeTimeout = 10s — a hammered HTTPS endpoint can
+//     be too busy to complete the handshake inside 10s; we lift it to 60s so a
+//     slow-but-alive server isn't killed at exactly 10s.
+//   - No Client.Timeout and ResponseHeaderTimeout left at 0: a long generation,
+//     or a server queuing the request before it answers, is legitimate and must
+//     NOT be capped — cancellation is driven by the request ctx only.
+//
+// The 30s dial timeout (TCP connect) is kept: a connection that can't even be
+// established should fail fast and visibly rather than hang.
+var llmHTTPClient = func() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSHandshakeTimeout = 60 * time.Second
+	t.ResponseHeaderTimeout = 0
+	return &http.Client{Transport: t}
+}()
 
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
 // sid scopes the debug log: req body and raw SSE response are appended to
@@ -190,7 +207,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		httpReq.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := llmHTTPClient.Do(httpReq)
 	if err != nil {
 		if logF != nil {
 			fmt.Fprintf(logF, "[transport error] %v\n", err)
@@ -866,43 +883,6 @@ func toolCallSig(calls []toolCall) string {
 	return b.String()
 }
 
-// failureSkillHint returns a short pointer to SKILL-*.md files relevant to the
-// failed tool, or "" when no skill docs exist or the tool isn't one of the
-// shell-style ones where skills typically apply. Used by runToolLoopOn to nudge
-// small models toward reading the skill docs after a hard failure instead of
-// blindly retrying. Returns paths relative to cwd so the model's read_file
-// call works without further escaping.
-func (a *agent) failureSkillHint(sid string, toolName string) string {
-	// Only fire on tools where a SKILL doc plausibly helps. Edit-failures
-	// usually mean the model passed wrong content, not that it needs a skill.
-	switch toolName {
-	case "run_command", "run_task":
-	default:
-		return ""
-	}
-	sess := a.getSession(sid)
-	if sess == nil {
-		return ""
-	}
-	entries, err := os.ReadDir(filepath.Join(sess.Cwd, ".codehalter"))
-	if err != nil {
-		return ""
-	}
-	var skills []string
-	for _, e := range entries {
-		n := e.Name()
-		if strings.HasPrefix(n, "SKILL-") && strings.HasSuffix(n, ".md") {
-			skills = append(skills, ".codehalter/"+n)
-		}
-	}
-	if len(skills) == 0 {
-		return ""
-	}
-	sort.Strings(skills)
-	return "[Hint: this command failed. The project ships skill docs that cover this kind of failure — read one with read_file before retrying: " +
-		strings.Join(skills, ", ") + "]"
-}
-
 // runToolLoop runs the agentic tool loop with the default token-streaming
 // callback so the user sees execute / document phases live. The internal
 // JSON phases (planner) call runToolLoopOn directly with a no-op. softCap
@@ -1144,17 +1124,6 @@ func (a *agent) runToolLoopOn(ctx context.Context, sid string, conn *LLMConnecti
 			// hint embeds useID so the model can `view_output id=useID …`
 			// to retrieve any portion of the original without re-running.
 			content := truncateForLLM(useID, tc.Function.Name, tc.Function.Arguments, result)
-			// Small models routinely keep retrying a failing run_command
-			// without consulting the SKILL-*.md docs that were loaded into
-			// the system prompt at session start. Re-surface them at the
-			// moment the model would benefit most: right after the failure.
-			// Hint is appended to the live tool result only — not to the
-			// stored ToolUse.Output — so session.toml stays clean.
-			if failed {
-				if hint := a.failureSkillHint(sid, tc.Function.Name); hint != "" {
-					content = content + "\n\n" + hint
-				}
-			}
 			var toolContent any = content
 			if multimodalContent != nil {
 				toolContent = multimodalContent

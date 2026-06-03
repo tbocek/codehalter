@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 )
@@ -130,6 +131,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 
 		out, err := a.llmSimple(ctx, sess.ID, t.Conn, []llmMessage{{Role: "user", Content: buf.String()}})
 		if err != nil {
+			slog.Debug("backgroundSummarise: llm call failed — turn note lost for this pair", "sid", sess.ID, "err", err)
 			return
 		}
 		// Image IDs are structured data — append deterministically so handles

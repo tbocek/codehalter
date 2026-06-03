@@ -381,7 +381,7 @@ func (a *agent) renderLLMStatus() string {
 	case conns[firstReachable].ImageSupport != nil:
 		b.WriteString("Image support: disabled (declared image_support = false in settings.toml)\n\n")
 	default:
-		b.WriteString("🟡 Image support: undetected — codehalter assumed disabled. If your model accepts images, set `image_support = true` on the [[llm]] entry in settings.toml.\n\n")
+		b.WriteString("❕ Image support: undetected — codehalter assumed disabled. If your model accepts images, set `image_support = true` on the [[llm]] entry in settings.toml.\n\n")
 	}
 	switch {
 	case a.mainSlotTokens == 0:
@@ -788,6 +788,13 @@ func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 	sess.AddUser(p.prompt)
 	_ = sess.Save()
 	if _, err := a.orchestrate(ctx, sid); err != nil {
-		slog.Debug("proposeFix: orchestrate returned error", "sid", sid, "err", err)
+		// A cancelled fix dispatch is routine (user stopped it); a real failure
+		// is not — surface it at Warn so a fix that silently never ran is
+		// visible in the log rather than buried at Debug.
+		if isCancelled(err) {
+			slog.Debug("proposeFix: fix dispatch cancelled", "sid", sid, "err", err)
+		} else {
+			slog.Warn("proposeFix: fix dispatch failed", "sid", sid, "err", err)
+		}
 	}
 }

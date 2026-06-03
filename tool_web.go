@@ -265,7 +265,9 @@ func (b *Browser) EvalJS(ctx context.Context, contextID, script string) (string,
 			Value string `json:"value"`
 		} `json:"result"`
 	}
-	json.Unmarshal(result, &evalResult)
+	if err := json.Unmarshal(result, &evalResult); err != nil {
+		return "", fmt.Errorf("parsing browser eval result: %w", err)
+	}
 	return evalResult.Result.Value, nil
 }
 
@@ -411,10 +413,14 @@ func init() {
 		defer browser.Close()
 		searchTab := browser.initialTab
 
-		// Wait for DDG results to render.
+		// Wait for DDG results to render. Per-iteration errors are transient
+		// (page not rendered yet), so we keep polling — but remember the last
+		// one so a consistent failure (browser/JS error) surfaces in the result
+		// instead of being indistinguishable from "DDG returned nothing".
 		var results []ddgResult
+		var extractErr error
 		for i := 0; i < 30; i++ {
-			results, _ = extractDDGResults(ctx, browser, searchTab)
+			results, extractErr = extractDDGResults(ctx, browser, searchTab)
 			if len(results) > 0 {
 				break
 			}
@@ -422,8 +428,12 @@ func init() {
 		}
 		browser.CloseTab(ctx, searchTab)
 		if len(results) == 0 {
-			a.FailToolCall(ctx, sid, tcId, "no search results found")
-			return "error: no search results found", false
+			msg := "no search results found"
+			if extractErr != nil {
+				msg += " (last extraction error: " + extractErr.Error() + ")"
+			}
+			a.FailToolCall(ctx, sid, tcId, msg)
+			return "error: " + msg, false
 		}
 
 		if len(results) > maxWebSearchResults {
