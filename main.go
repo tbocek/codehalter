@@ -437,6 +437,30 @@ func cwdAvailable(cwd string) error {
 	return nil
 }
 
+// usableCwd resolves a workspace root that actually exists in this
+// environment. It prefers the client-supplied cwd, but when that path isn't
+// mounted here (e.g. Zed restoring a thread created under another project's
+// devcontainer — /workspaces/codehalter while the user has since switched to
+// preveltekit) it falls back to the directory the agent process was launched
+// in rather than refusing to start. The substitution is logged for diagnosis
+// in the workspace that is actually open. The bool is true when a fallback was
+// substituted, so the caller can tell the user this is a fresh session rather
+// than a restored one. Returns an error only when neither the requested cwd
+// nor the process cwd is a usable directory.
+func usableCwd(cwd string) (string, bool, error) {
+	if err := cwdAvailable(cwd); err == nil {
+		return cwd, false, nil
+	} else {
+		fallback := cwdOrDefault("")
+		if ferr := cwdAvailable(fallback); ferr != nil {
+			return "", false, err
+		}
+		slog.Info("workspace unavailable; opening a new session under the process cwd",
+			"requested", cwd, "fallback", fallback, "err", err)
+		return fallback, true, nil
+	}
+}
+
 func (a *agent) getSession(id string) *Session {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -650,11 +674,11 @@ func readOSInfo() osInfo {
 }
 
 func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSessionResponse, error) {
-	cwd := cwdOrDefault(req.Cwd)
-	slog.Debug("NewSession: enter", "cwd", cwd)
-	if err := cwdAvailable(cwd); err != nil {
+	cwd, _, err := usableCwd(cwdOrDefault(req.Cwd))
+	if err != nil {
 		return NewSessionResponse{}, err
 	}
+	slog.Debug("NewSession: enter", "cwd", cwd)
 	s, err := newSession(cwd)
 	if err != nil {
 		slog.Debug("NewSession: newSession err", "err", err)
@@ -671,10 +695,18 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 }
 
 func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
-	cwd := cwdOrDefault(req.Cwd)
-	slog.Debug("LoadSession: enter", "cwd", cwd, "sid", req.SessionId)
-	if err := cwdAvailable(cwd); err != nil {
+	requested := cwdOrDefault(req.Cwd)
+	cwd, substituted, err := usableCwd(requested)
+	if err != nil {
 		return LoadSessionResponse{}, err
+	}
+	slog.Debug("LoadSession: enter", "cwd", cwd, "sid", req.SessionId)
+	// The requested workspace isn't mounted here (Zed restored a thread from a
+	// project that no longer exists in this environment), so there was nothing
+	// to restore — tell the user this is a fresh session rather than silently
+	// dropping their old thread's history.
+	if substituted {
+		a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("Started a new session: the workspace this thread was created in (%s) isn't available here, so there was nothing to restore.\n\n", requested)}})
 	}
 	s, err := loadSession(cwd, req.SessionId)
 	if err != nil {
