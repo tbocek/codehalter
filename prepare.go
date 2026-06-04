@@ -30,6 +30,9 @@ type fixProblem struct {
 // stack's required dev tooling is installed. "" means no probe known —
 // checkEnv ignores that stack. One binary per stack by design: gopls
 // stands in for Go because installing it implicitly requires the toolchain.
+// JS/TS has no single PATH-binary probe — its MCP code-intelligence path
+// (lsmcp, see SKILL-ts/js.md) is a project devDep + mcp.toml entry, set up on
+// request rather than auto-offered.
 func stackProbeBinary(stack string) string {
 	switch stack {
 	case "go":

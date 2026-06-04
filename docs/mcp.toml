@@ -60,6 +60,16 @@
 # command = "gopls"
 # args = ["mcp"]
 #
+# lsmcp — TS/JS code intelligence (the gopls analog). First, in the project:
+#   npm add -D @mizchi/lsmcp @typescript/native-preview
+#   npx @mizchi/lsmcp init -p tsgo        # writes .lsmcp/config.json
+# then uncomment. Exposes lsp_get_definitions / lsp_find_references /
+# lsp_get_hover / lsp_get_diagnostics / search_symbols. See SKILL-ts.md.
+# [[server]]
+# name = "lsmcp"
+# command = "npx"
+# args = ["-y", "@mizchi/lsmcp", "-p", "tsgo"]
+#
 # [[server]]
 # name = "fs"
 # command = "npx"
