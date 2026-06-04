@@ -714,13 +714,20 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		if redundantThisRound {
 			redundantFetches++
 			if redundantFetches >= 3 {
+				// Don't hard-error the whole turn over re-reads — exit the loop
+				// cleanly. In execute this surfaces as RespondCalled=false → the
+				// subtask replans; in plan, runPlanPhase salvages what's there. A
+				// scary "An Error Happened" for a re-read loop is worse than letting
+				// the normal failure paths handle it.
 				res.Text = allText.String()
 				stampTiming()
-				return res, fmt.Errorf("tool loop stuck re-fetching content already in context")
+				return res, nil
 			}
 			messages = append(messages, llmMessage{
-				Role:    "user",
-				Content: "You just re-read a file you already have unchanged in this turn's tool history. The same bytes come back every time — it never makes progress. Use the copy you already have. Do not read or search the same unchanged file again; if you have what you need, act on it or finish.",
+				Role: "user",
+				Content: "You just re-read a file already in this turn's tool history — re-reading returns the same bytes, so it makes no progress. " +
+					"If the read was marked PARTIAL and you need more, fetch a specific range with read_file line=<n> limit=<m>, or search_text for the part you want — do NOT re-read the whole file. " +
+					"Otherwise use what you already have and move on.",
 			})
 		}
 

@@ -387,6 +387,13 @@ const (
 	truncateThreshold = 1500
 	truncateHeadChars = 600
 	truncateTailChars = 600
+	// read_file is the planner's window into source. The generic 1500-char cap
+	// (~40 lines) left it blind to most of a file → re-read loops. Give read_file
+	// ~150 lines (~6 KB); bigger files still clip head+tail with a paginate hint.
+	// A bigger window, not an exemption.
+	readTruncateThreshold = 6 * 1024
+	readTruncateHead      = 4 * 1024
+	readTruncateTail      = 2 * 1024
 )
 
 // truncateForLLM returns content unchanged if short; otherwise emits a
@@ -399,12 +406,16 @@ const (
 // what it just asked about. Used by runToolCall on live execution and by
 // history.go when re-rendering stored tool outputs into the message stream.
 func truncateForLLM(useID, toolName, args, content string) string {
-	if len(content) <= truncateThreshold {
+	threshold, headChars, tailChars := truncateThreshold, truncateHeadChars, truncateTailChars
+	if toolName == "read_file" {
+		threshold, headChars, tailChars = readTruncateThreshold, readTruncateHead, readTruncateTail
+	}
+	if len(content) <= threshold {
 		return content
 	}
-	omitted := len(content) - truncateHeadChars - truncateTailChars
-	head := content[:truncateHeadChars]
-	tail := content[len(content)-truncateTailChars:]
+	omitted := len(content) - headChars - tailChars
+	head := content[:headChars]
+	tail := content[len(content)-tailChars:]
 	hint := truncationHint(useID, toolName, args)
 	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", head, omitted, len(content), hint, tail)
 }
