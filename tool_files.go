@@ -263,11 +263,22 @@ func init() {
 		// eventually escapes read_file for `sed`. The marker stops that loop
 		// before it starts.
 		eofNote := ""
-		if truncNote == "" {
-			if content == "" {
-				eofNote = "[file is empty]"
-			} else {
-				eofNote = fmt.Sprintf("[end of file — line %d is the last line; you have the complete file from line %d, do not re-read]", end, start)
+		switch {
+		case truncNote != "":
+			// capReadContent already truncated; its note tells the model to paginate.
+		case content == "":
+			eofNote = "[file is empty]"
+		default:
+			candidate := fmt.Sprintf("[end of file — line %d is the last line; you have the complete file from line %d, do not re-read]", end, start)
+			// Only promise "complete, do not re-read" when the model will ACTUALLY
+			// see the whole file. truncateForLLM (runToolCall) clips any result
+			// past truncateThreshold to head+tail with an "N chars omitted,
+			// paginate with line/limit" hint. If this body will be clipped,
+			// claiming "complete" directly contradicts that hint, and the model
+			// re-reads in confusion — the mcp.toml double-read. When it WILL be
+			// clipped, stay silent and let the paginate hint stand alone.
+			if len(dedupNote)+len(content)+len(candidate)+2 <= truncateThreshold {
+				eofNote = candidate
 			}
 		}
 
