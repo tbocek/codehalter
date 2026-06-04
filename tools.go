@@ -73,15 +73,18 @@ type Tool struct {
 	Terminal bool
 }
 
-// terminalToolName returns the name of the first registered tool with
-// Terminal=true that is NOT in the exclude filter. Used by runToolLoop to
-// decide whether the synthetic-respond exit applies for this phase: plan,
-// verify, and document exclude the respond tool because they parse JSON
-// output, so for those filters this returns "" and the loop falls back to the
-// legacy text exit. Returns "" when no terminal tool is enabled.
+// terminalToolName returns the registered Terminal tool exposed in this phase
+// (not in the exclude filter). There are two terminals: respond (execute /
+// subagent) and submit_plan (plan). respond is the general-purpose one and
+// always wins when both are available, so a phase that filters neither — an
+// unfiltered loop — stays on respond rather than depending on registration
+// order; submit_plan only takes over when respond is excluded (the plan phase
+// excludes it). Returns "" when every terminal is filtered out (document
+// excludes both), so the loop falls back to the legacy empty-tool-calls exit.
 func terminalToolName(f toolFilter) string {
 	registryMu.Lock()
 	defer registryMu.Unlock()
+	first := ""
 	for _, t := range registeredTools {
 		if !t.Terminal {
 			continue
@@ -91,9 +94,14 @@ func terminalToolName(f toolFilter) string {
 		if name == "" || f.exclude[name] {
 			continue
 		}
-		return name
+		if name == respondToolName {
+			return name
+		}
+		if first == "" {
+			first = name
+		}
 	}
-	return ""
+	return first
 }
 
 // registryMu guards registeredTools. Most writes happen at init() (single

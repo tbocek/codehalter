@@ -95,43 +95,59 @@ func runnerProbeBinary(kind string) string {
 // Orchestrator
 // ---------------------------------------------------------------------------
 
-// prepare runs after bootstrap and at the top of every Prompt cycle. It
-// re-verifies that we have a reachable LLM (looping on a Retry card when
-// not), refreshes the per-session environment snapshot (stacks, container,
-// firefox, run_command, per-stack probe binaries), and reconciles
-// .codehalter/mcp.toml. When any of those report a change since the last
-// turn, it emits a single consolidated capabilities banner so the user
-// sees the new state in one block; steady-state turns are silent. Any
-// missing tools / broken MCP entries are then offered as ack-card "fix
-// it for me?" prompts that synthesise a user message and dispatch it
-// through the normal plan/execute/verify/document phases.
-func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
+// prepareChecks runs the pre-turn freshness pass: re-advertise the slash-macro
+// menu, re-verify a reachable LLM (looping on a Retry card when not), refresh
+// the per-session environment snapshot (stacks, container, firefox,
+// run_command, per-stack probe binaries), and reconcile .codehalter/mcp.toml so
+// the turn runs against current config. Each check short-circuits on an
+// unchanged settings hash / env snapshot / mcp.toml mtime, so a steady-state
+// turn pays almost nothing. Returns the missing-tool / broken-MCP problems for
+// drainFixes to offer AFTER the turn — surfacing a fix card here, in front of
+// the user's prompt, would let an accepted card dispatch a whole orchestrate
+// cycle ahead of the request it interrupted.
+func (a *agent) prepareChecks(ctx context.Context, sess *Session, sid string) []fixProblem {
 	if sess == nil {
-		slog.Debug("prepare: nil sess, skipping")
-		return
+		slog.Debug("prepareChecks: nil sess, skipping")
+		return nil
 	}
-	slog.Debug("prepare: start", "sid", sid, "cwd", sess.Cwd)
+	slog.Debug("prepareChecks: start", "sid", sid, "cwd", sess.Cwd)
 	a.sendAvailableCommands(ctx, sid) // re-advertise the slash-macro menu each turn
 	llmChanged := a.ensureLLM(ctx, sess, sid)
 	envChanged, envProblems := a.checkEnv(sess, sid)
 	mcpChanged, mcpProblems := a.checkMCP(ctx, sess, sid)
 	// Full capabilities banner: emit it ONCE per session (the first prepare,
-	// at bootstrap, when state is established). After that, suppress the re-dump
-	// on routine changes — a tool getting installed, an MCP server starting, a
-	// re-probe — those are surfaced as one-line notices (checkMCP) or fix cards
-	// (proposeFix below), not by re-printing the whole setup screen in the
-	// middle of an unrelated turn.
+	// at bootstrap, when state is established — so it never fires mid-session).
+	// After that, suppress the re-dump on routine changes — a tool getting
+	// installed, an MCP server starting, a re-probe — those are surfaced as
+	// one-line notices (checkMCP) or fix cards (drainFixes), not by re-printing
+	// the whole setup screen in the middle of an unrelated turn. It stays here
+	// with the checks because it reads the change flags they produce.
 	if !sess.capabilitiesShown && (llmChanged || envChanged || mcpChanged) {
 		a.notifyCapabilities(ctx, sess, sid)
 		sess.capabilitiesShown = true
 	}
-	for _, p := range append(envProblems, mcpProblems...) {
+	slog.Debug("prepareChecks: done", "sid", sid, "hasLLM", a.hasReachableLLM(), "stacks", sess.knownStacks, "envChanged", envChanged, "mcpChanged", mcpChanged, "llmChanged", llmChanged)
+	return append(envProblems, mcpProblems...)
+}
+
+// drainFixes offers each problem prepareChecks detected as a one-click "fix it
+// for me?" ack card. Runs post-turn so an accepted fix dispatches its synthetic
+// prompt through the normal plan/execute/verify/document phases AFTER the user's
+// actual request, not ahead of it.
+func (a *agent) drainFixes(ctx context.Context, sid string, fixes []fixProblem) {
+	for _, p := range fixes {
 		if ctx.Err() != nil {
 			break
 		}
 		a.proposeFix(ctx, sid, p)
 	}
-	slog.Debug("prepare: done", "sid", sid, "hasLLM", a.hasReachableLLM(), "stacks", sess.knownStacks, "envChanged", envChanged, "mcpChanged", mcpChanged, "llmChanged", llmChanged)
+}
+
+// prepare runs the full pre-flight — checks then fix cards — in one shot. Used
+// at bootstrap, where there is no surrounding turn to split it across; the
+// per-Prompt path calls prepareChecks pre-turn and drainFixes post-turn instead.
+func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
+	a.drainFixes(ctx, sid, a.prepareChecks(ctx, sess, sid))
 }
 
 // ---------------------------------------------------------------------------

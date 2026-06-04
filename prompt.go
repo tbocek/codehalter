@@ -385,11 +385,10 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		slog.Debug("Prompt: indexDone nil, no gate", "sid", req.SessionId)
 	}
 
-	// Capture isFirstMessage and seed sess.SystemPrompt BEFORE prepare runs.
-	// prepare may dispatch proposeFix → AddUser → orchestrator to install a
-	// missing dev tool, which both fills sess.Messages (flipping isFirstMessage)
-	// and triggers an LLM call that needs sess.SystemPrompt to carry the
-	// skills / cwd context.
+	// Capture isFirstMessage and seed sess.SystemPrompt BEFORE the pre-turn
+	// checks run. prepareChecks rebuilds the system prompt (skills / cwd context)
+	// and an LLM call needs it seeded; isFirstMessage is read later for the
+	// empty-project hint.
 	sess := a.getSession(req.SessionId)
 	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
 	if sess != nil && sess.SystemPrompt == "" {
@@ -398,6 +397,17 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			return a.failPrompt(req.SessionId, err, nil)
 		}
 		sess.SystemPrompt = sysPrompt
+	}
+
+	// Pre-turn freshness pass: verify a reachable LLM (looping on a Retry card
+	// if not), refresh the env snapshot, and reconcile mcp.toml so THIS turn
+	// runs against current config — a server or tool added last turn is live
+	// before its work starts. Cheap in steady state (every check short-circuits).
+	// Detected problems are held and offered as fix cards post-turn via
+	// drainFixes, so an accepted card can't jump ahead of the user's request.
+	var pendingFixes []fixProblem
+	if sess != nil {
+		pendingFixes = a.prepareChecks(ctx, sess, req.SessionId)
 	}
 
 	// Clear per-turn read-dedup. Dedup is scoped to a single Prompt() turn
@@ -584,16 +594,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		a.compressHistory(ctx, sess)
 	}
 
-	// Prepare phase runs at the end of every turn so the capabilities banner /
-	// missing-tool fix cards are ready BEFORE the next user prompt arrives.
-	// Bootstrap's first prepare (startIndexing) covers turn #1; this covers
-	// turns #2+. Re-verifies the LLM (loops on a Retry card if unreachable),
-	// refreshes env snapshot + MCP reconcile, emits one consolidated banner
-	// only when something changed. Silent in steady state.
-	slog.Debug("Prompt: about to call prepare (post-turn)", "sid", req.SessionId, "sessNil", sess == nil)
-	if sess != nil {
-		a.prepare(ctx, sess, req.SessionId)
-	}
+	// Offer any fix cards the pre-turn checks detected, now that the user's
+	// actual request has run. The freshness checks themselves moved pre-turn
+	// (prepareChecks above); only the user-facing "fix it for me?" cards run
+	// here so an accepted one can't dispatch its orchestrate cycle ahead of the
+	// request it interrupted.
+	slog.Debug("Prompt: draining pre-turn fix cards (post-turn)", "sid", req.SessionId, "fixes", len(pendingFixes))
+	a.drainFixes(ctx, req.SessionId, pendingFixes)
 
 	return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
 }
@@ -622,9 +629,16 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
 	}
 	if len(plan.Subtasks) == 0 {
-		// Clarification path: planner asked a question via clear=false +
-		// choices, runPlanPhase resolved it; if subtasks still empty, the
-		// user's pick implied "no work needed".
+		// No subtasks means one of two things. (1) The planner answered a pure
+		// lookup directly (report_only): surface that answer — it used to be
+		// silently dropped, leaving the turn blank after "Planning". Returning
+		// it as result.Text also lets Prompt's success epilogue (stats line,
+		// git commit) run. (2) A clarification the user resolved to "no work
+		// needed": no answer prose, so return empty as before.
+		if plan.answer != "" {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: plan.answer + "\n"}})
+			return toolLoopResult{Text: plan.answer}, nil
+		}
 		return toolLoopResult{}, nil
 	}
 

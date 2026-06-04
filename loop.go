@@ -44,6 +44,12 @@ type planResult struct {
 	// subtask only relays findings — no file edits, no commands. When
 	// true the orchestrator skips the "Execute this plan?" confirmation.
 	ReportOnly bool `json:"report_only"`
+	// answer is the planner's user-facing prose when it answered a lookup
+	// directly (report_only with no subtasks). It rides on the struct rather
+	// than the JSON — runPlanPhase sets it from the loop's separate content
+	// channel — so orchestrate can surface it instead of silently dropping a
+	// finished answer. No json tag: it never comes from the model's arguments.
+	answer string
 }
 
 // runPlanPhase appends PLAN.md (plus an optional replanContext on retries) as a
@@ -88,9 +94,10 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		messages = a.buildLLMContext(sess)
 	}
 
-	// Exclude respond: planning emits a JSON object as plain text, so we don't
-	// want the model to escape into the synthetic terminal-tool grammar that
-	// execute uses.
+	// Exclude respond: planning has its OWN terminal tool, submit_plan, whose
+	// arguments are the structured plan. Keeping respond out forces the planner
+	// onto submit_plan instead of escaping into execute's exit and emitting a
+	// free-text answer with no plan attached.
 	// Exclude write_file/edit_file: planning is information-gathering only.
 	// When the planner edits files itself, those edits leak into history and
 	// the executor either repeats them or assumes the work is already done.
@@ -106,39 +113,61 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		"launch_subagent": true,
 	}}
 
-	// Run the tool loop (stream=false: the JSON reply is internal machinery —
-	// confirmPlan renders it to the user as a subtask list, it isn't streamed),
-	// then parse it. Tool calls still surface as cards so the user sees what the
-	// planner probes. Small models routinely wrap JSON in prose, so on a parse
-	// failure send one corrective follow-up and retry before giving up; the
-	// returned ToolUses merge both passes so the caller keeps full visibility.
+	// Run the tool loop (stream=false: planning output is machinery, not shown
+	// live — orchestrate renders the subtask list or surfaces a direct answer).
+	// The planner ends by calling submit_plan, whose arguments ARE the plan, so
+	// planRes.Text is clean JSON and planRes.Content is any user-facing answer
+	// prose — already separated. A model that skips the tool and emits the plan
+	// as free text falls through to the legacy parse + one corrective retry.
+	// Merged ToolUses keep full visibility either way.
 	var plan planResult
 	planRes, err := a.runToolLoop(ctx, sid, thinking, messages, filter, "plan", false, 0)
 	if err != nil {
 		return nil, planRes.ToolUses, err
 	}
-	if err := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan); err != nil {
-		slog.Info("planner JSON parse failed; retrying with corrective", "snippet", truncate(planRes.Text, 200))
+	parseErr := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
+	if parseErr != nil && !planRes.RespondCalled {
+		slog.Info("planner skipped submit_plan and JSON parse failed; retrying with corrective", "snippet", truncate(planRes.Text, 200))
 		fixMsgs := append([]llmMessage(nil), messages...)
 		fixMsgs = append(fixMsgs,
 			llmMessage{Role: "assistant", Content: planRes.Text},
-			llmMessage{Role: "user", Content: "Your previous reply was not valid JSON. Reply with ONLY the JSON object — first character `{`, last character `}`, nothing before or after. No prose, no markdown fences."},
+			llmMessage{Role: "user", Content: "Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."},
 		)
 		retry, retryErr := a.runToolLoop(ctx, sid, thinking, fixMsgs, filter, "plan", false, 0)
 		planRes.Text = retry.Text
+		planRes.Content = retry.Content
+		planRes.RespondCalled = retry.RespondCalled
 		planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
 		planRes.DurationMs += retry.DurationMs
 		if retryErr != nil {
 			return nil, planRes.ToolUses, retryErr
 		}
-		if err := json.Unmarshal([]byte(trimJSON(retry.Text)), &plan); err != nil {
-			return nil, planRes.ToolUses, fmt.Errorf("non-JSON after retry: %w", err)
-		}
+		parseErr = json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
+	}
+	if parseErr != nil {
+		return nil, planRes.ToolUses, fmt.Errorf("plan not valid JSON: %w", parseErr)
 	}
 
-	if sess != nil && planRes.Text != "" {
-		sess.UpsertLastAssistant(planRes.Text)
-		_ = sess.Save()
+	// Direct-answer prose: when the planner called submit_plan it's in the clean
+	// content channel; a free-text plan has it mashed with the JSON, so drop the
+	// JSON object out. orchestrate shows this when the plan has no subtasks.
+	if planRes.RespondCalled {
+		plan.answer = strings.TrimSpace(planRes.Content)
+	} else {
+		plan.answer = strings.TrimSpace(strings.Replace(planRes.Text, trimJSON(planRes.Text), "", 1))
+	}
+
+	if sess != nil {
+		// Persist the user-facing turn: the direct answer when there is one,
+		// else the structured plan JSON (kept in history for replan context).
+		msg := plan.answer
+		if msg == "" {
+			msg = planRes.Text
+		}
+		if msg != "" {
+			sess.UpsertLastAssistant(msg)
+			_ = sess.Save()
+		}
 	}
 
 	toolUses := planRes.ToolUses
@@ -218,9 +247,10 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	}
 
 	exclude := map[string]bool{
-		"web_search":   true,
-		"web_read":     true,
-		"web_read_raw": true,
+		"web_search":       true,
+		"web_read":         true,
+		"web_read_raw":     true,
+		submitPlanToolName: true, // planning-only terminal; respond is execute's exit
 	}
 	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", true, executeFailCap)
 	if sess != nil && res.Text != "" {
@@ -324,7 +354,7 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	}
 
 	messages := []llmMessage{{Role: "user", Content: userMsg}}
-	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true}}, "document", true, 0)
+	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true, submitPlanToolName: true}}, "document", true, 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil
@@ -368,7 +398,14 @@ const toolNameEscalateThreshold = 5
 
 // toolLoopResult is what an agentic tool loop (runToolLoop) returns.
 type toolLoopResult struct {
-	Text     string
+	Text string
+	// Content is the model's accumulated free-text (assistant content) across
+	// the loop, separate from Text. For a terminal exit these diverge: Text is
+	// the terminal tool's output (respond's message, or submit_plan's plan
+	// JSON), while Content is whatever prose the model wrote alongside the tool
+	// call. runPlanPhase relies on this split — submit_plan's args land in Text,
+	// the planner's user-facing answer lands here — so the two never mix.
+	Content  string
 	ToolUses []ToolUse
 	// RespondCalled is true when the loop exited because the model invoked
 	// the registered terminal tool (typically `respond`). False when the
@@ -435,6 +472,10 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 	// trailing assistant message in session. Called on every exit path so
 	// even error returns leave a recorded turn for postmortem analysis.
 	stampTiming := func() {
+		// Capture the accumulated free-text on every exit path so callers that
+		// need the prose separate from a terminal tool's output (runPlanPhase)
+		// always see it. Independent of the timing stamp below.
+		res.Content = allText.String()
 		if res.StartedAt.IsZero() {
 			return
 		}

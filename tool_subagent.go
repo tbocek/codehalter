@@ -331,10 +331,11 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 	// no business going to the web. launch_subagent is excluded at max depth
 	// to bound recursion.
 	exclude := map[string]bool{
-		"ask_user":     true,
-		"web_search":   true,
-		"web_read":     true,
-		"web_read_raw": true,
+		"ask_user":         true,
+		"web_search":       true,
+		"web_read":         true,
+		"web_read_raw":     true,
+		submitPlanToolName: true, // planning-only terminal; respond is the subagent exit
 	}
 	if subSess.Depth >= maxSubagentDepth {
 		exclude["launch_subagent"] = true

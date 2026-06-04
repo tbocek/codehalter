@@ -116,6 +116,21 @@ func sseToolCall(id, name, args string) string {
 	return b.String()
 }
 
+// sseContentThenToolCall emits a content delta (assistant prose) followed by a
+// single tool call, then [DONE] — the shape a planner produces when it writes a
+// direct answer AND calls submit_plan in the same turn.
+func sseContentThenToolCall(text, id, name, args string) string {
+	var b strings.Builder
+	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"content": text}}}})
+	fmt.Fprintf(&b, "data: %s\n\n", c1)
+	c2, _ := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"tool_calls": []map[string]any{{
+		"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": args},
+	}}}}}})
+	fmt.Fprintf(&b, "data: %s\n\n", c2)
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
 // TestSessionRoundtrip verifies the TOML schema for Session is stable: what we
 // write in memory comes back byte-for-byte on reload.
 func TestSessionRoundtrip(t *testing.T) {
@@ -412,11 +427,12 @@ func TestToolLoopRespondExits(t *testing.T) {
 	}
 }
 
-// TestToolLoopRespondExcludedFromJSONPhases verifies that the plan/verify/
-// document filter (excluding respond) keeps the legacy text-only exit: a
-// no-tool-calls turn returns immediately instead of nudging for respond. This
-// is what lets runPlanPhase parse the assistant text as JSON.
-func TestToolLoopRespondExcludedFromJSONPhases(t *testing.T) {
+// TestToolLoopNoTerminalKeepsTextExit verifies that a phase excluding EVERY
+// terminal tool (the document phase filters out both respond and submit_plan)
+// keeps the legacy text-only exit: a no-tool-calls turn returns immediately
+// instead of nudging. The plan phase no longer qualifies — it exposes
+// submit_plan as its terminal — so this guards the document path specifically.
+func TestToolLoopNoTerminalKeepsTextExit(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText(`{"clear": true, "steps": ["do x"]}`),
 	)
@@ -435,16 +451,50 @@ func TestToolLoopRespondExcludedFromJSONPhases(t *testing.T) {
 	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "plan something"}},
-		toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", true, 0)
+		[]llmMessage{{Role: "user", Content: "go"}},
+		toolFilter{exclude: map[string]bool{respondToolName: true, submitPlanToolName: true}}, "document", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
 	if mock.callCount() != 1 {
-		t.Errorf("LLM call count: got %d, want 1 (no nudge when respond is excluded)", mock.callCount())
+		t.Errorf("LLM call count: got %d, want 1 (no nudge when no terminal tool is exposed)", mock.callCount())
 	}
 	if !strings.Contains(res.Text, "do x") {
-		t.Errorf("res.Text missing JSON content: got %q", res.Text)
+		t.Errorf("res.Text missing text content: got %q", res.Text)
+	}
+}
+
+// TestPlanSubmitPlanSeparatesAnswer verifies the plan phase's terminal split:
+// when the planner writes a direct answer AND calls submit_plan, the structured
+// plan lands in res.Text (submit_plan's echoed args) while the user-facing prose
+// lands in res.Content — the two channels never mix, so the old "answer mashed
+// into the plan JSON" bug can't recur.
+func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
+	planArgs := `{"clear":true,"subtasks":[],"report_only":true}`
+	mock := newMockLLM(t, sseContentThenToolCall("Active servers: gopls.", "tc1", submitPlanToolName, planArgs))
+	defer mock.Close()
+
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	a := &agent{sessions: map[string]*Session{s.ID: s}}
+
+	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("thinking"),
+		[]llmMessage{{Role: "user", Content: "what servers?"}},
+		toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", false, 0)
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if !res.RespondCalled {
+		t.Errorf("RespondCalled: got false, want true (submit_plan is the plan terminal)")
+	}
+	if !strings.Contains(res.Text, `"report_only":true`) {
+		t.Errorf("res.Text should carry the submit_plan args (the plan JSON): got %q", res.Text)
+	}
+	if !strings.Contains(res.Content, "Active servers: gopls.") {
+		t.Errorf("res.Content should carry the prose answer separately: got %q", res.Content)
 	}
 }
 
