@@ -534,6 +534,23 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		}
 		allText.WriteString(text)
 
+		// Compaction check AFTER every LLM call: the stream just set the server's
+		// ground-truth prompt size (LastCompletePromptTokens). The 64% trigger
+		// leaves headroom below n_ctx, so the call we just made fit; compacting
+		// now — for the growing phases on the main session — keeps the NEXT call
+		// (this loop's next iteration, or the next subtask) from drifting over.
+		// Runs after every call, including the terminal `respond` one, so the
+		// session is already compacted when the next subtask starts. Rebuild the
+		// in-flight slice from the now-smaller session; the current batch is
+		// appended to it below.
+		if (phase == "plan" || phase == "execute") && sid != "" {
+			if s := a.getSession(sid); s != nil && s.Depth == 0 {
+				if a.compressHistory(ctx, s) {
+					messages = a.buildLLMContext(s)
+				}
+			}
+		}
+
 		if len(calls) == 0 {
 			// Terminal-tool mode: empty tool_calls means the model dropped
 			// out of tool-calling grammar instead of finishing. Nudge it to

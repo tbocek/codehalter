@@ -20,9 +20,11 @@ const compactTriggerPct = 80
 //
 // Called at end-of-turn so we can block on the background summariser
 // draining — the assistant's reply is already on screen.
-func (a *agent) compressHistory(ctx context.Context, sess *Session) {
+// Returns true when it actually compacted, so a mid-loop caller can rebuild its
+// in-flight context from the now-smaller session.
+func (a *agent) compressHistory(ctx context.Context, sess *Session) bool {
 	if sess.LastCompletePromptTokens() <= a.mainSlotTokens*compactTriggerPct/100 {
-		return
+		return false
 	}
 
 	// Drain queued/in-flight summariser tasks EXCEPT the trailing one — it
@@ -32,7 +34,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	shadow := sess.drainShadow()
 
 	if len(sess.Messages) < 2 {
-		return
+		return false
 	}
 	splitIdx := len(sess.Messages) - 1
 	keepMessages := append([]Message(nil), sess.Messages[splitIdx:]...)
@@ -41,7 +43,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	// Skip rather than corrupt Summary; next turn retries.
 	if shadow == "" {
 		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ History compaction skipped — background summariser produced no notes since the last rotation. The session may approach n_ctx if this persists; check the background-LLM slot reachability.\n\n"}})
-		return
+		return false
 	}
 	var b strings.Builder
 	if sess.Summary != "" {
@@ -54,7 +56,7 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	archiveID, err := sess.rotate(keepMessages, summary)
 	if err != nil {
 		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Compaction failed: " + err.Error() + "\n\n"}})
-		return
+		return false
 	}
 	// Re-render SystemPrompt so skills + project context survive the
 	// summariser folding the original rendering into Summary.
@@ -63,10 +65,11 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) {
 	}
 	if err := sess.Save(); err != nil {
 		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ History compacted in-memory but persisting %s failed: %s. The archive %s is on disk, but the live session file is stale and will diverge until the next successful Save.\n\n", sess.filePath, err.Error(), archiveID)}})
-		return
+		return true // in-memory state IS compacted; a rebuild from sess is valid
 	}
 
 	a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("🗜 History compacted — archived as %s\n\n", archiveID)}})
+	return true
 }
 
 // backgroundSummarise enqueues a structured-note task for the just-completed
