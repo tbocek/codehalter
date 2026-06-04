@@ -117,9 +117,9 @@ func (a *agent) backgroundSummarise(sess *Session) {
 		var buf strings.Builder
 		buf.WriteString(prompt)
 		buf.WriteString("\n<user_turn>\n")
-		buf.WriteString(clipBytes(t.User.Content, maxShadowInputBytes))
+		buf.WriteString(clipBytes(t.User.Content, maxLLMInputBytes))
 		buf.WriteString("\n</user_turn>\n<assistant_turn>\n")
-		buf.WriteString(clipBytes(t.Assistant.Content, maxShadowInputBytes))
+		buf.WriteString(clipBytes(t.Assistant.Content, maxLLMInputBytes))
 		buf.WriteString("\n</assistant_turn>")
 		if len(t.Assistant.ToolUses) > 0 {
 			buf.WriteString("\n<tool_calls>\n")

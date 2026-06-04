@@ -28,6 +28,9 @@ var defaultSummariseMD string
 //go:embed docs/SYSTEM.md
 var defaultSystemMD string
 
+//go:embed docs/COMMIT.md
+var defaultCommitMD string
+
 //go:embed docs/Dockerfile.devcontainer.alpine
 var defaultDevcontainerDockerfileAlpine string
 
@@ -57,7 +60,7 @@ type agent struct {
 	// mu guards the mutable top-level fields touched from concurrent ACP
 	// handlers and the bootstrap goroutine: cancel, sessions, mode,
 	// abortReason, and the probe-derived LLM fields (connReachable,
-	// mainSlotTokens, imagesSupported). MCP state has its own mutex (see
+	// mainSlotTokens, detectedSlots, imagesSupported). MCP state has its own mutex (see
 	// mcp mcpState); the per-conn semaphores in connSems lock themselves.
 	mu           sync.Mutex
 	conn         *AgentSideConnection
@@ -86,6 +89,14 @@ type agent struct {
 	// loops on a Retry card until the gate passes, so any turn that runs can
 	// assume this is ≥ minSlotTokens. compressHistory reads this; nothing else should.
 	mainSlotTokens int
+
+	// detectedSlots is the total slot count summed across every [[llm]] entry as
+	// of the last probeAllLLMs (each conn's parallelCap, after auto-detected
+	// total_slots is back-filled). Stored rather than recomputed live because
+	// ensureLLM resets settings.Parallel via loadSettings every pass — a live
+	// sum would read the post-reset default before the next probe, defeating the
+	// "nothing changed, skip the probe" short-circuit. totalSlots() returns this.
+	detectedSlots int
 
 	// imagesSupported is whether LLM[0] accepts inline images — the agent-wide
 	// image capability advertised over ACP. Derived from LLM[0]'s config
@@ -373,8 +384,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	// Seed .codehalter/ defaults when absent. Phase prompts
 	// (PLAN/EXECUTE/DOCUMENT/SUMMARISE) are user-owned templates seeded once;
 	// every SKILL-*.md (including the always-on container skill) is owned by
-	// ensureSkills (skills.go), which also refreshes un-edited copies from
-	// their embeds on every prepare turn.
+	// ensureSkills (skills.go), which seeds it once and otherwise leaves it.
 	dir := filepath.Join(cwd, ".codehalter")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
@@ -385,6 +395,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 		{"DOCUMENT.md", defaultDocumentMD},
 		{"SUMMARISE.md", defaultSummariseMD},
 		{"SYSTEM.md", defaultSystemMD},
+		{"COMMIT.md", defaultCommitMD},
 	} {
 		path := filepath.Join(dir, f.name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {

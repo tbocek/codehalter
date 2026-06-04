@@ -49,32 +49,6 @@ const maxReplans = 20
 // "cancelled" when this sentinel reaches the top level.
 var errUserCancelled = errors.New("user cancelled")
 
-// isCancelled returns true for both the deliberate-cancel sentinel and a
-// raw context.Canceled / DeadlineExceeded. The latter is what the LLM
-// stream / HTTP client surface when the user hits the red Cancel button
-// mid-request — surfacing it as a JSON-RPC error makes Zed render the
-// AUTH_REQUIRED red box (because ACP reserves -32000 for that). All three
-// must collapse to a clean "cancelled" stopReason at the top of Prompt.
-// maxShadowInputBytes caps the bytes any single payload contributes to a
-// background LLM call (per-turn summaries via backgroundSummarise, git diffs
-// via backgroundGitCommit). Without this, a turn that produced megabytes of
-// tool output (huge run_command dumps) would blow through the background
-// LLM's own context window.
-const maxShadowInputBytes = 20 * 1024
-
-// clipBytes truncates s to at most max bytes, leaving a marker in the middle
-// when it had to cut. Used to bound any single payload's contribution to a
-// background LLM call (turn summaries via backgroundSummarise, git diffs via
-// backgroundGitCommit) so one giant tool output can't blow the summariser's
-// own context window.
-func clipBytes(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	half := max / 2
-	return s[:half] + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + s[len(s)-half:]
-}
-
 // resourcePath returns the local filesystem path an ACP resource URI points
 // at: a file:// URI collapses to its percent-decoded path with any fragment
 // (e.g. an editor line range "#L801-836") stripped, so the model can pass it
@@ -104,11 +78,6 @@ func resourceLabel(uri string) string {
 	}
 	return strings.TrimPrefix(uri, "file://")
 }
-
-// maxLinkedResourceBytes bounds how much of a whole-file resource_link we inline
-// when it carries no line range — enough for a normal source file, capped so a
-// huge attachment can't blow the prompt.
-const maxLinkedResourceBytes = 32 * 1024
 
 // readLinkedResource reads the file a resource_link / embedded-resource URI
 // points at and returns it as an inline snippet plus a display label, honouring
@@ -148,8 +117,8 @@ func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
 		return strings.Join(lines[start-1:end], "\n"), fmt.Sprintf("%s:%d-%d", base, start, end), true
 	}
 	s := string(data)
-	if len(s) > maxLinkedResourceBytes {
-		s = s[:maxLinkedResourceBytes] + "\n[... truncated ...]"
+	if len(s) > maxLLMInputBytes {
+		s = s[:maxLLMInputBytes] + "\n[... truncated ...]"
 	}
 	return s, base, true
 }
@@ -207,6 +176,12 @@ func parseLineRange(frag string) (int, int) {
 	}
 }
 
+// isCancelled returns true for both the deliberate-cancel sentinel and a
+// raw context.Canceled / DeadlineExceeded. The latter is what the LLM
+// stream / HTTP client surface when the user hits the red Cancel button
+// mid-request — surfacing it as a JSON-RPC error makes Zed render the
+// AUTH_REQUIRED red box (because ACP reserves -32000 for that). All three
+// must collapse to a clean "cancelled" stopReason at the top of Prompt.
 func isCancelled(err error) bool {
 	return errors.Is(err, errUserCancelled) ||
 		errors.Is(err, context.Canceled) ||
@@ -695,9 +670,6 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		a.sendPhase(ctx, sid, 0, false)
 		newPlan, _, err := a.runPlanPhase(ctx, sid, replanCtx)
 		if err != nil {
-			if isCancelled(err) {
-				return lastResult, err
-			}
 			return lastResult, err
 		}
 		if newPlan == nil || len(newPlan.Subtasks) == 0 {
@@ -783,13 +755,6 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 // itself. .codehalter/ is gitignored on first bootstrap so the file never
 // gets accidentally staged.
 const gitCommitFile = ".codehalter/.git_commit"
-
-const gitCommitPrompt = "You are drafting a git commit message for the user's CURRENT uncommitted changes. " +
-	"Reply with ONLY the message text — no preamble, no code fences.\n\n" +
-	"Format:\n" +
-	"- Line 1: short imperative subject, ≤72 chars (e.g. \"add ...\", \"fix ...\", \"refactor ...\").\n" +
-	"- Blank line.\n" +
-	"- Body: 1-3 short bullets or sentences covering WHY the change is being made, not a restatement of the diff.\n"
 
 // gitStatusPorcelain runs `git status --porcelain` in cwd. Empty output means
 // the working tree (including the index) is clean. Returns ("", err) when
@@ -900,14 +865,21 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 
+		// COMMIT.md is the user-editable commit-message prompt seeded into
+		// .codehalter/ (see docs/COMMIT.md); fall back to the embed if it was
+		// deleted so the LLM never gets a bare status/diff with no instructions.
+		commitPrompt := a.loadPromptFile(sess.ID, "COMMIT.md")
+		if commitPrompt == "" {
+			commitPrompt = defaultCommitMD
+		}
 		var buf strings.Builder
-		buf.WriteString(gitCommitPrompt)
+		buf.WriteString(commitPrompt)
 		buf.WriteString("\n<git_status>\n")
 		buf.WriteString(status)
 		buf.WriteString("</git_status>\n")
 		if strings.TrimSpace(diff) != "" {
 			buf.WriteString("\n<git_diff>\n")
-			buf.WriteString(clipBytes(diff, maxShadowInputBytes))
+			buf.WriteString(clipBytes(diff, maxLLMInputBytes))
 			buf.WriteString("\n</git_diff>\n")
 		}
 

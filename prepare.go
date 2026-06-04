@@ -150,15 +150,16 @@ const minSlotTokens = 32 * 1024
 // warm. Below 2 slots there is nowhere to run it and compaction has no path.
 const minTotalSlots = 2
 
-// totalSlots returns the configured slot count summed across every [[llm]]
-// entry's parallelCap. Used by ensureLLM to gate startup on having a slot
+// totalSlots returns the slot count summed across every [[llm]] entry as of the
+// last probeAllLLMs (which back-fills auto-detected total_slots into each conn's
+// parallelCap before summing into a.detectedSlots). It reads the stored value
+// rather than recomputing live because ensureLLM resets settings.Parallel via
+// loadSettings each pass — a live sum would see the post-reset default before
+// the next probe and defeat the "nothing changed, skip the probe" short-circuit.
+// 0 before the first probe. Used by ensureLLM to gate startup on having a slot
 // for the background summariser separate from the foreground turn.
 func (a *agent) totalSlots() int {
-	n := 0
-	for i := range a.settings.LLM {
-		n += a.settings.LLM[i].parallelCap()
-	}
-	return n
+	return a.detectedSlots
 }
 
 // ensureLLM blocks until every startup gate passes: at least one [[llm]]
@@ -304,6 +305,7 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	conns := a.settings.allConnections()
 	a.connReachable = make(map[string]bool, len(conns))
 	a.mainSlotTokens = 0
+	a.detectedSlots = 0
 	if len(conns) == 0 {
 		a.imagesSupported = false
 		return
@@ -326,6 +328,13 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 		}
 	}
 	a.buildConnSems() // resize the per-conn semaphores to the back-filled caps
+
+	// Persist the total slot count (across all entries) so ensureLLM's pre-probe
+	// short-circuit reads the real number after loadSettings has reset Parallel.
+	a.detectedSlots = 0
+	for i := range a.settings.LLM {
+		a.detectedSlots += a.settings.LLM[i].parallelCap()
+	}
 
 	// LLM[0] owns the foreground session's KV cache, so its per-slot context
 	// window drives compaction sizing. Prefer the server's directly-reported
@@ -464,15 +473,6 @@ func (a *agent) envSnapshot(sess *Session) string {
 	return b.String()
 }
 
-// missingTool pairs a binary name with the human-readable reason it is
-// needed. checkEnv collects one per missing stack-probe / runner-probe so
-// the consolidated fixProblem can render "gopls (go stack), make
-// (Makefile), just (justfile)" in a single card.
-type missingTool struct {
-	bin    string
-	reason string
-}
-
 // checkEnv refreshes sess.knownStacks and sess.knownRunners, probes the
 // environment (container, firefox, run_command, per-stack dev-tool
 // binaries, runner-config binaries on PATH), and reports whether anything
@@ -492,12 +492,12 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	sess.knownStacks = stacks
 	sess.knownRunners = detectRunnerConfigs(sess.Cwd)
 
-	// Re-seed SKILL-*.md so a stack / runner config / distro added since
-	// session start has its skill on disk before the next turn's systemPrompt
-	// loads it. Keyed on FILE presence (justfile / Makefile / go.mod / ...),
-	// not on installed tools — the LLM needs the skill to know how to install
-	// the missing tool. ensureSkills also refreshes un-edited skills from
-	// updated embeds and prunes other-OS copies.
+	// Seed SKILL-*.md for a stack / runner config / distro added since session
+	// start so its skill is on disk before the next turn's systemPrompt loads
+	// it. Keyed on FILE presence (justfile / Makefile / go.mod / ...), not on
+	// installed tools — the LLM needs the skill to know how to install the
+	// missing tool. ensureSkills seeds each skill once (leaving existing copies)
+	// and prunes other-OS copies.
 	osi := readOSInfo()
 	if err := ensureSkills(sess.Cwd, sess.knownStacks, osi); err != nil {
 		slog.Warn("prepare: ensureSkills failed", "sid", sid, "err", err)
@@ -518,35 +518,31 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	changed := snap != sess.envSnapshot
 	sess.envSnapshot = snap
 
-	var missing []missingTool
-	for _, s := range stacks {
-		bin := stackProbeBinary(s)
-		if bin == "" {
-			continue
+	// Build the "gopls (go stack), make (Makefile), …" detail as we find each
+	// missing probe binary — one consolidated fixProblem covers them all.
+	var detail strings.Builder
+	note := func(bin, reason string) {
+		if detail.Len() > 0 {
+			detail.WriteString(", ")
 		}
-		if _, err := exec.LookPath(bin); err != nil {
-			missing = append(missing, missingTool{bin: bin, reason: s + " stack"})
+		fmt.Fprintf(&detail, "%s (%s)", bin, reason)
+	}
+	for _, s := range stacks {
+		if bin := stackProbeBinary(s); bin != "" {
+			if _, err := exec.LookPath(bin); err != nil {
+				note(bin, s+" stack")
+			}
 		}
 	}
 	for _, k := range sess.knownRunners {
-		bin := runnerProbeBinary(k)
-		if bin == "" {
-			continue
-		}
-		if _, err := exec.LookPath(bin); err != nil {
-			missing = append(missing, missingTool{bin: bin, reason: k + " runner"})
+		if bin := runnerProbeBinary(k); bin != "" {
+			if _, err := exec.LookPath(bin); err != nil {
+				note(bin, k+" runner")
+			}
 		}
 	}
-	if len(missing) == 0 {
+	if detail.Len() == 0 {
 		return changed, nil
-	}
-
-	var detail strings.Builder
-	for i, m := range missing {
-		if i > 0 {
-			detail.WriteString(", ")
-		}
-		fmt.Fprintf(&detail, "%s (%s)", m.bin, m.reason)
 	}
 	// Embed the OS we already detected so the LLM doesn't waste a tool
 	// call rediscovering it. The bootstrap step (ensureDevcontainer) only
@@ -741,31 +737,6 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	}
 
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
-}
-
-// listSkills returns the bare names (no "SKILL-" prefix, no ".md" suffix)
-// of every SKILL-*.md present in .codehalter/, sorted. notifyCapabilities
-// uses this so the user sees in chat which skill bodies got concatenated
-// into the system prompt this turn — implicitly revealing what was
-// pruned (anything missing from the list).
-func listSkills(cwd string) []string {
-	entries, err := os.ReadDir(filepath.Join(cwd, ".codehalter"))
-	if err != nil {
-		return nil
-	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		n := e.Name()
-		if !strings.HasPrefix(n, "SKILL-") || !strings.HasSuffix(n, ".md") {
-			continue
-		}
-		names = append(names, strings.TrimSuffix(strings.TrimPrefix(n, "SKILL-"), ".md"))
-	}
-	sort.Strings(names)
-	return names
 }
 
 // ---------------------------------------------------------------------------
