@@ -25,8 +25,17 @@ var templateFS embed.FS
 const templatePlaceholder = "{{}}"
 
 type availableCommandsUpdate struct {
-	Kind     string   `json:"sessionUpdate"` // "available_commands_update"
-	Commands []string `json:"availableCommands"`
+	Kind     string             `json:"sessionUpdate"` // "available_commands_update"
+	Commands []availableCommand `json:"availableCommands"`
+}
+
+// availableCommand is one entry in the ACP slash-command menu. The protocol
+// requires an object with name + description; a bare string array deserialises
+// to zero valid commands client-side (Zed shows "Available commands: none" and
+// rejects the slash), which is exactly what an earlier []string version did.
+type availableCommand struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 // isTemplateFile reports whether a filename is a TEMPLATE-<name>.md and returns
@@ -140,5 +149,10 @@ func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
 	if sess := a.getSession(sid); sess != nil {
 		cwd = sess.Cwd
 	}
-	a.sendUpdate(ctx, sid, availableCommandsUpdate{Kind: "available_commands_update", Commands: templateNames(cwd)})
+	names := templateNames(cwd)
+	cmds := make([]availableCommand, len(names))
+	for i, n := range names {
+		cmds[i] = availableCommand{Name: n, Description: "Run the " + n + " prompt template"}
+	}
+	a.sendUpdate(ctx, sid, availableCommandsUpdate{Kind: "available_commands_update", Commands: cmds})
 }
