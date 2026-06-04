@@ -611,7 +611,10 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	// ran inside orchestrate. Report active wall-clock (elapsed minus human-input
 	// wait) + tokens first; a turn too short to measure stays silent.
 	if activeMs, promptTokens, completionTokens := sess.turnStats(); activeMs > 0 {
-		line := fmt.Sprintf("\n✅ Done in %.1fs · %d tokens (%d prompt + %d completion)\n",
+		// Leading blank line: the message stream renders as markdown, where a
+		// single \n collapses to a space — \n\n forces the stats onto their own
+		// line instead of jamming against the document phase's last sentence.
+		line := fmt.Sprintf("\n\n✅ Done in %.1fs · %d tokens (%d prompt + %d completion)\n",
 			float64(activeMs)/1000, promptTokens+completionTokens, promptTokens, completionTokens)
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
 	}
