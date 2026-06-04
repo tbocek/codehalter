@@ -611,7 +611,7 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	// ran inside orchestrate. Report active wall-clock (elapsed minus human-input
 	// wait) + tokens first; a turn too short to measure stays silent.
 	if activeMs, promptTokens, completionTokens := sess.turnStats(); activeMs > 0 {
-		line := fmt.Sprintf("✅ Done in %.1fs · %d tokens (%d prompt + %d completion)\n",
+		line := fmt.Sprintf("\n✅ Done in %.1fs · %d tokens (%d prompt + %d completion)\n",
 			float64(activeMs)/1000, promptTokens+completionTokens, promptTokens, completionTokens)
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
 	}
@@ -765,7 +765,8 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 	// Render the planned subtask list (header + numbered descriptions).
 	if len(plan.Subtasks) > 0 {
 		var planText strings.Builder
-		planText.WriteString(header + "\n")
+		planText.WriteString(header)
+		planText.WriteByte('\n')
 		for i, st := range plan.Subtasks {
 			fmt.Fprintf(&planText, "%d. %s\n", i+1, st.Description)
 		}

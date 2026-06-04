@@ -34,6 +34,12 @@ straight to yay.
   not the default, even though installing needs root.
 - `yay -Syu --noconfirm` — full update (rarely needed here).
 
+This holds for LANGUAGE-ECOSYSTEM tools too (gopls, ruff, prettier, …): prefer
+`yay -S <tool>` over `go install` / `pip install` / `npm i -g` whenever the repo
+carries it (`yay -Ss <tool>` to check). In a container the language installers
+hit root-vs-`dev` env mismatches (GOBIN/PATH) and land binaries off PATH; yay
+just works. Only use the language installer when yay has no package.
+
 If yay isn't on PATH (rare): `sudo pacman -Ss`/`-Si`/`-S --noconfirm`
 (official only, misses AUR).
 
