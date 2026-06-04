@@ -560,11 +560,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
-	if sess != nil {
-		sess.resetTurnStats(time.Now())
-	}
-	result, err := a.orchestrate(ctx, req.SessionId)
-	if err != nil {
+	if err := a.runTurn(ctx, req.SessionId); err != nil {
 		if isCancelled(err) {
 			// Never silent: log the cancellation and tell the user why. Covers
 			// the in-app Abort/Cancel button AND the editor aborting the turn
@@ -579,26 +575,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		return a.failPrompt(req.SessionId, err, nil)
 	}
 
-	// Each phase already persisted its own response via UpsertLastAssistant.
-	// The epilogue here only fires background work that observes the
-	// now-complete transcript.
-	if sess != nil && result.Text != "" {
-		// The turn verified clean: report active wall-clock (elapsed minus time
-		// blocked on user-input cards) and total tokens spent (foreground +
-		// background LLM calls). Emitted before the background epilogue so the
-		// numbers reflect the turn the user just watched.
-		if activeMs, prompt, completion := sess.turnStats(); activeMs > 0 {
-			line := fmt.Sprintf("✅ Done in %.1fs · %d tokens (%d prompt + %d completion)\n",
-				float64(activeMs)/1000, prompt+completion, prompt, completion)
-			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
-		}
-		// Per-subtask backgroundSummarise already fires inside orchestrate
-		// for every subtask iteration; the final pair is covered too, so we
-		// don't double-summarise here.
-		a.backgroundGitCommit(sess)
-		a.compressHistory(ctx, sess)
-	}
-
 	// Offer any fix cards the pre-turn checks detected, now that the user's
 	// actual request has run. The freshness checks themselves moved pre-turn
 	// (prepareChecks above); only the user-facing "fix it for me?" cards run
@@ -608,6 +584,40 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	a.drainFixes(ctx, req.SessionId, pendingFixes)
 
 	return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
+}
+
+// runTurn drives one full turn through the single shared path: reset the
+// per-turn stats window, run the orchestrator, and on a clean result fire the
+// epilogue — the "✅ Done" stats line, a git-commit of the turn's edits, and
+// history compaction. Both entry points use it — a typed user Prompt and an
+// accepted proposeFix "install fix?" card — so a fix-dispatched turn behaves
+// identically to a typed one (they used to diverge: the fix path skipped stats
+// AND compaction). The caller owns error presentation (Prompt surfaces it over
+// ACP, proposeFix logs it).
+func (a *agent) runTurn(ctx context.Context, sid string) error {
+	sess := a.getSession(sid)
+	if sess != nil {
+		sess.resetTurnStats(time.Now())
+	}
+	result, err := a.orchestrate(ctx, sid)
+	if err != nil {
+		return err
+	}
+	if sess == nil || result.Text == "" {
+		return nil
+	}
+	// Epilogue: background work over the now-complete transcript. Each phase
+	// already persisted its response; per-subtask backgroundSummarise already
+	// ran inside orchestrate. Report active wall-clock (elapsed minus human-input
+	// wait) + tokens first; a turn too short to measure stays silent.
+	if activeMs, promptTokens, completionTokens := sess.turnStats(); activeMs > 0 {
+		line := fmt.Sprintf("✅ Done in %.1fs · %d tokens (%d prompt + %d completion)\n",
+			float64(activeMs)/1000, promptTokens+completionTokens, promptTokens, completionTokens)
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
+	}
+	a.backgroundGitCommit(sess)
+	a.compressHistory(ctx, sess)
+	return nil
 }
 
 // orchestrate drives the plan → subtasks → replan → document pipeline for

@@ -785,7 +785,10 @@ func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 	}
 	sess.AddUser(p.prompt)
 	sess.saveOrLog()
-	if _, err := a.orchestrate(ctx, sid); err != nil {
+	// The accepted fix is its own turn — run it through the same path as a typed
+	// Prompt (runTurn) so it gets the "✅ Done" stats line, git-commit, and
+	// compaction. This used to call orchestrate directly and skip all three.
+	if err := a.runTurn(ctx, sid); err != nil {
 		// A cancelled fix dispatch is routine (user stopped it); a real failure
 		// is not — surface it at Warn so a fix that silently never ran is
 		// visible in the log rather than buried at Debug.
