@@ -136,6 +136,11 @@ func (a *agent) discoverRunners(cwd string) {
 			collected.WriteString(line)
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
 		}
+		if err := scanner.Err(); err != nil {
+			// Line past the 1 MB buffer or a read fault: flag the truncation
+			// in-band so a clipped transcript isn't read as the whole run.
+			fmt.Fprintf(&collected, "\n[output truncated: %s]\n", err)
+		}
 		runErr := <-waitErr
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "```\n"}})
 

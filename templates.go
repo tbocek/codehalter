@@ -4,13 +4,18 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 )
 
-// Template macros are slash commands: `/<name> <args>` expands the embedded
-// docs/TEMPLATE-<name>.md into the turn's user message and runs it as a normal
+// Template macros are slash commands: `/<name> <args>` expands a
+// TEMPLATE-<name>.md body into the turn's user message and runs it as a normal
 // prompt. Command name = filename minus the TEMPLATE- prefix and .md suffix.
+// Defaults ship embedded and are seeded into .codehalter/ on first run
+// (seedTemplates); from then on the on-disk copy wins, so users can edit a
+// shipped template or drop in their own TEMPLATE-<name>.md.
 
 //go:embed docs/TEMPLATE-*.md
 var templateFS embed.FS
@@ -24,19 +29,70 @@ type availableCommandsUpdate struct {
 	Commands []string `json:"availableCommands"`
 }
 
-// templateNames returns the macro command names (sorted) from the embedded
-// docs/TEMPLATE-<name>.md filenames.
-func templateNames() []string {
+// isTemplateFile reports whether a filename is a TEMPLATE-<name>.md and returns
+// the bare <name>.
+func isTemplateFile(n string) (name string, ok bool) {
+	if strings.HasPrefix(n, "TEMPLATE-") && strings.HasSuffix(n, ".md") {
+		return strings.TrimSuffix(strings.TrimPrefix(n, "TEMPLATE-"), ".md"), true
+	}
+	return "", false
+}
+
+// seedTemplates copies each embedded TEMPLATE-*.md into .codehalter/ when absent
+// (seed-once, like the phase prompts), so the user has editable copies.
+func seedTemplates(cwd string) error {
 	entries, _ := templateFS.ReadDir("docs")
-	var names []string
 	for _, e := range entries {
 		n := e.Name()
-		if strings.HasPrefix(n, "TEMPLATE-") && strings.HasSuffix(n, ".md") {
-			names = append(names, strings.TrimSuffix(strings.TrimPrefix(n, "TEMPLATE-"), ".md"))
+		if _, ok := isTemplateFile(n); !ok {
+			continue
 		}
+		path := filepath.Join(cwd, ".codehalter", n)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			data, _ := templateFS.ReadFile("docs/" + n)
+			if err := os.WriteFile(path, data, 0o644); err != nil {
+				return fmt.Errorf("seeding %s: %w", path, err)
+			}
+		}
+	}
+	return nil
+}
+
+// templateNames returns the macro command names (sorted, deduped) from both the
+// user's .codehalter/TEMPLATE-*.md and the embedded defaults, so a user-dropped
+// template shows up in the slash menu alongside the shipped ones.
+func templateNames(cwd string) []string {
+	set := map[string]bool{}
+	add := func(entries []os.DirEntry) {
+		for _, e := range entries {
+			if name, ok := isTemplateFile(e.Name()); ok {
+				set[name] = true
+			}
+		}
+	}
+	embedded, _ := templateFS.ReadDir("docs")
+	add(embedded)
+	if disk, err := os.ReadDir(filepath.Join(cwd, ".codehalter")); err == nil {
+		add(disk)
+	}
+	names := make([]string, 0, len(set))
+	for n := range set {
+		names = append(names, n)
 	}
 	sort.Strings(names)
 	return names
+}
+
+// loadTemplate returns a template body, preferring the user's editable
+// .codehalter copy over the embedded default. ok=false when neither exists.
+func loadTemplate(cwd, name string) (body string, ok bool) {
+	if data, err := os.ReadFile(filepath.Join(cwd, ".codehalter", "TEMPLATE-"+name+".md")); err == nil {
+		return string(data), true
+	}
+	if data, err := templateFS.ReadFile("docs/TEMPLATE-" + name + ".md"); err == nil {
+		return string(data), true
+	}
+	return "", false
 }
 
 // renderMacro applies the body→prompt rules: {{}} replaced with args; {{}} with
@@ -60,7 +116,7 @@ func renderMacro(name, body, args string) (rendered, stopMsg string) {
 // <name> is a known macro. handled=false → not a macro, run userText as-is.
 // handled=true + stopMsg → macro needs an arg it lacks; show stopMsg, run no
 // turn. Otherwise `rendered` replaces the user message.
-func expandMacro(userText string) (rendered, stopMsg string, handled bool) {
+func expandMacro(cwd, userText string) (rendered, stopMsg string, handled bool) {
 	if !strings.HasPrefix(userText, "/") {
 		return "", "", false
 	}
@@ -69,16 +125,20 @@ func expandMacro(userText string) (rendered, stopMsg string, handled bool) {
 	if i := strings.IndexAny(rest, " \t\r\n"); i >= 0 {
 		name, args = rest[:i], rest[i+1:]
 	}
-	data, err := templateFS.ReadFile("docs/TEMPLATE-" + name + ".md")
-	if err != nil {
+	body, ok := loadTemplate(cwd, name)
+	if !ok {
 		return "", "", false
 	}
-	r, msg := renderMacro(name, string(data), args)
+	r, msg := renderMacro(name, body, args)
 	return r, msg, true
 }
 
 // sendAvailableCommands advertises the macro commands to the editor's slash
 // menu. Re-sent every turn (from prepare) so the menu stays live.
 func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
-	a.sendUpdate(ctx, sid, availableCommandsUpdate{Kind: "available_commands_update", Commands: templateNames()})
+	cwd := ""
+	if sess := a.getSession(sid); sess != nil {
+		cwd = sess.Cwd
+	}
+	a.sendUpdate(ctx, sid, availableCommandsUpdate{Kind: "available_commands_update", Commands: templateNames(cwd)})
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -70,13 +71,25 @@ func readDedupKey(path string, line, limit int) string {
 	return fmt.Sprintf("%s|%d|%d", path, line, limit)
 }
 
+// readUnchangedMarker is a stable phrase the dedup note carries when a read is a
+// literal repeat of unchanged content. runToolLoop scans tool output for it to
+// inject a corrective on the FIRST redundant fetch — catching the interleaved
+// re-read pattern (read, search, read, read) that the consecutive-repeat nudge
+// misses. Only present when the mtime+size guard confirmed no change, so a
+// legitimate post-edit re-read (dedup busted, fresh content) never trips it.
+const readUnchangedMarker = "already in your context and unchanged"
+
 // listProjectFiles returns relative paths of all files under root, skipping
 // common junk dirs. The skipDirs filter only applies to descendants — if the
 // caller explicitly points us at e.g. `.codehalter`, they want its contents,
 // not an empty result because the dir name matches the junk list.
 func listProjectFiles(root string) []string {
 	var files []string
-	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	// The walk fn swallows per-entry errors (returns nil) by design — one
+	// unreadable file shouldn't abort the listing. WalkDir itself only errors
+	// if root can't be walked at all; log that rather than returning an
+	// empty list with no trace.
+	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
@@ -89,7 +102,9 @@ func listProjectFiles(root string) []string {
 		rel, _ := filepath.Rel(root, path)
 		files = append(files, rel)
 		return nil
-	})
+	}); err != nil {
+		slog.Debug("listProjectFiles: walk failed", "root", root, "err", err)
+	}
 	return files
 }
 
@@ -189,7 +204,7 @@ func init() {
 			sess.readDedupMu.Lock()
 			if prev, ok := sess.readDedup[dedupKey]; ok {
 				if st, statErr := os.Stat(path); statErr == nil && st.ModTime().Equal(prev.mtime) && st.Size() == prev.size {
-					dedupNote = fmt.Sprintf("[note: %s (line=%d, limit=%d) was already read earlier this turn and is unchanged. Returning the same content again — scroll back next time, or pass a different `line`/`limit` to see a different window.]", path, lineKey, limitKey)
+					dedupNote = fmt.Sprintf("[note: %s (line=%d, limit=%d) is %s — you read it earlier this turn and it has NOT changed. The same bytes follow, but reading it again makes no progress: use the copy already in your tool history. To see a different part, pass a different `line`/`limit`.]", path, lineKey, limitKey, readUnchangedMarker)
 				}
 			}
 			sess.readDedupMu.Unlock()

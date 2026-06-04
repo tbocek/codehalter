@@ -303,7 +303,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 	}
 
 	subSess.AddUser(instructions)
-	_ = subSess.Save()
+	subSess.saveOrLog()
 
 	var b strings.Builder
 	if sysPrompt, err := a.systemPrompt(sid); err == nil && sysPrompt != "" {
@@ -355,7 +355,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 		} else {
 			subSess.AddAssistantWithTools(result.Text, result.ToolUses)
 		}
-		_ = subSess.Save()
+		subSess.saveOrLog()
 	}
 
 	return result.Text, nil
@@ -395,7 +395,7 @@ func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task 
 		instructions = "Task:\n" + task.Instructions
 	}
 	subSess.AddUser(instructions)
-	_ = subSess.Save()
+	subSess.saveOrLog()
 
 	plan, _, err := a.runPlanPhase(ctx, sid, "")
 	if err != nil {

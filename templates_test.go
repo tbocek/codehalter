@@ -25,26 +25,30 @@ func TestRenderMacro(t *testing.T) {
 }
 
 func TestExpandMacroNonCommand(t *testing.T) {
+	dir := t.TempDir() // no on-disk templates → embed-only lookup
 	for _, s := range []string{"hello world", "/nope-not-a-template here", "", "no slash here"} {
-		if _, _, handled := expandMacro(s); handled {
+		if _, _, handled := expandMacro(dir, s); handled {
 			t.Errorf("expandMacro(%q) handled=true, want false", s)
 		}
 	}
 }
 
 func TestTemplateNamesIncludesGrillMe(t *testing.T) {
-	if !contains(templateNames(), "grill-me") {
-		t.Errorf("templateNames() = %v, want it to include grill-me (docs/TEMPLATE-grill-me.md)", templateNames())
+	dir := t.TempDir()
+	if !contains(templateNames(dir), "grill-me") {
+		t.Errorf("templateNames() = %v, want it to include grill-me (docs/TEMPLATE-grill-me.md)", templateNames(dir))
 	}
 }
 
 // expandMacro on the real /grill-me template: it carries a {{}}, so no args
-// must stop with a message and args must land in the rendered prompt.
+// must stop with a message and args must land in the rendered prompt. Embed
+// fallback (empty temp cwd) so the shipped default is what's exercised.
 func TestExpandMacroGrillMe(t *testing.T) {
-	if _, stopMsg, handled := expandMacro("/grill-me"); !handled || stopMsg == "" {
+	dir := t.TempDir()
+	if _, stopMsg, handled := expandMacro(dir, "/grill-me"); !handled || stopMsg == "" {
 		t.Errorf("/grill-me with no args: handled=%v stopMsg=%q (want handled + a stop message)", handled, stopMsg)
 	}
-	rendered, stopMsg, handled := expandMacro("/grill-me the auth design")
+	rendered, stopMsg, handled := expandMacro(dir, "/grill-me the auth design")
 	if !handled || stopMsg != "" || !strings.Contains(rendered, "the auth design") {
 		t.Errorf("/grill-me <args>: handled=%v stopMsg=%q rendered=%q", handled, stopMsg, rendered)
 	}

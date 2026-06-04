@@ -45,9 +45,9 @@
   activate it; no restart is needed.
 
 ## Mutating commands — never during planning
-These rewrite files in place. They are NOT probes. Do not run during PLAN
-to "see what would change" — they actually change things, often across
-hundreds of files:
+These rewrite files in place. NOT probes. Do not run during PLAN to "see
+what would change" — they actually change things, often across hundreds
+of files:
 - `go fix ./...` (Go 1.26 modernizers — silently updates source)
 - `go mod tidy` (rewrites `go.mod` / `go.sum`)
 - `gofmt -w`, `goimports -w` (rewrite formatting in place)

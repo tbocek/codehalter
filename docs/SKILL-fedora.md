@@ -1,7 +1,7 @@
 # Fedora skill
 
 Base is Fedora ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}}). Pkg manager
-is `dnf` (`yum` alias still works). Fedora releases every ~6 months, so
+is `dnf` (`yum` alias still works). Fedora releases every ~6 months —
 packages stay relatively fresh.
 
 Run as non-root `dev` (sudo NOPASSWD). Prefix `dnf install`/`remove`/
@@ -10,8 +10,7 @@ Run as non-root `dev` (sudo NOPASSWD). Prefix `dnf install`/`remove`/
 
 ## Probe (only if needed)
 
-`/etc/os-release` is reflected in the header — do NOT re-run. Session-
-invariant:
+`/etc/os-release` is in the header — do NOT re-run. Session-invariant:
 
 - `dnf --version`
 - `rpm -qa` — every installed package (long; pipe to grep).
@@ -31,8 +30,8 @@ invariant:
 
 ## Version staleness
 
-If `dnf info` shows an older version than expected, check upstream with
-`web_search`. Workarounds:
+If `dnf info` shows older than expected, check upstream with `web_search`.
+Workarounds:
 
 - **COPR**: Fedora's user repos. `dnf copr enable <owner>/<repo> &&
   dnf install -y <pkg>`. Many language toolchains have COPRs.

@@ -86,7 +86,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	sess := a.getSession(sid)
 	if sess != nil {
 		sess.AddUser(planPrompt)
-		_ = sess.Save()
+		sess.saveOrLog()
 	}
 
 	var messages []llmMessage
@@ -166,7 +166,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		}
 		if msg != "" {
 			sess.UpsertLastAssistant(msg)
-			_ = sess.Save()
+			sess.saveOrLog()
 		}
 	}
 
@@ -185,14 +185,14 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		if err != nil || choice == "abort" {
 			appendAssistantNote(sess, "User aborted on clarification.")
 			if sess != nil {
-				_ = sess.Save()
+				sess.saveOrLog()
 			}
 			return nil, toolUses, errUserCancelled
 		}
 
 		appendAssistantNote(sess, "User chose: "+choice)
 		if sess != nil {
-			_ = sess.Save()
+			sess.saveOrLog()
 		}
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Understood: " + choice + "\n"}})
 	}
@@ -238,7 +238,7 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 
 	if sess != nil {
 		sess.AddUser(prompt.String())
-		_ = sess.Save()
+		sess.saveOrLog()
 	}
 
 	var messages []llmMessage
@@ -255,7 +255,7 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", true, executeFailCap)
 	if sess != nil && res.Text != "" {
 		sess.UpsertLastAssistant(res.Text)
-		_ = sess.Save()
+		sess.saveOrLog()
 	}
 
 	out := subtaskOutcome{Result: res}
@@ -350,7 +350,7 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// this message — it sees only `messages` below.
 	if sess != nil {
 		sess.AddUser(docPrompt)
-		_ = sess.Save()
+		sess.saveOrLog()
 	}
 
 	messages := []llmMessage{{Role: "user", Content: userMsg}}
@@ -361,7 +361,7 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	}
 	if sess != nil && docRes.Text != "" {
 		sess.UpsertLastAssistant(docRes.Text)
-		_ = sess.Save()
+		sess.saveOrLog()
 	}
 	exec.ToolUses = append(exec.ToolUses, docRes.ToolUses...)
 	return exec, nil
@@ -506,6 +506,11 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 	// failedRounds counts iterations whose tool batch produced a failure; the
 	// failSoftCap check below bounces the loop once it accumulates too many.
 	var failedRounds int
+	// redundantFetches counts rounds where a tool re-served content the model
+	// already has unchanged this turn (read_file dedup hit). Each one gets a
+	// corrective; a third bails the loop as stuck. Catches the interleaved
+	// re-read pattern the consecutive-repeat nudge can't.
+	var redundantFetches int
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			res.Text = allText.String()
@@ -605,6 +610,9 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		// failedThisRound flips when any tool in this batch returns Failed=true,
 		// feeding the failSoftCap counter once the batch is done.
 		var failedThisRound bool
+		// redundantThisRound flips when a tool re-served unchanged content the
+		// model already has (read_file dedup hit, flagged via readUnchangedMarker).
+		var redundantThisRound bool
 
 		for _, tc := range calls {
 			// Subagent sessions don't surface their own UI (Zed doesn't know
@@ -623,6 +631,9 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			res.ToolUses = append(res.ToolUses, tu)
 			if tu.Failed {
 				failedThisRound = true
+			}
+			if strings.Contains(tu.Output, readUnchangedMarker) {
+				redundantThisRound = true
 			}
 			if hasTerminal && tc.Function.Name == termName && !terminalCalled {
 				terminalCalled = true
@@ -688,6 +699,24 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 					"1. Act on the output you already have (edit a file, run a different command, or summarise your finding), or\n" +
 					"2. If you are stuck or the task is infeasible, say so and stop.\n\n" +
 					"Do not call the same tool with the same arguments again unless you have first changed state that the call observes (e.g. a file you just edited).",
+			})
+		}
+
+		// Redundant-fetch corrective: a tool re-served content the model already
+		// has unchanged this turn. Unlike nudgeThisIter (consecutive byte-identical
+		// calls), this fires even when the re-read is interleaved with other calls
+		// — the pattern that let a document phase re-read one README four times.
+		// React on the FIRST redundant fetch; a third bails the loop as stuck.
+		if redundantThisRound {
+			redundantFetches++
+			if redundantFetches >= 3 {
+				res.Text = allText.String()
+				stampTiming()
+				return res, fmt.Errorf("tool loop stuck re-fetching content already in context")
+			}
+			messages = append(messages, llmMessage{
+				Role:    "user",
+				Content: "You just re-read a file you already have unchanged in this turn's tool history. The same bytes come back every time — it never makes progress. Use the copy you already have. Do not read or search the same unchanged file again; if you have what you need, act on it or finish.",
 			})
 		}
 

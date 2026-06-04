@@ -1,9 +1,9 @@
 # Container skill
 
-You are running inside a container. The workspace is bind-mounted from the
-host; the container is your sandbox — pkg-mgr / pip / npm writes persist
-for the container's lifetime (wiped on rebuild), so test installs are
-cheap and reversible.
+You run inside a container. The workspace is bind-mounted from the host;
+the container is your sandbox — pkg-mgr / pip / npm writes persist for the
+container's lifetime (wiped on rebuild), so test installs are cheap and
+reversible.
 
 ## Git — read-only history, mutable working tree
 
@@ -21,8 +21,8 @@ exact host command and stop — don't try yourself, the FS error is unhelpful.
 
 ## When a task fails with "command not found"
 
-This applies in execute and verify-failure replans. In plan, emit install
-+ Dockerfile-edit steps and let execute run them.
+Applies in execute and verify-failure replans. In plan, emit install +
+Dockerfile-edit steps and let execute run them.
 
 1. Confirm with `run_command`: `which <tool>` (exit 1 = missing).
 2. Read `.devcontainer/devcontainer.json` and its `Dockerfile`.
@@ -38,7 +38,7 @@ Package-manager commands depend on the base image — check the matching
 
 **Execute phase only.** Plan must stay read-only.
 
-When about to write `RUN <pkg-manager> install <pkg>` (or `pip`, `npm i -g`)
+Before writing `RUN <pkg-manager> install <pkg>` (or `pip`, `npm i -g`)
 into the Dockerfile, first run the same install via `run_command`:
 
 ```

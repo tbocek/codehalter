@@ -131,7 +131,9 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 				Context string `json:"context"`
 			} `json:"contexts"`
 		}
-		json.Unmarshal(treeResult, &tree)
+		if err := json.Unmarshal(treeResult, &tree); err != nil {
+			slog.Debug("getTree: decoding contexts failed", "err", err)
+		}
 		if len(tree.Contexts) > 0 {
 			b.initialTab = tree.Contexts[0].Context
 			slog.Info("initial tab", "context", b.initialTab)
@@ -184,7 +186,9 @@ func (b *Browser) Send(ctx context.Context, method string, params any) (json.Raw
 		return nil, ctx.Err()
 	case raw := <-ch:
 		var resp bidiResponse
-		json.Unmarshal(raw, &resp)
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return nil, fmt.Errorf("decoding bidi response: %w", err)
+		}
 		if resp.Type == "error" {
 			return nil, fmt.Errorf("bidi error: %s: %s", resp.Error, resp.Message)
 		}
@@ -213,7 +217,9 @@ func (b *Browser) OpenTab(ctx context.Context, url string) (string, error) {
 	var ctxResult struct {
 		Context string `json:"context"`
 	}
-	json.Unmarshal(result, &ctxResult)
+	if err := json.Unmarshal(result, &ctxResult); err != nil {
+		return "", fmt.Errorf("decoding create-tab response: %w", err)
+	}
 
 	err = b.Navigate(ctx, ctxResult.Context, url)
 	return ctxResult.Context, err
@@ -221,9 +227,11 @@ func (b *Browser) OpenTab(ctx context.Context, url string) (string, error) {
 
 // CloseTab closes a browsing context.
 func (b *Browser) CloseTab(ctx context.Context, contextID string) {
-	b.Send(ctx, "browsingContext.close", map[string]any{
+	if _, err := b.Send(ctx, "browsingContext.close", map[string]any{
 		"context": contextID,
-	})
+	}); err != nil {
+		slog.Debug("CloseTab failed", "context", contextID, "err", err)
+	}
 }
 
 // PageText returns the visible text content of a tab.

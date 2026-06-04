@@ -784,7 +784,7 @@ func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 		return
 	}
 	sess.AddUser(p.prompt)
-	_ = sess.Save()
+	sess.saveOrLog()
 	if _, err := a.orchestrate(ctx, sid); err != nil {
 		// A cancelled fix dispatch is routine (user stopped it); a real failure
 		// is not — surface it at Warn so a fix that silently never ran is

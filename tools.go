@@ -289,7 +289,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	// Cache the full output (saved incrementally so it survives a crash) for view_output.
 	if sess := a.getSession(sid); sess != nil {
 		sess.AppendToolUse(tu)
-		_ = sess.Save()
+		sess.saveOrLog()
 	}
 
 	if multimodal != nil {

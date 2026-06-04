@@ -2,7 +2,7 @@
 
 Base is Debian ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}},
 codename={{VERSION_CODENAME}}). Pkg manager is `apt`/`apt-get`; libc is
-glibc. Stable repos prioritise stability over freshness — versions can be
+glibc. Stable repos favor stability over freshness — versions can be
 months/years behind upstream.
 
 Run as non-root `dev` (sudo NOPASSWD). Prefix `apt update`/`install`/
@@ -11,8 +11,7 @@ search`/`policy`, `dpkg -l`/`-s`) don't need it.
 
 ## Probe (only if needed)
 
-`/etc/os-release` is reflected in the header — do NOT re-run. Session-
-invariant:
+`/etc/os-release` is in the header — do NOT re-run. Session-invariant:
 
 - `apt --version`
 - `dpkg -l` — every installed package (long; pipe to grep).
@@ -24,7 +23,7 @@ invariant:
 - `apt update` — refresh index. Required after editing sources; cheap.
 - `apt-cache search <pkg>` — fuzzy search.
 - `apt-cache policy <pkg>` — installed + candidate + source suite. Check
-  this BEFORE installing to see what you'd get.
+  BEFORE installing to see what you'd get.
 - `apt-cache show <pkg>` — full record.
 - `apt install -y <pkg>` — install (`-y` skips prompt).
 - `apt remove`/`purge <pkg>` — uninstall (purge removes config too).

@@ -9,7 +9,7 @@ targets via `run_task`, not raw `make`.
   defined target including pattern rules. Noisy but exhaustive.
 - `grep '^[a-zA-Z][^:]*:' Makefile` — quick-and-dirty target list.
 - `awk '/^\.PHONY:/ {for (i=2;i<=NF;i++) print $i}' Makefile` — declared
-  phony targets, which usually correspond to user-facing tasks.
+  phony targets, usually the user-facing tasks.
 
 If `run_task` already enumerated tasks this turn, reuse — don't re-parse.
 

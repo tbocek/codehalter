@@ -88,6 +88,11 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 		collected.WriteString(line)
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
 	}
+	if err := scanner.Err(); err != nil {
+		// A line past the 1 MB buffer (or a read fault) ends the scan early —
+		// say so in-band rather than presenting truncated output as complete.
+		fmt.Fprintf(&collected, "\n[output truncated: %s]\n", err)
+	}
 	runErr := <-waitErr
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "```\n"}})
 
@@ -103,7 +108,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 		// error text so the model can tell "command exited 1" apart from
 		// "shell itself broke".
 		exitCode = -1
-		collected.WriteString("\n[exec error: " + runErr.Error() + "]\n")
+		fmt.Fprintf(&collected, "\n[exec error: %s]\n", runErr.Error())
 	}
 
 	result := fmt.Sprintf("exit %d\n\n%s", exitCode, collected.String())

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -116,9 +117,15 @@ func searchInFile(path string, matcher func(string) bool, limit int) []int {
 		if matcher(scanner.Text()) {
 			matches = append(matches, lineNum)
 			if len(matches) >= limit {
-				break
+				return matches
 			}
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		// A line longer than bufio's 64 KB default ends the scan early; the
+		// match list is then partial. Log it rather than returning a silently
+		// truncated result as if the whole file was searched.
+		slog.Debug("searchInFile: scan ended early (long line?)", "path", path, "err", err)
 	}
 	return matches
 }

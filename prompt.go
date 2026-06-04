@@ -330,7 +330,7 @@ func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptRes
 		} else {
 			sess.AddAssistant("❌ " + err.Error())
 		}
-		_ = sess.Save()
+		sess.saveOrLog()
 	}
 	return PromptResponse{}, err
 }
@@ -507,10 +507,15 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
-	// `/<name> <args>` matching an embedded TEMPLATE-<name>.md expands into a
-	// full prompt and runs as a normal turn. A macro that requires an arg ({{}})
-	// but got none stops here with a user-facing note — no model call.
-	if rendered, stopMsg, handled := expandMacro(userText); handled {
+	// `/<name> <args>` matching a TEMPLATE-<name>.md (user copy in .codehalter,
+	// else the embedded default) expands into a full prompt and runs as a normal
+	// turn. A macro that requires an arg ({{}}) but got none stops here with a
+	// user-facing note — no model call.
+	macroCwd := ""
+	if sess != nil {
+		macroCwd = sess.Cwd
+	}
+	if rendered, stopMsg, handled := expandMacro(macroCwd, userText); handled {
 		if stopMsg != "" {
 			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: stopMsg + "\n"}})
 			return PromptResponse{StopReason: "end_turn"}, nil
@@ -536,7 +541,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		} else {
 			sess.AddUser(stored)
 		}
-		_ = sess.Save()
+		sess.saveOrLog()
 	}
 
 	// Reject prompts whose text alone would breach the compaction trigger.
@@ -620,7 +625,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		}
 		if sess != nil && len(firstToolUses) > 0 {
 			sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
-			_ = sess.Save()
+			sess.saveOrLog()
 		}
 		return toolLoopResult{}, err
 	}
@@ -772,7 +777,7 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 	if err != nil || choice == "abort" {
 		appendAssistantNote(sess, "User declined execution.")
 		if sess != nil {
-			_ = sess.Save()
+			sess.saveOrLog()
 		}
 		return errUserCancelled
 	}

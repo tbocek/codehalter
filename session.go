@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -484,7 +485,12 @@ func newSession(cwd string) (*Session, error) {
 }
 
 func newSubagentSession(cwd string, parentID string, index, depth, pinnedLLMIdx int) *Session {
-	os.MkdirAll(filepath.Join(cwd, sessionDir), 0755)
+	// Belt-and-suspenders: the parent session already created this dir. If it
+	// fails here the first saveLocked will surface it, but don't let the mkdir
+	// itself vanish.
+	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0755); err != nil {
+		slog.Warn("newSubagentSession: mkdir failed", "cwd", cwd, "err", err)
+	}
 	// Nanosecond suffix so sequential launch_subagent calls from the same
 	// parent don't collide on id (each call re-starts index at 0).
 	now := time.Now()
@@ -500,7 +506,7 @@ func newSubagentSession(cwd string, parentID string, index, depth, pinnedLLMIdx 
 		filePath:     path,
 		PinnedLLMIdx: pinnedLLMIdx,
 	}
-	_ = s.Save()
+	s.saveOrLog()
 	return s
 }
 
@@ -716,6 +722,17 @@ func (s *Session) Save() error {
 	return s.saveLocked()
 }
 
+// saveOrLog persists the session, logging on failure instead of returning the
+// error. Most save sites are best-effort (after each AddUser/AddAssistant in
+// the tool loops) where a failure isn't worth unwinding the turn — but it must
+// NOT vanish: a full disk or read-only .codehalter should be loud. Replaces the
+// former `_ = sess.Save()` discards so the failure is never silent.
+func (s *Session) saveOrLog() {
+	if err := s.Save(); err != nil {
+		slog.Error("session save failed", "id", s.ID, "path", s.filePath, "err", err)
+	}
+}
+
 // rotate archives the session as it currently is to a new "session_archive_*"
 // file, then resets s in place to carry only `keep` raw messages and `summary`
 // as the rolled-up prior context. The live session keeps its own ID and
@@ -754,8 +771,13 @@ func (s *Session) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	return toml.NewEncoder(f).Encode(s)
+	if err := toml.NewEncoder(f).Encode(s); err != nil {
+		f.Close() // best-effort; the encode error is the real failure
+		return err
+	}
+	// Return the close error: a failed flush on close means a truncated /
+	// corrupt session TOML, which the encode step alone won't surface.
+	return f.Close()
 }
 
 func listSessions(cwd string) ([]SessionInfo, error) {

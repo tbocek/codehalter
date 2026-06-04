@@ -407,6 +407,11 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	if err := ensureSkills(cwd, detectStacks(cwd), readOSInfo()); err != nil {
 		return err
 	}
+	// Template macros (TEMPLATE-*.md): seed editable copies once, same as the
+	// phase prompts. After this the on-disk copy wins, so users can edit them.
+	if err := seedTemplates(cwd); err != nil {
+		return err
+	}
 	// mcp.toml — only seeded on first run with the bare placeholder. Per-stack
 	// MCP wiring (e.g. gopls for Go) is the prepare phase's job: it asks the
 	// user before installing tools, and the same flow appends the matching

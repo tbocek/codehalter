@@ -2,7 +2,7 @@
 
 Base is Ubuntu ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}},
 codename={{UBUNTU_CODENAME}}). Debian-derived: `apt`/`apt-get`/`dpkg`
-work identically. Main differences are suite codenames (jammy, noble,
+work identically. Main differences: suite codenames (jammy, noble,
 oracular, …) and PPAs as a source of fresher packages.
 
 Run as non-root `dev` (sudo NOPASSWD). Prefix `apt update`/`install`/
@@ -11,8 +11,7 @@ probes (`apt-cache search`/`policy`, `dpkg -l`/`-s`) don't need it.
 
 ## Probe (only if needed)
 
-`/etc/os-release` is reflected in the header — do NOT re-run. Session-
-invariant:
+`/etc/os-release` is in the header — do NOT re-run. Session-invariant:
 
 - `apt --version`
 - `dpkg -l` — every installed package (long; pipe to grep).

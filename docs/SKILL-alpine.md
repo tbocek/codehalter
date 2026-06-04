@@ -1,17 +1,16 @@
 # Alpine skill
 
 Base is Alpine Linux ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}}). Pkg
-manager is `apk`; libc is **musl, not glibc** — prebuilt glibc binaries
-generally won't run, so prefer Alpine packages or static binaries.
+manager is `apk`. libc is **musl, not glibc** — prebuilt glibc binaries
+generally won't run. Prefer Alpine packages or static binaries.
 
 Run as non-root `dev` (sudo NOPASSWD). Prefix `apk add`/`del`/`update`
 with `sudo`. Read-only probes (`apk info`, `apk list -I`) don't need it.
 
 ## Probe (only if needed)
 
-`/etc/os-release` is reflected in the header above — do NOT re-run
-`cat /etc/os-release`. These are session-invariant — reuse from this
-turn's history:
+`/etc/os-release` is in the header — do NOT re-run `cat /etc/os-release`.
+Session-invariant — reuse from this turn's history:
 
 - `apk --version`
 - `apk list -I` — every installed package (long; pipe to grep).
@@ -25,16 +24,16 @@ turn's history:
 - `apk add <pkg>` — install (no `--noconfirm`; apk doesn't prompt).
 - `apk del <pkg>` — uninstall.
 
-Main + community repos are split. Most dev tooling is in `community/`;
-enable in `/etc/apk/repositories` if missing. For rolling versions:
+Main + community repos split. Most dev tooling is in `community/`; enable
+in `/etc/apk/repositories` if missing. Rolling versions:
 `apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community/ <pkg>`.
 
 ## Version staleness
 
 Stable releases freeze versions. If `apk info` looks old for a fast-moving
 tool (Go, Node, gopls, LSPs), check upstream with `web_search` before
-claiming "version X isn't available." Edge or `apk add build-base && make`
-from source is the fallback.
+claiming "version X isn't available." Fallback: edge, or
+`apk add build-base && make` from source.
 
 ## Common gotchas
 
