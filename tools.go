@@ -402,8 +402,12 @@ func truncateForLLM(useID, toolName, args, content string) string {
 	// read_file / continue_read do their own line-aware chunking (serveRead),
 	// serving up to readChunkLines whole lines with a continue_read pointer — so
 	// they must NOT be byte-clipped here (that cut mid-line and re-introduced the
-	// "partial mislabelled as complete" loop).
-	if toolName == "read_file" || toolName == "continue_read" {
+	// "partial mislabelled as complete" loop). search_text is a LIST of matches
+	// with context blocks, bounded by maxSearchResults; head+tail byte-clipping
+	// would slice blocks mid-way and drop the middle matches, so it's exempt too —
+	// the right bound for a match list is the match count, not a byte window.
+	switch toolName {
+	case "read_file", "continue_read", "search_text":
 		return content
 	}
 	if len(content) <= truncateThreshold {
