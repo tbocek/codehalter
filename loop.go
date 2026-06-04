@@ -353,6 +353,10 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 		sess.saveOrLog()
 	}
 
+	// Blank line before the documenter streams, so its output (often just "No
+	// documentation change needed.") starts a fresh markdown paragraph instead
+	// of running into the executor's final sentence.
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n\n"}})
 	messages := []llmMessage{{Role: "user", Content: userMsg}}
 	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true, submitPlanToolName: true}}, "document", true, 0)
 	if err != nil {
