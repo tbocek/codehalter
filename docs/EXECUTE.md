@@ -32,6 +32,23 @@ recipe arrive in the next user message. Budget: 10 LLM turns.
   change a value/version/dependency: read with read_file, change with edit_file/
   write_file. Don't explain how the user could do it themselves.
 
+## Never reverse the user's intent — only the user can
+
+A change the user explicitly asked for in an EARLIER turn is locked in. You may
+never undo, revert, or weaken it to make a later task pass — ONLY a new user
+prompt can reverse it. Common trap: the user upgraded a dependency, then a later
+"make it build" fails because a downstream tool lags that version. Downgrading
+the dependency (editing `go 1.25` back to `go 1.24`, pinning an older release)
+makes the build go green but silently throws away what the user asked for.
+
+That is a CONFLICT, not a fix. Do NOT revert. Instead:
+- Solve the OTHER side — upgrade/patch the downstream tool, find a compatible
+  pair, adjust config — keeping the user's change intact.
+- If you can't within this turn, do NOT improvise a revert to pass verify. Call
+  `respond` describing the conflict and stop. The orchestrator replans (with web
+  access) toward a real fix. A failed subtask that preserved the user's intent
+  beats a passing one that destroyed it.
+
 ## Self-check before respond
 
 Run every `verify` entry first. Per entry:

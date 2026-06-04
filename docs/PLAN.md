@@ -36,6 +36,15 @@ WHY it failed before re-proposing the same fix — if the note says "same failur
 recurring N times," the approach is wrong; try a structurally different angle.
 Request infeasible? Say so via `clear=false` + `question` instead of spinning.
 
+## Don't plan a revert of the user's intent
+
+A change the user explicitly requested in an earlier turn is locked in — only a
+later user prompt may undo it, never a subtask you write. If the request can
+only be met by reverting it (e.g. downgrading a dependency the user just
+upgraded, to satisfy a lagging tool), don't: that's a conflict. Plan the OTHER
+side — upgrade the downstream tool, pin a compatible pair — or set `clear=false`
++ `question` to surface the incompatibility. Honour history's Constraints.
+
 ## Clarity check
 
 Set `clear=false` if ANY of:
