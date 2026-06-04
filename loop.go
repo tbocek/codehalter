@@ -726,7 +726,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			messages = append(messages, llmMessage{
 				Role: "user",
 				Content: "You just re-read a file already in this turn's tool history — re-reading returns the same bytes, so it makes no progress. " +
-					"If the read was marked PARTIAL and you need more, fetch a specific range with read_file line=<n> limit=<m>, or search_text for the part you want — do NOT re-read the whole file. " +
+					"If the read was marked PARTIAL and you need more, call continue_read with the file path for the next chunk (or search_text for a specific part) — do NOT re-read the whole file. " +
 					"Otherwise use what you already have and move on.",
 			})
 		}

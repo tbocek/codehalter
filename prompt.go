@@ -417,6 +417,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		sess.readDedupMu.Lock()
 		sess.readDedup = nil
 		sess.readDedupMu.Unlock()
+		sess.readCursorMu.Lock()
+		sess.readCursor = nil
+		sess.readCursorMu.Unlock()
 	} else {
 		slog.Debug("Prompt: pre-turn getSession NIL", "sid", req.SessionId, "knownSessions", len(a.sessions))
 	}

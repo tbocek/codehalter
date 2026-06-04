@@ -11,14 +11,17 @@ import (
 	"strings"
 )
 
-const maxSearchResults = 100
+const (
+	maxSearchResults   = 100
+	searchContextLines = 2 // lines of context shown on each side of a match
+)
 
 func init() {
 	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "search_text",
-			"description": "Search for text or a regex across all files in the project. Returns up to 100 matches as file:line pairs. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive. Line-oriented by default; set multiline=true so a regex can match across newlines.",
+			"description": fmt.Sprintf("Search for text or a regex across all files in the project. Returns up to %d matches, each as `file:line` plus the matched line and %d lines of context on each side (the match line marked with `>`) — so you can often act on a hit without opening the file. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive. Line-oriented by default; set multiline=true so a regex can match across newlines.", maxSearchResults, searchContextLines),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"query"},
@@ -79,8 +82,19 @@ func init() {
 			} else {
 				matches = searchInFile(absPath, matcher, maxSearchResults-len(results))
 			}
+			if len(matches) == 0 {
+				continue
+			}
+			// Read the file once to pull the lines around each hit.
+			var lines []string
+			if data, err := os.ReadFile(absPath); err == nil {
+				lines = strings.Split(string(data), "\n")
+				if n := len(lines); n > 0 && lines[n-1] == "" {
+					lines = lines[:n-1]
+				}
+			}
 			for _, lineNum := range matches {
-				results = append(results, fmt.Sprintf("%s:%d", relPath, lineNum))
+				results = append(results, formatMatchBlock(relPath, lines, lineNum, searchContextLines))
 			}
 		}
 
@@ -100,6 +114,34 @@ func init() {
 			[]ToolCallContent{TextContent(summary)})
 		return strings.Join(results, "\n"), false
 	}})
+}
+
+// formatMatchBlock renders one search hit as `file:matchLine` followed by the
+// matched line and up to ctx lines of context on each side, line-numbered, the
+// match marked with ">". Falls back to a bare file:line when the file couldn't
+// be read for context (lines nil/empty).
+func formatMatchBlock(relPath string, lines []string, matchLine, ctx int) string {
+	if matchLine < 1 || matchLine > len(lines) {
+		return fmt.Sprintf("%s:%d", relPath, matchLine)
+	}
+	lo := matchLine - ctx
+	if lo < 1 {
+		lo = 1
+	}
+	hi := matchLine + ctx
+	if hi > len(lines) {
+		hi = len(lines)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s:%d\n", relPath, matchLine)
+	for i := lo; i <= hi; i++ {
+		marker := "  "
+		if i == matchLine {
+			marker = "> "
+		}
+		fmt.Fprintf(&b, "%s%d| %s\n", marker, i, lines[i-1])
+	}
+	return b.String()
 }
 
 func searchInFile(path string, matcher func(string) bool, limit int) []int {

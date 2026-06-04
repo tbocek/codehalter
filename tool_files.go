@@ -18,42 +18,143 @@ var skipDirs = map[string]bool{
 	".idea": true, ".vscode": true, "target": true, "dist": true, "build": true,
 }
 
-// Read-size caps guard the LLM context against pathological files. When the
-// caller doesn't pass `limit`, read_file reads defaultReadLines and warns if
-// truncated. An explicit `limit` is still capped at maxReadLines, and the
-// final content is further capped by maxReadBytes to stop a minified blob
-// from blowing through the byte budget even under the line limit.
+// Read-size caps guard the LLM context. read_file / continue_read serve at most
+// readChunkLines whole lines per call (a sequential window the model pages
+// through via continue_read); an explicit `limit` is capped at maxReadLines, and
+// maxReadBytes bounds a minified / long-line blob even under the line limit.
 const (
-	defaultReadLines = 2000
-	maxReadLines     = 5000
-	maxReadBytes     = 200 * 1024
+	readChunkLines = 150        // default lines per read_file / continue_read chunk
+	maxReadLines   = 5000       // hard cap when the caller passes an explicit limit
+	maxReadBytes   = 200 * 1024 // byte safety for minified / very long lines
 )
 
-// capReadContent trims over-long reads and returns a note describing what was
-// dropped. Returns empty note when nothing was trimmed.
-func capReadContent(content string, explicitLimit bool, startLine string) (string, string) {
-	var notes []string
-	lineCount := strings.Count(content, "\n")
-	if !strings.HasSuffix(content, "\n") && content != "" {
-		lineCount++
+// countLines counts lines in s; a trailing partial line (no final newline) counts.
+func countLines(s string) int {
+	if s == "" {
+		return 0
 	}
+	n := strings.Count(s, "\n")
+	if !strings.HasSuffix(s, "\n") {
+		n++
+	}
+	return n
+}
 
-	// Only emit a truncation hint when we capped something the caller didn't
-	// opt into. If they asked for limit=X explicitly, hitting X is expected.
-	if !explicitLimit && lineCount >= defaultReadLines {
-		start := "1"
-		if startLine != "" {
-			start = startLine
+// firstNLines returns the first n lines of s (newlines preserved); s unchanged
+// if it has n or fewer lines.
+func firstNLines(s string, n int) string {
+	lines := strings.SplitAfter(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return strings.Join(lines[:n], "")
+}
+
+// serveRead is the shared body of read_file and continue_read: it reads up to
+// maxLines whole lines of path from 1-based `start`, advances or clears the
+// per-path continue_read cursor, and returns the model-visible output — the
+// chunk plus a note that points to continue_read when the file continues, or
+// marks EOF when it doesn't. read_file/continue_read are exempt from the
+// downstream byte-clip (truncateForLLM), so this output is exactly what the
+// model sees. tcId is the already-started tool-call card to complete/fail.
+func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines int, tcId string) (string, bool) {
+	sess := a.getSession(sid)
+
+	// Dedup: same path+window, file unchanged this turn → still return the bytes
+	// (small models ignore "scroll back"), but lead with a note steering to
+	// continue_read so a re-read becomes forward progress. Busted on write.
+	dedupKey := readDedupKey(path, start, maxLines)
+	var dedupNote string
+	if sess != nil {
+		sess.readDedupMu.Lock()
+		if prev, ok := sess.readDedup[dedupKey]; ok {
+			if st, e := os.Stat(path); e == nil && st.ModTime().Equal(prev.mtime) && st.Size() == prev.size {
+				dedupNote = fmt.Sprintf("[note: %s — you read %s from line %d earlier this turn and it has NOT changed. Re-reading the same window makes no progress; for MORE of the file call continue_read path=%q.]", readUnchangedMarker, path, start, path)
+			}
 		}
-		notes = append(notes, fmt.Sprintf("[truncated at %d lines starting at line %s; call read_file again with a later `line` to see the rest]", defaultReadLines, start))
+		sess.readDedupMu.Unlock()
 	}
 
+	// Read one line past the window so we can tell whether the file continues.
+	fetch := maxLines + 1
+	startCopy := start
+	content, err := fsRead(a, ctx, sid, path, &startCopy, &fetch)
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		return "error: " + err.Error(), false
+	}
+	if sess != nil {
+		if st, e := os.Stat(path); e == nil {
+			sess.readDedupMu.Lock()
+			if sess.readDedup == nil {
+				sess.readDedup = map[string]readDedupEntry{}
+			}
+			sess.readDedup[dedupKey] = readDedupEntry{mtime: st.ModTime(), size: st.Size()}
+			sess.readDedupMu.Unlock()
+		}
+	}
+
+	served := countLines(content)
+	more := served > maxLines
+	if more {
+		content = firstNLines(content, maxLines)
+		served = maxLines
+	}
+	byteNote := ""
 	if len(content) > maxReadBytes {
 		content = content[:maxReadBytes]
-		notes = append(notes, fmt.Sprintf("[truncated at %d bytes — file has long lines; use `line`+`limit` to narrow]", maxReadBytes))
+		more = true
+		byteNote = fmt.Sprintf("[truncated at %d bytes — long lines; use search_text or read_file line+limit to narrow] ", maxReadBytes)
+	}
+	end := start
+	if served > 0 {
+		end = start + served - 1
 	}
 
-	return content, strings.Join(notes, " ")
+	// Advance the cursor while the file continues; clear it at EOF.
+	if sess != nil {
+		sess.readCursorMu.Lock()
+		if sess.readCursor == nil {
+			sess.readCursor = map[string]int{}
+		}
+		if more {
+			sess.readCursor[path] = end + 1
+		} else {
+			delete(sess.readCursor, path)
+		}
+		sess.readCursorMu.Unlock()
+	}
+
+	var note string
+	switch {
+	case content == "":
+		note = "[file is empty or past end of file]"
+	case more:
+		note = fmt.Sprintf("[showing lines %d-%d — the file continues. Call continue_read path=%q for the next ~%d lines (or read_file line=%d / search_text for a specific part). Do NOT re-read the whole file.]", start, end, path, readChunkLines, end+1)
+	default:
+		note = fmt.Sprintf("[end of file — line %d is the last; you have the file through line %d, do not re-read]", end, end)
+	}
+
+	out := content
+	if byteNote != "" {
+		out += "\n" + byteNote
+	}
+	out += "\n" + note
+	if dedupNote != "" {
+		out = dedupNote + "\n" + out
+	}
+
+	title := fmt.Sprintf("Reading: %s (%d-%d)", path, start, end)
+	if dedupNote != "" {
+		title += " (re-read)"
+	}
+	if more {
+		title += " (partial)"
+	} else {
+		title += " (complete)"
+	}
+	a.CompleteToolCallTitled(ctx, sid, tcId, title, []ToolCallContent{TextContent(out)})
+	return out, false
 }
 
 // readDedupEntry remembers a successful read_file outcome so a literal-repeat
@@ -149,14 +250,14 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": fmt.Sprintf("Read a text file. Output is truncated to %d lines or %d KB — a truncation note will tell you to re-call with line+limit to continue. If instead the output ends with an end-of-file marker, you have the WHOLE file; there is nothing more to read, so do not re-read or shell out to sed/cat for the same content. Do NOT re-read a file whose contents you already have in this turn's tool history AND which you have not modified since; scroll back instead. A literal-repeat read (same path, same line/limit, file unchanged) is rejected with a pointer to the prior result. Once you call edit_file or write_file on a path, re-reading IS allowed (and expected). Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go) — both are resolved.", defaultReadLines, maxReadBytes/1024),
+			"description": fmt.Sprintf("Read a text file from the top (or from `line`). Serves up to %d lines per call. If the file continues past that, the output is marked partial and ends with a pointer to call continue_read for the next chunk (it remembers where you left off, so no line math). When the output ends with an end-of-file marker you have the file through that point, so do not re-read. A literal-repeat read (same window, file unchanged) is rejected with a pointer to continue_read. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
 					"path":  map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
 					"line":  map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
-					"limit": map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line window.", maxReadLines, defaultReadLines)},
+					"limit": map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk, then use continue_read for more.", maxReadLines, readChunkLines)},
 				},
 			},
 		},
@@ -166,140 +267,54 @@ func init() {
 		if err != nil {
 			return "error: " + err.Error(), false
 		}
-
-		var linePtr *int
-		if v, err := strconv.Atoi(args["line"]); err == nil && v > 0 {
-			linePtr = &v
+		start := 1
+		if v, e := strconv.Atoi(args["line"]); e == nil && v > 0 {
+			start = v
 		}
-
-		explicitLimit := args["limit"] != ""
-		limit := defaultReadLines
-		if v, err := strconv.Atoi(args["limit"]); err == nil && v > 0 {
-			limit = v
-			if limit > maxReadLines {
-				limit = maxReadLines
+		maxLines := readChunkLines
+		if v, e := strconv.Atoi(args["limit"]); e == nil && v > 0 {
+			maxLines = v
+			if maxLines > maxReadLines {
+				maxLines = maxReadLines
 			}
 		}
-
-		// Dedup repeat reads. Same path + same window + file's mtime/size
-		// unchanged since the last read in this turn → return the same content
-		// again with a leading note so the model sees the bytes it asked for
-		// (small MoE models at high temp don't reliably follow a "scroll back"
-		// pointer). The disk re-read is cheap and the file is guaranteed
-		// unchanged by the mtime+size guard. Reset at Prompt() boundary (see
-		// Prompt() in prompt.go), and busted whenever edit_file / write_file
-		// touches the path so a post-edit re-read still goes through.
-		sess := a.getSession(sid)
-		lineKey := 0
-		if linePtr != nil {
-			lineKey = *linePtr
-		}
-		limitKey := 0
-		if explicitLimit {
-			limitKey = limit
-		}
-		dedupKey := readDedupKey(path, lineKey, limitKey)
-		var dedupNote string
-		if sess != nil {
-			sess.readDedupMu.Lock()
-			if prev, ok := sess.readDedup[dedupKey]; ok {
-				if st, statErr := os.Stat(path); statErr == nil && st.ModTime().Equal(prev.mtime) && st.Size() == prev.size {
-					dedupNote = fmt.Sprintf("[note: %s (line=%d, limit=%d) is %s — you read it earlier this turn and it has NOT changed. The same bytes follow, but reading it again makes no progress: use the copy already in your tool history. To see a different part, pass a different `line`/`limit`.]", path, lineKey, limitKey, readUnchangedMarker)
-				}
-			}
-			sess.readDedupMu.Unlock()
-		}
-
 		title := "Reading: " + path
 		if args["line"] != "" {
 			title = fmt.Sprintf("Reading: %s:%s", path, args["line"])
 		}
 		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
+		return a.serveRead(ctx, sid, path, start, maxLines, tcId)
+	}})
 
-		content, err := fsRead(a, ctx, sid, path, linePtr, &limit)
+	RegisterTool(Tool{Def: map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "continue_read",
+			"description": "Read the NEXT chunk of a file you have already partially read. It picks up exactly where the last read_file/continue_read left off, so you never compute line numbers. Use this (not another read_file) whenever a read came back marked partial. Returns the next lines and stops at end of file.",
+			"parameters": map[string]any{
+				"type":     "object",
+				"required": []string{"path"},
+				"properties": map[string]any{
+					"path": map[string]any{"type": "string", "description": "The file to keep reading: the same path you read before."},
+				},
+			},
+		},
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+		args := parseArgs(rawArgs)
+		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error(), false
 		}
-
-		// Record success in the dedup cache after a clean read. Use the
-		// post-read stat so the recorded mtime/size match what the LLM just
-		// saw — a write between read and stat would still bust the cache on
-		// the next call because the new stat won't match this one.
-		if sess != nil {
-			if st, statErr := os.Stat(path); statErr == nil {
-				sess.readDedupMu.Lock()
-				if sess.readDedup == nil {
-					sess.readDedup = make(map[string]readDedupEntry)
-				}
-				sess.readDedup[dedupKey] = readDedupEntry{mtime: st.ModTime(), size: st.Size()}
-				sess.readDedupMu.Unlock()
-			}
-		}
-
-		content, truncNote := capReadContent(content, explicitLimit, args["line"])
-
-		// Line count of the actual returned slice (before any truncation note
-		// is appended), so the title preview reflects what the LLM/user got.
-		lineCount := 0
-		if content != "" {
-			lineCount = strings.Count(content, "\n")
-			if !strings.HasSuffix(content, "\n") {
-				lineCount++
-			}
-		}
 		start := 1
-		if v, err := strconv.Atoi(args["line"]); err == nil && v > 0 {
-			start = v
+		if sess := a.getSession(sid); sess != nil {
+			sess.readCursorMu.Lock()
+			if c, ok := sess.readCursor[path]; ok {
+				start = c
+			}
+			sess.readCursorMu.Unlock()
 		}
-		end := start
-		if lineCount > 0 {
-			end = start + lineCount - 1
-		}
-		// A read is "partial" when capReadContent trimmed it OR runToolCall's
-		// truncateForLLM will byte-clip it for the model (read_file uses
-		// readTruncateThreshold). Either way the model is NOT seeing the whole
-		// file, so the UI says "partial" and we withhold the "complete, do not
-		// re-read" marker — claiming complete while the body is clipped is the
-		// contradiction that made the planner re-read whole files in a loop.
-		// Without a positive complete marker on a small file the model can't tell
-		// a complete short file from a truncated one and re-reads, so we DO emit
-		// it whenever the whole file is actually visible.
-		candidate := fmt.Sprintf("[end of file — line %d is the last line; you have the complete file from line %d, do not re-read]", end, start)
-		partial := truncNote != "" || len(dedupNote)+len(content)+len(candidate)+2 > readTruncateThreshold
-
-		eofNote := ""
-		switch {
-		case truncNote != "":
-			// capReadContent already truncated; its note tells the model to paginate.
-		case content == "":
-			eofNote = "[file is empty]"
-		case !partial:
-			eofNote = candidate
-		}
-
-		resultTitle := fmt.Sprintf("Reading: %s (%d-%d)", path, start, end)
-		if dedupNote != "" {
-			resultTitle += " (re-read)"
-		}
-		if partial {
-			resultTitle += " (partial)"
-		} else {
-			resultTitle += " (complete)"
-		}
-
-		if truncNote != "" {
-			content += "\n" + truncNote
-		}
-		if eofNote != "" {
-			content += "\n" + eofNote
-		}
-		if dedupNote != "" {
-			content = dedupNote + "\n" + content
-		}
-
-		a.CompleteToolCallTitled(ctx, sid, tcId, resultTitle, []ToolCallContent{TextContent(content)})
-		return content, false
+		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Continuing: %s:%d", path, start), "read", []ToolCallLocation{{Path: path}})
+		return a.serveRead(ctx, sid, path, start, readChunkLines, tcId)
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -434,6 +449,11 @@ func fsWrite(a *agent, ctx context.Context, sid string, path, content string) er
 			}
 		}
 		sess.readDedupMu.Unlock()
+		// The file changed — drop any continue_read cursor so the next read
+		// starts fresh rather than continuing from a now-stale line.
+		sess.readCursorMu.Lock()
+		delete(sess.readCursor, path)
+		sess.readCursorMu.Unlock()
 		if sess.Depth > 0 {
 			return os.WriteFile(path, []byte(content), 0644)
 		}

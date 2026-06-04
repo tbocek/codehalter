@@ -945,51 +945,37 @@ func TestConcurrentSessionWritesAreRaceFree(t *testing.T) {
 	}
 }
 
-// TestCapReadContent verifies the default-cap logic in read_file: explicit
-// limits are honoured without warnings, implicit reads get a truncation note
-// when exceeding defaultReadLines, and the byte cap fires for long-line files.
-func TestCapReadContent(t *testing.T) {
-	tests := []struct {
-		name          string
-		lines         int
-		explicit      bool
-		startLine     string
-		wantNote      bool
-		wantKeyword   string // substring expected in note
-		wantTruncated bool
-	}{
-		{name: "small implicit read", lines: 10, explicit: false, wantNote: false},
-		{name: "small explicit read", lines: 10, explicit: true, wantNote: false},
-		{name: "exact boundary implicit", lines: defaultReadLines, explicit: false, wantNote: true, wantKeyword: "truncated"},
-		{name: "over default implicit", lines: defaultReadLines + 500, explicit: false, wantNote: true, wantKeyword: "truncated"},
-		{name: "over default explicit", lines: defaultReadLines + 500, explicit: true, wantNote: false},
-		{name: "implicit with startLine", lines: defaultReadLines + 1, explicit: false, startLine: "50", wantNote: true, wantKeyword: "line 50"},
+// TestReadChunking verifies the line-aware chunking helpers serveRead uses:
+// countLines is correct with and without a trailing newline, and firstNLines
+// returns exactly the leading n lines (or the whole string when it's shorter),
+// which is how a read is trimmed to readChunkLines before continue_read pages on.
+func TestReadChunking(t *testing.T) {
+	// countLines: trailing newline and not.
+	if got := countLines("a\nb\nc\n"); got != 3 {
+		t.Errorf("countLines trailing-newline: got %d, want 3", got)
+	}
+	if got := countLines("a\nb\nc"); got != 3 {
+		t.Errorf("countLines no-trailing-newline: got %d, want 3", got)
+	}
+	if got := countLines(""); got != 0 {
+		t.Errorf("countLines empty: got %d, want 0", got)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			content := strings.Repeat("x\n", tc.lines)
-			_, note := capReadContent(content, tc.explicit, tc.startLine)
-			if tc.wantNote && note == "" {
-				t.Errorf("expected a truncation note, got empty")
-			}
-			if !tc.wantNote && note != "" {
-				t.Errorf("expected no note, got %q", note)
-			}
-			if tc.wantKeyword != "" && !strings.Contains(note, tc.wantKeyword) {
-				t.Errorf("note missing %q: %q", tc.wantKeyword, note)
-			}
-		})
+	// firstNLines trims to exactly n leading lines, newlines preserved.
+	body := strings.Repeat("x\n", readChunkLines+50) // 200 lines
+	chunk := firstNLines(body, readChunkLines)
+	if got := countLines(chunk); got != readChunkLines {
+		t.Errorf("firstNLines: served %d lines, want %d", got, readChunkLines)
+	}
+	if chunk != strings.Repeat("x\n", readChunkLines) {
+		t.Errorf("firstNLines content mismatch")
 	}
 
-	// Byte-cap path: one enormous single line.
-	long := strings.Repeat("a", maxReadBytes+1024)
-	out, note := capReadContent(long, false, "")
-	if len(out) != maxReadBytes {
-		t.Errorf("byte cap: got length %d, want %d", len(out), maxReadBytes)
-	}
-	if !strings.Contains(note, "bytes") {
-		t.Errorf("byte cap note missing 'bytes': %q", note)
+	// Shorter-than-n input is returned unchanged (read fits in one chunk → no
+	// continue_read needed).
+	short := "a\nb\nc\n"
+	if firstNLines(short, readChunkLines) != short {
+		t.Errorf("firstNLines should return a short input unchanged")
 	}
 }
 

@@ -220,6 +220,13 @@ type Session struct {
 	// fsWrite. In-memory only.
 	readDedupMu sync.Mutex
 	readDedup   map[string]readDedupEntry
+	// readCursor remembers, per file path, the next 1-based line continue_read
+	// should serve — set when read_file (or continue_read) returns a partial
+	// chunk, cleared when a chunk reaches EOF. Lets continue_read page forward
+	// with no line math. Same lifecycle as readDedup: reset each Prompt() turn,
+	// busted for a path on write. In-memory only.
+	readCursorMu sync.Mutex
+	readCursor   map[string]int
 	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
 	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
 	// of role — cache-coherence trumps per-role sampler matching, the conn

@@ -387,13 +387,6 @@ const (
 	truncateThreshold = 1500
 	truncateHeadChars = 600
 	truncateTailChars = 600
-	// read_file is the planner's window into source. The generic 1500-char cap
-	// (~40 lines) left it blind to most of a file → re-read loops. Give read_file
-	// ~150 lines (~6 KB); bigger files still clip head+tail with a paginate hint.
-	// A bigger window, not an exemption.
-	readTruncateThreshold = 6 * 1024
-	readTruncateHead      = 4 * 1024
-	readTruncateTail      = 2 * 1024
 )
 
 // truncateForLLM returns content unchanged if short; otherwise emits a
@@ -406,16 +399,19 @@ const (
 // what it just asked about. Used by runToolCall on live execution and by
 // history.go when re-rendering stored tool outputs into the message stream.
 func truncateForLLM(useID, toolName, args, content string) string {
-	threshold, headChars, tailChars := truncateThreshold, truncateHeadChars, truncateTailChars
-	if toolName == "read_file" {
-		threshold, headChars, tailChars = readTruncateThreshold, readTruncateHead, readTruncateTail
-	}
-	if len(content) <= threshold {
+	// read_file / continue_read do their own line-aware chunking (serveRead),
+	// serving up to readChunkLines whole lines with a continue_read pointer — so
+	// they must NOT be byte-clipped here (that cut mid-line and re-introduced the
+	// "partial mislabelled as complete" loop).
+	if toolName == "read_file" || toolName == "continue_read" {
 		return content
 	}
-	omitted := len(content) - headChars - tailChars
-	head := content[:headChars]
-	tail := content[len(content)-tailChars:]
+	if len(content) <= truncateThreshold {
+		return content
+	}
+	omitted := len(content) - truncateHeadChars - truncateTailChars
+	head := content[:truncateHeadChars]
+	tail := content[len(content)-truncateTailChars:]
 	hint := truncationHint(useID, toolName, args)
 	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", head, omitted, len(content), hint, tail)
 }
@@ -433,12 +429,6 @@ func truncationHint(useID, toolName, args string) string {
 	a := parseArgs(args)
 	viewOut := fmt.Sprintf("call view_output id=%q mode=grep pattern=<regex> (or mode=head / mode=tail with lines=<n>) to retrieve the cached full output without re-running this tool", useID)
 	switch toolName {
-	case "read_file":
-		path := a["path"]
-		if path == "" {
-			return "To see more: " + viewOut + ", OR call read_file again with line=<n> limit=<m> to view a specific range."
-		}
-		return fmt.Sprintf("To see more: %s, OR call read_file path=%q with line=<n> limit=<m> for a specific range, or search_text path=%q pattern=<regex>.", viewOut, path, path)
 	case "web_read", "web_read_raw":
 		u := a["url"]
 		if u == "" {
