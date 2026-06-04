@@ -497,6 +497,17 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
+	// `/<name> <args>` matching an embedded TEMPLATE-<name>.md expands into a
+	// full prompt and runs as a normal turn. A macro that requires an arg ({{}})
+	// but got none stops here with a user-facing note — no model call.
+	if rendered, stopMsg, handled := expandMacro(userText); handled {
+		if stopMsg != "" {
+			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: stopMsg + "\n"}})
+			return PromptResponse{StopReason: "end_turn"}, nil
+		}
+		userText = rendered
+	}
+
 	// The empty-project hint stays folded into the first user message because
 	// it's a one-shot nudge — once the project has files, we want the
 	// summariser to drop it naturally rather than re-injecting it forever.
@@ -534,6 +545,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
+	if sess != nil {
+		sess.resetTurnStats(time.Now())
+	}
 	result, err := a.orchestrate(ctx, req.SessionId)
 	if err != nil {
 		if isCancelled(err) {
@@ -554,6 +568,15 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// The epilogue here only fires background work that observes the
 	// now-complete transcript.
 	if sess != nil && result.Text != "" {
+		// The turn verified clean: report active wall-clock (elapsed minus time
+		// blocked on user-input cards) and total tokens spent (foreground +
+		// background LLM calls). Emitted before the background epilogue so the
+		// numbers reflect the turn the user just watched.
+		if activeMs, prompt, completion := sess.turnStats(); activeMs > 0 {
+			line := fmt.Sprintf("✅ Done in %.1fs · %d tokens (%d prompt + %d completion)\n",
+				float64(activeMs)/1000, prompt+completion, prompt, completion)
+			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
+		}
 		// Per-subtask backgroundSummarise already fires inside orchestrate
 		// for every subtask iteration; the final pair is covered too, so we
 		// don't double-summarise here.

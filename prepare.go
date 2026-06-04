@@ -111,6 +111,7 @@ func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
 		return
 	}
 	slog.Debug("prepare: start", "sid", sid, "cwd", sess.Cwd)
+	a.sendAvailableCommands(ctx, sid) // re-advertise the slash-macro menu each turn
 	llmChanged := a.ensureLLM(ctx, sess, sid)
 	envChanged, envProblems := a.checkEnv(sess, sid)
 	mcpChanged, mcpProblems := a.checkMCP(ctx, sess, sid)

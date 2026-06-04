@@ -189,6 +189,15 @@ func isUnknownSessionErr(err error) bool {
 }
 
 func (a *AgentSideConnection) doPermissionRequest(ctx context.Context, r permissionRequest) (string, error) {
+	// Every interactive card blocks here waiting on the user; record that span
+	// so the turn's "✅ Done" line can exclude it from active time. (Auto-answer
+	// paths never reach here — they return before calling conn.Ask*.)
+	start := time.Now()
+	defer func() {
+		if sess := a.agent.getSession(r.SessionId); sess != nil {
+			sess.addHumanWait(time.Since(start))
+		}
+	}()
 	var raw json.RawMessage
 	var err error
 	for attempt := 0; attempt <= len(unknownSessionBackoffs); attempt++ {

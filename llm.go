@@ -283,10 +283,13 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// harmless and keeps subagent telemetry honest. sid="" (probes/tests)
 	// has no session, skip. On a scan failure the stream broke before the
 	// usage chunk, so promptTokens is 0 and this is a no-op anyway.
-	if scanErr == nil && promptTokens > 0 {
-		if sess := a.getSession(sid); sess != nil {
+	if sess := a.getSession(sid); sess != nil {
+		if scanErr == nil && promptTokens > 0 {
 			sess.SetLastCompletePromptTokens(promptTokens)
 		}
+		// Sum every call's usage into the turn so the "✅ Done" line reports total
+		// tokens (foreground + background); 0/0 when the backend reports no usage.
+		sess.addTurnTokens(promptTokens, completionTokens)
 	}
 
 	// One outcome error, shared by the RESPONSE log block and the return:

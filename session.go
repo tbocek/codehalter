@@ -281,6 +281,60 @@ type Session struct {
 	// compressHistory's read.
 	lastTokensMu             sync.Mutex
 	lastCompletePromptTokens int
+
+	// Per-turn stats for the "✅ Done" line: reset at Prompt start, summed
+	// during the turn, read at the end. turnStart is wall-clock; turnHumanWaitMs
+	// is time blocked on user-input cards (doPermissionRequest) so it can be
+	// subtracted out; turn*Tokens sum every llmStream call's reported usage.
+	// Guarded by turnStatsMu — background goroutines (summariser, git-commit)
+	// add tokens concurrently with the foreground turn.
+	turnStatsMu          sync.Mutex
+	turnStart            time.Time
+	turnHumanWaitMs      int64
+	turnPromptTokens     int
+	turnCompletionTokens int
+}
+
+// resetTurnStats starts a fresh per-turn measurement window at start.
+func (s *Session) resetTurnStats(start time.Time) {
+	s.turnStatsMu.Lock()
+	s.turnStart = start
+	s.turnHumanWaitMs = 0
+	s.turnPromptTokens = 0
+	s.turnCompletionTokens = 0
+	s.turnStatsMu.Unlock()
+}
+
+// addTurnTokens adds one llmStream call's server-reported usage to the turn.
+func (s *Session) addTurnTokens(prompt, completion int) {
+	s.turnStatsMu.Lock()
+	s.turnPromptTokens += prompt
+	s.turnCompletionTokens += completion
+	s.turnStatsMu.Unlock()
+}
+
+// addHumanWait records time spent blocked on a user-input card so it can be
+// excluded from the turn's active time.
+func (s *Session) addHumanWait(d time.Duration) {
+	s.turnStatsMu.Lock()
+	s.turnHumanWaitMs += d.Milliseconds()
+	s.turnStatsMu.Unlock()
+}
+
+// turnStats returns the active wall-clock for the current turn (elapsed minus
+// time spent waiting on the user) and the summed token usage. activeMs is 0
+// before the first resetTurnStats.
+func (s *Session) turnStats() (activeMs int64, promptTokens, completionTokens int) {
+	s.turnStatsMu.Lock()
+	defer s.turnStatsMu.Unlock()
+	if s.turnStart.IsZero() {
+		return 0, 0, 0
+	}
+	activeMs = time.Since(s.turnStart).Milliseconds() - s.turnHumanWaitMs
+	if activeMs < 0 {
+		activeMs = 0
+	}
+	return activeMs, s.turnPromptTokens, s.turnCompletionTokens
 }
 
 // SetLastCompletePromptTokens records the server-reported prompt_tokens for
