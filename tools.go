@@ -295,7 +295,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	if multimodal != nil {
 		return tu, multimodal
 	}
-	return tu, truncateForLLM(useID, tc.Function.Name, tc.Function.Arguments, result)
+	return tu, liveToolOutput(useID, tc.Function.Name, tc.Function.Arguments, result)
 }
 
 type toolCallUpdate struct {
@@ -389,27 +389,32 @@ const (
 	truncateTailChars = 600
 )
 
+// liveToolOutput is the model-visible content for a tool call as it executes.
+// read_file / continue_read / search_text manage their OWN size (line chunks /
+// bounded match lists), so their live output passes through whole — byte-
+// clipping them cut mid-line / sliced match blocks. Every other tool gets the
+// head/tail byte cap. This is LIVE only: history.go re-renders stored outputs
+// through truncateForLLM directly, which truncates everything — an old read or
+// search must NOT sit at full size in every later request (that ballooned the
+// context past n_ctx; the model can re-read / view_output if it needs it again).
+func liveToolOutput(useID, toolName, args, content string) string {
+	switch toolName {
+	case "read_file", "continue_read", "search_text":
+		return content
+	}
+	return truncateForLLM(useID, toolName, args, content)
+}
+
 // truncateForLLM returns content unchanged if short; otherwise emits a
 // head/tail-shaped slice with a per-tool "to see more" hint in the middle.
 // useID is the ToolUse handle the caller just assigned — embedded in the hint
 // so the model can `view_output id=useID mode=grep pattern=…` to retrieve any
 // portion of the original without re-running the underlying tool. toolName +
 // args let the hint name the exact alternate follow-up call (e.g. read_file
-// path+line, web_read url+offset) so the model doesn't have to reconstruct
-// what it just asked about. Used by runToolCall on live execution and by
-// history.go when re-rendering stored tool outputs into the message stream.
+// path+line, web_read url+offset) so the model doesn't have to reconstruct what
+// it just asked about. Used by history.go when re-rendering stored tool outputs
+// (always truncates) and by liveToolOutput for the non-exempt live tools.
 func truncateForLLM(useID, toolName, args, content string) string {
-	// read_file / continue_read do their own line-aware chunking (serveRead),
-	// serving up to readChunkLines whole lines with a continue_read pointer — so
-	// they must NOT be byte-clipped here (that cut mid-line and re-introduced the
-	// "partial mislabelled as complete" loop). search_text is a LIST of matches
-	// with context blocks, bounded by maxSearchResults; head+tail byte-clipping
-	// would slice blocks mid-way and drop the middle matches, so it's exempt too —
-	// the right bound for a match list is the match count, not a byte window.
-	switch toolName {
-	case "read_file", "continue_read", "search_text":
-		return content
-	}
 	if len(content) <= truncateThreshold {
 		return content
 	}
