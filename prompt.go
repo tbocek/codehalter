@@ -572,11 +572,24 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			// ctx for the notice since the request ctx is already cancelled.
 			reason := cancelReason(err)
 			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "reason", reason, "err", err)
-			a.sendUpdate(context.Background(), req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⏹ Turn cancelled — " + reason + ".\n"}})
+			// If a plan card was dismissed (the user typed instead of choosing),
+			// the plan is held in pendingPlan and re-shown after their message —
+			// say so rather than the misleading "cancelled".
+			msg := "⏹ Turn cancelled — " + reason + ".\n"
+			if sess := a.getSession(req.SessionId); sess != nil && sess.pendingPlan != nil {
+				msg = "⏸ Holding the plan — I'll re-show it after your message.\n"
+			}
+			a.sendUpdate(context.Background(), req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: msg}})
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, nil)
 	}
+
+	// If the user dismissed a plan card earlier by typing (e.g. a question), it's
+	// preserved in sess.pendingPlan — now that the typed message has been handled,
+	// re-show it (Execute / Replan / Abort) so the plan isn't thrown away. No-op
+	// when nothing is pending.
+	a.reshowPendingPlan(ctx, req.SessionId)
 
 	// Offer any fix cards the pre-turn checks detected, now that the user's
 	// actual request has run. The freshness checks themselves moved pre-turn
@@ -604,6 +617,13 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	}
 	result, err := a.orchestrate(ctx, sid)
 	if err != nil {
+		// A cancelled turn skips the epilogue below, but it may have grown the
+		// context past the compaction trigger — so compact here too. Background
+		// ctx because the request ctx is already cancelled (same reason Prompt
+		// posts the cancel notice on context.Background()).
+		if sess != nil && isCancelled(err) {
+			a.compressHistory(context.Background(), sess)
+		}
 		return err
 	}
 	if sess == nil || result.Text == "" {
@@ -633,38 +653,45 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
 
-	a.sendPhase(ctx, sid, 0, false)
-	plan, firstToolUses, err := a.runPlanPhase(ctx, sid, "")
-	if err != nil {
-		if isCancelled(err) {
+	var plan *planResult
+	if sess != nil && sess.resumePlan != nil {
+		// Resuming a plan the user dismissed earlier and then chose Execute on
+		// when it was re-shown (see reshowPendingPlan). It was already confirmed
+		// there, so skip planning and the initial confirmPlan — straight to the
+		// subtask loop.
+		plan = sess.resumePlan
+		sess.resumePlan = nil
+	} else {
+		a.sendPhase(ctx, sid, 0, false)
+		p, firstToolUses, err := a.runPlanPhase(ctx, sid, "")
+		if err != nil {
+			if isCancelled(err) {
+				return toolLoopResult{}, err
+			}
+			if sess != nil && len(firstToolUses) > 0 {
+				sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
+				sess.saveOrLog()
+			}
 			return toolLoopResult{}, err
 		}
-		if sess != nil && len(firstToolUses) > 0 {
-			sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
-			sess.saveOrLog()
+		if p == nil {
+			// No PLAN.md or unparseable response — pipeline cannot proceed.
+			return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
 		}
-		return toolLoopResult{}, err
-	}
-	if plan == nil {
-		// No PLAN.md or unparseable response — pipeline cannot proceed.
-		return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
-	}
-	if len(plan.Subtasks) == 0 {
-		// No subtasks means one of two things. (1) The planner answered a pure
-		// lookup directly (report_only): surface that answer — it used to be
-		// silently dropped, leaving the turn blank after "Planning". Returning
-		// it as result.Text also lets Prompt's success epilogue (stats line,
-		// git commit) run. (2) A clarification the user resolved to "no work
-		// needed": no answer prose, so return empty as before.
-		if plan.answer != "" {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: plan.answer + "\n"}})
-			return toolLoopResult{Text: plan.answer}, nil
+		if len(p.Subtasks) == 0 {
+			// No subtasks: (1) a report_only direct answer — surface it (returning
+			// it as result.Text lets Prompt's epilogue run); or (2) a clarification
+			// resolved to "no work needed" — return empty.
+			if p.answer != "" {
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: p.answer + "\n"}})
+				return toolLoopResult{Text: p.answer}, nil
+			}
+			return toolLoopResult{}, nil
 		}
-		return toolLoopResult{}, nil
-	}
-
-	if err := a.confirmPlan(ctx, sid, plan, false); err != nil {
-		return toolLoopResult{}, err
+		if err := a.confirmPlan(ctx, sid, p, false); err != nil {
+			return toolLoopResult{}, err
+		}
+		plan = p
 	}
 
 	var lastResult toolLoopResult
@@ -786,12 +813,32 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 		return nil
 	}
 
+	// Remember the plan: if the user dismisses this card (types a question
+	// instead of choosing) Prompt re-shows it after handling the typed message,
+	// so a question doesn't throw the plan away. Cleared below on any real choice.
+	if sess := a.getSession(sid); sess != nil {
+		sess.pendingPlan = plan
+	}
+
 	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
 	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Execute", "Automatic"})
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
 	sess := a.getSession(sid)
-	if err != nil || choice == "abort" {
+	if err != nil {
+		// Card dismissed (the user typed instead of choosing) — keep pendingPlan
+		// set so Prompt re-shows it once the typed message is handled.
+		appendAssistantNote(sess, "User dismissed the plan card.")
+		if sess != nil {
+			sess.saveOrLog()
+		}
+		return errUserCancelled
+	}
+	// A real choice was made — this plan is decided, drop the pending copy.
+	if sess != nil {
+		sess.pendingPlan = nil
+	}
+	if choice == "abort" {
 		appendAssistantNote(sess, "User declined execution.")
 		if sess != nil {
 			sess.saveOrLog()
@@ -806,6 +853,65 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[Automatic] Running without further interruption.\n\n"}})
 	}
 	return nil
+}
+
+// reshowPendingPlan re-presents a plan whose confirmation card the user
+// dismissed earlier (by typing a question instead of choosing), now that the
+// typed message has been handled. Offers Execute (run that plan as-is, no
+// re-planning), Replan (plan again — the conversation now includes the Q&A, so
+// the question can reshape it), or Abort. No "Automatic" — the user is actively
+// reviewing. No-op when nothing is pending. Called from Prompt after a turn.
+func (a *agent) reshowPendingPlan(ctx context.Context, sid string) {
+	sess := a.getSession(sid)
+	if sess == nil || sess.pendingPlan == nil {
+		return
+	}
+	plan := sess.pendingPlan
+
+	if len(plan.Subtasks) > 0 {
+		var b strings.Builder
+		b.WriteString("Pending plan (from before your question):")
+		b.WriteByte('\n')
+		for i, st := range plan.Subtasks {
+			fmt.Fprintf(&b, "%d. %s\n", i+1, st.Description)
+		}
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
+	}
+
+	tcId := a.StartToolCall(ctx, sid, "Run the earlier plan now?", "think", nil)
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Execute", "Replan"})
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
+	if err != nil {
+		// Dismissed again (another question) — leave pendingPlan set for next turn.
+		return
+	}
+	sess.pendingPlan = nil
+
+	switch choice {
+	case "Execute":
+		// Hand the exact plan back to orchestrate, which skips planning + confirm.
+		sess.resumePlan = plan
+		a.runResumedTurn(ctx, sid)
+	case "Replan":
+		// Plain re-plan: the conversation (now with the Q&A) is the planner's
+		// context, so the question reshapes the new plan.
+		a.runResumedTurn(ctx, sid)
+	default: // abort
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Plan discarded.\n"}})
+	}
+}
+
+// runResumedTurn runs a turn dispatched from reshowPendingPlan and surfaces its
+// outcome (Prompt's own runTurn-error handling doesn't cover this nested turn).
+func (a *agent) runResumedTurn(ctx context.Context, sid string) {
+	if err := a.runTurn(ctx, sid); err != nil {
+		if isCancelled(err) {
+			a.sendUpdate(context.Background(), sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⏹ Turn cancelled — " + cancelReason(err) + ".\n"}})
+		} else {
+			slog.Warn("reshowPendingPlan: turn failed", "sid", sid, "err", err)
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ " + err.Error() + "\n"}})
+		}
+	}
 }
 
 // gitCommitFile is the path (relative to cwd) where the background updater

@@ -227,6 +227,14 @@ type Session struct {
 	// busted for a path on write. In-memory only.
 	readCursorMu sync.Mutex
 	readCursor   map[string]int
+	// pendingPlan holds a plan whose "Execute / Automatic / Abort" card the user
+	// dismissed by typing (e.g. asking a question) instead of choosing. Prompt
+	// re-shows it after the typed message is handled, so a question doesn't throw
+	// the plan away. resumePlan is that plan handed back to orchestrate when the
+	// user picks Execute on the re-show, so it runs without re-planning. Both are
+	// foreground-turn-only (no background goroutine touches them), so unguarded.
+	pendingPlan *planResult
+	resumePlan  *planResult
 	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
 	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
 	// of role — cache-coherence trumps per-role sampler matching, the conn
