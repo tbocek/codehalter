@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -417,15 +418,17 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	// llama.cpp's per-slot n_ctx / total_slots, none of which /v1/models exposes.
 	// Non-llama backends 404 here (ok=false) and we keep the /v1/models result.
 	p, ok := a.probeViaProps(probeCtx, conn, "/props")
-	// llama-swap router: its own /props always reports n_ctx=0 (role:"router") —
-	// loading a model doesn't change that, the model's real n_ctx lives behind
-	// /upstream/<model>/props. So when /props is reachable but ctx is 0, read the
-	// upstream's /props, which also auto-loads the model. Its own (longer) timeout
-	// covers a cold load. Scoped to reachable /props so OpenAI/vLLM (which 404
-	// /props and take ctx from settings.toml) never hit this.
+	// llama.cpp router mode (role:"router", models_autoload): bare /props reports
+	// n_ctx=0 — the loaded model's real n_ctx is only returned when the request is
+	// routed to it via the ?model=<id> query param (and that also autoloads the
+	// model). url.QueryEscape is required: ids routinely carry spaces and
+	// semicolons ("Qwen3.5 (122B-A10B; …)") and a raw ';' is a query separator, so
+	// the name would be truncated → "model not found". Own longer timeout covers a
+	// cold load. Scoped to reachable-but-zero /props so direct servers (real n_ctx)
+	// and OpenAI/vLLM (404 /props) are untouched.
 	if ok && p.ContextSize == 0 && p.SlotCtx == 0 {
 		upCtx, upCancel := context.WithTimeout(ctx, 180*time.Second)
-		if up, upOK := a.probeViaProps(upCtx, conn, "/upstream/"+conn.Model+"/props"); upOK {
+		if up, upOK := a.probeViaProps(upCtx, conn, "/props?model="+url.QueryEscape(conn.Model)); upOK {
 			p = up
 		}
 		upCancel()
@@ -529,9 +532,9 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 // probeViaProps reads a llama-server /props endpoint. Tells us the server is
 // reachable and (via modalities.vision) whether the loaded model supports image
 // input, but cannot tell us *which* model is loaded — so ModelKnown stays false.
-// path is "/props" for a direct llama-server, or "/upstream/<model>/props" to
-// reach the real model behind a llama-swap router (whose own /props always
-// reports n_ctx=0).
+// path is "/props" for a direct llama-server, or "/props?model=<url-encoded id>"
+// to reach a specific model in llama.cpp router mode (whose bare /props reports
+// n_ctx=0).
 func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection, path string) (probeResult, bool) {
 	propsURL := conn.endpoint(path)
 	req, err := http.NewRequestWithContext(ctx, "GET", propsURL, nil)

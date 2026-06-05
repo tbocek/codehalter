@@ -261,40 +261,43 @@ func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	}
 }
 
-// TestProbeAllLLMsRouterUpstreamProps pins the llama-swap fix: the router's own
-// /props always reports n_ctx=0 (role:"router") — even with a model loaded — so
-// probeLLM must read /upstream/<model>/props to get the real per-slot n_ctx +
-// total_slots (that path also auto-loads the model). Without it the n_ctx-unknown
-// gate would block forever.
-func TestProbeAllLLMsRouterUpstreamProps(t *testing.T) {
-	var upstreamHit atomic.Bool
+// TestProbeAllLLMsRouterModelProps pins the llama.cpp router-mode fix: bare /props
+// reports n_ctx=0 (role:"router"), and the real per-slot n_ctx is only returned
+// when the request is routed to the model via ?model=<id>. The id here carries a
+// space and a semicolon ("q3 (a; b)") to prove the query is encoded — a raw ';'
+// is a query separator that would truncate the name to "model not found".
+func TestProbeAllLLMsRouterModelProps(t *testing.T) {
+	const modelID = "q3 (a; b)"
+	var gotModel atomic.Pointer[string] // written from the handler goroutine
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/v1/models"):
-			_, _ = w.Write([]byte(`{"data":[{"id":"qwen"}]}`))
-		case strings.Contains(r.URL.Path, "/upstream/qwen/props"):
-			upstreamHit.Store(true) // real model props behind the router (auto-loads)
-			fmt.Fprint(w, `{"default_generation_settings":{"n_ctx":16384},"total_slots":2}`)
+			_, _ = w.Write([]byte(`{"data":[{"id":"q3"}]}`))
 		case strings.HasSuffix(r.URL.Path, "/props"):
-			fmt.Fprint(w, `{"role":"router","model_path":"none","default_generation_settings":{"n_ctx":0},"total_slots":0}`)
+			if m := r.URL.Query().Get("model"); m != "" {
+				gotModel.Store(&m) // real model props (router routed by ?model=)
+				fmt.Fprint(w, `{"default_generation_settings":{"n_ctx":16384},"total_slots":2}`)
+			} else {
+				fmt.Fprint(w, `{"role":"router","default_generation_settings":{"n_ctx":0},"total_slots":0}`)
+			}
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer ts.Close()
 
-	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen"}}}}
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: modelID}}}}
 	a.probeAllLLMs(context.Background())
 
-	if !upstreamHit.Load() {
-		t.Fatal("never read /upstream/qwen/props — router /props (n_ctx=0) was taken at face value")
+	if got := gotModel.Load(); got == nil || *got != modelID {
+		t.Fatalf("router ?model= param: got %v, want %q (encoding bug truncates at ';')", got, modelID)
 	}
 	if got := a.settings.LLM[0].Parallel; got != 2 {
-		t.Errorf("Parallel: got %d, want 2 (from upstream /props total_slots)", got)
+		t.Errorf("Parallel: got %d, want 2 (from ?model= /props total_slots)", got)
 	}
 	if a.mainSlotTokens != 16384 {
-		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from upstream /props)", a.mainSlotTokens)
+		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from ?model= /props)", a.mainSlotTokens)
 	}
 }
 
