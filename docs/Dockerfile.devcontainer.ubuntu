@@ -19,13 +19,11 @@ RUN install -d -m 0755 /etc/apt/keyrings \
     && apt-get install -y --no-install-recommends firefox \
     && rm -rf /var/lib/apt/lists/*
 
-COPY .devcontainer/.uid .devcontainer/.gid /tmp/
 RUN userdel -r ubuntu 2>/dev/null || true \
-    && groupadd --gid "$(cat /tmp/.gid)" dev \
-    && useradd --uid "$(cat /tmp/.uid)" --gid "$(cat /tmp/.gid)" -m -s /bin/bash dev \
+    && groupadd --gid 1000 dev \
+    && useradd --uid 1000 --gid 1000 -m -s /bin/bash dev \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
-    && install -d -o dev -g dev /home/dev/.config \
-    && rm -f /tmp/.uid /tmp/.gid
+    && install -d -o 1000 -g 1000 /home/dev/.config
 
 ENV GOBIN=/usr/local/bin
 ENV GOTOOLCHAIN=auto
