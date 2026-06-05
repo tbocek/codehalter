@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 )
 
 var skipDirs = map[string]bool{
@@ -37,22 +37,8 @@ const (
 // model sees. tcId is the already-started tool-call card to complete/fail.
 func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines int, tcId string) (string, bool) {
 	sess := a.getSession(sid)
-
-	// Dedup: same path+window, file unchanged this turn → still return the bytes
-	// (small models ignore "scroll back"), but lead with a note steering to
-	// continue_read so a re-read becomes forward progress. Busted on write.
 	// Key format is contractual: fsWrite busts entries by `path+"|"` prefix.
 	dedupKey := fmt.Sprintf("%s|%d|%d", path, start, maxLines)
-	var dedupNote string
-	if sess != nil {
-		sess.readDedupMu.Lock()
-		if prev, ok := sess.readDedup[dedupKey]; ok {
-			if st, e := os.Stat(path); e == nil && st.ModTime().Equal(prev.mtime) && st.Size() == prev.size {
-				dedupNote = fmt.Sprintf("[note: %s — you read %s from line %d earlier this turn and it has NOT changed. Re-reading the same window makes no progress; for MORE of the file call continue_read path=%q.]", readUnchangedMarker, path, start, path)
-			}
-		}
-		sess.readDedupMu.Unlock()
-	}
 
 	// Read one line past the window so we can tell whether the file continues.
 	fetch := maxLines + 1
@@ -61,16 +47,6 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return "error: " + err.Error(), false
-	}
-	if sess != nil {
-		if st, e := os.Stat(path); e == nil {
-			sess.readDedupMu.Lock()
-			if sess.readDedup == nil {
-				sess.readDedup = map[string]readDedupEntry{}
-			}
-			sess.readDedup[dedupKey] = readDedupEntry{mtime: st.ModTime(), size: st.Size()}
-			sess.readDedupMu.Unlock()
-		}
 	}
 
 	// Served line count (a trailing partial line with no final newline counts),
@@ -93,6 +69,29 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	end := start
 	if served > 0 {
 		end = start + served - 1
+	}
+
+	// Dedup on the ACTUAL served bytes, not a stat proxy: only flag a re-read as
+	// redundant when the content is byte-identical to what this same window
+	// served earlier this turn. A re-read that returns new bytes (an unsaved Zed
+	// buffer, a coarse-mtime filesystem) is NOT redundant and must not trip the
+	// loop's redundant-fetch guard. Still return the bytes (small models ignore
+	// "scroll back"), but lead with a note steering to continue_read. fsWrite
+	// clears a path's entries on write, so a post-edit re-read starts fresh.
+	var dedupNote string
+	if sess != nil {
+		h := fnv.New64a()
+		h.Write([]byte(content))
+		sum := h.Sum64()
+		sess.readDedupMu.Lock()
+		if prev, ok := sess.readDedup[dedupKey]; ok && prev.hash == sum {
+			dedupNote = fmt.Sprintf("[note: %s — you read %s from line %d earlier this turn and it has NOT changed. Re-reading the same window makes no progress; for MORE of the file call continue_read path=%q.]", readUnchangedMarker, path, start, path)
+		}
+		if sess.readDedup == nil {
+			sess.readDedup = map[string]readDedupEntry{}
+		}
+		sess.readDedup[dedupKey] = readDedupEntry{hash: sum}
+		sess.readDedupMu.Unlock()
 	}
 
 	// Advance the cursor while the file continues; clear it at EOF.
@@ -141,21 +140,20 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	return out, false
 }
 
-// readDedupEntry remembers a successful read_file outcome so a literal-repeat
-// call can short-circuit. We compare the file's current mtime+size against
-// what we saw last time; when they match, the model already has this content
-// in its tool-call history and should not pay for another read.
+// readDedupEntry holds the fnv hash of the bytes a read_file/continue_read
+// window last served. A later read of the same window whose content hashes
+// identically is a true literal repeat — the model already has those exact
+// bytes in its tool-call history.
 type readDedupEntry struct {
-	mtime time.Time
-	size  int64
+	hash uint64
 }
 
 // readUnchangedMarker is a stable phrase the dedup note carries when a read is a
 // literal repeat of unchanged content. runToolLoop scans tool output for it to
 // inject a corrective on the FIRST redundant fetch — catching the interleaved
 // re-read pattern (read, search, read, read) that the consecutive-repeat nudge
-// misses. Only present when the mtime+size guard confirmed no change, so a
-// legitimate post-edit re-read (dedup busted, fresh content) never trips it.
+// misses. Only present when the served bytes hashed identically to a prior read
+// of the same window, so a re-read that returns fresh content never trips it.
 const readUnchangedMarker = "already in your context and unchanged"
 
 // listProjectFiles returns relative paths of all files under root, skipping

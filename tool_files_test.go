@@ -116,3 +116,23 @@ func TestServeReadDedupOnUnchangedReread(t *testing.T) {
 		t.Errorf("re-read of an unchanged window should carry the unchanged marker:\n%s", out)
 	}
 }
+
+// TestServeReadFreshBytesNotFlagged pins the content-based dedup: when a re-read
+// of the same window returns different bytes, it is NOT redundant — even though
+// the dedup entry from the prior read still exists. (Rewriting via os.WriteFile
+// rather than fsWrite leaves the entry in place, so only the hash comparison
+// keeps this from being a false redundant-fetch.)
+func TestServeReadFreshBytesNotFlagged(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.Depth = 1
+	ctx := context.Background()
+	path := filepath.Join(s.Cwd, "f.txt")
+	writeLines(t, path, 10)
+
+	a.serveRead(ctx, s.ID, path, 1, readChunkLines, "tc1")
+	writeLines(t, path, 12) // content changes; dedup entry NOT busted
+	out, _ := a.serveRead(ctx, s.ID, path, 1, readChunkLines, "tc2")
+	if strings.Contains(out, readUnchangedMarker) {
+		t.Errorf("a re-read returning fresh bytes must not be flagged redundant:\n%s", out)
+	}
+}
