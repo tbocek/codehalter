@@ -945,40 +945,6 @@ func TestConcurrentSessionWritesAreRaceFree(t *testing.T) {
 	}
 }
 
-// TestReadChunking verifies the line-aware chunking helpers serveRead uses:
-// countLines is correct with and without a trailing newline, and firstNLines
-// returns exactly the leading n lines (or the whole string when it's shorter),
-// which is how a read is trimmed to readChunkLines before continue_read pages on.
-func TestReadChunking(t *testing.T) {
-	// countLines: trailing newline and not.
-	if got := countLines("a\nb\nc\n"); got != 3 {
-		t.Errorf("countLines trailing-newline: got %d, want 3", got)
-	}
-	if got := countLines("a\nb\nc"); got != 3 {
-		t.Errorf("countLines no-trailing-newline: got %d, want 3", got)
-	}
-	if got := countLines(""); got != 0 {
-		t.Errorf("countLines empty: got %d, want 0", got)
-	}
-
-	// firstNLines trims to exactly n leading lines, newlines preserved.
-	body := strings.Repeat("x\n", readChunkLines+50) // 200 lines
-	chunk := firstNLines(body, readChunkLines)
-	if got := countLines(chunk); got != readChunkLines {
-		t.Errorf("firstNLines: served %d lines, want %d", got, readChunkLines)
-	}
-	if chunk != strings.Repeat("x\n", readChunkLines) {
-		t.Errorf("firstNLines content mismatch")
-	}
-
-	// Shorter-than-n input is returned unchanged (read fits in one chunk → no
-	// continue_read needed).
-	short := "a\nb\nc\n"
-	if firstNLines(short, readChunkLines) != short {
-		t.Errorf("firstNLines should return a short input unchanged")
-	}
-}
-
 // TestPrefixStableAcrossTurns is the cache-correctness contract: a second
 // Prompt() turn must reproduce the previous turn's wire bytes byte-for-byte
 // for every message that's already on record. llama.cpp / vLLM / etc. only

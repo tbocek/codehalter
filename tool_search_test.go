@@ -9,6 +9,27 @@ import (
 	"testing"
 )
 
+// TestFormatMatchBlock pins the search-result rendering: file:line header, the
+// match line marked ">", context clamped at the file bounds, and a bare
+// file:line fallback when there were no lines to render context from.
+func TestFormatMatchBlock(t *testing.T) {
+	lines := []string{"a", "b", "c", "d", "e"}
+
+	got := formatMatchBlock("f.go", lines, 3, 2)
+	if want := "f.go:3\n  1| a\n  2| b\n> 3| c\n  4| d\n  5| e\n"; got != want {
+		t.Errorf("middle match:\ngot  %q\nwant %q", got, want)
+	}
+
+	got = formatMatchBlock("f.go", lines, 1, 2)
+	if want := "f.go:1\n> 1| a\n  2| b\n  3| c\n"; got != want {
+		t.Errorf("top match (context clamped):\ngot  %q\nwant %q", got, want)
+	}
+
+	if got := formatMatchBlock("f.go", nil, 7, 2); got != "f.go:7" {
+		t.Errorf("no-context fallback: got %q, want %q", got, "f.go:7")
+	}
+}
+
 // TestSearchInFileMatchers verifies the matcher callback cleanly swaps
 // literal substring and regex behavior. Literal mode treats '.' as a dot;
 // regex mode treats it as any-char.

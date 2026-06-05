@@ -3,8 +3,34 @@ package main
 import (
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 )
+
+// TestLiveVsHistoryTruncation pins the split that caused (then fixed) the
+// history bloat that pushed requests past n_ctx: read_file / continue_read /
+// search_text pass through whole LIVE (they manage their own size), but the
+// SAME output is byte-clipped when re-rendered from history, so an old read
+// can't sit at full size in every later request.
+func TestLiveVsHistoryTruncation(t *testing.T) {
+	big := strings.Repeat("x", truncateThreshold*3)
+
+	for _, tool := range []string{"read_file", "continue_read", "search_text"} {
+		if got := liveToolOutput("tu_1", tool, "{}", big); got != big {
+			t.Errorf("liveToolOutput(%s) clipped a size-managing tool (len %d, want %d)", tool, len(got), len(big))
+		}
+	}
+	if got := liveToolOutput("tu_1", "run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
+		t.Errorf("liveToolOutput(run_command) should clip a non-exempt tool")
+	}
+	// History re-render clips everything, including the live-exempt tools.
+	if got := truncateForLLM("tu_1", "read_file", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
+		t.Errorf("truncateForLLM must clip read_file in history (regression guard)")
+	}
+	if got := truncateForLLM("tu_1", "run_command", "{}", "small"); got != "small" {
+		t.Errorf("short content should pass through, got %q", got)
+	}
+}
 
 func toolDef(name string) map[string]any {
 	return map[string]any{

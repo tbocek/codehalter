@@ -28,28 +28,6 @@ const (
 	maxReadBytes   = 200 * 1024 // byte safety for minified / very long lines
 )
 
-// countLines counts lines in s; a trailing partial line (no final newline) counts.
-func countLines(s string) int {
-	if s == "" {
-		return 0
-	}
-	n := strings.Count(s, "\n")
-	if !strings.HasSuffix(s, "\n") {
-		n++
-	}
-	return n
-}
-
-// firstNLines returns the first n lines of s (newlines preserved); s unchanged
-// if it has n or fewer lines.
-func firstNLines(s string, n int) string {
-	lines := strings.SplitAfter(s, "\n")
-	if len(lines) <= n {
-		return s
-	}
-	return strings.Join(lines[:n], "")
-}
-
 // serveRead is the shared body of read_file and continue_read: it reads up to
 // maxLines whole lines of path from 1-based `start`, advances or clears the
 // per-path continue_read cursor, and returns the model-visible output — the
@@ -63,7 +41,8 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	// Dedup: same path+window, file unchanged this turn → still return the bytes
 	// (small models ignore "scroll back"), but lead with a note steering to
 	// continue_read so a re-read becomes forward progress. Busted on write.
-	dedupKey := readDedupKey(path, start, maxLines)
+	// Key format is contractual: fsWrite busts entries by `path+"|"` prefix.
+	dedupKey := fmt.Sprintf("%s|%d|%d", path, start, maxLines)
 	var dedupNote string
 	if sess != nil {
 		sess.readDedupMu.Lock()
@@ -94,10 +73,15 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 		}
 	}
 
-	served := countLines(content)
+	// Served line count (a trailing partial line with no final newline counts),
+	// then clip to maxLines (newlines preserved) when the file ran past the window.
+	served := strings.Count(content, "\n")
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		served++
+	}
 	more := served > maxLines
 	if more {
-		content = firstNLines(content, maxLines)
+		content = strings.Join(strings.SplitAfter(content, "\n")[:maxLines], "")
 		served = maxLines
 	}
 	byteNote := ""
@@ -164,12 +148,6 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 type readDedupEntry struct {
 	mtime time.Time
 	size  int64
-}
-
-// readDedupKey canonicalises (path, line, limit) into a single map key so two
-// equivalent calls collide. Empty line/limit normalise to 0 (whole file).
-func readDedupKey(path string, line, limit int) string {
-	return fmt.Sprintf("%s|%d|%d", path, line, limit)
 }
 
 // readUnchangedMarker is a stable phrase the dedup note carries when a read is a

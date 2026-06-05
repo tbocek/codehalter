@@ -39,16 +39,11 @@ type sseChunk struct {
 		Delta struct {
 			Content   string     `json:"content"`
 			ToolCalls []toolCall `json:"tool_calls"`
-			// ReasoningContent is the chain-of-thought channel emitted by
-			// thinking models (Qwen3, DeepSeek-R1, GPT-OSS, …) when the
-			// upstream server is configured to split <think>…</think> off
-			// the main content stream (llama.cpp `--reasoning-format
-			// deepseek`, vLLM `--reasoning-parser deepseek_r1`, etc.). We
-			// don't merge it into Content because then prefix-cache lookups
-			// would key on a different string than the model actually
-			// generated — but we DO accumulate and log it so a turn that
-			// burns its whole budget thinking reports as "N bytes reasoning,
-			// 0 visible" instead of "(empty response)".
+			// ReasoningContent is the chain-of-thought channel thinking models
+			// emit when the server splits <think>…</think> off the content
+			// stream. Kept OUT of Content (merging would break prefix-cache
+			// keys) but accumulated + logged, so an all-thinking turn reports
+			// "N B reasoning, 0 visible" instead of "(empty response)".
 			ReasoningContent string `json:"reasoning_content"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
@@ -144,14 +139,9 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent…)", slotLabel, upLabel))
 	defer a.setStatus(ctx, sid, "")
 
-	// One meter, one cadence: streamWaitMeter refreshes the phase row once per
-	// second for the whole call. Before the first token it shows "(sent… Ns)" so
-	// a busy/queuing server isn't a frozen "(sent…)"; once bytes arrive it shows
-	// the live "↑up ↓tokens…" estimate. genChars is the running generated-byte
-	// count it reads each tick — written by the scanner loop below, read by the
-	// meter goroutine, so it's atomic. There's no client timeout (a slow
-	// generation is legitimate); if the server drops the connection the scanner
-	// surfaces the transport error directly.
+	// streamWaitMeter (see its doc) refreshes the phase row each second for the
+	// whole call. genChars is the running generated-byte count it reads per tick,
+	// written concurrently by the scanner loop below — hence atomic.
 	var genChars int64
 	waitDone := make(chan struct{})
 	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), &genChars, waitDone)
