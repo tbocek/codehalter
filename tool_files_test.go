@@ -136,3 +136,37 @@ func TestServeReadFreshBytesNotFlagged(t *testing.T) {
 		t.Errorf("a re-read returning fresh bytes must not be flagged redundant:\n%s", out)
 	}
 }
+
+// TestEditFileMissFailsAndSteers pins the edit_file recovery contract: a missed
+// old_text reports failed=true (so it feeds the loop's fail cap) and steers the
+// model to read the region and retry a small edit — never rewrite the whole
+// file. A successful edit stays failed=false.
+func TestEditFileMissFailsAndSteers(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.Depth = 1 // direct disk I/O instead of the ACP wire
+	ctx := context.Background()
+	path := filepath.Join(s.Cwd, "f.go")
+	if err := os.WriteFile(path, []byte("package main\n\nfunc A() {}\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var miss toolCall
+	miss.Function.Name = "edit_file"
+	miss.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func ZZZ() {}","new_text":"x"}`, path)
+	out, failed := a.executeTool(ctx, s.ID, miss)
+	if !failed {
+		t.Errorf("missed old_text: failed=false, want true (must feed the fail cap)")
+	}
+	for _, want := range []string{"not found", "read_file", "whole file"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("miss message missing %q steering:\n%s", want, out)
+		}
+	}
+
+	var hit toolCall
+	hit.Function.Name = "edit_file"
+	hit.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func A() {}","new_text":"func A() { return }"}`, path)
+	if _, failed := a.executeTool(ctx, s.ID, hit); failed {
+		t.Errorf("successful edit: failed=true, want false")
+	}
+}

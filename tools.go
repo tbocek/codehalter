@@ -62,8 +62,10 @@ type Tool struct {
 	// failure (e.g. run_task observed a non-zero exit). It's surfaced as
 	// ToolUse.Failed so the subtask orchestrator can override an LLM
 	// "success=true" when codehalter itself saw the call fail. Most handlers
-	// return (output, false); only run_task and similar truth-bearing tools
-	// set failed=true.
+	// return (output, false); run_task and similar truth-bearing tools set
+	// failed=true on a non-zero exit. edit_file/write_file also set it on a usage
+	// error to feed the loop's fail cap — but runExecutePhase's verdict excludes
+	// file-mutation tools, so a recovered edit doesn't condemn the subtask.
 	Execute func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
 	// Terminal marks a tool as the loop's exit point: when the model invokes
 	// it, the agentic tool loop returns after this batch completes, with the

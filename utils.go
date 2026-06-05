@@ -2,12 +2,22 @@ package main
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 )
+
+// fnvHash returns the 64-bit FNV-1a hash of s — a cheap, deterministic identity
+// for "is this byte-for-byte the content I saw before?" (read dedup, the tool
+// loop's repeat detection). Not cryptographic; collisions are irrelevant here.
+func fnvHash(s string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
+}
 
 // parallel runs fn for each index [0, n) with up to `cap` concurrent
 // goroutines. Callers pass an explicit upper bound matched to the work-list

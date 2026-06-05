@@ -288,7 +288,13 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	}
 	var failedNames []string
 	for _, k := range order {
-		if lastFailed[k] {
+		// edit_file/write_file set Failed on a usage error to feed the loop's
+		// fail cap, but they're NOT truth-bearing verdicts here: a failed edit the
+		// model recovered from (a later edit with corrected text — a different
+		// input, so a different key) must not condemn the subtask, and one it did
+		// NOT recover from is caught by the verify recipe (the changed file won't
+		// build). Only run_task/run_command exit codes are authoritative.
+		if lastFailed[k] && k.name != "edit_file" && k.name != "write_file" {
 			failedNames = append(failedNames, k.name)
 		}
 	}
@@ -374,8 +380,8 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 // maxToolLoopIterations is runToolLoop's hard runaway backstop: a model
 // emitting "different enough" tool calls forever can't spin past it. One
 // iteration is one LLM round-trip; a complex execute pass is usually 10-20, so
-// 100 leaves headroom while still bailing genuine runaways. The signature nudge
-// and per-name escalation catch the common stuck patterns earlier.
+// 100 leaves headroom while still bailing genuine runaways. The repetition
+// ladder catches the common stuck patterns earlier.
 const maxToolLoopIterations = 100
 
 // executeFailCap is the per-subtask budget of FAILED rounds (iterations whose
@@ -391,14 +397,17 @@ const maxToolLoopIterations = 100
 // from one web-blind loop toward more web-capable replan rounds.
 const executeFailCap = 8
 
-// toolNameEscalateThreshold is how many *redundant* calls to one tool name in a
-// loop trigger a switch from the "execute" role to "thinking" — same server
-// (sampler params don't enter the KV cache key, so the prefix cache stays warm),
-// warmer sampler. A call is redundant only when its (name, arguments) pair was
-// already seen this loop, so legitimate fan-out across distinct files doesn't
-// count. Complements the signature nudge (byte-for-byte consecutive repeats);
-// this catches interleaved revisits. One-shot per loop.
-const toolNameEscalateThreshold = 5
+// stuckEscalateRounds / stuckBailRounds drive runToolLoop's repetition ladder.
+// A "stuck round" is an iteration whose every tool call reproduced output it
+// already produced this loop (an unchanged re-read, a re-run command with
+// identical output, a repeated failing call). Consecutive stuck rounds first
+// warm the sampler (switch execute→thinking — same server/model, so the prefix
+// cache stays warm), then bail. Escalate strictly below bail so the warmer
+// sampler always gets a turn before we give up.
+const (
+	stuckEscalateRounds = 3
+	stuckBailRounds     = 5
+)
 
 // toolLoopResult is what an agentic tool loop (runToolLoop) returns.
 type toolLoopResult struct {
@@ -488,20 +497,16 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			sess.MarkLastAssistantTiming(res.StartedAt, res.DurationMs, phase)
 		}
 	}
-	// Repetition state: track the signature of the previous iteration's tool
-	// calls. Two consecutive identical signatures inject a corrective and
-	// give the model one chance to break out; a third (post-nudge) bails.
-	// A different signature resets the streak — natural variation isn't
-	// punished, only tight loops.
-	var lastSig string
-	var sameSigCount int
-	var nudged bool
-	// Per-name redundant-call counts; crossing toolNameEscalateThreshold swaps
-	// conn to the "thinking" role (see the const). toolArgSeen[name] tracks which
-	// argument strings have already been seen, so only genuine revisits count as
-	// redundant — fan-out across distinct files doesn't. One-shot per loop.
-	toolNameCounts := map[string]int{}
-	toolArgSeen := map[string]map[string]bool{}
+	// Repetition ladder state. callOutHash remembers the last output hash of each
+	// (name,args) call this loop; a later call that reproduces it made no progress
+	// (an interleaved revisit counts, not just a consecutive one). A round whose
+	// every call reproduced known output is "stuck"; consecutive stuck rounds
+	// climb one ladder — corrective nudge each round, warm the sampler at
+	// stuckEscalateRounds, bail at stuckBailRounds — and any productive round
+	// resets the streak, so read-after-write and genuine fan-out are never punished.
+	callOutHash := map[string]uint64{}
+	var stuckRounds int
+	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
 	// respondNudged: with a terminal tool (hasTerminal), an empty tool-call list
 	// gets one nudge to call it; a second empty list falls through to the legacy
@@ -510,11 +515,6 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 	// failedRounds counts iterations whose tool batch produced a failure; the
 	// failSoftCap check below bounces the loop once it accumulates too many.
 	var failedRounds int
-	// redundantFetches counts rounds where a tool re-served content the model
-	// already has unchanged this turn (read_file dedup hit). Each one gets a
-	// corrective; a third bails the loop as stuck. Catches the interleaved
-	// re-read pattern the consecutive-repeat nudge can't.
-	var redundantFetches int
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			res.Text = allText.String()
@@ -574,49 +574,6 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			return res, nil
 		}
 
-		// Signature of this iteration's calls: byte-for-byte name(args), joined
-		// by "|". Identical consecutive signatures are the tight-repetition
-		// pathology (same grep / read_file re-run without acting on the result).
-		var sigB strings.Builder
-		for i, c := range calls {
-			if i > 0 {
-				sigB.WriteByte('|')
-			}
-			sigB.WriteString(c.Function.Name)
-			sigB.WriteByte('(')
-			sigB.WriteString(c.Function.Arguments)
-			sigB.WriteByte(')')
-		}
-		sig := sigB.String()
-		if sig != "" && sig == lastSig {
-			sameSigCount++
-		} else {
-			sameSigCount = 1
-			nudged = false
-		}
-		lastSig = sig
-
-		// Third identical call after a nudge → give up: the model had its
-		// recovery chance. A clean error beats waiting for the iteration cap.
-		if sameSigCount >= 3 && nudged {
-			res.Text = allText.String()
-			stampTiming()
-			return res, fmt.Errorf("tool loop stuck on identical call after nudge: %s", truncate(sig, 200))
-		}
-		// Second identical call → nudge once. We still EXECUTE the duplicate
-		// (legitimate read-after-write needs the fresh read to land, even
-		// when its sig matches the prior read), but tack on a user-role
-		// corrective at the end of this iteration so the next LLM round-trip
-		// sees a break-out instruction alongside the (possibly unchanged)
-		// tool result.
-		nudgeThisIter := sameSigCount == 2 && !nudged
-		if nudgeThisIter {
-			nudged = true
-			if sid != "" {
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Repeated tool call detected — nudging the model to try a different action.\n"}})
-			}
-		}
-
 		messages = append(messages, llmMessage{
 			Role:      "assistant",
 			Content:   text,
@@ -631,9 +588,10 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		// failedThisRound flips when any tool in this batch returns Failed=true,
 		// feeding the failSoftCap counter once the batch is done.
 		var failedThisRound bool
-		// redundantThisRound flips when a tool re-served unchanged content the
-		// model already has (read_file dedup hit, flagged via readUnchangedMarker).
-		var redundantThisRound bool
+		// roundStuck stays true only if EVERY call this round reproduced output it
+		// already produced this loop — i.e. the round made no progress (see the
+		// repetition ladder below). A single new/productive call clears it.
+		roundStuck := len(calls) > 0
 
 		for _, tc := range calls {
 			// Subagent sessions don't surface their own UI (Zed doesn't know
@@ -653,8 +611,24 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			if tu.Failed {
 				failedThisRound = true
 			}
-			if strings.Contains(tu.Output, readUnchangedMarker) {
-				redundantThisRound = true
+			// Did this exact (name,args) call reproduce output it already
+			// produced this loop? read_file/continue_read also honour the
+			// content-dedup marker — serveRead prepends a note on a repeat, which
+			// would otherwise defeat the hash on the first re-read. A call that
+			// returns NEW output is progress and clears roundStuck.
+			key := tc.Function.Name + "\x00" + tc.Function.Arguments
+			h := fnvHash(tu.Output)
+			repeated := false
+			if prev, ok := callOutHash[key]; ok && prev == h {
+				repeated = true
+			}
+			callOutHash[key] = h
+			if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read") &&
+				strings.Contains(tu.Output, readUnchangedMarker) {
+				repeated = true
+			}
+			if !repeated {
+				roundStuck = false
 			}
 			if hasTerminal && tc.Function.Name == termName && !terminalCalled {
 				terminalCalled = true
@@ -683,8 +657,8 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 
 		// Terminal tool called: stream the message to the UI as one chunk
 		// (the model emitted it as tool arguments, which never went through
-		// the text-stream callback) and exit. The same-sig nudge and per-name
-		// escalation below are skipped — this turn is over.
+		// the text-stream callback) and exit. The repetition ladder below is
+		// skipped — this turn is over.
 		if terminalCalled {
 			if on != nil && terminalMessage != "" {
 				on(terminalMessage)
@@ -710,79 +684,49 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			}
 		}
 
-		// If this iteration was flagged as a repeat, append a corrective
-		// user message after the tool results so the model sees the nudge
-		// alongside the (often unchanged) output it just got back.
-		if nudgeThisIter {
-			messages = append(messages, llmMessage{
-				Role: "user",
-				Content: "You just repeated the same tool call with the same arguments. Re-running rarely produces new information. Either:\n" +
-					"1. Act on the output you already have (edit a file, run a different command, or summarise your finding), or\n" +
-					"2. If you are stuck or the task is infeasible, say so and stop.\n\n" +
-					"Do not call the same tool with the same arguments again unless you have first changed state that the call observes (e.g. a file you just edited).",
-			})
+		// Repetition ladder. A round where every call reproduced known output is
+		// "stuck"; any productive round resets the streak. Consecutive stuck
+		// rounds climb one ladder so the recovery step (warming the sampler)
+		// always gets a turn before we give up.
+		if !roundStuck {
+			stuckRounds = 0
+			continue
 		}
-
-		// Redundant-fetch corrective: a tool re-served content the model already
-		// has unchanged this turn. Unlike nudgeThisIter (consecutive byte-identical
-		// calls), this fires even when the re-read is interleaved with other calls
-		// — the pattern that let a document phase re-read one README four times.
-		// React on the FIRST redundant fetch; a third bails the loop as stuck.
-		if redundantThisRound {
-			redundantFetches++
-			if redundantFetches >= 3 {
-				// Don't hard-error the whole turn over re-reads — exit the loop
-				// cleanly. In execute this surfaces as RespondCalled=false → the
-				// subtask replans; in plan, runPlanPhase salvages what's there. A
-				// scary "An Error Happened" for a re-read loop is worse than letting
-				// the normal failure paths handle it.
-				res.Text = allText.String()
-				stampTiming()
-				return res, nil
-			}
-			messages = append(messages, llmMessage{
-				Role: "user",
-				Content: "You just re-read a file already in this turn's tool history — re-reading returns the same bytes, so it makes no progress. " +
-					"If the read was marked PARTIAL and you need more, call continue_read with the file path for the next chunk (or search_text for a specific part) — do NOT re-read the whole file. " +
-					"Otherwise use what you already have and move on.",
-			})
+		stuckRounds++
+		if stuckRounds >= stuckBailRounds {
+			// Give up gracefully (RespondCalled=false): in execute this surfaces
+			// as a failed subtask → replan (where web tools + a fresh
+			// decomposition open up); in plan, runPlanPhase salvages what's
+			// there. A scary hard error for a re-read loop is worse than letting
+			// the normal failure paths run.
+			res.Text = allText.String()
+			stampTiming()
+			return res, nil
 		}
-
-		// Per-name escalation: redundant calls to the same tool (same args
-		// seen before) mean the sampler is too cold to abandon a stuck plan.
-		// Distinct args don't count — surveying many files via read_file
-		// doesn't trip this. Switch to the "thinking" role's params — same
-		// URL/model so the prefix cache survives — and let the warmer
-		// sampler pick a different action. One-shot per loop. Skip entirely
-		// when conn.Tag is already "thinking" (plan phase): the swap would be
-		// a no-op and the warning would mislead.
-		if !escalated && conn != nil && conn.Tag != "thinking" {
-			for _, c := range calls {
-				seen := toolArgSeen[c.Function.Name]
-				if seen == nil {
-					seen = map[string]bool{}
-					toolArgSeen[c.Function.Name] = seen
-				}
-				if seen[c.Function.Arguments] {
-					toolNameCounts[c.Function.Name]++
-				} else {
-					seen[c.Function.Arguments] = true
-				}
-			}
-			for name, n := range toolNameCounts {
-				if n < toolNameEscalateThreshold {
-					continue
-				}
-				thinkConn := a.connForSession(ctx, sid, "thinking")
-				if thinkConn == nil {
-					break
-				}
+		if !nudgedUI && sid != "" {
+			nudgedUI = true
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Repeating with no new information — nudging the model to change course.\n"}})
+		}
+		// Corrective alongside the (unchanged) tool results, so the next round
+		// sees the break-out instruction next to the output it just got back.
+		messages = append(messages, llmMessage{
+			Role: "user",
+			Content: "Your last tool call(s) returned output you already have — that makes no progress. Do NOT repeat them. Instead:\n" +
+				"1. If a read came back PARTIAL and you need more, call continue_read for the next chunk — never re-read the same window, never rewrite a whole file.\n" +
+				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n" +
+				"3. If you are stuck or the task is infeasible, say so and stop.",
+		})
+		// Mid-ladder recovery: warm the sampler once before the bail. Same
+		// server/model (sampler params don't enter the KV cache key, so the
+		// prefix cache survives); the "thinking" role's params let it abandon the
+		// stuck plan. Skip when already on "thinking" (plan phase) — a no-op swap.
+		if stuckRounds >= stuckEscalateRounds && !escalated && conn != nil && conn.Tag != "thinking" {
+			if thinkConn := a.connForSession(ctx, sid, "thinking"); thinkConn != nil {
 				conn = thinkConn
 				escalated = true
 				if sid != "" {
-					a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Tool '%s' invoked %d× this loop — switching to thinking sampler to break out.\n", name, n)}})
+					a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Still repeating — switching to the thinking sampler to break out.\n"}})
 				}
-				break
 			}
 		}
 	}

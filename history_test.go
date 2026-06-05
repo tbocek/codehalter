@@ -572,7 +572,13 @@ func TestToolLoopNoDedup(t *testing.T) {
 // must keep working) but appends a user-role nudge; the third identical
 // call bails before executing. ~3 iterations of stuck behavior fails
 // fast instead of waiting for the 50-iter cap.
-func TestToolLoopRepeatNudgeAndBail(t *testing.T) {
+// TestToolLoopRepetitionLadder exercises the unified repeat ladder end to end: a
+// tool that returns identical output every call makes no progress, so consecutive
+// rounds climb ONE ladder — a corrective nudge each stuck round, a one-shot swap
+// to the thinking sampler at stuckEscalateRounds, then a GRACEFUL bail (nil error,
+// RespondCalled=false) at stuckBailRounds. Replaces the old separate
+// signature-nudge/bail and per-name-escalation guards.
+func TestToolLoopRepetitionLadder(t *testing.T) {
 	withFreshToolRegistry(t)
 	const toolName = "test_probe_a3f"
 	var execs int
@@ -586,57 +592,84 @@ func TestToolLoopRepeatNudgeAndBail(t *testing.T) {
 		},
 		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 			execs++
-			return "result", false
+			return "same result", false
 		},
 	})
 
-	mock := newMockLLM(t,
-		sseToolCall("c1", toolName, `{}`),
-		sseToolCall("c2", toolName, `{}`),
-		sseToolCall("c3", toolName, `{}`),
-	)
+	// Identical call every round → identical output → stuck from round 2 on.
+	// 8 queued is more than enough; the loop bails at round 6 (stuckBailRounds).
+	var resp []string
+	for i := 0; i < 8; i++ {
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), toolName, `{}`))
+	}
+	mock := newMockLLM(t, resp...)
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	_, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+	a.settings = Settings{
+		LLM: []LLMConnection{{
+			Server:         mock.ts.URL,
+			Model:          "test-model",
+			ParamsExecute:  map[string]any{"temperature": 0.3},
+			ParamsThinking: map[string]any{"temperature": 1.0},
+		}},
+	}
+	conn := a.connForSession(context.Background(), s.ID, "execute")
+	if conn == nil {
+		t.Fatalf("connForSession(execute) returned nil")
+	}
+
+	res, err := a.runToolLoop(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
-	if err == nil {
-		t.Fatalf("runToolLoop: want error, got nil")
+	if err != nil {
+		t.Fatalf("runToolLoop: want graceful nil error, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "stuck on identical call") {
-		t.Errorf("error: got %v, want substring 'stuck on identical call'", err)
+	if res.RespondCalled {
+		t.Errorf("RespondCalled: got true, want false (the loop bailed, never called respond)")
 	}
-	if execs != 2 {
-		t.Errorf("tool execs: got %d, want 2 (iter 1 + iter 2; iter 3 bails)", execs)
+	// round 1 is productive (first output); rounds 2-6 are stuck; the 5th stuck
+	// round (round 6) hits stuckBailRounds and bails after executing.
+	if mock.callCount() != 6 {
+		t.Errorf("LLM calls: got %d, want 6 (bail at stuckBailRounds)", mock.callCount())
 	}
-	if mock.callCount() != 3 {
-		t.Errorf("LLM calls: got %d, want 3", mock.callCount())
+	if execs != 6 {
+		t.Errorf("tool execs: got %d, want 6", execs)
 	}
-	// The 3rd LLM request should carry the nudge message appended after
-	// iter 2's tool result.
-	req3 := mock.request(2)
-	msgs, _ := req3["messages"].([]any)
+	// Corrective shows up once a round goes stuck (request index 2 onward).
 	var found bool
-	for _, m := range msgs {
-		mm, _ := m.(map[string]any)
-		if mm["role"] == "user" {
-			if s, _ := mm["content"].(string); strings.Contains(s, "repeated the same tool call") {
-				found = true
-				break
+	for i := 2; i < mock.callCount(); i++ {
+		msgs, _ := mock.request(i)["messages"].([]any)
+		for _, m := range msgs {
+			mm, _ := m.(map[string]any)
+			if mm["role"] == "user" {
+				if c, _ := mm["content"].(string); strings.Contains(c, "makes no progress") {
+					found = true
+				}
 			}
 		}
 	}
 	if !found {
-		t.Errorf("3rd LLM request did not contain the repeat-nudge user message")
+		t.Errorf("no repeat-corrective user message found in the stuck rounds")
+	}
+	// stuckEscalateRounds=3: the swap fires at the END of round 4 (stuckRounds
+	// hits 3), so requests 0-3 use the execute sampler (0.3), 4-5 use thinking (1.0).
+	for i := 0; i < 4; i++ {
+		if temp, _ := mock.request(i)["temperature"].(float64); temp != 0.3 {
+			t.Errorf("request %d temperature: got %v, want 0.3 (pre-escalation)", i, temp)
+		}
+	}
+	for i := 4; i < 6; i++ {
+		if temp, _ := mock.request(i)["temperature"].(float64); temp != 1.0 {
+			t.Errorf("request %d temperature: got %v, want 1.0 (post-escalation)", i, temp)
+		}
 	}
 }
 
 // TestToolLoopDoesNotEscalateOnDistinctArgs verifies that legitimate fan-out
 // across distinct arguments (e.g. read_file on go.mod, examples/go.mod, …
-// when surveying a multi-module repo) does NOT trip the per-name escalation.
-// Only redundant calls — same (name, args) pair seen before — count toward
-// toolNameEscalateThreshold. Sampler must stay on the execute role for the
-// whole loop.
+// when surveying a multi-module repo) never climbs the repetition ladder: each
+// call returns NEW output, so no round is "stuck", the sampler stays on the
+// execute role, and the loop never bails.
 func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	withFreshToolRegistry(t)
 	const toolName = "test_grep_q9z"
@@ -705,98 +738,6 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		if temp != 0.3 {
 			t.Errorf("request %d temperature: got %v, want 0.3 (no escalation expected on distinct args)", i, temp)
 		}
-	}
-}
-
-// TestToolLoopEscalatesOnRepeatedArgs covers the per-name escalation under
-// distinct-args counting: when the same (name, arguments) pair is revisited
-// enough times in one loop, the connection swaps to the "thinking" role's
-// sampler. We interleave two arg values to avoid two consecutive byte-for-
-// byte identical sigs (which would trip the signature nudge / bail first).
-func TestToolLoopEscalatesOnRepeatedArgs(t *testing.T) {
-	withFreshToolRegistry(t)
-	const toolName = "test_grep_q9z"
-	var execs int
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": toolName, "description": "grep",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			execs++
-			return "no match", false
-		},
-	})
-
-	// Alternate two args: A B A B A B A. Sigs differ each iter so the
-	// signature nudge never fires, but every call after the first
-	// occurrence of each arg counts as redundant. The per-name counter
-	// (aggregated across all args of the same tool) reaches
-	// toolNameEscalateThreshold (5) at iter 6 — escalating the 8th LLM
-	// call's sampler.
-	mock := newMockLLM(t,
-		sseToolCall("a1", toolName, `{"q":"A"}`),
-		sseToolCall("b1", toolName, `{"q":"B"}`),
-		sseToolCall("a2", toolName, `{"q":"A"}`),
-		sseToolCall("b2", toolName, `{"q":"B"}`),
-		sseToolCall("a3", toolName, `{"q":"A"}`),
-		sseToolCall("b3", toolName, `{"q":"B"}`),
-		sseToolCall("a4", toolName, `{"q":"A"}`),
-		sseText("giving up."),
-	)
-	defer mock.Close()
-
-	a, s := newTestAgent(t)
-	a.settings = Settings{
-		LLM: []LLMConnection{{
-			Server:         mock.ts.URL,
-			Model:          "test-model",
-			ParamsExecute:  map[string]any{"temperature": 0.3},
-			ParamsThinking: map[string]any{"temperature": 1.0},
-		}},
-	}
-
-	conn := a.connForSession(context.Background(), s.ID, "execute")
-	if conn == nil {
-		t.Fatalf("connForSession(execute) returned nil")
-	}
-	_, err := a.runToolLoop(context.Background(), s.ID, conn,
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
-	if err != nil {
-		t.Fatalf("runToolLoop: %v", err)
-	}
-
-	if execs != 7 {
-		t.Errorf("tool execs: got %d, want 7", execs)
-	}
-	if mock.callCount() != 8 {
-		t.Errorf("LLM calls: got %d, want 8", mock.callCount())
-	}
-
-	// Calls 1..7 used execute sampler (temperature 0.3) — escalation runs
-	// at the END of iter 6 (the 7th call), so the call itself still went
-	// out under execute params; the 8th is the first one with thinking.
-	for i := 0; i < 7; i++ {
-		req := mock.request(i)
-		if req == nil {
-			t.Fatalf("request %d missing", i)
-		}
-		temp, _ := req["temperature"].(float64)
-		if temp != 0.3 {
-			t.Errorf("request %d temperature: got %v, want 0.3", i, temp)
-		}
-	}
-	// Call 8 must have escalated to thinking (temperature 1.0).
-	req8 := mock.request(7)
-	if req8 == nil {
-		t.Fatalf("request 8 missing")
-	}
-	temp8, _ := req8["temperature"].(float64)
-	if temp8 != 1.0 {
-		t.Errorf("request 8 temperature: got %v, want 1.0 (escalation should have flipped sampler)", temp8)
 	}
 }
 

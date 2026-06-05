@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -80,9 +79,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	// clears a path's entries on write, so a post-edit re-read starts fresh.
 	var dedupNote string
 	if sess != nil {
-		h := fnv.New64a()
-		h.Write([]byte(content))
-		sum := h.Sum64()
+		sum := fnvHash(content)
 		sess.readDedupMu.Lock()
 		if prev, ok := sess.readDedup[dedupKey]; ok && prev.hash == sum {
 			dedupNote = fmt.Sprintf("[note: %s — you read %s from line %d earlier this turn and it has NOT changed. Re-reading the same window makes no progress; for MORE of the file call continue_read path=%q.]", readUnchangedMarker, path, start, path)
@@ -297,7 +294,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "write_file",
-			"description": "Create a new file or completely overwrite an existing one. For targeted changes to an existing file use edit_file — it preserves context that write_file would clobber.",
+			"description": "Create a NEW file (or fully regenerate a small/generated one). Do NOT use write_file to change a file you've been reading — reproducing a large existing file from memory loses content; use edit_file for targeted changes.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path", "content"},
@@ -332,7 +329,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "edit_file",
-			"description": "Replace one exact text snippet in a file. Use read_file first to see the current contents. Returns an error when old_text is missing, matches more than once, or the file can't be written — fix and retry.",
+			"description": "Replace one exact text snippet in an EXISTING file — always prefer this over write_file for changing a file that already exists. old_text must match the file byte-for-byte AND be unique; copy it from a fresh read_file and keep it small (a few lines, not a whole function). Change a large region as SEVERAL small edits. If old_text isn't found, the file differs from what you remember — read_file that region and retry on a small snippet; never rewrite the whole file. Errors (not found / not unique / unwritable) come back as messages — fix and retry.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path", "old_text", "new_text"},
@@ -363,11 +360,14 @@ func init() {
 		count := strings.Count(content, oldText)
 		if count == 0 {
 			a.FailToolCall(ctx, sid, tcId, "old_text not found in file")
-			return "error: old_text not found in file", false
+			// Failed=true feeds the loop's fail cap (a model spraying wrong edits
+			// gives up instead of looping to the iteration backstop); the verdict
+			// authority excludes edit_file, so a recovered miss never condemns.
+			return "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit). Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file.", true
 		}
 		if count > 1 {
 			a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("old_text matches %d times, must be unique", count))
-			return fmt.Sprintf("error: old_text matches %d times, must be unique", count), false
+			return fmt.Sprintf("error: old_text matches %d places — it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count), true
 		}
 
 		newContent := strings.Replace(content, oldText, newText, 1)

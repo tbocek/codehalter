@@ -80,6 +80,22 @@ in verify; add it if missing).
 - Subtask wrong or impossible? Stop and explain via `respond` — don't improvise.
   The orchestrator replans.
 
+## Editing files — small targeted edits, never whole-file rewrites
+
+To change a file that already exists, ALWAYS use `edit_file`; `write_file` is for
+NEW files only (or fully regenerating a small/generated one). Reproducing a large
+existing file from memory loses content — and you only ever see it in chunks, so
+you can't hold all of it anyway.
+
+- Keep each `edit_file` `old_text` SMALL and UNIQUE — a few lines copied from a
+  fresh `read_file`, not a whole function. Change a large region as SEVERAL small
+  edits; if an `old_text` isn't unique, add surrounding lines until it pins one
+  spot.
+- `old_text not found` means the file differs from what you remember (it was
+  reformatted, or you edited it). Read the REGION you're changing
+  (`read_file line=N`), copy its current exact text, and retry a SMALL edit. Do
+  NOT re-read from the top, and do NOT fall back to rewriting the whole file.
+
 ## Git — the human runs it
 
 NEVER `git commit` or `git push` (in the devcontainer `.git` is read-only; the
