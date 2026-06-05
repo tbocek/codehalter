@@ -24,7 +24,8 @@
 - Prefer immutable updates (`{...obj, field: x}`, `[...arr, x]`) over mutation.
 
 ## Tooling
-- Type-check and lint through the project's task runner — `npm run typecheck`/`build`/`lint` or whatever the `package.json` scripts declare. Don't call `tsc` or eslint directly.
+- ONE package manager per project, detected BEFORE installing — check `package.json`'s `packageManager` field, then the lockfile (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, `bun.lockb`→bun, else npm), then an existing `node_modules/.pnpm` dir (→pnpm; the lockfile is often gitignored, so this is the real signal). Use that ONE for EVERYTHING (formatter, lsmcp, scripts). Never mix npm into a pnpm/yarn project, and don't `npm install` then fall back. Get pnpm/yarn via `corepack enable`.
+- Type-check and lint through the project's task runner — its package-manager run (`pnpm run`/`npm run`/`yarn`, matching the lockfile) `typecheck`/`build`/`lint` or whatever the `package.json` scripts declare. Don't call `tsc` or eslint directly.
 
 ## Code intelligence over MCP — lsmcp (the gopls analog)
 `@mizchi/lsmcp` is an LSP→MCP server: it gives the model real code-intelligence
@@ -33,8 +34,9 @@ tools — `lsp_get_definitions`, `lsp_find_references`, `lsp_get_hover`,
 `search_symbols`. Set it up ONLY when the user asks for TS code intelligence.
 
 Setup (tsgo backend — fast native TS):
-1. `npm add -D @mizchi/lsmcp @typescript/native-preview` — project devDeps
-   (persisted in package.json; NOT `-g`).
+1. Add as project devDeps with the PROJECT'S package manager (the one matching
+   the lockfile, see Tooling above): `<pm> add -D @mizchi/lsmcp @typescript/native-preview`
+   — e.g. `pnpm add -D …` for a pnpm project (persisted in package.json; NOT `-g`).
 2. `npx @mizchi/lsmcp init -p tsgo` — generates `.lsmcp/config.json`.
 3. Add the MCP server to `.codehalter/mcp.toml`:
    ```
@@ -47,5 +49,5 @@ Setup (tsgo backend — fast native TS):
    `search_symbols` tools go live next prompt. No restart, no new session.
 
 Stable alternative to the `@typescript/native-preview` (tsgo) preview: drive the
-classic LSP instead — `npm add -D typescript-language-server typescript` and
+classic LSP instead — `<pm> add -D typescript-language-server typescript` (project's manager) and
 point lsmcp at it via `--bin` in place of `-p tsgo`.

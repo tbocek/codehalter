@@ -97,9 +97,11 @@ func TestResolvePath(t *testing.T) {
 	}
 }
 
-// TestToolFilter pins the exclude semantics: an empty filter passes every
-// registered tool, and the exclude set drops the named tools. The
-// "this tool mutates" gate is gone — every phase sees every tool.
+// TestToolFilter pins the exclude semantics AND the sort: an empty filter passes
+// every registered tool, the exclude set drops the named tools, and the result
+// is sorted by name (NOT registration order) so the rendered `tools` block is
+// byte-stable turn-over-turn for the LLM's prefix cache. (Registered out of
+// order on purpose below.)
 func TestToolFilter(t *testing.T) {
 	withFreshToolRegistry(t)
 	RegisterTool(Tool{Def: toolDef("read")})
@@ -111,8 +113,8 @@ func TestToolFilter(t *testing.T) {
 		filter toolFilter
 		want   []string
 	}{
-		{"no filter", toolFilter{}, []string{"read", "write", "other"}},
-		{"exclude read", toolFilter{exclude: map[string]bool{"read": true}}, []string{"write", "other"}},
+		{"no filter", toolFilter{}, []string{"other", "read", "write"}},
+		{"exclude read", toolFilter{exclude: map[string]bool{"read": true}}, []string{"other", "write"}},
 		{"exclude two", toolFilter{exclude: map[string]bool{"read": true, "other": true}}, []string{"write"}},
 	}
 	for _, tc := range cases {

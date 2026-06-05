@@ -534,18 +534,16 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		}
 		allText.WriteString(text)
 
-		// Compaction check AFTER every LLM call: the stream just set the server's
-		// ground-truth prompt size (LastCompletePromptTokens). The 64% trigger
-		// leaves headroom below n_ctx, so the call we just made fit; compacting
-		// now — for the growing phases on the main session — keeps the NEXT call
-		// (this loop's next iteration, or the next subtask) from drifting over.
-		// Runs after every call, including the terminal `respond` one, so the
-		// session is already compacted when the next subtask starts. Rebuild the
-		// in-flight slice from the now-smaller session; the current batch is
-		// appended to it below.
+		// Mid-turn 80% overflow check: the stream just set the server's
+		// ground-truth prompt size, so check whether this growing turn crossed
+		// the compaction trigger and, if so, compact NOW to keep the NEXT call
+		// under n_ctx. summariseFirst=true captures the current turn before
+		// rotation (the optimistic summariser runs only at the turn boundary).
+		// No routine summarise/git here — just the safety check. Rebuild the
+		// in-flight slice from the now-smaller session.
 		if (phase == "plan" || phase == "execute") && sid != "" {
 			if s := a.getSession(sid); s != nil && s.Depth == 0 {
-				if a.compressHistory(ctx, s) {
+				if a.compressHistory(ctx, s, true) {
 					messages = a.buildLLMContext(s)
 				}
 			}
@@ -639,19 +637,6 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 				Content:    content,
 				ToolCallID: tc.ID,
 			})
-		}
-
-		// Per-LLM-call progress fan-out: fire the summariser after each
-		// iteration's tool batch so a long tool loop keeps populating the shadow
-		// buffer that mid-turn compaction draws on (without this, a planner that
-		// spends 17 minutes in one loop produces zero shadow notes). git-commit
-		// is deliberately NOT fired here: the commit message only matters once
-		// the turn ends and the user is back in control, and the working tree
-		// keeps changing mid-turn — so runTurn fires backgroundGitCommit once at
-		// turn end, and per-iteration commits would only burn the background slot.
-		// Subagents (Depth>0) skip — they don't own the shadow buffer.
-		if sess := a.getSession(sid); sess != nil && sess.Depth == 0 {
-			a.backgroundSummarise(sess)
 		}
 
 		// Terminal tool called: stream the message to the UI as one chunk

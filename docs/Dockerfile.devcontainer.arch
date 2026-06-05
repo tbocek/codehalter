@@ -5,6 +5,7 @@ RUN pacman -Syu --noconfirm --needed \
         ca-certificates \
         curl \
         git \
+        openssh \
         go \
         firefox \
     && rm -rf /var/cache/pacman/pkg/*

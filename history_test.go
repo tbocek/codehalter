@@ -788,7 +788,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	a.compressHistory(context.Background(), s)
+	a.compressHistory(context.Background(), s, false)
 
 	if !strings.Contains(s.Summary, "scaffolded module") || !strings.Contains(s.Summary, "wired up handler") {
 		t.Errorf("summary missing drained shadow entries; got %q", s.Summary)
@@ -1026,7 +1026,7 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	a.compressHistory(context.Background(), s)
+	a.compressHistory(context.Background(), s, false)
 
 	if s.Summary != "" {
 		t.Errorf("expected empty summary, got %q", s.Summary)
@@ -1076,7 +1076,7 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	a.compressHistory(context.Background(), s)
+	a.compressHistory(context.Background(), s, false)
 
 	// Older entries fold into Summary; the most-recent stays in the buffer
 	// as the anchor covering the verbatim trailing message.
@@ -1450,7 +1450,7 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 	// and confirm the image reference lands in Summary.
 	s.appendShadow("Goal: anchor\nProgress: follow-up turn")
 	s.SetLastCompletePromptTokens(80_000)
-	a.compressHistory(context.Background(), s)
+	a.compressHistory(context.Background(), s, false)
 
 	if !strings.Contains(s.Summary, "view_image id="+imgID) {
 		t.Errorf("Summary lost the image handle after compaction; got %q", s.Summary)
@@ -1489,7 +1489,7 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	a.compressHistory(context.Background(), s)
+	a.compressHistory(context.Background(), s, false)
 
 	if !strings.Contains(s.Summary, "PRIOR SUMMARY") {
 		t.Errorf("prior Summary dropped during shadow fast path; got %q", s.Summary)

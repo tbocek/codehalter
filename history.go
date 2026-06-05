@@ -18,13 +18,22 @@ const compactTriggerPct = 80
 // On any failure we DO NOT rotate — keeping raw messages and retrying next
 // turn beats corrupting the live session.
 //
-// Called at end-of-turn so we can block on the background summariser
-// draining — the assistant's reply is already on screen.
+// Called at the turn boundary (after the optimistic per-turn summariser, with
+// summariseFirst=false) AND mid-turn from runToolLoop's 80% overflow check
+// (summariseFirst=true). Mid-turn the optimistic summariser hasn't run yet, so
+// the current turn isn't in the shadow — summariseFirst captures it on demand
+// before rotating, otherwise the about-to-be-rotated messages would be lost.
 // Returns true when it actually compacted, so a mid-loop caller can rebuild its
 // in-flight context from the now-smaller session.
-func (a *agent) compressHistory(ctx context.Context, sess *Session) bool {
+func (a *agent) compressHistory(ctx context.Context, sess *Session, summariseFirst bool) bool {
 	if sess.LastCompletePromptTokens() <= a.mainSlotTokens*compactTriggerPct/100 {
 		return false
+	}
+
+	// Mid-turn: summarise the current turn now (the optimistic summariser only
+	// runs at the boundary), so the content we're about to rotate has a note.
+	if summariseFirst {
+		a.backgroundSummarise(sess)
 	}
 
 	// Drain queued/in-flight summariser tasks EXCEPT the trailing one — it

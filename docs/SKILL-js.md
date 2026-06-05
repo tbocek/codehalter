@@ -31,8 +31,10 @@
 `lsp_find_references`, `lsp_get_hover`, `lsp_get_diagnostics`, `search_symbols`)
 for JS too — it's an LSP→MCP server. Set it up ONLY when the user asks.
 
+ONE package manager per project, detected BEFORE installing: check `package.json`'s `packageManager` field, then the lockfile (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, else npm), then an existing `node_modules/.pnpm` dir (→pnpm; the lockfile is often gitignored). Use that ONE for everything — never mix npm into a pnpm/yarn project, don't `npm install` then fall back. pnpm/yarn via `corepack enable`.
+
 Setup (tsgo backend — fast, handles JS):
-1. `npm add -D @mizchi/lsmcp @typescript/native-preview` — project devDeps (NOT `-g`).
+1. Add as project devDeps with the PROJECT'S package manager: `<pm> add -D @mizchi/lsmcp @typescript/native-preview` — e.g. `pnpm add -D …` for a pnpm project (NOT `-g`).
 2. `npx @mizchi/lsmcp init -p tsgo` — generates `.lsmcp/config.json`.
 3. Add to `.codehalter/mcp.toml`:
    ```

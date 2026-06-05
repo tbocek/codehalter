@@ -2,7 +2,7 @@
 FROM alpine:3.23
 
 RUN apk update && apk add --no-cache \
-        ca-certificates curl git sudo \
+        ca-certificates curl git sudo openssh-client \
         bash shadow \
         go \
         firefox-esr

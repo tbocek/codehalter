@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -175,14 +176,28 @@ type toolFilter struct {
 func llmToolDefinitionsFiltered(f toolFilter) []map[string]any {
 	registryMu.Lock()
 	defer registryMu.Unlock()
-	var defs []map[string]any
+	type named struct {
+		name string
+		def  map[string]any
+	}
+	var got []named
 	for _, t := range registeredTools {
 		fn, _ := t.Def["function"].(map[string]any)
 		name, _ := fn["name"].(string)
 		if f.exclude[name] {
 			continue
 		}
-		defs = append(defs, t.Def)
+		got = append(got, named{name, t.Def})
+	}
+	// Sort by tool name so the rendered `tools` block is byte-identical
+	// turn-over-turn regardless of registration order. The MCP reconciler
+	// re-adds server tools in a non-deterministic order; without this, that
+	// reorders the tool list every reconcile, changing the prompt prefix and
+	// busting the LLM's KV cache (full reprocess) — same rule as message bytes.
+	sort.Slice(got, func(i, j int) bool { return got[i].name < got[j].name })
+	defs := make([]map[string]any, len(got))
+	for i, g := range got {
+		defs[i] = g.def
 	}
 	return defs
 }

@@ -21,23 +21,34 @@ has no `node`/`npm`. Install the runtime FIRST (`apk add nodejs npm` /
 `apt-get install -y nodejs npm`), persist it, THEN install the JS tool — don't
 `npm install ...` before npm exists.
 
-### Use the project's package manager — don't assume npm
+### Detect the project's package manager FIRST — don't assume npm
 
-Check the lockfile and match it; mixing managers corrupts `node_modules`:
+Before ANY install, determine the project's manager and use that ONE for
+everything (mixing corrupts `node_modules` — npm chokes on a pnpm `node_modules`
+with `Cannot read properties of null`). Check, in this order:
 
-- `pnpm-lock.yaml` → **pnpm**   · `yarn.lock` → **yarn**
-- `bun.lockb` → **bun**         · `package-lock.json` (or none) → **npm**
+1. `packageManager` field in `package.json` (e.g. `"packageManager": "pnpm@9"`) — authoritative.
+2. Lockfile: `pnpm-lock.yaml`→**pnpm** · `yarn.lock`→**yarn** · `bun.lockb`→**bun** · `package-lock.json`→**npm**.
+3. An already-installed `node_modules`: a `node_modules/.pnpm` dir → **pnpm** (its virtual store), `node_modules/.yarn` → yarn. The committed lockfile is often gitignored, so this is frequently the ONLY signal — check it.
+4. None of the above → **npm**.
 
-Get pnpm/yarn via **corepack** (ships with node) — `corepack enable` — not
-`npm install -g pnpm`. Then use it for everything: `pnpm add -D <pkg>`,
-`pnpm install`. Persist `corepack enable` in the Dockerfile too. Persist the RIGHT
-manager: a pnpm project's Dockerfile runs `pnpm install`, never `npm install`
-(that fights the pnpm lockfile).
+Do NOT just run `npm install` and fall back when it errors — that wastes a failed
+attempt and can leave a broken `node_modules`. Get pnpm/yarn via **corepack**
+(ships with node) — `corepack enable` — not `npm install -g pnpm`. Then use that
+manager for everything: `<pm> add -D <pkg>`, `<pm> install`. Persist the RIGHT
+manager in the Dockerfile (a pnpm project runs `pnpm install`, never `npm
+install`), plus `corepack enable`.
 
 ### pnpm inside a container
 
-Don't point `store-dir` at a host path (`/home/<hostuser>/...` — that path
-doesn't exist for the container user and the install fails). Leave pnpm's default
-store, or set it under the container home (`/home/dev/.local/share/pnpm`). If
-`node_modules` is half-built from a failed npm attempt, `rm -rf node_modules` and
-reinstall clean with the right manager.
+pnpm hardlinks packages from a content-addressable store into `node_modules`, so
+the store must be on the SAME filesystem as the project. In a devcontainer the
+workspace is bind-mounted from the host while pnpm's default store
+(`~/.local/share/pnpm`) is on the container's overlay — a different filesystem —
+so pnpm drops a project-local store at `<repo>/.pnpm-store`. That's expected, but
+it's a CACHE, not source: ensure `.pnpm-store` and `node_modules` are in
+`.gitignore` (add them if missing) so they're never committed.
+
+Don't point `store-dir` at a host path (`/home/<hostuser>/...` — doesn't exist
+for the container user). If `node_modules` is half-built from a failed npm
+attempt, `rm -rf node_modules` and reinstall clean with the right manager.

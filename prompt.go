@@ -617,22 +617,26 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	}
 	result, err := a.orchestrate(ctx, sid)
 	if err != nil {
-		// A cancelled turn skips the epilogue below, but it may have grown the
-		// context past the compaction trigger — so compact here too. Background
-		// ctx because the request ctx is already cancelled (same reason Prompt
-		// posts the cancel notice on context.Background()).
+		// A cancelled turn skips the epilogue below, but it still returns control
+		// to the user — so summarise + compact here too (the only places either
+		// happens). Background ctx because the request ctx is already cancelled
+		// (same reason Prompt posts the cancel notice on context.Background()).
 		if sess != nil && isCancelled(err) {
-			a.compressHistory(context.Background(), sess)
+			a.backgroundSummarise(sess)
+			a.compressHistory(context.Background(), sess, false)
 		}
 		return err
 	}
 	if sess == nil || result.Text == "" {
 		return nil
 	}
-	// Epilogue: background work over the now-complete transcript. Each phase
-	// already persisted its response; per-subtask backgroundSummarise already
-	// ran inside orchestrate. Report active wall-clock (elapsed minus human-input
-	// wait) + tokens first; a turn too short to measure stays silent.
+	// Epilogue — the turn boundary, where control returns to the user. This is
+	// the ONLY place codehalter summarises and compacts: nothing happens mid-turn
+	// (no per-tool-loop, no per-subtask), so the background slot stays clear while
+	// the agent works and the LLM's prefix cache only ever changes here, between
+	// turns. backgroundSummarise enqueues this turn's note; compressHistory then
+	// drains it and rotates IF the session crossed the trigger (else it's a no-op
+	// and the summary just rides the next compaction). Report stats first.
 	if activeMs, promptTokens, completionTokens := sess.turnStats(); activeMs > 0 {
 		// Leading blank line: the message stream renders as markdown, where a
 		// single \n collapses to a space — \n\n forces the stats onto their own
@@ -641,8 +645,9 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 			float64(activeMs)/1000, promptTokens+completionTokens, promptTokens, completionTokens)
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
 	}
+	a.backgroundSummarise(sess)
 	a.backgroundGitCommit(sess)
-	a.compressHistory(ctx, sess)
+	a.compressHistory(ctx, sess, false)
 	return nil
 }
 
@@ -709,10 +714,6 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 
 			outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 			lastResult = outcome.Result
-
-			if sess != nil && outcome.Result.Text != "" {
-				a.backgroundSummarise(sess)
-			}
 
 			if outcome.Success {
 				continue
