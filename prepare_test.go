@@ -261,28 +261,23 @@ func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	}
 }
 
-// TestProbeAllLLMsLoadsIdleRouter pins the llama-swap deadlock fix: a router with
-// models_autoload reports n_ctx=0 from /props until a completion loads a model
-// (role:"router", model_path:"none"). probeLLM must call the model to load it,
-// then re-read /props and pick up the real per-slot n_ctx + total_slots — so the
-// n_ctx-unknown gate clears on its own instead of blocking the prompt that would
-// have loaded the model.
-func TestProbeAllLLMsLoadsIdleRouter(t *testing.T) {
-	var loaded atomic.Bool
+// TestProbeAllLLMsRouterUpstreamProps pins the llama-swap fix: the router's own
+// /props always reports n_ctx=0 (role:"router") — even with a model loaded — so
+// probeLLM must read /upstream/<model>/props to get the real per-slot n_ctx +
+// total_slots (that path also auto-loads the model). Without it the n_ctx-unknown
+// gate would block forever.
+func TestProbeAllLLMsRouterUpstreamProps(t *testing.T) {
+	var upstreamHit atomic.Bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/v1/models"):
 			_, _ = w.Write([]byte(`{"data":[{"id":"qwen"}]}`))
-		case strings.HasSuffix(r.URL.Path, "/v1/chat/completions"):
-			loaded.Store(true) // models_autoload: any call to the model loads it
-			_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`))
+		case strings.Contains(r.URL.Path, "/upstream/qwen/props"):
+			upstreamHit.Store(true) // real model props behind the router (auto-loads)
+			fmt.Fprint(w, `{"default_generation_settings":{"n_ctx":16384},"total_slots":2}`)
 		case strings.HasSuffix(r.URL.Path, "/props"):
-			if loaded.Load() {
-				fmt.Fprint(w, `{"default_generation_settings":{"n_ctx":16384},"total_slots":2}`)
-			} else {
-				fmt.Fprint(w, `{"role":"router","model_path":"none","default_generation_settings":{"n_ctx":0},"total_slots":0}`)
-			}
+			fmt.Fprint(w, `{"role":"router","model_path":"none","default_generation_settings":{"n_ctx":0},"total_slots":0}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -292,14 +287,14 @@ func TestProbeAllLLMsLoadsIdleRouter(t *testing.T) {
 	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen"}}}}
 	a.probeAllLLMs(context.Background())
 
-	if !loaded.Load() {
-		t.Fatal("router was never loaded — no completion sent, so /props stayed at n_ctx=0")
+	if !upstreamHit.Load() {
+		t.Fatal("never read /upstream/qwen/props — router /props (n_ctx=0) was taken at face value")
 	}
 	if got := a.settings.LLM[0].Parallel; got != 2 {
-		t.Errorf("Parallel: got %d, want 2 (from /props total_slots after load)", got)
+		t.Errorf("Parallel: got %d, want 2 (from upstream /props total_slots)", got)
 	}
 	if a.mainSlotTokens != 16384 {
-		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx after load)", a.mainSlotTokens)
+		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from upstream /props)", a.mainSlotTokens)
 	}
 }
 

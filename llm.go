@@ -416,18 +416,19 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	// Enrich via /props when reachable: it carries image + ctx metadata AND
 	// llama.cpp's per-slot n_ctx / total_slots, none of which /v1/models exposes.
 	// Non-llama backends 404 here (ok=false) and we keep the /v1/models result.
-	p, ok := a.probeViaProps(probeCtx, conn)
-	// llama-swap router with models_autoload: /props is reachable but reports
-	// n_ctx=0 until a model is loaded (role:"router", model_path:"none"). The
-	// n_ctx-unknown gate would then block the prompt that WOULD load it — a
-	// deadlock. So load the model (one bodyless call) and re-read /props. Scoped
-	// to reachable /props so OpenAI/vLLM (which 404 /props and take ctx from
-	// settings.toml) never hit this.
+	p, ok := a.probeViaProps(probeCtx, conn, "/props")
+	// llama-swap router: its own /props always reports n_ctx=0 (role:"router") —
+	// loading a model doesn't change that, the model's real n_ctx lives behind
+	// /upstream/<model>/props. So when /props is reachable but ctx is 0, read the
+	// upstream's /props, which also auto-loads the model. Its own (longer) timeout
+	// covers a cold load. Scoped to reachable /props so OpenAI/vLLM (which 404
+	// /props and take ctx from settings.toml) never hit this.
 	if ok && p.ContextSize == 0 && p.SlotCtx == 0 {
-		a.loadModel(ctx, conn)
-		rpCtx, rpCancel := context.WithTimeout(ctx, 5*time.Second)
-		p, ok = a.probeViaProps(rpCtx, conn)
-		rpCancel()
+		upCtx, upCancel := context.WithTimeout(ctx, 180*time.Second)
+		if up, upOK := a.probeViaProps(upCtx, conn, "/upstream/"+conn.Model+"/props"); upOK {
+			p = up
+		}
+		upCancel()
 	}
 	if ok {
 		r.Reachable = true
@@ -451,35 +452,6 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 		slog.Info("probeLLM: unreachable", "server", conn.Server, "model", conn.Model)
 	}
 	return r
-}
-
-// loadModel sends one bodyless completion so a lazy-loading router (llama-swap
-// models_autoload) loads the model — then the caller's /props re-read returns
-// the real n_ctx instead of 0. Fire-and-forget: the router loads the model
-// before forwarding, so it loads even if the empty request itself errors. Own
-// long timeout — a cold load far outlasts the 5s metadata probe.
-func (a *agent) loadModel(ctx context.Context, conn *LLMConnection) {
-	body, err := json.Marshal(map[string]any{"model": conn.Model, "messages": []any{}})
-	if err != nil {
-		return
-	}
-	loadCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(loadCtx, "POST", conn.endpoint("/v1/chat/completions"), bytes.NewReader(body))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if conn.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
-	}
-	slog.Info("loadModel: triggering autoload (router reported n_ctx=0)", "model", conn.Model)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		slog.Info("loadModel: request failed", "model", conn.Model, "err", err)
-		return
-	}
-	_ = resp.Body.Close()
 }
 
 // probeViaModels asks /v1/models for the configured model. Always confirms
@@ -554,11 +526,14 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 	return r, true
 }
 
-// probeViaProps reads llama-server's /props. Tells us the server is reachable
-// and (via modalities.vision) whether the loaded model supports image input,
-// but cannot tell us *which* model is loaded — so ModelKnown stays false.
-func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
-	propsURL := conn.endpoint("/props")
+// probeViaProps reads a llama-server /props endpoint. Tells us the server is
+// reachable and (via modalities.vision) whether the loaded model supports image
+// input, but cannot tell us *which* model is loaded — so ModelKnown stays false.
+// path is "/props" for a direct llama-server, or "/upstream/<model>/props" to
+// reach the real model behind a llama-swap router (whose own /props always
+// reports n_ctx=0).
+func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection, path string) (probeResult, bool) {
+	propsURL := conn.endpoint(path)
 	req, err := http.NewRequestWithContext(ctx, "GET", propsURL, nil)
 	if err == nil && conn.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
