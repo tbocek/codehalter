@@ -376,7 +376,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 //
 // User-facing prompts inside runPlanPhase (clarification choices) auto-confirm
 // because shouldAutoAnswer returns true for any session with Depth > 0 (see
-// tool_ask.go). The orchestrator's "Execute / Automatic / Cancel" gate is
+// tool_ask.go). The orchestrator's "Execute / Abort" gate is
 // skipped here — subagents are dispatched by the parent and never gate on
 // the user.
 func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task subagentTask) (string, error) {

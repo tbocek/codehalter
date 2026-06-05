@@ -227,7 +227,7 @@ type Session struct {
 	// busted for a path on write. In-memory only.
 	readCursorMu sync.Mutex
 	readCursor   map[string]int
-	// pendingPlan holds a plan whose "Execute / Automatic / Abort" card the user
+	// pendingPlan holds a plan whose "Execute / Abort" card the user
 	// dismissed by typing (e.g. asking a question) instead of choosing. Prompt
 	// re-shows it after the typed message is handled, so a question doesn't throw
 	// the plan away. resumePlan is that plan handed back to orchestrate when the

@@ -781,12 +781,12 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	return lastResult, nil
 }
 
-// confirmPlan renders the planned subtasks and asks the user how to run
-// them. Three-way: Execute (one subtask at a time), Automatic (flip to
-// autopilot for the rest of this Prompt), Cancel. Skipped entirely when
-// already in autopilot mode. Skipped for report_only plans where no
-// mutating work happens. Replan plans use the same gate so the user sees
-// the new approach before it runs.
+// confirmPlan renders the planned subtasks and gates execution on the user:
+// Execute or Abort. Autopilot is the session mode (Zed's Interactive/Autopilot
+// switch, via session/set_mode) — not a card button — so this gate is skipped
+// when already in autopilot, and for report_only plans where no mutating work
+// happens. Replan plans use the same gate so the user sees the new approach
+// before it runs.
 func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, isReplan bool) error {
 	header := "Plan:"
 	if isReplan {
@@ -821,7 +821,7 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 	}
 
 	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Execute", "Automatic"})
+	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Execute"})
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
 	sess := a.getSession(sid)
@@ -846,12 +846,6 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 		return errUserCancelled
 	}
 
-	if choice == "Automatic" {
-		a.mu.Lock()
-		a.mode = "Autopilot"
-		a.mu.Unlock()
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[Automatic] Running without further interruption.\n\n"}})
-	}
 	return nil
 }
 
@@ -859,8 +853,8 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 // dismissed earlier (by typing a question instead of choosing), now that the
 // typed message has been handled. Offers Execute (run that plan as-is, no
 // re-planning), Replan (plan again — the conversation now includes the Q&A, so
-// the question can reshape it), or Abort. No "Automatic" — the user is actively
-// reviewing. No-op when nothing is pending. Called from Prompt after a turn.
+// the question can reshape it), or Abort. No-op when nothing is pending.
+// Called from Prompt after a turn.
 func (a *agent) reshowPendingPlan(ctx context.Context, sid string) {
 	sess := a.getSession(sid)
 	if sess == nil || sess.pendingPlan == nil {
