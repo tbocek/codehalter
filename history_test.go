@@ -788,7 +788,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	a.compressHistory(context.Background(), s, false)
+	a.compressHistory(context.Background(), s, false, 0)
 
 	if !strings.Contains(s.Summary, "scaffolded module") || !strings.Contains(s.Summary, "wired up handler") {
 		t.Errorf("summary missing drained shadow entries; got %q", s.Summary)
@@ -832,6 +832,81 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 
 	if mock.callCount() != 0 {
 		t.Errorf("LLM calls: got %d, want 0 (shadow fast path is fully local)", mock.callCount())
+	}
+}
+
+// TestCompressHistoryEstimateFallback pins the ai.jos.li regression: a backend
+// that reports NO prompt_tokens (LastCompletePromptTokens stays 0) must still
+// compact, driven by the caller's chars/4 estimate of the in-flight context.
+// Before the fix the trigger was 0 ≤ 72_000 forever, so the context grew
+// unbounded until a request blew n_ctx (the 229k/80k 400). Also asserts the
+// other direction: 0 server tokens AND a below-trigger estimate is a no-op.
+func TestCompressHistoryEstimateFallback(t *testing.T) {
+	mock := newMockLLM(t)
+	defer mock.Close()
+
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	filler := strings.Repeat("lorem ipsum ", 100)
+	for i := 0; i < 10; i++ {
+		s.AddUser(fmt.Sprintf("user msg %d %s", i, filler))
+		s.AddAssistant(fmt.Sprintf("asst msg %d %s", i, filler))
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	s.appendShadow("Goal: ship\nProgress: one")
+	s.appendShadow("Goal: ship\nProgress: two")
+	s.appendShadow("Goal: ship\nProgress: anchor")
+
+	// Server reported nothing — the only signal is the estimate.
+	s.SetLastCompletePromptTokens(0)
+
+	a := &agent{
+		sessions:       map[string]*Session{s.ID: s},
+		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		mainSlotTokens: 90_000, // trigger at 72_000
+	}
+
+	// Below-trigger estimate + zero server tokens → no-op.
+	if a.compressHistory(context.Background(), s, false, 50_000) {
+		t.Fatalf("compacted on a below-trigger estimate with no server tokens")
+	}
+	if s.Summary != "" || len(s.Messages) == 1 {
+		t.Fatalf("rotation happened despite below-trigger estimate")
+	}
+
+	// Over-trigger estimate (e.g. live reads ballooned the context) → compact
+	// even though the server never reported a token count.
+	if !a.compressHistory(context.Background(), s, false, 80_000) {
+		t.Fatalf("did not compact on an over-trigger estimate (server reported 0)")
+	}
+	if !strings.Contains(s.Summary, "one") || !strings.Contains(s.Summary, "two") {
+		t.Errorf("summary missing drained shadow entries; got %q", s.Summary)
+	}
+	if len(s.Messages) != 1 {
+		t.Errorf("Messages after trim: got %d, want 1", len(s.Messages))
+	}
+}
+
+// TestEstimateMessageTokens covers the chars/4 estimate over string content and
+// tool-call argument blobs — the fields that dominate a tool-heavy context.
+func TestEstimateMessageTokens(t *testing.T) {
+	msgs := []llmMessage{
+		{Role: "user", Content: strings.Repeat("a", 400)}, // 400 chars
+		{Role: "assistant", Content: "", ToolCalls: []toolCall{
+			{Function: struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			}{Name: "read_file", Arguments: strings.Repeat("b", 396)}}}}, // 9 + 396
+		{Role: "tool", Content: nil}, // nil content contributes 0
+	}
+	// (400 + 9 + 396) / 4 = 201
+	if got := estimateMessageTokens(msgs); got != 201 {
+		t.Errorf("estimateMessageTokens: got %d, want 201", got)
 	}
 }
 
@@ -1026,7 +1101,7 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	a.compressHistory(context.Background(), s, false)
+	a.compressHistory(context.Background(), s, false, 0)
 
 	if s.Summary != "" {
 		t.Errorf("expected empty summary, got %q", s.Summary)
@@ -1076,7 +1151,7 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	a.compressHistory(context.Background(), s, false)
+	a.compressHistory(context.Background(), s, false, 0)
 
 	// Older entries fold into Summary; the most-recent stays in the buffer
 	// as the anchor covering the verbatim trailing message.
@@ -1450,7 +1525,7 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 	// and confirm the image reference lands in Summary.
 	s.appendShadow("Goal: anchor\nProgress: follow-up turn")
 	s.SetLastCompletePromptTokens(80_000)
-	a.compressHistory(context.Background(), s, false)
+	a.compressHistory(context.Background(), s, false, 0)
 
 	if !strings.Contains(s.Summary, "view_image id="+imgID) {
 		t.Errorf("Summary lost the image handle after compaction; got %q", s.Summary)
@@ -1489,7 +1564,7 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	a.compressHistory(context.Background(), s, false)
+	a.compressHistory(context.Background(), s, false, 0)
 
 	if !strings.Contains(s.Summary, "PRIOR SUMMARY") {
 		t.Errorf("prior Summary dropped during shadow fast path; got %q", s.Summary)

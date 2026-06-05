@@ -521,6 +521,26 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			stampTiming()
 			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
 		}
+		// Mid-turn 80% overflow check — runs BEFORE the call, on the in-flight
+		// context we're about to send. The previous iteration's tool batch may
+		// have ballooned `messages` (read_file/search_text outputs are live-
+		// exempt from truncation), so check NOW and compact before the call
+		// instead of after — the after-the-call check is useless when the
+		// overflowing call is the one that 400s. The size is a chars/4 estimate
+		// of `messages` (estimateMessageTokens), max'd with the server's last
+		// ground-truth count inside compressHistory; the estimate is what keeps
+		// this working when the backend reports no usage. summariseFirst=true
+		// captures the current turn before rotation (the optimistic summariser
+		// runs only at the turn boundary). Rebuild the slice from the now-smaller
+		// session when it compacts.
+		if (phase == "plan" || phase == "execute") && sid != "" {
+			if s := a.getSession(sid); s != nil && s.Depth == 0 {
+				if a.compressHistory(ctx, s, true, estimateMessageTokens(messages)) {
+					messages = a.buildLLMContext(s)
+				}
+			}
+		}
+
 		streamStart := time.Now()
 		if res.StartedAt.IsZero() {
 			res.StartedAt = streamStart
@@ -533,21 +553,6 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			return res, err
 		}
 		allText.WriteString(text)
-
-		// Mid-turn 80% overflow check: the stream just set the server's
-		// ground-truth prompt size, so check whether this growing turn crossed
-		// the compaction trigger and, if so, compact NOW to keep the NEXT call
-		// under n_ctx. summariseFirst=true captures the current turn before
-		// rotation (the optimistic summariser runs only at the turn boundary).
-		// No routine summarise/git here — just the safety check. Rebuild the
-		// in-flight slice from the now-smaller session.
-		if (phase == "plan" || phase == "execute") && sid != "" {
-			if s := a.getSession(sid); s != nil && s.Depth == 0 {
-				if a.compressHistory(ctx, s, true) {
-					messages = a.buildLLMContext(s)
-				}
-			}
-		}
 
 		if len(calls) == 0 {
 			// Terminal-tool mode: empty tool_calls means the model dropped

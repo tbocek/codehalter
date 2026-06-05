@@ -27,7 +27,31 @@ paths, and link order live in the build files; a hand `gcc` call drops them and
   overflow, uninitialised reads) to make something compile or pass — it's a
   latent crash, not a fix.
 
-## Tooling (install + persist in the Dockerfile if missing — see SKILL-install.md)
+## Code intelligence over MCP — clangd (the gopls analog)
+
+Set up ONLY when the user asks. clangd is a pure LSP, so bridge it to MCP with
+lsmcp (the generic LSP→MCP server, needs node):
+
+1. Install `clangd` via the OS package manager (`apk add clang clang-extra-tools`
+   / `apt-get install -y clangd` / `dnf install -y clang-tools-extra`); verify
+   `clangd --version`.
+2. Install node + the project's package manager (see SKILL-container.md), then
+   drive clangd via lsmcp. If lsmcp can't drive clangd cleanly, use another
+   LSP→MCP adapter — verify the `lsp_*` tools actually appear.
+3. Add to `.codehalter/mcp.toml` (uncomment the WHOLE block INCLUDING the
+   `[[server]]` header — a commented header leaves the keys orphan and the server
+   never loads):
+   ```
+   [[server]]
+   name = "clangd"
+   command = "npx"
+   args = ["-y", "@mizchi/lsmcp", "--bin", "clangd"]
+   ```
+4. clangd needs `compile_commands.json` to resolve includes — generate it (CMake:
+   `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`; Make: `bear -- make`).
+5. Persist clangd + node in `.devcontainer/Dockerfile`.
+
+## Tooling (install + persist in the Dockerfile if missing — see SKILL-container.md)
 
 - Format: `clang-format` (honours a `.clang-format`; codehalter auto-formats
   `.c/.h/.cpp` on edit when it's installed).

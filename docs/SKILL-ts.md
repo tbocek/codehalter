@@ -24,7 +24,7 @@
 - Prefer immutable updates (`{...obj, field: x}`, `[...arr, x]`) over mutation.
 
 ## Tooling
-- ONE package manager per project, detected BEFORE installing — check `package.json`'s `packageManager` field, then the lockfile (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, `bun.lockb`→bun, else npm), then an existing `node_modules/.pnpm` dir (→pnpm; the lockfile is often gitignored, so this is the real signal). Use that ONE for EVERYTHING (formatter, lsmcp, scripts). Never mix npm into a pnpm/yarn project, and don't `npm install` then fall back. Get pnpm/yarn via `corepack enable`.
+- ONE package manager per project, detected BEFORE installing — check `package.json`'s `packageManager` field, then the lockfile (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, `bun.lockb`→bun, else npm), then an existing `node_modules/.pnpm` dir (→pnpm; the lockfile is often gitignored, so this is the real signal). Use that ONE for EVERYTHING (formatter, lsmcp, scripts). Never mix npm into a pnpm/yarn project, and don't `npm install` then fall back. Get pnpm/yarn via `corepack enable`. These tools need node — if the base image has none, install `nodejs npm` (OS package manager) and persist it FIRST. pnpm in a devcontainer drops a `.pnpm-store` in the repo (its store can't hardlink across the bind-mount) — gitignore `.pnpm-store` + `node_modules`.
 - Type-check and lint through the project's task runner — its package-manager run (`pnpm run`/`npm run`/`yarn`, matching the lockfile) `typecheck`/`build`/`lint` or whatever the `package.json` scripts declare. Don't call `tsc` or eslint directly.
 
 ## Code intelligence over MCP — lsmcp (the gopls analog)

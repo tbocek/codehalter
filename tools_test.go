@@ -8,14 +8,15 @@ import (
 )
 
 // TestLiveVsHistoryTruncation pins the split that caused (then fixed) the
-// history bloat that pushed requests past n_ctx: read_file / continue_read /
-// search_text pass through whole LIVE (they manage their own size), but the
+// history bloat that pushed requests past n_ctx: the content-retrieval tools
+// (read_file / continue_read / search_text + web_search / web_read /
+// web_read_raw) pass through whole LIVE (they manage their own size), but the
 // SAME output is byte-clipped when re-rendered from history, so an old read
 // can't sit at full size in every later request.
 func TestLiveVsHistoryTruncation(t *testing.T) {
 	big := strings.Repeat("x", truncateThreshold*3)
 
-	for _, tool := range []string{"read_file", "continue_read", "search_text"} {
+	for _, tool := range []string{"read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw"} {
 		if got := liveToolOutput("tu_1", tool, "{}", big); got != big {
 			t.Errorf("liveToolOutput(%s) clipped a size-managing tool (len %d, want %d)", tool, len(got), len(big))
 		}
@@ -29,6 +30,40 @@ func TestLiveVsHistoryTruncation(t *testing.T) {
 	}
 	if got := truncateForLLM("tu_1", "run_command", "{}", "small"); got != "small" {
 		t.Errorf("short content should pass through, got %q", got)
+	}
+}
+
+// TestLiveExemptCap pins the per-call byte ceiling on the content tools: even
+// the "pass through whole" tools can't blow n_ctx in one call — an oversized
+// output is clipped at a line boundary, reports how much was omitted, and the
+// kept span ends on a newline (no mid-line cut).
+func TestLiveExemptCap(t *testing.T) {
+	line := strings.Repeat("a", 80) + "\n"
+	huge := strings.Repeat(line, liveExemptCap/len(line)+50) // comfortably over the cap
+
+	got := liveToolOutput("tu_1", "search_text", "{}", huge)
+	if got == huge {
+		t.Fatal("oversized search_text output should be capped, not passed whole")
+	}
+	if !strings.Contains(got, "chars omitted") || !strings.Contains(got, "capped") {
+		t.Errorf("capped output must report the omission, got tail %q", got[max(0, len(got)-160):])
+	}
+	if len(got) > liveExemptCap+512 { // body ≤ cap, plus the short hint footer
+		t.Errorf("capped output too large: %d (cap %d)", len(got), liveExemptCap)
+	}
+	body := got[:strings.Index(got, "\n\n[...")]
+	if !strings.HasSuffix(body, "a") { // last kept char is real content, cut on a line boundary
+		t.Errorf("clip not line-aware: body ends %q", body[max(0, len(body)-5):])
+	}
+}
+
+// TestWebSearchRefineHint pins that web_search overflow steers the model to
+// refine the query (not just view_output) — the "ask to refine" half of the
+// truncation contract.
+func TestWebSearchRefineHint(t *testing.T) {
+	hint := truncationHint("tu_1", "web_search", `{"query":"x"}`)
+	if !strings.Contains(hint, "refine the query") {
+		t.Errorf("web_search hint should suggest refining the query, got %q", hint)
 	}
 }
 

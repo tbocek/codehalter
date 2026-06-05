@@ -623,7 +623,7 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		// (same reason Prompt posts the cancel notice on context.Background()).
 		if sess != nil && isCancelled(err) {
 			a.backgroundSummarise(sess)
-			a.compressHistory(context.Background(), sess, false)
+			a.compressHistory(context.Background(), sess, false, estimateMessageTokens(a.buildLLMContext(sess)))
 		}
 		return err
 	}
@@ -647,7 +647,7 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	}
 	a.backgroundSummarise(sess)
 	a.backgroundGitCommit(sess)
-	a.compressHistory(ctx, sess, false)
+	a.compressHistory(ctx, sess, false, estimateMessageTokens(a.buildLLMContext(sess)))
 	return nil
 }
 

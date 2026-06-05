@@ -404,20 +404,44 @@ const (
 	truncateThreshold = 1500
 	truncateHeadChars = 600
 	truncateTailChars = 600
+	// liveExemptCap bounds the LIVE output of the truncation-exempt tools
+	// (read_file / continue_read / search_text). They self-bound by COUNT
+	// (150-line chunk / 100 matches) but NOT by bytes — a minified file or
+	// long-line matches can still be enormous and blow n_ctx in a single call.
+	// ~32 KB ≈ 8k tokens: 20× the history clip, big enough to act on, but no
+	// single call can balloon the context. Clipped at a line boundary so we
+	// never slice mid-line / mid-match (the reason these are exempt at all).
+	liveExemptCap = 32 * 1024
 )
 
 // liveToolOutput is the model-visible content for a tool call as it executes.
-// read_file / continue_read / search_text manage their OWN size (line chunks /
-// bounded match lists), so their live output passes through whole — byte-
-// clipping them cut mid-line / sliced match blocks. Every other tool gets the
-// head/tail byte cap. This is LIVE only: history.go re-renders stored outputs
-// through truncateForLLM directly, which truncates everything — an old read or
-// search must NOT sit at full size in every later request (that ballooned the
-// context past n_ctx; the model can re-read / view_output if it needs it again).
+// The content-retrieval tools — read_file / continue_read / search_text and the
+// web fetchers web_search / web_read / web_read_raw — manage their OWN size
+// (line chunks, bounded match/result lists, offset/limit page slices) and the
+// model must act on the whole result in the current turn, so their live output
+// passes through whole rather than the 1.5 KB head/tail cap every other tool
+// gets — byte-clipping them cut mid-line / mid-result / mid-page. They still get
+// a generous line-aware ceiling (liveExemptCap) so one pathological call (a
+// minified file, long-line matches) can't blow n_ctx. This is LIVE only:
+// history.go re-renders stored outputs through truncateForLLM directly, which
+// truncates EVERYTHING to 1.5 KB — an old read or search must NOT sit at full
+// size in every later request (that ballooned the context past n_ctx; the model
+// can re-read / view_output if it needs it again).
 func liveToolOutput(useID, toolName, args, content string) string {
 	switch toolName {
-	case "read_file", "continue_read", "search_text":
-		return content
+	case "read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw":
+		if len(content) <= liveExemptCap {
+			return content
+		}
+		// Line-aware clip: keep whole lines up to the cap, then a pointer to
+		// the cached full output. Falls back to a hard byte cut only if there's
+		// no newline in the kept span (a single mega-line).
+		cut := strings.LastIndexByte(content[:liveExemptCap], '\n')
+		if cut <= 0 {
+			cut = liveExemptCap
+		}
+		return fmt.Sprintf("%s\n\n[... %d of %d chars omitted (oversized output capped at %d KB). %s]",
+			content[:cut], len(content)-cut, len(content), liveExemptCap/1024, truncationHint(useID, toolName, args))
 	}
 	return truncateForLLM(useID, toolName, args, content)
 }
@@ -471,6 +495,8 @@ func truncationHint(useID, toolName, args string) string {
 		return fmt.Sprintf("To see more: %s, OR call list_files on a subdirectory of %q.", viewOut, path)
 	case "search_text":
 		return "To see more: " + viewOut + ", OR re-run search_text with a more specific pattern or narrower path."
+	case "web_search":
+		return "To see more: " + viewOut + ", OR refine the query (fewer, more specific terms) and search again — then web_read the most promising result for its full text."
 	default:
 		return "To see more: " + viewOut + "."
 	}

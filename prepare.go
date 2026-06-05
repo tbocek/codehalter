@@ -17,20 +17,22 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// Fix-card prompts dispatched to the executor when the user accepts a card.
-// Kept as markdown in docs/ (embedded) rather than Go string literals; the %s/%q
-// holes are filled by fmt.Sprintf at the call site.
+// Fix-card prompts — the message dispatched to the executor when the user
+// accepts a 🟡 card. Kept as markdown in docs/ (not Go string literals) so the
+// wording is editable without code spelunking; the %s/%q holes are filled by
+// fmt.Sprintf at the call site. Each is a THIN trigger — the actual how-to
+// lives in the SKILL it points at (already in the system prompt).
 var (
-	//go:embed docs/fix-tools.md
-	fixToolsPrompt string
-	//go:embed docs/fix-lsmcp.md
-	fixLsmcpPrompt string
-	//go:embed docs/fix-mcp-parse.md
-	fixMCPParsePrompt string
-	//go:embed docs/fix-mcp-start.md
-	fixMCPStartPrompt string
-	//go:embed docs/fix-clangd.md
-	fixClangdPrompt string
+	//go:embed docs/card-install-tools.md
+	cardInstallTools string
+	//go:embed docs/card-setup-lsmcp.md
+	cardSetupLsmcp string
+	//go:embed docs/card-setup-clangd.md
+	cardSetupClangd string
+	//go:embed docs/card-mcp-parse-error.md
+	cardMCPParseError string
+	//go:embed docs/card-mcp-start-error.md
+	cardMCPStartError string
 )
 
 // ---------------------------------------------------------------------------
@@ -735,7 +737,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 		}
 		problems = append(problems, fixProblem{
 			desc:   fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
-			prompt: fmt.Sprintf(fixToolsPrompt, distro, detail.String()) + "\n\n" + installGuidance,
+			prompt: fmt.Sprintf(cardInstallTools, distro, detail.String()),
 		})
 	}
 	// JS/TS code-intelligence MCP (lsmcp) — the gopls analog. Offer setup when a
@@ -744,7 +746,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	if (slices.Contains(stacks, "ts") || slices.Contains(stacks, "js")) && !mcpServerConfigured(sess.Cwd, "lsmcp") {
 		problems = append(problems, fixProblem{
 			desc:   "🟡 JS/TS code intelligence (lsmcp MCP) not set up",
-			prompt: fixLsmcpPrompt + "\n\n" + installGuidance,
+			prompt: cardSetupLsmcp,
 		})
 	}
 	// C/C++ code-intelligence MCP (clangd) — the gopls analog for C, offered the
@@ -752,7 +754,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	if slices.Contains(stacks, "c") && !mcpServerConfigured(sess.Cwd, "clangd") {
 		problems = append(problems, fixProblem{
 			desc:   "🟡 C/C++ code intelligence (clangd MCP) not set up",
-			prompt: fixClangdPrompt + "\n\n" + installGuidance,
+			prompt: cardSetupClangd,
 		})
 	}
 	return changed, problems
@@ -783,12 +785,12 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) (bool, 
 		case "parse_error":
 			problems = append(problems, fixProblem{
 				desc:   fmt.Sprintf("🟡 .codehalter/mcp.toml parse error: %s", ch.err),
-				prompt: fmt.Sprintf(fixMCPParsePrompt, ch.err),
+				prompt: fmt.Sprintf(cardMCPParseError, ch.err),
 			})
 		case "failed":
 			problems = append(problems, fixProblem{
 				desc:   fmt.Sprintf("🟡 MCP server %q failed to start: %s", ch.name, ch.err),
-				prompt: fmt.Sprintf(fixMCPStartPrompt, ch.name, ch.err),
+				prompt: fmt.Sprintf(cardMCPStartError, ch.name, ch.err),
 			})
 		case "started":
 			notices = append(notices, fmt.Sprintf("✅ MCP server %q started", ch.name))

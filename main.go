@@ -55,15 +55,6 @@ var defaultSettingsTOML string
 //go:embed docs/mcp.toml
 var defaultMCPToml string
 
-// installGuidance is appended to install-type fix-card prompts (the user context
-// of that one dispatched turn) — NOT seeded as a skill. Install help is a
-// one-shot need; putting it in the system prompt would either bloat every turn
-// or, if added mid-session, change the leading prompt and kill the KV prefix
-// cache. Delivering it as user context keeps the cached prefix untouched.
-//
-//go:embed docs/INSTALL.md
-var installGuidance string
-
 // agent implements acp.Agent.
 type agent struct {
 	// mu guards the mutable top-level fields touched from concurrent ACP

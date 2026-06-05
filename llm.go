@@ -51,8 +51,10 @@ type sseChunk struct {
 	// Usage is the OpenAI-compatible token count block. With
 	// stream_options.include_usage=true the server emits one final chunk
 	// (choices empty) carrying this — the prompt_tokens count is ground
-	// truth for what the server actually packed into n_ctx, and replaces
-	// the chars/4 estimator on the compaction trigger.
+	// truth for what the server actually packed into n_ctx, PREFERRED over
+	// the chars/4 estimator on the compaction trigger. Not all backends send
+	// it (a proxy may strip include_usage); when absent the trigger falls back
+	// to estimateMessageTokens so compaction still fires (see compressHistory).
 	Usage *struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
@@ -80,7 +82,9 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// stream_options.include_usage asks the server to emit a final SSE chunk
 	// carrying prompt_tokens / completion_tokens. The chars/4 estimator can be
 	// 30% wrong on tool-heavy JSON; this gives us the server's own count so
-	// compressHistory triggers on ground truth instead of a guess.
+	// compressHistory triggers on ground truth when available. A backend that
+	// ignores this (or a proxy that strips it) leaves prompt_tokens at 0, so
+	// compressHistory falls back to the estimate rather than never firing.
 	reqBody["stream_options"] = map[string]any{"include_usage": true}
 	reqBody["messages"] = messages
 	if tools != nil {
