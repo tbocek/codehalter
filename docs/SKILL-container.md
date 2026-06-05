@@ -5,19 +5,19 @@ the container is your sandbox — pkg-mgr / pip / npm writes persist for the
 container's lifetime (wiped on rebuild), so test installs are cheap and
 reversible.
 
-## Git — read-only history, mutable working tree
+## Git — writable, commit/push when asked
 
-`.git` is bind-mounted read-only. The working tree can change, but the
-object/ref store cannot, so destructive history-rewriting commands fail at
-the filesystem layer:
+`.git` is bind-mounted writable and your `~/.gitconfig` plus SSH agent are
+mounted, so commit and push work from inside the container. But act on git ONLY
+when the user explicitly asks (see EXECUTE.md) — never commit/push on your own.
 
-- **Blocked**: `git push` (any form), `git reset --hard`, `git branch -D`,
-  `git filter-branch`, `git gc --prune`, anything writing under `.git/`.
-- **Fine**: `git status`/`log`/`diff`/`show`/`blame`/`ls-remote`/`fetch`,
-  `git clone <other-repo>` (into a fresh dir), `git archive`.
+- **Fine on request**: `git commit`, `git push`, and the always-safe reads
+  `git status`/`log`/`diff`/`show`/`blame`/`fetch`.
+- **Still avoid unless explicitly asked**: history rewrites on shared branches —
+  `git reset --hard`, `git push --force`, `git filter-branch`, `git gc --prune`.
 
-If the user wants to push, commit, amend, or rewrite history, surface the
-exact host command and stop — don't try yourself, the FS error is unhelpful.
+If a git write fails (read-only `.git`, or no credentials mounted — an older
+container), surface the exact host command and stop rather than fighting it.
 
 ## When a task fails with "command not found"
 

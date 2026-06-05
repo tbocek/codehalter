@@ -96,10 +96,11 @@ you can't hold all of it anyway.
   (`read_file line=N`), copy its current exact text, and retry a SMALL edit. Do
   NOT re-read from the top, and do NOT fall back to rewriting the whole file.
 
-## Git — the human runs it
+## Git — commit/push only when explicitly asked
 
-NEVER `git commit` or `git push` (in the devcontainer `.git` is read-only; the
-rule holds outside too). You only prepare the message.
+This devcontainer has a WRITABLE `.git` and your SSH push credentials mounted, so
+you can commit and push yourself — but ONLY when the user explicitly asks. Never
+commit or push on your own initiative, and never as a side effect of another task.
 
 Asked to commit (and/or push):
 
@@ -108,10 +109,14 @@ Asked to commit (and/or push):
        <imperative subject ≤72 chars>
        <blank line>
        <body: 1-3 short bullets/sentences on WHY, not WHAT>
-2. In `respond`, suggest the exact host command:
-       git commit -F .codehalter/.git_commit
-   Append ` && git push` if push was asked.
-3. End the turn. Do NOT run commit/push via run_task/run_command.
+2. Commit via `run_command`: `git commit -F .codehalter/.git_commit`.
+3. If push was asked: `git push`.
+4. In `respond`, report what you did — the commit subject, and the branch if you
+   pushed.
+
+Fallback: if commit fails read-only or push fails auth (an older container
+without the writable-`.git` / SSH mounts), don't fight it — suggest the host
+command `git commit -F .codehalter/.git_commit && git push` in `respond` and stop.
 
 ## On tool failure (especially run_task)
 

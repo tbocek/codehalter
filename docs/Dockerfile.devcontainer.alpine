@@ -7,10 +7,12 @@ RUN apk update && apk add --no-cache \
         go \
         firefox-esr
 
-RUN groupadd --gid 1000 dev \
-    && useradd --uid 1000 --gid 1000 -m -s /bin/bash -G wheel dev \
+COPY .devcontainer/.uid .devcontainer/.gid /tmp/
+RUN groupadd --gid "$(cat /tmp/.gid)" dev \
+    && useradd --uid "$(cat /tmp/.uid)" --gid "$(cat /tmp/.gid)" -m -s /bin/bash -G wheel dev \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
-    && install -d -o 1000 -g 1000 /home/dev/.config
+    && install -d -o dev -g dev /home/dev/.config \
+    && rm -f /tmp/.uid /tmp/.gid
 
 ENV GOBIN=/usr/local/bin
 ENV GOTOOLCHAIN=auto
