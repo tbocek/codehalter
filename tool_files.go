@@ -314,6 +314,7 @@ func init() {
 		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
 		oldContent, _ := fsRead(a, ctx, sid, path, nil, nil)
+		newContent = a.formatGuarded(sid, path, oldContent, newContent)
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
@@ -371,6 +372,7 @@ func init() {
 		}
 
 		newContent := strings.Replace(content, oldText, newText, 1)
+		newContent = a.formatGuarded(sid, path, content, newContent)
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())

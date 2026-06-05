@@ -9,8 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+
+	"github.com/BurntSushi/toml"
 )
 
 // ---------------------------------------------------------------------------
@@ -30,9 +33,9 @@ type fixProblem struct {
 // stack's required dev tooling is installed. "" means no probe known —
 // checkEnv ignores that stack. One binary per stack by design: gopls
 // stands in for Go because installing it implicitly requires the toolchain.
-// JS/TS has no single PATH-binary probe — its MCP code-intelligence path
-// (lsmcp, see SKILL-ts/js.md) is a project devDep + mcp.toml entry, set up on
-// request rather than auto-offered.
+// JS/TS has no PATH-binary probe — its code-intelligence path is the lsmcp MCP
+// (a project devDep + mcp.toml entry), which checkEnv offers via its own setup
+// card (mcpServerConfigured), so it's no longer second-class versus gopls.
 func stackProbeBinary(stack string) string {
 	switch stack {
 	case "go":
@@ -92,6 +95,101 @@ func runnerProbeBinary(kind string) string {
 		return "go"
 	}
 	return ""
+}
+
+// formatterNeed is a formatter this project would use (from a detected stack or
+// a formatter config file) plus a human-readable reason, for the install card.
+type formatterNeed struct {
+	bin    string
+	reason string
+}
+
+// detectFormatters returns the formatters defensive auto-formatting (format.go)
+// would invoke here, EXCLUDING ones that ship with their language toolchain
+// (gofmt, rustfmt, zig fmt — present whenever the language is). Derived from
+// detected stacks AND formatter config files, so the install card can offer a
+// missing one (e.g. prettier on a fresh TS repo, or ruff when pyproject pins it
+// even though detectStacks doesn't model Python).
+func detectFormatters(stacks []string, cwd string) []formatterNeed {
+	var needs []formatterNeed
+	seen := map[string]bool{}
+	add := func(bin, reason string) {
+		if seen[bin] {
+			return
+		}
+		seen[bin] = true
+		needs = append(needs, formatterNeed{bin, reason})
+	}
+	for _, s := range stacks {
+		switch s {
+		case "ts", "js":
+			add("prettier", s+" stack")
+		case "bash":
+			add("shfmt", "bash stack")
+		}
+	}
+	if hasPrettierConfig(cwd) {
+		add("prettier", "prettier config")
+	}
+	if fileExists(cwd, ".clang-format") {
+		add("clang-format", ".clang-format")
+	}
+	if pyprojectHasTable(cwd, "[tool.ruff") {
+		add("ruff", "ruff config")
+	}
+	if pyprojectHasTable(cwd, "[tool.black]") {
+		add("black", "black config")
+	}
+	return needs
+}
+
+func fileExists(cwd, name string) bool {
+	_, err := os.Stat(filepath.Join(cwd, name))
+	return err == nil
+}
+
+// hasPrettierConfig reports whether the project pins prettier — a dotfile, a
+// prettier.config.*, or a "prettier" key in package.json.
+func hasPrettierConfig(cwd string) bool {
+	for _, n := range []string{
+		".prettierrc", ".prettierrc.json", ".prettierrc.yaml", ".prettierrc.yml",
+		".prettierrc.json5", ".prettierrc.js", ".prettierrc.cjs", ".prettierrc.mjs",
+		".prettierrc.toml", "prettier.config.js", "prettier.config.cjs", "prettier.config.mjs",
+	} {
+		if fileExists(cwd, n) {
+			return true
+		}
+	}
+	if data, err := os.ReadFile(filepath.Join(cwd, "package.json")); err == nil {
+		return strings.Contains(string(data), "\"prettier\"")
+	}
+	return false
+}
+
+// pyprojectHasTable reports whether cwd/pyproject.toml contains the given table
+// header prefix ("[tool.ruff" matches both [tool.ruff] and [tool.ruff.lint]).
+func pyprojectHasTable(cwd, prefix string) bool {
+	data, err := os.ReadFile(filepath.Join(cwd, "pyproject.toml"))
+	return err == nil && strings.Contains(string(data), prefix)
+}
+
+// mcpServerConfigured reports whether .codehalter/mcp.toml has an ACTIVE
+// [[server]] with the given name. Missing/unparseable file → false; commented
+// entries don't decode, so they read as not-configured — exactly what the
+// setup card wants.
+func mcpServerConfigured(cwd, name string) bool {
+	var f struct {
+		Server []MCPServerConfig `toml:"server"`
+	}
+	if _, err := toml.DecodeFile(filepath.Join(cwd, sessionDir, "mcp.toml"), &f); err != nil {
+		return false
+	}
+	for _, s := range f.Server {
+		if s.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
@@ -490,6 +588,20 @@ func (a *agent) envSnapshot(sess *Session) string {
 			fmt.Fprintf(&b, "runner[%s]=missing\n", bin)
 		}
 	}
+	// Formatter + lsmcp presence: so the snapshot flips (and the card stops being
+	// offered) once a missing formatter is installed or lsmcp gets wired.
+	for _, f := range detectFormatters(sess.knownStacks, sess.Cwd) {
+		present := false
+		if f.bin == "prettier" {
+			present = prettierBin(sess.Cwd) != ""
+		} else if _, err := exec.LookPath(f.bin); err == nil {
+			present = true
+		}
+		fmt.Fprintf(&b, "fmt[%s]=%v\n", f.bin, present)
+	}
+	if slices.Contains(sess.knownStacks, "ts") || slices.Contains(sess.knownStacks, "js") {
+		fmt.Fprintf(&b, "lsmcp=%v\n", mcpServerConfigured(sess.Cwd, "lsmcp"))
+	}
 	return b.String()
 }
 
@@ -561,29 +673,61 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 			}
 		}
 	}
-	if detail.Len() == 0 {
-		return changed, nil
+	// Formatters defensive auto-formatting would use (prettier checks the
+	// project-local bin too) — a missing one folds into the same install card.
+	for _, f := range detectFormatters(stacks, sess.Cwd) {
+		missing := false
+		if f.bin == "prettier" {
+			missing = prettierBin(sess.Cwd) == ""
+		} else if _, err := exec.LookPath(f.bin); err != nil {
+			missing = true
+		}
+		if missing {
+			note(f.bin, f.reason+" formatter")
+		}
 	}
-	// Embed the OS we already detected so the LLM doesn't waste a tool
-	// call rediscovering it. The bootstrap step (ensureDevcontainer) only
-	// scaffolds containers based on one of the five supported distros, so
-	// osi.ID is a non-empty supported value by the time prepare runs.
-	distro := osi.Fields["PRETTY_NAME"]
-	if distro == "" {
-		distro = strings.ToUpper(osi.ID[:1]) + osi.ID[1:]
+
+	var problems []fixProblem
+	if detail.Len() > 0 {
+		// Embed the OS we already detected so the LLM doesn't waste a tool
+		// call rediscovering it. The bootstrap step (ensureDevcontainer) only
+		// scaffolds containers based on one of the five supported distros, so
+		// osi.ID is a non-empty supported value by the time prepare runs.
+		distro := osi.Fields["PRETTY_NAME"]
+		if distro == "" {
+			distro = strings.ToUpper(osi.ID[:1]) + osi.ID[1:]
+		}
+		problems = append(problems, fixProblem{
+			desc: fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
+			prompt: fmt.Sprintf("Missing dev tools in this %s devcontainer: %s. "+
+				"PLAN ONLY — do not install anything yourself. Produce execute-phase "+
+				"steps in this order for each tool: (1) install it with the right "+
+				"package manager (the OS one for system tools; npm/pip/etc. for "+
+				"language formatters like prettier/ruff — the SKILL files cover which), "+
+				"(2) verify it runs (e.g. `<tool> --version`), (3) persist by editing "+
+				".devcontainer/Dockerfile, (4) if the tool is MCP-capable (e.g. gopls "+
+				"via `gopls mcp`), add a [[server]] entry to .codehalter/mcp.toml. "+
+				"Verify-phase checks: each tool on PATH, Dockerfile contains the persist line.",
+				distro, detail.String()),
+		})
 	}
-	return changed, []fixProblem{{
-		desc: fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
-		prompt: fmt.Sprintf("Missing dev tools in this %s devcontainer: %s. "+
-			"PLAN ONLY — do not install anything yourself. Produce execute-phase "+
-			"steps in this order for each tool: (1) install via the OS package "+
-			"manager, (2) verify it runs (e.g. `<tool> --version`), (3) persist "+
-			"by editing .devcontainer/Dockerfile, (4) if the tool is MCP-capable "+
-			"(e.g. gopls via `gopls mcp`), add a [[server]] entry to "+
-			".codehalter/mcp.toml. Verify-phase checks: each tool on PATH, "+
-			"Dockerfile contains the persist line.",
-			distro, detail.String()),
-	}}
+	// JS/TS code-intelligence MCP (lsmcp) — the gopls analog. Offer setup when a
+	// TS/JS project hasn't wired it, mirroring Go's gopls card so JS/TS isn't a
+	// second-class citizen at fresh-project setup.
+	if (slices.Contains(stacks, "ts") || slices.Contains(stacks, "js")) && !mcpServerConfigured(sess.Cwd, "lsmcp") {
+		problems = append(problems, fixProblem{
+			desc: "🟡 JS/TS code intelligence (lsmcp MCP) not set up",
+			prompt: "This TS/JS project has no code-intelligence MCP configured (the gopls analog). " +
+				"PLAN ONLY — do not run anything yourself. Produce execute-phase steps to set up lsmcp: " +
+				"(1) add devDeps `npm add -D @mizchi/lsmcp @typescript/native-preview`, " +
+				"(2) `npx @mizchi/lsmcp init -p tsgo` to write .lsmcp/config.json, " +
+				"(3) add an lsmcp [[server]] to .codehalter/mcp.toml (command=\"npx\", " +
+				"args=[\"-y\", \"@mizchi/lsmcp\", \"-p\", \"tsgo\"]) — the file has a commented template, " +
+				"(4) persist the devDeps in package.json. See SKILL-ts.md. " +
+				"Verify: .codehalter/mcp.toml has an active lsmcp [[server]].",
+		})
+	}
+	return changed, problems
 }
 
 // ---------------------------------------------------------------------------

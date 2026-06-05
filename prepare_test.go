@@ -5,9 +5,73 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func hasFormatterNeed(needs []formatterNeed, bin string) bool {
+	for _, n := range needs {
+		if n.bin == bin {
+			return true
+		}
+	}
+	return false
+}
+
+// TestDetectFormatters covers both drivers: detected stack (ts → prettier) and
+// formatter config files (.clang-format → clang-format, pyproject [tool.ruff] →
+// ruff), and that an empty project needs nothing.
+func TestDetectFormatters(t *testing.T) {
+	if !hasFormatterNeed(detectFormatters([]string{"ts"}, t.TempDir()), "prettier") {
+		t.Errorf("ts stack should need prettier")
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".clang-format"), []byte("BasedOnStyle: LLVM\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "pyproject.toml"), []byte("[tool.ruff.lint]\nselect = [\"E\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := detectFormatters(nil, dir)
+	if !hasFormatterNeed(got, "clang-format") || !hasFormatterNeed(got, "ruff") {
+		t.Errorf("config files should need clang-format+ruff, got %v", got)
+	}
+
+	if n := detectFormatters(nil, t.TempDir()); len(n) != 0 {
+		t.Errorf("empty project should need no formatters, got %v", n)
+	}
+}
+
+// TestMcpServerConfigured pins lsmcp detection: no file / commented entry read
+// as not-configured (so the setup card fires), an active entry as configured.
+func TestMcpServerConfigured(t *testing.T) {
+	dir := t.TempDir()
+	if mcpServerConfigured(dir, "lsmcp") {
+		t.Error("no mcp.toml should be not-configured")
+	}
+	cfgDir := filepath.Join(dir, sessionDir)
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mcpPath := filepath.Join(cfgDir, "mcp.toml")
+
+	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"lsmcp\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if mcpServerConfigured(dir, "lsmcp") {
+		t.Error("commented lsmcp should be not-configured")
+	}
+
+	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"lsmcp\"\ncommand = \"npx\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !mcpServerConfigured(dir, "lsmcp") {
+		t.Error("active lsmcp should be configured")
+	}
+}
 
 // TestProbeAllLLMsConfigBeatsProbe asserts the precedence rule: explicit
 // context_size / image_support on the [[llm]] entry win over whatever the
