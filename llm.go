@@ -413,12 +413,23 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	defer cancel()
 
 	r, _ := a.probeViaModels(probeCtx, conn)
-	// Always enrich via /props when reachable: it carries image + ctx metadata
-	// AND llama.cpp's per-slot n_ctx / total_slots, none of which /v1/models
-	// exposes. Non-llama backends 404 here (ok=false) and we keep the
-	// /v1/models result; /props also serves as a reachability fallback for
-	// llama-server builds that don't expose /v1/models.
-	if p, ok := a.probeViaProps(probeCtx, conn); ok {
+	// Enrich via /props when reachable: it carries image + ctx metadata AND
+	// llama.cpp's per-slot n_ctx / total_slots, none of which /v1/models exposes.
+	// Non-llama backends 404 here (ok=false) and we keep the /v1/models result.
+	p, ok := a.probeViaProps(probeCtx, conn)
+	// llama-swap router with models_autoload: /props is reachable but reports
+	// n_ctx=0 until a model is loaded (role:"router", model_path:"none"). The
+	// n_ctx-unknown gate would then block the prompt that WOULD load it — a
+	// deadlock. So load the model (one bodyless call) and re-read /props. Scoped
+	// to reachable /props so OpenAI/vLLM (which 404 /props and take ctx from
+	// settings.toml) never hit this.
+	if ok && p.ContextSize == 0 && p.SlotCtx == 0 {
+		a.loadModel(ctx, conn)
+		rpCtx, rpCancel := context.WithTimeout(ctx, 5*time.Second)
+		p, ok = a.probeViaProps(rpCtx, conn)
+		rpCancel()
+	}
+	if ok {
 		r.Reachable = true
 		if !r.ImageSupport {
 			r.ImageSupport = p.ImageSupport
@@ -440,6 +451,35 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 		slog.Info("probeLLM: unreachable", "server", conn.Server, "model", conn.Model)
 	}
 	return r
+}
+
+// loadModel sends one bodyless completion so a lazy-loading router (llama-swap
+// models_autoload) loads the model — then the caller's /props re-read returns
+// the real n_ctx instead of 0. Fire-and-forget: the router loads the model
+// before forwarding, so it loads even if the empty request itself errors. Own
+// long timeout — a cold load far outlasts the 5s metadata probe.
+func (a *agent) loadModel(ctx context.Context, conn *LLMConnection) {
+	body, err := json.Marshal(map[string]any{"model": conn.Model, "messages": []any{}})
+	if err != nil {
+		return
+	}
+	loadCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(loadCtx, "POST", conn.endpoint("/v1/chat/completions"), bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if conn.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
+	}
+	slog.Info("loadModel: triggering autoload (router reported n_ctx=0)", "model", conn.Model)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.Info("loadModel: request failed", "model", conn.Model, "err", err)
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 // probeViaModels asks /v1/models for the configured model. Always confirms
