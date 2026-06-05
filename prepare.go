@@ -29,6 +29,8 @@ var (
 	fixMCPParsePrompt string
 	//go:embed docs/fix-mcp-start.md
 	fixMCPStartPrompt string
+	//go:embed docs/fix-clangd.md
+	fixClangdPrompt string
 )
 
 // ---------------------------------------------------------------------------
@@ -141,6 +143,8 @@ func detectFormatters(stacks []string, cwd string) []formatterNeed {
 			add("prettier", s+" stack")
 		case "bash":
 			add("shfmt", "bash stack")
+		case "c":
+			add("clang-format", "c stack")
 		}
 	}
 	if hasPrettierConfig(cwd) {
@@ -741,6 +745,14 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 		problems = append(problems, fixProblem{
 			desc:   "🟡 JS/TS code intelligence (lsmcp MCP) not set up",
 			prompt: fixLsmcpPrompt + "\n\n" + installGuidance,
+		})
+	}
+	// C/C++ code-intelligence MCP (clangd) — the gopls analog for C, offered the
+	// same way as Go's gopls and JS/TS's lsmcp when a C project hasn't wired it.
+	if slices.Contains(stacks, "c") && !mcpServerConfigured(sess.Cwd, "clangd") {
+		problems = append(problems, fixProblem{
+			desc:   "🟡 C/C++ code intelligence (clangd MCP) not set up",
+			prompt: fixClangdPrompt + "\n\n" + installGuidance,
 		})
 	}
 	return changed, problems

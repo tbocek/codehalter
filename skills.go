@@ -25,6 +25,9 @@ var skillJava string
 //go:embed docs/SKILL-bash.md
 var skillBash string
 
+//go:embed docs/SKILL-c.md
+var skillC string
+
 //go:embed docs/SKILL-container.md
 var skillContainer string
 
@@ -59,6 +62,7 @@ var defaultSkills = map[string]string{
 	"js":   skillJS,
 	"java": skillJava,
 	"bash": skillBash,
+	"c":    skillC,
 }
 
 // osSkills maps an /etc/os-release ID (as returned by readOSInfo) to the

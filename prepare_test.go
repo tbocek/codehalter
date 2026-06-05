@@ -67,6 +67,9 @@ func TestDetectFormatters(t *testing.T) {
 	if !hasFormatterNeed(detectFormatters([]string{"ts"}, t.TempDir()), "prettier") {
 		t.Errorf("ts stack should need prettier")
 	}
+	if !hasFormatterNeed(detectFormatters([]string{"c"}, t.TempDir()), "clang-format") {
+		t.Errorf("c stack should need clang-format")
+	}
 
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, ".clang-format"), []byte("BasedOnStyle: LLVM\n"), 0o644); err != nil {

@@ -42,6 +42,10 @@ func TestDetectStacksSingle(t *testing.T) {
 		{"ts-tsconfig", []string{"tsconfig.json"}, "ts"},
 		{"ts-fileonly", []string{"app.ts"}, "ts"},
 		{"js", []string{"package.json"}, "js"},
+		{"c-source", []string{"main.c"}, "c"},
+		{"cpp-source", []string{"main.cpp"}, "c"},
+		{"c-header-only", []string{"lib.h"}, "c"},
+		{"cmake", []string{"CMakeLists.txt"}, "c"},
 		{"bash", []string{"run.sh"}, "bash"},
 	}
 	for _, c := range cases {
@@ -87,12 +91,12 @@ func TestDetectStacksMulti(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir,
 		"go.mod", "package.json", "tsconfig.json",
-		"pom.xml", "Cargo.toml", "build.zig", "run.sh",
+		"pom.xml", "Cargo.toml", "build.zig", "main.c", "run.sh",
 	)
 	if err := os.MkdirAll(filepath.Join(dir, ".devcontainer"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	want := []string{"go", "ts", "java", "rust", "zig", "bash", "devcontainer"}
+	want := []string{"go", "ts", "java", "rust", "zig", "c", "bash", "devcontainer"}
 	got := detectStacks(dir)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("multi: want %v, got %v", want, got)

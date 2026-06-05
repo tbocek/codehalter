@@ -215,6 +215,11 @@ func detectStacks(cwd string) []string {
 		}
 	}
 
+	_, cmakeErr := os.Stat(filepath.Join(cwd, "CMakeLists.txt"))
+	if cmakeErr == nil || hasFileWithExt(cwd, ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx") {
+		stacks = append(stacks, "c")
+	}
+
 	if hasFileWithExt(cwd, ".sh", ".bash") {
 		stacks = append(stacks, "bash")
 	}
