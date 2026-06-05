@@ -641,18 +641,17 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			})
 		}
 
-		// Per-LLM-call progress fan-out: fire summary + git_commit after each
-		// iteration's tool batch. Without this, a planner that spends 17
-		// minutes in one tool loop produces zero shadow notes and a stale
-		// .codehalter/.git_commit — the existing Prompt() epilogue only runs
-		// after the whole task finishes. Summariser enqueues every fire so a
-		// 50-iteration loop produces 50 progress notes; git commit coalesces
-		// via gitCommitJob (bgJob) since gitCommitLastHash already dedupes
-		// identical snapshots. Subagents (Depth>0) skip — they already route
-		// via their pinned slot and don't own the shadow buffer.
+		// Per-LLM-call progress fan-out: fire the summariser after each
+		// iteration's tool batch so a long tool loop keeps populating the shadow
+		// buffer that mid-turn compaction draws on (without this, a planner that
+		// spends 17 minutes in one loop produces zero shadow notes). git-commit
+		// is deliberately NOT fired here: the commit message only matters once
+		// the turn ends and the user is back in control, and the working tree
+		// keeps changing mid-turn — so runTurn fires backgroundGitCommit once at
+		// turn end, and per-iteration commits would only burn the background slot.
+		// Subagents (Depth>0) skip — they don't own the shadow buffer.
 		if sess := a.getSession(sid); sess != nil && sess.Depth == 0 {
 			a.backgroundSummarise(sess)
-			a.backgroundGitCommit(sess)
 		}
 
 		// Terminal tool called: stream the message to the UI as one chunk

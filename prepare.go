@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -14,6 +15,20 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+)
+
+// Fix-card prompts dispatched to the executor when the user accepts a card.
+// Kept as markdown in docs/ (embedded) rather than Go string literals; the %s/%q
+// holes are filled by fmt.Sprintf at the call site.
+var (
+	//go:embed docs/fix-tools.md
+	fixToolsPrompt string
+	//go:embed docs/fix-lsmcp.md
+	fixLsmcpPrompt string
+	//go:embed docs/fix-mcp-parse.md
+	fixMCPParsePrompt string
+	//go:embed docs/fix-mcp-start.md
+	fixMCPStartPrompt string
 )
 
 // ---------------------------------------------------------------------------
@@ -634,16 +649,33 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	if err := ensureSkills(sess.Cwd, sess.knownStacks, osi); err != nil {
 		slog.Warn("prepare: ensureSkills failed", "sid", sid, "err", err)
 	}
-	// Rebuild the system prompt every turn but assign only on an actual byte
-	// diff. An unchanged prompt keeps the LLM's KV prefix cache warm; a skill
-	// added/edited/removed on disk this turn — whether codehalter-managed or a
-	// SKILL-*.md the user hand-dropped — gets picked up for the next LLM call
-	// (including proposeFix's orchestrate below) instead of waiting for a new
-	// session.
+	// The system prompt is the leading message of every request, so changing it
+	// mid-session busts the LLM's KV prefix cache — which only compaction may do.
+	// So: set it on the FIRST build; afterward, a skill SEEDED on disk this
+	// session (e.g. a stack newly detected after an install) is injected as a
+	// user message for this turn instead — cache-safe, since it appends to the
+	// tail. The next compaction re-renders the prompt (history.go) and is where
+	// the skill finally enters the cached prefix. promptSkills tracks what the
+	// current prompt already holds, so each new skill is injected exactly once.
+	if sess.promptSkills == nil {
+		sess.promptSkills = skillFiles(sess.Cwd)
+	}
 	if sp, err := a.systemPrompt(sid); err != nil {
 		slog.Warn("prepare: systemPrompt rebuild failed", "sid", sid, "err", err)
-	} else if sp != sess.SystemPrompt {
+	} else if sess.SystemPrompt == "" {
 		sess.SystemPrompt = sp
+		sess.promptSkills = skillFiles(sess.Cwd)
+	} else if sp != sess.SystemPrompt {
+		for _, name := range skillFiles(sess.Cwd) {
+			if slices.Contains(sess.promptSkills, name) {
+				continue
+			}
+			if body := readSkillBody(sess.Cwd, name); body != "" {
+				sess.AddUser("[New skill available this session — " + name +
+					". It enters the system prompt at the next history compaction; until then it's here.]\n\n" + body)
+				sess.promptSkills = append(sess.promptSkills, name)
+			}
+		}
 	}
 
 	snap := a.envSnapshot(sess)
@@ -698,17 +730,8 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 			distro = strings.ToUpper(osi.ID[:1]) + osi.ID[1:]
 		}
 		problems = append(problems, fixProblem{
-			desc: fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
-			prompt: fmt.Sprintf("Missing dev tools in this %s devcontainer: %s. "+
-				"PLAN ONLY — do not install anything yourself. Produce execute-phase "+
-				"steps in this order for each tool: (1) install it with the right "+
-				"package manager (the OS one for system tools; npm/pip/etc. for "+
-				"language formatters like prettier/ruff — the SKILL files cover which), "+
-				"(2) verify it runs (e.g. `<tool> --version`), (3) persist by editing "+
-				".devcontainer/Dockerfile, (4) if the tool is MCP-capable (e.g. gopls "+
-				"via `gopls mcp`), add a [[server]] entry to .codehalter/mcp.toml. "+
-				"Verify-phase checks: each tool on PATH, Dockerfile contains the persist line.",
-				distro, detail.String()),
+			desc:   fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
+			prompt: fmt.Sprintf(fixToolsPrompt, distro, detail.String()) + "\n\n" + installGuidance,
 		})
 	}
 	// JS/TS code-intelligence MCP (lsmcp) — the gopls analog. Offer setup when a
@@ -716,15 +739,8 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	// second-class citizen at fresh-project setup.
 	if (slices.Contains(stacks, "ts") || slices.Contains(stacks, "js")) && !mcpServerConfigured(sess.Cwd, "lsmcp") {
 		problems = append(problems, fixProblem{
-			desc: "🟡 JS/TS code intelligence (lsmcp MCP) not set up",
-			prompt: "This TS/JS project has no code-intelligence MCP configured (the gopls analog). " +
-				"PLAN ONLY — do not run anything yourself. Produce execute-phase steps to set up lsmcp: " +
-				"(1) add devDeps `npm add -D @mizchi/lsmcp @typescript/native-preview`, " +
-				"(2) `npx @mizchi/lsmcp init -p tsgo` to write .lsmcp/config.json, " +
-				"(3) add an lsmcp [[server]] to .codehalter/mcp.toml (command=\"npx\", " +
-				"args=[\"-y\", \"@mizchi/lsmcp\", \"-p\", \"tsgo\"]) — the file has a commented template, " +
-				"(4) persist the devDeps in package.json. See SKILL-ts.md. " +
-				"Verify: .codehalter/mcp.toml has an active lsmcp [[server]].",
+			desc:   "🟡 JS/TS code intelligence (lsmcp MCP) not set up",
+			prompt: fixLsmcpPrompt + "\n\n" + installGuidance,
 		})
 	}
 	return changed, problems
@@ -754,19 +770,13 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) (bool, 
 		switch ch.action {
 		case "parse_error":
 			problems = append(problems, fixProblem{
-				desc: fmt.Sprintf("🟡 .codehalter/mcp.toml parse error: %s", ch.err),
-				prompt: fmt.Sprintf("The MCP configuration file .codehalter/mcp.toml failed to parse: %s. "+
-					"Read the file, fix the syntax error, and confirm it parses cleanly by re-reading it. "+
-					"Do not start any servers — codehalter will pick up the fix on the next prompt.", ch.err),
+				desc:   fmt.Sprintf("🟡 .codehalter/mcp.toml parse error: %s", ch.err),
+				prompt: fmt.Sprintf(fixMCPParsePrompt, ch.err),
 			})
 		case "failed":
 			problems = append(problems, fixProblem{
-				desc: fmt.Sprintf("🟡 MCP server %q failed to start: %s", ch.name, ch.err),
-				prompt: fmt.Sprintf("The MCP server %q in .codehalter/mcp.toml failed to start: %s. "+
-					"Inspect the [[server]] entry, confirm the command is on PATH, and check any required "+
-					"args / env. If the server's binary is missing, install it via run_command, verify it "+
-					"runs by hand, then persist the install in .devcontainer/Dockerfile so it survives a "+
-					"container rebuild.", ch.name, ch.err),
+				desc:   fmt.Sprintf("🟡 MCP server %q failed to start: %s", ch.name, ch.err),
+				prompt: fmt.Sprintf(fixMCPStartPrompt, ch.name, ch.err),
 			})
 		case "started":
 			notices = append(notices, fmt.Sprintf("✅ MCP server %q started", ch.name))
@@ -932,6 +942,10 @@ func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 	}
 	sess.AddUser(p.prompt)
 	sess.saveOrLog()
+	// The user accepting the fix card IS the execute approval, so auto-run the
+	// plan without a second "Execute?" gate (confirmPlan honours fixAutoExec).
+	sess.fixAutoExec = true
+	defer func() { sess.fixAutoExec = false }()
 	// The accepted fix is its own turn — run it through the same path as a typed
 	// Prompt (runTurn) so it gets the "✅ Done" stats line, git-commit, and
 	// compaction. This used to call orchestrate directly and skip all three.

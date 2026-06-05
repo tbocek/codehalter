@@ -1,10 +1,26 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+// TestConfirmPlanFixAutoExecSkipsGate pins that a user-accepted fix dispatch
+// (fixAutoExec set) skips confirmPlan's "Execute?" gate. Every fix card —
+// missing-tools/npm, lsmcp, mcp errors — routes through proposeFix, which sets
+// the flag, so this one check covers them all. With a nil conn, reaching the
+// gate would call conn.AskChoice and panic; returning nil proves it was skipped.
+func TestConfirmPlanFixAutoExecSkipsGate(t *testing.T) {
+	a, s := newTestAgent(t)
+	plan := &planResult{Subtasks: []subtask{{Description: "install npm + prettier"}}}
+
+	s.fixAutoExec = true
+	if err := a.confirmPlan(context.Background(), s.ID, plan, false); err != nil {
+		t.Errorf("fixAutoExec set: confirmPlan should skip the gate and return nil, got %v", err)
+	}
+}
 
 // TestParseLineRange covers the line-range encodings Zed may put in a
 // resource_link fragment.
@@ -80,7 +96,7 @@ func TestResourceLabel(t *testing.T) {
 	cases := map[string]string{
 		"file:///workspaces/codehalter/llm.go":          "/workspaces/codehalter/llm.go",
 		"file:///workspaces/codehalter/llm.go#L801-836": "/workspaces/codehalter/llm.go (L801-836)",
-		"":                                              "attachment",
+		"": "attachment",
 	}
 	for uri, want := range cases {
 		if got := resourceLabel(uri); got != want {

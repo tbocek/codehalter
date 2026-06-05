@@ -169,6 +169,16 @@ func renderOSSkill(body string, fields map[string]string) string {
 	})
 }
 
+// readSkillBody returns the body of one .codehalter/SKILL-*.md, or "" if absent.
+// Used to inject a mid-session-seeded skill as a user message (see checkEnv).
+func readSkillBody(cwd, name string) string {
+	data, err := os.ReadFile(filepath.Join(cwd, ".codehalter", name))
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
 // skillFiles returns the SKILL-*.md filenames in .codehalter/, sorted — a
 // deterministic order keeps loadSkills's cache prefix and listSkills's banner
 // stable. Non-skill files are filtered out.

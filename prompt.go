@@ -812,6 +812,12 @@ func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, i
 	if a.isAutopilot() {
 		return nil
 	}
+	// A user-accepted fix card already got the go-ahead — don't ask "Execute?"
+	// again; just run the install plan it dispatched.
+	if sess := a.getSession(sid); sess != nil && sess.fixAutoExec {
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[fix accepted] Running the plan.\n\n"}})
+		return nil
+	}
 
 	// Remember the plan: if the user dismisses this card (types a question
 	// instead of choosing) Prompt re-shows it after handling the typed message,

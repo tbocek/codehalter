@@ -20,6 +20,46 @@ func hasFormatterNeed(needs []formatterNeed, bin string) bool {
 	return false
 }
 
+// TestCheckEnvInjectsMidSessionSkillNotPrompt pins the cache-safety rule: a
+// skill seeded mid-session is injected as a user message, NOT folded into the
+// system prompt (which would bust the KV prefix cache — only compaction may).
+func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
+	a, s := newTestAgent(t)
+	cfgDir := filepath.Join(s.Cwd, ".codehalter")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Baseline: seed the always-on skills and freeze them as "already in the
+	// prompt", so only a NEW skill counts as added mid-session.
+	if err := ensureSkills(s.Cwd, nil, readOSInfo()); err != nil {
+		t.Fatal(err)
+	}
+	const frozen = "EXISTING PROMPT — do not mutate"
+	s.SystemPrompt = frozen
+	s.promptSkills = skillFiles(s.Cwd)
+
+	body := "# Zzz skill\n\nuse the zzz tool wisely\n"
+	if err := os.WriteFile(filepath.Join(cfgDir, "SKILL-zzz.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a.checkEnv(s, s.ID)
+
+	if s.SystemPrompt != frozen {
+		t.Errorf("system prompt was mutated mid-session — KV cache bust")
+	}
+	var injected bool
+	for _, m := range s.Messages {
+		if m.Role == "user" && strings.Contains(m.Content, "SKILL-zzz.md") &&
+			strings.Contains(m.Content, "use the zzz tool wisely") {
+			injected = true
+		}
+	}
+	if !injected {
+		t.Errorf("a mid-session skill should be injected as a user message, got none")
+	}
+}
+
 // TestDetectFormatters covers both drivers: detected stack (ts → prettier) and
 // formatter config files (.clang-format → clang-format, pyproject [tool.ruff] →
 // ruff), and that an empty project needs nothing.

@@ -59,9 +59,13 @@ func (a *agent) compressHistory(ctx context.Context, sess *Session) bool {
 		return false
 	}
 	// Re-render SystemPrompt so skills + project context survive the
-	// summariser folding the original rendering into Summary.
+	// summariser folding the original rendering into Summary. Compaction is the
+	// one place the prompt may change, so this is where mid-session-seeded skills
+	// (injected as user messages until now) finally enter the prefix — reset the
+	// promptSkills baseline to match.
 	if sysPrompt, err := a.systemPrompt(sess.ID); err == nil {
 		sess.SystemPrompt = sysPrompt
+		sess.promptSkills = skillFiles(sess.Cwd)
 	}
 	if err := sess.Save(); err != nil {
 		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ History compacted in-memory but persisting %s failed: %s. The archive %s is on disk, but the live session file is stale and will diverge until the next successful Save.\n\n", sess.filePath, err.Error(), archiveID)}})

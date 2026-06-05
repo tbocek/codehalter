@@ -235,6 +235,15 @@ type Session struct {
 	// foreground-turn-only (no background goroutine touches them), so unguarded.
 	pendingPlan *planResult
 	resumePlan  *planResult
+	// fixAutoExec is set while a user-accepted fix card is being dispatched: the
+	// user already approved on the card, so confirmPlan skips its "Execute?" gate
+	// for that turn. Foreground-turn-only, so unguarded like the plans above.
+	fixAutoExec bool
+	// promptSkills is the set of SKILL-*.md filenames folded into the current
+	// SystemPrompt. A skill seeded on disk AFTER the prompt was built is injected
+	// as a user message (NOT folded into the prompt — that would bust the KV
+	// prefix cache) until the next compaction re-renders the prompt. Runtime-only.
+	promptSkills []string
 	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
 	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
 	// of role — cache-coherence trumps per-role sampler matching, the conn
