@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,21 @@ import (
 	"strconv"
 	"strings"
 )
+
+// binarySniffLen is how many leading bytes we inspect to classify a file as
+// binary. A NUL byte in this window means "not text" — the cheap heuristic git
+// and grep use. Binary files (zips, images, compiled blobs) must NEVER be
+// scanned by search_text or rendered by read_file: their bytes poison the LLM
+// context — the model echoes garbage, emits empty content, and stalls (observed
+// as "plan not valid JSON" after a search hit inside a .zip).
+const binarySniffLen = 8192
+
+func looksBinary(b []byte) bool {
+	if len(b) > binarySniffLen {
+		b = b[:binarySniffLen]
+	}
+	return bytes.IndexByte(b, 0) >= 0
+}
 
 var skipDirs = map[string]bool{
 	".git": true, ".codehalter": true, "node_modules": true,
@@ -46,6 +62,11 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return "error: " + err.Error(), false
+	}
+	if looksBinary([]byte(content)) {
+		msg := fmt.Sprintf("%s is a binary file (NUL bytes) — not shown. Reading it as text would corrupt the context. Use a shell tool to inspect its bytes if you must.", path)
+		a.CompleteToolCallTitled(ctx, sid, tcId, "Read (binary, skipped): "+path, []ToolCallContent{TextContent(msg)})
+		return msg, false
 	}
 
 	// Served line count (a trailing partial line with no final newline counts),

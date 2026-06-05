@@ -151,8 +151,12 @@ func searchInFile(path string, matcher func(string) bool, limit int) []int {
 	}
 	defer f.Close()
 
+	r := bufio.NewReaderSize(f, binarySniffLen)
+	if head, _ := r.Peek(binarySniffLen); looksBinary(head) {
+		return nil // binary file — never scan as text (its bytes poison the context)
+	}
 	var matches []int
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
@@ -180,6 +184,9 @@ func searchInFileMultiline(path string, re *regexp.Regexp, limit int) []int {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
+	}
+	if looksBinary(data) {
+		return nil // binary file — never scan as text (its bytes poison the context)
 	}
 	idx := re.FindAllIndex(data, limit)
 	if len(idx) == 0 {

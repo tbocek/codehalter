@@ -33,6 +33,40 @@ func TestFormatMatchBlock(t *testing.T) {
 // TestSearchInFileMatchers verifies the matcher callback cleanly swaps
 // literal substring and regex behavior. Literal mode treats '.' as a dot;
 // regex mode treats it as any-char.
+
+// TestSearchSkipsBinary pins the fix for the "plan not valid JSON" stall: a
+// search must NOT scan a binary file (NUL bytes) — returning its bytes as match
+// blocks poisons the LLM context. Covers both the line scanner (searchInFile)
+// and the multiline path (searchInFileMultiline), and confirms a text file with
+// the same token still matches.
+func TestSearchSkipsBinary(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "blob.zip")
+	txt := filepath.Join(dir, "code.txt")
+	// "name" appears in both, but the zip has a NUL byte → must be skipped.
+	if err := os.WriteFile(bin, []byte("PK\x03\x04\x00name\x00\x00duckduckgo"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(txt, []byte("the name is here\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	lit := func(s string) bool { return strings.Contains(s, "name") }
+	if m := searchInFile(bin, lit, 10); m != nil {
+		t.Errorf("searchInFile scanned a binary file: got matches %v", m)
+	}
+	if m := searchInFile(txt, lit, 10); len(m) != 1 {
+		t.Errorf("searchInFile missed the text match: got %v, want 1", m)
+	}
+	re := regexp.MustCompile("name")
+	if m := searchInFileMultiline(bin, re, 10); m != nil {
+		t.Errorf("searchInFileMultiline scanned a binary file: got %v", m)
+	}
+	if m := searchInFileMultiline(txt, re, 10); len(m) != 1 {
+		t.Errorf("searchInFileMultiline missed the text match: got %v, want 1", m)
+	}
+}
+
 func TestSearchInFileMatchers(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.txt")
