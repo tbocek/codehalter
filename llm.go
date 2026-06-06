@@ -72,8 +72,10 @@ type sseChunk struct {
 	// non-standard fields won't send it; then we fall back to usage cached_tokens,
 	// and if that's absent too, to the raw context size (no cache claim).
 	Timings *struct {
-		PromptN int `json:"prompt_n"`
-		CacheN  int `json:"cache_n"`
+		PromptN     int     `json:"prompt_n"`
+		CacheN      int     `json:"cache_n"`
+		PromptMs    float64 `json:"prompt_ms"`    // server-measured prompt-eval time
+		PredictedMs float64 `json:"predicted_ms"` // server-measured generation time
 	} `json:"timings"`
 }
 
@@ -227,6 +229,8 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// evaluatedTokens = prompt tokens actually run through the model this call;
 	// cachedTokens = reused from KV cache. -1 = the server didn't report it.
 	evaluatedTokens, cachedTokens := -1, -1
+	// Server-measured eval/gen times (ms) — exact, vs our TTFT proxy.
+	var serverPromptMs, serverGenMs float64
 
 	scanner := bufio.NewScanner(resp.Body)
 	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
@@ -271,6 +275,8 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		if chunk.Timings != nil {
 			evaluatedTokens = chunk.Timings.PromptN
 			cachedTokens = chunk.Timings.CacheN
+			serverPromptMs = chunk.Timings.PromptMs
+			serverGenMs = chunk.Timings.PredictedMs
 		}
 		if len(chunk.Choices) == 0 {
 			continue
@@ -333,8 +339,15 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 			evaluatedTokens = promptTokens - cachedTokens
 		}
 		sess.addTurnTokens(promptTokens, completionTokens, evaluatedTokens, cachedTokens)
-		if !firstTokenAt.IsZero() {
-			sess.addTurnTiming(firstTokenAt.Sub(readStart).Milliseconds(), time.Since(firstTokenAt).Milliseconds())
+		// Prefer the server's measured prompt/gen times (exact eval time) over our
+		// TTFT proxy (which includes queue + cache-load overhead → understates pp/s).
+		pMs, gMs := serverPromptMs, serverGenMs
+		if pMs == 0 && gMs == 0 && !firstTokenAt.IsZero() {
+			pMs = float64(firstTokenAt.Sub(readStart).Milliseconds())
+			gMs = float64(time.Since(firstTokenAt).Milliseconds())
+		}
+		if pMs > 0 || gMs > 0 {
+			sess.addTurnTiming(int64(pMs), int64(gMs))
 		}
 	}
 

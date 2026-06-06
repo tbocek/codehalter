@@ -200,6 +200,16 @@ func (a *agent) backgroundSummarise(sess *Session) {
 // Every stored image is inlined as image_url every turn so wire bytes for a
 // given message stay byte-identical until compaction rotates it out; after
 // compaction the reference lives in Summary and view_image fetches on demand.
+// wireCallID is the tool_call id to put on the wire for a ToolUse: the model's
+// own id (what the live request used) so a rebuild from history is byte-identical.
+// Falls back to the internal useID for older sessions / models that sent no id.
+func wireCallID(tu ToolUse) string {
+	if tu.CallID != "" {
+		return tu.CallID
+	}
+	return tu.ID
+}
+
 func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 	var messages []llmMessage
 
@@ -257,7 +267,7 @@ func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 
 		var toolCalls []toolCall
 		for _, tu := range m.ToolUses {
-			tc := toolCall{ID: tu.ID, Type: "function"}
+			tc := toolCall{ID: wireCallID(tu), Type: "function"}
 			tc.Function.Name = tu.Name
 			tc.Function.Arguments = tu.Input
 			toolCalls = append(toolCalls, tc)
@@ -266,9 +276,11 @@ func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 		messages = append(messages, llmMessage{Role: m.Role, Content: content, ToolCalls: toolCalls})
 		for _, tu := range m.ToolUses {
 			messages = append(messages, llmMessage{
-				Role:       "tool",
+				Role: "tool",
+				// truncateForLLM's first arg is the view_output handle (useID); the
+				// tool_call_id must be the MODEL's id so the bytes match the wire.
 				Content:    truncateForLLM(tu.ID, tu.Name, tu.Input, tu.Output),
-				ToolCallID: tu.ID,
+				ToolCallID: wireCallID(tu),
 			})
 		}
 	}

@@ -302,6 +302,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	useID := nextToolUseID()
 	tu := ToolUse{
 		ID:         useID,
+		CallID:     tc.ID, // the model's own tool_call id — replayed verbatim from history
 		Name:       tc.Function.Name,
 		Input:      tc.Function.Arguments,
 		Output:     result,
@@ -333,6 +334,7 @@ func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall
 	a.FailToolCall(ctx, sid, tcId, msg)
 	tu := ToolUse{
 		ID:        nextToolUseID(),
+		CallID:    tc.ID,
 		Name:      tc.Function.Name,
 		Input:     tc.Function.Arguments,
 		Output:    msg,

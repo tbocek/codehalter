@@ -1635,3 +1635,33 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 		t.Errorf("shadow chunk missing from new Summary; got %q", s.Summary)
 	}
 }
+
+// TestBuildContextUsesModelCallID pins the cache fix: a rebuilt context must use
+// the MODEL's tool_call id (CallID) on the wire — both the assistant tool call
+// and its tool result — so replaying from history is byte-identical to what was
+// sent live. The internal useID stays only as the view_output handle.
+func TestBuildContextUsesModelCallID(t *testing.T) {
+	a := &agent{}
+	s := &Session{}
+	s.AddUser("go")
+	s.AddAssistant("")
+	s.AppendToolUse(ToolUse{ID: "tu_1", CallID: "call_abc", Name: "read_file", Input: "{}", Output: "data"})
+
+	var gotCall, gotResult string
+	for _, m := range a.buildLLMContext(s) {
+		if m.Role == "assistant" && len(m.ToolCalls) == 1 {
+			gotCall = m.ToolCalls[0].ID
+		}
+		if m.Role == "tool" {
+			gotResult = m.ToolCallID
+		}
+	}
+	if gotCall != "call_abc" || gotResult != "call_abc" {
+		t.Errorf("wire ids: tool_call=%q tool_call_id=%q, want both %q (model's id)", gotCall, gotResult, "call_abc")
+	}
+
+	// Fallback for an old session with no CallID → the useID.
+	if got := wireCallID(ToolUse{ID: "tu_9"}); got != "tu_9" {
+		t.Errorf("fallback: got %q, want tu_9", got)
+	}
+}

@@ -55,7 +55,13 @@ type ToolUse struct {
 	// model can call `view_output id=tu_N` to retrieve any portion of the
 	// full result without re-running the original tool. Empty for ToolUses
 	// loaded from older session files; view_output treats those as not found.
-	ID     string `toml:"id,omitempty"`
+	ID string `toml:"id,omitempty"`
+	// CallID is the tool_call id the MODEL emitted (OpenAI linkage between the
+	// assistant's tool call and its result). It's what the live wire used, so we
+	// replay it verbatim from history — using the internal useID (ID) instead
+	// would change the bytes and bust the prefix cache at every phase boundary.
+	// Empty for older sessions / models that don't send ids → falls back to ID.
+	CallID string `toml:"call_id,omitempty"`
 	Name   string `toml:"name"`
 	Input  string `toml:"input"`
 	Output string `toml:"output"`
