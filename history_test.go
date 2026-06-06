@@ -351,27 +351,27 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 		t.Errorf("ToolUse output: got %q", res.ToolUses[0].Output)
 	}
 
-	// The session should carry the recorded tool use, attached to a freshly
-	// created assistant message (since the last message was user).
-	if got := len(s.Messages); got != 2 {
-		t.Fatalf("session messages: got %d, want 2", got)
+	// The loop now stores each assistant turn VERBATIM (cache-faithful replay):
+	// [user, assistant{tool turn: echo}, assistant{text turn: "All done."}].
+	// The tool turn carries the tool use; the final text turn carries the text —
+	// no merge, no post-hoc patch.
+	if got := len(s.Messages); got != 3 {
+		t.Fatalf("session messages: got %d, want 3", got)
 	}
-	if s.Messages[1].Role != "assistant" {
-		t.Errorf("expected trailing assistant message, got role %q", s.Messages[1].Role)
+	if s.Messages[1].Role != "assistant" || len(s.Messages[1].ToolUses) != 1 {
+		t.Errorf("msg[1]: want assistant with 1 tool use, got role=%q tools=%d", s.Messages[1].Role, len(s.Messages[1].ToolUses))
 	}
-	if got := len(s.Messages[1].ToolUses); got != 1 {
-		t.Fatalf("session tool uses: got %d, want 1", got)
+	if s.Messages[2].Role != "assistant" || s.Messages[2].Content != "All done." {
+		t.Errorf("msg[2]: want assistant content %q, got role=%q content=%q", "All done.", s.Messages[2].Role, s.Messages[2].Content)
 	}
 
-	// Persistence: the tool use should already be on disk from the
-	// incremental Save in the tool loop, even before the caller adds the
-	// final assistant text.
+	// Persistence: the turns are on disk from the incremental Save in the loop.
 	loaded, err := loadSession(dir, s.ID)
 	if err != nil {
 		t.Fatalf("loadSession: %v", err)
 	}
-	if got := len(loaded.Messages); got != 2 {
-		t.Fatalf("persisted messages: got %d, want 2", got)
+	if got := len(loaded.Messages); got != 3 {
+		t.Fatalf("persisted messages: got %d, want 3", got)
 	}
 	if got := len(loaded.Messages[1].ToolUses); got != 1 {
 		t.Fatalf("persisted tool uses: got %d, want 1", got)

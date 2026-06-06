@@ -642,17 +642,31 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	// turns. backgroundSummarise enqueues this turn's note; compressHistory then
 	// drains it and rotates IF the session crossed the trigger (else it's a no-op
 	// and the summary just rides the next compaction). Report stats first.
-	if activeMs, promptTokens, completionTokens, promptMs, genMs := sess.turnStats(); activeMs > 0 {
+	if r := sess.turnStats(); r.activeMs > 0 {
 		// Leading blank line: the message stream renders as markdown, where a
 		// single \n collapses to a space — \n\n forces the stats onto their own
 		// line instead of jamming against the document phase's last sentence.
-		line := fmt.Sprintf("\n\n✅ Done in %s · %s tokens (%s prompt + %s completion)",
-			humanDuration(activeMs), humanCount(promptTokens+completionTokens), humanCount(promptTokens), humanCount(completionTokens))
-		if promptMs > 0 && promptTokens > 0 {
-			line += " · " + humanRate(promptTokens, promptMs) + " pp/s"
+		//
+		// When the server reported its cache split, headline the WORK done —
+		// EVALUATED prompt + generated — with sent/cached% alongside to show the
+		// cache's payoff. With no server cache info we DON'T guess: show the final
+		// context size + generated, labelled plainly.
+		var line string
+		if r.haveServerCache {
+			line = fmt.Sprintf("\n\n✅ Done in %s · %s prompt + %s gen",
+				humanDuration(r.activeMs), humanCount(r.evaluatedPrompt), humanCount(r.completion))
+			if r.sentPrompt > r.evaluatedPrompt {
+				line += fmt.Sprintf(" (%s sent, %d%% cached)", humanCount(r.sentPrompt), r.cachedPrompt*100/r.sentPrompt)
+			}
+			if r.promptMs > 0 && r.evaluatedPrompt > 0 {
+				line += " · " + humanRate(r.evaluatedPrompt, r.promptMs) + " pp/s"
+			}
+		} else {
+			line = fmt.Sprintf("\n\n✅ Done in %s · %s ctx + %s gen",
+				humanDuration(r.activeMs), humanCount(r.lastPrompt), humanCount(r.completion))
 		}
-		if genMs > 0 && completionTokens > 0 {
-			line += " · " + humanRate(completionTokens, genMs) + " tg/s"
+		if r.genMs > 0 && r.completion > 0 {
+			line += " · " + humanRate(r.completion, r.genMs) + " tg/s"
 		}
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line + "\n"}})
 	}

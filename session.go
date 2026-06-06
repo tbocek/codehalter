@@ -318,9 +318,19 @@ type Session struct {
 	turnHumanWaitMs      int64
 	turnPromptTokens     int
 	turnCompletionTokens int
+	// Server-reported cache split for the turn (llama.cpp timings / usage
+	// cached_tokens), summed across calls: turnEvaluatedPrompt = prompt tokens
+	// actually run through the model, turnCachedPrompt = reused from the KV cache.
+	// haveServerCache is false when no backend reported either — then the turn
+	// line shows turnLastPrompt (the final context size) with no cache claim,
+	// rather than guessing. turnLastPrompt is the most recent call's prompt size.
+	turnEvaluatedPrompt int
+	turnCachedPrompt    int
+	turnLastPrompt      int
+	haveServerCache     bool
 	// Summed per-call timing for the turn's throughput line: turnPromptMs is the
 	// time-to-first-token (prompt-processing proxy), turnGenMs the rest (token
-	// generation). pp/s = promptTokens/turnPromptMs, tg/s = completion/turnGenMs.
+	// generation). pp/s = evaluatedPrompt/turnPromptMs, tg/s = completion/turnGenMs.
 	turnPromptMs int64
 	turnGenMs    int64
 }
@@ -332,16 +342,34 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.turnHumanWaitMs = 0
 	s.turnPromptTokens = 0
 	s.turnCompletionTokens = 0
+	s.turnEvaluatedPrompt = 0
+	s.turnCachedPrompt = 0
+	s.turnLastPrompt = 0
+	s.haveServerCache = false
 	s.turnPromptMs = 0
 	s.turnGenMs = 0
 	s.turnStatsMu.Unlock()
 }
 
 // addTurnTokens adds one llmStream call's server-reported usage to the turn.
-func (s *Session) addTurnTokens(prompt, completion int) {
+// evaluated/cached are the server's cache split (prompt tokens run vs reused);
+// pass -1 for either the backend didn't report — then haveServerCache stays
+// false and the turn line falls back to the raw context size.
+func (s *Session) addTurnTokens(prompt, completion, evaluated, cached int) {
 	s.turnStatsMu.Lock()
 	s.turnPromptTokens += prompt
 	s.turnCompletionTokens += completion
+	if prompt > 0 {
+		s.turnLastPrompt = prompt
+	}
+	if evaluated >= 0 {
+		s.turnEvaluatedPrompt += evaluated
+		s.haveServerCache = true
+	}
+	if cached >= 0 {
+		s.turnCachedPrompt += cached
+		s.haveServerCache = true
+	}
 	s.turnStatsMu.Unlock()
 }
 
@@ -365,17 +393,40 @@ func (s *Session) addHumanWait(d time.Duration) {
 // turnStats returns the active wall-clock for the current turn (elapsed minus
 // time spent waiting on the user) and the summed token usage. activeMs is 0
 // before the first resetTurnStats.
-func (s *Session) turnStats() (activeMs int64, promptTokens, completionTokens int, promptMs, genMs int64) {
+// turnReport is the end-of-turn accounting for the "✅ Done" line.
+type turnReport struct {
+	activeMs        int64
+	sentPrompt      int  // Σ prompt_tokens (the cached prefix re-counted each call)
+	completion      int  // Σ completion_tokens
+	evaluatedPrompt int  // Σ server-reported evaluated prompt (cache misses)
+	cachedPrompt    int  // Σ server-reported cached prompt
+	lastPrompt      int  // final context size (last call's prompt_tokens)
+	haveServerCache bool // a backend reported the cache split
+	promptMs        int64
+	genMs           int64
+}
+
+func (s *Session) turnStats() turnReport {
 	s.turnStatsMu.Lock()
 	defer s.turnStatsMu.Unlock()
 	if s.turnStart.IsZero() {
-		return 0, 0, 0, 0, 0
+		return turnReport{}
 	}
-	activeMs = time.Since(s.turnStart).Milliseconds() - s.turnHumanWaitMs
+	activeMs := time.Since(s.turnStart).Milliseconds() - s.turnHumanWaitMs
 	if activeMs < 0 {
 		activeMs = 0
 	}
-	return activeMs, s.turnPromptTokens, s.turnCompletionTokens, s.turnPromptMs, s.turnGenMs
+	return turnReport{
+		activeMs:        activeMs,
+		sentPrompt:      s.turnPromptTokens,
+		completion:      s.turnCompletionTokens,
+		evaluatedPrompt: s.turnEvaluatedPrompt,
+		cachedPrompt:    s.turnCachedPrompt,
+		lastPrompt:      s.turnLastPrompt,
+		haveServerCache: s.haveServerCache,
+		promptMs:        s.turnPromptMs,
+		genMs:           s.turnGenMs,
+	}
 }
 
 // SetLastCompletePromptTokens records the server-reported prompt_tokens for

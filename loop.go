@@ -134,10 +134,8 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// (a question, or already done), so there's no plan to execute. Surface it as
 	// a report_only answer with no subtasks; orchestrate prints it and stops.
 	if planRes.Terminal == respondToolName {
-		if sess != nil && strings.TrimSpace(planRes.Text) != "" {
-			sess.UpsertLastAssistant(strings.TrimSpace(planRes.Text))
-			sess.saveOrLog()
-		}
+		// The respond turn's text is already in the session (the loop stored it +
+		// respond's tool result); just surface the answer to orchestrate.
 		return &planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(planRes.Text)}, planRes.ToolUses, nil
 	}
 	parseErr := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
@@ -172,18 +170,8 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		plan.answer = strings.TrimSpace(strings.Replace(planRes.Text, trimJSON(planRes.Text), "", 1))
 	}
 
-	if sess != nil {
-		// Persist the user-facing turn: the direct answer when there is one,
-		// else the structured plan JSON (kept in history for replan context).
-		msg := plan.answer
-		if msg == "" {
-			msg = planRes.Text
-		}
-		if msg != "" {
-			sess.UpsertLastAssistant(msg)
-			sess.saveOrLog()
-		}
-	}
+	// The planner's turn (its prose + the submit_plan call/result) is already in
+	// the session, stored verbatim by the loop — no post-hoc patch.
 
 	toolUses := planRes.ToolUses
 	if !plan.Clear && len(plan.Choices) > 0 {
@@ -273,10 +261,8 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// in place (the orchestrator adopts it and keeps going — see subtaskOutcome).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
 	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, policy, "execute", true, executeFailCap)
-	if sess != nil && res.Text != "" {
-		sess.UpsertLastAssistant(res.Text)
-		sess.saveOrLog()
-	}
+	// The executor's turns (prose + respond's call/result) are already in the
+	// session, stored verbatim by the loop — no post-hoc patch.
 
 	out := subtaskOutcome{Result: res}
 	if err != nil {
@@ -406,10 +392,7 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil
 	}
-	if sess != nil && docRes.Text != "" {
-		sess.UpsertLastAssistant(docRes.Text)
-		sess.saveOrLog()
-	}
+	// The document turn is already in the session, stored verbatim by the loop.
 	exec.ToolUses = append(exec.ToolUses, docRes.ToolUses...)
 	return exec, nil
 }
@@ -595,6 +578,16 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			return res, err
 		}
 		allText.WriteString(text)
+
+		// Persist THIS turn's assistant text to the session as generated — once,
+		// verbatim — so replaying from the session reproduces the wire (cache
+		// consistency, not readability). A fresh assistant message per iteration
+		// (not one merged turn) matches what was sent; AppendToolUse below attaches
+		// this turn's tool uses to it. No post-hoc UpsertLastAssistant patch.
+		if s := a.getSession(sid); s != nil {
+			s.AddAssistant(text)
+			s.saveOrLog()
+		}
 
 		if len(calls) == 0 {
 			// Terminal-tool mode: empty tool_calls means the model dropped
