@@ -44,12 +44,13 @@ server never starts. Check `node --version` first.
    LSP→MCP adapter — verify the `lsp_*` tools actually appear.
 3. Add to `.codehalter/mcp.toml` (uncomment the WHOLE block INCLUDING the
    `[[server]]` header — a commented header leaves the keys orphan and the server
-   never loads):
+   never loads). `--bin` REQUIRES a `--files` glob telling lsmcp which files the
+   LSP handles, or it exits with "--files is required when using --bin":
    ```
    [[server]]
    name = "clangd"
    command = "npx"
-   args = ["-y", "@mizchi/lsmcp", "--bin", "clangd"]
+   args = ["-y", "@mizchi/lsmcp", "--bin", "clangd", "--files", "**/*.{c,cpp,cc,h,hpp}"]
    ```
 4. clangd needs `compile_commands.json` to resolve includes/flags. **GENERATE it
    from the build system — never hand-write it** (a hand-authored DB duplicates
