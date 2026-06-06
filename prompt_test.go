@@ -104,3 +104,31 @@ func TestResourceLabel(t *testing.T) {
 		}
 	}
 }
+
+func TestHumanFormatters(t *testing.T) {
+	for _, c := range []struct {
+		n    int
+		want string
+	}{
+		{0, "0"}, {543, "543"}, {1234, "1.2k"}, {12000, "12k"},
+		{543490, "543k"}, {1_500_000, "1.5m"}, {2_000_000_000, "2g"},
+	} {
+		if got := humanCount(c.n); got != c.want {
+			t.Errorf("humanCount(%d)=%q want %q", c.n, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		ms   int64
+		want string
+	}{
+		{5500, "5.5s"}, {61000, "1m1s"}, {3661000, "1h1m1s"}, {120000, "2m0s"},
+	} {
+		if got := humanDuration(c.ms); got != c.want {
+			t.Errorf("humanDuration(%d)=%q want %q", c.ms, got, c.want)
+		}
+	}
+	// 200 tokens in 500ms = 400/s
+	if got := humanRate(200, 500); got != "400" {
+		t.Errorf("humanRate(200,500)=%q want 400", got)
+	}
+}

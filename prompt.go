@@ -637,13 +637,19 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	// turns. backgroundSummarise enqueues this turn's note; compressHistory then
 	// drains it and rotates IF the session crossed the trigger (else it's a no-op
 	// and the summary just rides the next compaction). Report stats first.
-	if activeMs, promptTokens, completionTokens := sess.turnStats(); activeMs > 0 {
+	if activeMs, promptTokens, completionTokens, promptMs, genMs := sess.turnStats(); activeMs > 0 {
 		// Leading blank line: the message stream renders as markdown, where a
 		// single \n collapses to a space — \n\n forces the stats onto their own
 		// line instead of jamming against the document phase's last sentence.
-		line := fmt.Sprintf("\n\n✅ Done in %.1fs · %d tokens (%d prompt + %d completion)\n",
-			float64(activeMs)/1000, promptTokens+completionTokens, promptTokens, completionTokens)
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
+		line := fmt.Sprintf("\n\n✅ Done in %s · %s tokens (%s prompt + %s completion)",
+			humanDuration(activeMs), humanCount(promptTokens+completionTokens), humanCount(promptTokens), humanCount(completionTokens))
+		if promptMs > 0 && promptTokens > 0 {
+			line += " · " + humanRate(promptTokens, promptMs) + " pp/s"
+		}
+		if genMs > 0 && completionTokens > 0 {
+			line += " · " + humanRate(completionTokens, genMs) + " tg/s"
+		}
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line + "\n"}})
 	}
 	a.backgroundSummarise(sess)
 	a.backgroundGitCommit(sess)
@@ -1109,4 +1115,57 @@ func (a *agent) loadPromptFile(sid string, filename string) string {
 		}
 	}
 	return ""
+}
+
+// humanCount renders a token count compactly: 543490 → "543k", 1_500_000 → "1.5m".
+func humanCount(n int) string {
+	switch {
+	case n < 1000:
+		return strconv.Itoa(n)
+	case n < 1_000_000:
+		return trimUnit(float64(n)/1e3, "k")
+	case n < 1_000_000_000:
+		return trimUnit(float64(n)/1e6, "m")
+	default:
+		return trimUnit(float64(n)/1e9, "g")
+	}
+}
+
+func trimUnit(v float64, u string) string {
+	if v >= 10 || v == float64(int64(v)) { // no decimal when big or whole (2g, not 2.0g)
+		return fmt.Sprintf("%.0f%s", v, u)
+	}
+	return fmt.Sprintf("%.1f%s", v, u)
+}
+
+// humanDuration renders elapsed ms compactly: 5500 → "5.5s", 61000 → "1m1s",
+// 3661000 → "1h1m1s".
+func humanDuration(ms int64) string {
+	d := time.Duration(ms) * time.Millisecond
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	}
+	h := int(d / time.Hour)
+	m := int(d % time.Hour / time.Minute)
+	s := int(d % time.Minute / time.Second)
+	if h > 0 {
+		return fmt.Sprintf("%dh%dm%ds", h, m, s)
+	}
+	return fmt.Sprintf("%dm%ds", m, s)
+}
+
+// humanRate renders tokens-per-second over a span of ms (k-suffixed when large).
+func humanRate(tokens int, ms int64) string {
+	if ms <= 0 {
+		return "0"
+	}
+	r := float64(tokens) * 1000 / float64(ms)
+	switch {
+	case r >= 1000:
+		return humanCount(int(r))
+	case r >= 10:
+		return fmt.Sprintf("%.0f", r)
+	default:
+		return fmt.Sprintf("%.1f", r)
+	}
 }

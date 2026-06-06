@@ -170,3 +170,40 @@ func TestEditFileMissFailsAndSteers(t *testing.T) {
 		t.Errorf("successful edit: failed=true, want false")
 	}
 }
+
+// TestTolerantReplace covers the whitespace-tolerant edit_file fallback: it
+// recovers wrong trailing whitespace and wrong indentation (re-indenting
+// new_text to the file's column), stays unique-or-fail, and never matches across
+// genuinely different content.
+func TestTolerantReplace(t *testing.T) {
+	// Trailing-whitespace mismatch: file line has a trailing space the snippet lacks.
+	file := "func f() {\n\treturn 1 \n}\n"
+	old := "func f() {\n\treturn 1\n}"
+	out, n := tolerantReplace(file, old, "func f() {\n\treturn 2\n}")
+	if n != 1 || !strings.Contains(out, "return 2") {
+		t.Fatalf("trailing-ws: n=%d out=%q", n, out)
+	}
+
+	// Indentation mismatch: file indents with two tabs, snippet with none; the
+	// replacement must be re-indented to the file's two-tab column.
+	file = "x\n\t\tcall(a)\n\t\tcall(b)\ny\n"
+	old = "call(a)\ncall(b)"
+	out, n = tolerantReplace(file, old, "call(a)\ncall(c)")
+	if n != 1 {
+		t.Fatalf("indent: n=%d", n)
+	}
+	if !strings.Contains(out, "\t\tcall(c)") || strings.Contains(out, "\ncall(c)") {
+		t.Errorf("indent not reapplied to new_text:\n%q", out)
+	}
+
+	// Ambiguous: the snippet (ignoring whitespace) matches two windows → no apply.
+	file = "a\n  p()\nb\n  p()\nc\n"
+	if _, n = tolerantReplace(file, "p()", "q()"); n != 2 {
+		t.Errorf("ambiguous: want n=2, got %d", n)
+	}
+
+	// No match: genuinely absent content stays absent.
+	if out, n = tolerantReplace("alpha\nbeta\n", "gamma", "x"); n != 0 || out != "" {
+		t.Errorf("no-match: want n=0 empty, got n=%d out=%q", n, out)
+	}
+}

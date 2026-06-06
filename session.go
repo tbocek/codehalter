@@ -318,6 +318,11 @@ type Session struct {
 	turnHumanWaitMs      int64
 	turnPromptTokens     int
 	turnCompletionTokens int
+	// Summed per-call timing for the turn's throughput line: turnPromptMs is the
+	// time-to-first-token (prompt-processing proxy), turnGenMs the rest (token
+	// generation). pp/s = promptTokens/turnPromptMs, tg/s = completion/turnGenMs.
+	turnPromptMs int64
+	turnGenMs    int64
 }
 
 // resetTurnStats starts a fresh per-turn measurement window at start.
@@ -327,6 +332,8 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.turnHumanWaitMs = 0
 	s.turnPromptTokens = 0
 	s.turnCompletionTokens = 0
+	s.turnPromptMs = 0
+	s.turnGenMs = 0
 	s.turnStatsMu.Unlock()
 }
 
@@ -335,6 +342,15 @@ func (s *Session) addTurnTokens(prompt, completion int) {
 	s.turnStatsMu.Lock()
 	s.turnPromptTokens += prompt
 	s.turnCompletionTokens += completion
+	s.turnStatsMu.Unlock()
+}
+
+// addTurnTiming adds one llmStream call's measured timing to the turn:
+// promptMs = time-to-first-token, genMs = first-token-to-end.
+func (s *Session) addTurnTiming(promptMs, genMs int64) {
+	s.turnStatsMu.Lock()
+	s.turnPromptMs += promptMs
+	s.turnGenMs += genMs
 	s.turnStatsMu.Unlock()
 }
 
@@ -349,17 +365,17 @@ func (s *Session) addHumanWait(d time.Duration) {
 // turnStats returns the active wall-clock for the current turn (elapsed minus
 // time spent waiting on the user) and the summed token usage. activeMs is 0
 // before the first resetTurnStats.
-func (s *Session) turnStats() (activeMs int64, promptTokens, completionTokens int) {
+func (s *Session) turnStats() (activeMs int64, promptTokens, completionTokens int, promptMs, genMs int64) {
 	s.turnStatsMu.Lock()
 	defer s.turnStatsMu.Unlock()
 	if s.turnStart.IsZero() {
-		return 0, 0, 0
+		return 0, 0, 0, 0, 0
 	}
 	activeMs = time.Since(s.turnStart).Milliseconds() - s.turnHumanWaitMs
 	if activeMs < 0 {
 		activeMs = 0
 	}
-	return activeMs, s.turnPromptTokens, s.turnCompletionTokens
+	return activeMs, s.turnPromptTokens, s.turnCompletionTokens, s.turnPromptMs, s.turnGenMs
 }
 
 // SetLastCompletePromptTokens records the server-reported prompt_tokens for

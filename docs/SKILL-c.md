@@ -47,8 +47,15 @@ lsmcp (the generic LSP→MCP server, needs node):
    command = "npx"
    args = ["-y", "@mizchi/lsmcp", "--bin", "clangd"]
    ```
-4. clangd needs `compile_commands.json` to resolve includes — generate it (CMake:
-   `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`; Make: `bear -- make`).
+4. clangd needs `compile_commands.json` to resolve includes/flags. **GENERATE it
+   from the build system — never hand-write it** (a hand-authored DB duplicates
+   the build command and silently goes stale when the Makefile changes):
+   - Make: `bear -- make` (install `bear` first if missing — `apt-get install -y
+     bear` / `apk add bear`). `bear` wraps the real build and records exactly
+     what it compiled.
+   - CMake: configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
+   For a trivial single-file project a `compile_flags.txt` (one flag per line,
+   e.g. `-Wall`) is simpler than a JSON DB and needs no build wrapper.
 5. Persist clangd + node in `.devcontainer/Dockerfile`.
 
 ## Tooling (install + persist in the Dockerfile if missing — see SKILL-container.md)

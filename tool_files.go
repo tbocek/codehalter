@@ -27,6 +27,100 @@ func looksBinary(b []byte) bool {
 	return bytes.IndexByte(b, 0) >= 0
 }
 
+// trimBlankEdges drops leading/trailing all-whitespace lines — the empty final
+// element a trailing newline produces, plus any stray blank line the model
+// padded its snippet with — so they don't throw off line-window matching.
+func trimBlankEdges(lines []string) []string {
+	for len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
+		lines = lines[1:]
+	}
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func leadingWS(s string) string { return s[:len(s)-len(strings.TrimLeft(s, " \t"))] }
+
+// reindent shifts every line of text by the indent delta between the snippet's
+// indent (oldIndent) and the file's actual indent (fileIndent), so a block
+// matched while ignoring indentation lands at the file's column. Handles the
+// common "off by a consistent prefix" case (works for tabs or spaces); leaves
+// text unchanged when the two indents don't share a prefix.
+func reindent(text, oldIndent, fileIndent string) string {
+	if oldIndent == fileIndent {
+		return text
+	}
+	lines := strings.Split(text, "\n")
+	switch {
+	case strings.HasPrefix(fileIndent, oldIndent): // file deeper — add the extra
+		extra := fileIndent[len(oldIndent):]
+		for i, ln := range lines {
+			if strings.TrimSpace(ln) != "" {
+				lines[i] = extra + ln
+			}
+		}
+	case strings.HasPrefix(oldIndent, fileIndent): // file shallower — strip it
+		extra := oldIndent[len(fileIndent):]
+		for i, ln := range lines {
+			lines[i] = strings.TrimPrefix(ln, extra)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// tolerantReplace recovers an edit whose old_text matches the file except for
+// per-line whitespace — the dominant edit_file failure for small local models.
+// It matches whole lines ignoring trailing whitespace first, then (only if that
+// finds nothing) ignoring leading indentation too, re-indenting new_text to the
+// file's column. Returns the rewritten content and how many distinct line
+// windows matched, so the caller keeps edit_file's unique-or-fail contract (it
+// applies the result only when exactly one window matched). Used as a fallback
+// AFTER an exact match fails, never to override one.
+func tolerantReplace(content, oldText, newText string) (string, int) {
+	fileLines := strings.Split(content, "\n")
+	oldLines := trimBlankEdges(strings.Split(oldText, "\n"))
+	if len(oldLines) == 0 {
+		return "", 0
+	}
+	for _, ignoreIndent := range []bool{false, true} {
+		norm := func(s string) string {
+			if ignoreIndent {
+				return strings.TrimSpace(s)
+			}
+			return strings.TrimRight(s, " \t")
+		}
+		var hits []int
+		for i := 0; i+len(oldLines) <= len(fileLines); i++ {
+			match := true
+			for j := range oldLines {
+				if norm(fileLines[i+j]) != norm(oldLines[j]) {
+					match = false
+					break
+				}
+			}
+			if match {
+				hits = append(hits, i)
+			}
+		}
+		if len(hits) > 1 {
+			return "", len(hits) // ambiguous — report; don't loosen further
+		}
+		if len(hits) == 1 {
+			start := hits[0]
+			repl := newText
+			if ignoreIndent {
+				repl = reindent(newText, leadingWS(oldLines[0]), leadingWS(fileLines[start]))
+			}
+			out := append([]string(nil), fileLines[:start]...)
+			out = append(out, strings.Split(repl, "\n")...)
+			out = append(out, fileLines[start+len(oldLines):]...)
+			return strings.Join(out, "\n"), 1
+		}
+	}
+	return "", 0
+}
+
 var skipDirs = map[string]bool{
 	".git": true, ".codehalter": true, "node_modules": true,
 	"__pycache__": true, ".venv": true, "vendor": true,
@@ -380,19 +474,35 @@ func init() {
 		}
 
 		count := strings.Count(content, oldText)
-		if count == 0 {
-			a.FailToolCall(ctx, sid, tcId, "old_text not found in file")
-			// Failed=true feeds the loop's fail cap (a model spraying wrong edits
-			// gives up instead of looping to the iteration backstop); the verdict
-			// authority excludes edit_file, so a recovered miss never condemns.
-			return "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit). Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file.", true
-		}
-		if count > 1 {
+		var newContent string
+		okNote := "file written successfully"
+		switch {
+		case count > 1:
 			a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("old_text matches %d times, must be unique", count))
 			return fmt.Sprintf("error: old_text matches %d places — it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count), true
+		case count == 1:
+			newContent = strings.Replace(content, oldText, newText, 1)
+		default:
+			// Exact match failed. Small models routinely mis-reproduce indentation
+			// or trailing whitespace from a read_file, so retry ignoring per-line
+			// whitespace (still unique-or-fail) before sending them back to re-read.
+			tol, n := tolerantReplace(content, oldText, newText)
+			switch {
+			case n == 1:
+				newContent = tol
+				okNote = "file written successfully (old_text matched ignoring whitespace/indentation)"
+			case n > 1:
+				a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("old_text matches %d times ignoring whitespace, must be unique", n))
+				return fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n), true
+			default:
+				a.FailToolCall(ctx, sid, tcId, "old_text not found in file")
+				// Failed=true feeds the loop's fail cap (a model spraying wrong edits
+				// gives up instead of looping to the iteration backstop); the verdict
+				// authority excludes edit_file, so a recovered miss never condemns.
+				return "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit). Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file.", true
+			}
 		}
 
-		newContent := strings.Replace(content, oldText, newText, 1)
 		newContent = a.formatGuarded(sid, path, content, newContent)
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
@@ -402,7 +512,7 @@ func init() {
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
 
-		return "file written successfully", false
+		return okNote, false
 	}})
 }
 

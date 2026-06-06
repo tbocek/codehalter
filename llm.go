@@ -209,6 +209,11 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
 	// line limit silently truncates. 4 MB matches common reverse-proxy caps.
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	// Throughput timing: readStart→firstToken is the prompt-processing window
+	// (TTFT), firstToken→end is generation. Server timings aren't reported here,
+	// so we measure them ourselves for the turn's pp/s · tg/s line.
+	readStart := time.Now()
+	var firstTokenAt time.Time
 	for scanner.Scan() {
 		line := scanner.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -243,6 +248,10 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		}
 
 		delta := chunk.Choices[0].Delta
+
+		if firstTokenAt.IsZero() && (delta.Content != "" || delta.ReasoningContent != "" || len(delta.ToolCalls) > 0) {
+			firstTokenAt = time.Now()
+		}
 
 		if delta.ReasoningContent != "" {
 			reasoningText.WriteString(delta.ReasoningContent)
@@ -285,6 +294,9 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		// Sum every call's usage into the turn so the "✅ Done" line reports total
 		// tokens (foreground + background); 0/0 when the backend reports no usage.
 		sess.addTurnTokens(promptTokens, completionTokens)
+		if !firstTokenAt.IsZero() {
+			sess.addTurnTiming(firstTokenAt.Sub(readStart).Milliseconds(), time.Since(firstTokenAt).Milliseconds())
+		}
 	}
 
 	// One outcome error, shared by the RESPONSE log block and the return:
