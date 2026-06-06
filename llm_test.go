@@ -60,3 +60,25 @@ func TestBackgroundSlotLabel(t *testing.T) {
 		t.Fatalf("two-entry connForBackgroundLLM = %+v, want Slot 1 on u1", bg)
 	}
 }
+
+// TestBuildConnSemsIdempotent pins the fix for the connSems release deadlock: an
+// unchanged settings reload must NOT swap the slot channels, or an in-flight
+// llmStream (which captured the old channel at acquire) would release into a new
+// empty channel and block forever. A real cap change DOES rebuild.
+func TestBuildConnSemsIdempotent(t *testing.T) {
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "s", Model: "m"}}}}
+	a.buildConnSems()
+	first := a.connSems[0]
+
+	a.buildConnSems() // same shape → must reuse the same channel
+	if a.connSems[0] != first {
+		t.Fatal("buildConnSems swapped the channel on an unchanged reload — would orphan in-flight permits")
+	}
+
+	// A cap change rebuilds.
+	a.settings.LLM[0].Parallel = cap(first) + 3
+	a.buildConnSems()
+	if a.connSems[0] == first || cap(a.connSems[0]) != cap(first)+3 {
+		t.Errorf("cap change should rebuild: got cap %d, want %d", cap(a.connSems[0]), cap(first)+3)
+	}
+}

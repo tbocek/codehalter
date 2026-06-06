@@ -129,21 +129,26 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		}
 	}
 	if slot >= 0 && slot < len(a.connSems) {
+		// Capture THIS channel and acquire/release on it. probeAllLLMs rebuilds
+		// a.connSems (a fresh slice) on settings reload — per prompt — so reading
+		// a.connSems[slot] again at release time can hit a NEW, empty channel and
+		// block forever (the acquired permit lives in the OLD one). Bind once.
+		sem := a.connSems[slot]
 		// Try non-blocking first; only emit the queued suffix when we're
 		// actually about to wait. Avoids flashing the wrong status on the
 		// common hot path where the slot is free.
 		select {
-		case a.connSems[slot] <- struct{}{}:
+		case sem <- struct{}{}:
 		default:
 			a.setStatus(ctx, sid, " (queued…)")
 			select {
-			case a.connSems[slot] <- struct{}{}:
+			case sem <- struct{}{}:
 			case <-ctx.Done():
 				a.setStatus(ctx, sid, "")
 				return "", nil, ctx.Err()
 			}
 		}
-		defer func() { <-a.connSems[slot] }()
+		defer func() { <-sem }()
 	}
 
 	// slotLabel is the *display* index the user reads in the meter (llm[0]
@@ -679,10 +684,23 @@ func (a *agent) connForBackgroundLLM() *LLMConnection {
 }
 
 // buildConnSems sizes one buffered channel per LLM entry to its parallelCap.
-// Called once on agent startup after settings load. Re-init on settings
-// reload is handled by the caller (ensureLLM invokes loadSettings →
-// re-init connSems).
+// Called on startup AND on every settings reload (per prompt). It's a no-op when
+// the shape is unchanged so we don't needlessly swap channels out from under
+// in-flight llmStream calls (each binds its slot's channel at acquire and
+// releases on it — see llm.go's capture). Only an actual cap change rebuilds.
 func (a *agent) buildConnSems() {
+	if len(a.connSems) == len(a.settings.LLM) {
+		unchanged := true
+		for i := range a.settings.LLM {
+			if cap(a.connSems[i]) != a.settings.LLM[i].parallelCap() {
+				unchanged = false
+				break
+			}
+		}
+		if unchanged {
+			return
+		}
+	}
 	sems := make([]chan struct{}, len(a.settings.LLM))
 	for i := range a.settings.LLM {
 		sems[i] = make(chan struct{}, a.settings.LLM[i].parallelCap())
