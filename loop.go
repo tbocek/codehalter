@@ -167,6 +167,23 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		plan.answer = strings.TrimSpace(strings.Replace(planRes.Text, trimJSON(planRes.Text), "", 1))
 	}
 
+	// No-work verdict (report_only / no subtasks) with an EMPTY visible answer: a
+	// thinking model often pours its findings into the reasoning channel and calls
+	// submit_plan with no message — so the user would see NOTHING ("calculated a
+	// lot, then nothing"). Reasoning is chain-of-thought, not surfaced; re-prompt
+	// for the answer as plain text so the work isn't thrown away.
+	if plan.answer == "" && plan.Clear && (plan.ReportOnly || len(plan.Subtasks) == 0) {
+		slog.Info("planner: no-work verdict but empty answer — re-prompting for the answer text", "sid", sid)
+		fixMsgs := append([]llmMessage(nil), messages...)
+		fixMsgs = append(fixMsgs,
+			llmMessage{Role: "assistant", Content: planRes.Text},
+			llmMessage{Role: "user", Content: "You decided no code changes are needed, but your reply is empty. Write your findings/answer for the user now as plain text — this message is exactly what they read. Don't call a tool, and don't leave it in your reasoning."},
+		)
+		if ansRes, ansErr := a.runToolLoop(ctx, sid, thinking, fixMsgs, phasePolicy{}, "plan", false, 0); ansErr == nil {
+			plan.answer = strings.TrimSpace(ansRes.Text)
+		}
+	}
+
 	// The planner's turn (its prose + the submit_plan call/result) is already in
 	// the session, stored verbatim by the loop — no post-hoc patch.
 
@@ -406,6 +423,11 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 // ladder catches the common stuck patterns earlier.
 const maxToolLoopIterations = 100
 
+// reasoningNudgeBytes is the "the model clearly worked" bar: more reasoning than
+// this with an EMPTY visible message means the answer is stuck in the (never-
+// shown) reasoning channel, so the loop nudges it to write the answer as text.
+const reasoningNudgeBytes = 512
+
 // executeFailCap is the per-subtask budget of FAILED rounds (iterations whose
 // tool batch produced a failure). Successful work is uncounted, so a long but
 // productive subtask runs unhindered; only one that keeps hitting failures it
@@ -566,7 +588,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		if res.StartedAt.IsZero() {
 			res.StartedAt = streamStart
 		}
-		text, calls, err := a.llmStream(ctx, sid, conn, messages, tools, on, think)
+		text, calls, reasoning, err := a.llmStream(ctx, sid, conn, messages, tools, on, think)
 		genElapsed += time.Since(streamStart)
 		if err != nil {
 			res.Text = allText.String()
@@ -584,21 +606,29 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		}
 
 		if len(calls) == 0 {
-			// Terminal-tool mode: empty tool_calls means the model dropped
-			// out of tool-calling grammar instead of finishing. Nudge it to
-			// either call the terminal tool or another tool, but only once —
-			// a model that refuses twice gets the legacy text exit so we
-			// don't loop indefinitely on the new constraint.
-			if hasTerminal && !respondNudged {
+			// No tool call. Nudge ONCE (respondNudged) before accepting the text
+			// exit, for either model slip:
+			//   (a) reasoned a lot but emitted EMPTY content — the answer is stuck
+			//       in the never-shown reasoning channel ("calculated a lot, then
+			//       nothing"); tell it to write the answer as plain text.
+			//   (b) terminal mode: it dropped out of tool-calling without finishing.
+			reasonedButSilent := text == "" && len(reasoning) > reasoningNudgeBytes
+			if !respondNudged && (reasonedButSilent || hasTerminal) {
 				respondNudged = true
-				messages = append(messages, llmMessage{Role: "assistant", Content: text})
-				messages = append(messages, llmMessage{
-					Role: "user",
-					Content: fmt.Sprintf("Your last response was plain text with no tool call. "+
+				var nudge string
+				if reasonedButSilent {
+					nudge = "You produced a lot of reasoning but no visible output — your reasoning/thinking is NEVER shown to the user. Write your result now as plain text; this message is what they read."
+					if hasTerminal {
+						nudge += fmt.Sprintf(" If you're done, put it in %s.", termList)
+					}
+				} else {
+					nudge = fmt.Sprintf("Your last response was plain text with no tool call. "+
 						"This turn ends only when you call a terminal tool (%s), or "+
 						"another tool if you still have work to do. Do not reply in "+
-						"prose — call a tool.", termList),
-				})
+						"prose — call a tool.", termList)
+				}
+				messages = append(messages, llmMessage{Role: "assistant", Content: text})
+				messages = append(messages, llmMessage{Role: "user", Content: nudge})
 				continue
 			}
 			res.Text = allText.String()

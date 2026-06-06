@@ -83,7 +83,7 @@ type sseChunk struct {
 // and pre-session probes). think (nil to discard) receives reasoning_content
 // tokens — kept separate from `on` so callers can surface chain-of-thought to
 // the UI as agent_thought_chunk without polluting agent_message_chunk.
-func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string)) (string, []toolCall, error) {
+func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string)) (string, []toolCall, string, error) {
 	// Seed with extra_body (per-role sampler/reasoning overrides), then write
 	// core fields last so model/messages/stream/tools can't be hijacked from
 	// settings.toml.
@@ -111,7 +111,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return "", nil, fmt.Errorf("marshalling LLM request body: %w", err)
+		return "", nil, "", fmt.Errorf("marshalling LLM request body: %w", err)
 	}
 
 	// Per-conn concurrency gate: cap in-flight calls to this conn at its
@@ -145,7 +145,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 			case sem <- struct{}{}:
 			case <-ctx.Done():
 				a.setStatus(ctx, sid, "")
-				return "", nil, ctx.Err()
+				return "", nil, "", ctx.Err()
 			}
 		}
 		defer func() { <-sem }()
@@ -183,7 +183,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", conn.endpoint("/v1/chat/completions"), bytes.NewReader(body))
 	if err != nil {
-		return "", nil, err
+		return "", nil, "", err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if conn.APIKey != "" {
@@ -198,14 +198,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	resp, err := http.DefaultClient.Do(httpReq)
 	if err != nil {
 		a.logSession(sid, connLabel, "[transport error] %v", err)
-		return "", nil, err
+		return "", nil, "", err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return "", nil, fmt.Errorf("HTTP %d, failed to read body: %w", resp.StatusCode, err)
+			return "", nil, "", fmt.Errorf("HTTP %d, failed to read body: %w", resp.StatusCode, err)
 		}
 		a.logSession(sid, connLabel, "[HTTP %d] %s", resp.StatusCode, string(bodyBytes))
 		// Prefer the OpenAI-style {"error":{"message":…}} text; fall back to raw body.
@@ -218,7 +218,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		if json.Unmarshal(bodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
 			msg = apiErr.Error.Message
 		}
-		return "", nil, fmt.Errorf("LLM returned %d: %s [URL: %s]", resp.StatusCode, msg, resp.Request.URL.String())
+		return "", nil, "", fmt.Errorf("LLM returned %d: %s [URL: %s]", resp.StatusCode, msg, resp.Request.URL.String())
 	}
 
 	var fullText strings.Builder
@@ -371,8 +371,15 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// report them).
 	text, reasoning := fullText.String(), reasoningText.String()
 	var rb strings.Builder
-	if promptTokens > 0 || completionTokens > 0 {
-		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d\n", promptTokens, completionTokens)
+	if promptTokens > 0 || completionTokens > 0 || finishReason != "" {
+		// finish: "stop" = model ended; "length" = hit max_tokens (truncated);
+		// "tool_calls" = ended on a tool call; "(none)" = stream broke with no
+		// finish_reason (interrupted). Distinguishes a cap/interrupt from a clean end.
+		fr := finishReason
+		if fr == "" {
+			fr = "(none)"
+		}
+		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d finish=%s\n", promptTokens, completionTokens, fr)
 	}
 	if reasoning != "" {
 		fmt.Fprintf(&rb, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
@@ -390,7 +397,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		fmt.Fprintf(&rb, "[stream error] %v\n", err)
 	}
 	a.logSession(sid, connLabel+" RESPONSE", "%s", rb.String())
-	return fullText.String(), calls, err
+	return fullText.String(), calls, reasoningText.String(), err
 }
 
 // streamWaitMeter refreshes the active phase row once per second for the whole

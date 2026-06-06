@@ -660,7 +660,7 @@ func (a *agent) summarizePage(ctx context.Context, sid string, query, url, pageT
 	)
 
 	messages := []llmMessage{{Role: "user", Content: prompt}}
-	summary, _, err := a.llmStream(ctx, sid, conn, messages, nil, nil, nil)
+	summary, _, _, err := a.llmStream(ctx, sid, conn, messages, nil, nil, nil)
 	if err != nil {
 		const maxLen = 2000
 		if len(pageText) > maxLen {

@@ -166,7 +166,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 			buf.WriteString("</tool_calls>")
 		}
 
-		out, _, err := a.llmStream(ctx, sess.ID, t.Conn, []llmMessage{{Role: "user", Content: buf.String()}}, nil, nil, nil)
+		out, _, _, err := a.llmStream(ctx, sess.ID, t.Conn, []llmMessage{{Role: "user", Content: buf.String()}}, nil, nil, nil)
 		if err != nil {
 			slog.Debug("backgroundSummarise: llm call failed — turn note lost for this pair", "sid", sess.ID, "err", err)
 			return

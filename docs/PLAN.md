@@ -137,7 +137,9 @@ Answering a pure lookup yourself: write the FULL answer as your normal message
 text FIRST, then call `submit_plan` with `report_only=true` and empty
 `subtasks`. Your message text is what the user reads — the submit_plan arguments
 are machinery they never see. Answer only in the arguments (or empty message) →
-the user sees nothing.
+the user sees nothing. Your private reasoning/thinking is ALSO never shown: if
+your analysis lives only in your reasoning and the message is empty, the user
+gets NOTHING. Put the answer in the visible message, not the reasoning.
 
 ## Output — call submit_plan
 

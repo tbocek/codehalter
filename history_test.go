@@ -254,7 +254,7 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 
 	a := &agent{}
 	var collected strings.Builder
-	text, calls, err := a.llmStream(
+	text, calls, _, err := a.llmStream(
 		context.Background(),
 		"", // unscoped: no session log
 		mock.conn("execute"),
@@ -1663,5 +1663,43 @@ func TestBuildContextUsesModelCallID(t *testing.T) {
 	// Fallback for an old session with no CallID → the useID.
 	if got := wireCallID(ToolUse{ID: "tu_9"}); got != "tu_9" {
 		t.Errorf("fallback: got %q, want tu_9", got)
+	}
+}
+
+// sseReasoning emits a reasoning_content delta with NO visible content and no
+// tool call — a thinking model that dumped everything into its (never-shown)
+// reasoning channel.
+func sseReasoning(reasoning string) string {
+	chunk := map[string]any{
+		"choices": []map[string]any{{
+			"delta": map[string]any{"reasoning_content": reasoning},
+		}},
+	}
+	data, _ := json.Marshal(chunk)
+	return fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", data)
+}
+
+// TestToolLoopNudgesReasonedButEmpty pins the "calculated a lot, then nothing"
+// guard: a turn with a big reasoning block but EMPTY visible content (no tool
+// call) is nudged to write the answer as plain text, not silently accepted as an
+// empty result. After the nudge the model writes the answer and it's returned.
+func TestToolLoopNudgesReasonedButEmpty(t *testing.T) {
+	mock := newMockLLM(t,
+		sseReasoning(strings.Repeat("thinking hard. ", 80)), // ~1.1 KB reasoning, empty content, no calls
+		sseText("here is the answer"),                       // after the nudge, the visible answer
+	)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if mock.callCount() != 2 {
+		t.Errorf("calls: got %d, want 2 (reasoned-but-empty must be nudged, not accepted)", mock.callCount())
+	}
+	if res.Text != "here is the answer" {
+		t.Errorf("res.Text: got %q, want the post-nudge answer", res.Text)
 	}
 }

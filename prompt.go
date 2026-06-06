@@ -1117,7 +1117,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 			buf.WriteString("\n</git_diff>\n")
 		}
 
-		out, _, err := a.llmStream(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: buf.String()}}, nil, nil, nil)
+		out, _, _, err := a.llmStream(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: buf.String()}}, nil, nil, nil)
 		if err != nil {
 			slog.Debug("backgroundGitCommit: llm call failed", "sid", sess.ID, "err", err)
 			return
