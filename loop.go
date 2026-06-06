@@ -182,7 +182,17 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		choice, err := a.askChoiceAuto(ctx, sid, tcId, plan.Choices)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
-		if err != nil || choice == "abort" {
+		// err = the card's ctx was cancelled (the editor aborted this turn to send
+		// a new prompt) — NOT a stop the user made; surface the real cause so the
+		// notice doesn't say "you stopped it". choice=="abort" IS an explicit stop.
+		if err != nil {
+			appendAssistantNote(sess, "Clarification cancelled (superseded).")
+			if sess != nil {
+				sess.saveOrLog()
+			}
+			return nil, toolUses, err
+		}
+		if choice == "abort" {
 			appendAssistantNote(sess, "User aborted on clarification.")
 			if sess != nil {
 				sess.saveOrLog()

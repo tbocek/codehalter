@@ -15,27 +15,15 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// beginTurn registers the in-flight turn's cancel and clears the interrupted flag.
+// beginTurn registers the in-flight turn's cancel.
 func (s *Session) beginTurn(c context.CancelFunc) {
 	s.turnCancelMu.Lock()
 	s.turnCancel = c
-	s.interrupted = false
 	s.turnCancelMu.Unlock()
 }
 
-// interruptForPrompt cancels the in-flight turn as a REDIRECT (the user's next
-// message) — the cancelled turn then reports "continuing", not "you stopped it".
-func (s *Session) interruptForPrompt() {
-	s.turnCancelMu.Lock()
-	s.interrupted = true
-	c := s.turnCancel
-	s.turnCancelMu.Unlock()
-	if c != nil {
-		c()
-	}
-}
-
-// cancelTurn stops the in-flight turn (the Cancel button) — not a redirect.
+// cancelTurn cancels the in-flight turn's ctx (Cancel button, or a new prompt
+// superseding it). The caller does NOT wait for the turn to finish.
 func (s *Session) cancelTurn() {
 	s.turnCancelMu.Lock()
 	c := s.turnCancel
@@ -43,14 +31,6 @@ func (s *Session) cancelTurn() {
 	if c != nil {
 		c()
 	}
-}
-
-// wasInterrupted reports whether the turn was cancelled by the user's next
-// message (a redirect) rather than the Cancel button.
-func (s *Session) wasInterrupted() bool {
-	s.turnCancelMu.Lock()
-	defer s.turnCancelMu.Unlock()
-	return s.interrupted
 }
 
 const sessionDir = ".codehalter"
@@ -280,16 +260,11 @@ type Session struct {
 	// foreground-turn-only (no background goroutine touches them), so unguarded.
 	pendingPlan *planResult
 	resumePlan  *planResult
-	// Turn serialization: a session runs ONE turn at a time. turnMu is held across
-	// runTurn; a new Prompt cancels the in-flight turn (turnCancel) and waits here
-	// before starting, so two turns never overlap (a typed message during a card
-	// used to spawn a 2nd concurrent turn → stomped state → limbo). interrupted
-	// flags a cancel caused by the user's NEXT message (a redirect — keep going)
-	// vs the Cancel button (a stop). turnCancelMu guards turnCancel + interrupted.
-	turnMu       sync.Mutex
+	// turnCancel cancels the in-flight turn's ctx — fired by the Cancel button or
+	// by a new prompt superseding it (which does NOT wait on the old turn, so a
+	// wedged turn can't block future prompts). Guarded by turnCancelMu.
 	turnCancelMu sync.Mutex
 	turnCancel   context.CancelFunc
-	interrupted  bool
 	// fixAutoExec is set while a user-accepted fix card is being dispatched: the
 	// user already approved on the card, so confirmPlan skips its "Execute?" gate
 	// for that turn. Foreground-turn-only, so unguarded like the plans above.

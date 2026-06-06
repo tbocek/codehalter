@@ -353,18 +353,13 @@ func stopReasonFor(ctx context.Context) string {
 func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
 	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
 
-	// Serialize turns per session: cancel any in-flight turn (as a redirect — the
-	// user typed a new message) and wait for it to finish before starting, so two
-	// runTurns never overlap and stomp shared state. The Cancel button and a new
-	// Prompt both stop the in-flight turn; only a new Prompt continues after.
-	if sess := a.getSession(req.SessionId); sess != nil {
-		sess.interruptForPrompt()
-		sess.turnMu.Lock()
-		defer sess.turnMu.Unlock()
-	}
-
+	// A new prompt is a NEW turn, not a cancel-and-wait: supersede any in-flight
+	// turn (cancel its ctx so it winds down) and start THIS turn immediately —
+	// never block on the old turn. The old turn can wedge; blocking on it (the
+	// previous design) deadlocked every future prompt.
 	ctx, cancel := context.WithCancel(ctx)
 	if sess := a.getSession(req.SessionId); sess != nil {
+		sess.cancelTurn()
 		sess.beginTurn(cancel)
 	}
 	defer cancel()
@@ -588,19 +583,22 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			// ctx for the notice since the request ctx is already cancelled.
 			reason := cancelReason(err)
 			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "reason", reason, "err", err)
-			// If a plan card was dismissed (the user typed instead of choosing),
-			// the plan is held in pendingPlan and re-shown after their message —
-			// say so rather than the misleading "cancelled".
-			msg := "⏹ Turn cancelled — " + reason + ".\n"
-			if sess := a.getSession(req.SessionId); sess != nil {
-				switch {
-				case sess.pendingPlan != nil:
+			// Only the explicit in-app Abort is "you stopped it". An external cancel
+			// (the editor aborting to send your next message) is NOT a stop you made,
+			// so don't blame you — and when a plan is held, say that instead. A new
+			// prompt that superseded this turn will speak for itself.
+			msg := ""
+			switch {
+			case errors.Is(err, errUserCancelled):
+				msg = "⏹ Stopped.\n"
+			default:
+				if sess := a.getSession(req.SessionId); sess != nil && sess.pendingPlan != nil {
 					msg = "⏸ Holding the plan — I'll re-show it after your message.\n"
-				case sess.wasInterrupted():
-					msg = "↻ Continuing with your new message…\n"
 				}
 			}
-			a.sendUpdate(context.Background(), req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: msg}})
+			if msg != "" {
+				a.sendUpdate(context.Background(), req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: msg}})
+			}
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, nil)
