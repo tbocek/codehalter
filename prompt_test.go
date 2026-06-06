@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -130,5 +131,35 @@ func TestHumanFormatters(t *testing.T) {
 	// 200 tokens in 500ms = 400/s
 	if got := humanRate(200, 500); got != "400" {
 		t.Errorf("humanRate(200,500)=%q want 400", got)
+	}
+}
+
+// TestSystemPromptCarriesPhaseGuidance pins that PLAN.md/EXECUTE.md live in the
+// system prompt (the stable, cached prefix) instead of being re-injected as a
+// per-turn user message — the fix for the primer bloat that stacked 7-8 KB
+// copies in the history each (re)plan and forced repeated compactions.
+func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
+	a, s := newTestAgent(t)
+	dir := filepath.Join(s.Cwd, ".codehalter")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"SYSTEM.md":  "SYSTEM_SENTINEL",
+		"PLAN.md":    "PLAN_SENTINEL planning guidance",
+		"EXECUTE.md": "EXEC_SENTINEL execution guidance",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sp, err := a.systemPrompt(s.ID)
+	if err != nil {
+		t.Fatalf("systemPrompt: %v", err)
+	}
+	for _, want := range []string{"SYSTEM_SENTINEL", "PLAN_SENTINEL", "EXEC_SENTINEL"} {
+		if !strings.Contains(sp, want) {
+			t.Errorf("system prompt missing %q — phase guidance not carried in the prefix", want)
+		}
 	}
 }

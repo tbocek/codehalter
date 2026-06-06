@@ -260,9 +260,12 @@ type Session struct {
 	// foreground-turn-only (no background goroutine touches them), so unguarded.
 	pendingPlan *planResult
 	resumePlan  *planResult
-	// turnCancel cancels the in-flight turn's ctx — fired by the Cancel button or
-	// by a new prompt superseding it (which does NOT wait on the old turn, so a
-	// wedged turn can't block future prompts). Guarded by turnCancelMu.
+	// One turn per session. turnMu is held across the whole turn; a new prompt
+	// cancelTurn()s the in-flight one then Lock()s here, so turns never overlap
+	// (overlap raced compaction → two divergent context snapshots). turnCancel is
+	// the in-flight turn's ctx cancel, fired by the Cancel button or a superseding
+	// prompt; guarded by turnCancelMu.
+	turnMu       sync.Mutex
 	turnCancelMu sync.Mutex
 	turnCancel   context.CancelFunc
 	// fixAutoExec is set while a user-accepted fix card is being dispatched: the

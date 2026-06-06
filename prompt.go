@@ -353,13 +353,21 @@ func stopReasonFor(ctx context.Context) string {
 func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
 	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
 
-	// A new prompt is a NEW turn, not a cancel-and-wait: supersede any in-flight
-	// turn (cancel its ctx so it winds down) and start THIS turn immediately —
-	// never block on the old turn. The old turn can wedge; blocking on it (the
-	// previous design) deadlocked every future prompt.
-	ctx, cancel := context.WithCancel(ctx)
+	// One turn per session. A new prompt supersedes the in-flight turn: cancel it
+	// (stops its LLM call), then WAIT on turnMu for it to fully unwind before
+	// starting — so two turns never run with divergent context snapshots. That
+	// overlap was the bug: one turn compacted the session while the other kept
+	// re-sending its pre-compaction snapshot, re-bloating the context and
+	// double-compacting. The deadlock that made us drop this lock is fixed
+	// (connSems capture + the ctx bail-out in orchestrate below), so the wait is
+	// short: the old turn sees its cancelled ctx and returns within one step.
 	if sess := a.getSession(req.SessionId); sess != nil {
 		sess.cancelTurn()
+		sess.turnMu.Lock()
+		defer sess.turnMu.Unlock()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	if sess := a.getSession(req.SessionId); sess != nil {
 		sess.beginTurn(cancel)
 	}
 	defer cancel()
@@ -739,12 +747,21 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	upserts := 0
 
 	for {
+		// Bail the instant the turn is superseded/cancelled, so turnMu is released
+		// promptly (the new prompt is waiting on it) instead of starting another
+		// plan/execute phase on a turn that's already been told to stop.
+		if err := ctx.Err(); err != nil {
+			return lastResult, err
+		}
 		allOk := true
 		upserted := false
 		var failedAt int
 		var failedReason string
 
 		for i, st := range plan.Subtasks {
+			if err := ctx.Err(); err != nil {
+				return lastResult, err
+			}
 			a.sendPhase(ctx, sid, 1, false)
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(plan.Subtasks), st.Description)}})
 
@@ -1165,6 +1182,21 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	// Project-first investigation guidance — a user-editable prompt seeded to
 	// .codehalter/SYSTEM.md (see docs/SYSTEM.md), not a Go string const.
 	b.WriteString(a.loadPromptFile(sid, "SYSTEM.md"))
+
+	// Phase guidance lives in the system prompt (the stable, cached prefix) rather
+	// than being re-injected as a multi-KB user message on every plan/execute
+	// entry — that stacked a fresh 7-8 KB copy in the history each (re)plan and
+	// forced repeated compactions. The per-phase user message now carries only the
+	// trigger + the specific subtask. Both phases see both blocks; the live
+	// instruction + the dispatch gate decide which one is in force.
+	if plan := a.loadPromptFile(sid, "PLAN.md"); plan != "" {
+		b.WriteString("\n\n")
+		b.WriteString(plan)
+	}
+	if exec := a.loadPromptFile(sid, "EXECUTE.md"); exec != "" {
+		b.WriteString("\n\n")
+		b.WriteString(exec)
+	}
 
 	return b.String(), nil
 }

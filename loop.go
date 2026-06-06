@@ -75,17 +75,21 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	if thinking == nil {
 		return nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
 	}
-	planPrompt := a.loadPromptFile(sid, "PLAN.md")
-	if planPrompt == "" {
+	// PLAN.md is in the system prompt now (the stable, cached prefix); here we
+	// inject only the phase trigger + any replan context. An empty PLAN.md still
+	// disables planning. Keeping the primer out of the history is what stops
+	// re-plans from stacking 7 KB copies and re-bloating the context.
+	if a.loadPromptFile(sid, "PLAN.md") == "" {
 		return nil, nil, nil
 	}
+	marker := "Begin the PLANNING phase — produce the plan now (planning guidance is in the system prompt)."
 	if replanContext != "" {
-		planPrompt = planPrompt + "\n\n" + replanContext
+		marker = "Begin the PLANNING phase again.\n\n" + replanContext
 	}
 
 	sess := a.getSession(sid)
 	if sess != nil {
-		sess.AddUser(planPrompt)
+		sess.AddUser(marker)
 		sess.saveOrLog()
 	}
 
@@ -251,15 +255,12 @@ type subtaskOutcome struct {
 // planning). The executor self-verifies via the recipe before calling
 // respond. Bounded only by the hard maxToolLoopIterations backstop in this file.
 func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx, total int) subtaskOutcome {
-	executeMD := a.loadPromptFile(sid, "EXECUTE.md")
 	sess := a.getSession(sid)
 
+	// EXECUTE.md is in the system prompt now; inject only the specific subtask +
+	// verify recipe, not the full primer (which stacked in the history per subtask).
 	var prompt strings.Builder
-	if executeMD != "" {
-		prompt.WriteString(executeMD)
-		prompt.WriteString("\n\n")
-	}
-	fmt.Fprintf(&prompt, "## Subtask %d/%d\n\n%s\n", idx+1, total, st.Description)
+	fmt.Fprintf(&prompt, "EXECUTION phase — Subtask %d/%d\n\n%s\n", idx+1, total, st.Description)
 	if len(st.Verify) > 0 {
 		prompt.WriteString("\n## Verify recipe — run every entry via tools before calling respond\n\n")
 		for i, v := range st.Verify {
