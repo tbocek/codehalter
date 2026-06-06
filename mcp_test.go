@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // TestHTTPTransportRoundTrip covers the parts of the Streamable HTTP transport
@@ -130,5 +131,31 @@ func TestStartMCPClientRejectsCommandAndURL(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "command and url") {
 		t.Fatalf("error %q didn't mention command/url conflict", err)
+	}
+}
+
+// TestStdioTransportSurfacesCrash pins the fix for the swallowed-MCP-error hang:
+// a stdio child that crashes on startup (here: writes to stderr and exits, like
+// lsmcp's "No such built-in module: node:sqlite" on Node < 22) must have its
+// stderr CAPTURED, its exit DETECTED, and a send fail fast — not block forever
+// waiting on a response from a dead process.
+func TestStdioTransportSurfacesCrash(t *testing.T) {
+	cfg := MCPServerConfig{Name: "crashy", Command: "sh", Args: []string{"-c", "echo 'boom node:sqlite' >&2; exit 1"}}
+	tr, err := newStdioTransport(cfg, "")
+	if err != nil {
+		t.Fatalf("newStdioTransport: %v", err)
+	}
+	defer tr.close()
+
+	select {
+	case <-tr.done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("child exit not detected — done never closed")
+	}
+	if se := tr.stderr.String(); !strings.Contains(se, "boom") {
+		t.Errorf("stderr was not captured (would be swallowed): %q", se)
+	}
+	if _, err := tr.send(context.Background(), mcpRequest{JSONRPC: "2.0", ID: 1, Method: "initialize"}); err == nil {
+		t.Error("send to a dead server should error fast, not hang")
 	}
 }

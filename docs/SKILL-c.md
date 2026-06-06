@@ -30,13 +30,17 @@ paths, and link order live in the build files; a hand `gcc` call drops them and
 ## Code intelligence over MCP — clangd (the gopls analog)
 
 Set up ONLY when the user asks. clangd is a pure LSP, so bridge it to MCP with
-lsmcp (the generic LSP→MCP server, needs node):
+lsmcp (the generic LSP→MCP server). **lsmcp requires Node ≥ 22** — it imports the
+`node:sqlite` builtin, so on Node 20 it crashes immediately with
+`ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite` and the MCP
+server never starts. Check `node --version` first.
 
 1. Install `clangd` via the OS package manager (`apk add clang clang-extra-tools`
    / `apt-get install -y clangd` / `dnf install -y clang-tools-extra`); verify
    `clangd --version`.
-2. Install node + the project's package manager (see SKILL-container.md), then
-   drive clangd via lsmcp. If lsmcp can't drive clangd cleanly, use another
+2. Install **Node ≥ 22** + the project's package manager (see SKILL-container.md) —
+   verify `node --version` reports 22+, NOT 20. Then drive clangd via lsmcp. If
+   lsmcp can't drive clangd cleanly (or Node can't be bumped to 22), use another
    LSP→MCP adapter — verify the `lsp_*` tools actually appear.
 3. Add to `.codehalter/mcp.toml` (uncomment the WHOLE block INCLUDING the
    `[[server]]` header — a commented header leaves the keys orphan and the server
@@ -56,7 +60,8 @@ lsmcp (the generic LSP→MCP server, needs node):
    - CMake: configure with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
    For a trivial single-file project a `compile_flags.txt` (one flag per line,
    e.g. `-Wall`) is simpler than a JSON DB and needs no build wrapper.
-5. Persist clangd + node in `.devcontainer/Dockerfile`.
+5. Persist clangd + **Node ≥ 22** (not the distro's default 20) in
+   `.devcontainer/Dockerfile`.
 
 ## Tooling (install + persist in the Dockerfile if missing — see SKILL-container.md)
 

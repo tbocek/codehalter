@@ -97,6 +97,11 @@ type MCPClient struct {
 	nextID    atomic.Int64
 }
 
+// mcpStartTimeout bounds a server's bring-up (handshake + tools/list) so a
+// stdio server that never answers can't hang the prompt's prepare phase. Long
+// enough for a first-run `npx` fetch, short enough that a wedged --bin fails fast.
+const mcpStartTimeout = 30 * time.Second
+
 // StartMCPClient brings up the server described by cfg and runs the MCP
 // initialize handshake. The returned client is ready for tools/list and
 // tools/call. cwd scopes a stdio child's working directory; HTTP transports
@@ -114,8 +119,9 @@ func StartMCPClient(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPC
 			headers: cfg.Headers,
 			// Per-server timeout protects against a hung server holding up the
 			// agent indefinitely; tools/call for long-running operations should
-			// be wrapped in the request ctx for finer control.
-			client: &http.Client{Timeout: 60 * time.Second},
+			// be wrapped in the request ctx for finer control. Same bound as the
+			// stdio handshake (mcpStartTimeout) so both transports behave alike.
+			client: &http.Client{Timeout: mcpStartTimeout},
 		}
 	case cfg.Command != "":
 		st, err := newStdioTransport(cfg, cwd)
@@ -176,11 +182,38 @@ type stdioTransport struct {
 	cmd    *exec.Cmd
 	stdin  io.WriteCloser
 	stdout io.ReadCloser
+	stderr *ringWriter   // bounded capture of the child's stderr (the failure reason)
+	done   chan struct{} // closed when the child process exits
 
 	writeMu sync.Mutex
 
 	pendingMu sync.Mutex
 	pending   map[int64]chan mcpResponse
+}
+
+// ringWriter keeps only the last `max` bytes written — a bounded stderr capture
+// so a crashing MCP server's error survives in the log without letting normal
+// liveness chatter grow unbounded.
+type ringWriter struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (w *ringWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	if len(w.buf) > w.max {
+		w.buf = w.buf[len(w.buf)-w.max:]
+	}
+	return len(p), nil
+}
+
+func (w *ringWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return strings.TrimSpace(string(w.buf))
 }
 
 func newStdioTransport(cfg MCPServerConfig, cwd string) (*stdioTransport, error) {
@@ -205,9 +238,11 @@ func newStdioTransport(cfg MCPServerConfig, cwd string) (*stdioTransport, error)
 	if err != nil {
 		return nil, fmt.Errorf("mcp stdout: %w", err)
 	}
-	// Drop stderr — MCP servers tend to log liveness chatter that would
-	// otherwise drown the agent log.
-	cmd.Stderr = io.Discard
+	// Capture stderr (bounded) instead of discarding it: it's where a server that
+	// can't start prints WHY (e.g. lsmcp's "No such built-in module: node:sqlite"
+	// on Node < 22). The ring cap keeps liveness chatter from drowning the log.
+	stderr := &ringWriter{max: 8192}
+	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting %s: %w", cfg.Command, err)
@@ -217,6 +252,8 @@ func newStdioTransport(cfg MCPServerConfig, cwd string) (*stdioTransport, error)
 		cmd:     cmd,
 		stdin:   stdin,
 		stdout:  stdout,
+		stderr:  stderr,
+		done:    make(chan struct{}),
 		pending: make(map[int64]chan mcpResponse),
 	}
 	go t.readLoop()
@@ -227,6 +264,18 @@ func newStdioTransport(cfg MCPServerConfig, cwd string) (*stdioTransport, error)
 // route to the pending caller; notifications and server-originated requests
 // are dropped (we don't register for any).
 func (t *stdioTransport) readLoop() {
+	// stdout closing means the child exited. Reap it, log the real reason (its
+	// captured stderr), and signal done so any pending send() fails fast with that
+	// reason instead of blocking on a dead process until the ctx timeout.
+	defer func() {
+		err := t.cmd.Wait()
+		if se := t.stderr.String(); se != "" {
+			slog.Warn("mcp server exited", "name", t.name, "err", err, "stderr", truncate(se, 800))
+		} else {
+			slog.Warn("mcp server exited", "name", t.name, "err", err)
+		}
+		close(t.done)
+	}()
 	br := bufio.NewReader(t.stdout)
 	for {
 		line, err := br.ReadString('\n')
@@ -275,6 +324,13 @@ func (t *stdioTransport) send(ctx context.Context, req mcpRequest) (mcpResponse,
 	select {
 	case <-ctx.Done():
 		return mcpResponse{}, ctx.Err()
+	case <-t.done:
+		// The child exited (e.g. crashed on startup) — fail now with its stderr
+		// rather than waiting out the ctx timeout on a response that can't come.
+		if se := t.stderr.String(); se != "" {
+			return mcpResponse{}, fmt.Errorf("server exited: %s", truncate(se, 400))
+		}
+		return mcpResponse{}, fmt.Errorf("server exited before responding")
 	case resp := <-ch:
 		return resp, nil
 	}
@@ -303,20 +359,18 @@ func (t *stdioTransport) writeMessage(msg any) error {
 // hard Kill catches any that don't take the hint.
 func (t *stdioTransport) close() {
 	if t.stdin != nil {
-		t.stdin.Close()
+		t.stdin.Close() // EOF → a well-behaved server exits → stdout closes → readLoop reaps
 	}
-	if t.cmd != nil && t.cmd.Process != nil {
-		done := make(chan struct{})
-		go func() {
-			t.cmd.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(500 * time.Millisecond):
-			t.cmd.Process.Kill()
-			<-done
-		}
+	if t.cmd == nil || t.cmd.Process == nil {
+		return
+	}
+	// readLoop owns cmd.Wait() and closes t.done after reaping. Wait for it; if the
+	// server ignores the stdin EOF, Kill forces stdout closed so readLoop unblocks.
+	select {
+	case <-t.done:
+	case <-time.After(500 * time.Millisecond):
+		t.cmd.Process.Kill()
+		<-t.done
 	}
 }
 
@@ -702,12 +756,20 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 			continue
 		}
 
-		newClient, err := StartMCPClient(ctx, want, cwd)
+		// Bound the start+handshake+listTools: a stdio server that never answers
+		// (npx still fetching, a broken --bin, a wedged process) must NOT hang the
+		// prompt's prepare phase forever (the stdio transport has no client timeout
+		// like httpTransport does). On timeout it's recorded as "failed" and the
+		// prompt proceeds without that server's tools.
+		startCtx, cancel := context.WithTimeout(ctx, mcpStartTimeout)
+		newClient, err := StartMCPClient(startCtx, want, cwd)
 		if err != nil {
+			cancel()
 			changes = append(changes, mcpChange{action: "failed", name: name, err: err})
 			continue
 		}
-		tools, err := newClient.listTools(ctx)
+		tools, err := newClient.listTools(startCtx)
+		cancel()
 		if err != nil {
 			newClient.Close()
 			changes = append(changes, mcpChange{action: "failed", name: name, err: fmt.Errorf("tools/list: %w", err)})
