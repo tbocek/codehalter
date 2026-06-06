@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -13,6 +14,44 @@ import (
 
 	"github.com/BurntSushi/toml"
 )
+
+// beginTurn registers the in-flight turn's cancel and clears the interrupted flag.
+func (s *Session) beginTurn(c context.CancelFunc) {
+	s.turnCancelMu.Lock()
+	s.turnCancel = c
+	s.interrupted = false
+	s.turnCancelMu.Unlock()
+}
+
+// interruptForPrompt cancels the in-flight turn as a REDIRECT (the user's next
+// message) — the cancelled turn then reports "continuing", not "you stopped it".
+func (s *Session) interruptForPrompt() {
+	s.turnCancelMu.Lock()
+	s.interrupted = true
+	c := s.turnCancel
+	s.turnCancelMu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
+// cancelTurn stops the in-flight turn (the Cancel button) — not a redirect.
+func (s *Session) cancelTurn() {
+	s.turnCancelMu.Lock()
+	c := s.turnCancel
+	s.turnCancelMu.Unlock()
+	if c != nil {
+		c()
+	}
+}
+
+// wasInterrupted reports whether the turn was cancelled by the user's next
+// message (a redirect) rather than the Cancel button.
+func (s *Session) wasInterrupted() bool {
+	s.turnCancelMu.Lock()
+	defer s.turnCancelMu.Unlock()
+	return s.interrupted
+}
 
 const sessionDir = ".codehalter"
 
@@ -241,6 +280,16 @@ type Session struct {
 	// foreground-turn-only (no background goroutine touches them), so unguarded.
 	pendingPlan *planResult
 	resumePlan  *planResult
+	// Turn serialization: a session runs ONE turn at a time. turnMu is held across
+	// runTurn; a new Prompt cancels the in-flight turn (turnCancel) and waits here
+	// before starting, so two turns never overlap (a typed message during a card
+	// used to spawn a 2nd concurrent turn → stomped state → limbo). interrupted
+	// flags a cancel caused by the user's NEXT message (a redirect — keep going)
+	// vs the Cancel button (a stop). turnCancelMu guards turnCancel + interrupted.
+	turnMu       sync.Mutex
+	turnCancelMu sync.Mutex
+	turnCancel   context.CancelFunc
+	interrupted  bool
 	// fixAutoExec is set while a user-accepted fix card is being dispatched: the
 	// user already approved on the card, so confirmPlan skips its "Execute?" gate
 	// for that turn. Foreground-turn-only, so unguarded like the plans above.
@@ -322,23 +371,17 @@ type Session struct {
 	turnStatsMu          sync.Mutex
 	turnStart            time.Time
 	turnHumanWaitMs      int64
-	turnPromptTokens     int
+	turnPromptTokens     int // SENT (cached prefix re-counted per call)
 	turnCompletionTokens int
-	// Server-reported cache split for the turn (llama.cpp timings / usage
-	// cached_tokens), summed across calls: turnEvaluatedPrompt = prompt tokens
-	// actually run through the model, turnCachedPrompt = reused from the KV cache.
-	// haveServerCache is false when no backend reported either — then the turn
-	// line shows turnLastPrompt (the final context size) with no cache claim,
-	// rather than guessing. turnLastPrompt is the most recent call's prompt size.
-	turnEvaluatedPrompt int
-	turnCachedPrompt    int
-	turnLastPrompt      int
+	// Server cache split (llama.cpp timings / usage cached_tokens). When no backend
+	// reports it, haveServerCache is false and the Done line shows turnLastPrompt
+	// (final context size) instead of guessing.
+	turnEvaluatedPrompt int // run through the model
+	turnCachedPrompt    int // reused from KV cache
+	turnLastPrompt      int // most recent call's prompt size
 	haveServerCache     bool
-	// Summed per-call timing for the turn's throughput line: turnPromptMs is the
-	// time-to-first-token (prompt-processing proxy), turnGenMs the rest (token
-	// generation). pp/s = evaluatedPrompt/turnPromptMs, tg/s = completion/turnGenMs.
-	turnPromptMs int64
-	turnGenMs    int64
+	turnPromptMs        int64 // eval time (server prompt_ms, else TTFT)
+	turnGenMs           int64 // generation time
 }
 
 // resetTurnStats starts a fresh per-turn measurement window at start.
@@ -357,10 +400,8 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.turnStatsMu.Unlock()
 }
 
-// addTurnTokens adds one llmStream call's server-reported usage to the turn.
-// evaluated/cached are the server's cache split (prompt tokens run vs reused);
-// pass -1 for either the backend didn't report — then haveServerCache stays
-// false and the turn line falls back to the raw context size.
+// addTurnTokens sums one call's usage. evaluated/cached are the server cache
+// split; pass -1 when the backend didn't report it.
 func (s *Session) addTurnTokens(prompt, completion, evaluated, cached int) {
 	s.turnStatsMu.Lock()
 	s.turnPromptTokens += prompt
@@ -379,8 +420,7 @@ func (s *Session) addTurnTokens(prompt, completion, evaluated, cached int) {
 	s.turnStatsMu.Unlock()
 }
 
-// addTurnTiming adds one llmStream call's measured timing to the turn:
-// promptMs = time-to-first-token, genMs = first-token-to-end.
+// addTurnTiming sums one call's eval/gen times.
 func (s *Session) addTurnTiming(promptMs, genMs int64) {
 	s.turnStatsMu.Lock()
 	s.turnPromptMs += promptMs

@@ -11,12 +11,10 @@ import (
 
 const compactTriggerPct = 80
 
-// estimateMessageTokens is a chars/4 estimate of an LLM context. It's the
-// fallback trigger for compaction when the backend doesn't report prompt_tokens
-// (e.g. a proxy that strips stream_options.include_usage) — then
-// LastCompletePromptTokens stays 0 and the server-truth trigger never fires,
-// so the context grows unbounded until a request blows n_ctx. chars/4 can be
-// ~30% off on tool-call JSON, but the 80% trigger leaves enough headroom.
+// estimateMessageTokens is a chars/4 estimate of a context — the compaction
+// fallback when the backend reports no prompt_tokens (a proxy stripping
+// include_usage), where LastCompletePromptTokens stays 0 and the context would
+// otherwise grow unbounded. ~30% off on tool JSON, but the 80% trigger has room.
 func estimateMessageTokens(messages []llmMessage) int {
 	chars := 0
 	for _, m := range messages {
@@ -35,22 +33,16 @@ func estimateMessageTokens(messages []llmMessage) int {
 }
 
 // compressHistory rotates the session when the prompt size crosses
-// compactTriggerPct of the slot budget. The size is max(server-reported
-// prompt_tokens, curTokens) — curTokens is the caller's chars/4 estimate of the
-// CURRENT context (estimateMessageTokens), which is what keeps compaction
-// working on backends that don't report usage. The pre-rotation state is frozen
-// as a "session_archive_*" TOML; the live session keeps its ACP-facing ID +
-// on-disk path so Zed's panel continues without interruption. On any failure we
-// DO NOT rotate — keeping raw messages and retrying next turn beats corrupting
-// the live session.
+// compactTriggerPct of the slot budget — max(server prompt_tokens, curTokens),
+// where curTokens is the caller's chars/4 estimate (keeps compaction working on
+// backends that report no usage). The pre-rotation state is frozen as a
+// "session_archive_*" TOML; the live session keeps its ID + path so Zed's panel
+// continues. On any failure we DO NOT rotate.
 //
-// Called at the turn boundary (after the optimistic per-turn summariser, with
-// summariseFirst=false) AND mid-turn from runToolLoop's 80% overflow check
-// (summariseFirst=true). Mid-turn the optimistic summariser hasn't run yet, so
-// the current turn isn't in the shadow — summariseFirst captures it on demand
-// before rotating, otherwise the about-to-be-rotated messages would be lost.
-// Returns true when it actually compacted, so a mid-loop caller can rebuild its
-// in-flight context from the now-smaller session.
+// Called at the turn boundary (summariseFirst=false) AND mid-turn from the 80%
+// overflow check (summariseFirst=true) — mid-turn the optimistic summariser
+// hasn't run, so summariseFirst captures the current turn before rotating.
+// Returns true when it compacted, so a mid-loop caller rebuilds its context.
 func (a *agent) compressHistory(ctx context.Context, sess *Session, summariseFirst bool, curTokens int) bool {
 	if server := sess.LastCompletePromptTokens(); server > curTokens {
 		curTokens = server

@@ -70,3 +70,32 @@ func TestUpsertLastAssistant(t *testing.T) {
 		t.Errorf("tail: got %+v", s.Messages[2])
 	}
 }
+
+// TestSessionTurnControl pins the cancel-vs-redirect distinction that fixes the
+// limbo: the Cancel button stops the turn (not a redirect); a new Prompt cancels
+// the in-flight turn AND marks it interrupted (continue with the new message).
+func TestSessionTurnControl(t *testing.T) {
+	s := &Session{}
+	cancelled := false
+	s.beginTurn(func() { cancelled = true })
+	if s.wasInterrupted() {
+		t.Error("a fresh turn should not be interrupted")
+	}
+
+	s.cancelTurn() // Cancel button
+	if !cancelled || s.wasInterrupted() {
+		t.Errorf("cancelTurn: cancelled=%v interrupted=%v, want true/false", cancelled, s.wasInterrupted())
+	}
+
+	cancelled = false
+	s.beginTurn(func() { cancelled = true })
+	s.interruptForPrompt() // user typed a new message
+	if !cancelled || !s.wasInterrupted() {
+		t.Errorf("interruptForPrompt: cancelled=%v interrupted=%v, want true/true", cancelled, s.wasInterrupted())
+	}
+
+	s.beginTurn(func() {}) // a new turn clears the redirect flag
+	if s.wasInterrupted() {
+		t.Error("beginTurn should clear interrupted")
+	}
+}

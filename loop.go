@@ -107,12 +107,9 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// edits out to a leaf-worker subagent (which has the full edit toolkit)
 	// and reports report_only=true, papering over the loophole.
 	// Read-only planning, enforced at dispatch: edit_file/write_file/launch_subagent
-	// are denied (when the planner edits, those edits leak into history and the
-	// executor repeats them or assumes the work is done; launch_subagent is the
-	// loophole that fans edits to a leaf worker). run_command's `sed -i` is the
-	// other edit vector — PLAN.md forbids it in prose, unblockable at the tool
-	// layer. Two terminals: submit_plan (the structured plan) and respond (a
-	// direct answer when the request needs no work — a question, or already done).
+	// are denied (planner edits leak into history; launch_subagent fans them to a
+	// leaf worker). `sed -i` is unblockable here — PLAN.md forbids it in prose.
+	// Terminals: submit_plan (the plan) or respond (a direct answer, no work).
 	policy := phasePolicy{
 		deny:      map[string]bool{"write_file": true, "edit_file": true, "launch_subagent": true},
 		terminals: map[string]bool{submitPlanToolName: true, respondToolName: true},
@@ -215,11 +212,9 @@ type subtaskOutcome struct {
 	Result  toolLoopResult
 	Success bool
 	Reason  string
-	// Upsert is non-nil when the executor called submit_plan mid-execution to
-	// revise the remaining plan. The orchestrator adopts it and continues —
-	// completed subtasks stay done (their work is in history), nothing is
-	// cancelled, and the plan phase is NOT re-entered. Success is false and
-	// Reason empty in this case (it's neither a finished subtask nor a failure).
+	// Upsert is non-nil when the executor called submit_plan to revise the
+	// remaining plan; the orchestrator adopts it and continues (completed work
+	// stays, nothing cancelled). Success=false, Reason empty in this case.
 	Upsert *planResult
 }
 
@@ -255,10 +250,9 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		messages = a.buildLLMContext(sess)
 	}
 
-	// Execute allows EVERY tool (no deny) — web_search/web_read are now usable
-	// mid-execution for a quick lookup instead of forcing a fail→replan trip. Two
-	// terminals: respond ends the subtask; submit_plan revises the remaining plan
-	// in place (the orchestrator adopts it and keeps going — see subtaskOutcome).
+	// Execute allows EVERY tool (web_search/web_read usable mid-edit). Terminals:
+	// respond ends the subtask; submit_plan revises the remaining plan in place
+	// (the orchestrator adopts it — see subtaskOutcome).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
 	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
@@ -269,10 +263,8 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		out.Reason = "executor error: " + err.Error()
 		return out
 	}
-	// Plan-upsert: the executor called submit_plan to revise the remaining work.
-	// Parse it (submit_plan's args ARE the plan JSON, in res.Text) and hand it up
-	// for the orchestrator to adopt. A malformed upsert is ignored (fall through
-	// to the no-respond failure path) rather than aborting the run.
+	// Plan-upsert: submit_plan's args ARE the revised plan (in res.Text). Hand it
+	// up for the orchestrator to adopt; a malformed one falls through to failure.
 	if res.Terminal == submitPlanToolName {
 		var up planResult
 		if err := json.Unmarshal([]byte(trimJSON(res.Text)), &up); err == nil && len(up.Subtasks) > 0 {
@@ -546,18 +538,12 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			stampTiming()
 			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
 		}
-		// Mid-turn 80% overflow check — runs BEFORE the call, on the in-flight
-		// context we're about to send. The previous iteration's tool batch may
-		// have ballooned `messages` (read_file/search_text outputs are live-
-		// exempt from truncation), so check NOW and compact before the call
-		// instead of after — the after-the-call check is useless when the
-		// overflowing call is the one that 400s. The size is a chars/4 estimate
-		// of `messages` (estimateMessageTokens), max'd with the server's last
-		// ground-truth count inside compressHistory; the estimate is what keeps
-		// this working when the backend reports no usage. summariseFirst=true
-		// captures the current turn before rotation (the optimistic summariser
-		// runs only at the turn boundary). Rebuild the slice from the now-smaller
-		// session when it compacts.
+		// Mid-turn 80% overflow check — BEFORE the call, on the in-flight context.
+		// The previous batch may have ballooned `messages` (read/search outputs are
+		// live-exempt from truncation), and checking after the call is useless when
+		// that call is the one that 400s. Size = chars/4 estimate, max'd with the
+		// server's last count inside compressHistory (so it works with no usage).
+		// summariseFirst captures the turn before rotation. Rebuild on compact.
 		if (phase == "plan" || phase == "execute") && sid != "" {
 			if s := a.getSession(sid); s != nil && s.Depth == 0 {
 				if a.compressHistory(ctx, s, true, estimateMessageTokens(messages)) {
@@ -579,11 +565,9 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		}
 		allText.WriteString(text)
 
-		// Persist THIS turn's assistant text to the session as generated — once,
-		// verbatim — so replaying from the session reproduces the wire (cache
-		// consistency, not readability). A fresh assistant message per iteration
-		// (not one merged turn) matches what was sent; AppendToolUse below attaches
-		// this turn's tool uses to it. No post-hoc UpsertLastAssistant patch.
+		// Persist this turn's assistant text verbatim (a fresh message per
+		// iteration, not a merged turn) so a session replay reproduces the wire —
+		// cache consistency, not readability. AppendToolUse attaches the tool uses.
 		if s := a.getSession(sid); s != nil {
 			s.AddAssistant(text)
 			s.saveOrLog()

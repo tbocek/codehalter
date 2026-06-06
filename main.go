@@ -334,7 +334,10 @@ func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) e
 // the live map. The on-disk TOML is preserved so /session resume still works
 // — close is a "this client is done watching" signal, not a delete.
 func (a *agent) CloseSession(_ context.Context, req CloseSessionRequest) error {
-	a.mu.Lock()
+	if sess := a.getSession(req.SessionId); sess != nil {
+		sess.cancelTurn()
+	}
+	a.mu.Lock() // global slot: the pre-turn bootstrap (ensureDevcontainer)
 	if a.cancel != nil {
 		a.cancel()
 	}
@@ -343,12 +346,15 @@ func (a *agent) CloseSession(_ context.Context, req CloseSessionRequest) error {
 	return nil
 }
 
-func (a *agent) Cancel(_ context.Context, _ CancelNotification) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+func (a *agent) Cancel(_ context.Context, n CancelNotification) {
+	if sess := a.getSession(n.SessionId); sess != nil {
+		sess.cancelTurn() // the in-flight turn for THIS session
+	}
+	a.mu.Lock() // global slot: the pre-turn bootstrap
 	if a.cancel != nil {
 		a.cancel()
 	}
+	a.mu.Unlock()
 }
 
 // ---------------------------------------------------------------------------

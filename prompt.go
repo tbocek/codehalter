@@ -352,10 +352,21 @@ func stopReasonFor(ctx context.Context) string {
 
 func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
 	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
+
+	// Serialize turns per session: cancel any in-flight turn (as a redirect — the
+	// user typed a new message) and wait for it to finish before starting, so two
+	// runTurns never overlap and stomp shared state. The Cancel button and a new
+	// Prompt both stop the in-flight turn; only a new Prompt continues after.
+	if sess := a.getSession(req.SessionId); sess != nil {
+		sess.interruptForPrompt()
+		sess.turnMu.Lock()
+		defer sess.turnMu.Unlock()
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
-	a.mu.Lock()
-	a.cancel = cancel
-	a.mu.Unlock()
+	if sess := a.getSession(req.SessionId); sess != nil {
+		sess.beginTurn(cancel)
+	}
 	defer cancel()
 	defer a.finalizePlan(req.SessionId)
 
@@ -581,8 +592,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			// the plan is held in pendingPlan and re-shown after their message —
 			// say so rather than the misleading "cancelled".
 			msg := "⏹ Turn cancelled — " + reason + ".\n"
-			if sess := a.getSession(req.SessionId); sess != nil && sess.pendingPlan != nil {
-				msg = "⏸ Holding the plan — I'll re-show it after your message.\n"
+			if sess := a.getSession(req.SessionId); sess != nil {
+				switch {
+				case sess.pendingPlan != nil:
+					msg = "⏸ Holding the plan — I'll re-show it after your message.\n"
+				case sess.wasInterrupted():
+					msg = "↻ Continuing with your new message…\n"
+				}
 			}
 			a.sendUpdate(context.Background(), req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: msg}})
 			return PromptResponse{StopReason: "cancelled"}, nil
@@ -643,14 +659,9 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	// drains it and rotates IF the session crossed the trigger (else it's a no-op
 	// and the summary just rides the next compaction). Report stats first.
 	if r := sess.turnStats(); r.activeMs > 0 {
-		// Leading blank line: the message stream renders as markdown, where a
-		// single \n collapses to a space — \n\n forces the stats onto their own
-		// line instead of jamming against the document phase's last sentence.
-		//
-		// When the server reported its cache split, headline the WORK done —
-		// EVALUATED prompt + generated — with sent/cached% alongside to show the
-		// cache's payoff. With no server cache info we DON'T guess: show the final
-		// context size + generated, labelled plainly.
+		// \n\n keeps the stats on their own markdown line. With the server cache
+		// split, headline the work done (evaluated + gen) plus sent/cached%;
+		// without it, show the final context size — don't guess.
 		var line string
 		if r.haveServerCache {
 			line = fmt.Sprintf("\n\n✅ Done in %s · %s prompt + %s gen",
@@ -743,10 +754,8 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			lastResult = outcome.Result
 
 			if outcome.Upsert != nil {
-				// Plan-upsert: the executor called submit_plan to revise the remaining
-				// work. Adopt it and restart the subtask loop — completed subtasks stay
-				// done (their work is in history), nothing is cancelled, and we never
-				// re-enter the plan phase or touch the replan budget.
+				// Plan-upsert: adopt the revised plan and restart the subtask loop —
+				// completed work stays, nothing cancelled, no replan-budget cost.
 				plan = outcome.Upsert
 				upserted = true
 				break
@@ -834,10 +843,8 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 // when already in autopilot, and for report_only plans where no mutating work
 // happens. Replan plans use the same gate so the user sees the new approach
 // before it runs.
-// renderPlanUpdate shows a mid-run plan revision (executor called submit_plan)
-// as a plain message — NOT a confirmation card. The initial plan was already
-// approved; an upsert is the model adapting its remaining TODO, so it streams
-// inline and execution continues without re-gating (the user can still Cancel).
+// renderPlanUpdate shows a mid-run plan revision inline (not a confirm card):
+// the initial plan was approved, an upsert is the model adapting — no re-gating.
 func (a *agent) renderPlanUpdate(ctx context.Context, sid string, plan *planResult) {
 	if len(plan.Subtasks) == 0 {
 		return

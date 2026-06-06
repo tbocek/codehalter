@@ -59,18 +59,15 @@ type sseChunk struct {
 	Usage *struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
-		// PromptTokensDetails.CachedTokens is the OpenAI-standard count of prompt
-		// tokens served from the KV cache (vs freshly evaluated). llama.cpp fills
-		// it; evaluated = prompt_tokens - cached_tokens.
+		// CachedTokens (OpenAI-standard) = prompt tokens served from cache;
+		// evaluated = prompt_tokens - cached_tokens.
 		PromptTokensDetails *struct {
 			CachedTokens int `json:"cached_tokens"`
 		} `json:"prompt_tokens_details"`
 	} `json:"usage"`
-	// Timings is llama.cpp's per-request block (needs timings_per_token=true).
-	// prompt_n = tokens actually EVALUATED, cache_n = tokens reused from cache —
-	// the ground-truth cache split. A pure OpenAI backend / a router that strips
-	// non-standard fields won't send it; then we fall back to usage cached_tokens,
-	// and if that's absent too, to the raw context size (no cache claim).
+	// Timings is llama.cpp's per-request block (timings_per_token=true): prompt_n =
+	// evaluated, cache_n = reused, _ms = measured times. A proxy that strips
+	// non-standard fields won't send it (we then fall back to usage cached_tokens).
 	Timings *struct {
 		PromptN     int     `json:"prompt_n"`
 		CacheN      int     `json:"cache_n"`
@@ -97,9 +94,8 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	}
 	reqBody["model"] = conn.Model
 	reqBody["stream"] = true
-	// Ask llama.cpp for its per-request timings (prompt_n / cache_n) so the turn
-	// stats report tokens actually EVALUATED vs reused from KV cache — server
-	// ground truth, not a client guess. Harmless on backends that ignore it.
+	// Ask llama.cpp for per-request timings (prompt_n/cache_n/_ms) so the stats use
+	// server ground truth for the cache split. Harmless if ignored.
 	reqBody["timings_per_token"] = true
 	// stream_options.include_usage asks the server to emit a final SSE chunk
 	// carrying prompt_tokens / completion_tokens. The chars/4 estimator can be
@@ -236,10 +232,8 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
 	// line limit silently truncates. 4 MB matches common reverse-proxy caps.
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	// Throughput timing: readStart→firstToken is the prompt-processing window
-	// (TTFT), firstToken→end is generation — used for the pp/s · tg/s rates. (We
-	// request server timings for the token COUNTS below, but time the wall-clock
-	// ourselves so the rates work even when the server reports no _ms fields.)
+	// TTFT (readStart→firstToken) and gen (firstToken→end) — the rate timing
+	// fallback when the server sends no _ms.
 	readStart := time.Now()
 	var firstTokenAt time.Time
 	for scanner.Scan() {
@@ -330,17 +324,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		if scanErr == nil && promptTokens > 0 {
 			sess.SetLastCompletePromptTokens(promptTokens)
 		}
-		// Sum every call's usage into the turn so the "✅ Done" line reports total
-		// tokens (foreground + background); 0/0 when the backend reports no usage.
-		// Derive the evaluated count if only usage cached_tokens was reported
-		// (timings absent). -1 stays -1 (no cache info) → the turn line falls back
-		// to the raw context size rather than claiming a split.
+		// Sum usage into the turn (foreground + background). Derive evaluated from
+		// cached_tokens when timings are absent; -1 means no cache info reported.
 		if evaluatedTokens < 0 && cachedTokens >= 0 && promptTokens > 0 {
 			evaluatedTokens = promptTokens - cachedTokens
 		}
 		sess.addTurnTokens(promptTokens, completionTokens, evaluatedTokens, cachedTokens)
-		// Prefer the server's measured prompt/gen times (exact eval time) over our
-		// TTFT proxy (which includes queue + cache-load overhead → understates pp/s).
+		// Prefer the server's measured times over our TTFT proxy (which includes
+		// queue + cache-load overhead → understates pp/s).
 		pMs, gMs := serverPromptMs, serverGenMs
 		if pMs == 0 && gMs == 0 && !firstTokenAt.IsZero() {
 			pMs = float64(firstTokenAt.Sub(readStart).Milliseconds())

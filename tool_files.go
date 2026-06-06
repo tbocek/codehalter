@@ -12,12 +12,10 @@ import (
 	"strings"
 )
 
-// binarySniffLen is how many leading bytes we inspect to classify a file as
-// binary. A NUL byte in this window means "not text" — the cheap heuristic git
-// and grep use. Binary files (zips, images, compiled blobs) must NEVER be
-// scanned by search_text or rendered by read_file: their bytes poison the LLM
-// context — the model echoes garbage, emits empty content, and stalls (observed
-// as "plan not valid JSON" after a search hit inside a .zip).
+// binarySniffLen is how many leading bytes we sniff for a NUL to classify a file
+// as binary (the git/grep heuristic). Binary files (zips, images) must never be
+// scanned by search_text or rendered by read_file — their bytes poison the
+// context (the model emits garbage and stalls).
 const binarySniffLen = 8192
 
 func looksBinary(b []byte) bool {
@@ -27,9 +25,8 @@ func looksBinary(b []byte) bool {
 	return bytes.IndexByte(b, 0) >= 0
 }
 
-// trimBlankEdges drops leading/trailing all-whitespace lines — the empty final
-// element a trailing newline produces, plus any stray blank line the model
-// padded its snippet with — so they don't throw off line-window matching.
+// trimBlankEdges drops leading/trailing all-whitespace lines (a trailing
+// newline's empty element, or a stray blank line) so they don't skew matching.
 func trimBlankEdges(lines []string) []string {
 	for len(lines) > 0 && strings.TrimSpace(lines[0]) == "" {
 		lines = lines[1:]
@@ -42,11 +39,9 @@ func trimBlankEdges(lines []string) []string {
 
 func leadingWS(s string) string { return s[:len(s)-len(strings.TrimLeft(s, " \t"))] }
 
-// reindent shifts every line of text by the indent delta between the snippet's
-// indent (oldIndent) and the file's actual indent (fileIndent), so a block
-// matched while ignoring indentation lands at the file's column. Handles the
-// common "off by a consistent prefix" case (works for tabs or spaces); leaves
-// text unchanged when the two indents don't share a prefix.
+// reindent shifts text by the indent delta between the snippet's indent and the
+// file's, so a block matched ignoring indentation lands at the file's column.
+// Handles the common "off by a consistent prefix" case; otherwise leaves it.
 func reindent(text, oldIndent, fileIndent string) string {
 	if oldIndent == fileIndent {
 		return text
@@ -69,14 +64,11 @@ func reindent(text, oldIndent, fileIndent string) string {
 	return strings.Join(lines, "\n")
 }
 
-// tolerantReplace recovers an edit whose old_text matches the file except for
-// per-line whitespace — the dominant edit_file failure for small local models.
-// It matches whole lines ignoring trailing whitespace first, then (only if that
-// finds nothing) ignoring leading indentation too, re-indenting new_text to the
-// file's column. Returns the rewritten content and how many distinct line
-// windows matched, so the caller keeps edit_file's unique-or-fail contract (it
-// applies the result only when exactly one window matched). Used as a fallback
-// AFTER an exact match fails, never to override one.
+// tolerantReplace recovers an edit whose old_text matches except for per-line
+// whitespace (the dominant edit_file failure for small models): whole-line match
+// ignoring trailing whitespace, then leading indentation (re-indenting new_text).
+// Returns the rewritten content and how many windows matched — the caller applies
+// it only when exactly one did. A fallback AFTER an exact match misses.
 func tolerantReplace(content, oldText, newText string) (string, int) {
 	fileLines := strings.Split(content, "\n")
 	oldLines := trimBlankEdges(strings.Split(oldText, "\n"))

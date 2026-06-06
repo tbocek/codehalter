@@ -76,17 +76,12 @@ type Tool struct {
 	Terminal bool
 }
 
-// phasePolicy is a phase's per-call rules, applied at DISPATCH rather than by
-// pruning the tools array. The array stays a byte-identical superset across
-// every phase (only an MCP reconcile changes it), so the prompt prefix — and
-// thus the LLM's KV cache — survives plan↔execute↔document transitions instead
-// of being reprocessed each time the tool set used to swap.
-//
-//   - deny: tool names rejected at dispatch with a teaching message, without
-//     executing (e.g. plan denies edit_file/write_file → read-only planning).
-//   - terminals: tool names whose call ends the loop. A phase can have several:
-//     execute exits on respond (subtask done) OR submit_plan (plan-upsert);
-//     plan exits on submit_plan (the plan) OR respond (a direct answer).
+// phasePolicy is a phase's per-call rules, enforced at DISPATCH instead of by
+// pruning the tools array — so the array stays a byte-identical superset across
+// phases (only MCP reconcile changes it) and the KV-cache prefix survives
+// plan↔execute↔document. deny rejects a call with a teaching message; terminals
+// are the tools whose call ends the loop (a phase may have several — execute
+// exits on respond OR submit_plan).
 type phasePolicy struct {
 	deny      map[string]bool
 	terminals map[string]bool
@@ -113,7 +108,7 @@ func denyHint(phase string) string {
 	case "plan":
 		return "planning is read-only; describe this change as a subtask in submit_plan and the executor will make it."
 	case "document":
-		return "the documentation phase only wraps up — finish with respond, don't re-plan."
+		return "the documentation phase only wraps up — write the note and stop, don't re-plan."
 	default:
 		return "it isn't available in this phase."
 	}
@@ -322,12 +317,10 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	return tu, liveToolOutput(useID, tc.Function.Name, tc.Function.Arguments, result)
 }
 
-// denyToolCall handles a tool the current phase's policy forbids: it surfaces a
-// failed tool card, records the rejection in history (so the model sees why and
-// corrects), and returns the same (ToolUse, content) shape as runToolCall —
-// WITHOUT executing the tool. Failed=true is for the record only; the caller
-// does NOT feed it to the fail cap (a fumbled wrong-phase call shouldn't bail
-// the loop — the repetition ladder catches genuine spamming of a denied tool).
+// denyToolCall rejects a policy-forbidden tool WITHOUT executing it: a failed
+// tool card + a recorded rejection so the model corrects. Failed is for the
+// record only — the caller doesn't feed it to the fail cap (the repetition
+// ladder catches genuine spamming).
 func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall) (ToolUse, string) {
 	msg := fmt.Sprintf("error: %s is not available during the %s phase — %s", tc.Function.Name, phase, denyHint(phase))
 	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
@@ -437,29 +430,21 @@ const (
 	truncateThreshold = 1500
 	truncateHeadChars = 600
 	truncateTailChars = 600
-	// liveExemptCap bounds the LIVE output of the truncation-exempt tools
-	// (read_file / continue_read / search_text). They self-bound by COUNT
-	// (150-line chunk / 100 matches) but NOT by bytes — a minified file or
-	// long-line matches can still be enormous and blow n_ctx in a single call.
-	// ~32 KB ≈ 8k tokens: 20× the history clip, big enough to act on, but no
-	// single call can balloon the context. Clipped at a line boundary so we
-	// never slice mid-line / mid-match (the reason these are exempt at all).
+	// liveExemptCap bounds the LIVE output of the truncation-exempt tools. They
+	// self-bound by COUNT (150-line chunk / 100 matches) but not by bytes — a
+	// minified file or long-line matches could blow n_ctx. ~32 KB (20× the history
+	// clip) is plenty to act on; clipped at a line boundary, never mid-line.
 	liveExemptCap = 32 * 1024
 )
 
 // liveToolOutput is the model-visible content for a tool call as it executes.
-// The content-retrieval tools — read_file / continue_read / search_text and the
-// web fetchers web_search / web_read / web_read_raw — manage their OWN size
-// (line chunks, bounded match/result lists, offset/limit page slices) and the
-// model must act on the whole result in the current turn, so their live output
-// passes through whole rather than the 1.5 KB head/tail cap every other tool
-// gets — byte-clipping them cut mid-line / mid-result / mid-page. They still get
-// a generous line-aware ceiling (liveExemptCap) so one pathological call (a
-// minified file, long-line matches) can't blow n_ctx. This is LIVE only:
-// history.go re-renders stored outputs through truncateForLLM directly, which
-// truncates EVERYTHING to 1.5 KB — an old read or search must NOT sit at full
-// size in every later request (that ballooned the context past n_ctx; the model
-// can re-read / view_output if it needs it again).
+// The content-retrieval tools (read_file/continue_read/search_text + web_search/
+// web_read/web_read_raw) manage their own size and the model must act on the
+// whole result this turn, so their live output passes through whole (up to the
+// line-aware liveExemptCap) rather than the 1.5 KB head/tail cap every other tool
+// gets. LIVE only: history.go re-renders stored outputs via truncateForLLM, which
+// clips EVERYTHING to 1.5 KB — an old read must not sit at full size in every
+// later request (the model can re-read / view_output).
 func liveToolOutput(useID, toolName, args, content string) string {
 	switch toolName {
 	case "read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw":
