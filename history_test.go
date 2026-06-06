@@ -336,7 +336,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "please echo hello"}}, toolFilter{}, "execute", true, 0)
+		[]llmMessage{{Role: "user", Content: "please echo hello"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -411,7 +411,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "answer me"}}, toolFilter{}, "execute", true, 0)
+		[]llmMessage{{Role: "user", Content: "answer me"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -427,11 +427,73 @@ func TestToolLoopRespondExits(t *testing.T) {
 	}
 }
 
-// TestToolLoopNoTerminalKeepsTextExit verifies that a phase excluding EVERY
-// terminal tool (the document phase filters out both respond and submit_plan)
+// TestRunToolLoopDenyGate pins the dispatch gate that replaced array pruning: a
+// tool the phase policy denies is REJECTED without executing, recorded as a
+// failed tool use with a teaching message, and the loop continues so the model
+// can correct. (The tool is still in the array — only dispatch blocks it.)
+func TestRunToolLoopDenyGate(t *testing.T) {
+	withFreshToolRegistry(t)
+	var execs int
+	RegisterTool(Tool{
+		Def: map[string]any{"type": "function", "function": map[string]any{
+			"name": "mutate", "description": "x", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, raw string) (string, bool) {
+			execs++
+			return "did it", false
+		},
+	})
+	mock := newMockLLM(t,
+		sseToolCall("c1", "mutate", `{}`),
+		sseText("ok"),
+	)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}},
+		phasePolicy{deny: map[string]bool{"mutate": true}}, "plan", true, 0)
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if execs != 0 {
+		t.Errorf("denied tool executed %d times, want 0", execs)
+	}
+	if len(res.ToolUses) != 1 || !res.ToolUses[0].Failed {
+		t.Fatalf("denied call should be a single failed tooluse, got %+v", res.ToolUses)
+	}
+	if !strings.Contains(res.ToolUses[0].Output, "not available") {
+		t.Errorf("deny message missing: %q", res.ToolUses[0].Output)
+	}
+}
+
+// TestRunToolLoopMultiTerminalUpsert pins multi-terminal exit: in an execute
+// loop exposing BOTH respond and submit_plan, calling submit_plan ends the loop
+// with Terminal=submit_plan and the plan JSON in res.Text — the signal the
+// orchestrator reads as a plan-upsert.
+func TestRunToolLoopMultiTerminalUpsert(t *testing.T) {
+	planArgs := `{"clear":true,"subtasks":[{"description":"do y"}]}`
+	mock := newMockLLM(t, sseToolCall("c1", submitPlanToolName, planArgs))
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}},
+		phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}, "execute", true, 0)
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if res.Terminal != submitPlanToolName {
+		t.Errorf("Terminal: got %q, want %q", res.Terminal, submitPlanToolName)
+	}
+	if !strings.Contains(res.Text, "do y") {
+		t.Errorf("res.Text should carry the upsert plan JSON: %q", res.Text)
+	}
+}
+
+// TestToolLoopNoTerminalKeepsTextExit verifies that a policy with NO terminals
 // keeps the legacy text-only exit: a no-tool-calls turn returns immediately
-// instead of nudging. The plan phase no longer qualifies — it exposes
-// submit_plan as its terminal — so this guards the document path specifically.
+// instead of nudging. (Phases set their terminals explicitly now; an empty
+// phasePolicy is the no-terminal case.)
 func TestToolLoopNoTerminalKeepsTextExit(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText(`{"clear": true, "steps": ["do x"]}`),
@@ -452,7 +514,7 @@ func TestToolLoopNoTerminalKeepsTextExit(t *testing.T) {
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}},
-		toolFilter{exclude: map[string]bool{respondToolName: true, submitPlanToolName: true}}, "document", true, 0)
+		phasePolicy{}, "document", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -483,7 +545,7 @@ func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("thinking"),
 		[]llmMessage{{Role: "user", Content: "what servers?"}},
-		toolFilter{exclude: map[string]bool{respondToolName: true}}, "plan", false, 0)
+		phasePolicy{terminals: map[string]bool{submitPlanToolName: true, respondToolName: true}}, "plan", false, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -547,7 +609,7 @@ func TestToolLoopNoDedup(t *testing.T) {
 
 	a, s := newTestAgent(t)
 	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
@@ -620,7 +682,7 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 	}
 
 	res, err := a.runToolLoop(context.Background(), s.ID, conn,
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: want graceful nil error, got %v", err)
 	}
@@ -716,7 +778,7 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		t.Fatalf("connForSession(execute) returned nil")
 	}
 	_, err := a.runToolLoop(context.Background(), s.ID, conn,
-		[]llmMessage{{Role: "user", Content: "go"}}, toolFilter{}, "execute", true, 0)
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}

@@ -43,6 +43,11 @@ import (
 // web-blind execute loop. Still bounds total cost when a request is infeasible.
 const maxReplans = 20
 
+// maxUpserts caps how many times the executor may revise the plan mid-run via
+// submit_plan before the orchestrator stops, so a model that re-plans instead of
+// executing can't spin. Separate from (and additive to) the replan budget.
+const maxUpserts = 20
+
 // errUserCancelled flags a deliberate stop initiated by the user (e.g. they
 // chose Abort in a tool-choice prompt). It's NOT an error to surface as a
 // red box — the prompt returns a clean PromptResponse with stopReason
@@ -708,9 +713,11 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	var lastResult toolLoopResult
 	var failureBags []map[string]bool
 	replans := 0
+	upserts := 0
 
 	for {
 		allOk := true
+		upserted := false
 		var failedAt int
 		var failedReason string
 
@@ -721,6 +728,15 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 			lastResult = outcome.Result
 
+			if outcome.Upsert != nil {
+				// Plan-upsert: the executor called submit_plan to revise the remaining
+				// work. Adopt it and restart the subtask loop — completed subtasks stay
+				// done (their work is in history), nothing is cancelled, and we never
+				// re-enter the plan phase or touch the replan budget.
+				plan = outcome.Upsert
+				upserted = true
+				break
+			}
 			if outcome.Success {
 				continue
 			}
@@ -728,6 +744,16 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			failedAt = i
 			failedReason = outcome.Reason
 			break
+		}
+
+		if upserted {
+			upserts++
+			if upserts > maxUpserts {
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Plan revised %d times — stopping to avoid a re-plan loop.\n", upserts)}})
+				return lastResult, nil
+			}
+			a.renderPlanUpdate(ctx, sid, plan)
+			continue
 		}
 
 		if allOk {
@@ -794,6 +820,23 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 // when already in autopilot, and for report_only plans where no mutating work
 // happens. Replan plans use the same gate so the user sees the new approach
 // before it runs.
+// renderPlanUpdate shows a mid-run plan revision (executor called submit_plan)
+// as a plain message — NOT a confirmation card. The initial plan was already
+// approved; an upsert is the model adapting its remaining TODO, so it streams
+// inline and execution continues without re-gating (the user can still Cancel).
+func (a *agent) renderPlanUpdate(ctx context.Context, sid string, plan *planResult) {
+	if len(plan.Subtasks) == 0 {
+		return
+	}
+	var b strings.Builder
+	b.WriteString("\n📝 Plan updated — remaining:\n")
+	for i, st := range plan.Subtasks {
+		fmt.Fprintf(&b, "%d. %s\n", i+1, st.Description)
+	}
+	b.WriteByte('\n')
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
+}
+
 func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, isReplan bool) error {
 	header := "Plan:"
 	if isReplan {

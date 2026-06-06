@@ -76,35 +76,47 @@ type Tool struct {
 	Terminal bool
 }
 
-// terminalToolName returns the registered Terminal tool exposed in this phase
-// (not in the exclude filter). There are two terminals: respond (execute /
-// subagent) and submit_plan (plan). respond is the general-purpose one and
-// always wins when both are available, so a phase that filters neither — an
-// unfiltered loop — stays on respond rather than depending on registration
-// order; submit_plan only takes over when respond is excluded (the plan phase
-// excludes it). Returns "" when every terminal is filtered out (document
-// excludes both), so the loop falls back to the legacy empty-tool-calls exit.
-func terminalToolName(f toolFilter) string {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	first := ""
-	for _, t := range registeredTools {
-		if !t.Terminal {
-			continue
-		}
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		if name == "" || f.exclude[name] {
-			continue
-		}
-		if name == respondToolName {
-			return name
-		}
-		if first == "" {
-			first = name
-		}
+// phasePolicy is a phase's per-call rules, applied at DISPATCH rather than by
+// pruning the tools array. The array stays a byte-identical superset across
+// every phase (only an MCP reconcile changes it), so the prompt prefix — and
+// thus the LLM's KV cache — survives plan↔execute↔document transitions instead
+// of being reprocessed each time the tool set used to swap.
+//
+//   - deny: tool names rejected at dispatch with a teaching message, without
+//     executing (e.g. plan denies edit_file/write_file → read-only planning).
+//   - terminals: tool names whose call ends the loop. A phase can have several:
+//     execute exits on respond (subtask done) OR submit_plan (plan-upsert);
+//     plan exits on submit_plan (the plan) OR respond (a direct answer).
+type phasePolicy struct {
+	deny      map[string]bool
+	terminals map[string]bool
+}
+
+func (p phasePolicy) isDenied(name string) bool   { return p.deny[name] }
+func (p phasePolicy) isTerminal(name string) bool { return p.terminals[name] }
+func (p phasePolicy) hasTerminal() bool           { return len(p.terminals) > 0 }
+
+// terminalList renders the phase's terminal tools for a model-facing nudge,
+// e.g. "`respond` or `submit_plan`". Sorted for a stable message.
+func terminalList(p phasePolicy) string {
+	names := make([]string, 0, len(p.terminals))
+	for n := range p.terminals {
+		names = append(names, "`"+n+"`")
 	}
-	return first
+	sort.Strings(names)
+	return strings.Join(names, " or ")
+}
+
+// denyHint tells the model what to do instead of a forbidden tool, per phase.
+func denyHint(phase string) string {
+	switch phase {
+	case "plan":
+		return "planning is read-only; describe this change as a subtask in submit_plan and the executor will make it."
+	case "document":
+		return "the documentation phase only wraps up — finish with respond, don't re-plan."
+	default:
+		return "it isn't available in this phase."
+	}
 }
 
 // registryMu guards registeredTools. Most writes happen at init() (single
@@ -165,15 +177,12 @@ func hasToolPrefix(prefix string) bool {
 	return false
 }
 
-// toolFilter lets phases exclude specific tools from a turn (e.g. execute
-// strips web_search/web_read so the model can't go fishing mid-edit). Every
-// other tool is exposed in every phase — we run inside a devcontainer, so
-// "this tool might mutate" is no longer a reason to hide it from the planner.
-type toolFilter struct {
-	exclude map[string]bool
-}
-
-func llmToolDefinitionsFiltered(f toolFilter) []map[string]any {
+// llmAllToolDefinitions returns EVERY registered tool, sorted by name. Phases no
+// longer prune this — restriction is enforced at dispatch via phasePolicy — so
+// the rendered `tools` block is byte-identical across plan/execute/document and
+// the KV-cache prefix is never invalidated by a phase change (only an MCP
+// reconcile, which re-registers tools, alters it).
+func llmAllToolDefinitions() []map[string]any {
 	registryMu.Lock()
 	defer registryMu.Unlock()
 	type named struct {
@@ -184,9 +193,6 @@ func llmToolDefinitionsFiltered(f toolFilter) []map[string]any {
 	for _, t := range registeredTools {
 		fn, _ := t.Def["function"].(map[string]any)
 		name, _ := fn["name"].(string)
-		if f.exclude[name] {
-			continue
-		}
 		got = append(got, named{name, t.Def})
 	}
 	// Sort by tool name so the rendered `tools` block is byte-identical
@@ -313,6 +319,31 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		return tu, multimodal
 	}
 	return tu, liveToolOutput(useID, tc.Function.Name, tc.Function.Arguments, result)
+}
+
+// denyToolCall handles a tool the current phase's policy forbids: it surfaces a
+// failed tool card, records the rejection in history (so the model sees why and
+// corrects), and returns the same (ToolUse, content) shape as runToolCall —
+// WITHOUT executing the tool. Failed=true is for the record only; the caller
+// does NOT feed it to the fail cap (a fumbled wrong-phase call shouldn't bail
+// the loop — the repetition ladder catches genuine spamming of a denied tool).
+func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall) (ToolUse, string) {
+	msg := fmt.Sprintf("error: %s is not available during the %s phase — %s", tc.Function.Name, phase, denyHint(phase))
+	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
+	a.FailToolCall(ctx, sid, tcId, msg)
+	tu := ToolUse{
+		ID:        nextToolUseID(),
+		Name:      tc.Function.Name,
+		Input:     tc.Function.Arguments,
+		Output:    msg,
+		Failed:    true,
+		StartedAt: time.Now(),
+	}
+	if sess := a.getSession(sid); sess != nil {
+		sess.AppendToolUse(tu)
+		sess.saveOrLog()
+	}
+	return tu, msg
 }
 
 type toolCallUpdate struct {

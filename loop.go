@@ -106,12 +106,17 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// Also exclude launch_subagent: otherwise the planner fans its forbidden
 	// edits out to a leaf-worker subagent (which has the full edit toolkit)
 	// and reports report_only=true, papering over the loophole.
-	filter := toolFilter{exclude: map[string]bool{
-		respondToolName:   true,
-		"write_file":      true,
-		"edit_file":       true,
-		"launch_subagent": true,
-	}}
+	// Read-only planning, enforced at dispatch: edit_file/write_file/launch_subagent
+	// are denied (when the planner edits, those edits leak into history and the
+	// executor repeats them or assumes the work is done; launch_subagent is the
+	// loophole that fans edits to a leaf worker). run_command's `sed -i` is the
+	// other edit vector — PLAN.md forbids it in prose, unblockable at the tool
+	// layer. Two terminals: submit_plan (the structured plan) and respond (a
+	// direct answer when the request needs no work — a question, or already done).
+	policy := phasePolicy{
+		deny:      map[string]bool{"write_file": true, "edit_file": true, "launch_subagent": true},
+		terminals: map[string]bool{submitPlanToolName: true, respondToolName: true},
+	}
 
 	// Run the tool loop (stream=false: planning output is machinery, not shown
 	// live — orchestrate renders the subtask list or surfaces a direct answer).
@@ -121,9 +126,19 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// as free text falls through to the legacy parse + one corrective retry.
 	// Merged ToolUses keep full visibility either way.
 	var plan planResult
-	planRes, err := a.runToolLoop(ctx, sid, thinking, messages, filter, "plan", false, 0)
+	planRes, err := a.runToolLoop(ctx, sid, thinking, messages, policy, "plan", false, 0)
 	if err != nil {
 		return nil, planRes.ToolUses, err
+	}
+	// respond as the plan terminal = a direct answer: the request needs no work
+	// (a question, or already done), so there's no plan to execute. Surface it as
+	// a report_only answer with no subtasks; orchestrate prints it and stops.
+	if planRes.Terminal == respondToolName {
+		if sess != nil && strings.TrimSpace(planRes.Text) != "" {
+			sess.UpsertLastAssistant(strings.TrimSpace(planRes.Text))
+			sess.saveOrLog()
+		}
+		return &planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(planRes.Text)}, planRes.ToolUses, nil
 	}
 	parseErr := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
 	if parseErr != nil && !planRes.RespondCalled {
@@ -133,7 +148,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 			llmMessage{Role: "assistant", Content: planRes.Text},
 			llmMessage{Role: "user", Content: "Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."},
 		)
-		retry, retryErr := a.runToolLoop(ctx, sid, thinking, fixMsgs, filter, "plan", false, 0)
+		retry, retryErr := a.runToolLoop(ctx, sid, thinking, fixMsgs, policy, "plan", false, 0)
 		planRes.Text = retry.Text
 		planRes.Content = retry.Content
 		planRes.RespondCalled = retry.RespondCalled
@@ -212,6 +227,12 @@ type subtaskOutcome struct {
 	Result  toolLoopResult
 	Success bool
 	Reason  string
+	// Upsert is non-nil when the executor called submit_plan mid-execution to
+	// revise the remaining plan. The orchestrator adopts it and continues —
+	// completed subtasks stay done (their work is in history), nothing is
+	// cancelled, and the plan phase is NOT re-entered. Success is false and
+	// Reason empty in this case (it's neither a finished subtask nor a failure).
+	Upsert *planResult
 }
 
 // runExecutePhase runs one subtask as a single tool-calling loop. EXECUTE.md
@@ -246,13 +267,12 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		messages = a.buildLLMContext(sess)
 	}
 
-	exclude := map[string]bool{
-		"web_search":       true,
-		"web_read":         true,
-		"web_read_raw":     true,
-		submitPlanToolName: true, // planning-only terminal; respond is execute's exit
-	}
-	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, toolFilter{exclude: exclude}, "execute", true, executeFailCap)
+	// Execute allows EVERY tool (no deny) — web_search/web_read are now usable
+	// mid-execution for a quick lookup instead of forcing a fail→replan trip. Two
+	// terminals: respond ends the subtask; submit_plan revises the remaining plan
+	// in place (the orchestrator adopts it and keeps going — see subtaskOutcome).
+	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
+	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, policy, "execute", true, executeFailCap)
 	if sess != nil && res.Text != "" {
 		sess.UpsertLastAssistant(res.Text)
 		sess.saveOrLog()
@@ -261,6 +281,19 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	out := subtaskOutcome{Result: res}
 	if err != nil {
 		out.Reason = "executor error: " + err.Error()
+		return out
+	}
+	// Plan-upsert: the executor called submit_plan to revise the remaining work.
+	// Parse it (submit_plan's args ARE the plan JSON, in res.Text) and hand it up
+	// for the orchestrator to adopt. A malformed upsert is ignored (fall through
+	// to the no-respond failure path) rather than aborting the run.
+	if res.Terminal == submitPlanToolName {
+		var up planResult
+		if err := json.Unmarshal([]byte(trimJSON(res.Text)), &up); err == nil && len(up.Subtasks) > 0 {
+			out.Upsert = &up
+			return out
+		}
+		out.Reason = "executor called submit_plan with no usable subtasks"
 		return out
 	}
 	if !res.RespondCalled {
@@ -364,7 +397,11 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// of running into the executor's final sentence.
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n\n"}})
 	messages := []llmMessage{{Role: "user", Content: userMsg}}
-	docRes, err := a.runToolLoop(ctx, sid, conn, messages, toolFilter{exclude: map[string]bool{respondToolName: true, submitPlanToolName: true}}, "document", true, 0)
+	// Documentation wraps up a finished turn: deny submit_plan (no looping back to
+	// planning). No terminal — it keeps the legacy text exit (the model writes the
+	// doc note and stops), unchanged from before.
+	docPolicy := phasePolicy{deny: map[string]bool{submitPlanToolName: true}}
+	docRes, err := a.runToolLoop(ctx, sid, conn, messages, docPolicy, "document", true, 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil
@@ -427,6 +464,12 @@ type toolLoopResult struct {
 	// success signal — a loop that ran out of turns without calling
 	// `respond` is a failed subtask regardless of what's in res.Text.
 	RespondCalled bool
+	// Terminal is which terminal tool ended the loop ("" if none — legacy exit,
+	// fail cap, or error). A phase can expose several terminals (execute exits on
+	// respond OR submit_plan), so callers branch on this to tell a finished
+	// subtask (respond) from a plan-upsert (submit_plan). RespondCalled stays
+	// true for ANY terminal — it's the generic "loop reached a terminal" signal.
+	Terminal string
 	// StartedAt is when the first llmStream call of this loop began.
 	// DurationMs is the cumulative wall-clock time spent in llmStream calls
 	// across all iterations (excludes tool execution). Phase is the pipeline
@@ -455,7 +498,7 @@ type toolLoopResult struct {
 // subtask run freely while a stuck one — one that keeps hitting red builds/tests
 // this web-blind loop can't resolve — exits early. 0 means only the
 // maxToolLoopIterations backstop applies.
-func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, filter toolFilter, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
+func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
 	// Stream model text/reasoning to the UI unless this is a silent internal
 	// pass (the planner's JSON). nil callbacks are no-ops in the loop below.
 	var on, think func(string)
@@ -467,15 +510,14 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: token}})
 		}
 	}
-	tools := llmToolDefinitionsFiltered(filter)
+	tools := llmAllToolDefinitions()
 
-	// termName is the registered Terminal tool exposed in this phase ("" when
-	// none — e.g. plan/document filter respond out). When non-empty,
-	// the empty-tool-calls branch below stops meaning "model finished" and
-	// starts meaning "model dropped out of tool-calling grammar" — see the
-	// nudge + fallback there.
-	termName := terminalToolName(filter)
-	hasTerminal := termName != ""
+	// Terminals come from the phase policy, not the tool array (which is the full
+	// superset now). When the phase has any terminal, the empty-tool-calls branch
+	// below stops meaning "model finished" and starts meaning "model dropped out
+	// of tool-calling grammar" — see the nudge + fallback there.
+	hasTerminal := policy.hasTerminal()
+	termList := terminalList(policy)
 
 	var res toolLoopResult
 	res.Phase = phase
@@ -566,9 +608,9 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 				messages = append(messages, llmMessage{
 					Role: "user",
 					Content: fmt.Sprintf("Your last response was plain text with no tool call. "+
-						"This turn ends only when you call `%s` with your final "+
-						"user-facing message, or another tool if you still have work "+
-						"to do. Do not reply in prose — call a tool.", termName),
+						"This turn ends only when you call a terminal tool (%s), or "+
+						"another tool if you still have work to do. Do not reply in "+
+						"prose — call a tool.", termList),
 				})
 				continue
 			}
@@ -587,6 +629,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 		// we finish processing the batch (so its tool result lands in history
 		// for postmortem) and then exit with the message as res.Text.
 		var terminalCalled bool
+		var terminalName string
 		var terminalMessage string
 		// failedThisRound flips when any tool in this batch returns Failed=true,
 		// feeding the failSoftCap counter once the batch is done.
@@ -609,9 +652,22 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			// runToolCall (tools.go) executes the tool, caches its full output
 			// for view_output, and hands back the model-visible content (the
 			// output truncated past truncateThreshold, or inline image parts).
-			tu, content := a.runToolCall(ctx, sid, tc)
+			// A tool the phase policy forbids is rejected here WITHOUT executing —
+			// the rejection is recorded so the model sees why and corrects.
+			var tu ToolUse
+			var content any
+			denied := policy.isDenied(tc.Function.Name)
+			if denied {
+				var msg string
+				tu, msg = a.denyToolCall(ctx, sid, phase, tc)
+				content = msg
+			} else {
+				tu, content = a.runToolCall(ctx, sid, tc)
+			}
 			res.ToolUses = append(res.ToolUses, tu)
-			if tu.Failed {
+			// A denied call is the model's mistake, not a tool failure — don't feed
+			// it to the fail cap (the repetition ladder still catches spamming it).
+			if tu.Failed && !denied {
 				failedThisRound = true
 			}
 			// Did this exact (name,args) call reproduce output it already
@@ -633,8 +689,9 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			if !repeated {
 				roundStuck = false
 			}
-			if hasTerminal && tc.Function.Name == termName && !terminalCalled {
+			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled {
 				terminalCalled = true
+				terminalName = tc.Function.Name
 				terminalMessage = tu.Output
 			}
 			messages = append(messages, llmMessage{
@@ -654,6 +711,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 			}
 			res.Text = terminalMessage
 			res.RespondCalled = true
+			res.Terminal = terminalName
 			stampTiming()
 			return res, nil
 		}

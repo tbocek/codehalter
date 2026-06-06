@@ -132,33 +132,40 @@ func TestResolvePath(t *testing.T) {
 	}
 }
 
-// TestToolFilter pins the exclude semantics AND the sort: an empty filter passes
-// every registered tool, the exclude set drops the named tools, and the result
-// is sorted by name (NOT registration order) so the rendered `tools` block is
-// byte-stable turn-over-turn for the LLM's prefix cache. (Registered out of
-// order on purpose below.)
-func TestToolFilter(t *testing.T) {
+// TestAllToolDefinitions pins the cache invariant that replaced per-phase
+// pruning: llmAllToolDefinitions returns EVERY registered tool, sorted by name
+// (NOT registration order), so the rendered `tools` block is byte-identical
+// across phases and turns. (Registered out of order on purpose.)
+func TestAllToolDefinitions(t *testing.T) {
 	withFreshToolRegistry(t)
 	RegisterTool(Tool{Def: toolDef("read")})
 	RegisterTool(Tool{Def: toolDef("write")})
 	RegisterTool(Tool{Def: toolDef("other")})
 
-	cases := []struct {
-		name   string
-		filter toolFilter
-		want   []string
-	}{
-		{"no filter", toolFilter{}, []string{"other", "read", "write"}},
-		{"exclude read", toolFilter{exclude: map[string]bool{"read": true}}, []string{"other", "write"}},
-		{"exclude two", toolFilter{exclude: map[string]bool{"read": true, "other": true}}, []string{"write"}},
+	if got, want := toolNames(llmAllToolDefinitions()), []string{"other", "read", "write"}; !slices.Equal(got, want) {
+		t.Errorf("got %v, want %v (all tools, sorted)", got, want)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := toolNames(llmToolDefinitionsFiltered(tc.filter))
-			if !slices.Equal(got, tc.want) {
-				t.Errorf("got %v, want %v", got, tc.want)
-			}
-		})
+}
+
+// TestPhasePolicy covers the dispatch-gate predicates that replaced array
+// pruning: deny rejects a call, terminals end the loop, both independent of the
+// (now full) tools array.
+func TestPhasePolicy(t *testing.T) {
+	p := phasePolicy{
+		deny:      map[string]bool{"edit_file": true},
+		terminals: map[string]bool{"respond": true, "submit_plan": true},
+	}
+	if !p.isDenied("edit_file") || p.isDenied("read_file") {
+		t.Error("isDenied wrong")
+	}
+	if !p.isTerminal("respond") || !p.isTerminal("submit_plan") || p.isTerminal("edit_file") {
+		t.Error("isTerminal wrong")
+	}
+	if !p.hasTerminal() || (phasePolicy{}).hasTerminal() {
+		t.Error("hasTerminal wrong")
+	}
+	if got := terminalList(p); got != "`respond` or `submit_plan`" {
+		t.Errorf("terminalList: %q", got)
 	}
 }
 

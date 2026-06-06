@@ -23,8 +23,15 @@ recipe arrive in the next user message. Budget: 10 LLM turns.
   startup cost. Subagents see ONLY `instructions` + `context`, not this
   conversation — put EVERY fact in `context` (paths, find/replace text, versions,
   error strings, prior output). A re-investigating subagent wastes the parallelism.
-- `web_search`/`web_read`/`web_read_raw`: UNAVAILABLE here (planning got the
-  external info). Treat planning's tool results as authoritative — don't re-run.
+- `web_search`/`web_read`/`web_read_raw`: available if you genuinely need a fresh
+  lookup mid-edit (an API signature, a package name). Prefer planning's results —
+  don't re-run what it already found — but you no longer have to fail and replan
+  just to look something up.
+- Revise the plan in place with `submit_plan` when you learn the remaining
+  approach should change — pass the REMAINING subtasks (completed ones stay done;
+  don't re-list them). This updates the living plan and continues; it does NOT
+  re-run the planner or undo finished work. Use it instead of grinding on a wrong
+  decomposition. For just THIS subtask being done, use `respond`.
 - Tools: read_file, edit_file, write_file, list_files, search_text, run_task,
   ask_user, launch_subagent, and (in devcontainers) run_command. This phase OWNS
   all mutation: installs, edits, Dockerfile patches, config writes.
