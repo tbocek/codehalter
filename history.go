@@ -269,9 +269,12 @@ func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 		for _, tu := range m.ToolUses {
 			messages = append(messages, llmMessage{
 				Role: "tool",
-				// truncateForLLM's first arg is the view_output handle (useID); the
-				// tool_call_id must be the MODEL's id so the bytes match the wire.
-				Content:    truncateForLLM(tu.ID, tu.Name, tu.Input, tu.Output),
+				// Re-render EXACTLY like the live call (liveToolOutput, not a tighter
+				// history clip) so a replay is byte-identical to the wire — a cached
+				// re-send is free, whereas clipping changes the bytes and forces a
+				// reprocess. n_ctx size is bounded by compaction, not by clipping
+				// here. tool_call_id is the model's id so it matches the wire too.
+				Content:    liveToolOutput(tu.ID, tu.Name, tu.Input, tu.Output),
 				ToolCallID: wireCallID(tu),
 			})
 		}

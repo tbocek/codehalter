@@ -7,13 +7,11 @@ import (
 	"testing"
 )
 
-// TestLiveVsHistoryTruncation pins the split that caused (then fixed) the
-// history bloat that pushed requests past n_ctx: the content-retrieval tools
-// (read_file / continue_read / search_text + web_search / web_read /
-// web_read_raw) pass through whole LIVE (they manage their own size), but the
-// SAME output is byte-clipped when re-rendered from history, so an old read
-// can't sit at full size in every later request.
-func TestLiveVsHistoryTruncation(t *testing.T) {
+// TestLiveToolOutput pins the size policy used in BOTH the live call and the
+// history re-render (identical now → a replay is byte-faithful → cache stays
+// warm): content-retrieval tools pass through whole, every other tool gets the
+// head/tail clip. truncateForLLM is that clip, exercised directly below.
+func TestLiveToolOutput(t *testing.T) {
 	big := strings.Repeat("x", truncateThreshold*3)
 
 	for _, tool := range []string{"read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw"} {
@@ -24,9 +22,8 @@ func TestLiveVsHistoryTruncation(t *testing.T) {
 	if got := liveToolOutput("tu_1", "run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
 		t.Errorf("liveToolOutput(run_command) should clip a non-exempt tool")
 	}
-	// History re-render clips everything, including the live-exempt tools.
-	if got := truncateForLLM("tu_1", "read_file", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
-		t.Errorf("truncateForLLM must clip read_file in history (regression guard)")
+	if got := truncateForLLM("tu_1", "run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
+		t.Errorf("truncateForLLM must clip a long non-exempt output")
 	}
 	if got := truncateForLLM("tu_1", "run_command", "{}", "small"); got != "small" {
 		t.Errorf("short content should pass through, got %q", got)

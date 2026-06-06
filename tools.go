@@ -437,14 +437,13 @@ const (
 	liveExemptCap = 32 * 1024
 )
 
-// liveToolOutput is the model-visible content for a tool call as it executes.
-// The content-retrieval tools (read_file/continue_read/search_text + web_search/
-// web_read/web_read_raw) manage their own size and the model must act on the
-// whole result this turn, so their live output passes through whole (up to the
-// line-aware liveExemptCap) rather than the 1.5 KB head/tail cap every other tool
-// gets. LIVE only: history.go re-renders stored outputs via truncateForLLM, which
-// clips EVERYTHING to 1.5 KB — an old read must not sit at full size in every
-// later request (the model can re-read / view_output).
+// liveToolOutput is the model-visible content for a tool call. The content-
+// retrieval tools (read_file/continue_read/search_text + web_search/web_read/
+// web_read_raw) pass through whole (up to the line-aware liveExemptCap); every
+// other tool gets the 1.5 KB head/tail cap. history.go re-renders stored outputs
+// through THIS same function, so a replay is byte-identical to the live wire
+// (cache-warm) — re-sending a cached full read is free, whereas clipping it would
+// change the bytes and force a reprocess. n_ctx is bounded by compaction instead.
 func liveToolOutput(useID, toolName, args, content string) string {
 	switch toolName {
 	case "read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw":
@@ -471,8 +470,8 @@ func liveToolOutput(useID, toolName, args, content string) string {
 // portion of the original without re-running the underlying tool. toolName +
 // args let the hint name the exact alternate follow-up call (e.g. read_file
 // path+line, web_read url+offset) so the model doesn't have to reconstruct what
-// it just asked about. Used by history.go when re-rendering stored tool outputs
-// (always truncates) and by liveToolOutput for the non-exempt live tools.
+// it just asked about. Applied by liveToolOutput to the non-exempt tools (live
+// and on history re-render alike).
 func truncateForLLM(useID, toolName, args, content string) string {
 	if len(content) <= truncateThreshold {
 		return content
