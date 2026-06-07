@@ -420,17 +420,8 @@ func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel str
 			return
 		case <-ticker.C:
 			if g := atomic.LoadInt64(genChars); g > 0 {
-				// approx tokens, compact: <1000 as-is, else "k" suffix
-				// (1234 → "1.2k", 12000 → "12k"). Display-only.
-				n := int(g) / 4
-				tok := strconv.Itoa(n)
-				if n >= 1000 {
-					if v := float64(n) / 1000; v >= 10 {
-						tok = fmt.Sprintf("%.0fk", v)
-					} else {
-						tok = fmt.Sprintf("%.1fk", v)
-					}
-				}
+				// approx tokens (chars/4), compact via humanCount. Display-only.
+				tok := humanCount(int(g) / 4)
 				a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s ↓%s…)", slotLabel, upLabel, tok))
 			} else {
 				elapsed := int(time.Since(start).Seconds())

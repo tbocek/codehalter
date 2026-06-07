@@ -292,15 +292,18 @@ func (a *agent) runSubagent(ctx context.Context, subSess *Session, task subagent
 // prefix and seeding parent history would just bloat their context for no
 // cache benefit. This matters because LLM[0] is the dispatch target for the
 // first task in every breadth-first fan-out.
+// framed renders the subagent's prompt: the Task, prefixed with Context when set.
+func (t subagentTask) framed() string {
+	if t.Context != "" {
+		return "Context:\n" + t.Context + "\n\nTask:\n" + t.Instructions
+	}
+	return "Task:\n" + t.Instructions
+}
+
 func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task subagentTask) (string, error) {
 	sid := subSess.ID
 
-	instructions := task.Instructions
-	if task.Context != "" {
-		instructions = "Context:\n" + task.Context + "\n\nTask:\n" + task.Instructions
-	} else {
-		instructions = "Task:\n" + task.Instructions
-	}
+	instructions := task.framed()
 
 	subSess.AddUser(instructions)
 	subSess.saveOrLog()
@@ -392,12 +395,7 @@ func (a *agent) runSubagentThinking(ctx context.Context, subSess *Session, task 
 		}
 	}
 
-	instructions := task.Instructions
-	if task.Context != "" {
-		instructions = "Context:\n" + task.Context + "\n\nTask:\n" + task.Instructions
-	} else {
-		instructions = "Task:\n" + task.Instructions
-	}
+	instructions := task.framed()
 	subSess.AddUser(instructions)
 	subSess.saveOrLog()
 

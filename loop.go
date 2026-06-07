@@ -479,15 +479,12 @@ type toolLoopResult struct {
 	// true for ANY terminal — it's the generic "loop reached a terminal" signal.
 	Terminal string
 	// StartedAt is when the first llmStream call of this loop began.
-	// DurationMs is the cumulative wall-clock time spent in llmStream calls
-	// across all iterations (excludes tool execution). Phase is the pipeline
-	// stage tag passed in by the caller ("plan", "execute", "document",
-	// "subagent"). Callers that own the final assistant message (prompt.go,
-	// runSubagent) use these to stamp the message they create after the
-	// loop returns.
+	// StartedAt/DurationMs are the loop's own LLM-call timing (DurationMs is
+	// cumulative across iterations and excludes tool execution). runToolLoop
+	// stamps them onto the trailing assistant message via MarkLastAssistantTiming
+	// before returning — callers don't read them.
 	StartedAt  time.Time
 	DurationMs int64
-	Phase      string
 }
 
 // runToolLoop is the core agentic tool loop: send to LLM, execute tool calls,
@@ -528,7 +525,6 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 	termList := terminalList(policy)
 
 	var res toolLoopResult
-	res.Phase = phase
 	var allText strings.Builder
 	var genElapsed time.Duration
 	// stampTiming applies the accumulated start/duration/phase to the

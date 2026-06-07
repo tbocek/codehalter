@@ -68,12 +68,6 @@ type Tool struct {
 	// error to feed the loop's fail cap — but runExecutePhase's verdict excludes
 	// file-mutation tools, so a recovered edit doesn't condemn the subtask.
 	Execute func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
-	// Terminal marks a tool as the loop's exit point: when the model invokes
-	// it, the agentic tool loop returns after this batch completes, with the
-	// tool's Output (one Execute return value) becoming the assistant's final
-	// text. Currently only `respond` is terminal — see tool_respond.go. The
-	// loop guarantees the result is still recorded in history before exiting.
-	Terminal bool
 }
 
 // phasePolicy is a phase's per-call rules, enforced at DISPATCH instead of by

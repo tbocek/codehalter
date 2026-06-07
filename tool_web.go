@@ -236,25 +236,7 @@ func (b *Browser) CloseTab(ctx context.Context, contextID string) {
 
 // PageText returns the visible text content of a tab.
 func (b *Browser) PageText(ctx context.Context, contextID string) (string, error) {
-	result, err := b.Send(ctx, "script.evaluate", map[string]any{
-		"expression":   "document.body.innerText",
-		"target":       map[string]any{"context": contextID},
-		"awaitPromise": false,
-	})
-	if err != nil {
-		return "", err
-	}
-
-	var evalResult struct {
-		Result struct {
-			Type  string `json:"type"`
-			Value string `json:"value"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(result, &evalResult); err != nil {
-		return "", fmt.Errorf("parsing eval result: %w", err)
-	}
-	return evalResult.Result.Value, nil
+	return b.EvalJS(ctx, contextID, "document.body.innerText")
 }
 
 // EvalJS runs JavaScript in a tab and returns the string result.

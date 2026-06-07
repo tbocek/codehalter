@@ -14,7 +14,7 @@ import "context"
 const submitPlanToolName = "submit_plan"
 
 func init() {
-	RegisterTool(Tool{Terminal: true, Def: map[string]any{
+	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name": submitPlanToolName,
