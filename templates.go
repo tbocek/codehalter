@@ -17,7 +17,7 @@ import (
 // (seedTemplates); from then on the on-disk copy wins, so users can edit a
 // shipped template or drop in their own TEMPLATE-<name>.md.
 
-//go:embed docs/TEMPLATE-*.md
+//go:embed res/TEMPLATE-*.md
 var templateFS embed.FS
 
 // templatePlaceholder marks where a macro injects the user's args; its presence
@@ -50,7 +50,7 @@ func isTemplateFile(n string) (name string, ok bool) {
 // seedTemplates copies each embedded TEMPLATE-*.md into .codehalter/ when absent
 // (seed-once, like the phase prompts), so the user has editable copies.
 func seedTemplates(cwd string) error {
-	entries, _ := templateFS.ReadDir("docs")
+	entries, _ := templateFS.ReadDir("res")
 	for _, e := range entries {
 		n := e.Name()
 		if _, ok := isTemplateFile(n); !ok {
@@ -58,7 +58,7 @@ func seedTemplates(cwd string) error {
 		}
 		path := filepath.Join(cwd, ".codehalter", n)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
-			data, _ := templateFS.ReadFile("docs/" + n)
+			data, _ := templateFS.ReadFile("res/" + n)
 			if err := os.WriteFile(path, data, 0o644); err != nil {
 				return fmt.Errorf("seeding %s: %w", path, err)
 			}
@@ -79,7 +79,7 @@ func templateNames(cwd string) []string {
 			}
 		}
 	}
-	embedded, _ := templateFS.ReadDir("docs")
+	embedded, _ := templateFS.ReadDir("res")
 	add(embedded)
 	if disk, err := os.ReadDir(filepath.Join(cwd, ".codehalter")); err == nil {
 		add(disk)
@@ -98,7 +98,7 @@ func loadTemplate(cwd, name string) (body string, ok bool) {
 	if data, err := os.ReadFile(filepath.Join(cwd, ".codehalter", "TEMPLATE-"+name+".md")); err == nil {
 		return string(data), true
 	}
-	if data, err := templateFS.ReadFile("docs/TEMPLATE-" + name + ".md"); err == nil {
+	if data, err := templateFS.ReadFile("res/TEMPLATE-" + name + ".md"); err == nil {
 		return string(data), true
 	}
 	return "", false

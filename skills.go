@@ -10,46 +10,46 @@ import (
 	"strings"
 )
 
-//go:embed docs/SKILL-go.md
+//go:embed res/SKILL-go.md
 var skillGo string
 
-//go:embed docs/SKILL-ts.md
+//go:embed res/SKILL-ts.md
 var skillTS string
 
-//go:embed docs/SKILL-js.md
+//go:embed res/SKILL-js.md
 var skillJS string
 
-//go:embed docs/SKILL-java.md
+//go:embed res/SKILL-java.md
 var skillJava string
 
-//go:embed docs/SKILL-bash.md
+//go:embed res/SKILL-bash.md
 var skillBash string
 
-//go:embed docs/SKILL-c.md
+//go:embed res/SKILL-c.md
 var skillC string
 
-//go:embed docs/SKILL-container.md
+//go:embed res/SKILL-container.md
 var skillContainer string
 
-//go:embed docs/SKILL-makefile.md
+//go:embed res/SKILL-makefile.md
 var skillMakefile string
 
-//go:embed docs/SKILL-justfile.md
+//go:embed res/SKILL-justfile.md
 var skillJustfile string
 
-//go:embed docs/SKILL-alpine.md
+//go:embed res/SKILL-alpine.md
 var skillAlpine string
 
-//go:embed docs/SKILL-arch.md
+//go:embed res/SKILL-arch.md
 var skillArch string
 
-//go:embed docs/SKILL-debian.md
+//go:embed res/SKILL-debian.md
 var skillDebian string
 
-//go:embed docs/SKILL-fedora.md
+//go:embed res/SKILL-fedora.md
 var skillFedora string
 
-//go:embed docs/SKILL-ubuntu.md
+//go:embed res/SKILL-ubuntu.md
 var skillUbuntu string
 
 // defaultSkills maps a per-stack key (language stack from detectStacks)

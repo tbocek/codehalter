@@ -36,7 +36,7 @@ func TestExpandMacroNonCommand(t *testing.T) {
 func TestTemplateNamesIncludesGrillMe(t *testing.T) {
 	dir := t.TempDir()
 	if !contains(templateNames(dir), "grill-me") {
-		t.Errorf("templateNames() = %v, want it to include grill-me (docs/TEMPLATE-grill-me.md)", templateNames(dir))
+		t.Errorf("templateNames() = %v, want it to include grill-me (res/TEMPLATE-grill-me.md)", templateNames(dir))
 	}
 }
 

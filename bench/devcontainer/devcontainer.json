@@ -1,5 +1,5 @@
 // Default devcontainer dropped into test repos that don't ship one. Adapted
-// from codehalter/docs/devcontainer.json — the only change is the
+// from codehalter/res/devcontainer.json — the only change is the
 // removed `--name codehalter-devcontainer` runArg: the bench identifies its
 // containers via the `codehalter-bench=<test-name>` id-label instead, and a
 // fixed --name would force every test to collide on the same docker name.

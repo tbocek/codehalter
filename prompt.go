@@ -1117,7 +1117,7 @@ func (a *agent) backgroundGitCommit(sess *Session) {
 		defer cancel()
 
 		// COMMIT.md is the user-editable commit-message prompt seeded into
-		// .codehalter/ (see docs/COMMIT.md); fall back to the embed if it was
+		// .codehalter/ (see res/COMMIT.md); fall back to the embed if it was
 		// deleted so the LLM never gets a bare status/diff with no instructions.
 		commitPrompt := a.loadPromptFile(sess.ID, "COMMIT.md")
 		if commitPrompt == "" {
@@ -1180,7 +1180,7 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	// that day's date, which is good enough for typical use.
 	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
 	// Project-first investigation guidance — a user-editable prompt seeded to
-	// .codehalter/SYSTEM.md (see docs/SYSTEM.md), not a Go string const.
+	// .codehalter/SYSTEM.md (see res/SYSTEM.md), not a Go string const.
 	b.WriteString(a.loadPromptFile(sid, "SYSTEM.md"))
 
 	// Phase guidance lives in the system prompt (the stable, cached prefix) rather

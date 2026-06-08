@@ -45,46 +45,46 @@ func dumpGoroutinesOnSignal() {
 	}()
 }
 
-//go:embed docs/PLAN.md
+//go:embed res/PLAN.md
 var defaultPlanMD string
 
-//go:embed docs/EXECUTE.md
+//go:embed res/EXECUTE.md
 var defaultExecuteMD string
 
-//go:embed docs/DOCUMENT.md
+//go:embed res/DOCUMENT.md
 var defaultDocumentMD string
 
-//go:embed docs/SUMMARISE.md
+//go:embed res/SUMMARISE.md
 var defaultSummariseMD string
 
-//go:embed docs/SYSTEM.md
+//go:embed res/SYSTEM.md
 var defaultSystemMD string
 
-//go:embed docs/COMMIT.md
+//go:embed res/COMMIT.md
 var defaultCommitMD string
 
-//go:embed docs/Dockerfile.devcontainer.alpine
+//go:embed res/Dockerfile.devcontainer.alpine
 var defaultDevcontainerDockerfileAlpine string
 
-//go:embed docs/Dockerfile.devcontainer.arch
+//go:embed res/Dockerfile.devcontainer.arch
 var defaultDevcontainerDockerfileArch string
 
-//go:embed docs/Dockerfile.devcontainer.debian
+//go:embed res/Dockerfile.devcontainer.debian
 var defaultDevcontainerDockerfileDebian string
 
-//go:embed docs/Dockerfile.devcontainer.fedora
+//go:embed res/Dockerfile.devcontainer.fedora
 var defaultDevcontainerDockerfileFedora string
 
-//go:embed docs/Dockerfile.devcontainer.ubuntu
+//go:embed res/Dockerfile.devcontainer.ubuntu
 var defaultDevcontainerDockerfileUbuntu string
 
-//go:embed docs/devcontainer.json
+//go:embed res/devcontainer.json
 var defaultDevcontainerJSON string
 
-//go:embed docs/settings.toml
+//go:embed res/settings.toml
 var defaultSettingsTOML string
 
-//go:embed docs/mcp.toml
+//go:embed res/mcp.toml
 var defaultMCPToml string
 
 // agent implements acp.Agent.
@@ -510,6 +510,21 @@ func (a *agent) startIndexing(sid string, cwd string) {
 		a.cancel = cancel
 		a.mu.Unlock()
 		defer cancel()
+
+		// Brief pause before the first user-visible session/update. Zed
+		// registers the session (builds its AcpThread, inserts it into the
+		// session map) asynchronously AFTER it reads our session/new response;
+		// an update that lands inside that window is dropped as "Received
+		// session notification for unknown session" — which is exactly why the
+		// devcontainer notice never shows until the first prompt. We already
+		// write the response before the update, so this is purely Zed-side
+		// registration latency. 100ms lets registration win the race.
+		// Experimental: testing whether session-open notices then render.
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
 
 		if !a.ensureDevcontainer(ctx, cwd, sid) {
 			slog.Debug("startIndexing: ensureDevcontainer false, aborting", "sid", sid)

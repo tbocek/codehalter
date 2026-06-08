@@ -18,20 +18,20 @@ import (
 )
 
 // Fix-card prompts — the message dispatched to the executor when the user
-// accepts a 🟡 card. Kept as markdown in docs/ (not Go string literals) so the
+// accepts a 🟡 card. Kept as markdown in res/ (not Go string literals) so the
 // wording is editable without code spelunking; the %s/%q holes are filled by
 // fmt.Sprintf at the call site. Each is a THIN trigger — the actual how-to
 // lives in the SKILL it points at (already in the system prompt).
 var (
-	//go:embed docs/card-install-tools.md
+	//go:embed res/card-install-tools.md
 	cardInstallTools string
-	//go:embed docs/card-setup-lsmcp.md
+	//go:embed res/card-setup-lsmcp.md
 	cardSetupLsmcp string
-	//go:embed docs/card-setup-clangd.md
+	//go:embed res/card-setup-clangd.md
 	cardSetupClangd string
-	//go:embed docs/card-mcp-parse-error.md
+	//go:embed res/card-mcp-parse-error.md
 	cardMCPParseError string
-	//go:embed docs/card-mcp-start-error.md
+	//go:embed res/card-mcp-start-error.md
 	cardMCPStartError string
 )
 

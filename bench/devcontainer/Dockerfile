@@ -1,4 +1,4 @@
-# Default bench Dockerfile — copy of codehalter/docs/Dockerfile.devcontainer.debian.
+# Default bench Dockerfile — copy of codehalter/res/Dockerfile.devcontainer.debian.
 # Edit if a test needs extra toolchains (cargo, jdk, python, etc.). Tests that
 # need a different image entirely can ship their own bench/devcontainer/ overlay
 # and reference it via `devcontainer = "..."` in the test's .toml.
