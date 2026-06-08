@@ -361,7 +361,20 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 		case !a.hasReachableLLM():
 			msg = "LLM not reachable — edit settings.toml, then click Retry"
 		case a.mainSlotTokens == 0:
-			msg = "LLM reachable but server didn't report a context size (n_ctx). Codehalter needs this to size compaction safely. Restart your server with the context size set on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`, llama-server: ensure /props is enabled), then click Retry."
+			// Name the exact probe URLs so the user can curl them and see why
+			// n_ctx came back empty, and point at the context_size escape hatch
+			// in settings.toml — the fix when the backend simply doesn't expose
+			// it (OpenAI, Ollama, vLLM, …) and restarting the server won't help.
+			probed := "GET /v1/models and GET /props"
+			if len(a.settings.LLM) > 0 {
+				c := &a.settings.LLM[0]
+				probed = "GET " + c.endpoint("/v1/models") + " and GET " + c.endpoint("/props")
+			}
+			where := a.settings.path
+			if where == "" {
+				where = "your settings.toml"
+			}
+			msg = fmt.Sprintf("LLM reachable but neither metadata endpoint reported a context size (n_ctx) — codehalter probed %s. It needs the model's context window to size compaction safely. Fix it one of two ways: (1) set `context_size = N` (the model's max prompt+output tokens) on the [[llm]] entry in %s — use this when your backend doesn't expose n_ctx; or (2) restart your server with the size on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`, llama-server: ensure /props is enabled). Then click Retry.", probed, where)
 		case a.mainSlotTokens < minSlotTokens:
 			msg = fmt.Sprintf("LLM reachable but per-slot context window is only %d tokens — codehalter requires at least %d. Restart your server with a larger `-c N` (llama.cpp) / `--max-model-len N` (vLLM), or reduce the `parallel` slot count in settings.toml, then click Retry.", a.mainSlotTokens, minSlotTokens)
 		default:
