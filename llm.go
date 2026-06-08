@@ -440,6 +440,11 @@ type probeResult struct {
 	ModelKnown   bool // /v1/models enumerated models — ModelLoaded is meaningful
 	ModelLoaded  bool // the configured model was in the enumeration
 	ImageSupport bool
+	// AvailableModels is every model id /v1/models enumerated, in server
+	// order. renderLLMStatus shows it when the configured model isn't among
+	// them so the user can read off the correct name. Empty when the server
+	// didn't enumerate (ModelKnown false) or its list was empty.
+	AvailableModels []string
 	// ContextSize is the TOTAL n_ctx (prompt+output) the server was launched
 	// with — from /v1/models' -c / --ctx-size launch arg, or older llama.cpp
 	// /props top-level n_ctx. 0 = unknown. probeAllLLMs divides it by the slot
@@ -521,7 +526,9 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 // --ctx-size). OpenAI/Ollama/vLLM/LiteLLM all 200 here but return the bare
 // OpenAI shape, so the caller's /props enrichment + settings.toml fallback
 // fills the gap. ok=false only on network / non-200 — a bare response still
-// returns ok=true so the caller knows the server is up.
+// returns ok=true so the caller knows the server is up. Records every
+// enumerated id in AvailableModels so renderLLMStatus can show the real names
+// when the configured model isn't found.
 func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
 	modelsURL := conn.endpoint("/v1/models")
 	req, err := http.NewRequestWithContext(ctx, "GET", modelsURL, nil)
@@ -553,6 +560,7 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 	}
 	r := probeResult{Reachable: true, ModelKnown: true}
 	for _, m := range models.Data {
+		r.AvailableModels = append(r.AvailableModels, m.ID)
 		if m.ID != conn.Model {
 			continue
 		}
@@ -582,7 +590,6 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 				}
 			}
 		}
-		break
 	}
 	return r, true
 }

@@ -112,6 +112,15 @@ type agent struct {
 	// nil before the first prepare runs.
 	connReachable map[string]bool
 
+	// connProbe holds the full prepare-phase probe result per configured
+	// LLMConnection, keyed the same as connReachable (Server+"\x00"+Model).
+	// renderLLMStatus reads ModelKnown/ModelLoaded/AvailableModels from it to
+	// warn when a server is reachable but the configured model id isn't in its
+	// /v1/models list (the silent cause of empty completions). Populated by
+	// probeAllLLMs; nil before the first prepare — a nil-map read is the zero
+	// probeResult, so renderLLMStatus stays safe.
+	connProbe map[string]probeResult
+
 	// mainSlotTokens is the per-slot context window for LLM[0] in tokens.
 	// Discovered by the startup probe: llama.cpp /props reports it per-slot
 	// directly (default_generation_settings.n_ctx); otherwise a known total

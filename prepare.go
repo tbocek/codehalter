@@ -456,6 +456,7 @@ func (a *agent) hasReachableLLM() bool {
 func (a *agent) probeAllLLMs(ctx context.Context) {
 	conns := a.settings.allConnections()
 	a.connReachable = make(map[string]bool, len(conns))
+	a.connProbe = make(map[string]probeResult, len(conns))
 	a.mainSlotTokens = 0
 	a.detectedSlots = 0
 	if len(conns) == 0 {
@@ -475,6 +476,7 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// (resetting Parallel to the file value) right before calling us.
 	for i := range conns {
 		a.connReachable[conns[i].Server+"\x00"+conns[i].Model] = results[i].Reachable
+		a.connProbe[conns[i].Server+"\x00"+conns[i].Model] = results[i]
 		if a.settings.LLM[i].Parallel == 0 && results[i].TotalSlots > 0 {
 			a.settings.LLM[i].Parallel = results[i].TotalSlots
 		}
@@ -543,6 +545,23 @@ func (a *agent) renderLLMStatus() string {
 			fmt.Fprintf(&b, "🟡 %s: unreachable at %s — start your server or fix the server url.\n\n", label, c.Server)
 			continue
 		}
+		// Reachable, but /v1/models answered without listing the configured id.
+		// The connection works yet requests for this model often come back empty
+		// (the gateway routes an unknown/unloaded name to nothing, returning a
+		// clean 200 with no content). Previously swallowed — probeLLM logged
+		// loaded=false and moved on, so the banner showed a bare ✅ and the user
+		// only discovered the problem when the first turn failed to parse.
+		if pr := a.connProbe[c.Server+"\x00"+c.Model]; pr.ModelKnown && !pr.ModelLoaded {
+			avail := "its model list came back empty"
+			if len(pr.AvailableModels) > 0 {
+				avail = "it offers: " + joinCapped(pr.AvailableModels, 8)
+			}
+			fmt.Fprintf(&b, "🟡 %s: reachable at %s, but model `%s` isn't in its /v1/models list — requests may return an empty response. Check `model =` in settings.toml (%s). Harmless if your gateway lists models under different ids or doesn't enumerate them.\n\n", label, c.Server, c.Model, avail)
+			if firstReachable < 0 {
+				firstReachable = i
+			}
+			continue
+		}
 		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.Server, c.parallelCap())
 		if firstReachable < 0 {
 			firstReachable = i
@@ -577,6 +596,16 @@ func (a *agent) renderLLMStatus() string {
 		fmt.Fprintf(&b, "🟡 Slots: only %d configured — codehalter requires at least %d so the background summariser has a slot separate from the foreground. Set `parallel = 2` on your [[llm]] entry or add a second [[llm]].\n\n", total, minTotalSlots)
 	}
 	return b.String()
+}
+
+// joinCapped renders a string slice as "a, b, c", showing at most max items and
+// appending "… (+N more)" when the list is longer — keeps a server that
+// enumerates dozens of models from flooding the startup banner.
+func joinCapped(items []string, max int) string {
+	if len(items) <= max {
+		return strings.Join(items, ", ")
+	}
+	return strings.Join(items[:max], ", ") + fmt.Sprintf(", … (+%d more)", len(items)-max)
 }
 
 // ---------------------------------------------------------------------------

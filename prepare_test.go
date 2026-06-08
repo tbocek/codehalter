@@ -193,6 +193,60 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 	}
 }
 
+// TestRenderLLMStatusWarnsModelNotInList pins the surfaced warning for the
+// silent failure mode behind "plan not valid JSON": the server is reachable and
+// /v1/models enumerates models, but the configured id isn't among them. The
+// gateway then routes the unknown name to an empty 200, which only surfaces
+// three layers down at plan time. probeLLM used to log loaded=false and move on
+// (bare ✅ in the banner); now renderLLMStatus names the mismatch and lists the
+// ids the server actually offers.
+func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
+			http.NotFound(w, r) // /props 404s — keeps the /v1/models result
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// The configured model "qwopus3.6-27b" is NOT in this list.
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-4o"},{"id":"llama-3.1-70b"}]}`))
+	}))
+	defer ts.Close()
+
+	a := &agent{
+		settings: Settings{
+			LLM: []LLMConnection{{
+				Server:      ts.URL,
+				Model:       "qwopus3.6-27b",
+				Parallel:    1,
+				ContextSize: 128000, // keep the ctx gate quiet; not under test
+			}},
+		},
+	}
+	a.probeAllLLMs(context.Background())
+
+	pr := a.connProbe[ts.URL+"\x00"+"qwopus3.6-27b"]
+	if !pr.ModelKnown {
+		t.Fatalf("ModelKnown: got false, want true (the server enumerated /v1/models)")
+	}
+	if pr.ModelLoaded {
+		t.Errorf("ModelLoaded: got true, want false (configured id not in the list)")
+	}
+	if len(pr.AvailableModels) != 2 {
+		t.Errorf("AvailableModels: got %v, want the two offered ids", pr.AvailableModels)
+	}
+
+	status := a.renderLLMStatus()
+	for _, want := range []string{"qwopus3.6-27b", "isn't in its /v1/models list", "gpt-4o", "llama-3.1-70b"} {
+		if !strings.Contains(status, want) {
+			t.Errorf("renderLLMStatus output missing %q.\nGot:\n%s", want, status)
+		}
+	}
+	// No bare ✅ connection line for a model we could not confirm.
+	if strings.Contains(status, "✅ llm[0]: qwopus3.6-27b") {
+		t.Errorf("renderLLMStatus showed a bare ✅ for an unconfirmed model:\n%s", status)
+	}
+}
+
 // TestProbeAllLLMsExplicitFalseHonoured: a model that DOES auto-detect as
 // vision-capable but the user wants disabled via image_support = false must
 // stay disabled — *bool lets us distinguish "not set" from "explicitly off".
