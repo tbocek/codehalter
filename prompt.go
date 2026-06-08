@@ -726,13 +726,15 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
 		}
 		if len(p.Subtasks) == 0 {
-			// No subtasks: (1) a report_only direct answer — surface it (returning
-			// it as result.Text lets Prompt's epilogue run); or (2) a clarification
-			// resolved to "no work needed" — return empty.
+			// No subtasks: a report_only direct answer — surface it (returning it as
+			// result.Text lets Prompt's epilogue run). If the planner left it empty
+			// even after the plan-phase nudge, warn rather than ending silently —
+			// never leave the user with nothing after a turn that ran.
 			if p.answer != "" {
 				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: p.answer + "\n"}})
 				return toolLoopResult{Text: p.answer}, nil
 			}
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ I couldn't produce a clear answer or a plan for that — try rephrasing, or ask for a specific change.\n"}})
 			return toolLoopResult{}, nil
 		}
 		if err := a.confirmPlan(ctx, sid, p, false); err != nil {

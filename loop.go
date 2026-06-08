@@ -171,20 +171,41 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		plan.answer = strings.TrimSpace(strings.Replace(planRes.Text, trimJSON(planRes.Text), "", 1))
 	}
 
-	// No-work verdict (report_only / no subtasks) with an EMPTY visible answer: a
-	// thinking model often pours its findings into the reasoning channel and calls
-	// submit_plan with no message — so the user would see NOTHING ("calculated a
-	// lot, then nothing"). Reasoning is chain-of-thought, not surfaced; re-prompt
-	// for the answer as plain text so the work isn't thrown away.
-	if plan.answer == "" && plan.Clear && (plan.ReportOnly || len(plan.Subtasks) == 0) {
-		slog.Info("planner: no-work verdict but empty answer — re-prompting for the answer text", "sid", sid)
+	// Clean-signal enforcement: the planner must submit EITHER a final answer (a
+	// message, no subtasks) OR a plan (subtasks) — never both, never neither.
+	// PLAN.md spells this out; here we catch the structural violations and nudge
+	// ONCE to pick a lane, then re-parse — orchestrate then surfaces the answer or
+	// runs the subtasks. (A "message" that's really a promise — "I'll summarize" —
+	// reads structurally as an answer; keeping the model off that is PLAN.md's job,
+	// not a brittle string match here.)
+	hasPlan := len(plan.Subtasks) > 0
+	hasAnswer := plan.answer != ""
+	if plan.Clear && hasPlan == hasAnswer {
+		nudge := "You submitted neither a usable answer nor a plan — your message is empty or only promises to act (\"I'll…\"). Either write the COMPLETE answer now (report_only=true, no subtasks), OR submit subtasks that produce it. Never write \"I'll…\" / \"let me…\"."
+		if hasPlan {
+			nudge = "You submitted BOTH a final answer and a plan. Pick one: answer the user completely now (report_only=true, no subtasks), OR drop the message and submit only the subtasks to execute."
+		}
+		slog.Info("planner: ambiguous submission, nudging to pick one", "sid", sid, "hasPlan", hasPlan, "hasAnswer", hasAnswer)
 		fixMsgs := append([]llmMessage(nil), messages...)
 		fixMsgs = append(fixMsgs,
 			llmMessage{Role: "assistant", Content: planRes.Text},
-			llmMessage{Role: "user", Content: "You decided no code changes are needed, but your reply is empty. Write your findings/answer for the user now as plain text — this message is exactly what they read. Don't call a tool, and don't leave it in your reasoning."},
+			llmMessage{Role: "user", Content: nudge},
 		)
-		if ansRes, ansErr := a.runToolLoop(ctx, sid, thinking, fixMsgs, phasePolicy{}, "plan", false, 0); ansErr == nil {
-			plan.answer = strings.TrimSpace(ansRes.Text)
+		if retry, rerr := a.runToolLoop(ctx, sid, thinking, fixMsgs, policy, "plan", false, 0); rerr == nil {
+			planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
+			if retry.Terminal == respondToolName {
+				plan = planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(retry.Text)}
+			} else {
+				var rp planResult
+				if json.Unmarshal([]byte(trimJSON(retry.Text)), &rp) == nil {
+					plan = rp
+					if retry.RespondCalled {
+						plan.answer = strings.TrimSpace(retry.Content)
+					} else {
+						plan.answer = strings.TrimSpace(strings.Replace(retry.Text, trimJSON(retry.Text), "", 1))
+					}
+				}
+			}
 		}
 	}
 

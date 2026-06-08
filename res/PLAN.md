@@ -127,19 +127,28 @@ Each subtask:
 The executor runs every `verify` entry before respond; fails → fix and re-run;
 can't → subtask fails and the orchestrator replans.
 
-## report_only and direct answers
+## report_only and direct answers — EITHER answer OR plan, never both, never neither
 
-`report_only=true` when the whole request is informational and you ALREADY have
-the answer — no edits, no commands. Skips the "Execute this plan?" gate.
-Default `false`.
+Your submission must do exactly ONE of these:
 
-Answering a pure lookup yourself: write the FULL answer as your normal message
-text FIRST, then call `submit_plan` with `report_only=true` and empty
-`subtasks`. Your message text is what the user reads — the submit_plan arguments
-are machinery they never see. Answer only in the arguments (or empty message) →
-the user sees nothing. Your private reasoning/thinking is ALSO never shown: if
-your analysis lives only in your reasoning and the message is empty, the user
-gets NOTHING. Put the answer in the visible message, not the reasoning.
+- **Answer** — you already have the complete answer (a question, an explanation,
+  a summary you can write now): put the FULL answer in your message text, set
+  `report_only=true`, and leave `subtasks` EMPTY. There is no execution step after
+  this — your message IS the whole reply.
+- **Plan** — the request needs work done (produce or assemble something, an edit,
+  a command): submit `subtasks` and leave the message empty. The executor does the
+  work and reports back.
+
+NEVER do both (an answer AND subtasks), and NEVER do neither. In particular, NEVER
+write a PROMISE like "I'll summarize for you" / "let me gather the details" and
+stop — that is neither an answer nor a plan. report_only has NO next step, so a
+promise shows the user nothing. If you intend to PRODUCE something, that's a
+**Plan** (subtasks) — leave the message empty and let execution do it; if you can
+answer NOW, write the WHOLE answer, not an intro to it.
+
+Your message text is what the user reads — the submit_plan arguments are machinery
+they never see, and your private reasoning/thinking is never shown either. So an
+answer that lives only in the arguments or the reasoning shows the user NOTHING.
 
 ## Output — call submit_plan
 
