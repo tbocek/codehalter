@@ -82,7 +82,6 @@ Web work lives here only. Per external fact:
 - ONE precise query first (exact symbol/tag/version). Hard cap TWO `web_search`
   per fact; trust the first useful answer.
 - Nothing useful? REFORMULATE — don't rerun similar words.
-- Fan independent lookups out via `launch_subagent`, don't serialize.
 
 Project work: prefer probes — `list_files` / `search_text` / `read_file`.
 

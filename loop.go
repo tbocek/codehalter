@@ -370,12 +370,12 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 // Document phase (runs once at end of a successful prompt)
 // ---------------------------------------------------------------------------
 
-// runDocumentPhase runs after every subtask in the prompt has succeeded. It
-// routes to a non-foreground LLM entry (falling back to llm[0] on single-LLM
-// setups) with a minimal stateless input: DOCUMENT.md as the instructions,
-// plus the per-turn shadow notes and earlier-conversation summary as the
-// only context. No system prompt, no conversation history — llm[0]'s prefix
-// cache stays warm and the documenter sees a small focused message.
+// runDocumentPhase runs after every subtask in the prompt has succeeded. It is
+// part of the FOREGROUND turn (plan → execute → document): it runs on the same
+// connection as execute and feeds the documenter the full conversation via
+// buildLLMContext, so it reuses execute's warm KV prefix (a cache hit, not a
+// cold prefill) and sees the actual edits — not a digest. Only the summariser
+// and git-commit drafter run on the background LLM.
 // DOCUMENT.md self-skips when no documentation update is warranted.
 func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopResult) (toolLoopResult, error) {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
@@ -384,46 +384,30 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	}
 
 	sess := a.getSession(sid)
-
-	// Prefer a non-foreground slot so llm[0]'s warm cache isn't evicted.
-	// Falls back to MainLLM when only one entry is configured.
-	conn := a.connForBackgroundLLM()
-	if conn == nil {
-		conn = a.settings.MainLLM("thinking")
+	if sess == nil {
+		return exec, nil
 	}
+
+	// Documentation is part of the FOREGROUND turn (plan → execute → document),
+	// not background work — only the summariser and git-commit drafter belong on
+	// the background LLM. Run it on the SAME connection as execute so it reuses
+	// execute's warm KV prefix instead of cold-prefilling a separate slot.
+	conn := a.connForSession(ctx, sid, "execute")
 	if conn == nil {
 		return exec, nil
 	}
 
-	var summaryParts []string
-	if sess != nil {
-		if sess.Summary != "" {
-			summaryParts = append(summaryParts, "## Earlier conversation summary\n\n"+sess.Summary)
-		}
-		if shadow := sess.peekShadow(); shadow != "" {
-			summaryParts = append(summaryParts, "## Per-turn notes\n\n"+shadow)
-		}
-	}
-	summaryBlock := strings.Join(summaryParts, "\n\n")
-	if summaryBlock == "" {
-		summaryBlock = "(no turn summary available — assume nothing user-visible changed)"
-	}
-
-	userMsg := docPrompt + "\n\n---\n\n# Turn summary (your only context)\n\n" + summaryBlock
-
-	// Mirror the document instruction into session history for display so
-	// the user can see the documenter ran. The LLM call itself does not see
-	// this message — it sees only `messages` below.
-	if sess != nil {
-		sess.AddUser(docPrompt)
-		sess.saveOrLog()
-	}
+	// The doc instruction lands in the session as the trailing user turn, so
+	// buildLLMContext hands the documenter the FULL turn — the edits the executor
+	// actually made, not a lossy digest — continuing the cached lineage.
+	sess.AddUser(docPrompt)
+	sess.saveOrLog()
 
 	// Blank line before the documenter streams, so its output (often just "No
 	// documentation change needed.") starts a fresh markdown paragraph instead
 	// of running into the executor's final sentence.
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n\n"}})
-	messages := []llmMessage{{Role: "user", Content: userMsg}}
+	messages := a.buildLLMContext(sess)
 	// Documentation wraps up a finished turn: deny submit_plan (no looping back to
 	// planning). No terminal — it keeps the legacy text exit (the model writes the
 	// doc note and stops), unchanged from before.
