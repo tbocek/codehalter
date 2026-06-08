@@ -1750,3 +1750,14 @@ func TestToolLoopNudgesReasonedButEmpty(t *testing.T) {
 		t.Errorf("res.Text: got %q, want the post-nudge answer", res.Text)
 	}
 }
+
+// peekShadow joins every accumulated shadow note (including the anchor) without
+// draining the buffer. Test-only: the summariser tests poll it concurrently with
+// the backgroundSummarise goroutine, so it must take shadowMu. Production no
+// longer reads the shadow non-destructively (the document phase used to) — only
+// compressHistory drains it via drainShadow.
+func (s *Session) peekShadow() string {
+	s.shadowMu.Lock()
+	defer s.shadowMu.Unlock()
+	return strings.Join(s.shadowEntries, "\n\n")
+}

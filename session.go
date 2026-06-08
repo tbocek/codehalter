@@ -767,16 +767,6 @@ func (s *Session) drainShadow() string {
 	return out
 }
 
-// peekShadow returns every accumulated structured note (including the anchor)
-// joined with blank-line separators, WITHOUT draining the buffer. Used by the
-// document phase to read per-turn summaries while still letting compressHistory
-// drain the older ones at the next compaction.
-func (s *Session) peekShadow() string {
-	s.shadowMu.Lock()
-	defer s.shadowMu.Unlock()
-	return strings.Join(s.shadowEntries, "\n\n")
-}
-
 // UpsertLastAssistant sets the content of the trailing assistant message,
 // or appends a new one if the last message is not already an assistant turn.
 func (s *Session) UpsertLastAssistant(content string) {

@@ -142,9 +142,10 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	parseErr := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
 	if parseErr != nil && !planRes.RespondCalled {
 		slog.Info("planner skipped submit_plan and JSON parse failed; retrying with corrective", "snippet", truncate(planRes.Text, 200))
-		fixMsgs := append([]llmMessage(nil), messages...)
-		fixMsgs = append(fixMsgs,
-			llmMessage{Role: "assistant", Content: planRes.Text},
+		// Rebuild from the session, NOT the pre-read `messages` snapshot, so any
+		// files the planner read this turn stay in front of it (else the retry
+		// re-investigates from scratch). The planner's bad output is already in sess.
+		fixMsgs := append(a.buildLLMContext(sess),
 			llmMessage{Role: "user", Content: "Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."},
 		)
 		retry, retryErr := a.runToolLoop(ctx, sid, thinking, fixMsgs, policy, "plan", false, 0)
@@ -186,11 +187,10 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 			nudge = "You submitted BOTH a final answer and a plan. Pick one: answer the user completely now (report_only=true, no subtasks), OR drop the message and submit only the subtasks to execute."
 		}
 		slog.Info("planner: ambiguous submission, nudging to pick one", "sid", sid, "hasPlan", hasPlan, "hasAnswer", hasAnswer)
-		fixMsgs := append([]llmMessage(nil), messages...)
-		fixMsgs = append(fixMsgs,
-			llmMessage{Role: "assistant", Content: planRes.Text},
-			llmMessage{Role: "user", Content: nudge},
-		)
+		// Rebuild from the session, NOT the pre-read `messages` snapshot, so the
+		// reads from this turn stay in context (else the re-run re-reads them all).
+		// The submit_plan turn is already in sess.
+		fixMsgs := append(a.buildLLMContext(sess), llmMessage{Role: "user", Content: nudge})
 		if retry, rerr := a.runToolLoop(ctx, sid, thinking, fixMsgs, policy, "plan", false, 0); rerr == nil {
 			planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
 			if retry.Terminal == respondToolName {
