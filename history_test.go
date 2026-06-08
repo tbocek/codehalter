@@ -283,6 +283,53 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 	}
 }
 
+// TestLLMStreamSurfacesInStreamError pins the fix for the swallowed gateway
+// error. Some servers (llama.cpp, llama-swap, the llmhub gateway) return HTTP
+// 200 and put the failure in an {"error":…} SSE chunk with empty choices — e.g.
+// when the prompt exceeds the model's real context length. That chunk used to
+// be skipped at the empty-choices guard, so the whole call looked like a silent
+// "(empty response)" and surfaced three layers up as "plan not valid JSON:
+// unexpected end of JSON input". llmStream must now raise the server's message.
+func TestLLMStreamSurfacesInStreamError(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "nested openai shape",
+			body: `data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}` + "\n\n" +
+				`data: {"error":{"message":"The number of tokens to keep from the initial prompt is greater than the context length"}}` + "\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name: "bare top-level message",
+			body: `data: {"message":"The number of tokens to keep from the initial prompt is greater than the context length"}` + "\n\n" +
+				"data: [DONE]\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockLLM(t, tc.body)
+			defer mock.Close()
+
+			a := &agent{}
+			_, _, _, err := a.llmStream(
+				context.Background(), "", mock.conn("execute"),
+				[]llmMessage{{Role: "user", Content: "hi"}}, nil, nil, nil,
+			)
+			if err == nil {
+				t.Fatal("llmStream: got nil error, want the in-stream error surfaced")
+			}
+			if !strings.Contains(err.Error(), "greater than the context length") {
+				t.Errorf("error must carry the server's message verbatim, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "mid-stream") {
+				t.Errorf("error should be framed as a mid-stream failure, got: %v", err)
+			}
+		})
+	}
+}
+
 // TestToolLoopRecordsToolUses verifies that when the LLM returns a tool call,
 // the tool loop executes it, appends the ToolUse to the session, and persists
 // to disk — before the second LLM turn produces the final text.

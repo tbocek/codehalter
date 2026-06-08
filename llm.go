@@ -74,6 +74,34 @@ type sseChunk struct {
 		PromptMs    float64 `json:"prompt_ms"`    // server-measured prompt-eval time
 		PredictedMs float64 `json:"predicted_ms"` // server-measured generation time
 	} `json:"timings"`
+	// Error is an error delivered INSIDE the SSE stream under an HTTP 200 — how
+	// llama.cpp / llama-swap and some gateways signal a mid-stream failure
+	// (e.g. a prompt that exceeds the model's real context length) rather than a
+	// non-200 status. Such a chunk has empty Choices, so without this field it
+	// would be skipped and the whole call would surface as a baffling
+	// "(empty response)" → "plan not valid JSON" three layers up. Captured and
+	// raised as the call error so the server's own message reaches the user.
+	// Both shapes seen in the wild: nested {"error":{"message":…}} (OpenAI
+	// style) and a bare top-level {"message":…}; Message catches the latter.
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
+	Message string `json:"message"`
+}
+
+// chunkErrorMessage extracts an in-stream error message from an SSE chunk, or
+// "" when the chunk is a normal content/usage frame. Handles the nested OpenAI
+// shape {"error":{"message":…}} and a bare {"message":…} — the latter only when
+// the frame carries nothing else (no choices/usage/timings), so a stray field
+// can never make a normal chunk look like a failure.
+func chunkErrorMessage(c *sseChunk) string {
+	if c.Error != nil && c.Error.Message != "" {
+		return c.Error.Message
+	}
+	if c.Message != "" && len(c.Choices) == 0 && c.Usage == nil && c.Timings == nil {
+		return c.Message
+	}
+	return ""
 }
 
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
@@ -225,6 +253,10 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	var reasoningText strings.Builder
 	var calls []toolCall
 	var finishReason string
+	// streamErrMsg holds an error the server delivered in-band (HTTP 200, an
+	// {"error":…} SSE chunk). Surfaced as the call error so it isn't swallowed
+	// as an empty response.
+	var streamErrMsg string
 	var promptTokens, completionTokens int
 	// Server-reported cache split (see sseChunk.Timings / PromptTokensDetails).
 	// evaluatedTokens = prompt tokens actually run through the model this call;
@@ -254,6 +286,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		var chunk sseChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
 			continue
+		}
+		// In-band error: the gateway/llama.cpp can return HTTP 200 and put the
+		// failure in an {"error":…} chunk (empty Choices). Capture and stop —
+		// checked before the empty-Choices skip below, which would drop it and
+		// leave the call looking like a silent "(empty response)".
+		if msg := chunkErrorMessage(&chunk); msg != "" {
+			streamErrMsg = msg
+			break
 		}
 		// Usage arrives in its own trailing chunk (choices empty) when
 		// stream_options.include_usage=true. Capture and keep going — there
@@ -350,12 +390,16 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// One outcome error, shared by the RESPONSE log block and the return:
 	//   - scanErr: stream broke mid-flight (e.g. a router model swap force-kills
 	//     the connection).
+	//   - streamErrMsg: server sent an {"error":…} chunk under HTTP 200 — surface
+	//     its message verbatim (it names the real cause, e.g. prompt > n_ctx).
 	//   - finish_reason="length": hit max_tokens, not a stop token — output is
 	//     truncated and usually means the model looped. We bail rather than retry
 	//     (prompt.go's retry would hit the same wall); the message guides tuning.
 	switch {
 	case scanErr != nil:
 		err = fmt.Errorf("reading SSE stream: %w", scanErr)
+	case streamErrMsg != "":
+		err = fmt.Errorf("LLM returned an error mid-stream (role=%s, model=%s): %s", conn.Tag, conn.Model, streamErrMsg)
 	case finishReason == "length":
 		err = fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
 			conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)
