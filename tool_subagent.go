@@ -348,7 +348,7 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 	}
 	policy := phasePolicy{deny: deny, terminals: map[string]bool{respondToolName: true}}
 
-	result, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, policy, "subagent", true, 0)
+	result, err := a.runToolLoopSeeded(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, policy, "subagent", true, 0)
 	if err != nil {
 		return result.Text, err
 	}

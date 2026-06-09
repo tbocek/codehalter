@@ -93,11 +93,6 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		sess.saveOrLog()
 	}
 
-	var messages []llmMessage
-	if sess != nil {
-		messages = a.buildLLMContext(sess)
-	}
-
 	// Exclude respond: planning has its OWN terminal tool, submit_plan, whose
 	// arguments are the structured plan. Keeping respond out forces the planner
 	// onto submit_plan instead of escaping into execute's exit and emitting a
@@ -127,7 +122,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// as free text falls through to the legacy parse + one corrective retry.
 	// Merged ToolUses keep full visibility either way.
 	var plan planResult
-	planRes, err := a.runToolLoop(ctx, sid, thinking, messages, policy, "plan", false, 0)
+	planRes, err := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0)
 	if err != nil {
 		return nil, planRes.ToolUses, err
 	}
@@ -142,13 +137,11 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	parseErr := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
 	if parseErr != nil && !planRes.RespondCalled {
 		slog.Info("planner skipped submit_plan and JSON parse failed; retrying with corrective", "snippet", truncate(planRes.Text, 200))
-		// Rebuild from the session, NOT the pre-read `messages` snapshot, so any
-		// files the planner read this turn stay in front of it (else the retry
-		// re-investigates from scratch). The planner's bad output is already in sess.
-		fixMsgs := append(a.buildLLMContext(sess),
+		// runToolLoop builds fresh from the session, so the files the planner read
+		// this turn stay in front of it; the corrective rides as a trailing turn.
+		retry, retryErr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0,
 			llmMessage{Role: "user", Content: "Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."},
 		)
-		retry, retryErr := a.runToolLoop(ctx, sid, thinking, fixMsgs, policy, "plan", false, 0)
 		planRes.Text = retry.Text
 		planRes.Content = retry.Content
 		planRes.RespondCalled = retry.RespondCalled
@@ -187,11 +180,10 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 			nudge = "You submitted BOTH a final answer and a plan. Pick one: answer the user completely now (report_only=true, no subtasks), OR drop the message and submit only the subtasks to execute."
 		}
 		slog.Info("planner: ambiguous submission, nudging to pick one", "sid", sid, "hasPlan", hasPlan, "hasAnswer", hasAnswer)
-		// Rebuild from the session, NOT the pre-read `messages` snapshot, so the
-		// reads from this turn stay in context (else the re-run re-reads them all).
-		// The submit_plan turn is already in sess.
-		fixMsgs := append(a.buildLLMContext(sess), llmMessage{Role: "user", Content: nudge})
-		if retry, rerr := a.runToolLoop(ctx, sid, thinking, fixMsgs, policy, "plan", false, 0); rerr == nil {
+		// runToolLoop builds fresh from the session (reads from this turn stay in
+		// context); the nudge rides as a trailing turn.
+		if retry, rerr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0,
+			llmMessage{Role: "user", Content: nudge}); rerr == nil {
 			planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
 			if retry.Terminal == respondToolName {
 				plan = planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(retry.Text)}
@@ -294,16 +286,11 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		sess.saveOrLog()
 	}
 
-	var messages []llmMessage
-	if sess != nil {
-		messages = a.buildLLMContext(sess)
-	}
-
 	// Execute allows EVERY tool (web_search/web_read usable mid-edit). Terminals:
 	// respond ends the subtask; submit_plan revises the remaining plan in place
 	// (the orchestrator adopts it — see subtaskOutcome).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
-	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, policy, "execute", true, executeFailCap)
+	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
 	// session, stored verbatim by the loop — no post-hoc patch.
 
@@ -407,12 +394,11 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// documentation change needed.") starts a fresh markdown paragraph instead
 	// of running into the executor's final sentence.
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n\n"}})
-	messages := a.buildLLMContext(sess)
 	// Documentation wraps up a finished turn: deny submit_plan (no looping back to
 	// planning). No terminal — it keeps the legacy text exit (the model writes the
 	// doc note and stops), unchanged from before.
 	docPolicy := phasePolicy{deny: map[string]bool{submitPlanToolName: true}}
-	docRes, err := a.runToolLoop(ctx, sid, conn, messages, docPolicy, "document", true, 0)
+	docRes, err := a.runToolLoop(ctx, sid, conn, docPolicy, "document", true, 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec, nil
@@ -508,7 +494,26 @@ type toolLoopResult struct {
 // subtask run freely while a stuck one — one that keeps hitting red builds/tests
 // this web-blind loop can't resolve — exits early. 0 means only the
 // maxToolLoopIterations backstop applies.
-func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
+// runToolLoop builds the LLM context FRESH from the session each call — never
+// from a caller-held snapshot, which goes stale the instant the loop does work
+// that lands in the session but not the snapshot (the b/c re-read bug). extra
+// carries trailing corrective turns not yet persisted (a nudge, a "call
+// submit_plan" retry). Every phase uses this; only the subagent — which seeds
+// from its PARENT's session for cache warmth — calls runToolLoopSeeded directly.
+func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, policy phasePolicy, phase string, stream bool, failSoftCap int, extra ...llmMessage) (toolLoopResult, error) {
+	var messages []llmMessage
+	if sess := a.getSession(sid); sess != nil {
+		messages = a.buildLLMContext(sess)
+	}
+	messages = append(messages, extra...)
+	return a.runToolLoopSeeded(ctx, sid, conn, messages, policy, phase, stream, failSoftCap)
+}
+
+// runToolLoopSeeded runs the agentic loop with an EXPLICIT initial context. Only
+// the subagent uses it (it seeds from the parent's context, not its own session);
+// single-use, so the stale-snapshot risk runToolLoop removes doesn't apply. The
+// failSoftCap / loop-exit semantics in the doc above apply here too.
+func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
 	// Stream model text/reasoning to the UI unless this is a silent internal
 	// pass (the planner's JSON). nil callbacks are no-ops in the loop below.
 	var on, think func(string)

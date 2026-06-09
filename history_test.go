@@ -382,7 +382,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 		sessions: map[string]*Session{s.ID: s},
 	}
 
-	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "please echo hello"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
@@ -457,7 +457,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 
 	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
-	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "answer me"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
@@ -496,7 +496,7 @@ func TestRunToolLoopDenyGate(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}},
 		phasePolicy{deny: map[string]bool{"mutate": true}}, "plan", true, 0)
 	if err != nil {
@@ -523,7 +523,7 @@ func TestRunToolLoopMultiTerminalUpsert(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}},
 		phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}, "execute", true, 0)
 	if err != nil {
@@ -559,7 +559,7 @@ func TestToolLoopNoTerminalKeepsTextExit(t *testing.T) {
 
 	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
-	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}},
 		phasePolicy{}, "document", true, 0)
 	if err != nil {
@@ -590,7 +590,7 @@ func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 	}
 	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
-	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("thinking"),
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("thinking"),
 		[]llmMessage{{Role: "user", Content: "what servers?"}},
 		phasePolicy{terminals: map[string]bool{submitPlanToolName: true, respondToolName: true}}, "plan", false, 0)
 	if err != nil {
@@ -655,7 +655,7 @@ func TestToolLoopNoDedup(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
@@ -728,7 +728,7 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 		t.Fatalf("connForSession(execute) returned nil")
 	}
 
-	res, err := a.runToolLoop(context.Background(), s.ID, conn,
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: want graceful nil error, got %v", err)
@@ -824,7 +824,7 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	if conn == nil {
 		t.Fatalf("connForSession(execute) returned nil")
 	}
-	_, err := a.runToolLoop(context.Background(), s.ID, conn,
+	_, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
@@ -1738,7 +1738,7 @@ func TestToolLoopNudgesReasonedButEmpty(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	res, err := a.runToolLoop(context.Background(), s.ID, mock.conn("execute"),
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
