@@ -129,13 +129,12 @@ func (j *bgJob) Done() {
 // Done. Used by joiners that need fresh state.
 func (j *bgJob) Wait() { j.pending.Wait() }
 
-// summariseTask is one queued background-summariser job: the user/assistant
-// snapshot to feed the structured-turn prompt. The connection is picked at
-// enqueue time so the runner doesn't have to reach back into the agent.
+// summariseTask is one queued background-summariser job: the messages of one
+// completed turn to feed the structured-turn prompt. The connection is picked
+// at enqueue time so the runner doesn't have to reach back into the agent.
 type summariseTask struct {
-	User      Message
-	Assistant Message
-	Conn      *LLMConnection
+	Turn []Message
+	Conn *LLMConnection
 }
 
 type Session struct {
@@ -153,7 +152,15 @@ type Session struct {
 	// leading user message before any Summary.
 	SystemPrompt string    `toml:"system_prompt,omitempty"`
 	Messages     []Message `toml:"messages"`
-	filePath     string
+	// Shadow holds one structured per-turn note (Goal / Constraints / Progress /
+	// Decisions / Next Steps / Critical Context, per SUMMARISE.md) for every
+	// COMPLETED turn since the last compaction — produced by the background
+	// summariser at each turn boundary. compressHistory folds the whole buffer
+	// into Summary when it rotates, so a note exists for every turn it archives.
+	// Persisted (toml) so the notes survive a restart; the live context never
+	// shows them — they exist only to feed the next compaction.
+	Shadow   []string `toml:"shadow,omitempty"`
+	filePath string
 	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
 	// phaseActive=true means a phase entry is showing as in_progress and
 	// must be marked completed before Prompt returns; phaseCurrent is the
@@ -197,28 +204,23 @@ type Session struct {
 	// intentionally have their own locks — they don't touch persisted state
 	// and must not block on mu.
 	mu sync.Mutex
-	// shadowEntries holds one structured per-turn note per element (Goal /
-	// Constraints / Progress / Decisions / Next Steps / Critical Context)
-	// produced by the background summariser fired after each llmStream
-	// response. compressHistory drains all-but-the-most-recent entry into
-	// Session.Summary and leaves the trailing entry behind as the anchor
-	// covering the verbatim "last message" the live session keeps. In-memory
-	// only — process restart loses it and the next compaction falls through
-	// to the synchronous path.
-	shadowMu      sync.Mutex
-	shadowEntries []string
-	// summariseQueue is a FIFO of per-turn snapshots waiting for the
-	// background summariser. Every llmStream response in the tool loop
-	// enqueues one — none are dropped, so a 50-iteration loop produces 50
-	// shadow notes (one per assistant snapshot). A single worker goroutine
-	// drains the queue sequentially; the LLM connection's slot semaphore
-	// would serialise concurrent runners anyway, so a worker is simpler
-	// than fire-and-forget. summariseUndone counts enqueued-minus-finished;
-	// waitSummarise blocks while it exceeds 1 (the most-recent task is
-	// always allowed to ride the next compaction so end-of-turn doesn't
-	// stall on it). summariseCond is lazy-initialised under summariseMu on
-	// first use so tests that construct Session{} directly don't need to
-	// know about it.
+	// turnStartIdx is the index into Messages where the current top-level turn
+	// begins (set by markTurnStart at runTurn entry, after the human/card prompt
+	// is appended). Mid-turn compaction keeps Messages[turnStartIdx:] verbatim
+	// and folds only the completed turns before it; synthetic user messages a
+	// turn injects (subtask/doc prompts, mid-session skills) all land after
+	// turnStartIdx and stay in the in-flight turn. In-memory only: a turn never
+	// spans a restart, and the next prompt re-marks it. Guarded by mu.
+	turnStartIdx int
+	// summariseQueue is a FIFO of completed-turn snapshots waiting for the
+	// background summariser. backgroundSummarise enqueues exactly one per turn
+	// boundary; a single worker goroutine drains the queue sequentially (the LLM
+	// connection's slot semaphore would serialise concurrent runners anyway).
+	// summariseUndone counts enqueued-minus-finished; waitSummarise blocks while
+	// it exceeds 0 — compaction folds the whole Shadow buffer with no anchor held
+	// back, so every note must have landed first. summariseCond is
+	// lazy-initialised under summariseMu on first use so tests that construct
+	// Session{} directly don't need to know about it.
 	summariseMu      sync.Mutex
 	summariseQueue   []summariseTask
 	summariseRunning bool
@@ -721,50 +723,79 @@ func (s *Session) enqueueSummarise(t summariseTask, runner func(summariseTask)) 
 	}()
 }
 
-// waitSummarise blocks until at most one summariser task remains outstanding
-// (queued or in-flight). compressHistory uses it at end-of-turn: the older
-// notes must be in the shadow buffer before we drain them into Summary, but
-// the very latest task is allowed to ride the next compaction so the user
-// isn't stalled waiting for a fresh background LLM call to come back.
+// waitSummarise blocks until no summariser task remains outstanding (queued or
+// in-flight). compressHistory uses it before folding: every completed turn's
+// note must be in the Shadow buffer, since compaction folds the whole buffer
+// with no anchor held back. Only ever called past the trigger check, so a
+// below-budget turn never stalls on it.
 func (s *Session) waitSummarise() {
 	s.summariseMu.Lock()
 	defer s.summariseMu.Unlock()
 	if s.summariseCond == nil {
 		s.summariseCond = sync.NewCond(&s.summariseMu)
 	}
-	for s.summariseUndone > 1 {
+	for s.summariseUndone > 0 {
 		s.summariseCond.Wait()
 	}
 }
 
-// appendShadow adds a structured per-turn note to the shadow buffer. Each
-// note is stored as its own slice entry so drainShadow can leave the last one
-// behind as an anchor. Caller must NOT hold s.mu (shadowMu is independent).
+// appendShadow adds one completed-turn note to the Shadow buffer. Guarded by mu
+// (same lock as Messages/Save) so a note landing from the background worker
+// can't tear a concurrent encode.
 func (s *Session) appendShadow(chunk string) {
 	chunk = strings.TrimSpace(chunk)
 	if chunk == "" {
 		return
 	}
-	s.shadowMu.Lock()
-	defer s.shadowMu.Unlock()
-	s.shadowEntries = append(s.shadowEntries, chunk)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Shadow = append(s.Shadow, chunk)
 }
 
-// drainShadow returns the accumulated structured notes EXCEPT the most recent
-// one, joined with blank-line separators. The trailing entry stays in the
-// buffer as an anchor covering the verbatim "last message" that compressHistory
-// keeps — without this, the kept message and the freshly-drained note would
-// duplicate each other in the next prompt. Returns "" when there's fewer than
-// 2 entries, falling the caller through to the synchronous summarize path.
+// drainShadow returns every accumulated turn note joined with blank-line
+// separators and clears the buffer. No anchor is held back: compaction rotates
+// out exactly the turns these notes cover, so all of them belong in Summary.
+// Returns "" when the buffer is empty (no completed turn has a note yet).
 func (s *Session) drainShadow() string {
-	s.shadowMu.Lock()
-	defer s.shadowMu.Unlock()
-	if len(s.shadowEntries) < 2 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Shadow) == 0 {
 		return ""
 	}
-	out := strings.Join(s.shadowEntries[:len(s.shadowEntries)-1], "\n\n")
-	s.shadowEntries = s.shadowEntries[len(s.shadowEntries)-1:]
+	out := strings.Join(s.Shadow, "\n\n")
+	s.Shadow = nil
 	return out
+}
+
+// markTurnStart records where the current top-level turn begins: the index of
+// the just-appended human/card prompt. Called at runTurn entry. Mid-turn
+// compaction reads it via turnStartIndex to decide what to keep verbatim.
+func (s *Session) markTurnStart() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.turnStartIdx = len(s.Messages) - 1
+	if s.turnStartIdx < 0 {
+		s.turnStartIdx = 0
+	}
+}
+
+// turnStartIndex returns the in-flight turn's start index, clamped to the
+// current Messages length (a rotation may have shrunk Messages out from under
+// a stale value).
+func (s *Session) turnStartIndex() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.turnStartIdx > len(s.Messages) {
+		return len(s.Messages)
+	}
+	return s.turnStartIdx
+}
+
+// resetTurnStart is called right after rotate() trims the message prefix: the
+// kept window now begins at index 0, so the in-flight turn does too. rotate
+// runs with no concurrent writer (see its doc), so this needs no extra lock.
+func (s *Session) resetTurnStart() {
+	s.turnStartIdx = 0
 }
 
 // UpsertLastAssistant sets the content of the trailing assistant message,

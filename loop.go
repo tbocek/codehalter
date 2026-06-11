@@ -577,12 +577,13 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			stampTiming()
 			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
 		}
-		// Mid-turn 80% overflow check — BEFORE the call, on the in-flight context.
+		// Mid-turn overflow check — BEFORE the call, on the in-flight context.
 		// The previous batch may have ballooned `messages` (read/search outputs are
 		// live-exempt from truncation), and checking after the call is useless when
 		// that call is the one that 400s. Size = chars/4 estimate, max'd with the
 		// server's last count inside compressHistory (so it works with no usage).
-		// summariseFirst captures the turn before rotation. Rebuild on compact.
+		// midTurn=true: fires only above midTurnTriggerPct and keeps this in-flight
+		// turn verbatim, folding the completed turns before it. Rebuild on compact.
 		if (phase == "plan" || phase == "execute") && sid != "" {
 			if s := a.getSession(sid); s != nil && s.Depth == 0 {
 				if a.compressHistory(ctx, s, true, estimateMessageTokens(messages)) {

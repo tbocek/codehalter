@@ -641,15 +641,31 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	sess := a.getSession(sid)
 	if sess != nil {
 		sess.resetTurnStats(time.Now())
+		// Anchor the in-flight turn at the prompt just appended by the caller
+		// (Prompt / proposeFix), so mid-turn compaction keeps this whole turn —
+		// human prompt plus the synthetic subtask/doc prompts orchestrate adds —
+		// verbatim while folding only the completed turns before it.
+		sess.markTurnStart()
 	}
 	result, err := a.orchestrate(ctx, sid)
+
+	// Summarise the just-finished turn on EVERY exit path — success, empty output
+	// (orchestrate produced no answer/plan), or a non-recoverable error that still
+	// added messages — so its messages always carry a note before a later
+	// compaction can rotate them out. fold-all has no way to summarise an un-noted
+	// turn after the fact, so a skipped note here is silent loss. This only
+	// ENQUEUES; whichever compaction runs next folds it via waitSummarise. The
+	// summariser's own LLM call uses context.Background(), so a cancelled turn
+	// still gets a note.
+	if sess != nil {
+		a.backgroundSummarise(sess)
+	}
+
 	if err != nil {
-		// A cancelled turn skips the epilogue below, but it still returns control
-		// to the user — so summarise + compact here too (the only places either
-		// happens). Background ctx because the request ctx is already cancelled
-		// (same reason Prompt posts the cancel notice on context.Background()).
+		// A cancelled turn returns control to the user without the epilogue below,
+		// so compact here too. Background ctx because the request ctx is already
+		// cancelled (its UI chunks would otherwise be dropped).
 		if sess != nil && isCancelled(err) {
-			a.backgroundSummarise(sess)
 			a.compressHistory(context.Background(), sess, false, estimateMessageTokens(a.buildLLMContext(sess)))
 		}
 		return err
@@ -657,13 +673,10 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	if sess == nil || result.Text == "" {
 		return nil
 	}
-	// Epilogue — the turn boundary, where control returns to the user. This is
-	// the ONLY place codehalter summarises and compacts: nothing happens mid-turn
-	// (no per-tool-loop, no per-subtask), so the background slot stays clear while
-	// the agent works and the LLM's prefix cache only ever changes here, between
-	// turns. backgroundSummarise enqueues this turn's note; compressHistory then
-	// drains it and rotates IF the session crossed the trigger (else it's a no-op
-	// and the summary just rides the next compaction). Report stats first.
+	// Epilogue — the turn boundary, where control returns to the user. The note
+	// was enqueued above; here we report stats, commit the turn's edits, and
+	// compact at the boundary trigger if the session crossed it (the mid-turn
+	// overflow valve in runToolLoop may also have compacted already). Stats first.
 	if r := sess.turnStats(); r.activeMs > 0 {
 		// \n\n keeps the stats on their own markdown line. With the server cache
 		// split, headline the work done (evaluated + gen) plus sent/cached%;
@@ -687,7 +700,6 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		}
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line + "\n"}})
 	}
-	a.backgroundSummarise(sess)
 	a.backgroundGitCommit(sess)
 	a.compressHistory(ctx, sess, false, estimateMessageTokens(a.buildLLMContext(sess)))
 	return nil

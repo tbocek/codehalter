@@ -851,11 +851,11 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 }
 
 // TestCompressHistoryRecordsSummary is the headline history test: once the
-// server-reported prompt_tokens crosses the trigger, compressHistory should
-// rotate the session — freeze the pre-rotation state to a "session_archive_*"
-// file, push the drained shadow entries into Summary, trim raw messages to
-// the single most-recent one, and persist everything. The mock LLM has zero
-// responses queued: the shadow fast path is fully local and any LLM call
+// server-reported prompt_tokens crosses the trigger, a boundary compaction
+// (midTurn=false) should rotate the session — freeze the pre-rotation state to
+// a "session_archive_*" file, fold the WHOLE shadow buffer into Summary, keep
+// NOTHING verbatim (start fresh), and persist everything. The mock LLM has zero
+// responses queued: folding pre-computed notes is fully local and any LLM call
 // would fail the test.
 func TestCompressHistoryRecordsSummary(t *testing.T) {
 	mock := newMockLLM(t)
@@ -867,8 +867,8 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		t.Fatalf("newSession: %v", err)
 	}
 
-	// Build 10 user+assistant pairs so the rotation trims 19 messages into
-	// the summary and leaves exactly 1 verbatim (the trailing assistant reply).
+	// Build 10 user+assistant pairs; a boundary compaction folds them all into
+	// the summary and keeps nothing verbatim.
 	filler := strings.Repeat("lorem ipsum ", 100)
 	for i := 0; i < 10; i++ {
 		s.AddUser(fmt.Sprintf("user msg %d %s", i, filler))
@@ -879,11 +879,10 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	}
 	originalMsgCount := len(s.Messages)
 
-	// Seed shadow with two notes covering the older turns plus one anchor
-	// that must stay in the buffer for the next compaction.
+	// Seed shadow with three completed-turn notes; all fold (no anchor held back).
 	s.appendShadow("Goal: ship feature\nProgress: scaffolded module")
 	s.appendShadow("Goal: ship feature\nProgress: wired up handler")
-	s.appendShadow("Goal: ship feature\nProgress: anchor entry")
+	s.appendShadow("Goal: ship feature\nProgress: shipped it")
 
 	// mainSlotTokens = 90_000 → trigger at 72_000. Set LastCompletePromptTokens
 	// past the trigger to simulate the server's most recent /usage chunk.
@@ -899,17 +898,19 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 
 	a.compressHistory(context.Background(), s, false, 0)
 
-	if !strings.Contains(s.Summary, "scaffolded module") || !strings.Contains(s.Summary, "wired up handler") {
-		t.Errorf("summary missing drained shadow entries; got %q", s.Summary)
+	for _, want := range []string{"scaffolded module", "wired up handler", "shipped it"} {
+		if !strings.Contains(s.Summary, want) {
+			t.Errorf("summary missing folded shadow entry %q; got %q", want, s.Summary)
+		}
 	}
-	if strings.Contains(s.Summary, "anchor entry") {
-		t.Errorf("anchor entry leaked into Summary; should still be in shadow: %q", s.Summary)
+	if peek := s.peekShadow(); peek != "" {
+		t.Errorf("shadow buffer should be empty after a fold-all compaction; got %q", peek)
 	}
 	if len(s.Messages) >= originalMsgCount {
 		t.Errorf("Messages not trimmed: before %d, after %d", originalMsgCount, len(s.Messages))
 	}
-	if len(s.Messages) != 1 {
-		t.Errorf("Messages after trim: got %d, want 1", len(s.Messages))
+	if len(s.Messages) != 0 {
+		t.Errorf("boundary compaction should keep nothing verbatim; got %d messages", len(s.Messages))
 	}
 
 	// An archive file should exist holding the pre-rotation full state, and
@@ -969,7 +970,7 @@ func TestCompressHistoryEstimateFallback(t *testing.T) {
 	}
 	s.appendShadow("Goal: ship\nProgress: one")
 	s.appendShadow("Goal: ship\nProgress: two")
-	s.appendShadow("Goal: ship\nProgress: anchor")
+	s.appendShadow("Goal: ship\nProgress: three")
 
 	// Server reported nothing — the only signal is the estimate.
 	s.SetLastCompletePromptTokens(0)
@@ -984,7 +985,7 @@ func TestCompressHistoryEstimateFallback(t *testing.T) {
 	if a.compressHistory(context.Background(), s, false, 50_000) {
 		t.Fatalf("compacted on a below-trigger estimate with no server tokens")
 	}
-	if s.Summary != "" || len(s.Messages) == 1 {
+	if s.Summary != "" || len(s.Messages) != 20 {
 		t.Fatalf("rotation happened despite below-trigger estimate")
 	}
 
@@ -993,11 +994,13 @@ func TestCompressHistoryEstimateFallback(t *testing.T) {
 	if !a.compressHistory(context.Background(), s, false, 80_000) {
 		t.Fatalf("did not compact on an over-trigger estimate (server reported 0)")
 	}
-	if !strings.Contains(s.Summary, "one") || !strings.Contains(s.Summary, "two") {
-		t.Errorf("summary missing drained shadow entries; got %q", s.Summary)
+	for _, want := range []string{"one", "two", "three"} {
+		if !strings.Contains(s.Summary, want) {
+			t.Errorf("summary missing folded shadow entry %q; got %q", want, s.Summary)
+		}
 	}
-	if len(s.Messages) != 1 {
-		t.Errorf("Messages after trim: got %d, want 1", len(s.Messages))
+	if len(s.Messages) != 0 {
+		t.Errorf("boundary compaction should keep nothing verbatim; got %d messages", len(s.Messages))
 	}
 }
 
@@ -1224,10 +1227,8 @@ func TestCompressHistoryNoopWhenBelowBudget(t *testing.T) {
 }
 
 // TestCompressHistoryShadowFastPath verifies the background-summariser fast
-// path: when shadow buffer already has structured notes (populated during the
-// turns), compaction installs them directly as Summary and skips the
-// synchronous summarize LLM call. With retitle removed, compaction makes
-// zero LLM calls in this path.
+// path: when the shadow buffer already has structured notes (populated during
+// the turns), compaction folds the whole buffer into Summary with no LLM call.
 func TestCompressHistoryShadowFastPath(t *testing.T) {
 	mock := newMockLLM(t) // zero responses queued → any call fails the test.
 	defer mock.Close()
@@ -1250,7 +1251,7 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 
 	s.appendShadow("Goal: do thing\nProgress: did thing")
 	s.appendShadow("Goal: do thing\nProgress: refined thing")
-	s.appendShadow("Goal: do thing\nProgress: anchor entry")
+	s.appendShadow("Goal: do thing\nProgress: finished thing")
 
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
@@ -1262,20 +1263,18 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 
 	a.compressHistory(context.Background(), s, false, 0)
 
-	// Older entries fold into Summary; the most-recent stays in the buffer
-	// as the anchor covering the verbatim trailing message.
-	if !strings.Contains(s.Summary, "did thing") || !strings.Contains(s.Summary, "refined thing") {
-		t.Errorf("expected Summary to contain the older shadow chunks, got %q", s.Summary)
-	}
-	if strings.Contains(s.Summary, "anchor entry") {
-		t.Errorf("Summary swallowed the anchor entry; should still be in the shadow buffer: %q", s.Summary)
+	// Every note folds into Summary; no anchor is held back.
+	for _, want := range []string{"did thing", "refined thing", "finished thing"} {
+		if !strings.Contains(s.Summary, want) {
+			t.Errorf("expected Summary to contain folded shadow chunk %q, got %q", want, s.Summary)
+		}
 	}
 	if mock.callCount() != 0 {
 		t.Errorf("LLM calls: got %d, want 0 (shadow fast path is fully local)", mock.callCount())
 	}
-	// The anchor entry is still in the buffer; a follow-up peek must see it.
-	if peek := s.peekShadow(); !strings.Contains(peek, "anchor entry") {
-		t.Errorf("anchor entry missing from shadow buffer after compaction; got %q", peek)
+	// The buffer is fully drained after a fold-all compaction.
+	if peek := s.peekShadow(); peek != "" {
+		t.Errorf("shadow buffer should be empty after compaction; got %q", peek)
 	}
 }
 
@@ -1629,10 +1628,9 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 		t.Errorf("shadow chunk missing view_image handle %q: %q", imgID, peek)
 	}
 
-	// Drive the full compaction. drainShadow requires 2+ entries (the last
-	// stays as anchor), so append a second chunk; then exercise compressHistory
-	// and confirm the image reference lands in Summary.
-	s.appendShadow("Goal: anchor\nProgress: follow-up turn")
+	// Drive a boundary compaction and confirm the image reference folds into
+	// Summary (a second note alongside it, both fold — no anchor held back).
+	s.appendShadow("Goal: follow-up\nProgress: follow-up turn")
 	s.SetLastCompletePromptTokens(80_000)
 	a.compressHistory(context.Background(), s, false, 0)
 
@@ -1680,6 +1678,188 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 	}
 	if !strings.Contains(s.Summary, "Goal: x") {
 		t.Errorf("shadow chunk missing from new Summary; got %q", s.Summary)
+	}
+}
+
+// TestShadowPersistsAcrossReload pins the persistence fix: turn notes live in
+// the Shadow field and must survive a Save/loadSession round-trip, so the notes
+// accumulated across turns are not lost when the process restarts.
+func TestShadowPersistsAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s.AddUser("hi")
+	s.appendShadow("Goal: a\nProgress: one")
+	s.appendShadow("Goal: a\nProgress: two")
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := loadSession(dir, s.ID)
+	if err != nil {
+		t.Fatalf("loadSession: %v", err)
+	}
+	if len(loaded.Shadow) != 2 {
+		t.Fatalf("Shadow not persisted: got %d entries, want 2 (%q)", len(loaded.Shadow), loaded.Shadow)
+	}
+	if loaded.Shadow[0] != "Goal: a\nProgress: one" || loaded.Shadow[1] != "Goal: a\nProgress: two" {
+		t.Errorf("Shadow entries corrupted on reload: %q", loaded.Shadow)
+	}
+}
+
+// TestCompressHistoryMidTurnKeepsInFlightTurn covers the mid-turn policy: above
+// the 90% trigger, compaction keeps the in-flight turn (Messages[turnStart:])
+// verbatim and folds only the completed turns ahead of it into Summary.
+func TestCompressHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
+	mock := newMockLLM(t) // folding is local; any LLM call fails the test.
+	defer mock.Close()
+
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+
+	filler := strings.Repeat("lorem ipsum ", 100)
+	// Completed turn 1.
+	s.AddUser("turn1 user " + filler)
+	s.AddAssistant("turn1 asst " + filler)
+	// In-flight turn 2 begins at the next user message.
+	s.AddUser("turn2 user " + filler)
+	s.markTurnStart()
+	s.AddAssistant("turn2 asst step " + filler)
+
+	// One note for the completed turn 1 (the in-flight turn has none yet).
+	s.appendShadow("Goal: do\nProgress: finished turn 1")
+	s.SetLastCompletePromptTokens(85_000) // > 90% of 90_000 (81_000)
+
+	a := &agent{
+		sessions:       map[string]*Session{s.ID: s},
+		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		mainSlotTokens: 90_000,
+	}
+
+	if !a.compressHistory(context.Background(), s, true, 0) {
+		t.Fatalf("mid-turn compaction did not fire above the 90%% trigger")
+	}
+	if !strings.Contains(s.Summary, "finished turn 1") {
+		t.Errorf("Summary missing the completed turn's note; got %q", s.Summary)
+	}
+	if len(s.Messages) != 2 {
+		t.Fatalf("expected the 2 in-flight messages kept verbatim, got %d", len(s.Messages))
+	}
+	if !strings.Contains(s.Messages[0].Content, "turn2 user") {
+		t.Errorf("kept window must start at the in-flight turn; got %q", s.Messages[0].Content)
+	}
+	if peek := s.peekShadow(); peek != "" {
+		t.Errorf("shadow should be drained after compaction; got %q", peek)
+	}
+	if s.turnStartIndex() != 0 {
+		t.Errorf("turnStart not reset after rotation; got %d", s.turnStartIndex())
+	}
+	if mock.callCount() != 0 {
+		t.Errorf("LLM calls: got %d, want 0", mock.callCount())
+	}
+}
+
+// TestCompressHistoryMidTurnHigherThreshold pins the two-threshold split: in the
+// 80–90% band a mid-turn check is a no-op (it waits for the boundary) while a
+// boundary check at the same size compacts.
+func TestCompressHistoryMidTurnHigherThreshold(t *testing.T) {
+	mock := newMockLLM(t)
+	defer mock.Close()
+
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	filler := strings.Repeat("lorem ipsum ", 100)
+	s.AddUser("turn1 " + filler)
+	s.AddAssistant("a1 " + filler)
+	s.AddUser("turn2 " + filler)
+	s.markTurnStart()
+	s.AddAssistant("a2 " + filler)
+	s.appendShadow("Goal: g\nProgress: turn1 done")
+
+	// 75_000 is above the 80% boundary trigger (72_000) but below the 90%
+	// mid-turn trigger (81_000).
+	s.SetLastCompletePromptTokens(75_000)
+	a := &agent{
+		sessions:       map[string]*Session{s.ID: s},
+		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		mainSlotTokens: 90_000,
+	}
+
+	if a.compressHistory(context.Background(), s, true, 0) {
+		t.Fatalf("mid-turn compaction fired in the 80–90%% band (should wait for the boundary)")
+	}
+	if s.Summary != "" || len(s.Messages) != 4 {
+		t.Fatalf("mid-turn no-op mutated state: summary=%q msgs=%d", s.Summary, len(s.Messages))
+	}
+
+	if !a.compressHistory(context.Background(), s, false, 0) {
+		t.Fatalf("boundary compaction did not fire above the 80%% trigger")
+	}
+	if !strings.Contains(s.Summary, "turn1 done") {
+		t.Errorf("boundary summary missing the folded note; got %q", s.Summary)
+	}
+	if len(s.Messages) != 0 {
+		t.Errorf("boundary compaction should keep nothing verbatim; got %d", len(s.Messages))
+	}
+}
+
+// TestBackgroundSummariseRendersWholeTurn verifies the summariser is fed the
+// ENTIRE turn — the user prompt plus every assistant step and its tool calls —
+// not just the last assistant message, so one note covers the whole turn.
+func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
+	mock := newMockLLM(t, sseText("Goal: g\nProgress: did it"))
+	defer mock.Close()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
+		t.Fatalf("mkdir .codehalter: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".codehalter", "SUMMARISE.md"), []byte("SUMMARISE PROMPT\n"), 0o644); err != nil {
+		t.Fatalf("write SUMMARISE.md: %v", err)
+	}
+
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s.AddUser("please do the thing")
+	s.markTurnStart()
+	s.AddAssistantWithTools("reading files", []ToolUse{{ID: "tu_1", Name: "read_file", Input: `{"path":"a.go"}`, Output: "package a"}})
+	s.AddAssistant("done with the thing")
+
+	a := &agent{
+		sessions:       map[string]*Session{s.ID: s},
+		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		mainSlotTokens: 90_000,
+	}
+	a.backgroundSummarise(s)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for s.peekShadow() == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("backgroundSummarise never appended a note")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	req := mock.request(0)
+	msgs, _ := req["messages"].([]any)
+	if len(msgs) == 0 {
+		t.Fatalf("summariser request had no messages: %v", req)
+	}
+	content, _ := msgs[0].(map[string]any)["content"].(string)
+	for _, want := range []string{"please do the thing", "read_file", "done with the thing"} {
+		if !strings.Contains(content, want) {
+			t.Errorf("summariser prompt missing %q; got:\n%s", want, content)
+		}
 	}
 }
 
@@ -1751,13 +1931,11 @@ func TestToolLoopNudgesReasonedButEmpty(t *testing.T) {
 	}
 }
 
-// peekShadow joins every accumulated shadow note (including the anchor) without
-// draining the buffer. Test-only: the summariser tests poll it concurrently with
-// the backgroundSummarise goroutine, so it must take shadowMu. Production no
-// longer reads the shadow non-destructively (the document phase used to) — only
-// compressHistory drains it via drainShadow.
+// peekShadow joins every accumulated turn note without draining the buffer.
+// Test-only: the summariser tests poll it concurrently with the
+// backgroundSummarise goroutine, so it takes the same mu that guards Shadow.
 func (s *Session) peekShadow() string {
-	s.shadowMu.Lock()
-	defer s.shadowMu.Unlock()
-	return strings.Join(s.shadowEntries, "\n\n")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return strings.Join(s.Shadow, "\n\n")
 }
