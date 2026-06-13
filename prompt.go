@@ -1194,8 +1194,6 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	// that day's date, which is good enough for typical use.
 	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
 	// Project-first investigation guidance — a user-editable prompt seeded to
-	// .codehalter/SYSTEM.md (see res/SYSTEM.md), not a Go string const.
-	b.WriteString(a.loadPromptFile(sid, "SYSTEM.md"))
 
 	// Phase guidance lives in the system prompt (the stable, cached prefix) rather
 	// than being re-injected as a multi-KB user message on every plan/execute

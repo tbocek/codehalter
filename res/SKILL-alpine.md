@@ -1,43 +1,25 @@
 # Alpine skill
+Base: Alpine Linux ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}}). Pkg mgr apk. libc=musl NOT glibc → prebuilt glibc binaries usually no run. Prefer Alpine pkgs / static binaries.
+User=non-root `dev`, sudo NOPASSWD. Write ops (add/del/update) need sudo. Read probes (info, list -I) no sudo.
 
-Base is Alpine Linux ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}}). Pkg
-manager is `apk`. libc is **musl, not glibc** — prebuilt glibc binaries
-generally won't run. Prefer Alpine packages or static binaries.
+## Probe (only if needed; session-invariant, reuse from history)
+- /etc/os-release in header → no re-cat.
+- apk --version
+- apk list -I → all installed (long → grep).
+- apk info <pkg> → version + desc.
 
-Run as non-root `dev` (sudo NOPASSWD). Prefix `apk add`/`del`/`update`
-with `sudo`. Read-only probes (`apk info`, `apk list -I`) don't need it.
-
-## Probe (only if needed)
-
-`/etc/os-release` is in the header — do NOT re-run `cat /etc/os-release`.
-Session-invariant — reuse from this turn's history:
-
-- `apk --version`
-- `apk list -I` — every installed package (long; pipe to grep).
-- `apk info <pkg>` — installed version + description.
-
-## Search and install
-
-- `apk update` — refresh index (cheap; run before search/install).
-- `apk search <pkg>` / `apk search -e <pkg>` — fuzzy / exact name.
-- `apk info <pkg>` — version, deps, files.
-- `apk add <pkg>` — install (no `--noconfirm`; apk doesn't prompt).
-- `apk del <pkg>` — uninstall.
-
-Main + community repos split. Most dev tooling is in `community/`; enable
-in `/etc/apk/repositories` if missing. Rolling versions:
-`apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community/ <pkg>`.
+## Search / install
+- apk update → refresh index (cheap; do before search/install).
+- apk search <pkg> ; -e = exact.
+- apk info <pkg> → version, deps, files.
+- apk add <pkg> → install (no --noconfirm; no prompts).
+- apk del <pkg> → uninstall.
+- Main + community repos split. Most dev tooling in community/ → enable in /etc/apk/repositories. Rolling: apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community/ <pkg>
 
 ## Version staleness
+Stable freezes versions. Fast-moving tools (Go, Node, gopls, LSPs): if apk info looks old → web_search upstream before claiming unavailable. Fallback: edge repo, or apk add build-base && make from source.
 
-Stable releases freeze versions. If `apk info` looks old for a fast-moving
-tool (Go, Node, gopls, LSPs), check upstream with `web_search` before
-claiming "version X isn't available." Fallback: edge, or
-`apk add build-base && make` from source.
-
-## Common gotchas
-
-- musl ≠ glibc: prebuilt binaries often segfault. Look for "Alpine",
-  "musl", or "static" download variants.
-- Split packages: `python3` vs `py3-pip`, `go` vs `gopls`.
-- `apk` exits 0 on "already installed" — re-running confirms presence.
+## Gotchas
+- musl≠glibc: prebuilt may segfault → seek Alpine/musl/static variants.
+- Split pkgs: python3 vs py3-pip, go vs gopls.
+- apk exits 0 on "already installed" → re-run confirms presence.

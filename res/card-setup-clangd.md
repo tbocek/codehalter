@@ -1,5 +1,3 @@
-This C/C++ project has no code-intelligence MCP (clangd) configured — the gopls
-analog for C/C++.
+C/C++ project has no code-intelligence MCP (clangd = gopls analog for C/C++) configured.
 
-PLAN ONLY — produce execute-phase steps to set it up per SKILL-c.md and persist
-the installs in `.devcontainer/Dockerfile`.
+PLAN ONLY → execute-phase steps: set up per SKILL-c.md, persist installs in `.devcontainer/Dockerfile`.

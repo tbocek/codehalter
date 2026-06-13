@@ -1,28 +1,26 @@
 # Java skill
-
 ## Modern Java (11+)
-- `var` for local variable type inference. Don't use `var` for fields or method signatures.
+- `var` for local var type inference. NO `var` for fields or method signatures.
 - Records for immutable data carriers, not lombok-heavy classes.
 - `switch` expressions where supported.
 
 ## Null
-- Avoid returning `null`. Return `Optional<T>` for "may be absent" or throw for hard errors.
-- Don't `Optional.get()` without checking; use `orElse`, `orElseThrow`, `map`, `ifPresent`.
-- Annotate boundaries with `@Nullable` / `@NonNull` if the project uses them.
+- Avoid returning null → return `Optional<T>` for "may be absent" or throw for hard errors.
+- No `Optional.get()` without checking → use orElse, orElseThrow, map, ifPresent.
+- Annotate boundaries `@Nullable`/`@NonNull` if project uses them.
 
 ## Resources
-- Always use try-with-resources for `AutoCloseable` (streams, readers, connections):
-  `try (var f = Files.newBufferedReader(p)) { ... }`.
+- ALWAYS try-with-resources for `AutoCloseable` (streams, readers, connections): `try (var f = Files.newBufferedReader(p)) { ... }`.
 
-## Collections and streams
+## Collections / streams
 - Prefer `List.of`, `Set.of`, `Map.of` for small immutables.
-- Streams are fine when they make code clearer; don't force them when a `for` loop reads better.
-- Don't mutate the source collection inside a stream pipeline.
+- Streams fine when clearer; don't force when `for` loop reads better.
+- Don't mutate source collection inside stream pipeline.
 
 ## Style
-- Fields are `private final` by default; mutate only when you have to.
-- Constructor injection over field/setter injection (Spring, Guice, etc.).
-- Match the project's existing checkstyle / spotless config — don't reformat the world.
+- Fields `private final` by default; mutate only when you must.
+- Constructor injection over field/setter (Spring, Guice, etc.).
+- Match project's existing checkstyle/spotless config — don't reformat the world.
 
 ## Tests
-- JUnit 5 (`@Test`, `org.junit.jupiter.api`). Use AssertJ if the project already does; otherwise plain JUnit asserts.
+- JUnit 5 (`@Test`, `org.junit.jupiter.api`). AssertJ if project already does; else plain JUnit asserts.

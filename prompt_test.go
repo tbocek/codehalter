@@ -145,7 +145,6 @@ func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, body := range map[string]string{
-		"SYSTEM.md":  "SYSTEM_SENTINEL",
 		"PLAN.md":    "PLAN_SENTINEL planning guidance",
 		"EXECUTE.md": "EXEC_SENTINEL execution guidance",
 	} {

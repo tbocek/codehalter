@@ -1,77 +1,36 @@
 # Container skill
-
-You run inside a container. The workspace is bind-mounted from the host;
-the container is your sandbox — pkg-mgr / pip / npm writes persist for the
-container's lifetime (wiped on rebuild), so test installs are cheap and
-reversible.
+Run inside container. Workspace bind-mount from host; container=sandbox → pkg-mgr/pip/npm writes persist container lifetime (wiped on rebuild) → test install cheap + reversible.
 
 ## Git — writable, commit/push when asked
+.git bind-mount writable + ~/.gitconfig + SSH agent mounted → commit/push work inside. BUT git action ONLY when user explicit ask (see EXECUTE.md) — never commit/push self.
+- **OK on request**: commit, push, + safe reads status/log/diff/show/blame/fetch.
+- **Avoid unless explicit**: history rewrite shared branch — reset --hard, push --force, filter-branch, gc --prune.
+- Git write fail (read-only .git, or no creds = old container) → surface exact host cmd + stop, no fight.
 
-`.git` is bind-mounted writable and your `~/.gitconfig` plus SSH agent are
-mounted, so commit and push work from inside the container. But act on git ONLY
-when the user explicitly asks (see EXECUTE.md) — never commit/push on your own.
+## "command not found"
+Applies execute + verify-fail replan. In plan: emit install + Dockerfile-edit steps, let execute run.
+1. Confirm: `which <tool>` (exit 1 = missing).
+2. Read .devcontainer/devcontainer.json + Dockerfile.
+   - Declared → image stale → point install line.
+   - Not declared → propose add (TEST FIRST, below).
+3. NO retry same cmd unchanged.
+Pkg-mgr cmd depends base image → check SKILL-<os>.md (alpine/arch/debian/fedora/ubuntu) or fall back /etc/os-release.
 
-- **Fine on request**: `git commit`, `git push`, and the always-safe reads
-  `git status`/`log`/`diff`/`show`/`blame`/`fetch`.
-- **Still avoid unless explicitly asked**: history rewrites on shared branches —
-  `git reset --hard`, `git push --force`, `git filter-branch`, `git gc --prune`.
+## Test install live BEFORE patch Dockerfile
+**Execute phase only. Plan stays read-only.**
+Before write `RUN <pkg-mgr> install <pkg>` (or pip, npm i -g) into Dockerfile, first run same install via run_command: run_command: <install-cmd> && <tool> --version
+Install persists container lifetime → re-run project build/test, confirm end-to-end.
+Install fail (wrong name, repo missing, version mismatch) → debug HERE (alt source, search release page) before commit Dockerfile change. Untested patch = guess.
+Test OK → propose Dockerfile edit w/ exact verified cmds + tell user rebuild.
 
-If a git write fails (read-only `.git`, or no credentials mounted — an older
-container), surface the exact host command and stop rather than fighting it.
+## run_command for probes too
+- which <tool>, <tool> --version → exists?
+- Type-check/lint (cargo check, tsc --noEmit, go vet ./...).
+- ls -la <path>, cat <config> → inspect state.
+Probe workspace writes (e.g. cargo check fills target/) real. OK for build artifacts; no destructive shell cmd vs source → use edit_file/write_file.
 
-## When a task fails with "command not found"
-
-Applies in execute and verify-failure replans. In plan, emit install +
-Dockerfile-edit steps and let execute run them.
-
-1. Confirm with `run_command`: `which <tool>` (exit 1 = missing).
-2. Read `.devcontainer/devcontainer.json` and its `Dockerfile`.
-   - If declared → image is stale; point at the install line.
-   - If not declared → propose adding it (but TEST IT first, see below).
-3. Do NOT retry the same failing command without changing anything.
-
-Package-manager commands depend on the base image — check the matching
-`SKILL-<os>.md` (alpine, arch, debian, fedora, ubuntu) or fall back to
-`/etc/os-release`.
-
-## Test installs in the live container before patching the Dockerfile
-
-**Execute phase only.** Plan must stay read-only.
-
-Before writing `RUN <pkg-manager> install <pkg>` (or `pip`, `npm i -g`)
-into the Dockerfile, first run the same install via `run_command`:
-
-```
-run_command: <install-command> && <tool> --version
-```
-
-The install persists for this container's lifetime, so re-run the project
-build/test to confirm end-to-end success.
-
-If the install fails (wrong package name, repo missing it, version
-mismatch), debug HERE — try alternative sources, search the release page —
-before committing to a Dockerfile change. An untested patch is a guess.
-
-When the test succeeds, propose the Dockerfile edit with the exact verified
-commands and tell the user to rebuild.
-
-## Use `run_command` for probes too
-
-- `which <tool>`, `<tool> --version` — does it exist?
-- Type-check / lint (`cargo check`, `tsc --noEmit`, `go vet ./...`).
-- `ls -la <path>`, `cat <config>` — inspect state.
-
-Workspace writes from probes (e.g. `cargo check` populating `target/`) are
-real. Fine for build artifacts; don't run destructive shell commands
-against source — use `edit_file`/`write_file`.
-
-## What `run_command` is NOT for
-
-- Long-running services — they die with codehalter. Don't start daemons.
-- Replacing `run_task` — for declared project tasks (`just build`,
-  `npm test`), keep using `run_task` so the user sees it in the same UI.
-- Editing project files — use `edit_file`/`write_file` so the change goes
-  through the diff/approval UI. Raw `sed -i` or `>` skip that.
-
-Exit code is in the output and tool-card title. `which <tool>` exit 1 =
-binary missing, not tool error.
+## run_command NOT for
+- Long-running service → die w/ codehalter. No daemon.
+- Replacing run_task → declared project task (just build, npm test) keep run_task so user sees same UI.
+- Editing project file → use edit_file/write_file so change hits diff/approval UI. Raw `sed -i` or `>` skip that.
+Exit code in output + tool-card title. which <tool> exit 1 = binary missing, not tool error.

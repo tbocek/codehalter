@@ -57,8 +57,6 @@ var defaultDocumentMD string
 //go:embed res/SUMMARISE.md
 var defaultSummariseMD string
 
-//go:embed res/SYSTEM.md
-var defaultSystemMD string
 
 //go:embed res/COMMIT.md
 var defaultCommitMD string
@@ -442,7 +440,6 @@ func (a *agent) initSession(cwd string, s *Session) error {
 		{"EXECUTE.md", defaultExecuteMD},
 		{"DOCUMENT.md", defaultDocumentMD},
 		{"SUMMARISE.md", defaultSummariseMD},
-		{"SYSTEM.md", defaultSystemMD},
 		{"COMMIT.md", defaultCommitMD},
 	} {
 		path := filepath.Join(dir, f.name)

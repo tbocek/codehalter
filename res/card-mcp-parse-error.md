@@ -1,5 +1,3 @@
-The MCP config `.codehalter/mcp.toml` failed to parse: %s.
+MCP config `.codehalter/mcp.toml` failed to parse: %s.
 
-Read the file (its header comments document the schema), fix the syntax, and
-re-read to confirm it parses. Do NOT start any servers — codehalter reconciles
-on the next prompt.
+Read file (header comments = schema), fix syntax, re-read to confirm parses. Do NOT start servers → codehalter reconciles next prompt.

@@ -1,6 +1,3 @@
 Missing dev tools in this %s devcontainer: %s.
 
-PLAN ONLY — produce execute-phase steps to install each with the right package
-manager, verify it runs, and PERSIST it in `.devcontainer/Dockerfile`. Follow
-SKILL-base.md (the install/persist loop) and the matching language SKILL
-for which manager to use.
+PLAN ONLY → execute-phase steps: install each w/ right pkg mgr, verify runs, PERSIST in `.devcontainer/Dockerfile`. Follow SKILL-base.md (install/persist loop) + matching language SKILL for which mgr.
