@@ -585,11 +585,11 @@ func (a *agent) renderLLMStatus() string {
 	case a.mainSlotTokens < minSlotTokens:
 		fmt.Fprintf(&b, "🟡 Context window: only %d tokens/slot — codehalter requires at least %d. Raise `context_size` in settings.toml, increase your server's launch flag (`-c N` / `--max-model-len N`), or reduce `parallel`.\n\n", a.mainSlotTokens, minSlotTokens)
 	default:
-		trigger := a.mainSlotTokens * compactTriggerPct / 100
+		inputCap := a.mainSlotTokens * compactTriggerPct / 100
 		if pc := conns[0].parallelCap(); pc > 1 {
-			fmt.Fprintf(&b, "✅ Context window: %d tokens/slot (n_ctx %d ÷ %d slots, compact at %d)\n\n", a.mainSlotTokens, a.mainSlotTokens*pc, pc, trigger)
+			fmt.Fprintf(&b, "✅ Context window: %d tokens/slot (n_ctx %d ÷ %d slots, max prompt %d)\n\n", a.mainSlotTokens, a.mainSlotTokens*pc, pc, inputCap)
 		} else {
-			fmt.Fprintf(&b, "✅ Context window: %d tokens (compact at %d)\n\n", a.mainSlotTokens, trigger)
+			fmt.Fprintf(&b, "✅ Context window: %d tokens (max prompt %d)\n\n", a.mainSlotTokens, inputCap)
 		}
 	}
 	if total := a.totalSlots(); total < minTotalSlots {

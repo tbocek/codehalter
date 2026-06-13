@@ -34,6 +34,15 @@
 - gopls 0.20+ ships built-in MCP server. Start as stdio child `gopls mcp` (serves go_symbols / go_references / go_definition / go_hover).
 - Wire: add `[[server]]` block to `.codehalter/mcp.toml` with `name = "gopls"`, `command = "gopls"`, `args = ["mcp"]`. codehalter reconciles mcp.toml automatically at end of turn — starts server + registers tools itself → live on next prompt. Do NOT tell user to restart Zed or start new session; no restart needed.
 
+## Read code: outline before bytes (when gopls MCP is wired)
+Default to the language server to NAVIGATE; reading a whole file is the LAST step, not the first. Cheaper (signatures, not whole files → far fewer tokens, less context overflow) and precise (no grep false hits on comments/strings/same-named methods on other types).
+- What's in a file/package? → `go_symbols` (every decl + signature, no bodies). NOT `read_file` to "see what's there".
+- Where is X defined? → `go_definition`. NOT grep / `search_text`.
+- Who calls X / what breaks if I change it? → `go_references` (real call graph). `search_text` over-matches.
+- Signature + doc of X? → `go_hover`.
+- `read_file` ONLY to read a function's actual LOGIC, or to grab the exact bytes for an `edit_file`. Read the function, not the file.
+Tools register as `gopls__go_symbols` / `gopls__go_definition` / `gopls__go_references` / `gopls__go_hover` once gopls is wired (above). gopls NOT wired → fall back to `search_text` + `read_file`.
+
 ## Mutating commands — NEVER during planning
 These rewrite files in place. NOT probes. Don't run during PLAN to "see what would change" — they actually change things, often across hundreds of files:
 - `go fix ./...` (Go 1.26 modernizers — silently updates source)

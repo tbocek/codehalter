@@ -34,3 +34,6 @@ Probe workspace writes (e.g. cargo check fills target/) real. OK for build artif
 - Replacing run_task → declared project task (just build, npm test) keep run_task so user sees same UI.
 - Editing project file → use edit_file/write_file so change hits diff/approval UI. Raw `sed -i` or `>` skip that.
 Exit code in output + tool-card title. which <tool> exit 1 = binary missing, not tool error.
+
+## Answer from the project first
+Asked about tech/lang/lib/version X? FIRST check how X + neighbors are wired in THIS project (npm → also pnpm/yarn; python → also uv/poetry/pypy; framework → also its build/runtime variant) before web search or guessing. Read manifest/build files (go.mod, package.json, Cargo.toml, Makefile, justfile, Dockerfile, README) + grep related terms. Right answer usually depends on the variant the project actually uses.

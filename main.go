@@ -57,7 +57,6 @@ var defaultDocumentMD string
 //go:embed res/SUMMARISE.md
 var defaultSummariseMD string
 
-
 //go:embed res/COMMIT.md
 var defaultCommitMD string
 
@@ -126,7 +125,8 @@ type agent struct {
 	// count. 0 means unknown (probe failed or server didn't report it);
 	// ensureLLM treats both that and "below minSlotTokens" as a hard failure and
 	// loops on a Retry card until the gate passes, so any turn that runs can
-	// assume this is ≥ minSlotTokens. compressHistory reads this; nothing else should.
+	// assume this is ≥ minSlotTokens. Read by the input-size guard (prompt.go) and
+	// the startup banner (prepare.go).
 	mainSlotTokens int
 
 	// detectedSlots is the total slot count summed across every [[llm]] entry as

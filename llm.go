@@ -52,10 +52,10 @@ type sseChunk struct {
 	// Usage is the OpenAI-compatible token count block. With
 	// stream_options.include_usage=true the server emits one final chunk
 	// (choices empty) carrying this — the prompt_tokens count is ground
-	// truth for what the server actually packed into n_ctx, PREFERRED over
-	// the chars/4 estimator on the compaction trigger. Not all backends send
-	// it (a proxy may strip include_usage); when absent the trigger falls back
-	// to estimateMessageTokens so compaction still fires (see compressHistory).
+	// truth for what the server actually packed into n_ctx, and feeds the
+	// per-turn "✅ Done" usage stats (see addTurnTokens). Not all backends
+	// send it (a proxy may strip include_usage); when absent the stats line
+	// just shows less detail.
 	Usage *struct {
 		PromptTokens     int `json:"prompt_tokens"`
 		CompletionTokens int `json:"completion_tokens"`
@@ -104,6 +104,21 @@ func chunkErrorMessage(c *sseChunk) string {
 	return ""
 }
 
+// llmHTTPError is a non-200 response from the LLM endpoint. It carries the
+// status code so callers can distinguish a context-overflow 400 (the tool loop
+// recovers from it by summarising completed small turns, see foldHistory)
+// from other failures. Error() reproduces the prior bare-string message so logs
+// and UI surfaces are unchanged.
+type llmHTTPError struct {
+	Status int
+	Body   string
+	URL    string
+}
+
+func (e *llmHTTPError) Error() string {
+	return fmt.Sprintf("LLM returned %d: %s [URL: %s]", e.Status, e.Body, e.URL)
+}
+
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
 // sid scopes the debug log: req body and raw SSE response are appended to
 // .codehalter/session_<sid>.log so a single file captures everything that
@@ -126,11 +141,10 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// server ground truth for the cache split. Harmless if ignored.
 	reqBody["timings_per_token"] = true
 	// stream_options.include_usage asks the server to emit a final SSE chunk
-	// carrying prompt_tokens / completion_tokens. The chars/4 estimator can be
-	// 30% wrong on tool-heavy JSON; this gives us the server's own count so
-	// compressHistory triggers on ground truth when available. A backend that
-	// ignores this (or a proxy that strips it) leaves prompt_tokens at 0, so
-	// compressHistory falls back to the estimate rather than never firing.
+	// carrying prompt_tokens / completion_tokens, the server's own count for
+	// the per-turn "✅ Done" usage stats. A backend that ignores it (or a proxy
+	// that strips it) leaves the counts at 0, so the stats line just shows less
+	// detail.
 	reqBody["stream_options"] = map[string]any{"include_usage": true}
 	reqBody["messages"] = messages
 	if tools != nil {
@@ -246,7 +260,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		if json.Unmarshal(bodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
 			msg = apiErr.Error.Message
 		}
-		return "", nil, "", fmt.Errorf("LLM returned %d: %s [URL: %s]", resp.StatusCode, msg, resp.Request.URL.String())
+		return "", nil, "", &llmHTTPError{Status: resp.StatusCode, Body: msg, URL: resp.Request.URL.String()}
 	}
 
 	var fullText strings.Builder
@@ -359,18 +373,12 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	}
 	scanErr := scanner.Err()
 
-	// Record the server's reported prompt_tokens on the session so
-	// compressHistory can trigger on ground truth. Only the main session
-	// owns the foreground prefix cache, but storing on every session is
-	// harmless and keeps subagent telemetry honest. sid="" (probes/tests)
-	// has no session, skip. On a scan failure the stream broke before the
-	// usage chunk, so promptTokens is 0 and this is a no-op anyway.
+	// Sum the server's reported usage into the turn for the "✅ Done" stats line.
+	// sid="" (probes/tests) has no session, skip. A scan failure means the stream
+	// broke before the usage chunk, so the counts are 0 and this is a no-op.
 	if sess := a.getSession(sid); sess != nil {
-		if scanErr == nil && promptTokens > 0 {
-			sess.SetLastCompletePromptTokens(promptTokens)
-		}
-		// Sum usage into the turn (foreground + background). Derive evaluated from
-		// cached_tokens when timings are absent; -1 means no cache info reported.
+		// Derive evaluated from cached_tokens when timings are absent; -1 means no
+		// cache info reported.
 		if evaluatedTokens < 0 && cachedTokens >= 0 && promptTokens > 0 {
 			evaluatedTokens = promptTokens - cachedTokens
 		}

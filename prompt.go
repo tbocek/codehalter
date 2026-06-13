@@ -566,7 +566,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		sess.saveOrLog()
 	}
 
-	// Reject prompts whose text alone would breach the compaction trigger.
+	// Reject prompts whose text alone would breach the context-size guard.
 	// Even on a fresh session, system prompt + skills + the assistant
 	// reply won't fit alongside a user message that big, and letting
 	// llmStream error out mid-stream is worse UX than refusing up front.
@@ -642,9 +642,10 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	if sess != nil {
 		sess.resetTurnStats(time.Now())
 		// Anchor the in-flight turn at the prompt just appended by the caller
-		// (Prompt / proposeFix), so mid-turn compaction keeps this whole turn —
-		// human prompt plus the synthetic subtask/doc prompts orchestrate adds —
-		// verbatim while folding only the completed turns before it.
+		// (Prompt / proposeFix), so the 400-recovery's first fold (foldHistory at
+		// turnStartIndex) keeps this whole turn — human prompt plus the synthetic
+		// subtask/doc prompts orchestrate adds — verbatim while folding only the
+		// completed turns before it.
 		sess.markTurnStart()
 	}
 	result, err := a.orchestrate(ctx, sid)
@@ -662,21 +663,15 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	}
 
 	if err != nil {
-		// A cancelled turn returns control to the user without the epilogue below,
-		// so compact here too. Background ctx because the request ctx is already
-		// cancelled (its UI chunks would otherwise be dropped).
-		if sess != nil && isCancelled(err) {
-			a.compressHistory(context.Background(), sess, false, estimateMessageTokens(a.buildLLMContext(sess)))
-		}
 		return err
 	}
 	if sess == nil || result.Text == "" {
 		return nil
 	}
 	// Epilogue — the turn boundary, where control returns to the user. The note
-	// was enqueued above; here we report stats, commit the turn's edits, and
-	// compact at the boundary trigger if the session crossed it (the mid-turn
-	// overflow valve in runToolLoop may also have compacted already). Stats first.
+	// was enqueued above; here we report stats and commit the turn's edits. There
+	// is no proactive compaction: it is reactive now, driven by a context-overflow
+	// 400 in runToolLoopSeeded (see foldHistory). Stats first.
 	if r := sess.turnStats(); r.activeMs > 0 {
 		// \n\n keeps the stats on their own markdown line. With the server cache
 		// split, headline the work done (evaluated + gen) plus sent/cached%;
@@ -701,7 +696,6 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line + "\n"}})
 	}
 	a.backgroundGitCommit(sess)
-	a.compressHistory(ctx, sess, false, estimateMessageTokens(a.buildLLMContext(sess)))
 	return nil
 }
 

@@ -146,7 +146,7 @@ type Session struct {
 	Summary   string    `toml:"summary,omitempty"`
 	// SystemPrompt holds the rendered skills + project context that leads
 	// every LLM call. Set on the first user turn (see Prompt) and refreshed
-	// after each compressHistory rotation — so it survives the summariser
+	// after each foldHistory rotation — so it survives the summariser
 	// (which otherwise compresses skills away) and reflects current
 	// .codehalter/SKILL-*.md content. Emitted by buildLLMContext as the
 	// leading user message before any Summary.
@@ -155,7 +155,7 @@ type Session struct {
 	// Shadow holds one structured per-turn note (Goal / Constraints / Progress /
 	// Decisions / Next Steps / Critical Context, per SUMMARISE.md) for every
 	// COMPLETED turn since the last compaction — produced by the background
-	// summariser at each turn boundary. compressHistory folds the whole buffer
+	// summariser at each turn boundary. foldHistory folds the whole buffer
 	// into Summary when it rotates, so a note exists for every turn it archives.
 	// Persisted (toml) so the notes survive a restart; the live context never
 	// shows them — they exist only to feed the next compaction.
@@ -165,9 +165,9 @@ type Session struct {
 	// phaseActive=true means a phase entry is showing as in_progress and
 	// must be marked completed before Prompt returns; phaseCurrent is the
 	// 0-based index into phaseNames it refers to. Guarded by phaseMu, NOT
-	// the main session mu — compressHistory holds sess.mu across long LLM
-	// calls and llmStream calls setStatus mid-stream, so reusing sess.mu
-	// for phase reads would deadlock.
+	// the main session mu — llmStream calls setStatus mid-stream during long
+	// calls while session writers hold sess.mu, so reusing sess.mu for phase
+	// reads would deadlock.
 	phaseMu      sync.Mutex
 	phaseActive  bool
 	phaseCurrent int
@@ -327,20 +327,6 @@ type Session struct {
 	// surface as one-line notices / fix cards instead of re-dumping the whole
 	// setup screen mid-conversation. Not persisted — a restart re-shows it once.
 	capabilitiesShown bool `toml:"-"`
-	// lastCompletePromptTokens is the server-reported prompt_tokens count
-	// from the most recent llmStream call on this session, captured via
-	// stream_options.include_usage. "Complete" because every llmStream call
-	// re-sends the whole conversation prefix (system prompt + summary +
-	// every prior message + the new turn) — this single reading is the
-	// cumulative context size, not a per-message delta. Drives the
-	// compressHistory trigger: once it crosses ~80% of mainSlotTokens we
-	// rotate, no estimator required. In-memory only — a restart resets to
-	// 0, which is correct (the first turn after restart cannot exceed
-	// n_ctx, and the next llmStream call will refresh the count). Guarded
-	// by lastTokensMu so llmStream's background-thread writes don't race
-	// compressHistory's read.
-	lastTokensMu             sync.Mutex
-	lastCompletePromptTokens int
 
 	// Per-turn stats for the "✅ Done" line: reset at Prompt start, summed
 	// during the turn, read at the end. turnStart is wall-clock; turnHumanWaitMs
@@ -453,25 +439,6 @@ func (s *Session) turnStats() turnReport {
 		promptMs:        s.turnPromptMs,
 		genMs:           s.turnGenMs,
 	}
-}
-
-// SetLastCompletePromptTokens records the server-reported prompt_tokens for
-// the most recent llmStream call on this session. Called from llmStream's
-// hot path.
-func (s *Session) SetLastCompletePromptTokens(n int) {
-	s.lastTokensMu.Lock()
-	s.lastCompletePromptTokens = n
-	s.lastTokensMu.Unlock()
-}
-
-// LastCompletePromptTokens returns the server-reported prompt_tokens for the
-// most recent llmStream call, or 0 when no call has run yet on this session.
-// "Complete" because the value already covers the whole conversation prefix
-// re-sent on that call — callers should NOT sum across calls.
-func (s *Session) LastCompletePromptTokens() int {
-	s.lastTokensMu.Lock()
-	defer s.lastTokensMu.Unlock()
-	return s.lastCompletePromptTokens
 }
 
 // recallSubagent returns a prior result for the given task hash if one exists.
@@ -724,7 +691,7 @@ func (s *Session) enqueueSummarise(t summariseTask, runner func(summariseTask)) 
 }
 
 // waitSummarise blocks until no summariser task remains outstanding (queued or
-// in-flight). compressHistory uses it before folding: every completed turn's
+// in-flight). foldHistory uses it before folding: every completed turn's
 // note must be in the Shadow buffer, since compaction folds the whole buffer
 // with no anchor held back. Only ever called past the trigger check, so a
 // below-budget turn never stalls on it.
@@ -789,6 +756,27 @@ func (s *Session) turnStartIndex() int {
 		return len(s.Messages)
 	}
 	return s.turnStartIdx
+}
+
+// lastAssistantIndex returns the index of the most recent assistant message in
+// the in-flight large turn (at or after turnStartIdx), i.e. the start of the
+// unfinished small turn. The 400 recovery folds everything before it and keeps
+// it verbatim. Falls back to turnStartIndex when the turn has no assistant
+// message yet (its first call 400'd), so foldHistory then keeps the whole
+// in-flight turn rather than slicing into a prompt-only window.
+func (s *Session) lastAssistantIndex() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	start := s.turnStartIdx
+	if start < 0 || start > len(s.Messages) {
+		start = 0
+	}
+	for i := len(s.Messages) - 1; i >= start; i-- {
+		if s.Messages[i].Role == "assistant" {
+			return i
+		}
+	}
+	return start
 }
 
 // resetTurnStart is called right after rotate() trims the message prefix: the
@@ -873,7 +861,7 @@ func (s *Session) saveOrLog() {
 // file, then resets s in place to carry only `keep` raw messages and `summary`
 // as the rolled-up prior context. The live session keeps its own ID and
 // filePath; only its on-disk contents change. Returns the archive's id.
-// Called only from compressHistory in the post-orchestrate epilogue, where
+// Called only from foldHistory on a context-overflow 400, where
 // no concurrent writer exists for the session — so the in-place mutation of
 // s.Summary/s.Messages here doesn't take the lock; the follow-up Save() does.
 func (s *Session) rotate(keep []Message, summary string) (string, error) {

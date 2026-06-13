@@ -9,125 +9,101 @@ import (
 	"time"
 )
 
-// compactTriggerPct is the turn-boundary trigger: after a turn completes, if the
-// context is at/above this fraction of the slot budget, fold every completed
-// turn into Summary and start the next turn fresh. midTurnTriggerPct is the
-// higher mid-turn trigger: only when an in-flight turn pushes the context this
-// high do we compact without waiting for the boundary — and then we keep the
-// in-flight turn verbatim and fold only the completed turns before it.
-const (
-	compactTriggerPct = 80
-	midTurnTriggerPct = 90
-)
+// compactTriggerPct is the up-front input guard, NOT a compaction trigger.
+// A user prompt whose text alone would exceed this fraction of the slot budget
+// is refused (prompt.go), and the startup banner reports it (prepare.go).
+// Compaction itself is purely reactive now: driven by the server's
+// context-overflow 400, see foldHistory and the recovery loop in
+// runToolLoopSeeded. No chars/4 estimate anywhere.
+const compactTriggerPct = 80
 
-// estimateMessageTokens is a chars/4 estimate of a context — the compaction
-// fallback when the backend reports no prompt_tokens (a proxy stripping
-// include_usage), where LastCompletePromptTokens stays 0 and the context would
-// otherwise grow unbounded. ~30% off on tool JSON, but the 80% trigger has room.
-func estimateMessageTokens(messages []llmMessage) int {
-	chars := 0
-	for _, m := range messages {
-		switch c := m.Content.(type) {
-		case string:
-			chars += len(c)
-		case nil:
-		default:
-			chars += len(fmt.Sprint(c)) // image parts etc. — rough; text dominates
-		}
-		for _, tc := range m.ToolCalls {
-			chars += len(tc.Function.Name) + len(tc.Function.Arguments)
-		}
-	}
-	return chars / 4
-}
-
-// compressHistory rotates the session when the prompt size crosses the trigger
-// fraction of the slot budget — max(server prompt_tokens, curTokens), where
-// curTokens is the caller's chars/4 estimate (keeps compaction working on
-// backends that report no usage). The pre-rotation state is frozen as a
-// "session_archive_*" TOML; the live session keeps its ID + path so Zed's panel
-// continues. On any failure we DO NOT rotate.
+// foldHistory folds Messages[:keepFrom] into the rolling Summary and keeps
+// Messages[keepFrom:] verbatim, returning true when it folded anything. There is
+// NO token estimate: the recovery loop in runToolLoopSeeded calls this on a
+// context-overflow 400 and escalates keepFrom from turnStartIndex (fold the
+// COMPLETED LARGE turns from their ready Shadow notes, keep the whole in-flight
+// large turn) to lastAssistantIndex (fold the in-flight large turn's COMPLETED
+// SMALL turns with a synchronous summary, keep only the unfinished small turn).
+// The server's 400 between the two steps decides whether the cheaper step was
+// enough — if the in-flight large turn is small enough on its own, step 2 never
+// runs.
 //
-// midTurn picks the policy. At the turn boundary (midTurn=false) the trigger is
-// compactTriggerPct and we fold EVERY completed turn into Summary, keeping
-// nothing verbatim — the next turn starts fresh. Mid-turn (midTurn=true, from
-// the tool-loop overflow check) the trigger is the higher midTurnTriggerPct and
-// we keep the in-flight turn (Messages[turnStart:]) verbatim, folding only the
-// completed turns before it. Either way the background summariser has already
-// produced one note per completed turn (boundary path runs it just before this;
-// the in-flight turn has no note yet and is exactly what we keep), so folding
-// the whole Shadow buffer rotates out exactly the turns those notes cover.
-// Returns true when it compacted, so a mid-loop caller rebuilds its context.
-func (a *agent) compressHistory(ctx context.Context, sess *Session, midTurn bool, curTokens int) bool {
-	if server := sess.LastCompletePromptTokens(); server > curTokens {
-		curTokens = server
-	}
-	trigger := compactTriggerPct
-	if midTurn {
-		trigger = midTurnTriggerPct
-	}
-	if curTokens <= a.mainSlotTokens*trigger/100 {
-		return false
-	}
+// Messages[:turnStartIdx] are completed LARGE turns, already noted in Shadow.
+// Messages[turnStartIdx:keepFrom] is the in-flight slice being folded; it has no
+// note yet, so it is summarised synchronously here. Reuses rotate's epilogue.
+func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bool {
+	// Drain pending background notes for the completed LARGE turns first, so
+	// rotating them out doesn't lose their summary.
+	sess.waitSummarise()
 
-	// keepFrom is the first message we DON'T fold. Boundary: fold everything.
-	// Mid-turn: keep the in-flight turn verbatim, fold the completed turns ahead
-	// of it. keepFrom==0 means there's nothing to compact yet (no messages, or
-	// the in-flight turn IS the whole context) — not a failure.
-	keepFrom := len(sess.Messages)
-	if midTurn {
-		keepFrom = sess.turnStartIndex()
+	sess.mu.Lock()
+	if keepFrom > len(sess.Messages) {
+		keepFrom = len(sess.Messages)
 	}
 	if keepFrom <= 0 {
-		return false
+		sess.mu.Unlock()
+		return false // the kept window is the whole live context; nothing to fold
 	}
-
-	// Every completed turn we're about to rotate must have its note in the
-	// buffer first — no anchor is held back, so wait for all of them.
-	a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⏳ Waiting for background summary…\n"}})
-	sess.waitSummarise()
+	start := sess.turnStartIdx
+	if start < 0 || start > keepFrom {
+		start = 0
+	}
+	inFlightCompleted := append([]Message(nil), sess.Messages[start:keepFrom]...)
 	keepMessages := append([]Message(nil), sess.Messages[keepFrom:]...)
-	shadow := sess.drainShadow()
+	sess.mu.Unlock()
 
-	// Empty buffer → the completed turns produced no notes (background summariser
-	// unconfigured/unreachable; backgroundSummarise stores a raw fallback note
-	// when the LLM call itself fails, so this is genuinely "no summariser").
-	// Skip rather than rotate those turns into oblivion; the next turn retries.
-	if shadow == "" {
-		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ History compaction skipped — no turn summaries available to fold. Check that the background-LLM slot is reachable; the session may approach n_ctx if this persists.\n\n"}})
-		return false
+	// Notes for everything rotating out: drained Shadow (completed large turns,
+	// Messages[:start]) plus a synchronous summary of any in-flight slice being
+	// folded (Messages[start:keepFrom]), which has no pre-computed note.
+	var notes strings.Builder
+	if shadow := sess.drainShadow(); shadow != "" {
+		notes.WriteString(shadow)
 	}
+	if len(inFlightCompleted) > 0 {
+		// Announce: hitting the limit mid-turn is routine management, NOT an error
+		// (no ⚠/❌). This synchronous summarise can take a moment.
+		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "🗜 Context limit reached — compacting: summarising completed small turns, keeping the unfinished one…\n"}})
+		var note string
+		if prompt := a.loadPromptFile(sess.ID, "SUMMARISE.md"); prompt != "" {
+			if conn := a.connForBackgroundLLM(); conn != nil {
+				note = a.summariseSlice(ctx, sess, conn, prompt, inFlightCompleted)
+			}
+		}
+		if note == "" {
+			note = fallbackTurnNote(inFlightCompleted)
+		}
+		if notes.Len() > 0 {
+			notes.WriteString("\n\n")
+		}
+		notes.WriteString(note)
+	}
+	if notes.Len() == 0 {
+		return false // nothing to fold (no shadow notes and no in-flight slice)
+	}
+
 	var b strings.Builder
 	if sess.Summary != "" {
 		b.WriteString(sess.Summary)
 		b.WriteString("\n\n")
 	}
-	b.WriteString(shadow)
-	summary := b.String()
+	b.WriteString(notes.String())
 
-	archiveID, err := sess.rotate(keepMessages, summary)
+	archiveID, err := sess.rotate(keepMessages, b.String())
 	if err != nil {
 		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Compaction failed: " + err.Error() + "\n\n"}})
 		return false
 	}
-	// The kept window now begins at index 0, so the in-flight turn (if any) does
-	// too — re-anchor turnStart before more messages append to it.
 	sess.resetTurnStart()
-	// Re-render SystemPrompt so skills + project context survive the
-	// summariser folding the original rendering into Summary. Compaction is the
-	// one place the prompt may change, so this is where mid-session-seeded skills
-	// (injected as user messages until now) finally enter the prefix — reset the
-	// promptSkills baseline to match.
+	// Re-render the system prompt so skills + project context survive the fold.
 	if sysPrompt, err := a.systemPrompt(sess.ID); err == nil {
 		sess.SystemPrompt = sysPrompt
 		sess.promptSkills = skillFiles(sess.Cwd)
 	}
 	if err := sess.Save(); err != nil {
-		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ History compacted in-memory but persisting %s failed: %s. The archive %s is on disk, but the live session file is stale and will diverge until the next successful Save.\n\n", sess.filePath, err.Error(), archiveID)}})
-		return true // in-memory state IS compacted; a rebuild from sess is valid
+		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Compacted in-memory but persisting failed: %s. Archive %s is on disk; the live session file will diverge until the next Save.\n\n", err.Error(), archiveID)}})
+		return true
 	}
-
-	a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("🗜 History compacted — archived as %s\n\n", archiveID)}})
+	a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("🗜 Compacted — archived as %s\n\n", archiveID)}})
 	return true
 }
 
@@ -167,60 +143,67 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	sess.enqueueSummarise(summariseTask{Turn: turn, Conn: conn}, func(t summariseTask) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-
-		var turnBuf strings.Builder
-		var images []ImageData
-		for _, m := range t.Turn {
-			images = append(images, m.Images...)
-			switch m.Role {
-			case "user":
-				turnBuf.WriteString("\n<user_turn>\n")
-				turnBuf.WriteString(clipBytes(m.Content, maxLLMInputBytes))
-				turnBuf.WriteString("\n</user_turn>")
-			case "assistant":
-				if strings.TrimSpace(m.Content) != "" {
-					turnBuf.WriteString("\n<assistant_turn>\n")
-					turnBuf.WriteString(clipBytes(m.Content, maxLLMInputBytes))
-					turnBuf.WriteString("\n</assistant_turn>")
-				}
-				if len(m.ToolUses) > 0 {
-					turnBuf.WriteString("\n<tool_calls>\n")
-					for _, tu := range m.ToolUses {
-						fmt.Fprintf(&turnBuf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncateForLLM(tu.ID, tu.Name, tu.Input, tu.Output))
-					}
-					turnBuf.WriteString("</tool_calls>")
-				}
-			}
-		}
-		// Cap the whole rendered turn so a long (many-iteration) turn can't blow the
-		// background slot's context. clipBytes keeps the turn's head (the request +
-		// early work) and tail (recent work + outcome), which is what a terse note
-		// needs; without it a 100-iteration turn would 400 and degrade to the raw
-		// fallback note.
-		full := prompt + "\n" + clipBytes(turnBuf.String(), maxLLMInputBytes)
-
-		out, _, _, err := a.llmStream(ctx, sess.ID, t.Conn, []llmMessage{{Role: "user", Content: full}}, nil, nil, nil)
-		if err != nil || strings.TrimSpace(out) == "" {
-			slog.Debug("backgroundSummarise: llm call failed — storing raw fallback note", "sid", sess.ID, "err", err)
-			out = fallbackTurnNote(t.Turn)
-		}
-		// Image IDs are structured data — append deterministically so handles
-		// survive the summariser's paraphrasing, otherwise view_image breaks
-		// after compaction.
-		if len(images) > 0 {
-			var refs strings.Builder
-			refs.WriteString("Attached images:")
-			for _, img := range images {
-				fmt.Fprintf(&refs, "\n- %s (%s) — call view_image id=%s to view", img.ID, img.MimeType, img.ID)
-			}
-			out = strings.TrimRight(out, "\n") + "\n\n" + refs.String()
-		}
-		sess.appendShadow(out)
+		sess.appendShadow(a.summariseSlice(ctx, sess, t.Conn, prompt, t.Turn))
 		// Persist immediately so the note survives a process kill in the idle
 		// gap before the next turn's save — that gap is exactly where the old
 		// in-memory-only buffer lost notes across a restart.
 		sess.saveOrLog()
 	})
+}
+
+// summariseSlice renders a contiguous slice of messages and condenses it into a
+// structured note via the SUMMARISE.md summariser, falling back to a clipped raw
+// transcript when the LLM call fails or returns empty. Image IDs are appended
+// deterministically so they survive the summariser's paraphrasing and view_image
+// keeps working after compaction. Both the per-turn background summariser (whole
+// large turn) and the in-flight overflow recovery (the completed small turns of
+// the in-flight large turn, see foldHistory) go through here.
+func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConnection, prompt string, turn []Message) string {
+	var turnBuf strings.Builder
+	var images []ImageData
+	for _, m := range turn {
+		images = append(images, m.Images...)
+		switch m.Role {
+		case "user":
+			turnBuf.WriteString("\n<user_turn>\n")
+			turnBuf.WriteString(clipBytes(m.Content, maxLLMInputBytes))
+			turnBuf.WriteString("\n</user_turn>")
+		case "assistant":
+			if strings.TrimSpace(m.Content) != "" {
+				turnBuf.WriteString("\n<assistant_turn>\n")
+				turnBuf.WriteString(clipBytes(m.Content, maxLLMInputBytes))
+				turnBuf.WriteString("\n</assistant_turn>")
+			}
+			if len(m.ToolUses) > 0 {
+				turnBuf.WriteString("\n<tool_calls>\n")
+				for _, tu := range m.ToolUses {
+					fmt.Fprintf(&turnBuf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncateForLLM(tu.ID, tu.Name, tu.Input, tu.Output))
+				}
+				turnBuf.WriteString("</tool_calls>")
+			}
+		}
+	}
+	// Cap the whole rendered slice so a long (many-iteration) turn can't blow the
+	// background slot's context. clipBytes keeps the slice's head (the request +
+	// early work) and tail (recent work + outcome), which is what a terse note
+	// needs; without it a 100-iteration turn would 400 and degrade to the raw
+	// fallback note.
+	full := prompt + "\n" + clipBytes(turnBuf.String(), maxLLMInputBytes)
+
+	out, _, _, err := a.llmStream(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: full}}, nil, nil, nil)
+	if err != nil || strings.TrimSpace(out) == "" {
+		slog.Debug("summariseSlice: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
+		out = fallbackTurnNote(turn)
+	}
+	if len(images) > 0 {
+		var refs strings.Builder
+		refs.WriteString("Attached images:")
+		for _, img := range images {
+			fmt.Fprintf(&refs, "\n- %s (%s) — call view_image id=%s to view", img.ID, img.MimeType, img.ID)
+		}
+		out = strings.TrimRight(out, "\n") + "\n\n" + refs.String()
+	}
+	return out
 }
 
 // fallbackTurnNote builds a terse, clipped raw transcript of a turn for when the

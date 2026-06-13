@@ -156,7 +156,7 @@ func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("systemPrompt: %v", err)
 	}
-	for _, want := range []string{"SYSTEM_SENTINEL", "PLAN_SENTINEL", "EXEC_SENTINEL"} {
+	for _, want := range []string{"PLAN_SENTINEL", "EXEC_SENTINEL"} {
 		if !strings.Contains(sp, want) {
 			t.Errorf("system prompt missing %q — phase guidance not carried in the prefix", want)
 		}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -577,26 +578,50 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			stampTiming()
 			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
 		}
-		// Mid-turn overflow check — BEFORE the call, on the in-flight context.
-		// The previous batch may have ballooned `messages` (read/search outputs are
-		// live-exempt from truncation), and checking after the call is useless when
-		// that call is the one that 400s. Size = chars/4 estimate, max'd with the
-		// server's last count inside compressHistory (so it works with no usage).
-		// midTurn=true: fires only above midTurnTriggerPct and keeps this in-flight
-		// turn verbatim, folding the completed turns before it. Rebuild on compact.
-		if (phase == "plan" || phase == "execute") && sid != "" {
-			if s := a.getSession(sid); s != nil && s.Depth == 0 {
-				if a.compressHistory(ctx, s, true, estimateMessageTokens(messages)) {
-					messages = a.buildLLMContext(s)
-				}
-			}
-		}
-
 		streamStart := time.Now()
 		if res.StartedAt.IsZero() {
 			res.StartedAt = streamStart
 		}
-		text, calls, reasoning, err := a.llmStream(ctx, sid, conn, messages, tools, on, think)
+		// Call the model. On a context-overflow 400 (ground truth from the server,
+		// no token estimate), escalate the fold and retry: step 1 keeps the WHOLE
+		// in-flight large turn (folding only completed large turns from their ready
+		// notes); if that still 400s, step 2 keeps only the unfinished small turn
+		// (folding this turn's completed small turns). Each step strictly shrinks
+		// the context, so it terminates: out of steps, the 400 surfaces.
+		var text, reasoning string
+		var calls []toolCall
+		var err error
+		recoverStep := 0
+		recoverKeepFrom := []func(*Session) int{(*Session).turnStartIndex, (*Session).lastAssistantIndex}
+		for {
+			text, calls, reasoning, err = a.llmStream(ctx, sid, conn, messages, tools, on, think)
+			if err == nil {
+				break
+			}
+			var he *llmHTTPError
+			if !errors.As(err, &he) || he.Status != 400 || // 400 = context overflow
+				(phase != "plan" && phase != "execute") || sid == "" {
+				break
+			}
+			s := a.getSession(sid)
+			if s == nil || s.Depth != 0 {
+				break
+			}
+			// Advance through fold steps until one frees something.
+			folded := false
+			for recoverStep < len(recoverKeepFrom) {
+				keepFrom := recoverKeepFrom[recoverStep](s)
+				recoverStep++
+				if a.foldHistory(ctx, s, keepFrom) {
+					folded = true
+					break
+				}
+			}
+			if !folded {
+				break
+			}
+			messages = a.buildLLMContext(s)
+		}
 		genElapsed += time.Since(streamStart)
 		if err != nil {
 			res.Text = allText.String()
