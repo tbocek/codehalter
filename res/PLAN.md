@@ -66,6 +66,8 @@ Each subtask:
   - `["Run gopls --version via run_command", "Confirm gopls is in .devcontainer/Dockerfile via search_text"]` — install-then-persist.
   - `[]` — ONLY pure-lookup subtasks that edit nothing.
 
+A subtask that WRITES or CHANGES code: its `verify` MUST run the project's TEST target (`just:test` / `npm:test` / …), never a build-only check — a runtime bug (wrong JSON shape, nil deref, off-by-one) compiles fine, so a build is green on broken code. If no test covers the new behavior, the subtask `description` must include WRITING one: a `*_test.go` (or the project's format) that round-trips a real example of the documented input, success AND error paths. Build verifies "it compiles", never "it works".
+
 The executor runs every `verify` before respond; fails → fix and re-run; can't → subtask fails and the orchestrator replans.
 
 ## report_only and direct answers — EITHER answer OR plan, never both, never neither

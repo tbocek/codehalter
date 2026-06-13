@@ -27,6 +27,13 @@ Run every `verify` entry first. Per entry:
 4. Pass → next entry.
 Call `respond` ONLY after all pass (or spent turn budget on fixes). respond w/ failing checks → orchestrator replans. Empty verify recipe (pure lookup) → skip this, respond with findings.
 
+## Build is NOT verification — for code, write + run a test
+`just:build` / `go build` / `tsc` only proves it COMPILES. A wrong `json.Unmarshal` target (array into a struct), nil deref, off-by-one, or any logic bug compiles fine and fails only at RUNTIME. So a build-only check passes broken code.
+If this subtask WROTE or CHANGED code:
+- Write a test (`*_test.go`, or the project's test format) that exercises the new behavior with a REAL example of its documented input — round-trip the parse/serialise, cover the success AND the error path.
+- Run the TEST target (`just:test` / `npm:test` / …), NOT just build, and make it pass before `respond`.
+- A `verify` recipe that only builds is INSUFFICIENT for code — add the test step yourself. New behavior with no test that runs it = subtask NOT done.
+
 ## Sustainability
 A `run_command` install you don't persist to `.devcontainer/Dockerfile` vanishes on rebuild. Install anything → pair with a Dockerfile edit in same loop, self-check install is in Dockerfile (planner usually puts this in verify; add if missing).
 

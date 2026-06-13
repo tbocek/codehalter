@@ -22,6 +22,9 @@
 - `main.go` = entry. Tests in `*_test.go` next to file under test.
 - Run tests via project task runner (just, make, etc.), NOT raw `go test`.
 
+## Build ≠ test
+`just:build` / `go build` only proves it COMPILES. A wrong `json.Unmarshal` target (array into a struct), nil deref, or off-by-one compiles fine and fails only at RUNTIME — build stays green on broken code. Wrote or changed code that parses/serialises external input (a tool handler, an API payload, config)? → write a `*_test.go` that round-trips a REAL example of the documented format (success AND error path), run `just:test`, make it pass. NOT just `just:build`.
+
 ## Probe toolchain once
 - `go version`, `go env`, `which go` = session-invariant. Once a result shows answer → do NOT re-run with diff cwd/redirect/wrapper (`cd X && go version`, `go version 2>&1`); output won't change.
 - Same for go.mod directives: already read `go X.Y` line this turn → don't re-read.
