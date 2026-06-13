@@ -266,12 +266,15 @@ const readUnchangedMarker = "already in your context and unchanged"
 // not an empty result because the dir name matches the junk list.
 func listProjectFiles(root string) []string {
 	var files []string
-	// The walk fn swallows per-entry errors (returns nil) by design — one
-	// unreadable file shouldn't abort the listing. WalkDir itself only errors
-	// if root can't be walked at all; log that rather than returning an
-	// empty list with no trace.
+	// The walk fn swallows per-entry errors (one unreadable file shouldn't abort
+	// the listing) but propagates the error on root itself: a missing or
+	// unreadable root would otherwise return an empty slice indistinguishable
+	// from a real empty dir, with no trace.
 	if err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			if path == root {
+				return err
+			}
 			return nil
 		}
 		if d.IsDir() {
@@ -318,11 +321,17 @@ func init() {
 			dir = resolved
 		}
 
+		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+			return fmt.Sprintf("error: no such directory: %s", dir), false
+		}
 		tcId := a.StartToolCall(ctx, sid, "Listing: "+dir, "search", []ToolCallLocation{{Path: dir}})
 		files := listProjectFiles(dir)
 		a.CompleteToolCallTitled(ctx, sid, tcId,
 			fmt.Sprintf("Listing: %s (%d files)", dir, len(files)),
 			[]ToolCallContent{TextContent(fmt.Sprintf("%d files", len(files)))})
+		if len(files) == 0 {
+			return "(directory is empty: " + dir + ")", false
+		}
 		return strings.Join(files, "\n"), false
 	}})
 

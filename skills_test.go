@@ -28,18 +28,18 @@ func TestEnsureSkillsSeedsOnceAndLeavesEdits(t *testing.T) {
 	if err := ensureSkills(cwd, nil, osInfo{}); err != nil {
 		t.Fatalf("ensureSkills (seed): %v", err)
 	}
-	if readSkill(t, dir, "SKILL-container.md") == "" {
-		t.Fatal("SKILL-container.md should have been seeded")
+	if readSkill(t, dir, "SKILL-base.md") == "" {
+		t.Fatal("SKILL-base.md should have been seeded")
 	}
 	// User edits it; a second pass must NOT overwrite (seed-once).
-	if err := os.WriteFile(filepath.Join(dir, "SKILL-container.md"), []byte("my edits"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "SKILL-base.md"), []byte("my edits"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := ensureSkills(cwd, nil, osInfo{}); err != nil {
 		t.Fatalf("ensureSkills (re-run): %v", err)
 	}
-	if got := readSkill(t, dir, "SKILL-container.md"); got != "my edits" {
-		t.Errorf("SKILL-container.md = %q, want 'my edits' (seed-once must not overwrite existing)", got)
+	if got := readSkill(t, dir, "SKILL-base.md"); got != "my edits" {
+		t.Errorf("SKILL-base.md = %q, want 'my edits' (seed-once must not overwrite existing)", got)
 	}
 }
 

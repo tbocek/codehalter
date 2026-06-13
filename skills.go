@@ -28,8 +28,8 @@ var skillBash string
 //go:embed res/SKILL-c.md
 var skillC string
 
-//go:embed res/SKILL-container.md
-var skillContainer string
+//go:embed res/SKILL-base.md
+var skillBase string
 
 //go:embed res/SKILL-makefile.md
 var skillMakefile string
@@ -113,7 +113,7 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 	}
 
 	// Always-on container skill.
-	if err := seed("SKILL-container.md", skillContainer); err != nil {
+	if err := seed("SKILL-base.md", skillBase); err != nil {
 		return err
 	}
 	// Per-stack skills (driven by files in the tree).

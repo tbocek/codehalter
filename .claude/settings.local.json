@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git check-ignore *)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}

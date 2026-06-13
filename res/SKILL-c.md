@@ -38,7 +38,7 @@ server never starts. Check `node --version` first.
 1. Install `clangd` via the OS package manager (`apk add clang clang-extra-tools`
    / `apt-get install -y clangd` / `dnf install -y clang-tools-extra`); verify
    `clangd --version`.
-2. Install **Node ≥ 22** + the project's package manager (see SKILL-container.md) —
+2. Install **Node ≥ 22** + the project's package manager (see SKILL-base.md) —
    verify `node --version` reports 22+, NOT 20. Then drive clangd via lsmcp. If
    lsmcp can't drive clangd cleanly (or Node can't be bumped to 22), use another
    LSP→MCP adapter — verify the `lsp_*` tools actually appear.
@@ -64,7 +64,7 @@ server never starts. Check `node --version` first.
 5. Persist clangd + **Node ≥ 22** (not the distro's default 20) in
    `.devcontainer/Dockerfile`.
 
-## Tooling (install + persist in the Dockerfile if missing — see SKILL-container.md)
+## Tooling (install + persist in the Dockerfile if missing — see SKILL-base.md)
 
 - Format: `clang-format` (honours a `.clang-format`; codehalter auto-formats
   `.c/.h/.cpp` on edit when it's installed).

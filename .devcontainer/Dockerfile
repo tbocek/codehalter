@@ -26,7 +26,3 @@ WORKDIR /home/dev
 RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
     && cd /tmp/yay && makepkg -si --noconfirm \
     && cd / && rm -rf /tmp/yay
-
-# RTK — Rust Token Killer (CLI proxy for 60-90% token reduction on dev commands)
-RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh \
-    && echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/dev/.bashrc
