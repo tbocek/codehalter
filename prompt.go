@@ -436,6 +436,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		sess.readDedupMu.Lock()
 		sess.readDedup = nil
 		sess.readDedupMu.Unlock()
+		sess.searchDedupMu.Lock()
+		sess.searchDedup = nil
+		sess.searchDedupMu.Unlock()
 		sess.readCursorMu.Lock()
 		sess.readCursor = nil
 		sess.readCursorMu.Unlock()

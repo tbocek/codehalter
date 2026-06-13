@@ -202,29 +202,6 @@ func skillFiles(cwd string) []string {
 	return names
 }
 
-// stripShadowSections removes markdown sections that start with "## [SHADOW]"
-// and continue until the next "##" heading or end of file. These are test
-// entries used by the /copy-check-md slash command and must not appear in the
-// system prompt.
-func stripShadowSections(body string) string {
-	var b strings.Builder
-	inShadow := false
-	for _, line := range strings.Split(body, "\n") {
-		if strings.HasPrefix(line, "## [SHADOW]") {
-			inShadow = true
-			continue
-		}
-		if inShadow && strings.HasPrefix(line, "## ") {
-			inShadow = false
-		}
-		if !inShadow {
-			b.WriteString(line)
-			b.WriteString("\n")
-		}
-	}
-	return strings.TrimSuffix(b.String(), "\n")
-}
-
 // loadSkills concatenates every SKILL-*.md present in .codehalter/. Detection
 // (detectStacks) decides which to seed initially, but loading honors whatever
 // the user actually has on disk — drop a SKILL-rust.md in there manually and
@@ -240,7 +217,7 @@ func loadSkills(cwd string) string {
 		if err != nil {
 			continue
 		}
-		content := stripShadowSections(string(data))
+		content := string(data)
 		if content != "" {
 			b.WriteString(content)
 			if !strings.HasSuffix(content, "\n") {

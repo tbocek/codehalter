@@ -732,7 +732,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				repeated = true
 			}
 			callOutHash[key] = h
-			if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read") &&
+			if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read" || tc.Function.Name == "search_text") &&
 				strings.Contains(tu.Output, readUnchangedMarker) {
 				repeated = true
 			}

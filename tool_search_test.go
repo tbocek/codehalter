@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -100,5 +101,36 @@ func TestSearchInFileMatchers(t *testing.T) {
 	limited := searchInFile(path, anyLine.MatchString, 2)
 	if len(limited) != 2 {
 		t.Errorf("limit=2: got %d matches, want 2", len(limited))
+	}
+}
+
+// TestSearchTextDedupOnRepeat pins the search_text dedup: re-running an identical
+// search this turn still returns the hits but leads with the unchanged marker the
+// tool loop scans for, while a search with a different scope is NOT flagged.
+func TestSearchTextDedupOnRepeat(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.Depth = 1
+	ctx := context.Background()
+	if err := os.WriteFile(filepath.Join(s.Cwd, "f.go"), []byte("package main\n// needle here\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var tc toolCall
+	tc.Function.Name = "search_text"
+	tc.Function.Arguments = `{"query":"needle"}`
+
+	if first, _ := a.executeTool(ctx, s.ID, tc); strings.Contains(first, readUnchangedMarker) {
+		t.Fatalf("first search must not be flagged:\n%s", first)
+	}
+	if second, _ := a.executeTool(ctx, s.ID, tc); !strings.Contains(second, readUnchangedMarker) {
+		t.Errorf("a repeated identical search should carry the unchanged marker:\n%s", second)
+	}
+
+	// Same query, different path → different dedup key → NOT a repeat.
+	var scoped toolCall
+	scoped.Function.Name = "search_text"
+	scoped.Function.Arguments = `{"query":"needle","path":"."}`
+	if out, _ := a.executeTool(ctx, s.ID, scoped); strings.Contains(out, readUnchangedMarker) {
+		t.Errorf("a search with a different path must not be flagged as a repeat:\n%s", out)
 	}
 }

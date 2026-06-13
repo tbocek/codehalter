@@ -247,6 +247,13 @@ type Session struct {
 	// fsWrite. In-memory only.
 	readDedupMu sync.Mutex
 	readDedup   map[string]readDedupEntry
+	// searchDedup remembers search_text outcomes for the current Prompt() turn
+	// so a literal-repeat search (same query+path+flags, same results) is flagged
+	// with a note instead of silently re-running. Keyed by the full args, value
+	// is the fnv hash of the result. Same lifecycle as readDedup: reset at the
+	// top of Prompt(). In-memory only.
+	searchDedupMu sync.Mutex
+	searchDedup   map[string]uint64
 	// readCursor remembers, per file path, the next 1-based line continue_read
 	// should serve — set when read_file (or continue_read) returns a partial
 	// chunk, cleared when a chunk reaches EOF. Lets continue_read page forward

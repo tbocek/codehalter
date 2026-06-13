@@ -59,7 +59,8 @@ func init() {
 
 		root := sess.Cwd
 		dir := root
-		if subdir := args["path"]; subdir != "" {
+		subdir := args["path"]
+		if subdir != "" {
 			resolved, err := a.resolvePath(sid, subdir)
 			if err != nil {
 				return "error: " + err.Error(), false
@@ -67,7 +68,14 @@ func init() {
 			dir = resolved
 		}
 
-		tcId := a.StartToolCall(ctx, sid, "Searching: "+query, "search", nil)
+		// label carries the path so two searches with the same query but different
+		// scopes (e.g. `res` vs the whole repo) read distinctly in the UI — a "0
+		// matches in res" then "17 matches" is otherwise indistinguishable.
+		label := query
+		if subdir != "" {
+			label += " in " + subdir
+		}
+		tcId := a.StartToolCall(ctx, sid, "Searching: "+label, "search", nil)
 
 		var results []string
 		files := listProjectFiles(dir)
@@ -98,21 +106,43 @@ func init() {
 			}
 		}
 
-		if len(results) == 0 {
-			a.CompleteToolCallTitled(ctx, sid, tcId,
-				"Searching: "+query+" (no matches)",
-				[]ToolCallContent{TextContent("no matches found")})
-			return "no matches found", false
+		out := "no matches found"
+		summary := "no matches"
+		if len(results) > 0 {
+			summary = fmt.Sprintf("%d matches", len(results))
+			if len(results) >= maxSearchResults {
+				summary += ", limit reached"
+			}
+			out = strings.Join(results, "\n")
 		}
 
-		summary := fmt.Sprintf("%d matches", len(results))
-		if len(results) >= maxSearchResults {
-			summary += ", limit reached"
+		// Literal-repeat dedup: the same query+path+flags returning the same
+		// results this turn gets a note so the model reuses the earlier result
+		// instead of re-running. Mirrors read_file's readUnchangedMarker dedup;
+		// loop.go scans the output for the marker to also count it as a stuck
+		// round (the prepended note changes the bytes, so callOutHash misses it).
+		dedupKey := query + "\x00" + subdir + "\x00" + fmt.Sprintf("%t%t", useRegex, multiline)
+		sum := fnvHash(out)
+		var dedupNote string
+		sess.searchDedupMu.Lock()
+		if prev, ok := sess.searchDedup[dedupKey]; ok && prev == sum {
+			dedupNote = fmt.Sprintf("[note: %s — you already ran this exact search (%s) earlier this turn and the results are UNCHANGED. Re-searching makes no progress; reuse the earlier result.]", readUnchangedMarker, label)
 		}
-		a.CompleteToolCallTitled(ctx, sid, tcId,
-			fmt.Sprintf("Searching: %s (%s)", query, summary),
-			[]ToolCallContent{TextContent(summary)})
-		return strings.Join(results, "\n"), false
+		if sess.searchDedup == nil {
+			sess.searchDedup = map[string]uint64{}
+		}
+		sess.searchDedup[dedupKey] = sum
+		sess.searchDedupMu.Unlock()
+
+		title := "Searching: " + label + " (" + summary + ")"
+		if dedupNote != "" {
+			title += " (repeat)"
+		}
+		a.CompleteToolCallTitled(ctx, sid, tcId, title, []ToolCallContent{TextContent(summary)})
+		if dedupNote != "" {
+			out = dedupNote + "\n" + out
+		}
+		return out, false
 	}})
 }
 
