@@ -426,6 +426,14 @@ const keepSmallTurnTokens = 10_000
 // shown) reasoning channel, so the loop nudges it to write the answer as text.
 const reasoningNudgeBytes = 512
 
+// A mid-response connection drop (server/router closed the stream) is usually
+// momentary, so the recovery loop re-sends the same request a few times with a
+// short backoff before surfacing a clear message instead of a raw EOF.
+const (
+	maxTransientStreamRetries = 2
+	transientStreamBackoff    = 750 * time.Millisecond
+)
+
 // executeFailCap is the per-subtask budget of FAILED rounds (iterations whose
 // tool batch produced a failure). Successful work is uncounted, so a long but
 // productive subtask runs unhindered; only one that keeps hitting failures it
@@ -577,6 +585,11 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	// failedRounds counts iterations whose tool batch produced a failure; the
 	// failSoftCap check below bounces the loop once it accumulates too many.
 	var failedRounds int
+	// thinkingStalled latches once the model burns a whole budget looping in
+	// <think>: every later round in THIS run then starts with thinking off, so a
+	// chronically-stalling model can't re-waste ~max_tokens of reasoning each
+	// round. Scoped to this run — the next phase/subtask re-enables thinking.
+	thinkingStalled := false
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			res.Text = allText.String()
@@ -601,10 +614,46 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
 			(*Session).lastAssistantIndex,
 		}
+		callConn := conn // a <think> stall retries (and latches) on a thinking-off copy
+		if thinkingStalled {
+			callConn = conn.withThinkingDisabled()
+		}
+		thinkingRetried := false // at most one such retry per round
+		transientRetries := 0    // mid-response drops retried up to maxTransientStreamRetries
 		for {
-			text, calls, reasoning, err = a.llmStream(ctx, sid, conn, messages, tools, on, think)
+			text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, tools, on, think)
 			if err == nil {
 				break
+			}
+			// Stuck in <think>: the model burned the whole budget on reasoning with
+			// no content and no tool calls. Retry once on a thinking-off copy so it
+			// must answer directly, and latch it for the rest of the run so it can't
+			// re-burn the budget next round. Any phase/depth — swaps the conn, no
+			// history fold needed.
+			if isStuckThinking(err) && !thinkingRetried {
+				thinkingRetried = true
+				thinkingStalled = true
+				callConn = callConn.withThinkingDisabled()
+				a.logSession(sid, "RECOVER", "model stuck in <think> — retrying with thinking disabled (rest of run)")
+				continue
+			}
+			// Mid-response connection drop (EOF/reset — server or router closed the
+			// stream), distinct from a deliberate cancel. Usually momentary: re-send
+			// a few times, then surface a clear, actionable message instead of the
+			// raw EOF so the user knows it's transient.
+			if isTransientStreamError(err) {
+				if transientRetries >= maxTransientStreamRetries {
+					err = fmt.Errorf("lost the connection to the LLM mid-response %d times (the server or router dropped the stream); this is usually transient — try again in a moment", transientRetries+1)
+					break
+				}
+				transientRetries++
+				a.logSession(sid, "RECOVER", "stream dropped mid-response (%v) — retry %d/%d", err, transientRetries, maxTransientStreamRetries)
+				select {
+				case <-time.After(transientStreamBackoff):
+					continue
+				case <-ctx.Done():
+					err = ctx.Err() // cancelled during backoff → falls through to the cancel path
+				}
 			}
 			if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
 				(phase != "plan" && phase != "execute") || sid == "" {

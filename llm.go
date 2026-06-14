@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -136,6 +137,72 @@ func isContextFull(err error) bool {
 		return true
 	}
 	return errors.Is(err, errContextCeiling)
+}
+
+// errStuckThinking marks a generation that spent its whole max_tokens budget on
+// reasoning_content with no message text and no tool calls — the model looped in
+// <think> and produced nothing usable. Recoverable: the tool loop retries once on
+// a thinking-disabled copy of the connection so the model must answer directly.
+// Only raised when thinking was ON, so the retry can't re-trigger it.
+var errStuckThinking = errors.New("model stuck in reasoning")
+
+// isStuckThinking reports whether err is the <think>-loop stall recovered by a
+// thinking-off retry (see errStuckThinking).
+func isStuckThinking(err error) bool { return errors.Is(err, errStuckThinking) }
+
+// isTransientStreamError reports whether err is a mid-flight connection drop:
+// the server or router closed the stream (EOF, reset, broken pipe) or a network
+// error hit the request — as opposed to a clean LLM error or a deliberate
+// cancel. These are usually momentary (a router model swap, a brief blip), so
+// the tool loop retries a couple of times before surfacing a clear message. A
+// cancel is excluded: it's intentional and already has its own user message.
+func isTransientStreamError(err error) bool {
+	if err == nil || isCancelled(err) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		return true
+	}
+	s := err.Error()
+	return strings.Contains(s, "connection reset") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "unexpected EOF") ||
+		strings.Contains(s, "EOF")
+}
+
+// thinkingOn reports whether the request had reasoning enabled. Absent
+// chat_template_kwargs (or an absent enable_thinking) counts as on, since the
+// stall is only classified when reasoning_content was actually produced; an
+// explicit enable_thinking=false (a retry) counts as off so it can't loop.
+func thinkingOn(reqBody map[string]any) bool {
+	ctk, ok := reqBody["chat_template_kwargs"].(map[string]any)
+	if !ok {
+		return true
+	}
+	et, ok := ctk["enable_thinking"].(bool)
+	return !ok || et
+}
+
+// withThinkingDisabled returns a shallow copy of the connection with
+// chat_template_kwargs.enable_thinking forced false in a deep-copied ExtraBody,
+// so the stuck-in-<think> retry answers directly. Slot/Server/Model are
+// unchanged, so it routes to the same connSem. The original conn is untouched.
+func (c *LLMConnection) withThinkingDisabled() *LLMConnection {
+	cp := *c
+	eb := make(map[string]any, len(c.ExtraBody)+1)
+	maps.Copy(eb, c.ExtraBody)
+	ctk := map[string]any{}
+	if existing, ok := eb["chat_template_kwargs"].(map[string]any); ok {
+		maps.Copy(ctk, existing)
+	}
+	ctk["enable_thinking"] = false
+	eb["chat_template_kwargs"] = ctk
+	cp.ExtraBody = eb
+	return &cp
 }
 
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
@@ -445,9 +512,22 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		case float64:
 			reqMax = int(v)
 		}
-		if completionTokens > 0 && reqMax > 0 && completionTokens < reqMax {
+		// The length limit was the n_ctx ceiling, not the cap, when EITHER the
+		// generation stopped below the cap (completion < reqMax), OR the prompt
+		// left less than a full generation of room (prompt + reqMax > n_ctx). The
+		// second form still catches the ceiling when the server omits
+		// completion_tokens (completion == 0), so it can't be compared to the cap.
+		belowCap := completionTokens > 0 && reqMax > 0 && completionTokens < reqMax
+		noRoom := promptTokens > 0 && reqMax > 0 && a.mainSlotTokens > 0 && promptTokens+reqMax > a.mainSlotTokens
+		if belowCap || noRoom {
 			err = fmt.Errorf("generation hit the context ceiling (prompt=%d gen=%d, n_ctx=%d, role=%s): %w",
 				promptTokens, completionTokens, a.mainSlotTokens, conn.Tag, errContextCeiling)
+		} else if fullText.Len() == 0 && len(calls) == 0 && reasoningText.Len() > 0 && thinkingOn(reqBody) {
+			// All budget went to reasoning with nothing to show — the model looped
+			// in <think>. Recoverable: the tool loop retries once with thinking off
+			// so it answers directly (see errStuckThinking).
+			err = fmt.Errorf("model stuck in <think> (%d B reasoning, 0 content/calls, role=%s): %w",
+				reasoningText.Len(), conn.Tag, errStuckThinking)
 		} else {
 			err = fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
 				conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)

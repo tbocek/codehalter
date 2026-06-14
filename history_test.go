@@ -109,6 +109,25 @@ func sseTruncated(reasoning string, promptTokens, completionTokens int) string {
 	return b.String()
 }
 
+// sseTruncatedContent is sseTruncated's cousin where the truncated output is
+// message content (not reasoning) — a verbose/looping generation rather than a
+// <think> stall, so it classifies as a genuine max_tokens cap (not recoverable).
+func sseTruncatedContent(content string, promptTokens, completionTokens int) string {
+	var b strings.Builder
+	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
+		"delta":         map[string]any{"content": content},
+		"finish_reason": "length",
+	}}})
+	fmt.Fprintf(&b, "data: %s\n\n", c1)
+	c2, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{},
+		"usage":   map[string]any{"prompt_tokens": promptTokens, "completion_tokens": completionTokens},
+	})
+	fmt.Fprintf(&b, "data: %s\n\n", c2)
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
 // sseToolCall builds an SSE body that emits a single tool call with the given
 // name + JSON args, then [DONE]. First chunk carries the tool-call id (triggers
 // append); the second delta extends arguments (per the llmStream protocol).

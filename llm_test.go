@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"testing"
 )
 
@@ -107,13 +109,14 @@ func TestIsContextFull(t *testing.T) {
 	}
 }
 
-// TestFinishLengthClassification pins the finish=length split: a truncation with
-// completion BELOW the max_tokens cap hit the n_ctx ceiling (recoverable), while
-// completion AT the cap is a genuine max_tokens cap (bail, not recoverable).
+// TestFinishLengthClassification pins the finish=length split: truncation BELOW
+// the cap is the n_ctx ceiling (fold + retry); reasoning-only AT the cap is a
+// <think> stall (thinking-off retry); content AT the cap is a genuine, not-
+// recoverable verbose/looping cap.
 func TestFinishLengthClassification(t *testing.T) {
-	run := func(prompt, completion int) error {
+	run := func(sse string) error {
 		t.Helper()
-		mock := newMockLLM(t, sseTruncated("thinking and thinking", prompt, completion))
+		mock := newMockLLM(t, sse)
 		defer mock.Close()
 		a, s := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
@@ -128,10 +131,94 @@ func TestFinishLengthClassification(t *testing.T) {
 		return err
 	}
 
-	if err := run(82393, 2854); err == nil || !isContextFull(err) { // 2854 < defaultMaxTokens
-		t.Errorf("context-ceiling truncation should be recoverable, got: %v", err)
+	// Reasoning truncated BELOW the cap → n_ctx ceiling (recover by folding).
+	if err := run(sseTruncated("thinking", 82393, 2854)); err == nil || !isContextFull(err) || isStuckThinking(err) {
+		t.Errorf("below-cap truncation should be a context ceiling, got: %v", err)
 	}
-	if err := run(1000, defaultMaxTokens); err == nil || isContextFull(err) { // hit the cap
-		t.Errorf("max_tokens cap should NOT be recoverable, got: %v", err)
+	// completion_tokens omitted (0) but prompt+max_tokens overruns n_ctx (85248)
+	// → still the ceiling, detected from prompt size, not the missing completion.
+	if err := run(sseTruncated("thinking", 80000, 0)); err == nil || !isContextFull(err) {
+		t.Errorf("no-room truncation with unreported completion should be a ceiling, got: %v", err)
+	}
+	// Reasoning-only AT the cap → stuck in <think> (recover by a thinking-off retry).
+	if err := run(sseTruncated("thinking", 1000, defaultMaxTokens)); err == nil || !isStuckThinking(err) || isContextFull(err) {
+		t.Errorf("reasoning-only cap should be a stuck-thinking stall, got: %v", err)
+	}
+	// Message CONTENT at the cap → verbose/looping output, genuinely not recoverable.
+	if err := run(sseTruncatedContent("verbose output", 1000, defaultMaxTokens)); err == nil || isStuckThinking(err) || isContextFull(err) {
+		t.Errorf("content at the cap should be a non-recoverable cap, got: %v", err)
+	}
+}
+
+// TestIsTransientStreamError pins the mid-response-drop detector that drives the
+// retry: EOF / reset / network errors are transient (retry), while a deliberate
+// cancel, a clean LLM error, and nil are not.
+func TestIsTransientStreamError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"io.EOF", io.EOF, true},
+		{"unexpected EOF", io.ErrUnexpectedEOF, true},
+		{"wrapped SSE EOF", fmt.Errorf("reading SSE stream: %w", io.ErrUnexpectedEOF), true},
+		{"connection reset string", errors.New(`Post "http://x": read: connection reset by peer`), true},
+		{"broken pipe string", errors.New("write: broken pipe"), true},
+		{"net error", &net.OpError{Op: "read", Err: errors.New("reset")}, true},
+		{"context canceled", context.Canceled, false},
+		{"user cancelled", errUserCancelled, false},
+		{"deadline exceeded", context.DeadlineExceeded, false},
+		{"clean LLM error", errors.New("model returned no plan"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := isTransientStreamError(c.err); got != c.want {
+			t.Errorf("%s: isTransientStreamError=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestThinkingOn pins the guard deciding whether a <think> stall is recoverable:
+// thinking counts as ON unless chat_template_kwargs.enable_thinking is explicitly
+// false (a thinking-off retry), so the retry can't loop.
+func TestThinkingOn(t *testing.T) {
+	cases := []struct {
+		name string
+		body map[string]any
+		want bool
+	}{
+		{"no kwargs", map[string]any{}, true},
+		{"empty kwargs", map[string]any{"chat_template_kwargs": map[string]any{}}, true},
+		{"enabled", map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": true}}, true},
+		{"disabled", map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}, false},
+	}
+	for _, c := range cases {
+		if got := thinkingOn(c.body); got != c.want {
+			t.Errorf("%s: thinkingOn=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestWithThinkingDisabled pins the retry conn copy: enable_thinking is forced
+// false, sibling params and routing fields survive, and the original is untouched.
+func TestWithThinkingDisabled(t *testing.T) {
+	orig := &LLMConnection{Server: "s", Model: "m", Slot: 2, ExtraBody: map[string]any{
+		"temperature":          0.7,
+		"chat_template_kwargs": map[string]any{"enable_thinking": true, "keep": 1},
+	}}
+	off := orig.withThinkingDisabled()
+
+	if off.Server != "s" || off.Model != "m" || off.Slot != 2 {
+		t.Errorf("routing fields changed: %+v", off)
+	}
+	ctk := off.ExtraBody["chat_template_kwargs"].(map[string]any)
+	if ctk["enable_thinking"] != false || ctk["keep"] != 1 {
+		t.Errorf("kwargs: got %+v, want enable_thinking=false + keep=1", ctk)
+	}
+	if off.ExtraBody["temperature"] != 0.7 {
+		t.Errorf("sibling params dropped: %+v", off.ExtraBody)
+	}
+	if orig.ExtraBody["chat_template_kwargs"].(map[string]any)["enable_thinking"] != true {
+		t.Error("withThinkingDisabled mutated the original conn")
 	}
 }
