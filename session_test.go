@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -90,5 +91,60 @@ func TestSessionTurnControl(t *testing.T) {
 	s.cancelTurn()
 	if first || !second {
 		t.Errorf("cancelTurn should fire only the latest turn: first=%v second=%v", first, second)
+	}
+}
+
+// TestKeepWindowStart pins the 400-recovery keep window sized by REAL server
+// prompt_tokens: the unfinished small turn plus the most recent completed small
+// turns under the budget — never the whole oversized in-flight turn (the 194 KB
+// bug), and only the unfinished turn when no token usage is reported.
+func TestKeepWindowStart(t *testing.T) {
+	dir := t.TempDir()
+
+	// Oversized turn: cumulative prompt_tokens grow [1k,4k,7k,15k,25k]. Keeping
+	// from K costs ref(25k) - PromptTokens[K]; under a 10k budget only step 3
+	// (25k-15k=10k) fits, step 2 (25k-7k=18k) does not.
+	s, _ := newSession(dir)
+	s.AddUser("task prompt")
+	s.markTurnStart()
+	for i := 0; i < 5; i++ {
+		s.AddAssistant(fmt.Sprintf("step %d", i))
+	}
+	base := s.turnStartIndex() + 1
+	for i, pt := range []int{1000, 4000, 7000, 15000, 25000} {
+		s.Messages[base+i].PromptTokens = pt
+	}
+	keep := s.keepWindowStart(10_000)
+	if kept := len(s.Messages) - keep; kept != 2 {
+		t.Errorf("oversized: kept %d, want 2 (unfinished + step 3)", kept)
+	}
+	if s.Messages[keep].Content != "step 3" {
+		t.Errorf("oversized: kept window starts at %q, want 'step 3'", s.Messages[keep].Content)
+	}
+
+	// Small turn: all completed small turns fit under budget, so all are kept and
+	// only the prompt folds (keepFrom = the first assistant message).
+	s2, _ := newSession(dir)
+	s2.AddUser("p")
+	s2.markTurnStart()
+	for i := 0; i < 3; i++ {
+		s2.AddAssistant(fmt.Sprintf("a%d", i))
+	}
+	b2 := s2.turnStartIndex() + 1
+	for i, pt := range []int{500, 1500, 3000} {
+		s2.Messages[b2+i].PromptTokens = pt
+	}
+	if got := s2.keepWindowStart(10_000); got != b2 {
+		t.Errorf("small turn: keepWindowStart=%d, want %d (keep all small turns)", got, b2)
+	}
+
+	// No token usage reported (PromptTokens == 0) → keep only the unfinished turn.
+	s3, _ := newSession(dir)
+	s3.AddUser("p")
+	s3.markTurnStart()
+	s3.AddAssistant("a1")
+	s3.AddAssistant("a2")
+	if got := s3.keepWindowStart(10_000); got != s3.lastAssistantIndex() {
+		t.Errorf("no usage: keepWindowStart=%d, want lastAssistantIndex=%d", got, s3.lastAssistantIndex())
 	}
 }

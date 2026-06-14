@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(git check-ignore *)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Read(//usr/lib/**)",
+      "Bash(go env *)",
+      "Bash(grep -rn \"unexpected length\" \"$\\(go env GOROOT \\)/src\")",
+      "Bash(git log *)",
+      "Bash(grep -rn \"StartToolCall\\\\|CompleteToolCall\\\\|runToolCall\" --include=\"*.go\" tools.go | head; echo \"--- runToolCall body: does it forward to parent? ---\"; sed -n '/func \\(a \\\\*agent\\) runToolCall/,/^}/p' /home/draft/git/codehalter/tools.go | grep -n \"sendUpdate\\\\|StartToolCall\\\\|ParentID\\\\|sid\" | head -20)"
     ]
   }
 }

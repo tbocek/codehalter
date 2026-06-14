@@ -18,15 +18,13 @@ import (
 const compactTriggerPct = 80
 
 // foldHistory folds Messages[:keepFrom] into the rolling Summary and keeps
-// Messages[keepFrom:] verbatim, returning true when it folded anything. There is
-// NO token estimate: the recovery loop in runToolLoopSeeded calls this on a
-// context-overflow 400 and escalates keepFrom from turnStartIndex (fold the
-// COMPLETED LARGE turns from their ready Shadow notes, keep the whole in-flight
-// large turn) to lastAssistantIndex (fold the in-flight large turn's COMPLETED
-// SMALL turns with a synchronous summary, keep only the unfinished small turn).
-// The server's 400 between the two steps decides whether the cheaper step was
-// enough — if the in-flight large turn is small enough on its own, step 2 never
-// runs.
+// Messages[keepFrom:] verbatim, returning true when it folded anything. The
+// recovery loop in runToolLoopSeeded calls this on a context-overflow 400 and
+// escalates keepFrom: first keepWindowStart (keep the unfinished small turn plus
+// the most recent ~keepSmallTurnTokens of completed small turns, fold everything
+// older), then lastAssistantIndex (keep ONLY the unfinished small turn) if that
+// still overflows. The server's 400 between the steps decides whether the cheaper
+// step was enough.
 //
 // Messages[:turnStartIdx] are completed LARGE turns, already noted in Shadow.
 // Messages[turnStartIdx:keepFrom] is the in-flight slice being folded; it has no

@@ -416,6 +416,12 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 // ladder catches the common stuck patterns earlier.
 const maxToolLoopIterations = 100
 
+// keepSmallTurnTokens caps the verbatim keep-window of completed small turns the
+// 400 recovery preserves, sized by the server's real prompt_tokens (not an
+// estimate). The unfinished small turn is always kept on top; everything older
+// folds into Summary. See Session.keepWindowStart.
+const keepSmallTurnTokens = 10_000
+
 // reasoningNudgeBytes is the "the model clearly worked" bar: more reasoning than
 // this with an EMPTY visible message means the answer is stuck in the (never-
 // shown) reasoning channel, so the loop nudges it to write the answer as text.
@@ -582,17 +588,20 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		if res.StartedAt.IsZero() {
 			res.StartedAt = streamStart
 		}
-		// Call the model. On a context-overflow 400 (ground truth from the server,
-		// no token estimate), escalate the fold and retry: step 1 keeps the WHOLE
-		// in-flight large turn (folding only completed large turns from their ready
-		// notes); if that still 400s, step 2 keeps only the unfinished small turn
-		// (folding this turn's completed small turns). Each step strictly shrinks
-		// the context, so it terminates: out of steps, the 400 surfaces.
+		// Call the model. On a context-overflow 400 (ground truth from the server),
+		// escalate the fold and retry: step 1 keeps the unfinished small turn plus
+		// the most recent ~keepSmallTurnTokens of completed small turns (folding
+		// everything older, including the rest of the in-flight large turn); if that
+		// still 400s, step 2 keeps ONLY the unfinished small turn. Each step strictly
+		// shrinks the context, so it terminates: out of steps, the 400 surfaces.
 		var text, reasoning string
 		var calls []toolCall
 		var err error
 		recoverStep := 0
-		recoverKeepFrom := []func(*Session) int{(*Session).turnStartIndex, (*Session).lastAssistantIndex}
+		recoverKeepFrom := []func(*Session) int{
+			func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
+			(*Session).lastAssistantIndex,
+		}
 		for {
 			text, calls, reasoning, err = a.llmStream(ctx, sid, conn, messages, tools, on, think)
 			if err == nil {
@@ -635,6 +644,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		// cache consistency, not readability. AppendToolUse attaches the tool uses.
 		if s := a.getSession(sid); s != nil {
 			s.AddAssistant(text)
+			s.recordLastPromptTokens() // stamp the call's prompt_tokens for keepWindowStart
 			s.saveOrLog()
 		}
 

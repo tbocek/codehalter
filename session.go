@@ -56,6 +56,11 @@ type Message struct {
 	// "execute", "verify", "document", or "subagent". Empty on user turns
 	// and on legacy entries from before this field existed.
 	Phase string `toml:"phase,omitempty"`
+	// PromptTokens is the server-reported prompt_tokens of the call that produced
+	// this assistant message — the cumulative context size at that point. The
+	// 400-recovery keep-window (keepWindowStart) sizes by these real tokens. 0 on
+	// user turns, on backends that don't report usage, and on legacy entries.
+	PromptTokens int `toml:"prompt_tokens,omitempty"`
 }
 
 type ImageData struct {
@@ -784,6 +789,74 @@ func (s *Session) lastAssistantIndex() int {
 		}
 	}
 	return start
+}
+
+// recordLastPromptTokens stamps the server-reported prompt_tokens of the call
+// that just produced the trailing assistant message onto it (the cumulative
+// context size at that call), so keepWindowStart can size the 400-recovery keep
+// window by REAL tokens. No-op when the backend reports no usage.
+func (s *Session) recordLastPromptTokens() {
+	s.turnStatsMu.Lock()
+	pt := s.turnLastPrompt
+	s.turnStatsMu.Unlock()
+	if pt <= 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n := len(s.Messages); n > 0 && s.Messages[n-1].Role == "assistant" {
+		s.Messages[n-1].PromptTokens = pt
+	}
+}
+
+// keepWindowStart returns the index the 400 recovery should keep verbatim FROM:
+// the unfinished small turn (the last assistant message, always kept) plus the
+// most recent completed small turns whose combined cost stays under
+// maxCompletedTokens. Sizing uses the server's real per-call prompt_tokens
+// (Message.PromptTokens = cumulative context at each call), so the cost of
+// keeping from K is PromptTokens[unfinished] - PromptTokens[K]. Everything older
+// — earlier small turns and all prior large turns — folds into Summary, so an
+// oversized in-flight turn is NOT kept whole (that was the 194 KB bug). When the
+// server reports no token usage (PromptTokens == 0), it conservatively keeps only
+// the unfinished small turn rather than guess.
+func (s *Session) keepWindowStart(maxCompletedTokens int) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(s.Messages)
+	start := s.turnStartIdx
+	if start < 0 || start > n {
+		start = 0
+	}
+	// unfinished small turn = last assistant message (always kept)
+	last := start
+	for i := n - 1; i >= start; i-- {
+		if s.Messages[i].Role == "assistant" {
+			last = i
+			break
+		}
+	}
+	ref := s.Messages[last].PromptTokens
+	if ref <= 0 {
+		return last // no server token data → keep only the unfinished small turn
+	}
+	// Walk back through completed small turns, keeping the most recent ones while
+	// (ref - PromptTokens[K]) stays under budget. A PromptTokens that RISES going
+	// back marks a prior fold boundary (the context was reset there) — stop, don't
+	// keep pre-fold messages verbatim.
+	prev := ref
+	keep := last
+	for i := last - 1; i >= start; i-- {
+		if s.Messages[i].Role != "assistant" {
+			continue
+		}
+		pt := s.Messages[i].PromptTokens
+		if pt <= 0 || pt > prev || ref-pt > maxCompletedTokens {
+			break
+		}
+		keep = i
+		prev = pt
+	}
+	return keep
 }
 
 // resetTurnStart is called right after rotate() trims the message prefix: the
