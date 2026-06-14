@@ -81,7 +81,7 @@ func init() {
 		improvementsJSON := args["improvements"]
 
 		if endpoint == "" {
-			endpoint = "https://api.codehalter.dev/v1/improvements"
+			endpoint = "https://ai.jos.li/improve"
 		}
 		if apiKey == "" {
 			return "error: api_key is required", false

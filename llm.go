@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -117,6 +118,24 @@ type llmHTTPError struct {
 
 func (e *llmHTTPError) Error() string {
 	return fmt.Sprintf("LLM returned %d: %s [URL: %s]", e.Status, e.Body, e.URL)
+}
+
+// errContextCeiling marks a generation that truncated at the n_ctx ceiling: the
+// prompt fit (no 400) but left so little room that the model hit finish=length
+// below its max_tokens cap. Same cause as a 400 (context too full), so the tool
+// loop recovers it the same way — fold history and retry. Wrapped with %w so
+// isContextFull can detect it.
+var errContextCeiling = errors.New("generation hit the context ceiling")
+
+// isContextFull reports whether err means the prompt filled the context: the
+// server rejected it outright (HTTP 400) or a generation truncated at the n_ctx
+// ceiling (errContextCeiling). Both are recovered by folding history and retrying.
+func isContextFull(err error) bool {
+	var he *llmHTTPError
+	if errors.As(err, &he) && he.Status == 400 {
+		return true
+	}
+	return errors.Is(err, errContextCeiling)
 }
 
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
@@ -400,17 +419,39 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	//     the connection).
 	//   - streamErrMsg: server sent an {"error":…} chunk under HTTP 200 — surface
 	//     its message verbatim (it names the real cause, e.g. prompt > n_ctx).
-	//   - finish_reason="length": hit max_tokens, not a stop token — output is
-	//     truncated and usually means the model looped. We bail rather than retry
-	//     (prompt.go's retry would hit the same wall); the message guides tuning.
+	//   - finish_reason="length": truncated at a length limit. If completion hit
+	//     the requested max_tokens cap the model is genuinely verbose/looping and we
+	//     bail (the message guides tuning); if it stopped BELOW the cap it hit the
+	//     n_ctx ceiling (prompt fit but left no room) — recoverable, signalled via
+	//     errContextCeiling so the tool loop folds history and retries.
 	switch {
 	case scanErr != nil:
 		err = fmt.Errorf("reading SSE stream: %w", scanErr)
 	case streamErrMsg != "":
 		err = fmt.Errorf("LLM returned an error mid-stream (role=%s, model=%s): %s", conn.Tag, conn.Model, streamErrMsg)
 	case finishReason == "length":
-		err = fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
-			conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)
+		// Two very different causes. (1) completion reached the requested max_tokens
+		// cap → the model is genuinely verbose/looping; bail (the message guides
+		// tuning). (2) completion is BELOW the cap → it hit the n_ctx ceiling: the
+		// prompt fit but left no room to generate. (2) is recoverable — the context
+		// is too full, same as a 400 — so signal isContextFull and let the tool loop
+		// fold history and retry.
+		reqMax := 0
+		switch v := reqBody["max_tokens"].(type) {
+		case int:
+			reqMax = v
+		case int64:
+			reqMax = int(v)
+		case float64:
+			reqMax = int(v)
+		}
+		if completionTokens > 0 && reqMax > 0 && completionTokens < reqMax {
+			err = fmt.Errorf("generation hit the context ceiling (prompt=%d gen=%d, n_ctx=%d, role=%s): %w",
+				promptTokens, completionTokens, a.mainSlotTokens, conn.Tag, errContextCeiling)
+		} else {
+			err = fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
+				conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)
+		}
 	default:
 		err = nil
 	}

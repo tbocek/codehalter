@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -607,8 +606,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if err == nil {
 				break
 			}
-			var he *llmHTTPError
-			if !errors.As(err, &he) || he.Status != 400 || // 400 = context overflow
+			if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
 				(phase != "plan" && phase != "execute") || sid == "" {
 				break
 			}

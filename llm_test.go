@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"fmt"
+	"testing"
+)
 
 func TestTrimJSON(t *testing.T) {
 	cases := []struct {
@@ -80,5 +85,53 @@ func TestBuildConnSemsIdempotent(t *testing.T) {
 	a.buildConnSems()
 	if a.connSems[0] == first || cap(a.connSems[0]) != cap(first)+3 {
 		t.Errorf("cap change should rebuild: got cap %d, want %d", cap(a.connSems[0]), cap(first)+3)
+	}
+}
+
+func TestIsContextFull(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"400 reject", &llmHTTPError{Status: 400}, true},
+		{"context ceiling", fmt.Errorf("ceiling: %w", errContextCeiling), true},
+		{"500 error", &llmHTTPError{Status: 500}, false},
+		{"plain error", errors.New("boom"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		if got := isContextFull(c.err); got != c.want {
+			t.Errorf("%s: isContextFull=%v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// TestFinishLengthClassification pins the finish=length split: a truncation with
+// completion BELOW the max_tokens cap hit the n_ctx ceiling (recoverable), while
+// completion AT the cap is a genuine max_tokens cap (bail, not recoverable).
+func TestFinishLengthClassification(t *testing.T) {
+	run := func(prompt, completion int) error {
+		t.Helper()
+		mock := newMockLLM(t, sseTruncated("thinking and thinking", prompt, completion))
+		defer mock.Close()
+		a, s := newTestAgent(t)
+		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+		a.mainSlotTokens = 85248
+		conn := a.connForSession(context.Background(), s.ID, "thinking")
+		if conn == nil {
+			t.Fatalf("connForSession returned nil")
+		}
+		// sid="" disables session logging; the finish=length classification works
+		// off the locally-parsed usage tokens regardless.
+		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil)
+		return err
+	}
+
+	if err := run(82393, 2854); err == nil || !isContextFull(err) { // 2854 < defaultMaxTokens
+		t.Errorf("context-ceiling truncation should be recoverable, got: %v", err)
+	}
+	if err := run(1000, defaultMaxTokens); err == nil || isContextFull(err) { // hit the cap
+		t.Errorf("max_tokens cap should NOT be recoverable, got: %v", err)
 	}
 }

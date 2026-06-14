@@ -91,6 +91,24 @@ func sseText(text string) string {
 	return fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", data)
 }
 
+// sseTruncated emits a reasoning delta with finish_reason="length", then a usage
+// chunk, then [DONE] — a generation that truncated at a length limit.
+func sseTruncated(reasoning string, promptTokens, completionTokens int) string {
+	var b strings.Builder
+	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
+		"delta":         map[string]any{"reasoning_content": reasoning},
+		"finish_reason": "length",
+	}}})
+	fmt.Fprintf(&b, "data: %s\n\n", c1)
+	c2, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{},
+		"usage":   map[string]any{"prompt_tokens": promptTokens, "completion_tokens": completionTokens},
+	})
+	fmt.Fprintf(&b, "data: %s\n\n", c2)
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
 // sseToolCall builds an SSE body that emits a single tool call with the given
 // name + JSON args, then [DONE]. First chunk carries the tool-call id (triggers
 // append); the second delta extends arguments (per the llmStream protocol).
