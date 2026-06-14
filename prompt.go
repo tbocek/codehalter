@@ -606,6 +606,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	if sess != nil {
 		macroCwd = sess.Cwd
 	}
+	macroNm, _ := splitMacro(userText)
+	if sess != nil {
+		// /improve fans out one ask_user per proposed change; arm the code-level
+		// top-N cap for this turn (cleared for every other prompt).
+		sess.beginImproveFlow(macroNm == "improve")
+	}
 	if rendered, stopMsg, handled := expandMacro(macroCwd, userText); handled {
 		if stopMsg != "" {
 			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: stopMsg + "\n"}})

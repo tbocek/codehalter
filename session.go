@@ -15,6 +15,29 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+// improveAskCap is the maximum number of improvements /improve may present per
+// run; the per-change ask_user loop is held to this in code (tool_ask.go).
+const improveAskCap = 3
+
+// beginImproveFlow arms (on=true) or clears the code-level /improve ask cap for
+// the turn that is starting. Called once per prompt from the Prompt handler, so
+// every non-/improve turn resets it.
+func (s *Session) beginImproveFlow(on bool) {
+	s.improveFlow = on
+	s.improveAsks = 0
+}
+
+// improveAskBlocked counts one /improve Apply/Skip prompt and reports whether it
+// exceeds improveAskCap. A no-op returning false outside an armed /improve turn.
+// Once the cap is passed it stays blocked, forcing the per-change loop to stop.
+func (s *Session) improveAskBlocked() bool {
+	if !s.improveFlow {
+		return false
+	}
+	s.improveAsks++
+	return s.improveAsks > improveAskCap
+}
+
 // beginTurn registers the in-flight turn's cancel.
 func (s *Session) beginTurn(c context.CancelFunc) {
 	s.turnCancelMu.Lock()
@@ -317,6 +340,12 @@ type Session struct {
 	// user already approved on the card, so confirmPlan skips its "Execute?" gate
 	// for that turn. Foreground-turn-only, so unguarded like the plans above.
 	fixAutoExec bool
+	// improveFlow marks the current turn as an /improve run, whose per-change
+	// ask_user Apply/Skip prompts are capped to improveAskCap in code so a chatty
+	// model can't loop through dozens. improveAsks counts those prompts. Armed
+	// once per prompt by the Prompt handler; foreground-turn-only, so unguarded.
+	improveFlow bool
+	improveAsks int
 	// promptSkills is the set of SKILL-*.md filenames folded into the current
 	// SystemPrompt. A skill seeded on disk AFTER the prompt was built is injected
 	// as a user message (NOT folded into the prompt — that would bust the KV

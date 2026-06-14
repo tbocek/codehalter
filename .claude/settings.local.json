@@ -7,7 +7,9 @@
       "Bash(go env *)",
       "Bash(grep -rn \"unexpected length\" \"$\\(go env GOROOT \\)/src\")",
       "Bash(git log *)",
-      "Bash(grep -rn \"StartToolCall\\\\|CompleteToolCall\\\\|runToolCall\" --include=\"*.go\" tools.go | head; echo \"--- runToolCall body: does it forward to parent? ---\"; sed -n '/func \\(a \\\\*agent\\) runToolCall/,/^}/p' /home/draft/git/codehalter/tools.go | grep -n \"sendUpdate\\\\|StartToolCall\\\\|ParentID\\\\|sid\" | head -20)"
+      "Bash(grep -rn \"StartToolCall\\\\|CompleteToolCall\\\\|runToolCall\" --include=\"*.go\" tools.go | head; echo \"--- runToolCall body: does it forward to parent? ---\"; sed -n '/func \\(a \\\\*agent\\) runToolCall/,/^}/p' /home/draft/git/codehalter/tools.go | grep -n \"sendUpdate\\\\|StartToolCall\\\\|ParentID\\\\|sid\" | head -20)",
+      "Bash(go build *)",
+      "Bash(awk '{print $5, $9}')"
     ]
   }
 }

@@ -153,14 +153,25 @@ func handleClean(cwd string) (message string, handled bool) {
 // <name> is a known macro. handled=false → not a macro, run userText as-is.
 // handled=true + stopMsg → macro needs an arg it lacks; show stopMsg, run no
 // turn. Otherwise `rendered` replaces the user message.
-func expandMacro(cwd, userText string) (rendered, stopMsg string, handled bool) {
+// splitMacro parses a slash command "/name args" into its name and args. name
+// is "" when userText is not a slash command. Shared by expandMacro and the
+// Prompt handler, which arms the /improve ask cap from the parsed name.
+func splitMacro(userText string) (name, args string) {
 	if !strings.HasPrefix(userText, "/") {
-		return "", "", false
+		return "", ""
 	}
 	rest := strings.TrimPrefix(userText, "/")
-	name, args := rest, ""
+	name = rest
 	if i := strings.IndexAny(rest, " \t\r\n"); i >= 0 {
 		name, args = rest[:i], rest[i+1:]
+	}
+	return name, args
+}
+
+func expandMacro(cwd, userText string) (rendered, stopMsg string, handled bool) {
+	name, args := splitMacro(userText)
+	if name == "" {
+		return "", "", false
 	}
 	// Code-level slash commands run before template expansion.
 	if name == "clean" {

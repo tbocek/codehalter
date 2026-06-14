@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
@@ -115,6 +116,15 @@ func init() {
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		question, yesLabel, noLabel := args["question"], args["yes_label"], args["no_label"]
+		// /improve fans out one ask per proposed change; hold the flow to the top
+		// improveAskCap in code so a chatty model can't loop through dozens. Only
+		// the Apply/Skip improvement prompts count — the final Yes/No submit
+		// prompt is exempt (different labels).
+		if strings.Contains(strings.ToLower(yesLabel), "apply") || strings.Contains(strings.ToLower(noLabel), "skip") {
+			if sess := a.getSession(sid); sess != nil && sess.improveAskBlocked() {
+				return fmt.Sprintf("[improve cap: you have already presented the top %d improvements (the maximum). Do NOT call ask_user for more improvements. Apply or skip what is shown, then go straight to the submit and verify steps.]", improveAskCap), false
+			}
+		}
 		tcId := a.StartToolCall(ctx, sid, question, "think", nil)
 		ok, err := a.askYesNoAuto(ctx, sid, tcId, yesLabel, noLabel)
 		if err != nil {
