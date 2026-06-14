@@ -2,7 +2,6 @@ package improve
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -35,30 +34,4 @@ func Store(dataDir string, payload ImprovementPayload, redactionNotes []string) 
 	}
 
 	return len(payload.Improvements), redactionNotes, nil
-}
-
-// LoadAll reads all TOML files in dataDir and returns the combined entries.
-func LoadAll(dataDir string) ([]ImprovementEntry, error) {
-	var entries []ImprovementEntry
-
-	err := filepath.WalkDir(dataDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() || filepath.Ext(path) != ".toml" {
-			return nil
-		}
-
-		var entry ImprovementEntry
-		if _, err := toml.DecodeFile(path, &entry); err != nil {
-			return fmt.Errorf("decode %s: %w", path, err)
-		}
-		entries = append(entries, entry)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	return entries, nil
 }
