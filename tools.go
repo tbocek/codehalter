@@ -214,24 +214,29 @@ func parseArgs(rawArgs string) map[string]string {
 func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (string, bool) {
 	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 
-	// Snapshot the registry under the lock so Execute can run without holding
-	// it (Execute may take seconds — bash commands, LLM subagents — and we
-	// must not block concurrent registration or other callers during that).
+	// Find the tool under the lock and capture just its Execute closure, so the
+	// call runs WITHOUT the lock held: Execute may take seconds (bash commands,
+	// LLM subagents) and must not block concurrent registration. Capturing the
+	// func value (not a slice index) keeps it callable even if the registry is
+	// rebuilt afterward. On a miss the scan collects the names to report.
 	registryMu.Lock()
-	snap := make([]Tool, len(registeredTools))
-	copy(snap, registeredTools)
-	registryMu.Unlock()
-
+	var run func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
 	var names []string
-	for _, t := range snap {
+	for _, t := range registeredTools {
 		fn, _ := t.Def["function"].(map[string]any)
 		name, _ := fn["name"].(string)
 		if name == tc.Function.Name {
-			return t.Execute(ctx, a, sid, tc.Function.Arguments)
+			run = t.Execute
+			break
 		}
 		if name != "" {
 			names = append(names, name)
 		}
+	}
+	registryMu.Unlock()
+
+	if run != nil {
+		return run(ctx, a, sid, tc.Function.Arguments)
 	}
 	// Listed names go back to the model as the tool result, so it can
 	// self-correct on the next turn instead of looping on the same hallucination.

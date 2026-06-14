@@ -334,14 +334,18 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 	forceRetry := false
 	for attempt := 0; ; attempt++ {
 		if loaded, err := loadSettings(sess.Cwd); err == nil {
+			a.cfgMu.Lock()
 			a.settings = loaded
 			a.buildConnSems()
+			a.cfgMu.Unlock()
 		}
 		if a.settings.path == "" {
 			a.scaffoldSettings(ctx, sess.Cwd, sid)
 			if loaded, err := loadSettings(sess.Cwd); err == nil {
+				a.cfgMu.Lock()
 				a.settings = loaded
 				a.buildConnSems()
+				a.cfgMu.Unlock()
 			}
 		}
 		currentHash := hashSettingsFiles(sess.Cwd)
@@ -437,8 +441,8 @@ func hashSettingsFiles(cwd string) string {
 // hasReachableLLM returns true when the last probe found at least one
 // answering [[llm]] entry.
 func (a *agent) hasReachableLLM() bool {
-	for _, r := range a.connReachable {
-		if r {
+	for _, p := range a.connProbe {
+		if p.Reachable {
 			return true
 		}
 	}
@@ -446,7 +450,7 @@ func (a *agent) hasReachableLLM() bool {
 }
 
 // probeAllLLMs probes every configured [[llm]] in parallel and updates
-// a.connReachable, a.mainSlotTokens, and a.imagesSupported. Config values
+// a.connProbe, a.mainSlotTokens, and a.imagesSupported. Config values
 // (context_size / image_support on [[llm]]) take precedence over probe
 // discovery — the probe is the auto-detect shortcut for llama.cpp/llama-swap;
 // every other backend (OpenAI, Ollama, vLLM, LiteLLM, …) configures
@@ -455,7 +459,6 @@ func (a *agent) hasReachableLLM() bool {
 // state changes.
 func (a *agent) probeAllLLMs(ctx context.Context) {
 	conns := a.settings.allConnections()
-	a.connReachable = make(map[string]bool, len(conns))
 	a.connProbe = make(map[string]probeResult, len(conns))
 	a.mainSlotTokens = 0
 	a.detectedSlots = 0
@@ -475,13 +478,19 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// `parallel` always wins. Re-detected each probe — ensureLLM reloads settings
 	// (resetting Parallel to the file value) right before calling us.
 	for i := range conns {
-		a.connReachable[conns[i].Server+"\x00"+conns[i].Model] = results[i].Reachable
 		a.connProbe[conns[i].Server+"\x00"+conns[i].Model] = results[i]
+	}
+	// Back-fill the detected parallelism and resize the semaphores under cfgMu: a
+	// prior turn's background LLM call may be reading a.settings.LLM / a.connSems
+	// right now (connForBackgroundLLM / the slot gate).
+	a.cfgMu.Lock()
+	for i := range conns {
 		if a.settings.LLM[i].Parallel == 0 && results[i].TotalSlots > 0 {
 			a.settings.LLM[i].Parallel = results[i].TotalSlots
 		}
 	}
 	a.buildConnSems() // resize the per-conn semaphores to the back-filled caps
+	a.cfgMu.Unlock()
 
 	// Persist the total slot count (across all entries) so ensureLLM's pre-probe
 	// short-circuit reads the real number after loadSettings has reset Parallel.
@@ -541,7 +550,7 @@ func (a *agent) renderLLMStatus() string {
 		if i > 0 && c.Tag != "" {
 			label += " " + c.Tag
 		}
-		if !a.connReachable[c.Server+"\x00"+c.Model] {
+		if !a.connProbe[c.Server+"\x00"+c.Model].Reachable {
 			fmt.Fprintf(&b, "🟡 %s: unreachable at %s — start your server or fix the server url.\n\n", label, c.Server)
 			continue
 		}
@@ -602,6 +611,48 @@ func (a *agent) renderLLMStatus() string {
 // checkEnv — stacks, container, firefox, run_command, per-stack probes
 // ---------------------------------------------------------------------------
 
+// toolPresence is one probed dev-tool binary: its name on PATH, a human label
+// (stack name / runner kind / formatter reason), and whether it's installed.
+type toolPresence struct {
+	bin     string
+	label   string
+	present bool
+}
+
+func onPath(bin string) bool { _, err := exec.LookPath(bin); return err == nil }
+
+func okMissing(present bool) string {
+	if present {
+		return "ok"
+	}
+	return "missing"
+}
+
+// probeToolBins resolves PATH presence once for every known stack, runner, and
+// formatter binary of the session. envSnapshot, checkEnv, and notifyCapabilities
+// each used to re-run this exec.LookPath loop with the prettier project-local
+// special-case duplicated; they now format this one shared result.
+func (a *agent) probeToolBins(sess *Session) (stacks, runners, formatters []toolPresence) {
+	for _, s := range sess.knownStacks {
+		if bin := stackProbeBinary(s); bin != "" {
+			stacks = append(stacks, toolPresence{bin: bin, label: s, present: onPath(bin)})
+		}
+	}
+	for _, k := range sess.knownRunners {
+		if bin := runnerProbeBinary(k); bin != "" {
+			runners = append(runners, toolPresence{bin: bin, label: k, present: onPath(bin)})
+		}
+	}
+	for _, f := range detectFormatters(sess.knownStacks, sess.Cwd) {
+		present := onPath(f.bin)
+		if f.bin == "prettier" {
+			present = prettierBin(sess.Cwd) != ""
+		}
+		formatters = append(formatters, toolPresence{bin: f.bin, label: f.reason, present: present})
+	}
+	return
+}
+
 // envSnapshot builds the canonical string that represents the entire
 // environment as currently observable. Two calls return identical strings
 // iff nothing the user can see in the capabilities banner has changed.
@@ -617,40 +668,19 @@ func (a *agent) envSnapshot(sess *Session) string {
 	}
 	// run_command availability is fully determined by container= above (it's
 	// registered iff in a container), so it needs no separate snapshot line.
+	stacks, runners, formatters := a.probeToolBins(sess)
 	fmt.Fprintf(&b, "stacks=%s\n", strings.Join(sess.knownStacks, ","))
-	for _, s := range sess.knownStacks {
-		bin := stackProbeBinary(s)
-		if bin == "" {
-			continue
-		}
-		if _, err := exec.LookPath(bin); err == nil {
-			fmt.Fprintf(&b, "tool[%s]=ok\n", bin)
-		} else {
-			fmt.Fprintf(&b, "tool[%s]=missing\n", bin)
-		}
+	for _, t := range stacks {
+		fmt.Fprintf(&b, "tool[%s]=%s\n", t.bin, okMissing(t.present))
 	}
 	fmt.Fprintf(&b, "runners=%s\n", strings.Join(sess.knownRunners, ","))
-	for _, k := range sess.knownRunners {
-		bin := runnerProbeBinary(k)
-		if bin == "" {
-			continue
-		}
-		if _, err := exec.LookPath(bin); err == nil {
-			fmt.Fprintf(&b, "runner[%s]=ok\n", bin)
-		} else {
-			fmt.Fprintf(&b, "runner[%s]=missing\n", bin)
-		}
+	for _, t := range runners {
+		fmt.Fprintf(&b, "runner[%s]=%s\n", t.bin, okMissing(t.present))
 	}
 	// Formatter + lsmcp presence: so the snapshot flips (and the card stops being
 	// offered) once a missing formatter is installed or lsmcp gets wired.
-	for _, f := range detectFormatters(sess.knownStacks, sess.Cwd) {
-		present := false
-		if f.bin == "prettier" {
-			present = prettierBin(sess.Cwd) != ""
-		} else if _, err := exec.LookPath(f.bin); err == nil {
-			present = true
-		}
-		fmt.Fprintf(&b, "fmt[%s]=%v\n", f.bin, present)
+	for _, t := range formatters {
+		fmt.Fprintf(&b, "fmt[%s]=%v\n", t.bin, t.present)
 	}
 	if slices.Contains(sess.knownStacks, "ts") || slices.Contains(sess.knownStacks, "js") {
 		fmt.Fprintf(&b, "lsmcp=%v\n", mcpServerConfigured(sess.Cwd, "lsmcp"))
@@ -729,31 +759,22 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 		}
 		fmt.Fprintf(&detail, "%s (%s)", bin, reason)
 	}
-	for _, s := range stacks {
-		if bin := stackProbeBinary(s); bin != "" {
-			if _, err := exec.LookPath(bin); err != nil {
-				note(bin, s+" stack")
-			}
+	binStacks, binRunners, binFormatters := a.probeToolBins(sess)
+	for _, t := range binStacks {
+		if !t.present {
+			note(t.bin, t.label+" stack")
 		}
 	}
-	for _, k := range sess.knownRunners {
-		if bin := runnerProbeBinary(k); bin != "" {
-			if _, err := exec.LookPath(bin); err != nil {
-				note(bin, k+" runner")
-			}
+	for _, t := range binRunners {
+		if !t.present {
+			note(t.bin, t.label+" runner")
 		}
 	}
 	// Formatters defensive auto-formatting would use (prettier checks the
 	// project-local bin too) — a missing one folds into the same install card.
-	for _, f := range detectFormatters(stacks, sess.Cwd) {
-		missing := false
-		if f.bin == "prettier" {
-			missing = prettierBin(sess.Cwd) == ""
-		} else if _, err := exec.LookPath(f.bin); err != nil {
-			missing = true
-		}
-		if missing {
-			note(f.bin, f.reason+" formatter")
+	for _, t := range binFormatters {
+		if !t.present {
+			note(t.bin, t.label+" formatter")
 		}
 	}
 
@@ -879,6 +900,9 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	// run_command is always registered by discoverSandbox at this point.
 	b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only — destructive git commands fail at the FS layer)\n\n")
 
+	// Probe every known stack/runner binary once for the ✅/🟡 lines below.
+	pStacks, pRunners, _ := a.probeToolBins(sess)
+
 	// Stacks paired with their probe binary so the user sees stack →
 	// required-binary status on consecutive lines.
 	if len(sess.knownStacks) > 0 {
@@ -887,15 +911,11 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 			b.WriteString(" (monorepo)")
 		}
 		b.WriteString("\n\n")
-		for _, s := range sess.knownStacks {
-			bin := stackProbeBinary(s)
-			if bin == "" {
-				continue
-			}
-			if _, err := exec.LookPath(bin); err == nil {
-				fmt.Fprintf(&b, "✅ %s: found (%s stack)\n\n", bin, s)
+		for _, t := range pStacks {
+			if t.present {
+				fmt.Fprintf(&b, "✅ %s: found (%s stack)\n\n", t.bin, t.label)
 			} else {
-				fmt.Fprintf(&b, "🟡 %s: not on PATH — required for the %s stack\n\n", bin, s)
+				fmt.Fprintf(&b, "🟡 %s: not on PATH — required for the %s stack\n\n", t.bin, t.label)
 			}
 		}
 	}
@@ -930,13 +950,9 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 			row("format", caps.format, "consider adding a `fmt`/`format` target")
 			b.WriteString("\n")
 		}
-		for _, k := range sess.knownRunners {
-			bin := runnerProbeBinary(k)
-			if bin == "" {
-				continue
-			}
-			if _, err := exec.LookPath(bin); err != nil {
-				fmt.Fprintf(&b, "🟡 %s config detected but `%s` not on PATH\n\n", k, bin)
+		for _, t := range pRunners {
+			if !t.present {
+				fmt.Fprintf(&b, "🟡 %s config detected but `%s` not on PATH\n\n", t.label, t.bin)
 			}
 		}
 	}

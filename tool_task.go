@@ -1,11 +1,9 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -101,58 +99,31 @@ func (a *agent) discoverRunners(cwd string) {
 
 		tcId := a.StartToolCall(ctx, sid, "Running: "+task, "execute", nil)
 
-		cmd := exec.CommandContext(ctx, runner.Command, runner.Args(target)...)
+		// A cancellable ctx so the scanErr guard (a >1 MB line) can SIGKILL a wedged
+		// runner. No idle watchdog (0): a build can legitimately go quiet (linking,
+		// fetching deps) and must not be reaped; the decoupled drain + bounded
+		// capture still apply, so a chatty build can neither deadlock nor flood.
+		cmdCtx, cancelCmd := context.WithCancel(ctx)
+		defer cancelCmd()
+		cmd := exec.CommandContext(cmdCtx, runner.Command, runner.Args(target)...)
 		cmd.Dir = sess.Cwd
 
-		// Stream stdout+stderr to the UI line-by-line so the user sees
-		// progress from long-running builds, while still collecting the
-		// full transcript to hand back to the LLM as tool output.
-		pipeR, pipeW := io.Pipe()
-		cmd.Stdout = pipeW
-		cmd.Stderr = pipeW
-
-		if err := cmd.Start(); err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			// Couldn't even start the runner — that's a real failure,
-			// not just a non-zero exit. Flag it so verify catches it.
-			return "error starting task: " + err.Error(), true
+		out, runErr, started := a.runStreamingCmd(ctx, sid, task, cmd, cancelCmd, 0)
+		if !started {
+			a.FailToolCall(ctx, sid, tcId, runErr.Error())
+			// Couldn't even start the runner: a real failure, not a non-zero exit.
+			// Flag it so verify catches it.
+			return "error starting task: " + runErr.Error(), true
 		}
 
-		waitErr := make(chan error, 1)
-		go func() {
-			waitErr <- cmd.Wait()
-			_ = pipeW.Close()
-		}()
-
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n```\n$ " + task + "\n"}})
-
-		var collected strings.Builder
-		scanner := bufio.NewScanner(pipeR)
-		// go test -v / verbose build output can produce long single lines;
-		// the default 64 KB ceiling silently drops them.
-		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-		for scanner.Scan() {
-			line := scanner.Text() + "\n"
-			collected.WriteString(line)
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
-		}
-		if err := scanner.Err(); err != nil {
-			// Line past the 1 MB buffer or a read fault: flag the truncation
-			// in-band so a clipped transcript isn't read as the whole run.
-			fmt.Fprintf(&collected, "\n[output truncated: %s]\n", err)
-		}
-		runErr := <-waitErr
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "```\n"}})
-
-		// Surface a non-zero exit unambiguously: a banner at the TOP and
-		// bottom of the returned output (so a long stdout transcript can't
-		// bury it) plus a failed-status card so the UI renders red. The
-		// returned `failed=true` is the authoritative signal — verify uses
-		// it to override an LLM "success=true" verdict (see phases.go).
-		// The banner still helps the model see the failure in-context.
+		// Surface a non-zero exit (or a kill) unambiguously: a banner at the TOP and
+		// bottom of the returned output (so a long transcript can't bury it) plus a
+		// failed-status card so the UI renders red. The returned failed=true is the
+		// authoritative signal: verify uses it to override an LLM "success=true"
+		// verdict (see phases.go). The banner still helps the model see it in-context.
 		if runErr != nil {
 			banner := fmt.Sprintf("❌ TASK FAILED: %s (%s)\n", task, runErr.Error())
-			result := banner + "\n" + collected.String() + "\n" + banner
+			result := banner + "\n" + out + "\n" + banner
 			a.sendUpdate(ctx, sid, toolCallUpdate{
 				Kind:       "tool_call_update",
 				ToolCallId: tcId,
@@ -162,9 +133,8 @@ func (a *agent) discoverRunners(cwd string) {
 			})
 			return result, true
 		}
-		result := collected.String()
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
-		return result, false
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(out)})
+		return out, false
 	}})
 }
 

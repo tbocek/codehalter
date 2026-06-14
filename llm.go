@@ -249,6 +249,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// shows as "(queued…)". Find the conn's semaphore index by matching
 	// server+model; -1 (test mocks / probes not in settings.LLM) means "no gate,
 	// dispatch directly".
+	// Find the conn's semaphore index and bind its channel under cfgMu (RLock): a
+	// foreground prepare phase can reassign a.settings.LLM / a.connSems while a
+	// background LLM call sits in this gate. Read the pair, capture the channel into
+	// a local, release the lock, THEN do the blocking acquire on that local. Binding
+	// once also survives a rebuild: probeAllLLMs swaps in a fresh a.connSems per
+	// prompt, so re-reading a.connSems[slot] at release time could hit a NEW empty
+	// channel and block forever (the permit lives in the OLD one).
+	a.cfgMu.RLock()
 	slot := -1
 	for i := range a.settings.LLM {
 		if a.settings.LLM[i].Server == conn.Server && a.settings.LLM[i].Model == conn.Model {
@@ -256,12 +264,12 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 			break
 		}
 	}
+	var sem chan struct{}
 	if slot >= 0 && slot < len(a.connSems) {
-		// Capture THIS channel and acquire/release on it. probeAllLLMs rebuilds
-		// a.connSems (a fresh slice) on settings reload — per prompt — so reading
-		// a.connSems[slot] again at release time can hit a NEW, empty channel and
-		// block forever (the acquired permit lives in the OLD one). Bind once.
-		sem := a.connSems[slot]
+		sem = a.connSems[slot]
+	}
+	a.cfgMu.RUnlock()
+	if sem != nil {
 		// Try non-blocking first; only emit the queued suffix when we're
 		// actually about to wait. Avoids flashing the wrong status on the
 		// common hot path where the slot is free.
@@ -481,21 +489,26 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		}
 	}
 
-	// One outcome error, shared by the RESPONSE log block and the return:
-	//   - scanErr: stream broke mid-flight (e.g. a router model swap force-kills
-	//     the connection).
-	//   - streamErrMsg: server sent an {"error":…} chunk under HTTP 200 — surface
+	// One outcome error, shared by the RESPONSE log block and the return. Order
+	// matters: an explicit in-band server error is checked FIRST, because gateways
+	// commonly emit an {"error":…} chunk and THEN drop the socket. Checking the
+	// transport error first would shadow the server's verbatim cause (e.g. "prompt
+	// exceeds n_ctx") behind a generic "unexpected EOF", and send a fatal prompt
+	// down the useless transient-retry path instead of surfacing the real reason.
+	//   - streamErrMsg: server sent an {"error":…} chunk under HTTP 200; surface
 	//     its message verbatim (it names the real cause, e.g. prompt > n_ctx).
+	//   - scanErr: stream broke mid-flight (e.g. a router model swap force-kills
+	//     the connection) with no in-band error to explain it.
 	//   - finish_reason="length": truncated at a length limit. If completion hit
 	//     the requested max_tokens cap the model is genuinely verbose/looping and we
 	//     bail (the message guides tuning); if it stopped BELOW the cap it hit the
-	//     n_ctx ceiling (prompt fit but left no room) — recoverable, signalled via
+	//     n_ctx ceiling (prompt fit but left no room), recoverable, signalled via
 	//     errContextCeiling so the tool loop folds history and retries.
 	switch {
-	case scanErr != nil:
-		err = fmt.Errorf("reading SSE stream: %w", scanErr)
 	case streamErrMsg != "":
 		err = fmt.Errorf("LLM returned an error mid-stream (role=%s, model=%s): %s", conn.Tag, conn.Model, streamErrMsg)
+	case scanErr != nil:
+		err = fmt.Errorf("reading SSE stream: %w", scanErr)
 	case finishReason == "length":
 		// Two very different causes. (1) completion reached the requested max_tokens
 		// cap → the model is genuinely verbose/looping; bail (the message guides
@@ -828,7 +841,13 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection, path str
 // Concurrency is enforced by per-conn semaphores in llmStream; this picker
 // just resolves the routing target.
 func (a *agent) connForSession(_ context.Context, sid string, role string) *LLMConnection {
-	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 && sess.PinnedLLMIdx >= 0 {
+	// Resolve the session under a.mu (getSession) BEFORE taking cfgMu, so cfgMu
+	// stays a strict leaf. Then read settings under RLock; ConnAt/MainLLM return
+	// value copies, safe to use after the lock is released.
+	sess := a.getSession(sid)
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if sess != nil && sess.Depth > 0 && sess.PinnedLLMIdx >= 0 {
 		if c := a.settings.ConnAt(sess.PinnedLLMIdx, role); c != nil {
 			return c
 		}
@@ -844,6 +863,8 @@ func (a *agent) connForSession(_ context.Context, sid string, role string) *LLMC
 // work routed off the foreground turn. The capacity peek is racy by design —
 // llmStream's semaphore just queues if the slot was taken meanwhile.
 func (a *agent) connForBackgroundLLM() *LLMConnection {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	for i := 1; i < len(a.settings.LLM); i++ {
 		if i < len(a.connSems) && a.connSems[i] != nil &&
 			len(a.connSems[i]) < cap(a.connSems[i]) {
@@ -866,6 +887,8 @@ func (a *agent) connForBackgroundLLM() *LLMConnection {
 // the shape is unchanged so we don't needlessly swap channels out from under
 // in-flight llmStream calls (each binds its slot's channel at acquire and
 // releases on it — see llm.go's capture). Only an actual cap change rebuilds.
+// Caller MUST hold a.cfgMu (write lock): it reads a.settings.LLM and reassigns
+// a.connSems, which the background-reachable readers touch under cfgMu.RLock.
 func (a *agent) buildConnSems() {
 	if len(a.connSems) == len(a.settings.LLM) {
 		unchanged := true

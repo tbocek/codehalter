@@ -56,10 +56,19 @@ var defaultMCPToml string
 type agent struct {
 	// mu guards the mutable top-level fields touched from concurrent ACP
 	// handlers and the bootstrap goroutine: cancel, sessions, mode,
-	// abortReason, and the probe-derived LLM fields (connReachable,
-	// mainSlotTokens, detectedSlots, imagesSupported). MCP state has its own mutex (see
-	// mcp mcpState); the per-conn semaphores in connSems lock themselves.
-	mu           sync.Mutex
+	// abortReason, and the probe-derived LLM fields (mainSlotTokens,
+	// detectedSlots, imagesSupported). MCP state has its own mutex (see
+	// mcp mcpState); the per-conn semaphores in connSems lock themselves, but the
+	// connSems slice and settings are reassigned wholesale on reload under cfgMu (below).
+	mu sync.Mutex
+	// cfgMu guards the settings + connSems pair, which a foreground turn's prepare
+	// phase reassigns (loadSettings / probeAllLLMs / buildConnSems) while a PRIOR
+	// turn's background goroutine (summariser, git-commit drafter) may still be
+	// reading them through connForBackgroundLLM / connForSession / llmStream's slot
+	// gate. Writers take Lock; those background-reachable readers take RLock, copy
+	// what they need (ConnAt returns a value copy), and release before any blocking
+	// call. A strict leaf: never held while acquiring a.mu or sess.mu.
+	cfgMu        sync.RWMutex
 	conn         *AgentSideConnection
 	cancel       context.CancelFunc
 	sessions     map[string]*Session
@@ -70,15 +79,8 @@ type agent struct {
 	indexDone    chan struct{}
 	mode         string // "Interactive" | "Autopilot"
 
-	// connReachable records whether each configured LLMConnection answered
-	// the prepare-phase probe. Keyed by Server+"\x00"+Model. connForBackgroundLLM
-	// filters candidates against this so a dead extra slot doesn't burn a
-	// timeout on every background summarise call. Populated by probeAllLLMs;
-	// nil before the first prepare runs.
-	connReachable map[string]bool
-
 	// connProbe holds the full prepare-phase probe result per configured
-	// LLMConnection, keyed the same as connReachable (Server+"\x00"+Model).
+	// LLMConnection, keyed by Server+"\x00"+Model.
 	// renderLLMStatus reads ModelKnown/ModelLoaded/AvailableModels from it to
 	// warn when a server is reachable but the configured model id isn't in its
 	// /v1/models list (the silent cause of empty completions). Populated by
@@ -200,8 +202,10 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	// the first Prompt's prepare phase re-probes and updates the flag plus
 	// the LLM banner.
 	if gs, err := loadGlobalSettings(); err == nil {
+		a.cfgMu.Lock()
 		a.settings = gs
 		a.buildConnSems()
+		a.cfgMu.Unlock()
 		if conn := a.settings.MainLLM("execute"); conn != nil {
 			a.imagesSupported = a.probeLLM(ctx, conn).ImageSupport
 		}
@@ -464,8 +468,10 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	// phase scaffolds the skeleton and blocks on a Retry card until the user
 	// fills it in. Running with no LLM until then is graceful (renderLLMStatus
 	// prints a warning instead of crashing).
+	a.cfgMu.Lock()
 	a.settings = settings
 	a.buildConnSems()
+	a.cfgMu.Unlock()
 	a.discoverRunners(cwd)
 	a.discoverSandbox()
 	a.registerSubagentTool()

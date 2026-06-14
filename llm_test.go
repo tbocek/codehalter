@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestTrimJSON(t *testing.T) {
@@ -88,6 +90,62 @@ func TestBuildConnSemsIdempotent(t *testing.T) {
 	if a.connSems[0] == first || cap(a.connSems[0]) != cap(first)+3 {
 		t.Errorf("cap change should rebuild: got cap %d, want %d", cap(a.connSems[0]), cap(first)+3)
 	}
+}
+
+// TestCfgConcurrentReloadAndRead exercises the cfgMu guard: a foreground "prepare"
+// reassigns a.settings + rebuilds a.connSems while background goroutines resolve
+// connections through connForBackgroundLLM / connForSession (as the summariser and
+// git-commit drafter do). Before cfgMu these raced the settings struct and the
+// connSems slice header; the test is meaningful under -race, where an
+// unsynchronised access on either side reports a failure.
+func TestCfgConcurrentReloadAndRead(t *testing.T) {
+	a, s := newTestAgent(t)
+	reload := func(p int) {
+		a.cfgMu.Lock()
+		a.settings = Settings{LLM: []LLMConnection{
+			{Server: "http://a", Model: "m0", Parallel: p},
+			{Server: "http://b", Model: "m1", Parallel: 1},
+		}}
+		a.buildConnSems()
+		a.cfgMu.Unlock()
+	}
+	reload(2)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() { // writer: prepare reloading settings repeatedly
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+				reload((i % 3) + 1)
+			}
+		}
+	}()
+
+	for r := 0; r < 4; r++ { // readers: background conn resolution
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = a.connForBackgroundLLM()
+					_ = a.connForSession(context.Background(), s.ID, "execute")
+				}
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }
 
 func TestIsContextFull(t *testing.T) {

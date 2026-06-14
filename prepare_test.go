@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -366,5 +368,53 @@ func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 
 	if got := a.settings.LLM[0].Parallel; got != 1 {
 		t.Errorf("Parallel: got %d, want 1 (explicit value must not be overwritten by total_slots)", got)
+	}
+}
+
+// TestProbeToolBinsMatchesInlineProbe pins that probeToolBins computes exactly the
+// per-binary presence the three reporters (envSnapshot / checkEnv /
+// notifyCapabilities) used to compute inline, so collapsing them into one helper
+// changed no behavior. It independently re-implements the original inline loops
+// and compares; both sides read the same PATH/cwd, so the result is deterministic
+// regardless of which dev tools happen to be installed.
+func TestProbeToolBinsMatchesInlineProbe(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.knownStacks = []string{"go", "rust"}           // go→gopls; rust→"" (skipped)
+	s.knownRunners = []string{"make", "go", "bogus"} // make→make, go→go; bogus→"" (skipped)
+
+	gotStacks, gotRunners, gotFormatters := a.probeToolBins(s)
+
+	// Independent re-implementation of the pre-refactor inline probe loops.
+	var wantStacks, wantRunners, wantFormatters []toolPresence
+	for _, st := range s.knownStacks {
+		if bin := stackProbeBinary(st); bin != "" {
+			_, err := exec.LookPath(bin)
+			wantStacks = append(wantStacks, toolPresence{bin: bin, label: st, present: err == nil})
+		}
+	}
+	for _, k := range s.knownRunners {
+		if bin := runnerProbeBinary(k); bin != "" {
+			_, err := exec.LookPath(bin)
+			wantRunners = append(wantRunners, toolPresence{bin: bin, label: k, present: err == nil})
+		}
+	}
+	for _, f := range detectFormatters(s.knownStacks, s.Cwd) {
+		present := false
+		if f.bin == "prettier" {
+			present = prettierBin(s.Cwd) != ""
+		} else if _, err := exec.LookPath(f.bin); err == nil {
+			present = true
+		}
+		wantFormatters = append(wantFormatters, toolPresence{bin: f.bin, label: f.reason, present: present})
+	}
+
+	if !reflect.DeepEqual(gotStacks, wantStacks) {
+		t.Errorf("stacks: got %+v, want %+v", gotStacks, wantStacks)
+	}
+	if !reflect.DeepEqual(gotRunners, wantRunners) {
+		t.Errorf("runners: got %+v, want %+v", gotRunners, wantRunners)
+	}
+	if !reflect.DeepEqual(gotFormatters, wantFormatters) {
+		t.Errorf("formatters: got %+v, want %+v", gotFormatters, wantFormatters)
 	}
 }
