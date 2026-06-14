@@ -57,7 +57,7 @@ func init() {
 			"description": "Submit prompt improvement changes to the feedback API. The improvements parameter is a JSON string with an array of objects, each having: title (string), file (string), type (string: remove|add|replace), original (string), new (string), reasoning (string).",
 			"parameters": map[string]any{
 				"type":     "object",
-				"required": []string{"endpoint", "api_key", "improvements"},
+				"required": []string{"improvements"},
 				"properties": map[string]any{
 					"endpoint": map[string]any{
 						"type":        "string",
@@ -65,7 +65,7 @@ func init() {
 					},
 					"api_key": map[string]any{
 						"type":        "string",
-						"description": "Bearer token for authentication.",
+						"description": "Optional bearer token for authentication. Omit or leave empty to submit anonymously.",
 					},
 					"improvements": map[string]any{
 						"type":        "string",
@@ -83,9 +83,9 @@ func init() {
 		if endpoint == "" {
 			endpoint = "https://ai.jos.li/improve"
 		}
-		if apiKey == "" {
-			return "error: api_key is required", false
-		}
+		// api_key is OPTIONAL: an empty key submits anonymously (the Authorization
+		// header is omitted below). The submission gate is the user's Yes/No and the
+		// open-source license, not an auth token.
 		if improvementsJSON == "" {
 			return "error: improvements is required", false
 		}
@@ -121,7 +121,9 @@ func init() {
 			return fmt.Sprintf("error: creating request: %v", err), false
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+apiKey)
+		if apiKey != "" {
+			req.Header.Set("Authorization", "Bearer "+apiKey)
+		}
 		req.Header.Set("X-License", license)
 
 		resp, err := client.Do(req)

@@ -72,6 +72,38 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	}
 }
 
+// TestSubmitImprovementAnonymous pins that api_key is optional: with no key the
+// submission still POSTs (the gate is the user's Yes + the license), and the
+// Authorization header is omitted entirely rather than sent as a bare "Bearer ".
+func TestSubmitImprovementAnonymous(t *testing.T) {
+	var gotAuth string
+	var hadAuth bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, hadAuth = r.Header["Authorization"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a, s := newTestAgent(t)
+	if err := os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0644); err != nil {
+		t.Fatalf("write LICENSE: %v", err)
+	}
+	var tc toolCall
+	tc.Function.Name = "submit_improvement"
+	tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
+		"endpoint":     srv.URL, // no api_key
+		"improvements": `[{"title":"t","file":"PLAN.md","type":"remove","original":"x","new":"","reasoning":"r"}]`,
+	})
+	out, failed := a.executeTool(context.Background(), s.ID, tc)
+	if failed || !strings.Contains(out, "Submitted 1 improvement") {
+		t.Fatalf("anonymous submit should succeed, got: %s", out)
+	}
+	if hadAuth || gotAuth != "" {
+		t.Errorf("no api_key should omit the Authorization header, got %q (present=%v)", gotAuth, hadAuth)
+	}
+}
+
 // TestSubmitImprovementErrors covers the validation and HTTP-error branches.
 func TestSubmitImprovementErrors(t *testing.T) {
 	a, s := newTestAgent(t)
@@ -86,9 +118,6 @@ func TestSubmitImprovementErrors(t *testing.T) {
 		return a.executeTool(context.Background(), s.ID, tc)
 	}
 
-	if out, _ := call(map[string]string{"improvements": "[]"}); !strings.Contains(out, "api_key is required") {
-		t.Errorf("missing api_key: %s", out)
-	}
 	if out, _ := call(map[string]string{"api_key": "k", "improvements": "[]"}); !strings.Contains(out, "empty") {
 		t.Errorf("empty improvements array should error: %s", out)
 	}

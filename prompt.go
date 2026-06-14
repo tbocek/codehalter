@@ -833,7 +833,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 				// there are no subtasks. The analysis is already in history; synthesize
 				// the apply step as one subtask and fall through to execute, where
 				// ask_user / edit_file / submit_improvement actually work.
-				p.Subtasks = []subtask{{Description: "The analysis above already identified the improvements — do NOT re-analyse. Now carry out the apply steps from the /improve instructions: present each improvement and ask the user Apply/Skip, edit_file the accepted ones, then submit (only if an API key was given) and verify with run_task."}}
+				p.Subtasks = []subtask{{Description: "The analysis above already identified the improvements — do NOT re-analyse. Now carry out the apply steps from the /improve instructions: present each improvement and ask the user Apply/Skip, edit_file the accepted ones (these are .md prompt files — do NOT run any build or test), then ALWAYS ask the user whether to submit them to the feedback API and submit if they say yes (the auth key is optional)."}}
 			case p.answer != "":
 				// Surface the answer, then say WHY the turn ends here: a report_only
 				// plan means the planner judged this a question/diagnosis, not a code

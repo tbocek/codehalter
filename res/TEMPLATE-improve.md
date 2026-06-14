@@ -90,26 +90,25 @@ presenting), use ask_user with "Apply" and "Skip" labels.
 - **Apply** → use edit_file to make the change now.
 - **Skip** → move on.
 
-Track the accepted changes for the submission step.
+These are `.md` prompt files, NOT code — the edit IS the whole change. Do NOT run
+`go build`, `just:build`, `just:test`, or any other build/test; there is nothing
+to compile or test. Track the accepted changes for the submission step.
 
-## Step 6: Submit (optional)
+## Step 6: Submit
 
-Submitting shares the accepted changes upstream and needs an API key, passed as
-the `/improve` argument. The key is here → `{{?}}` (empty when you ran `/improve`
-with no argument).
+ALWAYS ask the user with ask_user ("Yes" / "No"): "Submit these improvements to the
+feedback API so other users benefit?" — ask this whether or not an API key was
+given. On **Yes**:
 
-- **Key empty** → skip this whole step. Do NOT ask about submitting, do NOT call
-  submit_improvement. Go straight to Step 7.
-- **Key present** → ask with ask_user ("Yes" / "No"): "Submit accepted changes to
-  the feedback API?" On **Yes**:
-  - **Prerequisite**: an open-source license (MIT, BSD, Apache, GPL, …) must be in
-    the project root. If none is present the backend rejects it — tell the user
-    and do NOT call submit_improvement.
-  - Call submit_improvement with `endpoint`
-    `https://ai.jos.li/improve`, `api_key` `{{?}}`, and
-    `improvements`: the JSON array of accepted changes, each with `title`, `file`,
-    `type`, `original`, `new`, `reasoning`. Never put secrets in the text.
-
-## Step 7: Verify
-
-Run `just:build` AND `just:test` via run_task to confirm nothing broke.
+- The submission auth key is **optional** — pass `api_key` `{{?}}` (it's fine if
+  that's empty; the submission goes through anyway).
+- Separately, make sure the CHANGE TEXT carries no secrets (API keys, tokens,
+  passwords) in `original`/`new`. These are prompt-file edits, so that's unlikely,
+  and the backend also redacts known patterns — but if you spot one, scrub it or
+  drop that entry. (This is about secrets in the changes, NOT the auth key above.)
+- **Prerequisite**: the project needs an open-source license (MIT, BSD, Apache,
+  GPL, …) in its root, else the backend rejects it — if missing, tell the user and
+  skip the call.
+- Call submit_improvement with `endpoint` `https://ai.jos.li/improve`, `api_key`
+  `{{?}}`, and `improvements`: the JSON array of accepted changes, each with
+  `title`, `file`, `type`, `original`, `new`, `reasoning`.
