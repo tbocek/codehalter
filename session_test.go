@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -91,6 +92,38 @@ func TestSessionTurnControl(t *testing.T) {
 	s.cancelTurn()
 	if first || !second {
 		t.Errorf("cancelTurn should fire only the latest turn: first=%v second=%v", first, second)
+	}
+}
+
+// TestArchiveAndReset pins the /improve fresh-context reset: archiveAndReset
+// writes the current history to a session_archive_*.toml (so the analysis can
+// still read it from disk) and empties the live session, and is a no-op once
+// already fresh.
+func TestArchiveAndReset(t *testing.T) {
+	dir := t.TempDir()
+	s, _ := newSession(dir)
+	s.AddUser("hello")
+	s.AddAssistant("hi there")
+	s.Summary = "prior rolled-up context"
+
+	if err := s.archiveAndReset(); err != nil {
+		t.Fatalf("archiveAndReset: %v", err)
+	}
+	if len(s.Messages) != 0 || s.Summary != "" {
+		t.Errorf("live session not fresh: %d messages, summary %q", len(s.Messages), s.Summary)
+	}
+	glob := filepath.Join(dir, sessionDir, "session_archive_*.toml")
+	archives, _ := filepath.Glob(glob)
+	if len(archives) != 1 {
+		t.Fatalf("want 1 archive file, got %d", len(archives))
+	}
+
+	// Already fresh → no-op, no second archive.
+	if err := s.archiveAndReset(); err != nil {
+		t.Fatalf("archiveAndReset (already fresh): %v", err)
+	}
+	if again, _ := filepath.Glob(glob); len(again) != 1 {
+		t.Errorf("fresh reset should not archive again: got %d archives", len(again))
 	}
 }
 

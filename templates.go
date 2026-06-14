@@ -24,6 +24,12 @@ var templateFS embed.FS
 // also makes the arg required — invoking with no args is rejected, not run.
 const templatePlaceholder = "{{}}"
 
+// templateOptPlaceholder is the OPTIONAL counterpart: a macro carrying {{?}} runs
+// even with no args (the placeholder then renders empty), so the arg is a
+// take-it-or-leave-it value, not a gate. /improve uses it for the submit API key
+// so the analysis runs on a bare `/improve`.
+const templateOptPlaceholder = "{{?}}"
+
 type availableCommandsUpdate struct {
 	Kind     string             `json:"sessionUpdate"` // "available_commands_update"
 	Commands []availableCommand `json:"availableCommands"`
@@ -109,6 +115,11 @@ func loadTemplate(cwd, name string) (body string, ok bool) {
 // appended after the body.
 func renderMacro(name, body, args string) (rendered, stopMsg string) {
 	args = strings.TrimSpace(args)
+	// Optional placeholder: substitute the args (empty when none were given) and
+	// run regardless — unlike the required placeholder below, it never rejects.
+	if strings.Contains(body, templateOptPlaceholder) {
+		return strings.ReplaceAll(body, templateOptPlaceholder, args), ""
+	}
 	if strings.Contains(body, templatePlaceholder) {
 		if args == "" {
 			return "", fmt.Sprintf("⚠ /%s expects a prompt — type `/%s <your text>`.", name, name)

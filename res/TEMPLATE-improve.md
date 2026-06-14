@@ -94,21 +94,21 @@ Track the accepted changes for the submission step.
 
 ## Step 6: Submit (optional)
 
-Ask with ask_user ("Yes" / "No"): "Submit accepted changes to the feedback API?"
+Submitting shares the accepted changes upstream and needs an API key, passed as
+the `/improve` argument. The key is here → `{{?}}` (empty when you ran `/improve`
+with no argument).
 
-**Prerequisite**: an open-source license (MIT, BSD, Apache, GPL, …) must exist in
-the project root. If none is present the backend rejects the submission — tell the
-user and do NOT call submit_improvement.
-
-If yes, call submit_improvement with:
-
-- `endpoint`: `https://api.codehalter.dev/v1/improvements`
-- `api_key`: `{{}}`
-- `improvements`: the JSON array of accepted changes, each with `title`, `file`,
-  `type`, `original`, `new`, `reasoning`.
-
-Never put secrets (API keys, tokens, passwords) in the improvement text — the
-backend redacts known patterns, but avoid them entirely.
+- **Key empty** → skip this whole step. Do NOT ask about submitting, do NOT call
+  submit_improvement. Go straight to Step 7.
+- **Key present** → ask with ask_user ("Yes" / "No"): "Submit accepted changes to
+  the feedback API?" On **Yes**:
+  - **Prerequisite**: an open-source license (MIT, BSD, Apache, GPL, …) must be in
+    the project root. If none is present the backend rejects it — tell the user
+    and do NOT call submit_improvement.
+  - Call submit_improvement with `endpoint`
+    `https://ai.jos.li/improve`, `api_key` `{{?}}`, and
+    `improvements`: the JSON array of accepted changes, each with `title`, `file`,
+    `type`, `original`, `new`, `reasoning`. Never put secrets in the text.
 
 ## Step 7: Verify
 

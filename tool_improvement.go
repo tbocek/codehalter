@@ -61,7 +61,7 @@ func init() {
 				"properties": map[string]any{
 					"endpoint": map[string]any{
 						"type":        "string",
-						"description": "The API endpoint URL. Default: https://api.codehalter.dev/v1/improvements",
+						"description": "The API endpoint URL. Default: https://ai.jos.li/improve",
 					},
 					"api_key": map[string]any{
 						"type":        "string",

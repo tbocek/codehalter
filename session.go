@@ -1001,9 +1001,9 @@ func (s *Session) saveOrLog() {
 // file, then resets s in place to carry only `keep` raw messages and `summary`
 // as the rolled-up prior context. The live session keeps its own ID and
 // filePath; only its on-disk contents change. Returns the archive's id.
-// Called only from foldHistory on a context-overflow 400, where
-// no concurrent writer exists for the session — so the in-place mutation of
-// s.Summary/s.Messages here doesn't take the lock; the follow-up Save() does.
+// rotate itself takes no lock; the caller guarantees no concurrent writer:
+// foldHistory by running mid-turn on a context-overflow 400, archiveAndReset by
+// holding s.mu. The follow-up live-session Save() (by the caller) does lock.
 func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	archiveID := fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano())
 	archivePath := filepath.Join(s.Cwd, sessionDir, fmt.Sprintf("session_%s.toml", archiveID))
@@ -1026,6 +1026,23 @@ func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	s.Summary = summary
 	s.Messages = keep
 	return archiveID, nil
+}
+
+// archiveAndReset preserves the current session to a session_archive_*.toml and
+// resets the live session to a fresh, empty context (no messages, no summary).
+// /improve uses it: the analysis reads the on-disk logs (the archive plus the
+// append-only .log), not the live conversation, so resetting frees the full
+// context budget to read every prompt and log file. Lock-held, unlike rotate's
+// mid-turn caller, because /improve resets at turn start where a trailing
+// background summariser could still touch Messages. No-op when already fresh.
+func (s *Session) archiveAndReset() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Messages) == 0 && s.Summary == "" {
+		return nil
+	}
+	_, err := s.rotate(nil, "")
+	return err
 }
 
 // saveLocked writes the session to disk. Caller must hold s.mu (or own the

@@ -611,6 +611,15 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		// /improve fans out one ask_user per proposed change; arm the code-level
 		// top-N cap for this turn (cleared for every other prompt).
 		sess.beginImproveFlow(macroNm == "improve")
+		if macroNm == "improve" {
+			// /improve analyses the on-disk session logs, not the live
+			// conversation; archive the current history (kept on disk for the
+			// analysis) and start from a fresh context so the turn has full
+			// budget to read every prompt and log file.
+			if err := sess.archiveAndReset(); err != nil {
+				slog.Error("/improve: archive+reset failed", "sid", req.SessionId, "err", err)
+			}
+		}
 	}
 	if rendered, stopMsg, handled := expandMacro(macroCwd, userText); handled {
 		if stopMsg != "" {

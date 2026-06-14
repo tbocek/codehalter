@@ -24,6 +24,14 @@ func TestRenderMacro(t *testing.T) {
 	if got, _ := renderMacro("grill", "fixed body", ""); got != "fixed body" {
 		t.Errorf("as-is: got %q", got)
 	}
+	// {{?}} optional + no args → runs, placeholder renders empty (no stop message).
+	if got, msg := renderMacro("improve", "key=[{{?}}]", ""); got != "key=[]" || msg != "" {
+		t.Errorf("optional empty: got %q msg %q (want 'key=[]', no message)", got, msg)
+	}
+	// {{?}} optional + args → substituted, and the arg is NOT also appended.
+	if got, msg := renderMacro("improve", "key=[{{?}}] end", "secret"); got != "key=[secret] end" || msg != "" {
+		t.Errorf("optional substitute: got %q msg %q", got, msg)
+	}
 }
 
 func TestExpandMacroNonCommand(t *testing.T) {
@@ -97,5 +105,20 @@ func TestExpandMacroGrillMe(t *testing.T) {
 	rendered, stopMsg, handled := expandMacro(dir, "/grill-me the auth design")
 	if !handled || stopMsg != "" || !strings.Contains(rendered, "the auth design") {
 		t.Errorf("/grill-me <args>: handled=%v stopMsg=%q rendered=%q", handled, stopMsg, rendered)
+	}
+}
+
+// expandMacro on the real /improve template: it carries {{?}} (optional), so a
+// bare /improve RUNS (renders, no stop message) instead of being rejected, while
+// a provided key is substituted into the rendered prompt. Embed fallback (empty
+// temp cwd) exercises the shipped default.
+func TestExpandMacroImproveOptionalArg(t *testing.T) {
+	dir := t.TempDir()
+	rendered, stopMsg, handled := expandMacro(dir, "/improve")
+	if !handled || stopMsg != "" || rendered == "" {
+		t.Fatalf("bare /improve should run: handled=%v stopMsg=%q renderedEmpty=%v", handled, stopMsg, rendered == "")
+	}
+	if withKey, _, _ := expandMacro(dir, "/improve sk-secret-123"); !strings.Contains(withKey, "sk-secret-123") {
+		t.Errorf("/improve <key> should substitute the key into the rendered prompt")
 	}
 }
