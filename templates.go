@@ -121,6 +121,34 @@ func renderMacro(name, body, args string) (rendered, stopMsg string) {
 	return body, ""
 }
 
+// handleClean is a code-level slash command: /clean deletes all session log
+// files (session_*.log, session_*.toml) from .codehalter/ and returns a
+// confirmation. It runs before template expansion in expandMacro.
+func handleClean(cwd string) (message string, handled bool) {
+	if cwd == "" {
+		return "", false
+	}
+	dir := filepath.Join(cwd, ".codehalter")
+	matched := []string{}
+	for _, pattern := range []string{"session_*.log", "session_*.toml"} {
+		entries, _ := filepath.Glob(filepath.Join(dir, pattern))
+		matched = append(matched, entries...)
+	}
+	if len(matched) == 0 {
+		return "✓ No session log files found in .codehalter/", true
+	}
+	var errs []string
+	for _, f := range matched {
+		if err := os.Remove(f); err != nil {
+			errs = append(errs, err.Error())
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Sprintf("⚠ Cleaned %d file(s), %d error(s): %s", len(matched)-len(errs), len(errs), strings.Join(errs, "; ")), true
+	}
+	return fmt.Sprintf("✓ Cleaned %d session file(s) from .codehalter/", len(matched)), true
+}
+
 // expandMacro turns a `/<name> <args>` message into the prompt to run when
 // <name> is a known macro. handled=false → not a macro, run userText as-is.
 // handled=true + stopMsg → macro needs an arg it lacks; show stopMsg, run no
@@ -133,6 +161,13 @@ func expandMacro(cwd, userText string) (rendered, stopMsg string, handled bool) 
 	name, args := rest, ""
 	if i := strings.IndexAny(rest, " \t\r\n"); i >= 0 {
 		name, args = rest[:i], rest[i+1:]
+	}
+	// Code-level slash commands run before template expansion.
+	if name == "clean" {
+		msg, handled := handleClean(cwd)
+		if handled {
+			return "", msg, true
+		}
 	}
 	body, ok := loadTemplate(cwd, name)
 	if !ok {
@@ -150,9 +185,11 @@ func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
 		cwd = sess.Cwd
 	}
 	names := templateNames(cwd)
-	cmds := make([]availableCommand, len(names))
-	for i, n := range names {
-		cmds[i] = availableCommand{Name: n, Description: "Run the " + n + " prompt template"}
+	cmds := make([]availableCommand, 0, len(names)+1)
+	// Code-level slash commands first.
+	cmds = append(cmds, availableCommand{Name: "clean", Description: "Delete session log files from .codehalter/"})
+	for _, n := range names {
+		cmds = append(cmds, availableCommand{Name: n, Description: "Run the " + n + " prompt template"})
 	}
 	a.sendUpdate(ctx, sid, availableCommandsUpdate{Kind: "available_commands_update", Commands: cmds})
 }

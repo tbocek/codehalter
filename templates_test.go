@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -37,6 +39,50 @@ func TestTemplateNamesIncludesGrillMe(t *testing.T) {
 	dir := t.TempDir()
 	if !contains(templateNames(dir), "grill-me") {
 		t.Errorf("templateNames() = %v, want it to include grill-me (res/TEMPLATE-grill-me.md)", templateNames(dir))
+	}
+}
+
+func TestHandleClean(t *testing.T) {
+	dir := t.TempDir()
+	ch := filepath.Join(dir, ".codehalter")
+	os.MkdirAll(ch, 0o755)
+	// Create some session files.
+	for _, f := range []string{"session_20260614.log", "session_20260614.toml", "session_20260615.log"} {
+		os.WriteFile(filepath.Join(ch, f), []byte("test"), 0o644)
+	}
+	// Create a non-session file that should not be deleted.
+	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("keep"), 0o644)
+
+	msg, handled := handleClean(dir)
+	if !handled {
+		t.Fatal("handleClean returned handled=false")
+	}
+	if !strings.Contains(msg, "Cleaned 3") {
+		t.Errorf("handleClean: got %q, want message mentioning 3 files", msg)
+	}
+	// Verify session files are gone.
+	entries, _ := os.ReadDir(ch)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "session_") {
+			t.Errorf("session file still present: %s", e.Name())
+		}
+	}
+	// PLAN.md should still exist.
+	if _, err := os.Stat(filepath.Join(ch, "PLAN.md")); os.IsNotExist(err) {
+		t.Error("PLAN.md was incorrectly deleted")
+	}
+}
+
+func TestHandleCleanNoFiles(t *testing.T) {
+	dir := t.TempDir()
+	ch := filepath.Join(dir, ".codehalter")
+	os.MkdirAll(ch, 0o755)
+	msg, handled := handleClean(dir)
+	if !handled {
+		t.Fatal("handleClean returned handled=false")
+	}
+	if !strings.Contains(msg, "No session") {
+		t.Errorf("handleClean: got %q, want message about no session files", msg)
 	}
 }
 
