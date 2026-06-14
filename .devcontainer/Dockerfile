@@ -17,8 +17,7 @@ RUN groupadd --gid 1000 dev \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
     && install -d -o 1000 -g 1000 /home/dev/.config
 
-ENV GOBIN=/usr/local/bin
-RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
+RUN curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
 
 USER dev
 WORKDIR /home/dev

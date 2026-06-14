@@ -29,7 +29,7 @@ func TestServerPostImprovement(t *testing.T) {
 	}
 
 	body, _ := json.Marshal(payload)
-	req := httptest.NewRequest(http.MethodPost, "/v1/improvements", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/improve", bytes.NewReader(body))
 	req.Header.Set("X-Client-IP", "10.0.0.1")
 	req.Header.Set("X-Model", "qwen3.6-27b")
 	req.Header.Set("X-License", "MIT")
@@ -69,7 +69,7 @@ func TestServerPostWithSensitiveData(t *testing.T) {
 	}
 
 	body, _ := json.Marshal(payload)
-	req := httptest.NewRequest(http.MethodPost, "/v1/improvements", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/improve", bytes.NewReader(body))
 	req.Header.Set("X-Client-IP", "10.0.0.2")
 	req.Header.Set("X-Model", "gemma-27b")
 	req.Header.Set("X-License", "Apache-2.0")
@@ -111,7 +111,7 @@ func TestServerPostInvalidJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 	handler := NewServer(tmpDir)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/improvements", bytes.NewReader([]byte("not json")))
+	req := httptest.NewRequest(http.MethodPost, "/improve", bytes.NewReader([]byte("not json")))
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
@@ -124,7 +124,7 @@ func TestServerPostReadBodyError(t *testing.T) {
 	tmpDir := t.TempDir()
 	handler := NewServer(tmpDir)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/improvements", &errorReader{})
+	req := httptest.NewRequest(http.MethodPost, "/improve", &errorReader{})
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 
