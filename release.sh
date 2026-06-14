@@ -17,5 +17,5 @@ new_tag="v${next}"
 
 # Create the tag
 git tag "$new_tag"
-
+git push --tags
 echo "$new_tag"
