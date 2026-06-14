@@ -19,19 +19,11 @@ import (
 // run; the per-change ask_user loop is held to this in code (tool_ask.go).
 const improveAskCap = 3
 
-// beginImproveFlow arms (on=true) or clears the code-level /improve ask cap for
-// the turn that is starting. Called once per prompt from the Prompt handler, so
-// every non-/improve turn resets it.
-func (s *Session) beginImproveFlow(on bool) {
-	s.improveFlow = on
-	s.improveAsks = 0
-}
-
 // improveAskBlocked counts one /improve Apply/Skip prompt and reports whether it
-// exceeds improveAskCap. A no-op returning false outside an armed /improve turn.
-// Once the cap is passed it stays blocked, forcing the per-change loop to stop.
+// exceeds improveAskCap. A no-op returning false outside an /improve turn. Once
+// the cap is passed it stays blocked, forcing the per-change loop to stop.
 func (s *Session) improveAskBlocked() bool {
-	if !s.improveFlow {
+	if !s.improving.Load() {
 		return false
 	}
 	s.improveAsks++
@@ -340,12 +332,20 @@ type Session struct {
 	// user already approved on the card, so confirmPlan skips its "Execute?" gate
 	// for that turn. Foreground-turn-only, so unguarded like the plans above.
 	fixAutoExec bool
-	// improveFlow marks the current turn as an /improve run, whose per-change
-	// ask_user Apply/Skip prompts are capped to improveAskCap in code so a chatty
-	// model can't loop through dozens. improveAsks counts those prompts. Armed
-	// once per prompt by the Prompt handler; foreground-turn-only, so unguarded.
-	improveFlow bool
-	improveAsks int
+	// improving marks the current turn as an /improve run. It does double duty,
+	// since both effects begin and end with the same /improve turn: (1) the
+	// per-change ask_user Apply/Skip prompts are capped to improveAskCap in code so
+	// a chatty model can't loop through dozens (improveAsks counts them), and (2)
+	// this session's toml + log writes are routed to scratchDir (/tmp) instead of
+	// .codehalter/, for the run's throwaway, self-referential logs. Set by
+	// beginImproveScratch, cleared (deferred) by endImproveScratch; preImproveMsgs /
+	// preImproveSummary hold the real conversation snapshot to restore at turn end.
+	// Atomic: sessionFilePath/logSession read it from background goroutines (e.g.
+	// backgroundGitCommit's llmStream logging) concurrently with begin/end.
+	improving         atomic.Bool
+	improveAsks       int
+	preImproveMsgs    []Message
+	preImproveSummary string
 	// promptSkills is the set of SKILL-*.md filenames folded into the current
 	// SystemPrompt. A skill seeded on disk AFTER the prompt was built is injected
 	// as a user message (NOT folded into the prompt — that would bust the KV
@@ -1001,9 +1001,9 @@ func (s *Session) saveOrLog() {
 // file, then resets s in place to carry only `keep` raw messages and `summary`
 // as the rolled-up prior context. The live session keeps its own ID and
 // filePath; only its on-disk contents change. Returns the archive's id.
-// rotate itself takes no lock; the caller guarantees no concurrent writer:
-// foldHistory by running mid-turn on a context-overflow 400, archiveAndReset by
-// holding s.mu. The follow-up live-session Save() (by the caller) does lock.
+// rotate itself takes no lock; its sole caller, foldHistory, runs mid-turn on a
+// context-overflow 400 where no concurrent writer exists. The follow-up
+// live-session Save() (by the caller) does lock.
 func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	archiveID := fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano())
 	archivePath := filepath.Join(s.Cwd, sessionDir, fmt.Sprintf("session_%s.toml", archiveID))
@@ -1028,27 +1028,52 @@ func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	return archiveID, nil
 }
 
-// archiveAndReset preserves the current session to a session_archive_*.toml and
-// resets the live session to a fresh, empty context (no messages, no summary).
-// /improve uses it: the analysis reads the on-disk logs (the archive plus the
-// append-only .log), not the live conversation, so resetting frees the full
-// context budget to read every prompt and log file. Lock-held, unlike rotate's
-// mid-turn caller, because /improve resets at turn start where a trailing
-// background summariser could still touch Messages. No-op when already fresh.
-func (s *Session) archiveAndReset() error {
+// scratchDir is where an /improve run's throwaway session files go (its bulky,
+// self-referential logs must not bloat or pollute the .codehalter/ logs it
+// analyses). A var so tests can point it at a tempdir.
+var scratchDir = "/tmp"
+
+// beginImproveScratch marks the turn as an /improve run (arming the ask cap and
+// the scratchDir log redirect), snapshots the real conversation IN MEMORY, and
+// resets the session to a fresh context (so /improve has full budget to read
+// every log). Nothing touches disk here, so the real .codehalter/session_*.toml
+// stays exactly as the last turn left it. endImproveScratch restores the
+// snapshot at turn end (every exit path), so the user's conversation resumes
+// untouched and the /improve bulk is discarded with the /tmp files.
+func (s *Session) beginImproveScratch() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.Messages) == 0 && s.Summary == "" {
-		return nil
+	s.preImproveMsgs = s.Messages
+	s.preImproveSummary = s.Summary
+	s.Messages = nil
+	s.Summary = ""
+	s.improveAsks = 0
+	s.improving.Store(true)
+}
+
+func (s *Session) endImproveScratch() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Messages = s.preImproveMsgs
+	s.Summary = s.preImproveSummary
+	s.preImproveMsgs = nil
+	s.preImproveSummary = ""
+	s.improving.Store(false)
+}
+
+// sessionFilePath returns where this session's toml/log of basename `name`
+// should be written: scratchDir during an /improve run, else .codehalter/.
+func (s *Session) sessionFilePath(name string) string {
+	if s.improving.Load() {
+		return filepath.Join(scratchDir, name)
 	}
-	_, err := s.rotate(nil, "")
-	return err
+	return filepath.Join(s.Cwd, sessionDir, name)
 }
 
 // saveLocked writes the session to disk. Caller must hold s.mu (or own the
 // session exclusively, e.g. a freshly-constructed archive in rotate()).
 func (s *Session) saveLocked() error {
-	f, err := os.Create(s.filePath)
+	f, err := os.Create(s.sessionFilePath(filepath.Base(s.filePath)))
 	if err != nil {
 		return err
 	}

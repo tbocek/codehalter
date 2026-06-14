@@ -612,7 +612,7 @@ func (a *agent) logSession(sid string, tag, format string, args ...any) {
 	if sess == nil {
 		return
 	}
-	path := filepath.Join(sess.Cwd, sessionDir, fmt.Sprintf("session_%s.log", sid))
+	path := sess.sessionFilePath(fmt.Sprintf("session_%s.log", sid))
 	logF, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return

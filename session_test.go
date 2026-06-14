@@ -2,7 +2,9 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -95,35 +97,41 @@ func TestSessionTurnControl(t *testing.T) {
 	}
 }
 
-// TestArchiveAndReset pins the /improve fresh-context reset: archiveAndReset
-// writes the current history to a session_archive_*.toml (so the analysis can
-// still read it from disk) and empties the live session, and is a no-op once
-// already fresh.
-func TestArchiveAndReset(t *testing.T) {
+// TestImproveScratch pins the /improve scratch redirect: beginImproveScratch
+// snapshots + resets the conversation in memory and routes saves to scratchDir,
+// so writes during the run land in /tmp and the real .codehalter/ session is left
+// untouched; endImproveScratch restores the conversation.
+func TestImproveScratch(t *testing.T) {
 	dir := t.TempDir()
+	scratch := t.TempDir()
+	old := scratchDir
+	scratchDir = scratch
+	defer func() { scratchDir = old }()
+
 	s, _ := newSession(dir)
-	s.AddUser("hello")
-	s.AddAssistant("hi there")
-	s.Summary = "prior rolled-up context"
+	s.AddUser("real conversation")
+	s.Summary = "prior summary"
+	s.saveOrLog() // the real .codehalter/ session, as the last turn left it
 
-	if err := s.archiveAndReset(); err != nil {
-		t.Fatalf("archiveAndReset: %v", err)
+	s.beginImproveScratch()
+	if len(s.Messages) != 0 || s.Summary != "" || !s.improving.Load() {
+		t.Fatalf("begin: messages=%d summary=%q scratch=%v", len(s.Messages), s.Summary, s.improving.Load())
 	}
-	if len(s.Messages) != 0 || s.Summary != "" {
-		t.Errorf("live session not fresh: %d messages, summary %q", len(s.Messages), s.Summary)
+	s.AddUser("scratch analysis")
+	s.saveOrLog() // must land in scratchDir, NOT .codehalter/
+
+	real, _ := os.ReadFile(s.filePath)
+	if !strings.Contains(string(real), "real conversation") || strings.Contains(string(real), "scratch analysis") {
+		t.Errorf(".codehalter session was touched during scratch:\n%s", real)
 	}
-	glob := filepath.Join(dir, sessionDir, "session_archive_*.toml")
-	archives, _ := filepath.Glob(glob)
-	if len(archives) != 1 {
-		t.Fatalf("want 1 archive file, got %d", len(archives))
+	scratchData, err := os.ReadFile(filepath.Join(scratch, filepath.Base(s.filePath)))
+	if err != nil || !strings.Contains(string(scratchData), "scratch analysis") {
+		t.Errorf("scratch write not in scratchDir: err=%v", err)
 	}
 
-	// Already fresh → no-op, no second archive.
-	if err := s.archiveAndReset(); err != nil {
-		t.Fatalf("archiveAndReset (already fresh): %v", err)
-	}
-	if again, _ := filepath.Glob(glob); len(again) != 1 {
-		t.Errorf("fresh reset should not archive again: got %d archives", len(again))
+	s.endImproveScratch()
+	if s.improving.Load() || len(s.Messages) != 1 || s.Messages[0].Content != "real conversation" || s.Summary != "prior summary" {
+		t.Errorf("restore failed: scratch=%v msgs=%d summary=%q", s.improving.Load(), len(s.Messages), s.Summary)
 	}
 }
 

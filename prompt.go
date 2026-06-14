@@ -607,19 +607,16 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		macroCwd = sess.Cwd
 	}
 	macroNm, _ := splitMacro(userText)
-	if sess != nil {
-		// /improve fans out one ask_user per proposed change; arm the code-level
-		// top-N cap for this turn (cleared for every other prompt).
-		sess.beginImproveFlow(macroNm == "improve")
-		if macroNm == "improve" {
-			// /improve analyses the on-disk session logs, not the live
-			// conversation; archive the current history (kept on disk for the
-			// analysis) and start from a fresh context so the turn has full
-			// budget to read every prompt and log file.
-			if err := sess.archiveAndReset(); err != nil {
-				slog.Error("/improve: archive+reset failed", "sid", req.SessionId, "err", err)
-			}
-		}
+	if sess != nil && macroNm == "improve" {
+		// /improve is throwaway analysis of the on-disk logs, not the live
+		// conversation. Snapshot the real conversation in memory + run on a fresh
+		// context, route this turn's (bulky, self-referential) session files to
+		// /tmp so the real .codehalter/ logs it analyses stay untouched, and arm the
+		// code-level top-N ask cap. beginImproveScratch sets the `improving` flag
+		// that gates all of these; endImproveScratch (deferred) clears it at turn
+		// end on every exit path.
+		sess.beginImproveScratch()
+		defer sess.endImproveScratch()
 	}
 	if rendered, stopMsg, handled := expandMacro(macroCwd, userText); handled {
 		if stopMsg != "" {
@@ -827,7 +824,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			// even after the plan-phase nudge, warn rather than ending silently —
 			// never leave the user with nothing after a turn that ran.
 			switch {
-			case sess != nil && sess.improveFlow:
+			case sess != nil && sess.improving.Load():
 				// /improve workaround: the weak model can't reliably emit a structured
 				// plan here — it answers the analysis with a report-only respond, so
 				// there are no subtasks. The analysis is already in history; synthesize
@@ -849,7 +846,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		// /improve consents by being invoked, so skip the "Execute this plan?" gate
 		// and go straight to execute — the per-improvement Apply/Skip prompts in the
 		// execute phase are the real per-change approval.
-		if sess == nil || !sess.improveFlow {
+		if sess == nil || !sess.improving.Load() {
 			if err := a.confirmPlan(ctx, sid, p, false); err != nil {
 				return toolLoopResult{}, err
 			}
@@ -949,7 +946,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			return lastResult, nil
 		}
 
-		if sess == nil || !sess.improveFlow { // /improve auto-executes (see initial gate)
+		if sess == nil || !sess.improving.Load() { // /improve auto-executes (see initial gate)
 			if err := a.confirmPlan(ctx, sid, newPlan, true); err != nil {
 				return lastResult, err
 			}

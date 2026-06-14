@@ -24,14 +24,6 @@ func TestRenderMacro(t *testing.T) {
 	if got, _ := renderMacro("grill", "fixed body", ""); got != "fixed body" {
 		t.Errorf("as-is: got %q", got)
 	}
-	// {{?}} optional + no args → runs, placeholder renders empty (no stop message).
-	if got, msg := renderMacro("improve", "key=[{{?}}]", ""); got != "key=[]" || msg != "" {
-		t.Errorf("optional empty: got %q msg %q (want 'key=[]', no message)", got, msg)
-	}
-	// {{?}} optional + args → substituted, and the arg is NOT also appended.
-	if got, msg := renderMacro("improve", "key=[{{?}}] end", "secret"); got != "key=[secret] end" || msg != "" {
-		t.Errorf("optional substitute: got %q msg %q", got, msg)
-	}
 }
 
 func TestExpandMacroNonCommand(t *testing.T) {

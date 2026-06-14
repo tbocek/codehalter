@@ -290,7 +290,7 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// respond ends the subtask; submit_plan revises the remaining plan in place
 	// (the orchestrator adopts it — see subtaskOutcome).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
-	if sess != nil && sess.improveFlow {
+	if sess != nil && sess.improving.Load() {
 		// /improve edits .md prompt files only — nothing to build or test, and the
 		// weak model ignores the "no verify" instruction. SKIP (not deny) the
 		// runners: a non-failing no-op so the model moves on, without the runner
@@ -441,6 +441,38 @@ const (
 	transientStreamBackoff    = 750 * time.Millisecond
 )
 
+// streamFlushInterval batches streamed model tokens to the editor at most this
+// often. Per-token sendUpdate is fine at ~45 tg/s, but at higher rates (e.g. 450
+// tg/s) it floods: each call takes the one conn write lock, and a slow editor
+// would backpressure the SSE read and stall the LLM call (the same failure run_command
+// had). Batching keeps editor updates at ~1/interval regardless of generation speed.
+const streamFlushInterval = 200 * time.Millisecond
+
+// throttledStream returns a per-token sink that accumulates tokens and emits an
+// EMITTED chunk at most once per streamFlushInterval (driven by token arrivals;
+// the first token emits immediately), plus a flush that emits whatever is left
+// (call it when the stream ends). Single-goroutine by construction: the SSE loop
+// drives the sink, the caller drives flush after llmStream returns, so no lock.
+func throttledStream(emit func(string)) (sink func(string), flush func()) {
+	var buf strings.Builder
+	var lastSent time.Time
+	send := func() {
+		if buf.Len() == 0 {
+			return
+		}
+		emit(buf.String())
+		buf.Reset()
+		lastSent = time.Now()
+	}
+	sink = func(token string) {
+		buf.WriteString(token)
+		if time.Since(lastSent) >= streamFlushInterval {
+			send()
+		}
+	}
+	return sink, send
+}
+
 // executeFailCap is the per-subtask budget of FAILED rounds (iterations whose
 // tool batch produced a failure). Successful work is uncounted, so a long but
 // productive subtask runs unhindered; only one that keeps hitting failures it
@@ -538,13 +570,16 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	// Stream model text/reasoning to the UI unless this is a silent internal
 	// pass (the planner's JSON). nil callbacks are no-ops in the loop below.
 	var on, think func(string)
+	flushStream := func() {} // no-op unless streaming; flushes the batched tail
 	if stream && sid != "" {
-		on = func(token string) {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: token}})
-		}
-		think = func(token string) {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: token}})
-		}
+		var flushOn, flushThink func()
+		on, flushOn = throttledStream(func(chunk string) {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: chunk}})
+		})
+		think, flushThink = throttledStream(func(chunk string) {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: chunk}})
+		})
+		flushStream = func() { flushOn(); flushThink() }
 	}
 	tools := llmAllToolDefinitions()
 
@@ -629,6 +664,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		transientRetries := 0    // mid-response drops retried up to maxTransientStreamRetries
 		for {
 			text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, tools, on, think)
+			flushStream() // emit any batched tail of this call's tokens to the UI
 			if err == nil {
 				break
 			}

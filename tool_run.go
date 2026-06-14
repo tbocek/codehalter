@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 )
 
 // discoverSandbox registers `run_command` whenever we're inside a container.
@@ -47,6 +49,13 @@ func (a *agent) discoverSandbox() {
 	}, Execute: runCmdExecute})
 }
 
+// cmdIdleTimeout reaps a run_command that prints NOTHING for this long. It's an
+// IDLE timeout, not a total one: a command that keeps producing output runs
+// unbounded (a long build is fine), but a silent/hung one is SIGKILLed so it
+// can't park a turn forever (the parent ctx only fires on a user Stop). A var so
+// tests can shorten it.
+var cmdIdleTimeout = 60 * time.Second
+
 func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
 	cmdStr := args["command"]
@@ -60,7 +69,10 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 
 	tcId := a.StartToolCall(ctx, sid, "Run: "+cmdStr, "execute", nil)
 
-	cmd := exec.CommandContext(ctx, "bash", "-c", cmdStr)
+	// Derive a cancellable ctx so the idle watchdog can SIGKILL a silent command.
+	cmdCtx, cancelCmd := context.WithCancel(ctx)
+	defer cancelCmd()
+	cmd := exec.CommandContext(cmdCtx, "bash", "-c", cmdStr)
 	cmd.Dir = sess.Cwd
 
 	pipeR, pipeW := io.Pipe()
@@ -80,18 +92,87 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n```\n$ " + cmdStr + "\n"}})
 
-	var collected strings.Builder
-	scanner := bufio.NewScanner(pipeR)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text() + "\n"
-		collected.WriteString(line)
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line}})
+	// Drain the command's output into a buffer in a goroutine, DECOUPLED from the
+	// editor, so the command can NEVER block on write() behind a slow editor. The
+	// old per-line sendUpdate over a synchronous io.Pipe deadlocked a high-volume
+	// command: its write stalled behind the editor write, which holds the one conn
+	// write lock. The drain always reads the pipe (the command runs to completion
+	// regardless of editor speed); a 200ms ticker batches the new output to the UI.
+	var mu sync.Mutex
+	var buf []byte
+	var scanErr error
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		scanner := bufio.NewScanner(pipeR)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			mu.Lock()
+			buf = append(buf, scanner.Bytes()...)
+			buf = append(buf, '\n')
+			mu.Unlock()
+		}
+		mu.Lock()
+		scanErr = scanner.Err()
+		mu.Unlock()
+	}()
+
+	flushed := 0
+	flush := func() {
+		mu.Lock()
+		var chunk string
+		if len(buf) > flushed {
+			chunk = string(buf[flushed:])
+			flushed = len(buf)
+		}
+		mu.Unlock()
+		if chunk != "" {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: chunk}})
+		}
 	}
-	if err := scanner.Err(); err != nil {
-		// A line past the 1 MB buffer (or a read fault) ends the scan early —
+	// Flush every 200ms; the idle watchdog rides the same tick. `flushed` is the
+	// running byte count produced so far — if it hasn't grown for cmdIdleTimeout
+	// the command is silent/hung, so SIGKILL it (which cascades: Wait returns →
+	// pipeW closes → the drain hits EOF → drainDone fires → this loop exits). A
+	// command that keeps printing keeps lastGrow fresh and runs unbounded.
+	ticker := time.NewTicker(200 * time.Millisecond)
+	lastLen, lastGrow, idleKilled := 0, time.Now(), false
+	for done := false; !done; {
+		select {
+		case <-ticker.C:
+			flush()
+			if flushed > lastLen {
+				lastLen, lastGrow = flushed, time.Now()
+			} else if !idleKilled && time.Since(lastGrow) > cmdIdleTimeout {
+				idleKilled = true
+				cancelCmd()
+			}
+		case <-drainDone:
+			done = true
+		}
+	}
+	ticker.Stop()
+	flush() // final tail past the last tick
+
+	var collected strings.Builder
+	mu.Lock()
+	collected.Write(buf)
+	switch {
+	case idleKilled:
+		fmt.Fprintf(&collected, "\n[killed: no output for %s — command timed out]\n", cmdIdleTimeout)
+	case scanErr != nil:
+		// A line past the 1 MB buffer (or a read fault) ended the scan early —
 		// say so in-band rather than presenting truncated output as complete.
-		fmt.Fprintf(&collected, "\n[output truncated: %s]\n", err)
+		fmt.Fprintf(&collected, "\n[output truncated: %s]\n", scanErr)
+	}
+	mu.Unlock()
+
+	// A scan error (e.g. a single line past the 1 MB buffer) stops the drain while
+	// the command keeps writing into a pipe nobody reads — it blocks on write and
+	// Wait would hang here, past the idle watchdog (which exited on drainDone).
+	// Kill it so <-waitErr returns. (An idle-kill already cancelled.)
+	if scanErr != nil {
+		cancelCmd()
 	}
 	runErr := <-waitErr
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "```\n"}})

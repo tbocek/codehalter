@@ -118,6 +118,13 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	if sess == nil {
 		return
 	}
+	if sess.improving.Load() {
+		// /improve turn: throwaway scratch context, no compaction note. Critically,
+		// the summariser runs in a background goroutine that can outlive
+		// endImproveScratch (which restores Messages/Summary but NOT Shadow), so a
+		// note here would appendShadow into the RESTORED real conversation. Skip it.
+		return
+	}
 	prompt := a.loadPromptFile(sess.ID, "SUMMARISE.md")
 	if prompt == "" {
 		return

@@ -7,6 +7,33 @@ import (
 	"testing"
 )
 
+// TestThrottledStream pins the token batcher that keeps per-token streaming from
+// flooding the editor at high tg/s: the first token emits immediately, tokens
+// within the interval batch into one emit, and flush drains the tail (and is a
+// no-op when nothing is buffered).
+func TestThrottledStream(t *testing.T) {
+	var emits []string
+	sink, flush := throttledStream(func(chunk string) { emits = append(emits, chunk) })
+
+	sink("a") // first token: lastSent is zero, so it emits right away
+	if len(emits) != 1 || emits[0] != "a" {
+		t.Fatalf("first token should emit immediately: %v", emits)
+	}
+	sink("b") // within the interval → batched, not emitted
+	sink("c")
+	if len(emits) != 1 {
+		t.Errorf("tokens within the interval should batch, got %v", emits)
+	}
+	flush() // emit the tail
+	if len(emits) != 2 || emits[1] != "bc" {
+		t.Errorf("flush should emit the batched tail: %v", emits)
+	}
+	flush() // nothing buffered → no emit
+	if len(emits) != 2 {
+		t.Errorf("empty flush should not emit: %v", emits)
+	}
+}
+
 // TestImproveExecuteSkipsVerify pins that during an /improve execute pass the
 // build/test runners are SKIPPED at the tool layer (the edits are .md only): the
 // model's run_task call never executes, while a normal execute pass runs it. The
@@ -31,7 +58,7 @@ func TestImproveExecuteSkipsVerify(t *testing.T) {
 		defer mock.Close()
 		a, s := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-		s.improveFlow = improve
+		s.improving.Store(improve)
 		a.runExecutePhase(context.Background(), s.ID, subtask{Description: "apply"}, 0, 1)
 	}
 

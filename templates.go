@@ -24,12 +24,6 @@ var templateFS embed.FS
 // also makes the arg required — invoking with no args is rejected, not run.
 const templatePlaceholder = "{{}}"
 
-// templateOptPlaceholder is the OPTIONAL counterpart: a macro carrying {{?}} runs
-// even with no args (the placeholder then renders empty), so the arg is a
-// take-it-or-leave-it value, not a gate. /improve uses it for the submit API key
-// so the analysis runs on a bare `/improve`.
-const templateOptPlaceholder = "{{?}}"
-
 type availableCommandsUpdate struct {
 	Kind     string             `json:"sessionUpdate"` // "available_commands_update"
 	Commands []availableCommand `json:"availableCommands"`
@@ -115,11 +109,6 @@ func loadTemplate(cwd, name string) (body string, ok bool) {
 // appended after the body.
 func renderMacro(name, body, args string) (rendered, stopMsg string) {
 	args = strings.TrimSpace(args)
-	// Optional placeholder: substitute the args (empty when none were given) and
-	// run regardless — unlike the required placeholder below, it never rejects.
-	if strings.Contains(body, templateOptPlaceholder) {
-		return strings.ReplaceAll(body, templateOptPlaceholder, args), ""
-	}
 	if strings.Contains(body, templatePlaceholder) {
 		if args == "" {
 			return "", fmt.Sprintf("⚠ /%s expects a prompt — type `/%s <your text>`.", name, name)
@@ -160,10 +149,6 @@ func handleClean(cwd string) (message string, handled bool) {
 	return fmt.Sprintf("✓ Cleaned %d session file(s) from .codehalter/", len(matched)), true
 }
 
-// expandMacro turns a `/<name> <args>` message into the prompt to run when
-// <name> is a known macro. handled=false → not a macro, run userText as-is.
-// handled=true + stopMsg → macro needs an arg it lacks; show stopMsg, run no
-// turn. Otherwise `rendered` replaces the user message.
 // splitMacro parses a slash command "/name args" into its name and args. name
 // is "" when userText is not a slash command. Shared by expandMacro and the
 // Prompt handler, which arms the /improve ask cap from the parsed name.
@@ -179,6 +164,10 @@ func splitMacro(userText string) (name, args string) {
 	return name, args
 }
 
+// expandMacro turns a `/<name> <args>` message into the prompt to run when
+// <name> is a known macro. handled=false → not a macro, run userText as-is.
+// handled=true + stopMsg → macro needs an arg it lacks; show stopMsg, run no
+// turn. Otherwise `rendered` replaces the user message.
 func expandMacro(cwd, userText string) (rendered, stopMsg string, handled bool) {
 	name, args := splitMacro(userText)
 	if name == "" {
