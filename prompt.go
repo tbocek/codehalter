@@ -426,8 +426,10 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// (connSems capture + the ctx bail-out in orchestrate below), so the wait is
 	// short: the old turn sees its cancelled ctx and returns within one step.
 	if sess := a.getSession(req.SessionId); sess != nil {
+		sess.markSuperseding() // tell the in-flight turn this is a replacement, not an abort
 		sess.cancelTurn()
 		sess.turnMu.Lock()
+		sess.adoptTurn() // we're now the active turn; the superseded one has unwound
 		defer sess.turnMu.Unlock()
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -662,14 +664,20 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			// (the editor aborting to send your next message) is NOT a stop you made,
 			// so don't blame you — and when a plan is held, say that instead. A new
 			// prompt that superseded this turn will speak for itself.
+			sess := a.getSession(req.SessionId)
 			msg := ""
 			switch {
 			case errors.Is(err, errUserCancelled):
 				msg = "⏹ Stopped.\n"
-			default:
-				if sess := a.getSession(req.SessionId); sess != nil && sess.pendingPlan != nil {
-					msg = "⏸ Holding the plan — I'll re-show it after your message.\n"
-				}
+			case sess != nil && sess.pendingPlan != nil:
+				msg = "⏸ Holding the plan — I'll re-show it after your message.\n"
+			case sess == nil || !sess.superseded():
+				// Editor aborted the request (Cancel button, or a client-side
+				// request timeout while the LLM was busy) with nothing taking
+				// over — surface it so an aborted turn never dies without a
+				// trace in the UI. A supersede stays silent: the new turn speaks
+				// for itself.
+				msg = "⏹ Turn cancelled — " + cancelReason(err) + ".\n"
 			}
 			if msg != "" {
 				a.sendUpdate(context.Background(), req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: msg}})
@@ -804,7 +812,11 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			// even after the plan-phase nudge, warn rather than ending silently —
 			// never leave the user with nothing after a turn that ran.
 			if p.answer != "" {
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: p.answer + "\n"}})
+				// Surface the answer, then say WHY the turn ends here: a report_only
+				// plan means the planner judged this a question/diagnosis, not a code
+				// change, so no execute phase runs. Without this note a "Completed
+				// Plan — Planning" card reads as "stopped early", not "answered".
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: p.answer + "\n\nℹ Answered directly — no code change to execute.\n"}})
 				return toolLoopResult{Text: p.answer}, nil
 			}
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ I couldn't produce a clear answer or a plan for that — try rephrasing, or ask for a specific change.\n"}})

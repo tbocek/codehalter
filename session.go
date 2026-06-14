@@ -33,6 +33,33 @@ func (s *Session) cancelTurn() {
 	}
 }
 
+// markSuperseding flags that a freshly-arrived prompt is about to cancel and
+// replace the in-flight turn, so that turn's cancel handler stays silent (the
+// new turn speaks for itself) instead of reporting an editor abort. Pairs with
+// adoptTurn, which clears the flag once the new turn has taken over.
+func (s *Session) markSuperseding() {
+	s.turnCancelMu.Lock()
+	s.superseding = true
+	s.turnCancelMu.Unlock()
+}
+
+// adoptTurn clears the supersede flag once the new prompt has acquired turnMu
+// and become the active turn (the superseded turn has fully unwound by then).
+func (s *Session) adoptTurn() {
+	s.turnCancelMu.Lock()
+	s.superseding = false
+	s.turnCancelMu.Unlock()
+}
+
+// superseded reports whether a newly-arrived prompt flagged the in-flight turn
+// for replacement (markSuperseding). A superseded turn's cancel handler stays
+// silent; a plain editor abort / client-side timeout surfaces its reason.
+func (s *Session) superseded() bool {
+	s.turnCancelMu.Lock()
+	defer s.turnCancelMu.Unlock()
+	return s.superseding
+}
+
 const sessionDir = ".codehalter"
 
 type Message struct {
@@ -278,10 +305,14 @@ type Session struct {
 	// cancelTurn()s the in-flight one then Lock()s here, so turns never overlap
 	// (overlap raced compaction → two divergent context snapshots). turnCancel is
 	// the in-flight turn's ctx cancel, fired by the Cancel button or a superseding
-	// prompt; guarded by turnCancelMu.
+	// prompt; guarded by turnCancelMu. superseding (same mutex) is set by a
+	// newly-arrived prompt right before it cancels the in-flight turn, so that
+	// turn's cancel handler can tell a supersede (stay silent) from a plain
+	// editor abort / client-side timeout (surface the reason).
 	turnMu       sync.Mutex
 	turnCancelMu sync.Mutex
 	turnCancel   context.CancelFunc
+	superseding  bool
 	// fixAutoExec is set while a user-accepted fix card is being dispatched: the
 	// user already approved on the card, so confirmPlan skips its "Execute?" gate
 	// for that turn. Foreground-turn-only, so unguarded like the plans above.

@@ -94,6 +94,25 @@ func TestSessionTurnControl(t *testing.T) {
 	}
 }
 
+// TestSessionSupersedeFlag pins the supersede flag that lets a cancelled turn
+// tell an editor abort (surface the reason) from a new-prompt supersede (stay
+// silent). markSuperseding sets it, superseded reads it, adoptTurn clears it
+// once the replacement turn has taken over.
+func TestSessionSupersedeFlag(t *testing.T) {
+	s := &Session{}
+	if s.superseded() {
+		t.Error("fresh session should not be flagged superseded")
+	}
+	s.markSuperseding()
+	if !s.superseded() {
+		t.Error("markSuperseding should set the flag")
+	}
+	s.adoptTurn()
+	if s.superseded() {
+		t.Error("adoptTurn should clear the flag")
+	}
+}
+
 // TestKeepWindowStart pins the 400-recovery keep window sized by REAL server
 // prompt_tokens: the unfinished small turn plus the most recent completed small
 // turns under the budget — never the whole oversized in-flight turn (the 194 KB

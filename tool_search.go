@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -78,6 +79,7 @@ func init() {
 		tcId := a.StartToolCall(ctx, sid, "Searching: "+label, "search", nil)
 
 		var results []string
+		dirCounts := map[string]int{} // matches per path bucket, for the cap-hit hint
 		files := listProjectFiles(dir)
 		for _, relPath := range files {
 			if len(results) >= maxSearchResults {
@@ -93,6 +95,7 @@ func init() {
 			if len(matches) == 0 {
 				continue
 			}
+			dirCounts[searchBucket(relPath)] += len(matches)
 			// Read the file once to pull the lines around each hit.
 			var lines []string
 			if data, err := os.ReadFile(absPath); err == nil {
@@ -110,10 +113,18 @@ func init() {
 		summary := "no matches"
 		if len(results) > 0 {
 			summary = fmt.Sprintf("%d matches", len(results))
+			out = strings.Join(results, "\n")
 			if len(results) >= maxSearchResults {
 				summary += ", limit reached"
+				// Hit the cap: more matches exist than shown, and the file-walk
+				// order may have spent the whole budget on one noisy tree (e.g.
+				// gitignored build/bench logs). Point the model at where the shown
+				// matches cluster so it can re-scope with `path` or ignore that
+				// tree itself, instead of re-running the same flooded search.
+				if hot := topBuckets(dirCounts, 5); hot != "" {
+					out = fmt.Sprintf("[note: hit the %d-match cap — more matches exist than shown, so this result is partial. The matches shown cluster under: %s. Re-run with a narrower `path`, or ignore those paths.]\n\n%s", maxSearchResults, hot, out)
+				}
 			}
-			out = strings.Join(results, "\n")
 		}
 
 		// Literal-repeat dedup: the same query+path+flags returning the same
@@ -172,6 +183,44 @@ func formatMatchBlock(relPath string, lines []string, matchLine, ctx int) string
 		fmt.Fprintf(&b, "%s%d| %s\n", marker, i, lines[i-1])
 	}
 	return b.String()
+}
+
+// searchBucket groups a matched file under the first up-to-2 path segments
+// (bench/results/2026.../x.log → "bench/results"), the granularity the model
+// can hand straight back as a `path` scope. Root-level files bucket as "(root)".
+func searchBucket(relPath string) string {
+	d := filepath.ToSlash(filepath.Dir(relPath))
+	if d == "" || d == "." {
+		return "(root)"
+	}
+	parts := strings.Split(d, "/")
+	if len(parts) > 2 {
+		parts = parts[:2]
+	}
+	return strings.Join(parts, "/")
+}
+
+// topBuckets renders the highest-count buckets as "path (n) · path (n)",
+// highest first, ties broken by name, up to n entries. Empty when counts is.
+func topBuckets(counts map[string]int, n int) string {
+	keys := make([]string, 0, len(counts))
+	for k := range counts {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if counts[keys[i]] != counts[keys[j]] {
+			return counts[keys[i]] > counts[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
+	parts := make([]string, 0, n)
+	for _, k := range keys {
+		if len(parts) >= n {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s (%d)", k, counts[k]))
+	}
+	return strings.Join(parts, " · ")
 }
 
 func searchInFile(path string, matcher func(string) bool, limit int) []int {

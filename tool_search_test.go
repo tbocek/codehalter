@@ -31,6 +31,36 @@ func TestFormatMatchBlock(t *testing.T) {
 	}
 }
 
+// TestSearchBuckets pins the cap-hit hint: searchBucket collapses a path to its
+// first two segments (root files → "(root)"), and topBuckets renders the
+// busiest buckets highest-first with name-tie-breaking so the model is pointed
+// at where matches cluster (e.g. a gitignored bench/results log tree).
+func TestSearchBuckets(t *testing.T) {
+	cases := map[string]string{
+		"bench/results/2026-05-16/x.log": "bench/results",
+		"improve/store.go":               "improve",
+		"main.go":                        "(root)",
+	}
+	for in, want := range cases {
+		if got := searchBucket(in); got != want {
+			t.Errorf("searchBucket(%q) = %q, want %q", in, got, want)
+		}
+	}
+
+	// Highest first, capped at n entries (cmd/build dropped).
+	counts := map[string]int{"bench/results": 63, "improve": 12, "cmd/build": 5}
+	if got := topBuckets(counts, 2); got != "bench/results (63) · improve (12)" {
+		t.Errorf("topBuckets top-2 = %q", got)
+	}
+	// Equal counts break by name ("alpha" before "zeta").
+	if got := topBuckets(map[string]int{"zeta": 5, "alpha": 5}, 5); got != "alpha (5) · zeta (5)" {
+		t.Errorf("topBuckets tie = %q", got)
+	}
+	if got := topBuckets(map[string]int{}, 5); got != "" {
+		t.Errorf("topBuckets(empty) = %q, want empty", got)
+	}
+}
+
 // TestSearchInFileMatchers verifies the matcher callback cleanly swaps
 // literal substring and regex behavior. Literal mode treats '.' as a dot;
 // regex mode treats it as any-char.
