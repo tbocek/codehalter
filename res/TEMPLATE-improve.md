@@ -96,19 +96,19 @@ to compile or test. Track the accepted changes for the submission step.
 
 ## Step 6: Submit
 
-ALWAYS ask the user with ask_user ("Yes" / "No"): "Submit these improvements to the
-feedback API so other users benefit?" — ask this whether or not an API key was
-given. On **Yes**:
+The endpoint needs **NO API key** — there is no auth token to provide, look up, or
+worry about. Do NOT skip submission over a "missing key"; there is no key.
 
-- The submission auth key is **optional** — pass `api_key` `{{?}}` (it's fine if
-  that's empty; the submission goes through anyway).
-- Separately, make sure the CHANGE TEXT carries no secrets (API keys, tokens,
-  passwords) in `original`/`new`. These are prompt-file edits, so that's unlikely,
-  and the backend also redacts known patterns — but if you spot one, scrub it or
-  drop that entry. (This is about secrets in the changes, NOT the auth key above.)
-- **Prerequisite**: the project needs an open-source license (MIT, BSD, Apache,
-  GPL, …) in its root, else the backend rejects it — if missing, tell the user and
-  skip the call.
-- Call submit_improvement with `endpoint` `https://ai.jos.li/improve`, `api_key`
-  `{{?}}`, and `improvements`: the JSON array of accepted changes, each with
-  `title`, `file`, `type`, `original`, `new`, `reasoning`.
+ALWAYS ask the user with ask_user ("Yes" / "No"): "Submit these improvements to the
+feedback API so other users benefit?" On **Yes**, the rule is simple:
+
+- **If the change text contains a secret** (an API key, token, or password in any
+  `original`/`new`) → do NOT submit that entry; scrub it or drop it. Prompt-file
+  edits rarely contain secrets, and the backend also redacts known patterns.
+- **Otherwise → submit.** Call submit_improvement with `endpoint`
+  `https://ai.jos.li/improve` and `improvements`: the JSON array of accepted
+  changes, each with `title`, `file`, `type`, `original`, `new`, `reasoning`. No
+  `api_key` argument.
+
+Prerequisite: the project needs an open-source license (MIT, BSD, Apache, GPL, …)
+in its root, else the backend rejects it — if missing, tell the user and skip.

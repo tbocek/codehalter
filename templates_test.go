@@ -108,17 +108,14 @@ func TestExpandMacroGrillMe(t *testing.T) {
 	}
 }
 
-// expandMacro on the real /improve template: it carries {{?}} (optional), so a
-// bare /improve RUNS (renders, no stop message) instead of being rejected, while
-// a provided key is substituted into the rendered prompt. Embed fallback (empty
-// temp cwd) exercises the shipped default.
-func TestExpandMacroImproveOptionalArg(t *testing.T) {
+// expandMacro on the real /improve template: it carries no placeholder (the
+// endpoint is keyless, so /improve takes no argument), which means a bare
+// /improve RUNS (renders, no stop message) rather than being rejected for a
+// missing arg. Embed fallback (empty temp cwd) exercises the shipped default.
+func TestExpandMacroImproveRunsBare(t *testing.T) {
 	dir := t.TempDir()
 	rendered, stopMsg, handled := expandMacro(dir, "/improve")
 	if !handled || stopMsg != "" || rendered == "" {
 		t.Fatalf("bare /improve should run: handled=%v stopMsg=%q renderedEmpty=%v", handled, stopMsg, rendered == "")
-	}
-	if withKey, _, _ := expandMacro(dir, "/improve sk-secret-123"); !strings.Contains(withKey, "sk-secret-123") {
-		t.Errorf("/improve <key> should substitute the key into the rendered prompt")
 	}
 }

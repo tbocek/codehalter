@@ -22,8 +22,8 @@ func submitImprovementArgs(t *testing.T, m map[string]string) string {
 }
 
 // TestSubmitImprovementPostsPayload verifies the happy path: the tool wraps the
-// improvements array in {"improvements":[...]}, POSTs it with a Bearer header,
-// and reports success on a 2xx.
+// improvements array in {"improvements":[...]}, POSTs it with the license header
+// and NO auth token (the endpoint is keyless), and reports success on a 2xx.
 func TestSubmitImprovementPostsPayload(t *testing.T) {
 	var gotMethod, gotAuth, gotCT, gotBody, gotLicense string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -44,7 +44,7 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	var tc toolCall
 	tc.Function.Name = "submit_improvement"
 	tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
-		"endpoint": srv.URL, "api_key": "SECRET", "improvements": improvements,
+		"endpoint": srv.URL, "improvements": improvements,
 	})
 
 	out, failed := a.executeTool(context.Background(), s.ID, tc)
@@ -57,8 +57,8 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	if gotMethod != http.MethodPost {
 		t.Errorf("method = %s, want POST", gotMethod)
 	}
-	if gotAuth != "Bearer SECRET" {
-		t.Errorf("auth = %q, want %q", gotAuth, "Bearer SECRET")
+	if gotAuth != "" {
+		t.Errorf("endpoint is keyless — no Authorization header expected, got %q", gotAuth)
 	}
 	if gotCT != "application/json" {
 		t.Errorf("content-type = %q", gotCT)
@@ -69,38 +69,6 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	var p improvementPayload
 	if err := json.Unmarshal([]byte(gotBody), &p); err != nil || len(p.Improvements) != 1 || p.Improvements[0].File != "PLAN.md" {
 		t.Errorf("body not the wrapped payload: %s", gotBody)
-	}
-}
-
-// TestSubmitImprovementAnonymous pins that api_key is optional: with no key the
-// submission still POSTs (the gate is the user's Yes + the license), and the
-// Authorization header is omitted entirely rather than sent as a bare "Bearer ".
-func TestSubmitImprovementAnonymous(t *testing.T) {
-	var gotAuth string
-	var hadAuth bool
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotAuth = r.Header.Get("Authorization")
-		_, hadAuth = r.Header["Authorization"]
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer srv.Close()
-
-	a, s := newTestAgent(t)
-	if err := os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0644); err != nil {
-		t.Fatalf("write LICENSE: %v", err)
-	}
-	var tc toolCall
-	tc.Function.Name = "submit_improvement"
-	tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
-		"endpoint":     srv.URL, // no api_key
-		"improvements": `[{"title":"t","file":"PLAN.md","type":"remove","original":"x","new":"","reasoning":"r"}]`,
-	})
-	out, failed := a.executeTool(context.Background(), s.ID, tc)
-	if failed || !strings.Contains(out, "Submitted 1 improvement") {
-		t.Fatalf("anonymous submit should succeed, got: %s", out)
-	}
-	if hadAuth || gotAuth != "" {
-		t.Errorf("no api_key should omit the Authorization header, got %q (present=%v)", gotAuth, hadAuth)
 	}
 }
 

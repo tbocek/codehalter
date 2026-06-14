@@ -7,11 +7,11 @@ import (
 	"testing"
 )
 
-// TestImproveExecuteDeniesVerify pins that during an /improve execute pass the
-// build/test runners are denied at the tool layer (the edits are .md only): the
-// model's run_task call is blocked and never executes, while a normal execute
-// pass runs it.
-func TestImproveExecuteDeniesVerify(t *testing.T) {
+// TestImproveExecuteSkipsVerify pins that during an /improve execute pass the
+// build/test runners are SKIPPED at the tool layer (the edits are .md only): the
+// model's run_task call never executes, while a normal execute pass runs it. The
+// skip is non-failing (see TestSkipToolCall) so it can't condemn the subtask.
+func TestImproveExecuteSkipsVerify(t *testing.T) {
 	withFreshToolRegistry(t)
 	var ran int
 	RegisterTool(Tool{
@@ -43,7 +43,7 @@ func TestImproveExecuteDeniesVerify(t *testing.T) {
 	ran = 0
 	run(true)
 	if ran != 0 {
-		t.Errorf("/improve execute: run_task must be DENIED, but it ran (ran=%d, want 0)", ran)
+		t.Errorf("/improve execute: run_task must be SKIPPED, but it ran (ran=%d, want 0)", ran)
 	}
 }
 

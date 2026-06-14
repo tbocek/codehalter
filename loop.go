@@ -292,10 +292,10 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
 	if sess != nil && sess.improveFlow {
 		// /improve edits .md prompt files only — nothing to build or test, and the
-		// weak model ignores the "no verify" instruction. Deny the runners at the
-		// tool layer so it can't burn turns on a meaningless build/test. A denied
-		// call doesn't count toward the fail cap (see runToolLoopSeeded).
-		policy.deny = map[string]bool{"run_task": true, "run_command": true}
+		// weak model ignores the "no verify" instruction. SKIP (not deny) the
+		// runners: a non-failing no-op so the model moves on, without the runner
+		// condemning the subtask (a denied/failed run_task fails the whole subtask).
+		policy.skip = map[string]bool{"run_task": true, "run_command": true}
 	}
 	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
@@ -771,11 +771,18 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			var tu ToolUse
 			var content any
 			denied := policy.isDenied(tc.Function.Name)
-			if denied {
+			switch {
+			case policy.isSkipped(tc.Function.Name):
+				// Non-failing no-op (e.g. /improve's build/test runners): the model
+				// moves on and the call doesn't condemn the subtask.
+				var msg string
+				tu, msg = a.skipToolCall(ctx, sid, tc, "/improve makes only .md prompt-file edits — there is nothing to build or test")
+				content = msg
+			case denied:
 				var msg string
 				tu, msg = a.denyToolCall(ctx, sid, phase, tc)
 				content = msg
-			} else {
+			default:
 				tu, content = a.runToolCall(ctx, sid, tc)
 			}
 			res.ToolUses = append(res.ToolUses, tu)

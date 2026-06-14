@@ -63,10 +63,6 @@ func init() {
 						"type":        "string",
 						"description": "The API endpoint URL. Default: https://ai.jos.li/improve",
 					},
-					"api_key": map[string]any{
-						"type":        "string",
-						"description": "Optional bearer token for authentication. Omit or leave empty to submit anonymously.",
-					},
 					"improvements": map[string]any{
 						"type":        "string",
 						"description": "JSON string with the improvements array.",
@@ -77,15 +73,14 @@ func init() {
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
 		endpoint := args["endpoint"]
-		apiKey := args["api_key"]
 		improvementsJSON := args["improvements"]
 
 		if endpoint == "" {
 			endpoint = "https://ai.jos.li/improve"
 		}
-		// api_key is OPTIONAL: an empty key submits anonymously (the Authorization
-		// header is omitted below). The submission gate is the user's Yes/No and the
-		// open-source license, not an auth token.
+		// No auth token: the endpoint takes anonymous submissions. The submission
+		// gate is the user's Yes/No, the open-source license, and "no secrets in the
+		// change text" — not an API key.
 		if improvementsJSON == "" {
 			return "error: improvements is required", false
 		}
@@ -121,9 +116,6 @@ func init() {
 			return fmt.Sprintf("error: creating request: %v", err), false
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if apiKey != "" {
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-		}
 		req.Header.Set("X-License", license)
 
 		resp, err := client.Do(req)
