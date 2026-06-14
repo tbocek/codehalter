@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -23,9 +25,10 @@ func submitImprovementArgs(t *testing.T, m map[string]string) string {
 // improvements array in {"improvements":[...]}, POSTs it with a Bearer header,
 // and reports success on a 2xx.
 func TestSubmitImprovementPostsPayload(t *testing.T) {
-	var gotMethod, gotAuth, gotCT, gotBody string
+	var gotMethod, gotAuth, gotCT, gotBody, gotLicense string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod, gotAuth, gotCT = r.Method, r.Header.Get("Authorization"), r.Header.Get("Content-Type")
+		gotLicense = r.Header.Get("X-License")
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
 		w.WriteHeader(http.StatusOK)
@@ -33,6 +36,10 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	defer srv.Close()
 
 	a, s := newTestAgent(t)
+	// Write a LICENSE file so checkLicense passes.
+	if err := os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0644); err != nil {
+		t.Fatalf("write LICENSE: %v", err)
+	}
 	improvements := `[{"title":"t","file":"PLAN.md","type":"remove","original":"x","new":"","reasoning":"r"}]`
 	var tc toolCall
 	tc.Function.Name = "submit_improvement"
@@ -56,6 +63,9 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	if gotCT != "application/json" {
 		t.Errorf("content-type = %q", gotCT)
 	}
+	if gotLicense != "MIT" {
+		t.Errorf("X-License = %q, want %q", gotLicense, "MIT")
+	}
 	var p improvementPayload
 	if err := json.Unmarshal([]byte(gotBody), &p); err != nil || len(p.Improvements) != 1 || p.Improvements[0].File != "PLAN.md" {
 		t.Errorf("body not the wrapped payload: %s", gotBody)
@@ -65,6 +75,10 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 // TestSubmitImprovementErrors covers the validation and HTTP-error branches.
 func TestSubmitImprovementErrors(t *testing.T) {
 	a, s := newTestAgent(t)
+	// Write a LICENSE file so checkLicense passes (errors below are not about license).
+	if err := os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0644); err != nil {
+		t.Fatalf("write LICENSE: %v", err)
+	}
 	call := func(m map[string]string) (string, bool) {
 		var tc toolCall
 		tc.Function.Name = "submit_improvement"
@@ -93,5 +107,22 @@ func TestSubmitImprovementErrors(t *testing.T) {
 	})
 	if !strings.Contains(out, "HTTP 500") || !strings.Contains(out, "boom") {
 		t.Errorf("HTTP error not surfaced: %s", out)
+	}
+}
+
+// TestSubmitImprovementNoLicense rejects submissions from projects without an
+// open-source license.
+func TestSubmitImprovementNoLicense(t *testing.T) {
+	a, s := newTestAgent(t)
+	// Make sure there's no LICENSE file.
+	var tc toolCall
+	tc.Function.Name = "submit_improvement"
+	tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
+		"endpoint": "http://example.com", "api_key": "k",
+		"improvements": `[{"title":"t","file":"f","type":"remove"}]`,
+	})
+	out, _ := a.executeTool(context.Background(), s.ID, tc)
+	if !strings.Contains(out, "no open-source license") {
+		t.Errorf("expected license error, got: %s", out)
 	}
 }

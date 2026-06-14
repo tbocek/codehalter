@@ -52,6 +52,27 @@ An [ACP](https://agentclientprotocol.com)-compatible AI coding agent that connec
 - An OpenAI-compatible LLM server (e.g. [llama.cpp](https://github.com/ggml-org/llama.cpp), [Ollama](https://ollama.com), [vLLM](https://github.com/vllm-project/vllm))
 - Firefox, if you want `web_search` / `web_read` to work
 
+## Improve Backend
+
+A lightweight HTTP server for receiving and storing prompt improvements locally as TOML files.
+
+```sh
+just improve-build   # build the server binary
+just improve         # build and run (default :8080)
+```
+
+Environment variables:
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `IMPROVE_DATA_DIR` | `data/` | Directory where TOML files are stored |
+| `IMPROVE_ADDR` | `:8080` | HTTP listen address |
+
+The server exposes:
+
+- `POST /v1/improvements` — accepts the same payload as the frontend `submit_improvement` tool (`{"improvements":[{title, file, type, original, new, reasoning}]}`). Each entry is scanned for sensitive data (api_key, token, password, secret, Bearer tokens) and redacted before storage. Returns `{"stored": N, "redacted": [notes]}`.
+- `GET /v1/improvements` — lists all stored improvements.
+
 ## Build
 
 ```sh

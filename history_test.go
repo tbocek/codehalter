@@ -774,6 +774,61 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 	}
 }
 
+// TestRepetitionLadderExemptsSuccessfulRunTask pins the build/test re-verify
+// carve-out: re-running run_task with identical SUCCESSFUL output (e.g. just:build
+// green both times after an edit) is NOT counted as no-progress, so the loop never
+// nudges or bails on it — unlike the generic repeating tool in the ladder test.
+func TestRepetitionLadderExemptsSuccessfulRunTask(t *testing.T) {
+	withFreshToolRegistry(t)
+	var execs int
+	RegisterTool(Tool{
+		Def: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "run_task", "description": "probe",
+				"parameters": map[string]any{"type": "object"},
+			},
+		},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			execs++
+			return "go build -o codehalter .", false // identical green output, success
+		},
+	})
+
+	// Six identical successful run_task calls, then a plain-text exit.
+	var resp []string
+	for i := 0; i < 6; i++ {
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "run_task", `{"task":"just:build"}`))
+	}
+	resp = append(resp, sseText("all green, done"))
+	mock := newMockLLM(t, resp...)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
+	conn := a.connForSession(context.Background(), s.ID, "execute")
+	if conn == nil {
+		t.Fatalf("connForSession(execute) returned nil")
+	}
+
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0); err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if execs != 6 {
+		t.Errorf("tool execs: got %d, want 6 (no early bail on successful run_task re-runs)", execs)
+	}
+	for i := 0; i < mock.callCount(); i++ {
+		msgs, _ := mock.request(i)["messages"].([]any)
+		for _, m := range msgs {
+			mm, _ := m.(map[string]any)
+			if c, _ := mm["content"].(string); mm["role"] == "user" && strings.Contains(c, "makes no progress") {
+				t.Errorf("request %d carried a repeat-corrective for a successful run_task re-run", i)
+			}
+		}
+	}
+}
+
 // TestToolLoopDoesNotEscalateOnDistinctArgs verifies that legitimate fan-out
 // across distinct arguments (e.g. read_file on go.mod, examples/go.mod, …
 // when surveying a multi-module repo) never climbs the repetition ladder: each

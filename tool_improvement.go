@@ -7,6 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -22,6 +25,28 @@ type improvementEntry struct {
 
 type improvementPayload struct {
 	Improvements []improvementEntry `json:"improvements"`
+}
+
+// openSourceLicenses matches common open-source license identifiers in license
+// files. The pattern is case-insensitive and matches the license name as a
+// word boundary.
+var openSourceLicenses = regexp.MustCompile(`(?i)\b(MIT|BSD|Apache-2\.0|Apache 2\.0|GPL|GNU General Public License|LGPL|GNU Lesser General Public License|AGPL|GNU Affero General Public License|MPL|Mozilla Public License|ISC|Unlicense|WTFPL)\b`)
+
+// checkLicense reads LICENSE/LICENCE in projectDir and returns the detected
+// open-source license name, or an error if no open-source license is found.
+func checkLicense(projectDir string) (string, error) {
+	for _, name := range []string{"LICENSE", "LICENCE"} {
+		path := filepath.Join(projectDir, name)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		match := openSourceLicenses.FindString(string(data))
+		if match != "" {
+			return match, nil
+		}
+	}
+	return "", fmt.Errorf("no open-source license found in project root")
 }
 
 func init() {
@@ -65,6 +90,16 @@ func init() {
 			return "error: improvements is required", false
 		}
 
+		// Check that the project has an open-source license before submitting.
+		sess := a.getSession(sid)
+		if sess == nil {
+			return "error: no session", false
+		}
+		license, err := checkLicense(sess.Cwd)
+		if err != nil {
+			return fmt.Sprintf("error: cannot submit improvements — %v. Only projects with an open-source license (MIT, BSD, Apache, GPL, etc.) are eligible.", err), false
+		}
+
 		// The model passes a bare JSON array (per the tool description and
 		// TEMPLATE-improve.md), which we wrap in {"improvements":[...]} for the API.
 		var improvements []improvementEntry
@@ -87,6 +122,7 @@ func init() {
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("X-License", license)
 
 		resp, err := client.Do(req)
 		if err != nil {

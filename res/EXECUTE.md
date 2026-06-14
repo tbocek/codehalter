@@ -61,6 +61,7 @@ Fallback: commit fails read-only or push fails auth (older container, no writabl
 
 ## On tool failure (esp run_task)
 Failure (`❌ TASK FAILED`, non-zero exit, `command not found`, `not installed`, `No such file or directory`) → VERY NEXT action = root-cause investigation. Don't retry same task; don't move on until you know WHY.
+EXCEPTION — transient concurrent-edit error: a build/embed error like `copy <file>: unexpected length N != M` (or any "file changed / length mismatch" mid-build) means the file was edited WHILE the toolchain read it (you or the user just changed it), NOT a real defect. Just re-run the same `run_task` ONCE — do NOT grep the error string or investigate. Only investigate if it recurs on a clean re-run.
 Investigate (read_file/list_files/search_text — fast):
 1. Read failing script/recipe (e.g. `site/build.sh:100`, the Justfile/Makefile target).
 2. Missing tool? Check `.devcontainer/` — read `devcontainer.json` + its `Dockerfile`. Declared → image stale; point at line that should've installed it. Not declared → propose adding. BOTH cases, when `run_command` available, do ONE pass:

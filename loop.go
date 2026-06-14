@@ -732,6 +732,13 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				repeated = true
 			}
 			callOutHash[key] = h
+			// A SUCCESSFUL run_task/run_command re-run with identical output is a
+			// legitimate re-verify after an edit (re-running just:build / just:test to
+			// confirm a change held), NOT spinning — don't count it as no-progress. A
+			// FAILED re-run still counts: the model IS stuck on a red build/test.
+			if repeated && !tu.Failed && (tc.Function.Name == "run_task" || tc.Function.Name == "run_command") {
+				repeated = false
+			}
 			if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read" || tc.Function.Name == "search_text") &&
 				strings.Contains(tu.Output, readUnchangedMarker) {
 				repeated = true
