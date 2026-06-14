@@ -36,6 +36,7 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	defer srv.Close()
 
 	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Model: "test-model"}}} // stamped onto each entry
 	// Write a LICENSE file so checkLicense passes.
 	if err := os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0644); err != nil {
 		t.Fatalf("write LICENSE: %v", err)
@@ -69,6 +70,9 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	var p improvementPayload
 	if err := json.Unmarshal([]byte(gotBody), &p); err != nil || len(p.Improvements) != 1 || p.Improvements[0].File != "PLAN.md" {
 		t.Errorf("body not the wrapped payload: %s", gotBody)
+	}
+	if p.Improvements[0].Model != "test-model" {
+		t.Errorf("model not stamped onto the entry: got %q, want %q", p.Improvements[0].Model, "test-model")
 	}
 }
 

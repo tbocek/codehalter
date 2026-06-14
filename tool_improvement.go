@@ -21,6 +21,10 @@ type improvementEntry struct {
 	Original  string `json:"original"`
 	New       string `json:"new"`
 	Reasoning string `json:"reasoning"`
+	// Model is stamped by codehalter (the LLM only writes the change fields, and
+	// the backend can't know which model ran). ip is left to the backend, which
+	// sees the request source; license rides the X-License header.
+	Model string `json:"model,omitempty"`
 }
 
 type improvementPayload struct {
@@ -103,6 +107,17 @@ func init() {
 		}
 		if len(improvements) == 0 {
 			return "error: improvements array is empty", false
+		}
+
+		// Stamp the model that produced these onto every entry — the LLM writes
+		// only the change fields, and the backend has no other way to know which
+		// model ran. (ip is filled backend-side from the request source.)
+		model := ""
+		if c := a.settings.MainLLM("execute"); c != nil {
+			model = c.Model
+		}
+		for i := range improvements {
+			improvements[i].Model = model
 		}
 
 		body, err := json.Marshal(improvementPayload{Improvements: improvements})
