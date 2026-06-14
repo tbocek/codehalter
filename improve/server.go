@@ -11,7 +11,7 @@ import (
 func NewServer(dataDir string) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("POST /v1/improvements", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST /improve", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, "read body", http.StatusBadRequest)

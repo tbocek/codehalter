@@ -1,10 +1,51 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"slices"
 	"testing"
 )
+
+// TestImproveExecuteDeniesVerify pins that during an /improve execute pass the
+// build/test runners are denied at the tool layer (the edits are .md only): the
+// model's run_task call is blocked and never executes, while a normal execute
+// pass runs it.
+func TestImproveExecuteDeniesVerify(t *testing.T) {
+	withFreshToolRegistry(t)
+	var ran int
+	RegisterTool(Tool{
+		Def: map[string]any{"type": "function", "function": map[string]any{
+			"name": "run_task", "description": "x",
+			"parameters": map[string]any{"type": "object"}}},
+		Execute: func(_ context.Context, _ *agent, _, _ string) (string, bool) {
+			ran++
+			return "ran the task", false
+		},
+	})
+
+	run := func(improve bool) {
+		// run_task, then two empty (text) rounds: with a terminal policy the first
+		// empty round is nudged, the second exits.
+		mock := newMockLLM(t, sseToolCall("c0", "run_task", `{"task":"just:build"}`), sseText("a"), sseText("done"))
+		defer mock.Close()
+		a, s := newTestAgent(t)
+		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+		s.improveFlow = improve
+		a.runExecutePhase(context.Background(), s.ID, subtask{Description: "apply"}, 0, 1)
+	}
+
+	ran = 0
+	run(false)
+	if ran != 1 {
+		t.Errorf("normal execute: run_task should run (ran=%d, want 1)", ran)
+	}
+	ran = 0
+	run(true)
+	if ran != 0 {
+		t.Errorf("/improve execute: run_task must be DENIED, but it ran (ran=%d, want 0)", ran)
+	}
+}
 
 // TestPlanResultSubtasksDeserialize ensures the planner's JSON output (an
 // array of `{description, verify}` objects under `subtasks`) round-trips into

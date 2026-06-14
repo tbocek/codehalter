@@ -290,6 +290,13 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// respond ends the subtask; submit_plan revises the remaining plan in place
 	// (the orchestrator adopts it — see subtaskOutcome).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
+	if sess != nil && sess.improveFlow {
+		// /improve edits .md prompt files only — nothing to build or test, and the
+		// weak model ignores the "no verify" instruction. Deny the runners at the
+		// tool layer so it can't burn turns on a meaningless build/test. A denied
+		// call doesn't count toward the fail cap (see runToolLoopSeeded).
+		policy.deny = map[string]bool{"run_task": true, "run_command": true}
+	}
 	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
 	// session, stored verbatim by the loop — no post-hoc patch.

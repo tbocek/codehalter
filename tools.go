@@ -104,7 +104,7 @@ func denyHint(phase string) string {
 	case "document":
 		return "the documentation phase only wraps up — write the note and stop, don't re-plan."
 	default:
-		return "it isn't available in this phase."
+		return "it isn't allowed here; continue without it."
 	}
 }
 
