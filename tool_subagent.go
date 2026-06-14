@@ -192,10 +192,12 @@ func (a *agent) registerSubagentTool() {
 			// All internal plan/execute/verify calls use the subagent's own
 			// session id. That keeps plan steps, tool uses, and assistant
 			// output in subSess.toml — and because Zed does not know about
-			// that session id, every session/update notification the tool
-			// loop emits is silently dropped. The subagent therefore runs
-			// without polluting the parent conversation; we surface only the
-			// final result (via the tool return value below) to the parent.
+			// that session id, the chat/message notifications the tool loop
+			// emits are silently dropped (sendUpdate). The subagent therefore
+			// runs without polluting the parent conversation; we surface only
+			// the final result (the tool return value below) plus a live
+			// progress feed: per-tool breadcrumbs (loop.go) and the folded
+			// status meter (setStatus -> setSubagentStatus) on the parent row.
 			result, err := ag.runSubagent(ctx, subSess, task)
 
 			mu.Lock()

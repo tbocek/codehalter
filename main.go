@@ -160,6 +160,15 @@ type agent struct {
 	// means proceed; non-empty causes Prompt to refuse with this message.
 	// Read under mu.
 	abortReason string
+
+	// subagentMeter folds the live status meter of each running subagent into
+	// its parent's in-progress phase row. Subagent sessions have no UI of their
+	// own (Zed only knows the parent sid), so their "↑sent ↓tokens… Ns" meter
+	// would otherwise be dropped. Keyed parentSid -> subSid -> latest meter
+	// fragment; setSubagentStatus re-renders the parent row as a compact join of
+	// every active subagent. Guarded by subagentMeterMu (concurrent subagents).
+	subagentMeterMu sync.Mutex
+	subagentMeter   map[string]map[string]string
 }
 
 // mcpState owns the spawned MCP server children plus the bookkeeping

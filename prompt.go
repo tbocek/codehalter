@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -270,6 +271,14 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 	if sess == nil {
 		return
 	}
+	// Subagents own no phase row (Zed only knows the parent sid), so fold their
+	// live meter into the PARENT's in-progress row instead of letting sendUpdate
+	// drop it. Intercept before the phaseActive gate below: an execute-mode
+	// subagent runs no phase of its own, yet its parent is mid-"Working".
+	if sess.ParentID != "" {
+		a.setSubagentStatus(ctx, sess.ParentID, sid, sess.DisplayLabel, suffix)
+		return
+	}
 	sess.phaseMu.Lock()
 	active := sess.phaseActive
 	phase := sess.phaseCurrent
@@ -282,6 +291,61 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 		return
 	}
 	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
+}
+
+// setSubagentStatus records (suffix non-empty) or clears (suffix empty) one
+// subagent's live meter under its parent, then re-renders the parent's
+// in-progress row as a compact " (labelA …metersA · labelB …metersB)" join of
+// every active subagent. This is what surfaces a subagent's ↑sent / ↓tokens /
+// elapsed in Zed's "Current: Working (…)" status — N parallel subagents each
+// keep their own fragment instead of clobbering a single row. Called from
+// concurrent subagent goroutines, so the map is mutex-guarded; the parent
+// sendUpdate it ends in already runs concurrently today (loop.go breadcrumbs).
+// Returns the rendered aggregate (the suffix handed to the parent's setStatus)
+// so the folding is observable in tests, mirroring phaseEntries' compute-and-
+// return shape; production callers ignore it.
+func (a *agent) setSubagentStatus(ctx context.Context, parentSid, subSid, label, suffix string) string {
+	if label == "" {
+		label = "sub"
+	}
+	a.subagentMeterMu.Lock()
+	if a.subagentMeter == nil {
+		a.subagentMeter = map[string]map[string]string{}
+	}
+	subs := a.subagentMeter[parentSid]
+	if subs == nil {
+		subs = map[string]string{}
+		a.subagentMeter[parentSid] = subs
+	}
+	// suffix is the meter fragment " (llm[0] ↑12kb ↓1.2k…)" / " (running read_file…)".
+	// Strip its outer " ( … )" framing (and the redundant "llm[slot] " prefix the
+	// meter adds — the label already names the slot) so the join reads cleanly.
+	if inner := strings.Trim(strings.TrimSpace(suffix), "()"); inner == "" {
+		delete(subs, subSid)
+	} else {
+		if rest, ok := strings.CutPrefix(inner, "llm["); ok {
+			if i := strings.IndexByte(rest, ']'); i >= 0 {
+				inner = strings.TrimPrefix(rest[i+1:], " ")
+			}
+		}
+		subs[subSid] = label + " " + inner
+	}
+	parts := make([]string, 0, len(subs))
+	for _, v := range subs {
+		parts = append(parts, v)
+	}
+	if len(subs) == 0 {
+		delete(a.subagentMeter, parentSid)
+	}
+	a.subagentMeterMu.Unlock()
+
+	sort.Strings(parts) // stable order so the row doesn't reshuffle each tick
+	agg := ""
+	if len(parts) > 0 {
+		agg = " (" + strings.Join(parts, " · ") + ")"
+	}
+	a.setStatus(ctx, parentSid, agg)
+	return agg
 }
 
 // phaseActive reports whether a foreground phase is currently in progress for

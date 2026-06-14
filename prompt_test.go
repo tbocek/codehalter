@@ -23,6 +23,48 @@ func TestConfirmPlanFixAutoExecSkipsGate(t *testing.T) {
 	}
 }
 
+// TestSubagentStatusFolding pins the subagent-meter fold: a subagent's live
+// status (which Zed would otherwise drop with its sub_* sid) is recorded under
+// its parent and rendered as a compact, labelled, sorted join on the parent's
+// row — so N parallel subagents each show ↑sent/↓tokens/elapsed instead of
+// clobbering one line. The meter's outer "( )" framing and redundant "llm[slot]"
+// prefix are stripped (the label already names the slot); an empty suffix clears
+// that subagent's fragment and prunes the parent once none remain.
+func TestSubagentStatusFolding(t *testing.T) {
+	a, _ := newTestAgent(t)
+	ctx := context.Background()
+	const parent = "parent-1"
+
+	got := a.setSubagentStatus(ctx, parent, "sub_a", "llm1@0/0", " (llm[0] ↑12.00kb ↓1.2k…)")
+	if want := " (llm1@0/0 ↑12.00kb ↓1.2k…)"; got != want {
+		t.Errorf("single sub: got %q, want %q", got, want)
+	}
+
+	// A second parallel subagent: both fragments, sorted by label, joined " · ".
+	// The non-meter "(running …)" suffix has no llm[slot] prefix to strip.
+	got = a.setSubagentStatus(ctx, parent, "sub_b", "llm2@1/0", " (running read_file…)")
+	if want := " (llm1@0/0 ↑12.00kb ↓1.2k… · llm2@1/0 running read_file…)"; got != want {
+		t.Errorf("two subs: got %q, want %q", got, want)
+	}
+
+	// Clearing the first subagent drops only its fragment.
+	got = a.setSubagentStatus(ctx, parent, "sub_a", "llm1@0/0", "")
+	if want := " (llm2@1/0 running read_file…)"; got != want {
+		t.Errorf("after clear: got %q, want %q", got, want)
+	}
+
+	// Clearing the last empties the row and prunes the parent entry.
+	if got = a.setSubagentStatus(ctx, parent, "sub_b", "llm2@1/0", ""); got != "" {
+		t.Errorf("after final clear: got %q, want empty", got)
+	}
+	a.subagentMeterMu.Lock()
+	_, present := a.subagentMeter[parent]
+	a.subagentMeterMu.Unlock()
+	if present {
+		t.Error("parent entry should be pruned once no subagents remain")
+	}
+}
+
 // TestParseLineRange covers the line-range encodings Zed may put in a
 // resource_link fragment.
 func TestParseLineRange(t *testing.T) {
