@@ -826,19 +826,33 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			// result.Text lets Prompt's epilogue run). If the planner left it empty
 			// even after the plan-phase nudge, warn rather than ending silently —
 			// never leave the user with nothing after a turn that ran.
-			if p.answer != "" {
+			switch {
+			case sess != nil && sess.improveFlow:
+				// /improve workaround: the weak model can't reliably emit a structured
+				// plan here — it answers the analysis with a report-only respond, so
+				// there are no subtasks. The analysis is already in history; synthesize
+				// the apply step as one subtask and fall through to execute, where
+				// ask_user / edit_file / submit_improvement actually work.
+				p.Subtasks = []subtask{{Description: "The analysis above already identified the improvements — do NOT re-analyse. Now carry out the apply steps from the /improve instructions: present each improvement and ask the user Apply/Skip, edit_file the accepted ones, then submit (only if an API key was given) and verify with run_task."}}
+			case p.answer != "":
 				// Surface the answer, then say WHY the turn ends here: a report_only
 				// plan means the planner judged this a question/diagnosis, not a code
 				// change, so no execute phase runs. Without this note a "Completed
 				// Plan — Planning" card reads as "stopped early", not "answered".
 				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: p.answer + "\n\nℹ Answered directly — no code change to execute.\n"}})
 				return toolLoopResult{Text: p.answer}, nil
+			default:
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ I couldn't produce a clear answer or a plan for that — try rephrasing, or ask for a specific change.\n"}})
+				return toolLoopResult{}, nil
 			}
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ I couldn't produce a clear answer or a plan for that — try rephrasing, or ask for a specific change.\n"}})
-			return toolLoopResult{}, nil
 		}
-		if err := a.confirmPlan(ctx, sid, p, false); err != nil {
-			return toolLoopResult{}, err
+		// /improve consents by being invoked, so skip the "Execute this plan?" gate
+		// and go straight to execute — the per-improvement Apply/Skip prompts in the
+		// execute phase are the real per-change approval.
+		if sess == nil || !sess.improveFlow {
+			if err := a.confirmPlan(ctx, sid, p, false); err != nil {
+				return toolLoopResult{}, err
+			}
 		}
 		plan = p
 	}
@@ -935,8 +949,10 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			return lastResult, nil
 		}
 
-		if err := a.confirmPlan(ctx, sid, newPlan, true); err != nil {
-			return lastResult, err
+		if sess == nil || !sess.improveFlow { // /improve auto-executes (see initial gate)
+			if err := a.confirmPlan(ctx, sid, newPlan, true); err != nil {
+				return lastResult, err
+			}
 		}
 		plan = newPlan
 	}
