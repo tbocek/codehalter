@@ -7,43 +7,11 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
-
-// dumpGoroutinesOnSignal writes every goroutine's stack to
-// .codehalter/goroutines.txt on SIGUSR1, so a wedged turn can be diagnosed
-// without ptrace/pprof: `kill -USR1 <pid>` while it's stuck, then read the file.
-func dumpGoroutinesOnSignal() {
-	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGUSR1)
-	go func() {
-		for range ch {
-			buf := make([]byte, 1<<20)
-			for {
-				if n := runtime.Stack(buf, true); n < len(buf) {
-					buf = buf[:n]
-					break
-				}
-				buf = make([]byte, 2*len(buf))
-			}
-			path := ".codehalter-goroutines.txt"
-			if cwd, err := os.Getwd(); err == nil {
-				path = filepath.Join(cwd, ".codehalter", "goroutines.txt")
-			}
-			if err := os.WriteFile(path, buf, 0o644); err != nil {
-				slog.Error("goroutine dump failed", "err", err)
-			} else {
-				slog.Info("goroutine dump written", "path", path, "bytes", len(buf))
-			}
-		}
-	}()
-}
 
 //go:embed res/PLAN.md
 var defaultPlanMD string
@@ -207,7 +175,6 @@ func main() {
 	// Global slog → stderr at debug (Zed captures it live); per-session detail
 	// (LLM req/reply, errors) goes to .codehalter/session_<id>.log via logSession.
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
-	dumpGoroutinesOnSignal()
 
 	a := &agent{sessions: make(map[string]*Session), mode: "Interactive"}
 	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin)
