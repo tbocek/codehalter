@@ -508,6 +508,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		sess.readCursorMu.Lock()
 		sess.readCursor = nil
 		sess.readCursorMu.Unlock()
+		sess.editFailedPathsMu.Lock()
+		sess.editFailedPaths = nil
+		sess.editFailedPathsMu.Unlock()
 	} else {
 		slog.Debug("Prompt: pre-turn getSession NIL", "sid", req.SessionId, "knownSessions", len(a.sessions))
 	}

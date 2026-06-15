@@ -230,7 +230,10 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	// byte-clipped) and is genuinely still present — verified against the live
 	// messages, not a per-turn hash, so a compacted-away read IS re-served.
 	// readUnchangedMarker keeps runToolLoop's repetition ladder counting it.
-	if sess != nil && len(content) > 0 && len(content) <= liveExemptCap && sess.readContentInContext(content) {
+	// Exception: if edit_file just failed for this path, the model needs a fresh
+	// look to get the exact old_text for a retry — bypass the guard once.
+	editFailed := sess != nil && sess.clearEditFailed(path)
+	if !editFailed && sess != nil && len(content) > 0 && len(content) <= liveExemptCap && sess.readContentInContext(content) {
 		ptr := " You already have these lines above — scroll back to that output instead of re-reading."
 		if more {
 			ptr = fmt.Sprintf(" You already have lines %d-%d above; for the rest of the file call continue_read path=%q (or read_file line=%d / search_text for a specific part).", start, end, path, end+1)
@@ -532,6 +535,9 @@ func init() {
 				return fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n), true
 			default:
 				a.FailToolCall(ctx, sid, tcId, "old_text not found in file")
+				if sess := a.getSession(sid); sess != nil {
+					sess.markEditFailed(path)
+				}
 				// Failed=true feeds the loop's fail cap (a model spraying wrong edits
 				// gives up instead of looping to the iteration backstop); the verdict
 				// authority excludes edit_file, so a recovered miss never condemns.

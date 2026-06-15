@@ -308,6 +308,14 @@ type Session struct {
 	// busted for a path on write. In-memory only.
 	readCursorMu sync.Mutex
 	readCursor   map[string]int
+	// editFailedPaths is the set of paths where edit_file returned "not found"
+	// this turn. A failed edit signals that the model's remembered content is
+	// stale or inexact, so the next read_file on that path must bypass the
+	// readContentInContext guard — the model genuinely needs a fresh look to
+	// get the exact old_text for a retry. Cleared when the path is re-read.
+	// Same lifecycle as readDedup: reset at the top of Prompt(). In-memory only.
+	editFailedPathsMu sync.Mutex
+	editFailedPaths   map[string]bool
 	// pendingPlan holds a plan whose "Execute / Abort" card the user
 	// dismissed by typing (e.g. asking a question) instead of choosing. Prompt
 	// re-shows it after the typed message is handled, so a question doesn't throw
@@ -705,6 +713,29 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 	}
 	last := &s.Messages[len(s.Messages)-1]
 	last.ToolUses = append(last.ToolUses, tu)
+}
+
+// markEditFailed records that edit_file failed with "not found" for path,
+// allowing the next read_file on that path to bypass readContentInContext.
+func (s *Session) markEditFailed(path string) {
+	s.editFailedPathsMu.Lock()
+	if s.editFailedPaths == nil {
+		s.editFailedPaths = map[string]bool{}
+	}
+	s.editFailedPaths[path] = true
+	s.editFailedPathsMu.Unlock()
+}
+
+// clearEditFailed clears the edit-failed flag for path and returns whether
+// it was set. Called by serveRead so the bypass fires exactly once per failure.
+func (s *Session) clearEditFailed(path string) bool {
+	s.editFailedPathsMu.Lock()
+	defer s.editFailedPathsMu.Unlock()
+	if s.editFailedPaths[path] {
+		delete(s.editFailedPaths, path)
+		return true
+	}
+	return false
 }
 
 // readContentInContext reports whether the exact bytes `content` are still
