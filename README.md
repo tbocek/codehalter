@@ -48,7 +48,7 @@ An [ACP](https://agentclientprotocol.com)-compatible AI coding agent that connec
 
 ## Prerequisites
 
-- Go 1.26+
+- Go 1.26+ — only to build from source; [Install](#install) uses prebuilt binaries and needs no toolchain
 - An OpenAI-compatible LLM server (e.g. [llama.cpp](https://github.com/ggml-org/llama.cpp), [Ollama](https://ollama.com), [vLLM](https://github.com/vllm-project/vllm))
 - Firefox, if you want `web_search` / `web_read` to work
 
@@ -73,7 +73,27 @@ The server exposes:
 - `POST /improve` — accepts the same payload as the frontend `submit_improvement` tool (`{"improvements":[{title, file, type, original, new, reasoning}]}`). Each entry is scanned for sensitive data (api_key, token, password, secret, Bearer tokens) and redacted before storage. Returns `{"stored": N, "redacted": [notes]}`.
 - `GET /v1/improvements` — lists all stored improvements.
 
+## Install
+
+Prebuilt binaries — no toolchain needed. The script detects your OS/arch, downloads the matching binary from the [latest release](https://github.com/tbocek/codehalter/releases/latest), and installs it.
+
+**Linux & macOS** (Intel and Apple Silicon) — installs to `/usr/local/bin`, or `~/.local/bin` when that isn't writable:
+
+```sh
+curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
+```
+
+**Windows** (PowerShell) — installs to `%LOCALAPPDATA%\Programs\codehalter` and adds it to your user PATH:
+
+```powershell
+irm https://raw.githubusercontent.com/tbocek/codehalter/main/install.ps1 | iex
+```
+
+On Windows you can also run `install.sh` under Git Bash or WSL, or download `codehalter-windows-amd64.exe` straight from the [releases page](https://github.com/tbocek/codehalter/releases/latest).
+
 ## Build
+
+To build from source instead (requires Go 1.26+):
 
 ```sh
 just build
