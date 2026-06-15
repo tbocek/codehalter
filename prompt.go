@@ -626,6 +626,16 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		userText = rendered
 	}
 
+	// /improve with no open-source license: the feedback backend rejects the
+	// submission and submit_improvement hard-fails on the same check, so disable
+	// the submit step in CODE rather than trusting the model to honour the
+	// template's prerequisite note (a weak model asks "Submit?" anyway, then the
+	// call errors). The fallback apply-subtask in orchestrate gates on the same
+	// flag for the path where the model emits no structured plan.
+	if sess != nil && sess.improving.Load() && sess.improveNoLicense.Load() {
+		userText += "\n\n[NO OPEN-SOURCE LICENSE in this project's root — feedback-API submission is DISABLED for this run. Do NOT ask the user whether to submit, and do NOT call submit_improvement. Applying the accepted edits locally completes /improve.]"
+	}
+
 	// The empty-project hint stays folded into the first user message because
 	// it's a one-shot nudge — once the project has files, we want the
 	// summariser to drop it naturally rather than re-injecting it forever.
@@ -830,7 +840,14 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 				// there are no subtasks. The analysis is already in history; synthesize
 				// the apply step as one subtask and fall through to execute, where
 				// ask_user / edit_file / submit_improvement actually work.
-				p.Subtasks = []subtask{{Description: "The analysis above already identified the improvements — do NOT re-analyse. Now carry out the apply steps from the /improve instructions: present each improvement and ask the user Apply/Skip, edit_file the accepted ones (these are .md prompt files — do NOT run any build or test), then ALWAYS ask the user whether to submit them to the feedback API; on yes, call submit_improvement (the endpoint needs NO API key — just don't include secrets from the change text)."}}
+				applyDesc := "The analysis above already identified the improvements — do NOT re-analyse. Now carry out the apply steps from the /improve instructions: present each improvement and ask the user Apply/Skip, edit_file the accepted ones (these are .md prompt files — do NOT run any build or test)"
+				if sess.improveNoLicense.Load() {
+					// No open-source license → submission is impossible; don't offer it.
+					applyDesc += ". This project has NO open-source license, so the improvements cannot be submitted — do NOT ask the user about submitting and do NOT call submit_improvement; applying the accepted edits locally is the whole task."
+				} else {
+					applyDesc += ", then ALWAYS ask the user whether to submit them to the feedback API; on yes, call submit_improvement (the endpoint needs NO API key — just don't include secrets from the change text)."
+				}
+				p.Subtasks = []subtask{{Description: applyDesc}}
 			case p.answer != "":
 				// Surface the answer, then say WHY the turn ends here: a report_only
 				// plan means the planner judged this a question/diagnosis, not a code

@@ -49,6 +49,16 @@
 # finish_reason="length", codehalter surfaces a clear error rather than
 # retrying — raise it only if a legitimate turn is being truncated.
 #
+# Repetition control: local models can loop on boilerplate — repeating the same
+# HTML block, list item, or sentence. The DRY sampler (`dry_multiplier` > 0)
+# penalises repeated multi-token SEQUENCES and is the real fix for that;
+# `repeat_penalty` is a blunter token-level backstop. The defaults below enable
+# both. They're llama.cpp sampler names, forwarded verbatim — if your backend
+# ignores DRY (some MLX servers do), drop the `dry_*` keys and add OpenAI-style
+# `frequency_penalty = 0.3, presence_penalty = 0.3` instead. Over-penalised
+# (mangled code, dropped closing tags)? Raise `dry_allowed_length` to 3–4 or set
+# `repeat_penalty = 1.0`.
+#
 # `context_size` and `image_support` are auto-detected on llama.cpp /
 # llama-swap setups (via /v1/models launch args or /props). Every other
 # backend (OpenAI, Ollama, vLLM, OpenWebUI, LiteLLM, …) doesn't expose that
@@ -65,8 +75,8 @@ model = "your-model-id"  # must match the model name your server reports at /v1/
 parallel = 1
 # context_size = 128000  # uncomment for non-llama.cpp backends — sized to the model's max prompt+output tokens
 # image_support = true   # uncomment for non-llama.cpp backends that accept image inputs (gpt-4o, claude-3.5-sonnet, qwen-vl, …)
-params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, max_tokens = 4096 }
-params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, max_tokens = 8192 }
+params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, max_tokens = 4096, repeat_penalty = 1.1, repeat_last_n = 256, dry_multiplier = 0.8, dry_base = 1.75, dry_allowed_length = 2, dry_penalty_last_n = -1 }
+params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, max_tokens = 8192, repeat_penalty = 1.1, repeat_last_n = 256, dry_multiplier = 0.8, dry_base = 1.75, dry_allowed_length = 2, dry_penalty_last_n = -1 }
 
 # Example extra entries — uncomment when you have a separate server (or
 # multiple slots on the same server you want to use in parallel). With
@@ -79,5 +89,5 @@ params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, ma
 # model = "your-larger-model-id"
 # tag = "execute"        # informational only — shown in the startup banner
 # parallel = 3
-# params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0 }
-# params_execute  = { temperature = 0.7, top_p = 0.8,  top_k = 20, min_p = 0.0 }
+# params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, repeat_penalty = 1.1, repeat_last_n = 256, dry_multiplier = 0.8, dry_base = 1.75, dry_allowed_length = 2, dry_penalty_last_n = -1 }
+# params_execute  = { temperature = 0.7, top_p = 0.8,  top_k = 20, min_p = 0.0, repeat_penalty = 1.1, repeat_last_n = 256, dry_multiplier = 0.8, dry_base = 1.75, dry_allowed_length = 2, dry_penalty_last_n = -1 }

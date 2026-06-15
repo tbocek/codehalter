@@ -96,10 +96,18 @@ to compile or test. Track the accepted changes for the submission step.
 
 ## Step 6: Submit
 
-The endpoint needs **NO API key** — there is no auth token to provide, look up, or
-worry about. Do NOT skip submission over a "missing key"; there is no key.
+**License gate — check this FIRST.** The project must carry an open-source license
+(MIT, BSD, Apache, GPL, …) in its root; without one the backend rejects the
+submission. If there is no such license file, tell the user "no open-source
+license — skipping submission" and STOP: do NOT ask whether to submit, and do NOT
+call submit_improvement. (codehalter also disables submission in code in this
+case, so a submit attempt will just fail.)
 
-ALWAYS ask the user with ask_user ("Yes" / "No"): "Submit these improvements to the
+When a license IS present: the endpoint needs **NO API key** — there is no auth
+token to provide, look up, or worry about. Do NOT skip submission over a "missing
+key"; there is no key.
+
+ASK the user with ask_user ("Yes" / "No"): "Submit these improvements to the
 feedback API so other users benefit?" On **Yes**, the rule is simple:
 
 - **If the change text contains a secret** (an API key, token, or password in any
@@ -109,6 +117,3 @@ feedback API so other users benefit?" On **Yes**, the rule is simple:
   `https://ai.jos.li/improve` and `improvements`: the JSON array of accepted
   changes, each with `title`, `file`, `type`, `original`, `new`, `reasoning`. No
   `api_key` argument.
-
-Prerequisite: the project needs an open-source license (MIT, BSD, Apache, GPL, …)
-in its root, else the backend rejects it — if missing, tell the user and skip.

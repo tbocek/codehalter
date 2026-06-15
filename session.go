@@ -342,7 +342,13 @@ type Session struct {
 	// preImproveSummary hold the real conversation snapshot to restore at turn end.
 	// Atomic: sessionFilePath/logSession read it from background goroutines (e.g.
 	// backgroundGitCommit's llmStream logging) concurrently with begin/end.
-	improving         atomic.Bool
+	improving atomic.Bool
+	// improveNoLicense caches, for the current /improve run, that the project has
+	// no open-source license — so feedback-API submission is impossible. Set in
+	// beginImproveScratch; read to drop the "Submit?" ask deterministically in
+	// code (the template's prerequisite footnote alone doesn't stop a weak model
+	// from asking, then submit_improvement hard-fails on the same check).
+	improveNoLicense  atomic.Bool
 	improveAsks       int
 	preImproveMsgs    []Message
 	preImproveSummary string
@@ -1041,6 +1047,9 @@ var scratchDir = "/tmp"
 // snapshot at turn end (every exit path), so the user's conversation resumes
 // untouched and the /improve bulk is discarded with the /tmp files.
 func (s *Session) beginImproveScratch() {
+	// Compute the license verdict before taking the lock (it does file I/O) so
+	// the submit step can be gated deterministically for this run.
+	_, licErr := checkLicense(s.Cwd)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.preImproveMsgs = s.Messages
@@ -1048,6 +1057,7 @@ func (s *Session) beginImproveScratch() {
 	s.Messages = nil
 	s.Summary = ""
 	s.improveAsks = 0
+	s.improveNoLicense.Store(licErr != nil)
 	s.improving.Store(true)
 }
 

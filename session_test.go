@@ -208,3 +208,30 @@ func TestKeepWindowStart(t *testing.T) {
 		t.Errorf("no usage: keepWindowStart=%d, want lastAssistantIndex=%d", got, s3.lastAssistantIndex())
 	}
 }
+
+// TestImproveNoLicenseGate pins the deterministic submit gate behind issue #2:
+// beginImproveScratch records whether the project lacks an open-source license,
+// and the /improve flow drops the "Submit?" ask (and submit_improvement) on that
+// flag in code — instead of trusting a weak model to honour the template's
+// license prerequisite.
+func TestImproveNoLicenseGate(t *testing.T) {
+	// No LICENSE file → submission disabled.
+	noLic := &Session{Cwd: t.TempDir()}
+	noLic.beginImproveScratch()
+	if !noLic.improveNoLicense.Load() {
+		t.Errorf("no LICENSE → improveNoLicense should be true (submit disabled)")
+	}
+	noLic.endImproveScratch()
+
+	// MIT LICENSE → submission allowed.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "LICENSE"), []byte("MIT License\n\nCopyright (c) 2026\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withLic := &Session{Cwd: dir}
+	withLic.beginImproveScratch()
+	if withLic.improveNoLicense.Load() {
+		t.Errorf("MIT LICENSE present → improveNoLicense should be false (submit allowed)")
+	}
+	withLic.endImproveScratch()
+}
