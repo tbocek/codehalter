@@ -460,6 +460,9 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
+		if argIsNonString(rawArgs, "content") {
+			return "error: `content` must be a JSON string. You sent a non-string value, which would be coerced to an empty string and ERASE the file. Resend with the full file content as a quoted string.", false
+		}
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
 			return "error: " + err.Error(), false
@@ -467,7 +470,15 @@ func init() {
 		newContent := args["content"]
 		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
-		oldContent, _ := fsRead(a, ctx, sid, path, nil, nil)
+		// Pre-edit read for the diff card + formatGuarded's dry run. A missing file
+		// (the common new-file case) and a read fault both surface as an error here,
+		// and the ACP read path can't reliably tell them apart, so proceed as a new
+		// file (oldContent ""). Log it rather than dropping it to `_`, so a genuine
+		// read fault on an existing file still leaves a trail.
+		oldContent, rerr := fsRead(a, ctx, sid, path, nil, nil)
+		if rerr != nil {
+			slog.Debug("write_file: pre-edit read returned an error; treating as new file", "path", path, "err", rerr)
+		}
 		newContent = a.formatGuarded(sid, path, oldContent, newContent)
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
@@ -497,6 +508,9 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
+		if argIsNonString(rawArgs, "old_text") || argIsNonString(rawArgs, "new_text") {
+			return "error: `old_text` and `new_text` must be JSON strings; a non-string value is coerced to \"\" and would mis-edit the file. Resend them quoted (use \"\" only to intentionally delete old_text).", false
+		}
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
 			return "error: " + err.Error(), false

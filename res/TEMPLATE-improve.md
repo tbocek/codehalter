@@ -82,38 +82,26 @@ One numbered list, **3 entries maximum**. Each entry:
 7. **Predicted behavior change** — what the agent will do DIFFERENTLY next time. If
    you cannot name a concrete behavior change, drop the entry.
 
-## Step 5: Apply
+## Step 5: Hand off — ONE submit_improvement call
 
-For each of the 3 (and only these 3 — do NOT re-analyze or generate more after
-presenting), use ask_user with "Apply" and "Skip" labels.
+Make a single `submit_improvement` call. Its `improvements` argument is a JSON
+array of your top changes (max 3), each object:
 
-- **Apply** → use edit_file to make the change now.
-- **Skip** → move on.
+- `title` — the behavior it fixes
+- `file` — the bare .codehalter prompt filename (e.g. `PLAN.md`, `SKILL-base.md`)
+- `type` — `add`, `replace`, or `remove`
+- `original` — the EXACT current text to match (for `replace`/`remove`); for
+  `add`, the anchor text to insert after, or empty to append at the end
+- `new` — the added or replacement text (empty for `remove`)
+- `reasoning` — why, tied to the evidence
 
-These are `.md` prompt files, NOT code — the edit IS the whole change. Do NOT run
-`go build`, `just:build`, `just:test`, or any other build/test; there is nothing
-to compile or test. Track the accepted changes for the submission step.
+**That single call IS the whole apply step. Do NOT call `ask_user` or `edit_file`
+yourself, and do NOT re-analyze.** codehalter takes it from there: it shows the
+user each change, asks Apply/Skip, applies the accepted edits to the file, and
+(for open-source projects with a LICENSE in the root) asks whether to submit the
+applied ones to the feedback API. The endpoint needs **NO API key**. Don't put
+secrets (keys, tokens, passwords) in any `original`/`new`; the backend also
+redacts known patterns.
 
-## Step 6: Submit
-
-**License gate — check this FIRST.** The project must carry an open-source license
-(MIT, BSD, Apache, GPL, …) in its root; without one the backend rejects the
-submission. If there is no such license file, tell the user "no open-source
-license — skipping submission" and STOP: do NOT ask whether to submit, and do NOT
-call submit_improvement. (codehalter also disables submission in code in this
-case, so a submit attempt will just fail.)
-
-When a license IS present: the endpoint needs **NO API key** — there is no auth
-token to provide, look up, or worry about. Do NOT skip submission over a "missing
-key"; there is no key.
-
-ASK the user with ask_user ("Yes" / "No"): "Submit these improvements to the
-feedback API so other users benefit?" On **Yes**, the rule is simple:
-
-- **If the change text contains a secret** (an API key, token, or password in any
-  `original`/`new`) → do NOT submit that entry; scrub it or drop it. Prompt-file
-  edits rarely contain secrets, and the backend also redacts known patterns.
-- **Otherwise → submit.** Call submit_improvement with `endpoint`
-  `https://ai.jos.li/improve` and `improvements`: the JSON array of accepted
-  changes, each with `title`, `file`, `type`, `original`, `new`, `reasoning`. No
-  `api_key` argument.
+If you found no real, evidence-backed problem, say so and stop — do not invent
+filler, and do not call submit_improvement with empty changes.

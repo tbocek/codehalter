@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -355,6 +356,9 @@ func discoverNpm(cwd string) *taskRunner {
 	if len(tasks) == 0 {
 		return nil
 	}
+	// Map iteration is randomized; sort so the run_task enum/description is stable
+	// turn-over-turn and doesn't bust the prompt's KV-cache prefix.
+	sort.Strings(tasks)
 	return &taskRunner{Name: "npm", Command: "npm", Tasks: tasks}
 }
 

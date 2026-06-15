@@ -26,30 +26,58 @@ func (a *agent) resolvePath(sid string, path string) (string, error) {
 	inside := func(p string) bool {
 		return p == sess.Cwd || strings.HasPrefix(p, sess.Cwd+string(filepath.Separator))
 	}
+	var final string
 	if filepath.IsAbs(path) {
-		resolved := filepath.Clean(path)
-		if !inside(resolved) {
-			return "", fmt.Errorf("path %q is outside project directory", path)
-		}
-		return resolved, nil
-	}
-	rel := filepath.Clean(filepath.Join(sess.Cwd, path))
-	if !inside(rel) {
-		return "", fmt.Errorf("path %q is outside project directory", path)
-	}
-	// LLMs sometimes write absolute-looking paths with a missing leading "/"
-	// (e.g. `workspaces/preveltekit/go.mod` when cwd is /workspaces/preveltekit).
-	// If the cwd-joined interpretation doesn't exist on disk but the "/"-
-	// prepended one does and stays inside cwd, prefer that.
-	if _, err := os.Stat(rel); err != nil {
-		abs := filepath.Clean("/" + path)
-		if abs != rel && inside(abs) {
-			if _, err := os.Stat(abs); err == nil {
-				return abs, nil
+		final = filepath.Clean(path)
+	} else {
+		final = filepath.Clean(filepath.Join(sess.Cwd, path))
+		// LLMs sometimes write absolute-looking paths with a missing leading "/"
+		// (e.g. `workspaces/preveltekit/go.mod` when cwd is /workspaces/preveltekit).
+		// If the cwd-joined interpretation doesn't exist on disk but the "/"-
+		// prepended one does and stays inside cwd, prefer that.
+		if _, err := os.Stat(final); err != nil {
+			abs := filepath.Clean("/" + path)
+			if abs != final && inside(abs) {
+				if _, err := os.Stat(abs); err == nil {
+					final = abs
+				}
 			}
 		}
 	}
-	return rel, nil
+	if !inside(final) {
+		return "", fmt.Errorf("path %q is outside project directory", path)
+	}
+	// inside() above is a string-prefix test, which a symlink LIVING under cwd but
+	// TARGETING outside it would defeat (e.g. `ln -s /etc cwd/x` then read x/passwd).
+	// Re-check after resolving symlinks on the path's deepest existing ancestor.
+	if !realInside(final, sess.Cwd) {
+		return "", fmt.Errorf("path %q resolves through a symlink outside the project directory", path)
+	}
+	return final, nil
+}
+
+// realInside reports whether p stays within cwd after symlink resolution. It
+// resolves the deepest EXISTING ancestor of p (a write target may not exist yet,
+// and a not-yet-created tail can't itself be a symlink) and re-checks the prefix
+// against the resolved cwd, so an in-tree symlink to an out-of-tree target is
+// rejected while a symlink to another in-tree path still works.
+func realInside(p, cwd string) bool {
+	rcwd, err := filepath.EvalSymlinks(cwd)
+	if err != nil {
+		rcwd = filepath.Clean(cwd)
+	}
+	p = filepath.Clean(p)
+	for dir := p; ; {
+		if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+			full := filepath.Clean(resolved + strings.TrimPrefix(p, dir))
+			return full == rcwd || strings.HasPrefix(full, rcwd+string(filepath.Separator))
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false // walked to the root with nothing resolvable
+		}
+		dir = parent
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +237,24 @@ func parseArgs(rawArgs string) map[string]string {
 		args = make(map[string]string)
 	}
 	return args
+}
+
+// argIsNonString reports whether rawArgs (a JSON object) has `key` present with a
+// NON-string value. parseArgs decodes into map[string]string, silently coercing a
+// number/null/object/array to "", so a tool that writes such a value (write_file's
+// content, edit_file's old/new text) would clobber a file to zero bytes with a
+// success message. Callers reject the call instead of losing data.
+func argIsNonString(rawArgs, key string) bool {
+	var raw map[string]json.RawMessage
+	if json.Unmarshal([]byte(rawArgs), &raw) != nil {
+		return false // not a JSON object; the tool's own validation handles it
+	}
+	v, ok := raw[key]
+	if !ok {
+		return false
+	}
+	t := strings.TrimSpace(string(v))
+	return t == "" || t[0] != '"'
 }
 
 func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (string, bool) {

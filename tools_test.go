@@ -2,11 +2,75 @@ package main
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 )
+
+// TestResolvePathSymlinkEscape pins the symlink-aware sandbox: a symlink living
+// under cwd but TARGETING outside it must be rejected (a plain string-prefix check
+// would pass it), while plain in-tree files and in-tree symlinks still resolve.
+func TestResolvePathSymlinkEscape(t *testing.T) {
+	a, s := newTestAgent(t)
+
+	outside := t.TempDir() // a directory OUTSIDE the session cwd
+	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(s.Cwd, "escape")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := a.resolvePath(s.ID, "escape/secret.txt"); err == nil {
+		t.Error("resolvePath followed a symlink out of cwd (sandbox escape)")
+	}
+
+	// A plain in-tree file resolves.
+	if err := os.WriteFile(filepath.Join(s.Cwd, "ok.txt"), []byte("y"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.resolvePath(s.ID, "ok.txt"); err != nil {
+		t.Errorf("in-tree file rejected: %v", err)
+	}
+
+	// An in-tree symlink to another in-tree path still works.
+	if err := os.MkdirAll(filepath.Join(s.Cwd, "real"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(s.Cwd, "real", "f.txt"), []byte("z"), 0o644)
+	if err := os.Symlink(filepath.Join(s.Cwd, "real"), filepath.Join(s.Cwd, "alias")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := a.resolvePath(s.ID, "alias/f.txt"); err != nil {
+		t.Errorf("in-tree symlink to an in-tree path was rejected: %v", err)
+	}
+}
+
+// TestArgIsNonString pins the guard that stops a non-string tool argument (which
+// parseArgs silently coerces to "") from clobbering a file: a real string (incl.
+// the empty string) passes, every non-string JSON value is flagged.
+func TestArgIsNonString(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want bool
+	}{
+		{`{"content":"hi"}`, false},   // string
+		{`{"content":""}`, false},     // empty string is STILL a string
+		{`{"content":123}`, true},     // number
+		{`{"content":null}`, true},    // null
+		{`{"content":{"a":1}}`, true}, // object
+		{`{"content":["x"]}`, true},   // array
+		{`{"content":true}`, true},    // bool
+		{`{"path":"x"}`, false},       // key absent
+		{`not json`, false},           // not a JSON object
+	}
+	for _, c := range cases {
+		if got := argIsNonString(c.raw, "content"); got != c.want {
+			t.Errorf("argIsNonString(%q) = %v, want %v", c.raw, got, c.want)
+		}
+	}
+}
 
 // TestSkipToolCall pins that a SKIPPED tool call is non-failing: Failed stays
 // false (so the subtask-outcome logic won't condemn the subtask the way a denied,

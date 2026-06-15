@@ -249,23 +249,32 @@ func wireCallID(tu ToolUse) string {
 }
 
 func (a *agent) buildLLMContext(sess *Session) []llmMessage {
+	// Snapshot under the lock: the background summariser (foldHistory/rotate
+	// reassigns s.Messages) and a parallel subagent's buildLLMContext(parent) can
+	// mutate the session while this ranges it. Copy the slice header + the prompt
+	// strings, then build from the copy unlocked.
+	sess.mu.Lock()
+	systemPrompt, summary := sess.SystemPrompt, sess.Summary
+	msgs := append([]Message(nil), sess.Messages...)
+	sess.mu.Unlock()
+
 	var messages []llmMessage
 
-	if sess.SystemPrompt != "" {
+	if systemPrompt != "" {
 		messages = append(messages, llmMessage{
 			Role:    "user",
-			Content: sess.SystemPrompt,
+			Content: systemPrompt,
 		})
 	}
 
-	if sess.Summary != "" {
+	if summary != "" {
 		messages = append(messages, llmMessage{
 			Role:    "user",
-			Content: "[Earlier conversation summary — most recent messages below take priority]\n\n" + sess.Summary,
+			Content: "[Earlier conversation summary — most recent messages below take priority]\n\n" + summary,
 		})
 	}
 
-	for _, m := range sess.Messages {
+	for _, m := range msgs {
 		var content any = m.Content
 		if len(m.Images) > 0 {
 			if !a.imagesSupported {

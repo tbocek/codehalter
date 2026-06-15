@@ -21,14 +21,75 @@ func submitImprovementArgs(t *testing.T, m map[string]string) string {
 	return string(b)
 }
 
-// TestSubmitImprovementPostsPayload verifies the happy path: the tool wraps the
-// improvements array in {"improvements":[...]}, POSTs it with the license header
-// and NO auth token (the endpoint is keyless), and reports success on a 2xx.
-func TestSubmitImprovementPostsPayload(t *testing.T) {
-	var gotMethod, gotAuth, gotCT, gotBody, gotLicense string
+// TestApplyImprovement pins the code-side edit applied once the user clicks Apply:
+// replace/remove swap the `original` text, add inserts after an anchor or appends,
+// and bad inputs (missing original, path escape, unknown type) error without
+// touching the file.
+func TestApplyImprovement(t *testing.T) {
+	dir := t.TempDir()
+	ch := filepath.Join(dir, ".codehalter")
+	if err := os.MkdirAll(ch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(body string) { os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte(body), 0o644) }
+	read := func() string { b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); return string(b) }
+
+	write("alpha OLD omega")
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "replace", Original: "OLD", New: "NEW"}); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	if read() != "alpha NEW omega" {
+		t.Errorf("replace: got %q", read())
+	}
+
+	write("head\nanchor\ntail")
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "add", Original: "anchor", New: "MORE"}); err != nil {
+		t.Fatalf("add-anchor: %v", err)
+	}
+	if !strings.Contains(read(), "anchor\n\nMORE") {
+		t.Errorf("add-anchor: got %q", read())
+	}
+
+	write("body")
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "add", New: "APPENDED"}); err != nil {
+		t.Fatalf("add-append: %v", err)
+	}
+	if !strings.HasSuffix(read(), "APPENDED\n") {
+		t.Errorf("add-append: got %q", read())
+	}
+
+	write("keep DROP keep")
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "remove", Original: " DROP"}); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	if read() != "keep keep" {
+		t.Errorf("remove: got %q", read())
+	}
+
+	// Errors, none of which should write.
+	write("nothing here")
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "replace", Original: "MISSING", New: "X"}); err == nil {
+		t.Error("missing original should error")
+	}
+	if err := applyImprovement(dir, improvementEntry{File: "../escape.md", Type: "add", New: "x"}); err == nil {
+		t.Error("path escape should error")
+	}
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "frobnicate", New: "x"}); err == nil {
+		t.Error("unknown type should error")
+	}
+	if read() != "nothing here" {
+		t.Errorf("error cases must not write: got %q", read())
+	}
+}
+
+// TestImprovementExecuteApplyAndSubmit drives the whole code-side flow in
+// autopilot (Apply + Submit auto-answered yes): the structured change is applied
+// to the .codehalter/ file AND the applied entry is POSTed with the license
+// header, no auth token, and the model stamped on.
+func TestImprovementExecuteApplyAndSubmit(t *testing.T) {
+	var gotBody, gotLicense, gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotMethod, gotAuth, gotCT = r.Method, r.Header.Get("Authorization"), r.Header.Get("Content-Type")
-		gotLicense = r.Header.Get("X-License")
+		gotLicense, gotAuth = r.Header.Get("X-License"), r.Header.Get("Authorization")
 		b, _ := io.ReadAll(r.Body)
 		gotBody = string(b)
 		w.WriteHeader(http.StatusOK)
@@ -36,94 +97,128 @@ func TestSubmitImprovementPostsPayload(t *testing.T) {
 	defer srv.Close()
 
 	a, s := newTestAgent(t)
-	a.settings = Settings{LLM: []LLMConnection{{Model: "test-model"}}} // stamped onto each entry
-	// Write a LICENSE file so checkLicense passes.
-	if err := os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0644); err != nil {
-		t.Fatalf("write LICENSE: %v", err)
-	}
-	improvements := `[{"title":"t","file":"PLAN.md","type":"remove","original":"x","new":"","reasoning":"r"}]`
-	var tc toolCall
-	tc.Function.Name = "submit_improvement"
-	tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
-		"endpoint": srv.URL, "improvements": improvements,
-	})
+	a.settings = Settings{LLM: []LLMConnection{{Model: "test-model"}}}
+	a.mu.Lock()
+	a.mode = "Autopilot" // auto-answer the Apply + Submit cards (no conn needed)
+	a.mu.Unlock()
 
+	ch := filepath.Join(s.Cwd, ".codehalter")
+	os.MkdirAll(ch, 0o755)
+	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("alpha OLD omega"), 0o644)
+	os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0o644)
+
+	var tc toolCall
+	tc.Function.Name = submitImprovementToolName
+	tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
+		"endpoint":     srv.URL,
+		"improvements": `[{"title":"t","file":"PLAN.md","type":"replace","original":"OLD","new":"NEW","reasoning":"r"}]`,
+	})
 	out, failed := a.executeTool(context.Background(), s.ID, tc)
 	if failed {
-		t.Fatalf("happy path returned failed=true: %s", out)
+		t.Fatalf("failed=true: %s", out)
 	}
-	if !strings.Contains(out, "Submitted 1 improvement") {
-		t.Errorf("success message wrong: %s", out)
-	}
-	if gotMethod != http.MethodPost {
-		t.Errorf("method = %s, want POST", gotMethod)
-	}
-	if gotAuth != "" {
-		t.Errorf("endpoint is keyless — no Authorization header expected, got %q", gotAuth)
-	}
-	if gotCT != "application/json" {
-		t.Errorf("content-type = %q", gotCT)
+	if b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); string(b) != "alpha NEW omega" {
+		t.Errorf("file not edited: %q", b)
 	}
 	if gotLicense != "MIT" {
-		t.Errorf("X-License = %q, want %q", gotLicense, "MIT")
+		t.Errorf("X-License = %q, want MIT", gotLicense)
+	}
+	if gotAuth != "" {
+		t.Errorf("endpoint is keyless — no Authorization expected, got %q", gotAuth)
 	}
 	var p improvementPayload
-	if err := json.Unmarshal([]byte(gotBody), &p); err != nil || len(p.Improvements) != 1 || p.Improvements[0].File != "PLAN.md" {
-		t.Errorf("body not the wrapped payload: %s", gotBody)
+	if json.Unmarshal([]byte(gotBody), &p) != nil || len(p.Improvements) != 1 || p.Improvements[0].Model != "test-model" {
+		t.Errorf("payload wrong (want 1 entry stamped test-model): %s", gotBody)
 	}
-	if p.Improvements[0].Model != "test-model" {
-		t.Errorf("model not stamped onto the entry: got %q, want %q", p.Improvements[0].Model, "test-model")
+	if !strings.Contains(out, "Applied 1") || !strings.Contains(out, "submitted") {
+		t.Errorf("summary wrong: %s", out)
 	}
 }
 
-// TestSubmitImprovementErrors covers the validation and HTTP-error branches.
-func TestSubmitImprovementErrors(t *testing.T) {
+// TestImprovementExecuteOnceOnly pins that the apply loop runs at most once per
+// run: a second submit_improvement call (a duplicate in one batch, or a replan
+// re-entry) no-ops instead of re-applying its side effects.
+func TestImprovementExecuteOnceOnly(t *testing.T) {
 	a, s := newTestAgent(t)
-	// Write a LICENSE file so checkLicense passes (errors below are not about license).
-	if err := os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0644); err != nil {
-		t.Fatalf("write LICENSE: %v", err)
-	}
-	call := func(m map[string]string) (string, bool) {
+	a.mu.Lock()
+	a.mode = "Autopilot"
+	a.mu.Unlock()
+	ch := filepath.Join(s.Cwd, ".codehalter")
+	os.MkdirAll(ch, 0o755)
+	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("alpha OLD omega"), 0o644)
+	// No LICENSE: applies locally, no POST.
+
+	mk := func() toolCall {
 		var tc toolCall
-		tc.Function.Name = "submit_improvement"
-		tc.Function.Arguments = submitImprovementArgs(t, m)
-		return a.executeTool(context.Background(), s.ID, tc)
+		tc.Function.Name = submitImprovementToolName
+		tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
+			"improvements": `[{"title":"t","file":"PLAN.md","type":"replace","original":"OLD","new":"NEW","reasoning":"r"}]`,
+		})
+		return tc
 	}
 
-	if out, _ := call(map[string]string{"api_key": "k", "improvements": "[]"}); !strings.Contains(out, "empty") {
-		t.Errorf("empty improvements array should error: %s", out)
+	out1, _ := a.executeTool(context.Background(), s.ID, mk())
+	if !strings.Contains(out1, "Applied 1") {
+		t.Fatalf("first call should apply: %s", out1)
 	}
-	if out, _ := call(map[string]string{"api_key": "k", "improvements": "not json"}); !strings.Contains(out, "invalid improvements JSON") {
-		t.Errorf("bad JSON should error: %s", out)
+	if b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); string(b) != "alpha NEW omega" {
+		t.Fatalf("not applied: %q", b)
 	}
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-		io.WriteString(w, "boom")
-	}))
-	defer srv.Close()
-	out, _ := call(map[string]string{
-		"endpoint": srv.URL, "api_key": "k",
-		"improvements": `[{"title":"t","file":"f","type":"remove"}]`,
-	})
-	if !strings.Contains(out, "HTTP 500") || !strings.Contains(out, "boom") {
-		t.Errorf("HTTP error not surfaced: %s", out)
+	out2, _ := a.executeTool(context.Background(), s.ID, mk())
+	if !strings.Contains(out2, "already handled") {
+		t.Errorf("second call must no-op (already handled), got: %s", out2)
 	}
 }
 
-// TestSubmitImprovementNoLicense rejects submissions from projects without an
-// open-source license.
-func TestSubmitImprovementNoLicense(t *testing.T) {
+// TestImprovementExecuteErrors covers the early validation branches (no ask, no
+// conn): missing/empty/invalid improvements.
+func TestImprovementExecuteErrors(t *testing.T) {
 	a, s := newTestAgent(t)
-	// Make sure there's no LICENSE file.
+	call := func(m map[string]string) string {
+		var tc toolCall
+		tc.Function.Name = submitImprovementToolName
+		tc.Function.Arguments = submitImprovementArgs(t, m)
+		out, _ := a.executeTool(context.Background(), s.ID, tc)
+		return out
+	}
+	if out := call(map[string]string{"improvements": ""}); !strings.Contains(out, "improvements is required") {
+		t.Errorf("empty string: %s", out)
+	}
+	if out := call(map[string]string{"improvements": "[]"}); !strings.Contains(out, "nothing to apply") {
+		t.Errorf("empty array: %s", out)
+	}
+	if out := call(map[string]string{"improvements": "not json"}); !strings.Contains(out, "invalid improvements JSON") {
+		t.Errorf("bad json: %s", out)
+	}
+}
+
+// TestImprovementExecuteNoLicense: without a LICENSE the accepted edit is still
+// applied locally, but the submission is refused (no POST), so a missing license
+// can't block the user from improving their own prompts.
+func TestImprovementExecuteNoLicense(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.mu.Lock()
+	a.mode = "Autopilot"
+	a.mu.Unlock()
+	ch := filepath.Join(s.Cwd, ".codehalter")
+	os.MkdirAll(ch, 0o755)
+	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("alpha OLD omega"), 0o644)
+	// No LICENSE file written.
+
 	var tc toolCall
-	tc.Function.Name = "submit_improvement"
+	tc.Function.Name = submitImprovementToolName
 	tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
-		"endpoint": "http://example.com", "api_key": "k",
-		"improvements": `[{"title":"t","file":"f","type":"remove"}]`,
+		"endpoint":     "http://127.0.0.1:0", // must never be hit
+		"improvements": `[{"title":"t","file":"PLAN.md","type":"replace","original":"OLD","new":"NEW","reasoning":"r"}]`,
 	})
-	out, _ := a.executeTool(context.Background(), s.ID, tc)
+	out, failed := a.executeTool(context.Background(), s.ID, tc)
+	if failed {
+		t.Fatalf("failed=true: %s", out)
+	}
+	if b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); string(b) != "alpha NEW omega" {
+		t.Errorf("file should still be edited locally: %q", b)
+	}
 	if !strings.Contains(out, "no open-source license") {
-		t.Errorf("expected license error, got: %s", out)
+		t.Errorf("expected no-license note, got: %s", out)
 	}
 }

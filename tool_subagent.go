@@ -220,18 +220,24 @@ func (a *agent) registerSubagentTool() {
 			}
 		})
 
-		// Format results.
+		// Format results. Surface failure to the orchestrator's verdict: when EVERY
+		// subagent failed the whole fan-out is a real failure (failed=true, so it can
+		// override an LLM "success=true" and trigger a replan). A partial failure
+		// stays non-failing — some work landed, and the FAILED markers below let the
+		// model react without discarding the successes.
 		var out strings.Builder
+		failures := 0
 		for _, r := range results {
 			if r.Success {
 				fmt.Fprintf(&out, "=== Subagent %d ===\n%s\n\n", r.Index+1, r.Result)
 			} else {
+				failures++
 				fmt.Fprintf(&out, "=== Subagent %d (FAILED) ===\n%s\n\n", r.Index+1, r.Error)
 			}
 		}
 
 		ag.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf("%d subagent(s) completed", len(tasks)))})
-		return out.String(), false
+		return out.String(), len(results) > 0 && failures == len(results)
 	}})
 }
 

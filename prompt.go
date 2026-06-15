@@ -844,14 +844,12 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 				// /improve workaround: the weak model can't reliably emit a structured
 				// plan here — it answers the analysis with a report-only respond, so
 				// there are no subtasks. The analysis is already in history; synthesize
-				// the apply step as one subtask and fall through to execute, where
-				// ask_user / edit_file / submit_improvement actually work.
-				applyDesc := "The analysis above already identified the improvements — do NOT re-analyse. Now carry out the apply steps from the /improve instructions: present each improvement and ask the user Apply/Skip, edit_file the accepted ones (these are .md prompt files — do NOT run any build or test)"
+				// the apply step as one subtask and fall through to execute, where the
+				// model makes a single structured submit_improvement call and codehalter
+				// drives the Apply/Skip + submit in code (see improvementExecute).
+				applyDesc := "The analysis above already identified the improvements — do NOT re-analyse, and do NOT call ask_user or edit_file. Make ONE submit_improvement call whose `improvements` is a JSON array of the top changes (each object: title; file = the bare .codehalter prompt filename like \"PLAN.md\"; type = add|replace|remove; original = the exact current text to match; new = the added/replacement text; reasoning). codehalter then shows the user each change, asks Apply/Skip, applies the accepted edits, and asks whether to submit. That single call is the whole apply step."
 				if sess.improveNoLicense.Load() {
-					// No open-source license → submission is impossible; don't offer it.
-					applyDesc += ". This project has NO open-source license, so the improvements cannot be submitted — do NOT ask the user about submitting and do NOT call submit_improvement; applying the accepted edits locally is the whole task."
-				} else {
-					applyDesc += ", then ALWAYS ask the user whether to submit them to the feedback API; on yes, call submit_improvement (the endpoint needs NO API key — just don't include secrets from the change text)."
+					applyDesc += " (This project has no open-source license, so codehalter applies the accepted edits locally and skips submission.)"
 				}
 				p.Subtasks = []subtask{{Description: applyDesc}}
 			case p.answer != "":

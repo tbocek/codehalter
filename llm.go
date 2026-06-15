@@ -328,8 +328,11 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// written concurrently by the scanner loop below — hence atomic.
 	var genChars int64
 	waitDone := make(chan struct{})
-	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), &genChars, waitDone)
-	defer close(waitDone)
+	waitStopped := make(chan struct{})
+	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), &genChars, waitDone, waitStopped)
+	// Join the meter before the deferred status clear (registered above) runs, so a
+	// late tick can't re-set the row after it's cleared (mirrors startToolMeter).
+	defer func() { close(waitDone); <-waitStopped }()
 
 	// Per-session log: a REQUEST block now, one aggregated RESPONSE block at the
 	// end (the per-token SSE wire is too noisy to skim). connLabel carries
@@ -415,6 +418,9 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 
 		var chunk sseChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			// Don't drop a malformed frame silently: an off-shape chunk would
+			// otherwise make a backend look like a terse model with no trail.
+			slog.Debug("llm: skipped unparseable SSE frame", "role", conn.Tag, "err", err, "frame", truncate(data, 200))
 			continue
 		}
 		// In-band error: the gateway/llama.cpp can return HTTP 200 and put the
@@ -553,10 +559,11 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		// second form still catches the ceiling when the server omits
 		// completion_tokens (completion == 0), so it can't be compared to the cap.
 		belowCap := completionTokens > 0 && reqMax > 0 && completionTokens < reqMax
-		noRoom := promptTokens > 0 && reqMax > 0 && a.mainSlotTokens > 0 && promptTokens+reqMax > a.mainSlotTokens
+		mst := a.getMainSlotTokens()
+		noRoom := promptTokens > 0 && reqMax > 0 && mst > 0 && promptTokens+reqMax > mst
 		if belowCap || noRoom {
 			err = fmt.Errorf("generation hit the context ceiling (prompt=%d gen=%d, n_ctx=%d, role=%s): %w",
-				promptTokens, completionTokens, a.mainSlotTokens, conn.Tag, errContextCeiling)
+				promptTokens, completionTokens, mst, conn.Tag, errContextCeiling)
 		} else if fullText.Len() == 0 && len(calls) == 0 && reasoningText.Len() > 0 && thinkingOn(reqBody) {
 			// All budget went to reasoning with nothing to show — the model looped
 			// in <think>. Recoverable: the tool loop retries once with thinking off
@@ -617,7 +624,8 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 // the request. No warning is emitted: while the call is alive the climbing
 // counter is the signal, and if it dies (e.g. a router model swap force-kills
 // the connection) llmStream surfaces the transport error directly.
-func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel string, start time.Time, genChars *int64, done <-chan struct{}) {
+func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel string, start time.Time, genChars *int64, done <-chan struct{}, stopped chan struct{}) {
+	defer close(stopped)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {

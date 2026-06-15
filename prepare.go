@@ -460,7 +460,7 @@ func (a *agent) hasReachableLLM() bool {
 func (a *agent) probeAllLLMs(ctx context.Context) {
 	conns := a.settings.allConnections()
 	a.connProbe = make(map[string]probeResult, len(conns))
-	a.mainSlotTokens = 0
+	a.setMainSlotTokens(0)
 	a.detectedSlots = 0
 	if len(conns) == 0 {
 		a.imagesSupported = false
@@ -507,11 +507,11 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	slots := a.settings.LLM[0].parallelCap()
 	switch {
 	case conns[0].ContextSize > 0:
-		a.mainSlotTokens = conns[0].ContextSize / slots
+		a.setMainSlotTokens(conns[0].ContextSize / slots)
 	case results[0].SlotCtx > 0:
-		a.mainSlotTokens = results[0].SlotCtx
+		a.setMainSlotTokens(results[0].SlotCtx)
 	case results[0].ContextSize > 0:
-		a.mainSlotTokens = results[0].ContextSize / slots
+		a.setMainSlotTokens(results[0].ContextSize / slots)
 	}
 	slog.Info("probeAllLLMs", "slots", slots, "mainSlotTokens", a.mainSlotTokens,
 		"slotCtx", results[0].SlotCtx, "totalCtx", results[0].ContextSize, "totalSlots", results[0].TotalSlots)

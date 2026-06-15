@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 )
@@ -409,12 +410,20 @@ func init() {
 		// instead of being indistinguishable from "DDG returned nothing".
 		var results []ddgResult
 		var extractErr error
+	poll:
 		for range 30 {
 			results, extractErr = extractDDGResults(ctx, browser, searchTab)
 			if len(results) > 0 {
 				break
 			}
-			time.Sleep(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				// A user Stop kills Firefox immediately; don't burn the remaining
+				// 15s of sleeps before unwinding.
+				extractErr = ctx.Err()
+				break poll
+			case <-time.After(500 * time.Millisecond):
+			}
 		}
 		browser.CloseTab(ctx, searchTab)
 		if len(results) == 0 {
@@ -598,7 +607,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 		} else {
 			out = text
 			if len(out) > maxRawPageChars {
-				out = out[:maxRawPageChars] + "\n... (truncated)"
+				out = clipUTF8(out, maxRawPageChars) + "\n... (truncated)"
 			}
 		}
 		if sess := a.getSession(sid); sess != nil {
@@ -608,20 +617,32 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 	}
 }
 
-// sliceWebBody returns up to `limit` characters of `body` starting at `offset`,
+// clipUTF8 truncates s to at most n bytes, snapped back to a rune boundary so a
+// multibyte character straddling the cut isn't split into a � replacement.
+func clipUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// sliceWebBody returns up to `limit` bytes of `body` starting at `offset`,
 // clamping both ends so out-of-range arguments produce a sensible empty/last
 // slice instead of a panic. The model can pass offset past the end (e.g. when
 // it doesn't know the exact length) — we return "" rather than erroring so the
-// model can correct on the next call.
+// model can correct on the next call. offset/limit snap to rune boundaries so a
+// range read never splits a multibyte character.
 func sliceWebBody(body string, offset, limit int) string {
 	if offset >= len(body) {
 		return ""
 	}
-	end := offset + limit
-	if end > len(body) {
-		end = len(body)
+	for offset < len(body) && !utf8.RuneStart(body[offset]) {
+		offset++
 	}
-	return body[offset:end]
+	return clipUTF8(body[offset:], limit)
 }
 
 // summarizePage uses the execute LLM to extract only the relevant information
@@ -633,7 +654,7 @@ func (a *agent) summarizePage(ctx context.Context, sid string, query, url, pageT
 	// Truncate input to avoid overwhelming the LLM.
 	const maxInput = 8000
 	if len(pageText) > maxInput {
-		pageText = pageText[:maxInput]
+		pageText = clipUTF8(pageText, maxInput)
 	}
 
 	prompt := fmt.Sprintf(

@@ -26,8 +26,7 @@ func (s *Session) improveAskBlocked() bool {
 	if !s.improving.Load() {
 		return false
 	}
-	s.improveAsks++
-	return s.improveAsks > improveAskCap
+	return s.improveAsks.Add(1) > improveAskCap
 }
 
 // beginTurn registers the in-flight turn's cancel.
@@ -356,8 +355,13 @@ type Session struct {
 	// beginImproveScratch; read to drop the "Submit?" ask deterministically in
 	// code (the template's prerequisite footnote alone doesn't stop a weak model
 	// from asking, then submit_improvement hard-fails on the same check).
-	improveNoLicense  atomic.Bool
-	improveAsks       int
+	improveNoLicense atomic.Bool
+	// improveDelivered marks that submit_improvement's apply loop has already run
+	// this /improve turn, so a duplicate call (same batch, or after a replan) no-ops
+	// instead of re-applying, and the respond-funnel stops re-arming. Reset in
+	// beginImproveScratch.
+	improveDelivered  atomic.Bool
+	improveAsks       atomic.Int64
 	preImproveMsgs    []Message
 	preImproveSummary string
 	// promptSkills is the set of SKILL-*.md filenames folded into the current
@@ -946,9 +950,12 @@ func (s *Session) keepWindowStart(maxCompletedTokens int) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := len(s.Messages)
+	if n == 0 {
+		return 0 // nothing to keep or fold
+	}
 	start := s.turnStartIdx
-	if start < 0 || start > n {
-		start = 0
+	if start < 0 || start >= n {
+		start = 0 // turnStartIdx past the end (or unset) → scan from the top
 	}
 	// unfinished small turn = last assistant message (always kept)
 	last := start
@@ -1113,7 +1120,8 @@ func (s *Session) beginImproveScratch() {
 	s.preImproveSummary = s.Summary
 	s.Messages = nil
 	s.Summary = ""
-	s.improveAsks = 0
+	s.improveAsks.Store(0)
+	s.improveDelivered.Store(false)
 	s.improveNoLicense.Store(licErr != nil)
 	s.improving.Store(true)
 }
@@ -1125,6 +1133,7 @@ func (s *Session) endImproveScratch() {
 	s.Summary = s.preImproveSummary
 	s.preImproveMsgs = nil
 	s.preImproveSummary = ""
+	s.improveAsks.Store(0)
 	s.improving.Store(false)
 }
 

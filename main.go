@@ -185,6 +185,7 @@ func main() {
 	slog.Info("waiting for connection")
 	<-conn.Done()
 	slog.Info("connection closed")
+	a.shutdownMCP() // reap MCP children (spawned with no context) so they don't orphan
 }
 
 // ---------------------------------------------------------------------------
@@ -563,6 +564,14 @@ func (a *agent) isAutopilot() bool {
 	defer a.mu.Unlock()
 	return a.mode == "Autopilot"
 }
+
+// get/setMainSlotTokens guard a.mainSlotTokens for its ONE cross-goroutine access:
+// a background llmStream (summariser / git-commit drafter) reads it on its
+// finish=length path (llm.go) while the next turn's probeAllLLMs rewrites it. The
+// foreground prepare/prompt reads run on the same goroutine as the writes, so they
+// read the field directly; only the writer and the background reader need the lock.
+func (a *agent) getMainSlotTokens() int  { a.mu.Lock(); defer a.mu.Unlock(); return a.mainSlotTokens }
+func (a *agent) setMainSlotTokens(n int) { a.mu.Lock(); a.mainSlotTokens = n; a.mu.Unlock() }
 
 // ---------------------------------------------------------------------------
 // Agent → client output

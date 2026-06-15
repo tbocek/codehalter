@@ -96,10 +96,30 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 			return nil
 		}
 		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-				return fmt.Errorf("seeding %s: %w", path, err)
-			}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			return nil // already seeded (or stat failed otherwise) — leave it
+		}
+		// Atomic publish (temp + rename): a concurrent reader (loadSkills) never sees
+		// a half-written seed, and two same-cwd sessions seeding at once just overwrite
+		// with identical bytes instead of racing a partial file. The ".seed-*" temp
+		// name can't match the "SKILL-*.md" load glob.
+		f, err := os.CreateTemp(dir, ".seed-*")
+		if err != nil {
+			return fmt.Errorf("seeding %s: %w", path, err)
+		}
+		tmp := f.Name()
+		if _, err := f.Write([]byte(body)); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return fmt.Errorf("seeding %s: %w", path, err)
+		}
+		if err := f.Close(); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("seeding %s: %w", path, err)
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			os.Remove(tmp)
+			return fmt.Errorf("seeding %s: %w", path, err)
 		}
 		return nil
 	}

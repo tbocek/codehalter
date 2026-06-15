@@ -33,7 +33,7 @@ func TestImproveAskCap(t *testing.T) {
 
 	// Armed → the first improveAskCap Apply/Skip prompts pass, the next is blocked.
 	s.improving.Store(true)
-	s.improveAsks = 0
+	s.improveAsks.Store(0)
 	for i := 0; i < improveAskCap; i++ {
 		if out := ask("Apply", "Skip"); strings.Contains(out, capNote) {
 			t.Fatalf("improvement %d should be allowed, got: %s", i+1, out)
@@ -49,7 +49,7 @@ func TestImproveAskCap(t *testing.T) {
 
 	// Re-arming a fresh turn resets the counter.
 	s.improving.Store(true)
-	s.improveAsks = 0
+	s.improveAsks.Store(0)
 	if out := ask("Apply", "Skip"); strings.Contains(out, capNote) {
 		t.Errorf("re-armed turn should start fresh, got: %s", out)
 	}

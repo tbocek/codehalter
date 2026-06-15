@@ -154,6 +154,20 @@ func TestSessionSupersedeFlag(t *testing.T) {
 	}
 }
 
+// TestKeepWindowStartDegenerate pins that the keep-window doesn't panic on an
+// empty session or an out-of-range turnStartIdx (the old unguarded
+// s.Messages[last] dereference).
+func TestKeepWindowStartDegenerate(t *testing.T) {
+	if got := (&Session{}).keepWindowStart(10_000); got != 0 {
+		t.Errorf("empty session: keepWindowStart = %d, want 0", got)
+	}
+	s := &Session{}
+	s.AddUser("p")
+	s.AddAssistant("a")
+	s.turnStartIdx = 99           // past the end
+	_ = s.keepWindowStart(10_000) // must not panic
+}
+
 // TestKeepWindowStart pins the 400-recovery keep window sized by REAL server
 // prompt_tokens: the unfinished small turn plus the most recent completed small
 // turns under the budget — never the whole oversized in-flight turn (the 194 KB

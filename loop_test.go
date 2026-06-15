@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -105,6 +107,43 @@ func TestImproveExecuteSkipsVerify(t *testing.T) {
 	run(true)
 	if ran != 0 {
 		t.Errorf("/improve execute: run_task must be SKIPPED, but it ran (ran=%d, want 0)", ran)
+	}
+}
+
+// TestImproveRespondFunnel pins the /improve funnel: a bare `respond` must NOT
+// end the turn before submit_improvement ran. The loop nudges respond toward
+// submit_improvement; once that's called, codehalter applies the change in code.
+// Proof: PLAN.md is edited only if the gated respond let the loop continue to the
+// submit_improvement call (a model that just analysed and respond'd would leave it
+// untouched — the original bug).
+func TestImproveRespondFunnel(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.mu.Lock()
+	a.mode = "Autopilot" // auto-answer the Apply card (no editor conn in the test)
+	a.mu.Unlock()
+	s.improving.Store(true)
+
+	ch := filepath.Join(s.Cwd, ".codehalter")
+	os.MkdirAll(ch, 0o755)
+	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("alpha OLD omega"), 0o644)
+	// No LICENSE: the edit applies locally, submission is refused (no HTTP call).
+
+	subArgs := submitImprovementArgs(t, map[string]string{
+		"improvements": `[{"title":"t","file":"PLAN.md","type":"replace","original":"OLD","new":"NEW","reasoning":"r"}]`,
+	})
+	// Round 1: a premature prose respond (the observed failure). Round 2: the
+	// structured submit_improvement the funnel pushes it toward.
+	mock := newMockLLM(t,
+		sseToolCall("c0", "respond", `{"message":"Here is my analysis of the session."}`),
+		sseToolCall("c1", "submit_improvement", subArgs),
+	)
+	defer mock.Close()
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+
+	a.runExecutePhase(context.Background(), s.ID, subtask{Description: "apply the analysis"}, 0, 1)
+
+	if b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); string(b) != "alpha NEW omega" {
+		t.Errorf("respond was not funnelled to submit_improvement (PLAN.md unchanged): %q", b)
 	}
 }
 
