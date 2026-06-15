@@ -19,6 +19,27 @@ import (
 	"time"
 )
 
+// llmHTTPClient is used for all LLM API calls. ResponseHeaderTimeout caps the
+// wait for the first response byte so a broken TCP connection (e.g. after a
+// network switch) doesn't hang for the full OS retransmission window (~15 min).
+// The dialer's KeepAlive matches http.DefaultTransport so idle connections are
+// probed every 30s. No Client.Timeout: streaming generations run unbounded and
+// are cancelled only via the request context.
+var llmHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 90 * time.Second,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
 // LLM message types for the OpenAI API.
 
 type llmMessage struct {
@@ -326,12 +347,13 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		httpReq.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
 
-	// http.DefaultClient already has no Client.Timeout and DefaultTransport
-	// leaves ResponseHeaderTimeout at 0, so a long generation or a server that
-	// queues the request before answering is never capped — cancellation is
-	// driven by the request ctx only. The 30s dial timeout (TCP connect) is the
-	// only ceiling, which is what we want: an unreachable server fails fast.
-	resp, err := http.DefaultClient.Do(httpReq)
+	// llmHTTPClient caps the wait for the server's first response byte at 90s
+	// (ResponseHeaderTimeout). This bounds the hang when a network switch breaks
+	// an in-flight TCP connection: without it, TCP retransmission keeps the
+	// request alive for up to ~15 minutes before the OS gives up. 90s is enough
+	// for a busy or queued LLM server to start streaming; cancellation via the
+	// request ctx still applies for the rest of the stream.
+	resp, err := llmHTTPClient.Do(httpReq)
 	if err != nil {
 		a.logSession(sid, connLabel, "[transport error] %v", err)
 		return "", nil, "", err

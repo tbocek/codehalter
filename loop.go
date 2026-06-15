@@ -437,8 +437,8 @@ const reasoningNudgeBytes = 512
 // momentary, so the recovery loop re-sends the same request a few times with a
 // short backoff before surfacing a clear message instead of a raw EOF.
 const (
-	maxTransientStreamRetries = 2
-	transientStreamBackoff    = 750 * time.Millisecond
+	maxTransientStreamRetries = 5
+	transientStreamBackoff    = 3 * time.Second
 )
 
 // streamFlushInterval batches streamed model tokens to the editor at most this
