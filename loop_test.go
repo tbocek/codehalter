@@ -5,7 +5,41 @@ import (
 	"encoding/json"
 	"slices"
 	"testing"
+	"time"
 )
+
+// TestStartToolMeter pins the tool status meter's lifecycle: stop() halts the
+// ticker and joins its goroutine promptly (no deadlock, no leak), and a cancelled
+// ctx also lets stop() return. It does not assert the 1s-tick text (time-based,
+// like streamWaitMeter, which is likewise not unit-tested).
+func TestStartToolMeter(t *testing.T) {
+	a, s := newTestAgent(t)
+
+	// Normal stop joins quickly.
+	stop := a.startToolMeter(context.Background(), s.ID, "web_search")
+	if stop == nil {
+		t.Fatal("startToolMeter returned a nil stop")
+	}
+	done := make(chan struct{})
+	go func() { stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop() did not return: meter goroutine leaked or deadlocked")
+	}
+
+	// A cancelled ctx also unblocks stop().
+	ctx, cancel := context.WithCancel(context.Background())
+	stop2 := a.startToolMeter(ctx, s.ID, "run_command")
+	cancel()
+	done2 := make(chan struct{})
+	go func() { stop2(); close(done2) }()
+	select {
+	case <-done2:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop() after ctx cancel did not return")
+	}
+}
 
 // TestThrottledStream pins the token batcher that keeps per-token streaming from
 // flooding the editor at high tg/s: the first token emits immediately, tokens

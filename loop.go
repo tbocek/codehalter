@@ -574,6 +574,34 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 	return a.runToolLoopSeeded(ctx, sid, conn, messages, policy, phase, stream, failSoftCap)
 }
 
+// startToolMeter ticks the active phase row once per second while a tool runs, so
+// a slow tool (run_command, web_search) or a subagent's tool call shows
+// "(running web_search… 12s)" instead of a frozen "(running web_search…)". It is
+// the tool-side counterpart of streamWaitMeter; for a subagent session setStatus
+// folds it into the parent's row. The returned stop() halts the ticker AND waits
+// for it, so no late tick can clobber the next status update.
+func (a *agent) startToolMeter(ctx context.Context, sid, tool string) (stop func()) {
+	start := time.Now()
+	a.setStatus(ctx, sid, " (running "+tool+"…)") // immediate, before the first tick
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.setStatus(ctx, sid, fmt.Sprintf(" (running %s… %ds)", tool, int(time.Since(start).Seconds())))
+			}
+		}
+	}()
+	return func() { close(done); <-stopped }
+}
+
 // runToolLoopSeeded runs the agentic loop with an EXPLICIT initial context. Only
 // the subagent uses it (it seeds from the parent's context, not its own session);
 // single-use, so the stale-snapshot risk runToolLoop removes doesn't apply. The
@@ -809,7 +837,18 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if sess := a.getSession(sid); sess != nil && sess.ParentID != "" && sess.DisplayLabel != "" {
 				a.sendUpdate(ctx, sess.ParentID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80))}})
 			}
-			a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
+			// Live status while the tool runs (the tool-side counterpart of the LLM
+			// streamWaitMeter): "(running web_search… 12s)" ticks so a long tool or a
+			// subagent's tool call shows liveness instead of a frozen row.
+			// launch_subagent is excluded: its subagents fold their OWN meters into
+			// this same parent row (setSubagentStatus), so a ticker here would fight
+			// them; a one-time marker holds until they take over.
+			var stopMeter func()
+			if tc.Function.Name == "launch_subagent" {
+				a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
+			} else {
+				stopMeter = a.startToolMeter(ctx, sid, tc.Function.Name)
+			}
 
 			// runToolCall (tools.go) executes the tool, caches its full output
 			// for view_output, and hands back the model-visible content (the
@@ -832,6 +871,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				content = msg
 			default:
 				tu, content = a.runToolCall(ctx, sid, tc)
+			}
+			if stopMeter != nil {
+				stopMeter() // stop the live ticker now the tool has returned
 			}
 			res.ToolUses = append(res.ToolUses, tu)
 			// A denied call is the model's mistake, not a tool failure — don't feed
