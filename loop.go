@@ -408,10 +408,15 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// documentation change needed.") starts a fresh markdown paragraph instead
 	// of running into the executor's final sentence.
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n\n"}})
-	// Documentation wraps up a finished turn: deny submit_plan (no looping back to
-	// planning). No terminal — it keeps the legacy text exit (the model writes the
-	// doc note and stops), unchanged from before.
-	docPolicy := phasePolicy{deny: map[string]bool{submitPlanToolName: true}}
+	// Documentation wraps up a finished turn: deny submit_plan (no looping back
+	// to planning). respond is a terminal here too: the model writes docs and
+	// then calls respond to signal "documentation complete" — the same intent as
+	// in execute phase. Without this, the loop sees respond as a normal tool
+	// call, continues, and the model calls respond again → stuck-repetition.
+	docPolicy := phasePolicy{
+		deny:      map[string]bool{submitPlanToolName: true},
+		terminals: map[string]bool{respondToolName: true},
+	}
 	docRes, err := a.runToolLoop(ctx, sid, conn, docPolicy, "document", true, 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
