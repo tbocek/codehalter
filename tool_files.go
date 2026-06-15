@@ -320,7 +320,7 @@ func init() {
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path": map[string]any{"type": "string", "description": "Subdirectory relative to project root. Empty = list from root."},
+					"path": map[string]any{"type": "string", "description": `Subdirectory relative to project root. Omitting, passing "" or "." all mean the same thing: list from root. Do not call list_files again on the same directory — if you already have the listing this turn, reuse it.`},
 				},
 			},
 		},
@@ -351,7 +351,23 @@ func init() {
 		if len(files) == 0 {
 			return "(directory is empty: " + dir + ")", false
 		}
-		return strings.Join(files, "\n"), false
+		listing := strings.Join(files, "\n")
+		// Dedup: same directory listed again this turn with the same result.
+		// Mirrors read_file's readUnchangedMarker so the repetition ladder
+		// counts it and the model knows to reuse the listing it already has.
+		dedupKey := "list_files|" + dir
+		h := fnvHash(listing)
+		sess.readDedupMu.Lock()
+		if sess.readDedup == nil {
+			sess.readDedup = map[string]readDedupEntry{}
+		}
+		_, seen := sess.readDedup[dedupKey]
+		sess.readDedup[dedupKey] = readDedupEntry{hash: h}
+		sess.readDedupMu.Unlock()
+		if seen {
+			return fmt.Sprintf("[note: %s — you already listed %s this turn and the contents are UNCHANGED. Reuse the listing you already have.]\n%s", readUnchangedMarker, dir, listing), false
+		}
+		return listing, false
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
