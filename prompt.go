@@ -793,6 +793,9 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		if r.genMs > 0 && r.completion > 0 {
 			line += " · " + humanRate(r.completion, r.genMs) + " tg/s"
 		}
+		// Nudge toward self-improvement: /improve reads this session's logs and
+		// proposes (then applies/submits) refinements to codehalter's own prompts.
+		line += "\n\n💡 Run /improve to analyze this session and improve codehalter."
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line + "\n"}})
 	}
 	a.backgroundGitCommit(sess)

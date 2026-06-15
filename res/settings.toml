@@ -1,93 +1,20 @@
-# Codehalter settings — edit this file, then restart the Zed session.
-#
-# To use these settings for every project on this machine, move this file to:
-#   ~/.config/codehalter/settings.toml
-# Codehalter looks there first, and only falls back to this project-local file
-# when no global settings exist. Once the global file is in place, this
-# project-local copy can be deleted.
-#
-# Schema: one [[llm]] array. The order matters.
-#
-#   llm[0]  → the MAIN connection. Owns the foreground session's KV cache, so
-#             its prefix stays warm across turns. Every plan/execute/verify/
-#             document call on the main session lands here.
-#   llm[1+] → EXTRA connections. Used to fan out launch_subagent tasks in
-#             parallel and to host the per-turn background summariser (kept
-#             off llm[0] so the main cache isn't evicted).
-#
-# `parallel = N` caps how many concurrent LLM calls each entry accepts. The
-# total fan-out for one launch_subagent batch is the sum of `parallel` across
-# every [[llm]] entry, with a breadth-first interleave: the first subagent
-# pins to llm[0] (it inherits the parent's history so its prefix cache stays
-# warm), the next N pin to llm[1], the next to llm[2], and so on. Pool size 1
-# everywhere just serialises everything — no deadlock, just slow.
-#
-# Sampler params can be split by role on EACH entry:
-#
-#   params_thinking → used for PLAN, history summarisation, title generation.
-#                     Set higher temperature / top_p — these phases benefit
-#                     from exploration.
-#   params_execute  → used for EXECUTE, VERIFY, DOCUMENT, web-page summary,
-#                     and every subagent's tool loop. Set lower temperature
-#                     — these phases need to follow instructions precisely.
-#   params          → legacy single-set fallback. Used when the role-specific
-#                     variant isn't configured. Fine for simple setups.
-#
-# All three are forwarded verbatim as the OpenAI request's extra body
-# (sampler keys plus anything model-specific like enable_thinking,
-# reasoning_mode). Core fields (model, messages, stream, tools) always
-# override. Sampler params never enter the prefix KV cache key, so switching
-# between params_thinking and params_execute on the same server hits the same
-# cache — no warm-up cost.
-#
-# `max_tokens` caps a single completion. If you don't set it, codehalter
-# injects 8192 (defaultMaxTokens in settings.go). Bounds the worst case where
-# a small model loops forever inside one completion — the per-tool-loop
-# iteration cap can't help there because the runaway happens within ONE LLM
-# round-trip. Healthy turns are well under it (execute ~2-4k, plan/verify
-# <1k), so the 8192 default is generous headroom. If the server returns
-# finish_reason="length", codehalter surfaces a clear error rather than
-# retrying — raise it only if a legitimate turn is being truncated.
-#
-# Repetition control: local models can loop on boilerplate — repeating the same
-# HTML block, list item, or sentence. The DRY sampler (`dry_multiplier` > 0)
-# penalises repeated multi-token SEQUENCES and is the real fix for that;
-# `repeat_penalty` is a blunter token-level backstop. The defaults below enable
-# both. They're llama.cpp sampler names, forwarded verbatim — if your backend
-# ignores DRY (some MLX servers do), drop the `dry_*` keys and add OpenAI-style
-# `frequency_penalty = 0.3, presence_penalty = 0.3` instead. Over-penalised
-# (mangled code, dropped closing tags)? Raise `dry_allowed_length` to 3–4 or set
-# `repeat_penalty = 1.0`.
-#
-# `context_size` and `image_support` are auto-detected on llama.cpp /
-# llama-swap setups (via /v1/models launch args or /props). Every other
-# backend (OpenAI, Ollama, vLLM, OpenWebUI, LiteLLM, …) doesn't expose that
-# metadata over a standard endpoint, so declare it here. The startup banner
-# warns when either signal couldn't be discovered.
+# Codehalter settings. Edit, then restart the Zed session.
+# Machine-wide: move to ~/.config/codehalter/settings.toml (checked first).
 
 [[llm]]
-# server is the base URL of your OpenAI-compatible server (host root only).
-# codehalter appends the API paths itself — /v1/chat/completions for
-# completions, /v1/models and /props for probing. Do NOT include a path here.
-server = "http://localhost:8080"
-# api_key = "..."        # uncomment if your server requires bearer auth
-model = "your-model-id"  # must match the model name your server reports at /v1/models
-parallel = 1
-# context_size = 128000  # uncomment for non-llama.cpp backends — sized to the model's max prompt+output tokens
-# image_support = true   # uncomment for non-llama.cpp backends that accept image inputs (gpt-4o, claude-3.5-sonnet, qwen-vl, …)
-params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, max_tokens = 4096, repeat_penalty = 1.1, repeat_last_n = 256, dry_multiplier = 0.8, dry_base = 1.75, dry_allowed_length = 2, dry_penalty_last_n = -1 }
-params_execute  = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, max_tokens = 8192, repeat_penalty = 1.1, repeat_last_n = 256, dry_multiplier = 0.8, dry_base = 1.75, dry_allowed_length = 2, dry_penalty_last_n = -1 }
+server = "http://localhost:8080"  # host root only, no path
+# api_key = "..."                 # if your server needs bearer auth
+model = "your-model-id"           # must match /v1/models
+parallel = 1                      # max concurrent calls to this server
+# context_size = 128000           # required for non-llama.cpp backends
+# image_support = true            # for non-llama.cpp vision models
+params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 16384 }
+params_execute = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 8192, chat_template_kwargs = { enable_thinking = false } }
 
-# Example extra entries — uncomment when you have a separate server (or
-# multiple slots on the same server you want to use in parallel). With
-# `parallel = 3` below, launch_subagent can fan out up to 4 tasks at once
-# (1 on llm[0] + 3 on llm[1]); the background summariser routes here too,
-# off the main slot.
-#
+# More [[llm]] entries fan out subagents and host the summariser off llm[0]:
 # [[llm]]
-# server = "http://your-other-server:9001"
+# server = "http://other-server:9001"
 # model = "your-larger-model-id"
-# tag = "execute"        # informational only — shown in the startup banner
 # parallel = 3
-# params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, repeat_penalty = 1.1, repeat_last_n = 256, dry_multiplier = 0.8, dry_base = 1.75, dry_allowed_length = 2, dry_penalty_last_n = -1 }
-# params_execute  = { temperature = 0.7, top_p = 0.8,  top_k = 20, min_p = 0.0, repeat_penalty = 1.1, repeat_last_n = 256, dry_multiplier = 0.8, dry_base = 1.75, dry_allowed_length = 2, dry_penalty_last_n = -1 }
+# params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 16384 }
+# params_execute = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 8192, chat_template_kwargs = { enable_thinking = false } }
