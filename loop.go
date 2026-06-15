@@ -239,6 +239,13 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 			sess.saveOrLog()
 		}
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Understood: " + choice + "\n"}})
+
+		// Re-run the planner now that the user has clarified. The session already
+		// carries "User chose: X" so the model sees the full context and should
+		// produce subtasks. Without this, orchestrate receives the original empty
+		// plan (subtasks=[]) and hits the "couldn't produce a plan" fallback.
+		p, u, err := a.runPlanPhase(ctx, sid, replanContext)
+		return p, append(toolUses, u...), err
 	}
 
 	return &plan, toolUses, nil
