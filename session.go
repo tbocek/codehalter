@@ -707,6 +707,32 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 	last.ToolUses = append(last.ToolUses, tu)
 }
 
+// readContentInContext reports whether the exact bytes `content` are still
+// present in the live message window as a prior read_file/continue_read result
+// the model can scroll back to. Compaction trims s.Messages, so an archived read
+// returns false — the model genuinely needs those bytes re-served. Callers
+// restrict this to content that fits whole in context (≤ liveExemptCap); a
+// clipped >32 KB read isn't fully present and must not be treated as available.
+// Only read tools count: a run_command that happened to echo the same bytes
+// isn't the file "in context" for navigation purposes.
+func (s *Session) readContentInContext(content string) bool {
+	if content == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.Messages {
+		for _, tu := range s.Messages[i].ToolUses {
+			if tu.Name == "read_file" || tu.Name == "continue_read" {
+				if strings.Contains(tu.Output, content) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // FindToolUseOutput scans every message's tool uses for one matching id and
 // returns its Output. Used by view_output to re-serve the full output of any
 // prior tool call without re-running it. Returns "" when no match (older

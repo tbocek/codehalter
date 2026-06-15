@@ -137,6 +137,44 @@ func TestServeReadFreshBytesNotFlagged(t *testing.T) {
 	}
 }
 
+// TestServeReadRefusesWhenInContext pins the in-context refusal: when the exact
+// bytes are already present as a prior read result in the LIVE message window, a
+// re-read is REFUSED (the chunk is not re-served — the model scrolls back). A
+// read that isn't in the messages (never recorded, or compacted away) is still
+// served. serveRead itself doesn't record the ToolUse (runToolCall does), so the
+// test seeds s.Messages to simulate the prior read being in context.
+func TestServeReadRefusesWhenInContext(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.Depth = 1
+	ctx := context.Background()
+	path := filepath.Join(s.Cwd, "f.txt")
+	writeLines(t, path, 10)
+
+	// Nothing in the message window yet → re-reads are SERVED (carry the bytes).
+	out1, _ := a.serveRead(ctx, s.ID, path, 1, readChunkLines, "tc1")
+	out2, _ := a.serveRead(ctx, s.ID, path, 1, readChunkLines, "tc2")
+	if strings.Contains(out2, "re-read refused") {
+		t.Fatalf("a read not in the message window must be served, not refused:\n%s", out2)
+	}
+	if !strings.Contains(out2, "L2") {
+		t.Fatalf("a served read must contain the file content:\n%s", out2)
+	}
+
+	// Record the prior read in the live context, as runToolCall would.
+	s.Messages = []Message{{Role: "assistant", ToolUses: []ToolUse{{Name: "read_file", Output: out1}}}}
+
+	out3, failed := a.serveRead(ctx, s.ID, path, 1, readChunkLines, "tc3")
+	if failed {
+		t.Fatalf("an in-context refusal is benign — failed must be false")
+	}
+	if !strings.Contains(out3, "already in the context") || !strings.Contains(out3, readUnchangedMarker) {
+		t.Errorf("re-read with content in context must be refused with the unchanged marker:\n%s", out3)
+	}
+	if strings.Contains(out3, "L2") {
+		t.Errorf("the refusal must NOT re-serve the file bytes:\n%s", out3)
+	}
+}
+
 // TestEditFileMissFailsAndSteers pins the edit_file recovery contract: a missed
 // old_text reports failed=true (so it feeds the loop's fail cap) and steers the
 // model to read the region and retry a small edit — never rewrite the whole

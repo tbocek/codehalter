@@ -222,6 +222,25 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 		note = fmt.Sprintf("[end of file — line %d is the last; you have the file through line %d, do not re-read]", end, end)
 	}
 
+	// Already in the live context verbatim: refuse instead of re-serving. The
+	// model can scroll back to the copy it already has, and re-reading would just
+	// duplicate the whole chunk in the prompt — a small model that loops on
+	// read_file otherwise keeps inflating n_ctx with identical bytes. Scoped to
+	// content that fits whole in context (≤ liveExemptCap, so it wasn't
+	// byte-clipped) and is genuinely still present — verified against the live
+	// messages, not a per-turn hash, so a compacted-away read IS re-served.
+	// readUnchangedMarker keeps runToolLoop's repetition ladder counting it.
+	if sess != nil && len(content) > 0 && len(content) <= liveExemptCap && sess.readContentInContext(content) {
+		ptr := " You already have these lines above — scroll back to that output instead of re-reading."
+		if more {
+			ptr = fmt.Sprintf(" You already have lines %d-%d above; for the rest of the file call continue_read path=%q (or read_file line=%d / search_text for a specific part).", start, end, path, end+1)
+		}
+		refusal := fmt.Sprintf("This file is already in the context — %s. You read %s lines %d-%d earlier this turn and it has not changed; re-read refused.%s",
+			readUnchangedMarker, path, start, end, ptr)
+		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Read (already in context): %s (%d-%d)", path, start, end), []ToolCallContent{TextContent(refusal)})
+		return refusal, false
+	}
+
 	out := content
 	if byteNote != "" {
 		out += "\n" + byteNote
@@ -339,7 +358,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": fmt.Sprintf("Read a text file from the top (or from `line`). Serves up to %d lines per call. If the file continues past that, the output is marked partial and ends with a pointer to call continue_read for the next chunk (it remembers where you left off, so no line math). When the output ends with an end-of-file marker you have the file through that point, so do not re-read. A literal-repeat read (same window, file unchanged) is rejected with a pointer to continue_read. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
+			"description": fmt.Sprintf("Read a text file from the top (or from `line`). Serves up to %d lines per call. If the file continues past that, the output is marked partial and ends with a pointer to call continue_read for the next chunk (it remembers where you left off, so no line math). When the output ends with an end-of-file marker you have the file through that point, so do not re-read. A repeat read whose exact content is still in this conversation is refused (scroll back to it, or call continue_read for the next part); once it has scrolled out of context it is re-served. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path"},
