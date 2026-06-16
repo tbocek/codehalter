@@ -108,8 +108,9 @@ func (a *agent) discoverRunners(cwd string) {
 		defer cancelCmd()
 		cmd := exec.CommandContext(cmdCtx, runner.Command, runner.Args(target)...)
 		cmd.Dir = sess.Cwd
+		detachGroup(cmd) // group-kill on cancel reaps any subprocess the runner spawned
 
-		out, runErr, started := a.runStreamingCmd(ctx, sid, task, cmd, cancelCmd, 0)
+		out, runErr, started, _ := a.runStreamingCmd(ctx, sid, task, cmd, cancelCmd, 0)
 		if !started {
 			a.FailToolCall(ctx, sid, tcId, runErr.Error())
 			// Couldn't even start the runner: a real failure, not a non-zero exit.

@@ -26,6 +26,35 @@ func TestRunCmdIdleTimeout(t *testing.T) {
 	}
 }
 
+// TestRunCommandReapsBackgroundChild pins the foreground-done-but-child-alive
+// detection: a command that backgrounds a long-lived process returns PROMPTLY
+// (not after the idle timeout), the child is reaped, and the result steers the
+// model to run_background. This is the case that used to wedge the turn forever.
+func TestRunCommandReapsBackgroundChild(t *testing.T) {
+	a, s := newTestAgent(t)
+	oldGrace, oldIdle := bgLingerGrace, cmdIdleTimeout
+	bgLingerGrace = 20 * time.Millisecond
+	cmdIdleTimeout = 30 * time.Second // far longer than the test: prove we don't wait for it
+	defer func() { bgLingerGrace, cmdIdleTimeout = oldGrace, oldIdle }()
+
+	start := time.Now()
+	out, failed := runCmdExecute(context.Background(), a, s.ID, `{"command":"sleep 30 & echo started"}`)
+	elapsed := time.Since(start)
+
+	if failed {
+		t.Fatalf("unexpected failed=true: %s", out)
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("did not return promptly after the foreground exited: took %s", elapsed)
+	}
+	if !strings.Contains(out, "started") {
+		t.Errorf("expected foreground output 'started', got: %s", out)
+	}
+	if !strings.Contains(out, "run_background") {
+		t.Errorf("expected a run_background hint after reaping the child, got: %s", out)
+	}
+}
+
 // TestRunCmdCapturesFullOutput pins that the decoupled drain captures a
 // high-volume command's full output. The old per-line sendUpdate path streamed
 // through a synchronous io.Pipe, so a chatty command could deadlock behind a

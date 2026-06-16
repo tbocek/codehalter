@@ -139,6 +139,14 @@ type agent struct {
 	// every active subagent. Guarded by subagentMeterMu (concurrent subagents).
 	subagentMeterMu sync.Mutex
 	subagentMeter   map[string]map[string]string
+
+	// bgJobs tracks run_background processes (detached daemons the model starts:
+	// dev servers, watchers) so shutdownBackground can SIGKILL their process
+	// groups on exit instead of orphaning them with a held port. Keyed by the
+	// sequential id shown to the model; bgSeq hands out ids. Guarded by bgMu.
+	bgMu   sync.Mutex
+	bgJobs map[int]*backgroundJob
+	bgSeq  int
 }
 
 // mcpState owns the spawned MCP server children plus the bookkeeping
@@ -185,7 +193,8 @@ func main() {
 	slog.Info("waiting for connection")
 	<-conn.Done()
 	slog.Info("connection closed")
-	a.shutdownMCP() // reap MCP children (spawned with no context) so they don't orphan
+	a.shutdownMCP()        // reap MCP children (spawned with no context) so they don't orphan
+	a.shutdownBackground() // reap detached run_background daemons (dev servers etc.)
 }
 
 // ---------------------------------------------------------------------------
