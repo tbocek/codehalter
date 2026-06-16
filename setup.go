@@ -3,11 +3,14 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -122,6 +125,20 @@ func runSetup() {
 		os.Exit(1)
 	}
 	configPath := filepath.Join(configDir, "settings.toml")
+
+	// Backup existing settings.toml before overwriting
+	if _, err := os.Stat(configPath); err == nil {
+		old, readErr := os.ReadFile(configPath)
+		if readErr == nil {
+			hash := sha256.Sum256(old)
+			shaPrefix := hex.EncodeToString(hash[:])[:8]
+			ts := time.Now().Format("20060102150405")
+			backupPath := filepath.Join(configDir, fmt.Sprintf("settings.backup-%s-%s", ts, shaPrefix))
+			if writeErr := os.WriteFile(backupPath, old, 0o644); writeErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: could not create backup: %v\n", writeErr)
+			}
+		}
+	}
 
 	f, err := os.Create(configPath)
 	if err != nil {
