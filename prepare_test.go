@@ -371,6 +371,34 @@ func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 	}
 }
 
+// TestScaffoldSettings pins that the skeleton settings.toml is written from the
+// embedded default when none exists, and that a second call is a no-op (never
+// clobbers an existing, possibly user-edited, file). This is the "if there is none,
+// create a skeleton" behavior the prepare phase relies on.
+func TestScaffoldSettings(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, sessionDir, "settings.toml")
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("precondition: no settings.toml should exist yet")
+	}
+
+	a.scaffoldSettings(context.Background(), s.Cwd, s.ID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("scaffoldSettings did not create the skeleton: %v", err)
+	}
+	if len(data) == 0 || string(data) != defaultSettingsTOML {
+		t.Errorf("skeleton doesn't match the embedded default (%d bytes)", len(data))
+	}
+
+	// Idempotent: a second call must NOT clobber an existing file.
+	os.WriteFile(path, []byte("# user edited\n"), 0o644)
+	a.scaffoldSettings(context.Background(), s.Cwd, s.ID)
+	if again, _ := os.ReadFile(path); string(again) != "# user edited\n" {
+		t.Error("scaffoldSettings clobbered an existing settings.toml")
+	}
+}
+
 // TestProbeToolBinsMatchesInlineProbe pins that probeToolBins computes exactly the
 // per-binary presence the three reporters (envSnapshot / checkEnv /
 // notifyCapabilities) used to compute inline, so collapsing them into one helper
