@@ -1,7 +1,7 @@
 {
   "id": "codehalter",
   "name": "codehalter",
-  "version": "v24",
+  "version": "24.0.0",
   "description": "ACP-only coding agent that runs in a devcontainer sandbox against any OpenAI-compatible LLM (llama.cpp, Ollama, vLLM, ...)",
   "repository": "https://github.com/tbocek/codehalter",
   "license": "MIT",
