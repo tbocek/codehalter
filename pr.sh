@@ -23,7 +23,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$REPO_ROOT/registry/codehalter"
-FORK="${REGISTRY_FORK:-https://github.com/tbocek/registry.git}"
+FORK="${REGISTRY_FORK:-git@github.com:tbocek/registry.git}"
 UPSTREAM="${REGISTRY_UPSTREAM:-agentclientprotocol/registry}"
 UPSTREAM_URL="https://github.com/$UPSTREAM.git"
 BRANCH="${PR_BRANCH:-add-codehalter}"
