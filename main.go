@@ -182,6 +182,12 @@ type mcpState struct {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// --setup flag: interactive LLM configuration, skips the ACP server.
+	if len(os.Args) > 1 && os.Args[1] == "--setup" {
+		runSetup()
+		os.Exit(0)
+	}
+
 	// Global slog → stderr at debug (Zed captures it live); per-session detail
 	// (LLM req/reply, errors) goes to .codehalter/session_<id>.log via logSession.
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -234,7 +240,13 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 		Name    string `json:"name,omitempty"`
 		Version string `json:"version,omitempty"`
 	}{"codehalter", "0.1.0"}
-	res.AuthMethods = []string{}
+	res.AuthMethods = []AuthMethod{{
+		ID:          "terminal-setup",
+		Name:        "Terminal Setup",
+		Description: "Interactive LLM configuration",
+		Type:        "terminal",
+		Args:        []string{"--setup"},
+	}}
 	return res, nil
 }
 

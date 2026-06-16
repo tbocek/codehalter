@@ -50,6 +50,15 @@ const (
 	KindUserMessage  = "user_message_chunk"
 )
 
+type AuthMethod struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
+	Type        string            `json:"type"`
+	Args        []string          `json:"args,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+}
+
 type (
 	InitializeRequest struct {
 		ProtocolVersion int `json:"protocolVersion"`
@@ -66,8 +75,8 @@ type (
 				Close *struct{} `json:"close,omitempty"`
 			} `json:"sessionCapabilities,omitempty"`
 		} `json:"agentCapabilities"`
-		AgentInfo   any      `json:"agentInfo,omitempty"`
-		AuthMethods []string `json:"authMethods"`
+		AgentInfo   any          `json:"agentInfo,omitempty"`
+		AuthMethods []AuthMethod `json:"authMethods"`
 	}
 
 	NewSessionRequest struct {

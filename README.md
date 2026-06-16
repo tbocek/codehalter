@@ -114,6 +114,16 @@ Codehalter looks for settings in two places, in this order:
 
 On first run with neither file present, codehalter prompts to write a commented skeleton into `<project>/.codehalter/settings.toml`. Edit it, then move it to `~/.config/codehalter/` to share across projects (the project-local copy can be deleted once the global one exists).
 
+### Interactive setup
+
+Alternatively, run the `--setup` flag to configure the LLM connection interactively:
+
+```sh
+codehalter --setup
+```
+
+This walks through server URL, model name, and API key (optional), validates the connection, and writes `~/.config/codehalter/settings.toml` automatically.
+
 ### Example settings
 
 One `[[llm]]` array. Order matters: `llm[0]` is the main connection, `llm[1+]` are extras.
