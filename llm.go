@@ -499,12 +499,13 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// sid="" (probes/tests) has no session, skip. A scan failure means the stream
 	// broke before the usage chunk, so the counts are 0 and this is a no-op.
 	if sess := a.getSession(sid); sess != nil {
-		// Derive evaluated from cached_tokens when timings are absent; -1 means no
-		// cache info reported.
+		// Derive evaluated (sent-but-not-cached) from cached_tokens when timings are
+		// absent; -1 means no cache info reported. This is the only number we keep —
+		// the gross prompt_tokens (cached prefix re-counted each call) is not summed.
 		if evaluatedTokens < 0 && cachedTokens >= 0 && promptTokens > 0 {
 			evaluatedTokens = promptTokens - cachedTokens
 		}
-		sess.addTurnTokens(promptTokens, completionTokens, evaluatedTokens, cachedTokens)
+		sess.addTurnTokens(promptTokens, completionTokens, evaluatedTokens)
 		// Prefer the server's measured times over our TTFT proxy (which includes
 		// queue + cache-load overhead → understates pp/s).
 		pMs, gMs := serverPromptMs, serverGenMs

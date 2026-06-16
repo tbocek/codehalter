@@ -427,13 +427,13 @@ type Session struct {
 	turnStatsMu          sync.Mutex
 	turnStart            time.Time
 	turnHumanWaitMs      int64
-	turnPromptTokens     int // SENT (cached prefix re-counted per call)
 	turnCompletionTokens int
-	// Server cache split (llama.cpp timings / usage cached_tokens). When no backend
-	// reports it, haveServerCache is false and the Done line shows turnLastPrompt
-	// (final context size) instead of guessing.
-	turnEvaluatedPrompt int // run through the model
-	turnCachedPrompt    int // reused from KV cache
+	// turnEvaluatedPrompt is the sent-but-not-cached prompt total (Σ of each call's
+	// prompt_tokens − cached_tokens) — the real prompt work, shown on the Done line.
+	// We deliberately do NOT sum the gross prompt_tokens (which re-counts the cached
+	// prefix every call). When no backend reports a cache split, haveServerCache is
+	// false and the line falls back to turnLastPrompt (final context size).
+	turnEvaluatedPrompt int
 	turnLastPrompt      int // most recent call's prompt size
 	haveServerCache     bool
 	turnPromptMs        int64 // eval time (server prompt_ms, else TTFT)
@@ -445,10 +445,8 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.turnStatsMu.Lock()
 	s.turnStart = start
 	s.turnHumanWaitMs = 0
-	s.turnPromptTokens = 0
 	s.turnCompletionTokens = 0
 	s.turnEvaluatedPrompt = 0
-	s.turnCachedPrompt = 0
 	s.turnLastPrompt = 0
 	s.haveServerCache = false
 	s.turnPromptMs = 0
@@ -456,21 +454,19 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.turnStatsMu.Unlock()
 }
 
-// addTurnTokens sums one call's usage. evaluated/cached are the server cache
-// split; pass -1 when the backend didn't report it.
-func (s *Session) addTurnTokens(prompt, completion, evaluated, cached int) {
+// addTurnTokens folds one call's usage into the turn: it sums completion and the
+// evaluated (sent-but-not-cached) prompt tokens, and tracks the most recent
+// call's full prompt size for the no-cache fallback line. evaluated is -1 when
+// the backend reported no cache split (then haveServerCache stays false). prompt
+// is the full prompt size, used only for the context-size fallback — never summed.
+func (s *Session) addTurnTokens(prompt, completion, evaluated int) {
 	s.turnStatsMu.Lock()
-	s.turnPromptTokens += prompt
 	s.turnCompletionTokens += completion
 	if prompt > 0 {
 		s.turnLastPrompt = prompt
 	}
 	if evaluated >= 0 {
 		s.turnEvaluatedPrompt += evaluated
-		s.haveServerCache = true
-	}
-	if cached >= 0 {
-		s.turnCachedPrompt += cached
 		s.haveServerCache = true
 	}
 	s.turnStatsMu.Unlock()
@@ -498,10 +494,8 @@ func (s *Session) addHumanWait(d time.Duration) {
 // turnReport is the end-of-turn accounting for the "✅ Done" line.
 type turnReport struct {
 	activeMs        int64
-	sentPrompt      int  // Σ prompt_tokens (the cached prefix re-counted each call)
 	completion      int  // Σ completion_tokens
-	evaluatedPrompt int  // Σ server-reported evaluated prompt (cache misses)
-	cachedPrompt    int  // Σ server-reported cached prompt
+	evaluatedPrompt int  // Σ sent-but-not-cached prompt tokens (the real prompt work)
 	lastPrompt      int  // final context size (last call's prompt_tokens)
 	haveServerCache bool // a backend reported the cache split
 	promptMs        int64
@@ -520,10 +514,8 @@ func (s *Session) turnStats() turnReport {
 	}
 	return turnReport{
 		activeMs:        activeMs,
-		sentPrompt:      s.turnPromptTokens,
 		completion:      s.turnCompletionTokens,
 		evaluatedPrompt: s.turnEvaluatedPrompt,
-		cachedPrompt:    s.turnCachedPrompt,
 		lastPrompt:      s.turnLastPrompt,
 		haveServerCache: s.haveServerCache,
 		promptMs:        s.turnPromptMs,

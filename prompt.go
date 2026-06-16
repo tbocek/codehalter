@@ -778,11 +778,12 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		// without it, show the final context size — don't guess.
 		var line string
 		if r.haveServerCache {
-			line = fmt.Sprintf("\n\n✅ Done in %s · %s prompt + %s gen",
+			// Headline the real prompt work: tokens sent that were NOT served from
+			// cache (Σ evaluated). We don't show the gross prompt total, which
+			// re-counts the cached prefix every call and balloons with tool-step
+			// count (a multi-tool turn looked bigger than a later, larger-context one).
+			line = fmt.Sprintf("\n\n✅ Done in %s · %s uncached + %s gen",
 				humanDuration(r.activeMs), humanCount(r.evaluatedPrompt), humanCount(r.completion))
-			if r.sentPrompt > r.evaluatedPrompt {
-				line += fmt.Sprintf(" (%s sent, %d%% cached)", humanCount(r.sentPrompt), r.cachedPrompt*100/r.sentPrompt)
-			}
 			if r.promptMs > 0 && r.evaluatedPrompt > 0 {
 				line += " · " + humanRate(r.evaluatedPrompt, r.promptMs) + " pp/s"
 			}

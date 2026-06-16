@@ -9,24 +9,19 @@ import (
 	"time"
 )
 
-// TestTurnServerCache pins the server-driven accounting: with the cache split
-// reported (evaluated, cached per call) the turn sums them and flags
-// haveServerCache; with -1/-1 (no backend report) it flags no cache info and
-// keeps the final context size for the fallback line — no guessing.
+// TestTurnServerCache pins the server-driven accounting: with the evaluated
+// (sent-but-not-cached) count reported per call the turn sums just that and flags
+// haveServerCache; with -1 (no backend report) it flags no cache info and keeps
+// the final context size for the fallback line — no guessing. The gross prompt
+// total is no longer tracked.
 func TestTurnServerCache(t *testing.T) {
 	s := &Session{}
 	s.resetTurnStats(time.Now())
-	s.addTurnTokens(1000, 50, 1000, 0)   // cold: 1000 evaluated, 0 cached
-	s.addTurnTokens(1100, 40, 100, 1000) // 100 evaluated, 1000 reused
+	s.addTurnTokens(1000, 50, 1000) // cold: 1000 evaluated (uncached)
+	s.addTurnTokens(1100, 40, 100)  // 100 evaluated, the rest served from cache
 	r := s.turnStats()
-	if r.sentPrompt != 2100 {
-		t.Errorf("sentPrompt: got %d, want 2100", r.sentPrompt)
-	}
 	if r.evaluatedPrompt != 1100 {
 		t.Errorf("evaluatedPrompt: got %d, want 1100", r.evaluatedPrompt)
-	}
-	if r.cachedPrompt != 1000 {
-		t.Errorf("cachedPrompt: got %d, want 1000", r.cachedPrompt)
 	}
 	if !r.haveServerCache || r.completion != 90 {
 		t.Errorf("haveServerCache=%v completion=%d", r.haveServerCache, r.completion)
@@ -35,8 +30,8 @@ func TestTurnServerCache(t *testing.T) {
 	// No server cache info → no claim, keep the final context size.
 	s2 := &Session{}
 	s2.resetTurnStats(time.Now())
-	s2.addTurnTokens(5000, 30, -1, -1)
-	s2.addTurnTokens(5200, 20, -1, -1)
+	s2.addTurnTokens(5000, 30, -1)
+	s2.addTurnTokens(5200, 20, -1)
 	r2 := s2.turnStats()
 	if r2.haveServerCache {
 		t.Error("haveServerCache should be false with no server data")
