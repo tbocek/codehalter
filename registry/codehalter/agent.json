@@ -6,7 +6,7 @@
   "repository": "https://github.com/tbocek/codehalter",
   "license": "MIT",
   "icon": "./icon.svg",
-  "authors": "Thomas Bocek",
+  "authors": ["Thomas Bocek"],
   "website": "https://tbocek.github.io/codehalter/",
   "distribution": {
     "binary": {

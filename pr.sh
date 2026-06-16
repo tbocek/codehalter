@@ -43,7 +43,7 @@ echo "latest tag: $tag"
 AGENT_REL="registry/codehalter/agent.json"
 tmp="$(mktemp)"
 jq --arg tag "$tag" '
-  .version = $tag
+  .version = ($tag | ltrimstr("v")) + ".0.0"
   | .distribution.binary |= map_values(
       .archive |= sub("/releases/download/v[0-9]+/"; "/releases/download/\($tag)/")
     )
