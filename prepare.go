@@ -29,6 +29,8 @@ var (
 	cardSetupLsmcp string
 	//go:embed res/card-setup-clangd.md
 	cardSetupClangd string
+	//go:embed res/card-setup-gopls.md
+	cardSetupGopls string
 	//go:embed res/card-mcp-parse-error.md
 	cardMCPParseError string
 	//go:embed res/card-mcp-start-error.md
@@ -211,6 +213,22 @@ func mcpServerConfigured(cwd, name string) bool {
 		}
 	}
 	return false
+}
+
+// mcpMentionsServer reports whether mcp.toml references a [[server]] with this
+// name in ANY form — ACTIVE or COMMENTED-OUT. Unlike mcpServerConfigured (which
+// decodes, so it only sees active entries), this is a raw-text check: a commented
+// `# name = "gopls"` still matches. The setup card uses this to decide whether to
+// OFFER wiring: an active entry means it's already wired, a commented one means
+// the user was already offered it and declined — either way, don't nag. This is
+// why the seed mcp.toml ships NO named-server example: a name here would read as
+// "already offered" on every fresh project and the card would never fire.
+func mcpMentionsServer(cwd, name string) bool {
+	data, err := os.ReadFile(filepath.Join(cwd, sessionDir, "mcp.toml"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), `"`+name+`"`)
 }
 
 // ---------------------------------------------------------------------------
@@ -807,17 +825,34 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 			prompt: fmt.Sprintf(cardInstallTools, distro, detail.String()),
 		})
 	}
-	// JS/TS code-intelligence MCP (lsmcp) — the gopls analog. Offer setup when a
-	// TS/JS project hasn't wired it, mirroring Go's gopls card so JS/TS isn't a
-	// second-class citizen at fresh-project setup.
+	// Go code-intelligence MCP (gopls). Offer wiring when a Go project has gopls on
+	// PATH but no gopls [[server]] in mcp.toml. mcpMentionsServer (not
+	// mcpServerConfigured): a commented-out entry counts as "already offered and
+	// declined", so we don't nag — which is also why the seed mcp.toml ships no
+	// gopls example. The lsmcp/clangd cards below mirror this for JS/TS and C.
+	goplsPresent := false
+	for _, t := range binStacks {
+		if t.bin == "gopls" {
+			goplsPresent = t.present
+		}
+	}
+	if slices.Contains(stacks, "go") && goplsPresent && !mcpMentionsServer(sess.Cwd, "gopls") {
+		problems = append(problems, fixProblem{
+			desc:   "🟡 Go code intelligence (gopls MCP) not set up",
+			prompt: cardSetupGopls,
+		})
+	}
+	// JS/TS code-intelligence MCP (lsmcp), the gopls analog for JS/TS. Offer setup
+	// when a TS/JS project hasn't wired it. (Uses mcpServerConfigured, so it
+	// re-offers until wired, unlike gopls which respects a commented-out decline.)
 	if (slices.Contains(stacks, "ts") || slices.Contains(stacks, "js")) && !mcpServerConfigured(sess.Cwd, "lsmcp") {
 		problems = append(problems, fixProblem{
 			desc:   "🟡 JS/TS code intelligence (lsmcp MCP) not set up",
 			prompt: cardSetupLsmcp,
 		})
 	}
-	// C/C++ code-intelligence MCP (clangd) — the gopls analog for C, offered the
-	// same way as Go's gopls and JS/TS's lsmcp when a C project hasn't wired it.
+	// C/C++ code-intelligence MCP (clangd), the gopls analog for C. Same shape as
+	// the lsmcp card above.
 	if slices.Contains(stacks, "c") && !mcpServerConfigured(sess.Cwd, "clangd") {
 		problems = append(problems, fixProblem{
 			desc:   "🟡 C/C++ code intelligence (clangd MCP) not set up",

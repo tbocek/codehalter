@@ -459,11 +459,13 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	if err := seedTemplates(cwd); err != nil {
 		return err
 	}
-	// mcp.toml — only seeded on first run with the bare placeholder. Per-stack
-	// MCP wiring (e.g. gopls for Go) is the prepare phase's job: it asks the
-	// user before installing tools, and the same flow appends the matching
-	// [[server]] entry to this file. Once it exists we never touch it again —
-	// the user owns it.
+	// mcp.toml — only seeded on first run with the minimal placeholder (a header
+	// and ONE generic commented example, no per-stack servers). Per-stack MCP
+	// wiring (e.g. gopls for Go) is the prepare phase's job: checkEnv offers a
+	// setup card, and accepting it appends the matching [[server]] entry. The
+	// placeholder deliberately names no server so that "is gopls mentioned?"
+	// (mcpMentionsServer) reads as not-yet-offered on a fresh project. Once this
+	// file exists we never touch it again — the user owns it.
 	mcpPath := filepath.Join(dir, "mcp.toml")
 	if _, err := os.Stat(mcpPath); os.IsNotExist(err) {
 		if err := os.WriteFile(mcpPath, []byte(defaultMCPToml), 0o644); err != nil {

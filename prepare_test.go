@@ -119,6 +119,51 @@ func TestMcpServerConfigured(t *testing.T) {
 	}
 }
 
+// TestMcpMentionsServer pins the comment-AWARE check that gates the gopls card:
+// unlike mcpServerConfigured, a commented-out entry counts as "mentioned" (the
+// user was already offered it and declined), so the card stops nagging. This is
+// the exact distinction the gopls offer relies on — and why the seed mcp.toml
+// must name no server.
+func TestMcpMentionsServer(t *testing.T) {
+	dir := t.TempDir()
+	if mcpMentionsServer(dir, "gopls") {
+		t.Error("no mcp.toml should leave gopls not-mentioned")
+	}
+	cfgDir := filepath.Join(dir, sessionDir)
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mcpPath := filepath.Join(cfgDir, "mcp.toml")
+
+	// The crux: a commented-out gopls is NOT active (no card would mean "wired")
+	// but IS mentioned, so the offer card must NOT re-fire.
+	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"gopls\"\n# command = \"gopls\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if mcpServerConfigured(dir, "gopls") {
+		t.Error("commented gopls should NOT be configured")
+	}
+	if !mcpMentionsServer(dir, "gopls") {
+		t.Error("commented gopls SHOULD be mentioned (already offered → don't nag)")
+	}
+
+	// A project mentioning a different server but not gopls → gopls still offered.
+	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"fs\"\ncommand = \"npx\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if mcpMentionsServer(dir, "gopls") {
+		t.Error("a non-gopls mcp.toml should leave gopls not-mentioned")
+	}
+
+	// Active gopls → both mentioned and configured.
+	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"gopls\"\ncommand = \"gopls\"\nargs = [\"mcp\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !mcpMentionsServer(dir, "gopls") || !mcpServerConfigured(dir, "gopls") {
+		t.Error("active gopls should be both mentioned and configured")
+	}
+}
+
 // TestProbeAllLLMsConfigBeatsProbe asserts the precedence rule: explicit
 // context_size / image_support on the [[llm]] entry win over whatever the
 // probe discovered. This is the path OpenAI/Ollama/vLLM users rely on —
