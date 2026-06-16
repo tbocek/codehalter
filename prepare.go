@@ -498,8 +498,9 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// right now (connForBackgroundLLM / the slot gate).
 	a.cfgMu.Lock()
 	for i := range conns {
-		if a.settings.LLM[i].Parallel == 0 && results[i].TotalSlots > 0 {
-			a.settings.LLM[i].Parallel = results[i].TotalSlots
+		if a.settings.LLM[i].Parallel == nil && results[i].TotalSlots > 0 {
+			val := results[i].TotalSlots
+			a.settings.LLM[i].Parallel = &val
 		}
 	}
 	a.buildConnSems() // resize the per-conn semaphores to the back-filled caps
@@ -519,8 +520,8 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// /v1/models' -c launch arg — by the slot count.
 	slots := a.settings.LLM[0].parallelCap()
 	switch {
-	case conns[0].ContextSize > 0:
-		a.setMainSlotTokens(conns[0].ContextSize / slots)
+	case conns[0].ContextSize != nil && *conns[0].ContextSize > 0:
+		a.setMainSlotTokens(*conns[0].ContextSize / slots)
 	case results[0].SlotCtx > 0:
 		a.setMainSlotTokens(results[0].SlotCtx)
 	case results[0].ContextSize > 0:

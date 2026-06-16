@@ -145,8 +145,8 @@ func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
 			LLM: []LLMConnection{{
 				Server:       ts.URL,
 				Model:        "gpt-4o",
-				Parallel:     1,
-				ContextSize:  128000,
+				Parallel:     ptr(1),
+				ContextSize:  ptr(128000),
 				ImageSupport: &yes,
 			}},
 		},
@@ -181,7 +181,7 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 			LLM: []LLMConnection{{
 				Server:   ts.URL,
 				Model:    "gpt-4o",
-				Parallel: 1,
+				Parallel: ptr(1),
 			}},
 		},
 	}
@@ -219,8 +219,8 @@ func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
 			LLM: []LLMConnection{{
 				Server:      ts.URL,
 				Model:       "qwopus3.6-27b",
-				Parallel:    1,
-				ContextSize: 128000, // keep the ctx gate quiet; not under test
+				Parallel:    ptr(1),
+				ContextSize: ptr(128000), // keep the ctx gate quiet; not under test
 			}},
 		},
 	}
@@ -271,7 +271,7 @@ func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
 			LLM: []LLMConnection{{
 				Server:       ts.URL,
 				Model:        "qwen-vl",
-				Parallel:     1,
+				Parallel:     ptr(1),
 				ImageSupport: &no,
 			}},
 		},
@@ -309,8 +309,8 @@ func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen"}}}}
 	a.probeAllLLMs(context.Background())
 
-	if got := a.settings.LLM[0].Parallel; got != 2 {
-		t.Errorf("Parallel: got %d, want 2 (auto-detected from /props total_slots)", got)
+	if got := a.settings.LLM[0].Parallel; *got != 2 {
+		t.Errorf("Parallel: got %d, want 2 (auto-detected from /props total_slots)", *got)
 	}
 	if a.mainSlotTokens != 16384 {
 		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx used directly, no division)", a.mainSlotTokens)
@@ -349,8 +349,8 @@ func TestProbeAllLLMsRouterModelProps(t *testing.T) {
 	if got := gotModel.Load(); got == nil || *got != modelID {
 		t.Fatalf("router ?model= param: got %v, want %q (encoding bug truncates at ';')", got, modelID)
 	}
-	if got := a.settings.LLM[0].Parallel; got != 2 {
-		t.Errorf("Parallel: got %d, want 2 (from ?model= /props total_slots)", got)
+	if got := a.settings.LLM[0].Parallel; *got != 2 {
+		t.Errorf("Parallel: got %d, want 2 (from ?model= /props total_slots)", *got)
 	}
 	if a.mainSlotTokens != 16384 {
 		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from ?model= /props)", a.mainSlotTokens)
@@ -363,11 +363,11 @@ func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 	ts := llamaCppServer(16384, 4)
 	defer ts.Close()
 
-	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen", Parallel: 1}}}}
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen", Parallel: ptr(1)}}}}
 	a.probeAllLLMs(context.Background())
 
-	if got := a.settings.LLM[0].Parallel; got != 1 {
-		t.Errorf("Parallel: got %d, want 1 (explicit value must not be overwritten by total_slots)", got)
+	if got := a.settings.LLM[0].Parallel; *got != 1 {
+		t.Errorf("Parallel: got %d, want 1 (explicit value must not be overwritten by total_slots)", *got)
 	}
 }
 
