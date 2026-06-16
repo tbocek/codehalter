@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"syscall"
 	"time"
 )
 
@@ -68,7 +67,7 @@ func (a *agent) shutdownBackground() {
 		case <-j.done: // already exited; nothing to kill
 		default:
 			if j.cmd.Process != nil {
-				_ = syscall.Kill(-j.cmd.Process.Pid, syscall.SIGKILL)
+				_ = killGroup(j.cmd.Process.Pid)
 			}
 		}
 		_ = os.Remove(j.logPath)
@@ -121,7 +120,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	cmd.Dir = sess.Cwd
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setPgid(cmd) // own process group so shutdownBackground can reap the whole tree
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()

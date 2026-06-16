@@ -8,33 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"syscall"
 	"time"
 )
-
-// detachGroup puts cmd in its own process group and rewires context-cancellation
-// to SIGKILL the WHOLE group, not just the direct child. Without it, a command
-// that backgrounds a process (`server & ; echo done`) leaves the grandchild
-// holding the inherited stdout pipe open after the shell exits: cmd.Wait() then
-// blocks on the copy goroutine forever, and the idle watchdog's default kill
-// (which targets only the already-dead shell) can't free it. Killing the group
-// reaps the daemon too, the pipe closes, and Wait returns. Callers still get the
-// timeout/cancel they asked for; this only widens what the kill reaches.
-func detachGroup(cmd *exec.Cmd) {
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Setpgid = true
-	cmd.Cancel = func() error {
-		if cmd.Process == nil {
-			return nil
-		}
-		// Negative pid targets the process group; with Setpgid the leader's pid
-		// is the pgid. ESRCH (already gone) is fine — exec ignores Cancel's error
-		// once the process has exited.
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
-}
 
 // discoverSandbox registers `run_command` whenever we're inside a container.
 // The container itself is the sandbox: it's throwaway, the host workspace is
@@ -108,17 +83,6 @@ var (
 	bgLingerGrace   = 250 * time.Millisecond
 	bgDrainDeadline = 2 * time.Second
 )
-
-// groupAlive reports whether process group pgid still has a live member. Used
-// after the foreground process exits to detect a child it backgrounded
-// (`server &`) that is still running. kill(-pgid, 0) sends no signal but performs
-// the existence check: nil => at least one member, ESRCH => none.
-func groupAlive(pgid int) bool {
-	if pgid <= 1 {
-		return false
-	}
-	return syscall.Kill(-pgid, 0) == nil
-}
 
 // cmdOutputCap bounds how many bytes of a command's output we CAPTURE for the
 // tool result (handed to the model); editorStreamCap bounds the live editor
@@ -307,7 +271,7 @@ func (a *agent) runStreamingCmd(ctx context.Context, sid, banner string, cmd *ex
 				time.Sleep(bgLingerGrace)
 				if groupAlive(pgid) {
 					leftBackground = true
-					_ = syscall.Kill(-pgid, syscall.SIGKILL)
+					_ = killGroup(pgid)
 				}
 			}
 			drainDeadline = time.After(bgDrainDeadline)
