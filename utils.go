@@ -231,3 +231,8 @@ func clipBytes(s string, max int) string {
 	half := max / 2
 	return s[:half] + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + s[len(s)-half:]
 }
+
+// ptr returns a pointer to v, useful for struct literals with *int/*bool fields.
+func ptr[T any](v T) *T {
+	return &v
+}

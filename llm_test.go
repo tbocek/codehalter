@@ -42,7 +42,7 @@ func TestTrimJSON(t *testing.T) {
 // entry routes background to llm[1] proper.
 func TestBackgroundSlotLabel(t *testing.T) {
 	// Single entry, parallel=2 → foreground llm[0], background llm[1] (same conn).
-	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: 2}}}}
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2)}}}}
 	a.buildConnSems()
 	if fg := a.settings.MainLLM("execute"); fg == nil || fg.Slot != 0 {
 		t.Fatalf("MainLLM.Slot = %v, want 0", fg)
@@ -53,7 +53,7 @@ func TestBackgroundSlotLabel(t *testing.T) {
 	}
 
 	// Single entry, parallel=1 → no second slot to label; background stays llm[0].
-	a1 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: 1}}}}
+	a1 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(1)}}}}
 	a1.buildConnSems()
 	if bg := a1.connForBackgroundLLM(); bg == nil || bg.Slot != 0 {
 		t.Fatalf("single-slot connForBackgroundLLM.Slot = %v, want 0", bg)
@@ -61,8 +61,8 @@ func TestBackgroundSlotLabel(t *testing.T) {
 
 	// Two entries → background routes to the second entry, llm[1].
 	a2 := &agent{settings: Settings{LLM: []LLMConnection{
-		{Server: "u0", Model: "m0", Parallel: 1},
-		{Server: "u1", Model: "m1", Parallel: 1},
+		{Server: "u0", Model: "m0", Parallel: ptr(1)},
+		{Server: "u1", Model: "m1", Parallel: ptr(1)},
 	}}}
 	a2.buildConnSems()
 	if bg := a2.connForBackgroundLLM(); bg == nil || bg.Slot != 1 || bg.Server != "u1" {
@@ -85,7 +85,8 @@ func TestBuildConnSemsIdempotent(t *testing.T) {
 	}
 
 	// A cap change rebuilds.
-	a.settings.LLM[0].Parallel = cap(first) + 3
+	v := cap(first) + 3
+	a.settings.LLM[0].Parallel = &v
 	a.buildConnSems()
 	if a.connSems[0] == first || cap(a.connSems[0]) != cap(first)+3 {
 		t.Errorf("cap change should rebuild: got cap %d, want %d", cap(a.connSems[0]), cap(first)+3)
@@ -103,8 +104,8 @@ func TestCfgConcurrentReloadAndRead(t *testing.T) {
 	reload := func(p int) {
 		a.cfgMu.Lock()
 		a.settings = Settings{LLM: []LLMConnection{
-			{Server: "http://a", Model: "m0", Parallel: p},
-			{Server: "http://b", Model: "m1", Parallel: 1},
+			{Server: "http://a", Model: "m0", Parallel: ptr(p)},
+			{Server: "http://b", Model: "m1", Parallel: ptr(1)},
 		}}
 		a.buildConnSems()
 		a.cfgMu.Unlock()

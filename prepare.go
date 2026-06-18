@@ -29,6 +29,8 @@ var (
 	cardSetupLsmcp string
 	//go:embed res/card-setup-clangd.md
 	cardSetupClangd string
+	//go:embed res/card-setup-gopls.md
+	cardSetupGopls string
 	//go:embed res/card-mcp-parse-error.md
 	cardMCPParseError string
 	//go:embed res/card-mcp-start-error.md
@@ -211,6 +213,22 @@ func mcpServerConfigured(cwd, name string) bool {
 		}
 	}
 	return false
+}
+
+// mcpMentionsServer reports whether mcp.toml references a [[server]] with this
+// name in ANY form — ACTIVE or COMMENTED-OUT. Unlike mcpServerConfigured (which
+// decodes, so it only sees active entries), this is a raw-text check: a commented
+// `# name = "gopls"` still matches. The setup card uses this to decide whether to
+// OFFER wiring: an active entry means it's already wired, a commented one means
+// the user was already offered it and declined — either way, don't nag. This is
+// why the seed mcp.toml ships NO named-server example: a name here would read as
+// "already offered" on every fresh project and the card would never fire.
+func mcpMentionsServer(cwd, name string) bool {
+	data, err := os.ReadFile(filepath.Join(cwd, sessionDir, "mcp.toml"))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), `"`+name+`"`)
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +430,20 @@ func (a *agent) scaffoldSettings(ctx context.Context, cwd string, sid string) {
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Failed to write " + path + ": " + err.Error() + "\n"}})
 		return
 	}
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " with placeholder values. Edit `server` and `model` to match your LLM server, then click Retry below. Optional: move the edited file to ~/.config/codehalter/settings.toml to share it across every project.\n\n"}})
+	// Read the file back before claiming success. On some devcontainer mounts a
+	// WriteFile reports nil yet nothing persists (read-only overlay), or a
+	// workspace-reset hook reaps it right away (.codehalter/ is gitignored, so a
+	// `git clean -fdX` would). Only say "Wrote" for a file we can actually read;
+	// otherwise name the likely cause instead of a misleading success message.
+	if data, err := os.ReadFile(path); err != nil || len(data) == 0 {
+		reason := "read back empty"
+		if err != nil {
+			reason = err.Error()
+		}
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " but could not read it back (" + reason + "). The directory may be read-only or wiped by a reset hook (.codehalter/ is gitignored). Add a global ~/.config/codehalter/settings.toml instead.\n\n"}})
+		return
+	}
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " with placeholder values. Edit `server` and `model` to match your LLM server, then click Retry below. If it is not in your editor's file tree, refresh: agent-created files do not always show up live. Optional: move the edited file to ~/.config/codehalter/settings.toml to share it across every project.\n\n"}})
 }
 
 // hashSettingsFiles returns hex sha256 of the concatenated contents of the
@@ -460,7 +491,7 @@ func (a *agent) hasReachableLLM() bool {
 func (a *agent) probeAllLLMs(ctx context.Context) {
 	conns := a.settings.allConnections()
 	a.connProbe = make(map[string]probeResult, len(conns))
-	a.mainSlotTokens = 0
+	a.setMainSlotTokens(0)
 	a.detectedSlots = 0
 	if len(conns) == 0 {
 		a.imagesSupported = false
@@ -485,8 +516,9 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// right now (connForBackgroundLLM / the slot gate).
 	a.cfgMu.Lock()
 	for i := range conns {
-		if a.settings.LLM[i].Parallel == 0 && results[i].TotalSlots > 0 {
-			a.settings.LLM[i].Parallel = results[i].TotalSlots
+		if a.settings.LLM[i].Parallel == nil && results[i].TotalSlots > 0 {
+			val := results[i].TotalSlots
+			a.settings.LLM[i].Parallel = &val
 		}
 	}
 	a.buildConnSems() // resize the per-conn semaphores to the back-filled caps
@@ -506,12 +538,12 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// /v1/models' -c launch arg — by the slot count.
 	slots := a.settings.LLM[0].parallelCap()
 	switch {
-	case conns[0].ContextSize > 0:
-		a.mainSlotTokens = conns[0].ContextSize / slots
+	case conns[0].ContextSize != nil && *conns[0].ContextSize > 0:
+		a.setMainSlotTokens(*conns[0].ContextSize / slots)
 	case results[0].SlotCtx > 0:
-		a.mainSlotTokens = results[0].SlotCtx
+		a.setMainSlotTokens(results[0].SlotCtx)
 	case results[0].ContextSize > 0:
-		a.mainSlotTokens = results[0].ContextSize / slots
+		a.setMainSlotTokens(results[0].ContextSize / slots)
 	}
 	slog.Info("probeAllLLMs", "slots", slots, "mainSlotTokens", a.mainSlotTokens,
 		"slotCtx", results[0].SlotCtx, "totalCtx", results[0].ContextSize, "totalSlots", results[0].TotalSlots)
@@ -793,17 +825,34 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 			prompt: fmt.Sprintf(cardInstallTools, distro, detail.String()),
 		})
 	}
-	// JS/TS code-intelligence MCP (lsmcp) — the gopls analog. Offer setup when a
-	// TS/JS project hasn't wired it, mirroring Go's gopls card so JS/TS isn't a
-	// second-class citizen at fresh-project setup.
+	// Go code-intelligence MCP (gopls). Offer wiring when a Go project has gopls on
+	// PATH but no gopls [[server]] in mcp.toml. mcpMentionsServer (not
+	// mcpServerConfigured): a commented-out entry counts as "already offered and
+	// declined", so we don't nag — which is also why the seed mcp.toml ships no
+	// gopls example. The lsmcp/clangd cards below mirror this for JS/TS and C.
+	goplsPresent := false
+	for _, t := range binStacks {
+		if t.bin == "gopls" {
+			goplsPresent = t.present
+		}
+	}
+	if slices.Contains(stacks, "go") && goplsPresent && !mcpMentionsServer(sess.Cwd, "gopls") {
+		problems = append(problems, fixProblem{
+			desc:   "🟡 Go code intelligence (gopls MCP) not set up",
+			prompt: cardSetupGopls,
+		})
+	}
+	// JS/TS code-intelligence MCP (lsmcp), the gopls analog for JS/TS. Offer setup
+	// when a TS/JS project hasn't wired it. (Uses mcpServerConfigured, so it
+	// re-offers until wired, unlike gopls which respects a commented-out decline.)
 	if (slices.Contains(stacks, "ts") || slices.Contains(stacks, "js")) && !mcpServerConfigured(sess.Cwd, "lsmcp") {
 		problems = append(problems, fixProblem{
 			desc:   "🟡 JS/TS code intelligence (lsmcp MCP) not set up",
 			prompt: cardSetupLsmcp,
 		})
 	}
-	// C/C++ code-intelligence MCP (clangd) — the gopls analog for C, offered the
-	// same way as Go's gopls and JS/TS's lsmcp when a C project hasn't wired it.
+	// C/C++ code-intelligence MCP (clangd), the gopls analog for C. Same shape as
+	// the lsmcp card above.
 	if slices.Contains(stacks, "c") && !mcpServerConfigured(sess.Cwd, "clangd") {
 		problems = append(problems, fixProblem{
 			desc:   "🟡 C/C++ code intelligence (clangd MCP) not set up",

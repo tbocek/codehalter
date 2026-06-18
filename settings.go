@@ -57,7 +57,7 @@ type LLMConnection struct {
 	APIKey         string         `toml:"api_key,omitempty"`
 	Model          string         `toml:"model"`
 	Tag            string         `toml:"tag,omitempty"`
-	Parallel       int            `toml:"parallel,omitempty"`
+	Parallel       *int           `toml:"parallel,omitempty"`
 	Params         map[string]any `toml:"params,omitempty"`
 	ParamsThinking map[string]any `toml:"params_thinking,omitempty"`
 	ParamsExecute  map[string]any `toml:"params_execute,omitempty"`
@@ -66,7 +66,7 @@ type LLMConnection struct {
 	// set, codehalter trusts this and skips metadata-endpoint probing for
 	// ctx size. Required for backends that don't expose llama.cpp-style
 	// discovery (OpenAI, Ollama, vLLM, OpenWebUI, LiteLLM, …).
-	ContextSize int `toml:"context_size,omitempty"`
+	ContextSize *int `toml:"context_size,omitempty"`
 	// ImageSupport declares whether the model accepts image inputs.
 	// Optional — *bool so unset (probe), true (force on), and false (force
 	// off) are distinct. nil falls through to discovery via /props or
@@ -118,10 +118,10 @@ func (c *LLMConnection) endpoint(path string) string {
 // parallelCap returns the effective concurrent-call cap for this conn,
 // defaulting to 1 when unset or invalid.
 func (c *LLMConnection) parallelCap() int {
-	if c.Parallel < 1 {
-		return 1
+	if c.Parallel != nil && *c.Parallel >= 1 {
+		return *c.Parallel
 	}
-	return c.Parallel
+	return 1
 }
 
 // loadSettings looks for settings.toml in this order:

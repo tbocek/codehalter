@@ -230,7 +230,10 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	// byte-clipped) and is genuinely still present — verified against the live
 	// messages, not a per-turn hash, so a compacted-away read IS re-served.
 	// readUnchangedMarker keeps runToolLoop's repetition ladder counting it.
-	if sess != nil && len(content) > 0 && len(content) <= liveExemptCap && sess.readContentInContext(content) {
+	// Exception: if edit_file just failed for this path, the model needs a fresh
+	// look to get the exact old_text for a retry — bypass the guard once.
+	editFailed := sess != nil && sess.clearEditFailed(path)
+	if !editFailed && sess != nil && len(content) > 0 && len(content) <= liveExemptCap && sess.readContentInContext(content) {
 		ptr := " You already have these lines above — scroll back to that output instead of re-reading."
 		if more {
 			ptr = fmt.Sprintf(" You already have lines %d-%d above; for the rest of the file call continue_read path=%q (or read_file line=%d / search_text for a specific part).", start, end, path, end+1)
@@ -320,7 +323,7 @@ func init() {
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"path": map[string]any{"type": "string", "description": "Subdirectory relative to project root. Empty = list from root."},
+					"path": map[string]any{"type": "string", "description": `Subdirectory relative to project root. Omitting, passing "" or "." all mean the same thing: list from root. Do not call list_files again on the same directory — if you already have the listing this turn, reuse it.`},
 				},
 			},
 		},
@@ -351,7 +354,23 @@ func init() {
 		if len(files) == 0 {
 			return "(directory is empty: " + dir + ")", false
 		}
-		return strings.Join(files, "\n"), false
+		listing := strings.Join(files, "\n")
+		// Dedup: same directory listed again this turn with the same result.
+		// Mirrors read_file's readUnchangedMarker so the repetition ladder
+		// counts it and the model knows to reuse the listing it already has.
+		dedupKey := "list_files|" + dir
+		h := fnvHash(listing)
+		sess.readDedupMu.Lock()
+		if sess.readDedup == nil {
+			sess.readDedup = map[string]readDedupEntry{}
+		}
+		_, seen := sess.readDedup[dedupKey]
+		sess.readDedup[dedupKey] = readDedupEntry{hash: h}
+		sess.readDedupMu.Unlock()
+		if seen {
+			return fmt.Sprintf("[note: %s — you already listed %s this turn and the contents are UNCHANGED. Reuse the listing you already have.]\n%s", readUnchangedMarker, dir, listing), false
+		}
+		return listing, false
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -441,6 +460,9 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
+		if argIsNonString(rawArgs, "content") {
+			return "error: `content` must be a JSON string. You sent a non-string value, which would be coerced to an empty string and ERASE the file. Resend with the full file content as a quoted string.", false
+		}
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
 			return "error: " + err.Error(), false
@@ -448,7 +470,15 @@ func init() {
 		newContent := args["content"]
 		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
-		oldContent, _ := fsRead(a, ctx, sid, path, nil, nil)
+		// Pre-edit read for the diff card + formatGuarded's dry run. A missing file
+		// (the common new-file case) and a read fault both surface as an error here,
+		// and the ACP read path can't reliably tell them apart, so proceed as a new
+		// file (oldContent ""). Log it rather than dropping it to `_`, so a genuine
+		// read fault on an existing file still leaves a trail.
+		oldContent, rerr := fsRead(a, ctx, sid, path, nil, nil)
+		if rerr != nil {
+			slog.Debug("write_file: pre-edit read returned an error; treating as new file", "path", path, "err", rerr)
+		}
 		newContent = a.formatGuarded(sid, path, oldContent, newContent)
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
@@ -478,6 +508,9 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
+		if argIsNonString(rawArgs, "old_text") || argIsNonString(rawArgs, "new_text") {
+			return "error: `old_text` and `new_text` must be JSON strings; a non-string value is coerced to \"\" and would mis-edit the file. Resend them quoted (use \"\" only to intentionally delete old_text).", false
+		}
 		path, err := a.resolvePath(sid, args["path"])
 		if err != nil {
 			return "error: " + err.Error(), false
@@ -516,6 +549,9 @@ func init() {
 				return fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n), true
 			default:
 				a.FailToolCall(ctx, sid, tcId, "old_text not found in file")
+				if sess := a.getSession(sid); sess != nil {
+					sess.markEditFailed(path)
+				}
 				// Failed=true feeds the loop's fail cap (a model spraying wrong edits
 				// gives up instead of looping to the iteration backstop); the verdict
 				// authority excludes edit_file, so a recovered miss never condemns.

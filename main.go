@@ -139,6 +139,14 @@ type agent struct {
 	// every active subagent. Guarded by subagentMeterMu (concurrent subagents).
 	subagentMeterMu sync.Mutex
 	subagentMeter   map[string]map[string]string
+
+	// bgJobs tracks run_background processes (detached daemons the model starts:
+	// dev servers, watchers) so shutdownBackground can SIGKILL their process
+	// groups on exit instead of orphaning them with a held port. Keyed by the
+	// sequential id shown to the model; bgSeq hands out ids. Guarded by bgMu.
+	bgMu   sync.Mutex
+	bgJobs map[int]*backgroundJob
+	bgSeq  int
 }
 
 // mcpState owns the spawned MCP server children plus the bookkeeping
@@ -174,6 +182,12 @@ type mcpState struct {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// --setup flag: interactive LLM configuration, skips the ACP server.
+	if len(os.Args) > 1 && os.Args[1] == "--setup" {
+		runSetup()
+		os.Exit(0)
+	}
+
 	// Global slog → stderr at debug (Zed captures it live); per-session detail
 	// (LLM req/reply, errors) goes to .codehalter/session_<id>.log via logSession.
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -185,6 +199,8 @@ func main() {
 	slog.Info("waiting for connection")
 	<-conn.Done()
 	slog.Info("connection closed")
+	a.shutdownMCP()        // reap MCP children (spawned with no context) so they don't orphan
+	a.shutdownBackground() // reap detached run_background daemons (dev servers etc.)
 }
 
 // ---------------------------------------------------------------------------
@@ -224,7 +240,13 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 		Name    string `json:"name,omitempty"`
 		Version string `json:"version,omitempty"`
 	}{"codehalter", "0.1.0"}
-	res.AuthMethods = []string{}
+	res.AuthMethods = []AuthMethod{{
+		ID:          "terminal-setup",
+		Name:        "Terminal Setup",
+		Description: "Interactive LLM configuration",
+		Type:        "terminal",
+		Args:        []string{"--setup"},
+	}}
 	return res, nil
 }
 
@@ -437,11 +459,13 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	if err := seedTemplates(cwd); err != nil {
 		return err
 	}
-	// mcp.toml — only seeded on first run with the bare placeholder. Per-stack
-	// MCP wiring (e.g. gopls for Go) is the prepare phase's job: it asks the
-	// user before installing tools, and the same flow appends the matching
-	// [[server]] entry to this file. Once it exists we never touch it again —
-	// the user owns it.
+	// mcp.toml — only seeded on first run with the minimal placeholder (a header
+	// and ONE generic commented example, no per-stack servers). Per-stack MCP
+	// wiring (e.g. gopls for Go) is the prepare phase's job: checkEnv offers a
+	// setup card, and accepting it appends the matching [[server]] entry. The
+	// placeholder deliberately names no server so that "is gopls mentioned?"
+	// (mcpMentionsServer) reads as not-yet-offered on a fresh project. Once this
+	// file exists we never touch it again — the user owns it.
 	mcpPath := filepath.Join(dir, "mcp.toml")
 	if _, err := os.Stat(mcpPath); os.IsNotExist(err) {
 		if err := os.WriteFile(mcpPath, []byte(defaultMCPToml), 0o644); err != nil {
@@ -563,6 +587,14 @@ func (a *agent) isAutopilot() bool {
 	defer a.mu.Unlock()
 	return a.mode == "Autopilot"
 }
+
+// get/setMainSlotTokens guard a.mainSlotTokens for its ONE cross-goroutine access:
+// a background llmStream (summariser / git-commit drafter) reads it on its
+// finish=length path (llm.go) while the next turn's probeAllLLMs rewrites it. The
+// foreground prepare/prompt reads run on the same goroutine as the writes, so they
+// read the field directly; only the writer and the background reader need the lock.
+func (a *agent) getMainSlotTokens() int  { a.mu.Lock(); defer a.mu.Unlock(); return a.mainSlotTokens }
+func (a *agent) setMainSlotTokens(n int) { a.mu.Lock(); a.mainSlotTokens = n; a.mu.Unlock() }
 
 // ---------------------------------------------------------------------------
 // Agent → client output

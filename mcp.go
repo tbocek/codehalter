@@ -245,6 +245,10 @@ func newStdioTransport(cfg MCPServerConfig, cwd string) (*stdioTransport, error)
 	cmd.Stderr = stderr
 
 	if err := cmd.Start(); err != nil {
+		// Close the pipes we opened above; without this each failed start (retried
+		// on every mcp.toml mtime bump) leaks two OS file descriptors.
+		stdin.Close()
+		stdout.Close()
 		return nil, fmt.Errorf("starting %s: %w", cfg.Command, err)
 	}
 	t := &stdioTransport{
@@ -301,9 +305,19 @@ func (t *stdioTransport) readLoop() {
 		ch, ok := t.pending[*resp.ID]
 		t.pendingMu.Unlock()
 		if !ok {
+			// No waiter: a late response to a cancelled/completed call, or an
+			// unknown id. Drop it with a breadcrumb instead of silently.
+			slog.Debug("mcp: response for unknown/late id", "name", t.name, "id", *resp.ID)
 			continue
 		}
-		ch <- resp
+		// Non-blocking: ch is buffered (cap 1) for the normal case, but a SECOND
+		// response to the same id (a misbehaving server) must not block the read
+		// loop here — that would wedge every other in-flight call on this transport.
+		select {
+		case ch <- resp:
+		default:
+			slog.Debug("mcp: dropped duplicate response", "name", t.name, "id", *resp.ID)
+		}
 	}
 }
 
@@ -514,7 +528,11 @@ func (t *httpTransport) close() {
 	if sid == "" {
 		return
 	}
-	req, err := http.NewRequest(http.MethodDelete, t.url, nil)
+	// Bound the best-effort DELETE so a black-holed endpoint can't hang shutdown
+	// (or, when called from reconcile, the user's turn) for the client's full timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.url, nil)
 	if err != nil {
 		return
 	}
@@ -670,6 +688,35 @@ type mcpChange struct {
 	action string // "started" | "stopped" | "restarted" | "failed" | "parse_error"
 	name   string // server name; "" for parse_error
 	err    error  // populated when action == "failed" or "parse_error"
+}
+
+// shutdownMCP closes every running MCP child on app exit. stdio servers are
+// spawned with exec.Command (no context), so without this they orphan and keep
+// running after codehalter is gone. Snapshot under the lock (don't race reconcile),
+// then Close unlocked with an overall deadline so a wedged server can't hang exit.
+func (a *agent) shutdownMCP() {
+	a.mcp.mu.Lock()
+	clients := make([]*MCPClient, 0, len(a.mcp.clients))
+	for _, c := range a.mcp.clients {
+		clients = append(clients, c)
+	}
+	a.mcp.clients = nil
+	a.mcp.mu.Unlock()
+	if len(clients) == 0 {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		for _, c := range clients {
+			c.Close()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		slog.Warn("mcp shutdown: timed out closing clients")
+	}
 }
 
 // reconcileMCP brings the running MCP clients in line with .codehalter/mcp.toml.

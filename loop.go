@@ -239,6 +239,13 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 			sess.saveOrLog()
 		}
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Understood: " + choice + "\n"}})
+
+		// Re-run the planner now that the user has clarified. The session already
+		// carries "User chose: X" so the model sees the full context and should
+		// produce subtasks. Without this, orchestrate receives the original empty
+		// plan (subtasks=[]) and hits the "couldn't produce a plan" fallback.
+		p, u, err := a.runPlanPhase(ctx, sid, replanContext)
+		return p, append(toolUses, u...), err
 	}
 
 	return &plan, toolUses, nil
@@ -296,6 +303,10 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		// runners: a non-failing no-op so the model moves on, without the runner
 		// condemning the subtask (a denied/failed run_task fails the whole subtask).
 		policy.skip = map[string]bool{"run_task": true, "run_command": true}
+		// submit_improvement is the /improve apply step: the model proposes the
+		// changes (structured) and submit_improvement drives the Apply/Skip + submit
+		// in code. It ends the subtask like respond (see the funnel in runToolLoopSeeded).
+		policy.terminals[submitImprovementToolName] = true
 	}
 	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
@@ -342,13 +353,14 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	}
 	var failedNames []string
 	for _, k := range order {
-		// edit_file/write_file set Failed on a usage error to feed the loop's
-		// fail cap, but they're NOT truth-bearing verdicts here: a failed edit the
-		// model recovered from (a later edit with corrected text — a different
-		// input, so a different key) must not condemn the subtask, and one it did
-		// NOT recover from is caught by the verify recipe (the changed file won't
-		// build). Only run_task/run_command exit codes are authoritative.
-		if lastFailed[k] && k.name != "edit_file" && k.name != "write_file" {
+		// Only run_task/run_command exit codes are authoritative build verdicts.
+		// Several other tools set Failed to feed the loop's fail cap but are NOT
+		// verdicts: edit_file/write_file on a usage error (a recovered edit is a
+		// later edit with a different key, and an unrecovered one is caught by the
+		// verify recipe when the file won't build), view_image on a benign missing
+		// image, submit_improvement on a malformed /improve call. Condemning the
+		// subtask on those triggers spurious replans, so use a positive allowlist.
+		if lastFailed[k] && (k.name == "run_task" || k.name == "run_command") {
 			failedNames = append(failedNames, k.name)
 		}
 	}
@@ -401,10 +413,15 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// documentation change needed.") starts a fresh markdown paragraph instead
 	// of running into the executor's final sentence.
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n\n"}})
-	// Documentation wraps up a finished turn: deny submit_plan (no looping back to
-	// planning). No terminal — it keeps the legacy text exit (the model writes the
-	// doc note and stops), unchanged from before.
-	docPolicy := phasePolicy{deny: map[string]bool{submitPlanToolName: true}}
+	// Documentation wraps up a finished turn: deny submit_plan (no looping back
+	// to planning). respond is a terminal here too: the model writes docs and
+	// then calls respond to signal "documentation complete" — the same intent as
+	// in execute phase. Without this, the loop sees respond as a normal tool
+	// call, continues, and the model calls respond again → stuck-repetition.
+	docPolicy := phasePolicy{
+		deny:      map[string]bool{submitPlanToolName: true},
+		terminals: map[string]bool{respondToolName: true},
+	}
 	docRes, err := a.runToolLoop(ctx, sid, conn, docPolicy, "document", true, 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
@@ -437,8 +454,8 @@ const reasoningNudgeBytes = 512
 // momentary, so the recovery loop re-sends the same request a few times with a
 // short backoff before surfacing a clear message instead of a raw EOF.
 const (
-	maxTransientStreamRetries = 2
-	transientStreamBackoff    = 750 * time.Millisecond
+	maxTransientStreamRetries = 5
+	transientStreamBackoff    = 3 * time.Second
 )
 
 // streamFlushInterval batches streamed model tokens to the editor at most this
@@ -562,6 +579,34 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 	return a.runToolLoopSeeded(ctx, sid, conn, messages, policy, phase, stream, failSoftCap)
 }
 
+// startToolMeter ticks the active phase row once per second while a tool runs, so
+// a slow tool (run_command, web_search) or a subagent's tool call shows
+// "(running web_search… 12s)" instead of a frozen "(running web_search…)". It is
+// the tool-side counterpart of streamWaitMeter; for a subagent session setStatus
+// folds it into the parent's row. The returned stop() halts the ticker AND waits
+// for it, so no late tick can clobber the next status update.
+func (a *agent) startToolMeter(ctx context.Context, sid, tool string) (stop func()) {
+	start := time.Now()
+	a.setStatus(ctx, sid, " (running "+tool+"…)") // immediate, before the first tick
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.setStatus(ctx, sid, fmt.Sprintf(" (running %s… %ds)", tool, int(time.Since(start).Seconds())))
+			}
+		}
+	}()
+	return func() { close(done); <-stopped }
+}
+
 // runToolLoopSeeded runs the agentic loop with an EXPLICIT initial context. Only
 // the subagent uses it (it seeds from the parent's context, not its own session);
 // single-use, so the stale-snapshot risk runToolLoop removes doesn't apply. The
@@ -609,6 +654,23 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			sess.MarkLastAssistantTiming(res.StartedAt, res.DurationMs, phase)
 		}
 	}
+	// /improve funnel state (persists across rounds): submit_improvement is the
+	// apply step; a weak model that ends with a prose respond after only analysing
+	// gets nudged toward it, up to improveRespondNudgeCap times before respond is
+	// allowed through (graceful give-up, never an infinite loop). Scoped to the
+	// EXECUTE phase only: that's where submit_improvement is the apply terminal. In
+	// plan (a report_only respond is a valid outcome) and document (respond is the
+	// only terminal), gating respond would wrongly push the model toward
+	// submit_improvement and could even re-run the apply loop.
+	const improveRespondNudgeCap = 2
+	var improveSess *Session
+	if phase == "execute" {
+		if s := a.getSession(sid); s != nil && s.improving.Load() {
+			improveSess = s
+		}
+	}
+	improveRespondNudges := 0
+
 	// Repetition ladder state. callOutHash remembers the last output hash of each
 	// (name,args) call this loop; a later call that reproduces it made no progress
 	// (an interleaved revisit counts, not just a consecutive one). A round whose
@@ -691,6 +753,12 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				}
 				transientRetries++
 				a.logSession(sid, "RECOVER", "stream dropped mid-response (%v) — retry %d/%d", err, transientRetries, maxTransientStreamRetries)
+				if sid != "" {
+					// The dropped attempt's partial tokens are already on screen and the
+					// retry re-streams from the top; flag it so the repeated prefix reads
+					// as a reconnect, not a glitch (append-only streaming can't rewind).
+					a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n⟲ Connection dropped mid-response; reconnecting.\n"}})
+				}
 				select {
 				case <-time.After(transientStreamBackoff):
 					continue
@@ -797,7 +865,18 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if sess := a.getSession(sid); sess != nil && sess.ParentID != "" && sess.DisplayLabel != "" {
 				a.sendUpdate(ctx, sess.ParentID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80))}})
 			}
-			a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
+			// Live status while the tool runs (the tool-side counterpart of the LLM
+			// streamWaitMeter): "(running web_search… 12s)" ticks so a long tool or a
+			// subagent's tool call shows liveness instead of a frozen row.
+			// launch_subagent is excluded: its subagents fold their OWN meters into
+			// this same parent row (setSubagentStatus), so a ticker here would fight
+			// them; a one-time marker holds until they take over.
+			var stopMeter func()
+			if tc.Function.Name == "launch_subagent" {
+				a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
+			} else {
+				stopMeter = a.startToolMeter(ctx, sid, tc.Function.Name)
+			}
 
 			// runToolCall (tools.go) executes the tool, caches its full output
 			// for view_output, and hands back the model-visible content (the
@@ -820,6 +899,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				content = msg
 			default:
 				tu, content = a.runToolCall(ctx, sid, tc)
+			}
+			if stopMeter != nil {
+				stopMeter() // stop the live ticker now the tool has returned
 			}
 			res.ToolUses = append(res.ToolUses, tu)
 			// A denied call is the model's mistake, not a tool failure — don't feed
@@ -853,7 +935,19 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if !repeated {
 				roundStuck = false
 			}
-			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled {
+			// /improve funnel: block a premature prose respond (the weak model's habit
+			// of analysing then bailing without applying) and point it back at
+			// submit_improvement, which drives the Apply/Skip + submit in code. Once
+			// submit_improvement has delivered (improveDelivered, set inside
+			// improvementExecute), respond is allowed to end the turn. Session-scoped so
+			// a replan that re-enters execute can't re-arm it and re-apply.
+			gatedRespond := improveSess != nil && !improveSess.improveDelivered.Load() &&
+				tc.Function.Name == respondToolName && improveRespondNudges < improveRespondNudgeCap
+			if gatedRespond {
+				improveRespondNudges++
+				content = "Do not finish with a prose summary. Call submit_improvement ONCE now with the improvements as a JSON array (each: title, file, type=add|replace|remove, original, new, reasoning). codehalter then shows the user each change, asks Apply/Skip, applies the accepted edits, and asks whether to submit. That single call IS the apply step."
+			}
+			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled && !gatedRespond {
 				terminalCalled = true
 				terminalName = tc.Function.Name
 				terminalMessage = tu.Output
@@ -870,8 +964,16 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		// the text-stream callback) and exit. The repetition ladder below is
 		// skipped — this turn is over.
 		if terminalCalled {
-			if on != nil && terminalMessage != "" {
+			switch {
+			case on == nil:
+				// Silent internal pass (e.g. the planner): no UI emit.
+			case terminalMessage != "":
 				on(terminalMessage)
+				flushStream() // the terminal message is the FINAL emit; never leave it batched in the throttled sink
+			default:
+				// An empty respond/terminal would end the turn wordlessly; emit a
+				// minimal acknowledgement so a turn that ran is never silent.
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "(done)\n"}})
 			}
 			res.Text = terminalMessage
 			res.RespondCalled = true

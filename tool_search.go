@@ -236,6 +236,10 @@ func searchInFile(path string, matcher func(string) bool, limit int) []int {
 	}
 	var matches []int
 	scanner := bufio.NewScanner(r)
+	// Raise the per-line cap above bufio's 64 KB default so a long minified line
+	// doesn't end the scan early and silently drop matches after it (the scanErr
+	// log below still covers anything beyond this).
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++

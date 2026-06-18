@@ -19,11 +19,34 @@ func writeImageFile(cwd, id, mime string, data []byte) error {
 	case "image/webp":
 		ext = "webp"
 	}
-	path := filepath.Join(cwd, ".codehalter", "images", id+"."+ext)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Join(cwd, ".codehalter", "images")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	// Write to a UNIQUE temp, then rename for an atomic publish a concurrent reader
+	// (view_image / LoadSession replay) can't catch half-written. The temp is
+	// "tmp-*", NOT "<id>.<ext>.tmp": unique so two parallel same-id writes don't
+	// clobber each other, and dotless so it can't match readImageFile's "<id>.*"
+	// glob (a leftover from a crashed write would otherwise pollute it).
+	f, err := os.CreateTemp(dir, "tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, filepath.Join(dir, id+"."+ext)); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // readImageFile finds the file by id (mime unknown to the caller — e.g.

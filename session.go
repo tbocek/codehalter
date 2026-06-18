@@ -26,8 +26,7 @@ func (s *Session) improveAskBlocked() bool {
 	if !s.improving.Load() {
 		return false
 	}
-	s.improveAsks++
-	return s.improveAsks > improveAskCap
+	return s.improveAsks.Add(1) > improveAskCap
 }
 
 // beginTurn registers the in-flight turn's cancel.
@@ -308,6 +307,14 @@ type Session struct {
 	// busted for a path on write. In-memory only.
 	readCursorMu sync.Mutex
 	readCursor   map[string]int
+	// editFailedPaths is the set of paths where edit_file returned "not found"
+	// this turn. A failed edit signals that the model's remembered content is
+	// stale or inexact, so the next read_file on that path must bypass the
+	// readContentInContext guard — the model genuinely needs a fresh look to
+	// get the exact old_text for a retry. Cleared when the path is re-read.
+	// Same lifecycle as readDedup: reset at the top of Prompt(). In-memory only.
+	editFailedPathsMu sync.Mutex
+	editFailedPaths   map[string]bool
 	// pendingPlan holds a plan whose "Execute / Abort" card the user
 	// dismissed by typing (e.g. asking a question) instead of choosing. Prompt
 	// re-shows it after the typed message is handled, so a question doesn't throw
@@ -348,8 +355,13 @@ type Session struct {
 	// beginImproveScratch; read to drop the "Submit?" ask deterministically in
 	// code (the template's prerequisite footnote alone doesn't stop a weak model
 	// from asking, then submit_improvement hard-fails on the same check).
-	improveNoLicense  atomic.Bool
-	improveAsks       int
+	improveNoLicense atomic.Bool
+	// improveDelivered marks that submit_improvement's apply loop has already run
+	// this /improve turn, so a duplicate call (same batch, or after a replan) no-ops
+	// instead of re-applying, and the respond-funnel stops re-arming. Reset in
+	// beginImproveScratch.
+	improveDelivered  atomic.Bool
+	improveAsks       atomic.Int64
 	preImproveMsgs    []Message
 	preImproveSummary string
 	// promptSkills is the set of SKILL-*.md filenames folded into the current
@@ -415,13 +427,13 @@ type Session struct {
 	turnStatsMu          sync.Mutex
 	turnStart            time.Time
 	turnHumanWaitMs      int64
-	turnPromptTokens     int // SENT (cached prefix re-counted per call)
 	turnCompletionTokens int
-	// Server cache split (llama.cpp timings / usage cached_tokens). When no backend
-	// reports it, haveServerCache is false and the Done line shows turnLastPrompt
-	// (final context size) instead of guessing.
-	turnEvaluatedPrompt int // run through the model
-	turnCachedPrompt    int // reused from KV cache
+	// turnEvaluatedPrompt is the sent-but-not-cached prompt total (Σ of each call's
+	// prompt_tokens − cached_tokens) — the real prompt work, shown on the Done line.
+	// We deliberately do NOT sum the gross prompt_tokens (which re-counts the cached
+	// prefix every call). When no backend reports a cache split, haveServerCache is
+	// false and the line falls back to turnLastPrompt (final context size).
+	turnEvaluatedPrompt int
 	turnLastPrompt      int // most recent call's prompt size
 	haveServerCache     bool
 	turnPromptMs        int64 // eval time (server prompt_ms, else TTFT)
@@ -433,10 +445,8 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.turnStatsMu.Lock()
 	s.turnStart = start
 	s.turnHumanWaitMs = 0
-	s.turnPromptTokens = 0
 	s.turnCompletionTokens = 0
 	s.turnEvaluatedPrompt = 0
-	s.turnCachedPrompt = 0
 	s.turnLastPrompt = 0
 	s.haveServerCache = false
 	s.turnPromptMs = 0
@@ -444,21 +454,19 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.turnStatsMu.Unlock()
 }
 
-// addTurnTokens sums one call's usage. evaluated/cached are the server cache
-// split; pass -1 when the backend didn't report it.
-func (s *Session) addTurnTokens(prompt, completion, evaluated, cached int) {
+// addTurnTokens folds one call's usage into the turn: it sums completion and the
+// evaluated (sent-but-not-cached) prompt tokens, and tracks the most recent
+// call's full prompt size for the no-cache fallback line. evaluated is -1 when
+// the backend reported no cache split (then haveServerCache stays false). prompt
+// is the full prompt size, used only for the context-size fallback — never summed.
+func (s *Session) addTurnTokens(prompt, completion, evaluated int) {
 	s.turnStatsMu.Lock()
-	s.turnPromptTokens += prompt
 	s.turnCompletionTokens += completion
 	if prompt > 0 {
 		s.turnLastPrompt = prompt
 	}
 	if evaluated >= 0 {
 		s.turnEvaluatedPrompt += evaluated
-		s.haveServerCache = true
-	}
-	if cached >= 0 {
-		s.turnCachedPrompt += cached
 		s.haveServerCache = true
 	}
 	s.turnStatsMu.Unlock()
@@ -486,10 +494,8 @@ func (s *Session) addHumanWait(d time.Duration) {
 // turnReport is the end-of-turn accounting for the "✅ Done" line.
 type turnReport struct {
 	activeMs        int64
-	sentPrompt      int  // Σ prompt_tokens (the cached prefix re-counted each call)
 	completion      int  // Σ completion_tokens
-	evaluatedPrompt int  // Σ server-reported evaluated prompt (cache misses)
-	cachedPrompt    int  // Σ server-reported cached prompt
+	evaluatedPrompt int  // Σ sent-but-not-cached prompt tokens (the real prompt work)
 	lastPrompt      int  // final context size (last call's prompt_tokens)
 	haveServerCache bool // a backend reported the cache split
 	promptMs        int64
@@ -508,10 +514,8 @@ func (s *Session) turnStats() turnReport {
 	}
 	return turnReport{
 		activeMs:        activeMs,
-		sentPrompt:      s.turnPromptTokens,
 		completion:      s.turnCompletionTokens,
 		evaluatedPrompt: s.turnEvaluatedPrompt,
-		cachedPrompt:    s.turnCachedPrompt,
 		lastPrompt:      s.turnLastPrompt,
 		haveServerCache: s.haveServerCache,
 		promptMs:        s.turnPromptMs,
@@ -705,6 +709,29 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 	}
 	last := &s.Messages[len(s.Messages)-1]
 	last.ToolUses = append(last.ToolUses, tu)
+}
+
+// markEditFailed records that edit_file failed with "not found" for path,
+// allowing the next read_file on that path to bypass readContentInContext.
+func (s *Session) markEditFailed(path string) {
+	s.editFailedPathsMu.Lock()
+	if s.editFailedPaths == nil {
+		s.editFailedPaths = map[string]bool{}
+	}
+	s.editFailedPaths[path] = true
+	s.editFailedPathsMu.Unlock()
+}
+
+// clearEditFailed clears the edit-failed flag for path and returns whether
+// it was set. Called by serveRead so the bypass fires exactly once per failure.
+func (s *Session) clearEditFailed(path string) bool {
+	s.editFailedPathsMu.Lock()
+	defer s.editFailedPathsMu.Unlock()
+	if s.editFailedPaths[path] {
+		delete(s.editFailedPaths, path)
+		return true
+	}
+	return false
 }
 
 // readContentInContext reports whether the exact bytes `content` are still
@@ -915,9 +942,12 @@ func (s *Session) keepWindowStart(maxCompletedTokens int) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := len(s.Messages)
+	if n == 0 {
+		return 0 // nothing to keep or fold
+	}
 	start := s.turnStartIdx
-	if start < 0 || start > n {
-		start = 0
+	if start < 0 || start >= n {
+		start = 0 // turnStartIdx past the end (or unset) → scan from the top
 	}
 	// unfinished small turn = last assistant message (always kept)
 	last := start
@@ -1082,7 +1112,8 @@ func (s *Session) beginImproveScratch() {
 	s.preImproveSummary = s.Summary
 	s.Messages = nil
 	s.Summary = ""
-	s.improveAsks = 0
+	s.improveAsks.Store(0)
+	s.improveDelivered.Store(false)
 	s.improveNoLicense.Store(licErr != nil)
 	s.improving.Store(true)
 }
@@ -1094,6 +1125,7 @@ func (s *Session) endImproveScratch() {
 	s.Summary = s.preImproveSummary
 	s.preImproveMsgs = nil
 	s.preImproveSummary = ""
+	s.improveAsks.Store(0)
 	s.improving.Store(false)
 }
 

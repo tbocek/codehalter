@@ -19,6 +19,27 @@ import (
 	"time"
 )
 
+// llmHTTPClient is used for all LLM API calls. ResponseHeaderTimeout caps the
+// wait for the first response byte so a broken TCP connection (e.g. after a
+// network switch) doesn't hang for the full OS retransmission window (~15 min).
+// The dialer's KeepAlive matches http.DefaultTransport so idle connections are
+// probed every 30s. No Client.Timeout: streaming generations run unbounded and
+// are cancelled only via the request context.
+var llmHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 90 * time.Second,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
 // LLM message types for the OpenAI API.
 
 type llmMessage struct {
@@ -307,8 +328,11 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// written concurrently by the scanner loop below — hence atomic.
 	var genChars int64
 	waitDone := make(chan struct{})
-	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), &genChars, waitDone)
-	defer close(waitDone)
+	waitStopped := make(chan struct{})
+	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), &genChars, waitDone, waitStopped)
+	// Join the meter before the deferred status clear (registered above) runs, so a
+	// late tick can't re-set the row after it's cleared (mirrors startToolMeter).
+	defer func() { close(waitDone); <-waitStopped }()
 
 	// Per-session log: a REQUEST block now, one aggregated RESPONSE block at the
 	// end (the per-token SSE wire is too noisy to skim). connLabel carries
@@ -326,12 +350,13 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		httpReq.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
 
-	// http.DefaultClient already has no Client.Timeout and DefaultTransport
-	// leaves ResponseHeaderTimeout at 0, so a long generation or a server that
-	// queues the request before answering is never capped — cancellation is
-	// driven by the request ctx only. The 30s dial timeout (TCP connect) is the
-	// only ceiling, which is what we want: an unreachable server fails fast.
-	resp, err := http.DefaultClient.Do(httpReq)
+	// llmHTTPClient caps the wait for the server's first response byte at 90s
+	// (ResponseHeaderTimeout). This bounds the hang when a network switch breaks
+	// an in-flight TCP connection: without it, TCP retransmission keeps the
+	// request alive for up to ~15 minutes before the OS gives up. 90s is enough
+	// for a busy or queued LLM server to start streaming; cancellation via the
+	// request ctx still applies for the rest of the stream.
+	resp, err := llmHTTPClient.Do(httpReq)
 	if err != nil {
 		a.logSession(sid, connLabel, "[transport error] %v", err)
 		return "", nil, "", err
@@ -393,6 +418,9 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 
 		var chunk sseChunk
 		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			// Don't drop a malformed frame silently: an off-shape chunk would
+			// otherwise make a backend look like a terse model with no trail.
+			slog.Debug("llm: skipped unparseable SSE frame", "role", conn.Tag, "err", err, "frame", truncate(data, 200))
 			continue
 		}
 		// In-band error: the gateway/llama.cpp can return HTTP 200 and put the
@@ -471,12 +499,13 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// sid="" (probes/tests) has no session, skip. A scan failure means the stream
 	// broke before the usage chunk, so the counts are 0 and this is a no-op.
 	if sess := a.getSession(sid); sess != nil {
-		// Derive evaluated from cached_tokens when timings are absent; -1 means no
-		// cache info reported.
+		// Derive evaluated (sent-but-not-cached) from cached_tokens when timings are
+		// absent; -1 means no cache info reported. This is the only number we keep —
+		// the gross prompt_tokens (cached prefix re-counted each call) is not summed.
 		if evaluatedTokens < 0 && cachedTokens >= 0 && promptTokens > 0 {
 			evaluatedTokens = promptTokens - cachedTokens
 		}
-		sess.addTurnTokens(promptTokens, completionTokens, evaluatedTokens, cachedTokens)
+		sess.addTurnTokens(promptTokens, completionTokens, evaluatedTokens)
 		// Prefer the server's measured times over our TTFT proxy (which includes
 		// queue + cache-load overhead → understates pp/s).
 		pMs, gMs := serverPromptMs, serverGenMs
@@ -531,10 +560,11 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		// second form still catches the ceiling when the server omits
 		// completion_tokens (completion == 0), so it can't be compared to the cap.
 		belowCap := completionTokens > 0 && reqMax > 0 && completionTokens < reqMax
-		noRoom := promptTokens > 0 && reqMax > 0 && a.mainSlotTokens > 0 && promptTokens+reqMax > a.mainSlotTokens
+		mst := a.getMainSlotTokens()
+		noRoom := promptTokens > 0 && reqMax > 0 && mst > 0 && promptTokens+reqMax > mst
 		if belowCap || noRoom {
 			err = fmt.Errorf("generation hit the context ceiling (prompt=%d gen=%d, n_ctx=%d, role=%s): %w",
-				promptTokens, completionTokens, a.mainSlotTokens, conn.Tag, errContextCeiling)
+				promptTokens, completionTokens, mst, conn.Tag, errContextCeiling)
 		} else if fullText.Len() == 0 && len(calls) == 0 && reasoningText.Len() > 0 && thinkingOn(reqBody) {
 			// All budget went to reasoning with nothing to show — the model looped
 			// in <think>. Recoverable: the tool loop retries once with thinking off
@@ -595,7 +625,8 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 // the request. No warning is emitted: while the call is alive the climbing
 // counter is the signal, and if it dies (e.g. a router model swap force-kills
 // the connection) llmStream surfaces the transport error directly.
-func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel string, start time.Time, genChars *int64, done <-chan struct{}) {
+func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel string, start time.Time, genChars *int64, done <-chan struct{}, stopped chan struct{}) {
+	defer close(stopped)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {

@@ -129,8 +129,10 @@ func ensureSettingsGitignored(cwd string) bool {
 // (requires .git/ or an existing .gitignore).
 func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	gitignorePath := filepath.Join(cwd, ".gitignore")
-	gitInfo, gitErr := os.Stat(filepath.Join(cwd, ".git"))
-	hasGit := gitErr == nil && gitInfo.IsDir()
+	// .git is a DIR in a normal repo but a FILE (a "gitdir:" pointer) in a linked
+	// worktree or a submodule — both are git-managed, so any successful stat counts.
+	_, gitErr := os.Stat(filepath.Join(cwd, ".git"))
+	hasGit := gitErr == nil
 	ignoreInfo, ignoreErr := os.Stat(gitignorePath)
 	hasGitignore := ignoreErr == nil && !ignoreInfo.IsDir()
 	if !hasGit && !hasGitignore {

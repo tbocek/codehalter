@@ -4,8 +4,8 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
+	"os"
 	"os/exec"
 	"sync"
 	"time"
@@ -31,7 +31,7 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name": "run_command",
-			"description": "Run a shell command directly inside this devcontainer. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. Use this for: (1) PROBE — `which <tool>`, `cargo check`, `node --version`, `apt list --installed | grep <pkg>` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install <pkg>`), first run the same install via run_command, then verify it works (e.g. `<tool> --version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which <tool>` exiting 1 means <tool> is missing, not that the tool failed. " +
+			"description": "Run a shell command that EXITS ON ITS OWN inside this devcontainer and wait for it to finish. For a long-running / never-exits process (a dev server, watcher, `python3 -m http.server`, `npm run dev`) use `run_background` instead — if you start one here (even with a trailing `&`) it is detected and stopped once the foreground finishes, and you'll be told to switch to run_background. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. Use this for: (1) PROBE — `which <tool>`, `cargo check`, `node --version`, `apt list --installed | grep <pkg>` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install <pkg>`), first run the same install via run_command, then verify it works (e.g. `<tool> --version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which <tool>` exiting 1 means <tool> is missing, not that the tool failed. Output is auto-capped keeping the START and the END (only the middle is elided), so do NOT pipe to `head`/`tail` to shorten it: that throws away what the cap already keeps, and the most useful lines (errors, and search hits like `yay -Ss` / `apt search`) come LAST. Run the command raw; use `grep` only to filter for a specific match, never to trim length. " +
 				"For project-file edits prefer `edit_file` / `write_file` — they go through the agent's diff/approval UI, raw `>` or `sed -i` do not. " +
 				"The `.git` directory is bind-mounted read-only; destructive git commands (push, reset --hard, etc.) will fail at the filesystem layer. Read-only git is fine (clone, log, ls-remote, archive).",
 			"parameters": map[string]any{
@@ -40,12 +40,30 @@ func (a *agent) discoverSandbox() {
 				"properties": map[string]any{
 					"command": map[string]any{
 						"type":        "string",
-						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Examples: `which <tool>`, `apt-get install -y <pkg> && <tool> --version`, `cargo check 2>&1 | tail -20`.",
+						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Run it raw: output is auto-capped (start+end kept), so do NOT append `| head` / `| tail` to limit size. Examples: `which <tool>`, `apt-get install -y <pkg> && <tool> --version`, `cargo check 2>&1`.",
 					},
 				},
 			},
 		},
 	}, Execute: runCmdExecute})
+
+	RegisterTool(Tool{Def: map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "run_background",
+			"description": "Start a LONG-RUNNING / background process (a dev server, watcher, daemon) inside this devcontainer and return immediately, leaving it running. Use this INSTEAD of run_command for anything that does not exit on its own: `python3 -m http.server 8765`, `npm run dev`, `vite`, `flask run`, a file watcher. run_command WAITS for the command to finish, so starting a server there (even with a trailing `&`) hangs the turn. run_background launches the command, waits briefly to catch an immediate failure (e.g. port already in use), then returns the pid and a log-file path. The process keeps running across later tool calls, so a following run_command can probe it (e.g. `curl -s localhost:8765`). Its output streams to the log file, which you read with run_command (`cat`/`tail`). Stop it with `run_command: kill <pid>`. Do NOT add a trailing `&` — run_background already detaches it.",
+			"parameters": map[string]any{
+				"type":     "object",
+				"required": []string{"command"},
+				"properties": map[string]any{
+					"command": map[string]any{
+						"type":        "string",
+						"description": "Shell command to run under bash -c, WITHOUT a trailing `&`. Examples: `python3 -m http.server 8765`, `npm run dev`, `flask --app app run --port 5000`.",
+					},
+				},
+			},
+		},
+	}, Execute: runBackgroundExecute})
 }
 
 // cmdIdleTimeout reaps a run_command that prints NOTHING for this long. It's an
@@ -54,6 +72,17 @@ func (a *agent) discoverSandbox() {
 // can't park a turn forever (the parent ctx only fires on a user Stop). A var so
 // tests can shorten it.
 var cmdIdleTimeout = 60 * time.Second
+
+// bgLingerGrace is how long runStreamingCmd waits, after the foreground process
+// exits with a child still alive, before deciding that child is a genuine
+// background process (a server) rather than a sub-second transient worth ignoring.
+// bgDrainDeadline bounds the wait for the output pipe to EOF after the foreground
+// exits, so a backgrounded daemon that escaped the process group (setsid
+// double-fork) can't hold the turn open. Vars so tests can shorten them.
+var (
+	bgLingerGrace   = 250 * time.Millisecond
+	bgDrainDeadline = 2 * time.Second
+)
 
 // cmdOutputCap bounds how many bytes of a command's output we CAPTURE for the
 // tool result (handed to the model); editorStreamCap bounds the live editor
@@ -124,28 +153,36 @@ func (b *boundedOutput) String() string {
 	}
 }
 
-// runStreamingCmd wires cmd's combined stdout+stderr through an io.Pipe, starts
+// runStreamingCmd wires cmd's combined stdout+stderr through an OS pipe, starts
 // it, streams output to the editor in 200 ms batches, and captures a bounded
 // head+tail copy for the tool result. The drain is DECOUPLED from the editor (it
-// always reads the pipe), so a slow editor can never deadlock the command on an
-// io.Pipe write behind the single conn write lock. If idleTimeout > 0 and nothing
-// prints for that long, cmd is SIGKILLed via cancelCmd. banner is the "$ <cmd>"
-// echo shown before output. started=false means cmd never launched (err is the
-// start failure); otherwise text is the captured output (with any markers) and
-// runErr is cmd.Wait()'s result. Shared by run_command and run_task.
-func (a *agent) runStreamingCmd(ctx context.Context, sid, banner string, cmd *exec.Cmd, cancelCmd context.CancelFunc, idleTimeout time.Duration) (text string, runErr error, started bool) {
-	pipeR, pipeW := io.Pipe()
-	cmd.Stdout = pipeW
-	cmd.Stderr = pipeW
-	if err := cmd.Start(); err != nil {
-		return "", err, false
+// always reads the pipe), so a slow editor can never deadlock the command. An OS
+// pipe (not io.Pipe) is used so cmd.Wait() returns when the FOREGROUND process
+// exits rather than blocking until every inherited fd closes — that's what lets
+// us notice a command that backgrounded a child (`server &`) which outlived it.
+// If idleTimeout > 0 and nothing prints for that long, cmd's group is SIGKILLed
+// via cancelCmd. banner is the "$ <cmd>" echo. started=false means cmd never
+// launched (err is the start failure). leftBackground=true means the foreground
+// finished but left a running child, which we reaped — the caller surfaces a
+// "use run_background" hint. Shared by run_command and run_task.
+func (a *agent) runStreamingCmd(ctx context.Context, sid, banner string, cmd *exec.Cmd, cancelCmd context.CancelFunc, idleTimeout time.Duration) (text string, runErr error, started, leftBackground bool) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return "", err, false, false
 	}
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+	if err := cmd.Start(); err != nil {
+		pr.Close()
+		pw.Close()
+		return "", err, false, false
+	}
+	pw.Close()              // parent drops the write end: pr EOFs only once the child tree closes its copies
+	defer pr.Close()        // freed once the loop exits (the drain goroutine has finished by then)
+	pgid := cmd.Process.Pid // == process-group id (callers set Setpgid via detachGroup)
 
-	waitErr := make(chan error, 1)
-	go func() {
-		waitErr <- cmd.Wait()
-		_ = pipeW.Close()
-	}()
+	procExited := make(chan error, 1)
+	go func() { procExited <- cmd.Wait() }()
 
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n```\n$ " + banner + "\n"}})
 
@@ -164,7 +201,7 @@ func (a *agent) runStreamingCmd(ctx context.Context, sid, banner string, cmd *ex
 	drainDone := make(chan struct{})
 	go func() {
 		defer close(drainDone)
-		scanner := bufio.NewScanner(pipeR)
+		scanner := bufio.NewScanner(pr)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			b := scanner.Bytes()
@@ -196,28 +233,51 @@ func (a *agent) runStreamingCmd(ctx context.Context, sid, banner string, cmd *ex
 		}
 	}
 
-	// Flush every 200 ms; the idle watchdog rides the same tick off the total bytes
-	// seen (capture.total grows even after the editor cap, so a producing command is
-	// never mistaken for idle). If that count hasn't grown for idleTimeout the
-	// command is silent/hung, so SIGKILL it (cascades: Wait returns, pipeW closes,
-	// the drain hits EOF, drainDone fires, this loop exits). idleTimeout <= 0
-	// disables the watchdog (a build may legitimately go quiet); the scanErr kill
-	// below still applies.
+	// Flush every 200 ms. UNTIL the foreground process exits, the idle watchdog
+	// rides the same tick off the total bytes seen (capture.total grows even after
+	// the editor cap, so a producing command is never mistaken for idle): if that
+	// count hasn't grown for idleTimeout the command is silent/hung, so SIGKILL the
+	// whole group via cancelCmd. idleTimeout <= 0 disables it (a build may go quiet).
+	// Once the foreground exits we stop idle-killing and instead bound the leftover
+	// drain with drainDeadline, so a child that escaped the group (a setsid daemon)
+	// can't hold the turn open.
 	ticker := time.NewTicker(200 * time.Millisecond)
 	lastLen, lastGrow, idleKilled := 0, time.Now(), false
+	waited := false
+	var drainDeadline <-chan time.Time
 	for done := false; !done; {
 		select {
 		case <-ticker.C:
 			flush()
-			mu.Lock()
-			total := capture.total
-			mu.Unlock()
-			if total > lastLen {
-				lastLen, lastGrow = total, time.Now()
-			} else if idleTimeout > 0 && !idleKilled && time.Since(lastGrow) > idleTimeout {
-				idleKilled = true
-				cancelCmd()
+			if !waited {
+				mu.Lock()
+				total := capture.total
+				mu.Unlock()
+				if total > lastLen {
+					lastLen, lastGrow = total, time.Now()
+				} else if idleTimeout > 0 && !idleKilled && time.Since(lastGrow) > idleTimeout {
+					idleKilled = true
+					cancelCmd()
+				}
 			}
+		case runErr = <-procExited:
+			waited = true
+			// Foreground finished. If the command backgrounded a child that's still
+			// alive (`server &`), the pipe will never EOF on its own. Detect it — a
+			// brief grace ignores a sub-second transient — then reap the group and
+			// flag it so the caller can point the model at run_background. Skip when
+			// we already killed (idle/scanErr/user-Stop): the group is gone anyway.
+			if !idleKilled && groupAlive(pgid) {
+				time.Sleep(bgLingerGrace)
+				if groupAlive(pgid) {
+					leftBackground = true
+					_ = killGroup(pgid)
+				}
+			}
+			drainDeadline = time.After(bgDrainDeadline)
+		case <-drainDeadline:
+			leftBackground = true // a child escaped the group kill and still holds the pipe
+			done = true
 		case <-drainDone:
 			done = true
 		}
@@ -238,16 +298,18 @@ func (a *agent) runStreamingCmd(ctx context.Context, sid, banner string, cmd *ex
 	se := scanErr
 	mu.Unlock()
 
-	// A scan error stops the drain while the command may keep writing into a pipe
-	// nobody reads; it then blocks on write and Wait would hang past the idle
-	// watchdog (which exited on drainDone). Kill it so <-waitErr returns. (An
-	// idle-kill already cancelled.)
-	if se != nil {
-		cancelCmd()
+	// If the loop ended before the foreground process was reaped (drain EOF'd first,
+	// the common case), reap it now. A scan error can leave the command blocked on a
+	// write into a pipe nobody reads, so kill the group first to unwedge Wait. (When
+	// waited is already true the deadline/EOF fired after the exit; runErr is set.)
+	if !waited {
+		if se != nil {
+			cancelCmd()
+		}
+		runErr = <-procExited
 	}
-	runErr = <-waitErr
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "```\n"}})
-	return out, runErr, true
+	return out, runErr, true, leftBackground
 }
 
 func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
@@ -269,8 +331,9 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	defer cancelCmd()
 	cmd := exec.CommandContext(cmdCtx, "bash", "-c", cmdStr)
 	cmd.Dir = sess.Cwd
+	detachGroup(cmd) // so the watchdog can reap a stray backgrounded child, not hang on it
 
-	out, runErr, started := a.runStreamingCmd(ctx, sid, cmdStr, cmd, cancelCmd, cmdIdleTimeout)
+	out, runErr, started, leftBg := a.runStreamingCmd(ctx, sid, cmdStr, cmd, cancelCmd, cmdIdleTimeout)
 	if !started {
 		a.FailToolCall(ctx, sid, tcId, runErr.Error())
 		return "error starting bash: " + runErr.Error(), false
@@ -289,6 +352,13 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 		// apart from "shell itself broke".
 		exitCode = -1
 		out += fmt.Sprintf("\n[exec error: %s]\n", runErr.Error())
+	}
+
+	// The foreground finished but left a process running (a server started with a
+	// trailing `&`). We reaped it; tell the model to use the right tool so its next
+	// attempt actually keeps the process alive.
+	if leftBg {
+		out += "\n[This command's foreground finished but it left a background process running, which was stopped. To start a long-lived process (a dev server, watcher, etc.) use the run_background tool, not run_command.]\n"
 	}
 
 	result := fmt.Sprintf("exit %d\n\n%s", exitCode, out)

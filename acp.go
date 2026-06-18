@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +50,15 @@ const (
 	KindUserMessage  = "user_message_chunk"
 )
 
+type AuthMethod struct {
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
+	Type        string            `json:"type"`
+	Args        []string          `json:"args,omitempty"`
+	Env         map[string]string `json:"env,omitempty"`
+}
+
 type (
 	InitializeRequest struct {
 		ProtocolVersion int `json:"protocolVersion"`
@@ -65,8 +75,8 @@ type (
 				Close *struct{} `json:"close,omitempty"`
 			} `json:"sessionCapabilities,omitempty"`
 		} `json:"agentCapabilities"`
-		AgentInfo   any      `json:"agentInfo,omitempty"`
-		AuthMethods []string `json:"authMethods"`
+		AgentInfo   any          `json:"agentInfo,omitempty"`
+		AuthMethods []AuthMethod `json:"authMethods"`
 	}
 
 	NewSessionRequest struct {
@@ -370,7 +380,19 @@ func (a *AgentSideConnection) serve() {
 		// Must be async: handlers issue outbound sendRequest calls whose
 		// responses come back through this same read loop. Running handle
 		// inline would block the loop and deadlock the response routing.
-		go a.handle(ctx, &req)
+		go func(req *jsonrpcRequest) {
+			defer func() {
+				if r := recover(); r != nil {
+					// A panic in ONE handler must not take down the process and every
+					// other session; isolate it and answer the request if it expects one.
+					slog.Error("handler panic", "method", req.Method, "panic", r, "stack", string(debug.Stack()))
+					if req.ID != nil {
+						a.replyError(req.ID, -32603, fmt.Sprintf("internal error: %v", r))
+					}
+				}
+			}()
+			a.handle(ctx, req)
+		}(&req)
 	}
 }
 
@@ -449,6 +471,9 @@ func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
 			}
 		}
 		a.agent.Cancel(ctx, p)
+		// Spec'd as a notification (no id), but ack a client that sent one with an
+		// id so it doesn't hang on the response (reply no-ops when ID is nil).
+		a.reply(req, struct{}{}, nil)
 
 	default:
 		if req.ID != nil {

@@ -119,6 +119,51 @@ func TestMcpServerConfigured(t *testing.T) {
 	}
 }
 
+// TestMcpMentionsServer pins the comment-AWARE check that gates the gopls card:
+// unlike mcpServerConfigured, a commented-out entry counts as "mentioned" (the
+// user was already offered it and declined), so the card stops nagging. This is
+// the exact distinction the gopls offer relies on — and why the seed mcp.toml
+// must name no server.
+func TestMcpMentionsServer(t *testing.T) {
+	dir := t.TempDir()
+	if mcpMentionsServer(dir, "gopls") {
+		t.Error("no mcp.toml should leave gopls not-mentioned")
+	}
+	cfgDir := filepath.Join(dir, sessionDir)
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mcpPath := filepath.Join(cfgDir, "mcp.toml")
+
+	// The crux: a commented-out gopls is NOT active (no card would mean "wired")
+	// but IS mentioned, so the offer card must NOT re-fire.
+	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"gopls\"\n# command = \"gopls\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if mcpServerConfigured(dir, "gopls") {
+		t.Error("commented gopls should NOT be configured")
+	}
+	if !mcpMentionsServer(dir, "gopls") {
+		t.Error("commented gopls SHOULD be mentioned (already offered → don't nag)")
+	}
+
+	// A project mentioning a different server but not gopls → gopls still offered.
+	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"fs\"\ncommand = \"npx\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if mcpMentionsServer(dir, "gopls") {
+		t.Error("a non-gopls mcp.toml should leave gopls not-mentioned")
+	}
+
+	// Active gopls → both mentioned and configured.
+	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"gopls\"\ncommand = \"gopls\"\nargs = [\"mcp\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !mcpMentionsServer(dir, "gopls") || !mcpServerConfigured(dir, "gopls") {
+		t.Error("active gopls should be both mentioned and configured")
+	}
+}
+
 // TestProbeAllLLMsConfigBeatsProbe asserts the precedence rule: explicit
 // context_size / image_support on the [[llm]] entry win over whatever the
 // probe discovered. This is the path OpenAI/Ollama/vLLM users rely on —
@@ -145,8 +190,8 @@ func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
 			LLM: []LLMConnection{{
 				Server:       ts.URL,
 				Model:        "gpt-4o",
-				Parallel:     1,
-				ContextSize:  128000,
+				Parallel:     ptr(1),
+				ContextSize:  ptr(128000),
 				ImageSupport: &yes,
 			}},
 		},
@@ -181,7 +226,7 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 			LLM: []LLMConnection{{
 				Server:   ts.URL,
 				Model:    "gpt-4o",
-				Parallel: 1,
+				Parallel: ptr(1),
 			}},
 		},
 	}
@@ -219,8 +264,8 @@ func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
 			LLM: []LLMConnection{{
 				Server:      ts.URL,
 				Model:       "qwopus3.6-27b",
-				Parallel:    1,
-				ContextSize: 128000, // keep the ctx gate quiet; not under test
+				Parallel:    ptr(1),
+				ContextSize: ptr(128000), // keep the ctx gate quiet; not under test
 			}},
 		},
 	}
@@ -271,7 +316,7 @@ func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
 			LLM: []LLMConnection{{
 				Server:       ts.URL,
 				Model:        "qwen-vl",
-				Parallel:     1,
+				Parallel:     ptr(1),
 				ImageSupport: &no,
 			}},
 		},
@@ -309,8 +354,8 @@ func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen"}}}}
 	a.probeAllLLMs(context.Background())
 
-	if got := a.settings.LLM[0].Parallel; got != 2 {
-		t.Errorf("Parallel: got %d, want 2 (auto-detected from /props total_slots)", got)
+	if got := a.settings.LLM[0].Parallel; *got != 2 {
+		t.Errorf("Parallel: got %d, want 2 (auto-detected from /props total_slots)", *got)
 	}
 	if a.mainSlotTokens != 16384 {
 		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx used directly, no division)", a.mainSlotTokens)
@@ -349,8 +394,8 @@ func TestProbeAllLLMsRouterModelProps(t *testing.T) {
 	if got := gotModel.Load(); got == nil || *got != modelID {
 		t.Fatalf("router ?model= param: got %v, want %q (encoding bug truncates at ';')", got, modelID)
 	}
-	if got := a.settings.LLM[0].Parallel; got != 2 {
-		t.Errorf("Parallel: got %d, want 2 (from ?model= /props total_slots)", got)
+	if got := a.settings.LLM[0].Parallel; *got != 2 {
+		t.Errorf("Parallel: got %d, want 2 (from ?model= /props total_slots)", *got)
 	}
 	if a.mainSlotTokens != 16384 {
 		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from ?model= /props)", a.mainSlotTokens)
@@ -363,11 +408,39 @@ func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 	ts := llamaCppServer(16384, 4)
 	defer ts.Close()
 
-	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen", Parallel: 1}}}}
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen", Parallel: ptr(1)}}}}
 	a.probeAllLLMs(context.Background())
 
-	if got := a.settings.LLM[0].Parallel; got != 1 {
-		t.Errorf("Parallel: got %d, want 1 (explicit value must not be overwritten by total_slots)", got)
+	if got := a.settings.LLM[0].Parallel; *got != 1 {
+		t.Errorf("Parallel: got %d, want 1 (explicit value must not be overwritten by total_slots)", *got)
+	}
+}
+
+// TestScaffoldSettings pins that the skeleton settings.toml is written from the
+// embedded default when none exists, and that a second call is a no-op (never
+// clobbers an existing, possibly user-edited, file). This is the "if there is none,
+// create a skeleton" behavior the prepare phase relies on.
+func TestScaffoldSettings(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, sessionDir, "settings.toml")
+	if _, err := os.Stat(path); err == nil {
+		t.Fatal("precondition: no settings.toml should exist yet")
+	}
+
+	a.scaffoldSettings(context.Background(), s.Cwd, s.ID)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("scaffoldSettings did not create the skeleton: %v", err)
+	}
+	if len(data) == 0 || string(data) != defaultSettingsTOML {
+		t.Errorf("skeleton doesn't match the embedded default (%d bytes)", len(data))
+	}
+
+	// Idempotent: a second call must NOT clobber an existing file.
+	os.WriteFile(path, []byte("# user edited\n"), 0o644)
+	a.scaffoldSettings(context.Background(), s.Cwd, s.ID)
+	if again, _ := os.ReadFile(path); string(again) != "# user edited\n" {
+		t.Error("scaffoldSettings clobbered an existing settings.toml")
 	}
 }
 
