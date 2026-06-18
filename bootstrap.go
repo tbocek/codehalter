@@ -62,6 +62,47 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		return false
 	}
 
+	// Offer the optional host bind mounts. Each source must exist on the host or
+	// the container fails to start (docker --mount type=bind is strict about its
+	// source), so only ask when the source is present and only add what the user
+	// accepts. The chosen mounts apply when the user reopens in the container.
+	gitWritable, gitconfig := false, false
+	if hasGitFolder(cwd) {
+		yes, gtc, gerr := a.askYesNoWithCard(ctx, sid, "Mount your repo's .git (writable) and ~/.gitconfig (when present) into the container, so git uses your real history and identity for commit/push?", "think", "Yes, mount", "No")
+		if gerr != nil {
+			a.FailToolCall(ctx, sid, gtc, gerr.Error())
+		} else {
+			gitWritable = yes
+			// .gitconfig only when the host actually has one (global.toml, captured
+			// at install time) — a missing bind source would fail the container.
+			gitconfig = yes && loadGlobalConfig().HasGitconfigInHome
+			done := "Not mounting .git or .gitconfig."
+			if yes {
+				done = "Will mount .git writable"
+				if gitconfig {
+					done += " and ~/.gitconfig."
+				} else {
+					done += " (no ~/.gitconfig recorded on the host, so it isn't mounted)."
+				}
+			}
+			a.CompleteToolCall(ctx, sid, gtc, []ToolCallContent{TextContent(done)})
+		}
+	}
+	sshAgent := false
+	if hostSSHAgentAvailable() {
+		yes, stc, serr := a.askYesNoWithCard(ctx, sid, "Forward your host SSH agent into the container? Lets git push / ssh use your host SSH keys.", "think", "Yes, forward SSH agent", "No")
+		if serr != nil {
+			a.FailToolCall(ctx, sid, stc, serr.Error())
+		} else {
+			sshAgent = yes
+			done := "Not forwarding the SSH agent."
+			if yes {
+				done = "Will forward the host SSH agent."
+			}
+			a.CompleteToolCall(ctx, sid, stc, []ToolCallContent{TextContent(done)})
+		}
+	}
+
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
@@ -72,7 +113,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
-	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(defaultDevcontainerJSON), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(buildDevcontainerJSON(gitWritable, gitconfig, sshAgent)), 0o644); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
@@ -81,10 +122,72 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	// Per-stack dev-tool installs are handled by the prepare phase on the
 	// next session (inside the container) — it asks the user, installs live,
 	// persists in this Dockerfile, and wires MCP. Nothing to seed here.
-	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json. " + reopen
+	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json — the mounts you chose apply once you (re)start the container. " + reopen
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
 	a.sendUpdateAndAbort(ctx, sid, note)
 	return false
+}
+
+// Optional devcontainer bind mounts codehalter offers at scaffold time. Kept OUT
+// of res/devcontainer.json (a bind whose source is missing fails the container
+// start) and spliced in only when the user opts in and the source exists.
+// configMountAnchor is the always-on mount already in the template; the extras go
+// in right after it.
+const (
+	configMountAnchor = `"source=${localEnv:HOME}/.config/codehalter,target=/home/dev/.config/codehalter,type=bind,readonly"`
+	gitMount          = `"source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind"`
+	gitconfigMount    = `"source=${localEnv:HOME}/.gitconfig,target=/home/dev/.gitconfig,type=bind,readonly"`
+	sshMount          = `"source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"`
+)
+
+// buildDevcontainerJSON renders devcontainer.json from the embedded base, adding
+// the optional mounts the user accepted: gitWritable adds the repo's .git
+// (read-write); gitconfig (only meaningful with gitWritable) adds ~/.gitconfig;
+// sshAgent adds the host SSH-agent socket AND the SSH_AUTH_SOCK env pointing at
+// it. Pure string splicing — output stays plain JSON, no parsing.
+func buildDevcontainerJSON(gitWritable, gitconfig, sshAgent bool) string {
+	out := defaultDevcontainerJSON
+	var extras []string
+	if gitWritable {
+		extras = append(extras, gitMount)
+		if gitconfig {
+			extras = append(extras, gitconfigMount)
+		}
+	}
+	if sshAgent {
+		extras = append(extras, sshMount)
+	}
+	if len(extras) > 0 {
+		ins := configMountAnchor
+		for _, m := range extras {
+			ins += ",\n    " + m
+		}
+		out = strings.Replace(out, configMountAnchor, ins, 1)
+	}
+	if sshAgent {
+		out = strings.Replace(out, `"DEVCONTAINER": "true"`, `"DEVCONTAINER": "true", "SSH_AUTH_SOCK": "/ssh-agent"`, 1)
+	}
+	return out
+}
+
+// hasGitFolder reports whether cwd has a .git directory (a normal clone). A .git
+// FILE (worktree/submodule link) doesn't count — the bind mount targets a dir.
+func hasGitFolder(cwd string) bool {
+	info, err := os.Stat(filepath.Join(cwd, ".git"))
+	return err == nil && info.IsDir()
+}
+
+// hostSSHAgentAvailable reports whether a host SSH agent is reachable: SSH_AUTH_SOCK
+// is set AND the socket it names exists. Gates whether to even offer agent
+// forwarding — and an unset SSH_AUTH_SOCK would resolve to an empty bind source
+// that fails the container start.
+func hostSSHAgentAvailable() bool {
+	sock := os.Getenv("SSH_AUTH_SOCK")
+	if sock == "" {
+		return false
+	}
+	_, err := os.Stat(sock)
+	return err == nil
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +251,11 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 		}
 		content = string(data)
 		for _, line := range strings.Split(content, "\n") {
+			// The settings-only ignore (added when settings.toml is scaffolded) is
+			// NOT the whole-dir decision — skip it so this prompt still fires.
+			if strings.TrimSpace(line) == gitignoreSettingsEntry {
+				continue
+			}
 			if strings.Contains(strings.ToLower(line), "codehalter") {
 				return
 			}

@@ -60,3 +60,21 @@ fi
 
 cp "$TMPFILE" "${INSTALL_DIR}/${BINARY}"
 echo "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
+
+# Ensure the global config dir exists: the devcontainer bind-mounts
+# ${localEnv:HOME}/.config/codehalter, and a missing bind source makes the
+# container fail to start (docker --mount type=bind is strict about its source).
+mkdir -p "${HOME}/.config/codehalter"
+echo "Ensured ${HOME}/.config/codehalter exists"
+
+# Record host facts codehalter reads when it scaffolds a .devcontainer. Right now
+# just whether ~/.gitconfig exists, so it only bind-mounts it when present — a
+# missing bind source would fail the container start.
+has_gitconfig=false
+[ -f "${HOME}/.gitconfig" ] && has_gitconfig=true
+cat > "${HOME}/.config/codehalter/global.toml" <<EOF
+# Host facts captured by install.sh, read by codehalter when scaffolding a
+# devcontainer. Edit if your setup changes.
+has_gitconfig_in_home = ${has_gitconfig}
+EOF
+echo "Wrote ${HOME}/.config/codehalter/global.toml (has_gitconfig_in_home=${has_gitconfig})"

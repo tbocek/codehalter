@@ -443,7 +443,13 @@ func (a *agent) scaffoldSettings(ctx context.Context, cwd string, sid string) {
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " but could not read it back (" + reason + "). The directory may be read-only or wiped by a reset hook (.codehalter/ is gitignored). Add a global ~/.config/codehalter/settings.toml instead.\n\n"}})
 		return
 	}
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " with placeholder values. Edit `server` and `model` to match your LLM server, then click Retry below. If it is not in your editor's file tree, refresh: agent-created files do not always show up live. Optional: move the edited file to ~/.config/codehalter/settings.toml to share it across every project.\n\n"}})
+	// Keep settings.toml out of git regardless of whether the user tracks the
+	// rest of .codehalter/ — it can hold an api_key.
+	gitignoreNote := ""
+	if ensureSettingsGitignored(cwd) {
+		gitignoreNote = " It's listed in .gitignore so your api_key isn't committed."
+	}
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " with placeholder values." + gitignoreNote + " Edit `server` and `model` to match your LLM server, then click Retry below. If it is not in your editor's file tree, refresh: agent-created files do not always show up live. Optional: move the edited file to ~/.config/codehalter/settings.toml to share it across every project.\n\n"}})
 }
 
 // hashSettingsFiles returns hex sha256 of the concatenated contents of the

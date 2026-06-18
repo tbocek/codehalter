@@ -83,13 +83,7 @@ Prebuilt binaries — no toolchain needed. The script detects your OS/arch, down
 curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
 ```
 
-**Windows** (PowerShell) — installs to `%LOCALAPPDATA%\Programs\codehalter` and adds it to your user PATH:
-
-```powershell
-irm https://raw.githubusercontent.com/tbocek/codehalter/main/install.ps1 | iex
-```
-
-On Windows you can also run `install.sh` under Git Bash or WSL, or download `codehalter-windows-amd64.exe` straight from the [releases page](https://github.com/tbocek/codehalter/releases/latest).
+**Windows** — codehalter runs inside a Linux devcontainer, so install it under **WSL**: run `wsl --install` (once), open your WSL distro, and run the same Linux command above inside it. Native Windows isn't supported — the devcontainer's host-path bind mounts resolve `${localEnv:HOME}`, which WSL provides and native Windows does not.
 
 ## Build
 

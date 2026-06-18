@@ -176,6 +176,28 @@ func loadGlobalSettings() (Settings, error) {
 	return decodeSettings(globalPath)
 }
 
+// GlobalConfig holds host-level facts captured at install time (install.sh writes
+// ~/.config/codehalter/global.toml). Read when scaffolding a devcontainer to
+// decide which optional bind mounts are safe — a bind whose source is missing
+// fails the container start, so e.g. .gitconfig is only mounted when the host has
+// one.
+type GlobalConfig struct {
+	HasGitconfigInHome bool `toml:"has_gitconfig_in_home"`
+}
+
+// loadGlobalConfig reads ~/.config/codehalter/global.toml, best-effort. A missing
+// or unreadable file yields the zero value (all false), the safe default —
+// codehalter just won't add the corresponding optional mount.
+func loadGlobalConfig() GlobalConfig {
+	var g GlobalConfig
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return g
+	}
+	_, _ = toml.DecodeFile(filepath.Join(home, ".config", "codehalter", "global.toml"), &g)
+	return g
+}
+
 func decodeSettings(path string) (Settings, error) {
 	var s Settings
 	md, err := toml.DecodeFile(path, &s)
