@@ -204,3 +204,51 @@ func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadAgentsFile pins the AGENTS.md scan: project-root only, priority order
+// (AGENTS.md first), trimmed, whitespace-only skipped.
+func TestLoadAgentsFile(t *testing.T) {
+	dir := t.TempDir()
+	if name, content := loadAgentsFile(dir); name != "" || content != "" {
+		t.Errorf("no agents file → empty, got %q / %q", name, content)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "agent.md"), []byte("\n  be concise  \n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if name, content := loadAgentsFile(dir); name != "agent.md" || content != "be concise" {
+		t.Errorf("agent.md should be found+trimmed, got %q / %q", name, content)
+	}
+
+	// AGENTS.md outranks the lowercase variant.
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("canonical conventions"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if name, content := loadAgentsFile(dir); name != "AGENTS.md" || content != "canonical conventions" {
+		t.Errorf("AGENTS.md should win priority, got %q / %q", name, content)
+	}
+
+	empty := t.TempDir()
+	if err := os.WriteFile(filepath.Join(empty, "AGENTS.md"), []byte("   \n\t\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if name, _ := loadAgentsFile(empty); name != "" {
+		t.Errorf("whitespace-only AGENTS.md should be skipped, got %q", name)
+	}
+}
+
+// TestSystemPromptIncludesAgentsFile verifies the root AGENTS.md is folded into
+// the system prompt (the cached prefix) at build time.
+func TestSystemPromptIncludesAgentsFile(t *testing.T) {
+	a, s := newTestAgent(t)
+	if err := os.WriteFile(filepath.Join(s.Cwd, "AGENTS.md"), []byte("Always use tabs."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sp, err := a.systemPrompt(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(sp, "## Project instructions (AGENTS.md)") || !strings.Contains(sp, "Always use tabs.") {
+		t.Errorf("system prompt should fold in AGENTS.md:\n%s", sp)
+	}
+}

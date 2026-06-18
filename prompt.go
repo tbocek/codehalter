@@ -1311,6 +1311,13 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	// stale conclusions. Captured at session start; resumed sessions inherit
 	// that day's date, which is good enough for typical use.
 	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
+	// Project-shipped agent instructions (AGENTS.md and common casings, project
+	// root only): fold them into the cached prefix at session start so they ride
+	// every turn alongside the SKILL files. Stable across the session, so no
+	// mid-session cache churn.
+	if name, content := loadAgentsFile(sess.Cwd); content != "" {
+		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation.\n\n%s\n", name, content)
+	}
 	// Project-first investigation guidance — a user-editable prompt seeded to
 
 	// Phase guidance lives in the system prompt (the stable, cached prefix) rather
@@ -1339,6 +1346,29 @@ func (a *agent) loadPromptFile(sid string, filename string) string {
 		}
 	}
 	return ""
+}
+
+// agentsFileNames are the project-root agent-instruction files codehalter folds
+// into the system prompt at session start, in priority order: the AGENTS.md
+// convention plus the common casings. The first that exists and is non-empty
+// wins; subdirectory/nested files are NOT scanned — project root only.
+var agentsFileNames = []string{"AGENTS.md", "AGENT.md", "agents.md", "agent.md"}
+
+// loadAgentsFile returns the filename and trimmed contents of the first
+// project-root agent-instruction file present (see agentsFileNames), or "", ""
+// when none exists. Read fresh on each systemPrompt build so an edit lands on
+// the next (re)build.
+func loadAgentsFile(cwd string) (string, string) {
+	for _, name := range agentsFileNames {
+		data, err := os.ReadFile(filepath.Join(cwd, name))
+		if err != nil {
+			continue
+		}
+		if s := strings.TrimSpace(string(data)); s != "" {
+			return name, s
+		}
+	}
+	return "", ""
 }
 
 // humanCount renders a token count compactly: 543490 → "543k", 1_500_000 → "1.5m".

@@ -91,6 +91,38 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 // .gitignore
 // ---------------------------------------------------------------------------
 
+// gitignoreSettingsEntry is the one path codehalter always keeps out of git: the
+// project-local settings.toml can hold an api_key. Added whenever settings.toml
+// is scaffolded, independent of the whole-dir ignore/track choice in
+// ensureGitignore — so a team that TRACKS .codehalter/ (to share PLAN.md/skills)
+// still never commits the secrets file.
+const gitignoreSettingsEntry = sessionDir + "/settings.toml"
+
+// ensureSettingsGitignored appends gitignoreSettingsEntry to cwd/.gitignore when
+// absent (creating the file if the project is a git repo), returning whether the
+// entry is now present. Best-effort and non-interactive: it runs at scaffold
+// time so the secrets file is excluded before the user fills in real values. No
+// point in a non-git project, so it no-ops there.
+func ensureSettingsGitignored(cwd string) bool {
+	gitInfo, gerr := os.Stat(filepath.Join(cwd, ".git"))
+	hasGit := gerr == nil && gitInfo.IsDir()
+	gitignorePath := filepath.Join(cwd, ".gitignore")
+	data, rerr := os.ReadFile(gitignorePath)
+	if !hasGit && rerr != nil {
+		return false // not a git repo and no existing .gitignore — nothing to do
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.TrimSpace(line) == gitignoreSettingsEntry {
+			return true // already ignored
+		}
+	}
+	sep := ""
+	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
+		sep = "\n"
+	}
+	return os.WriteFile(gitignorePath, []byte(string(data)+sep+gitignoreSettingsEntry+"\n"), 0o644) == nil
+}
+
 // ensureGitignore makes sure .gitignore mentions .codehalter/ (as an ignore
 // line or a tracked-on-purpose marker). Asks once per repo — later sessions
 // short-circuit on the existing entry. Skipped outside git-managed dirs
