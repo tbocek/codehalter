@@ -3,7 +3,6 @@ FROM fedora:44
 
 RUN dnf install -y --setopt=install_weak_deps=False \
         ca-certificates curl git sudo openssh-clients \
-        golang \
         firefox \
         shadow-utils \
     && dnf clean all
@@ -13,8 +12,6 @@ RUN groupadd --gid 1000 dev \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
     && install -d -o 1000 -g 1000 /home/dev/.config
 
-ENV GOBIN=/usr/local/bin
-ENV GOTOOLCHAIN=auto
-RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
-
 USER dev
+WORKDIR /home/dev
+RUN curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash

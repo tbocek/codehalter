@@ -6,7 +6,6 @@ RUN pacman -Syu --noconfirm --needed \
         curl \
         git \
         openssh \
-        go \
         firefox \
     && rm -rf /var/cache/pacman/pkg/*
 
@@ -15,12 +14,6 @@ RUN groupadd --gid 1000 dev \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
     && install -d -o 1000 -g 1000 /home/dev/.config
 
-ENV GOBIN=/usr/local/bin
-RUN GOPROXY=direct go install github.com/tbocek/codehalter@latest
-
 USER dev
 WORKDIR /home/dev
-
-RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
-    && cd /tmp/yay && makepkg -si --noconfirm \
-    && cd / && rm -rf /tmp/yay
+RUN curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
