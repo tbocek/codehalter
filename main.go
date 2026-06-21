@@ -363,11 +363,14 @@ func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) e
 	a.mu.Lock()
 	a.mode = req.ModeId
 	a.mu.Unlock()
-	// Field is "modeId" per ACP spec — distinct from "currentModeId" in SessionModeState.
+	// The current_mode_update notification carries "currentModeId" (matching
+	// SessionModeState.CurrentModeId), not the "modeId" of the inbound
+	// SetSessionModeRequest. Sending "modeId" makes the client reject the update
+	// with -32602 "missing field currentModeId".
 	a.sendUpdate(ctx, req.SessionId, struct {
-		Kind   string `json:"sessionUpdate"`
-		ModeId string `json:"modeId"`
-	}{Kind: "current_mode_update", ModeId: req.ModeId})
+		Kind          string `json:"sessionUpdate"`
+		CurrentModeId string `json:"currentModeId"`
+	}{Kind: "current_mode_update", CurrentModeId: req.ModeId})
 	a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Mode: " + req.ModeId + "\n\n"}})
 	return nil
 }
