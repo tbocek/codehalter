@@ -773,6 +773,14 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	// is no proactive compaction: it is reactive now, driven by a context-overflow
 	// 400 in runToolLoopSeeded (see foldHistory). Stats first.
 	if r := sess.turnStats(); r.activeMs > 0 {
+		// Context-window ring in the client (ACP usage_update, an unstable
+		// feature): used = the last call's prompt_tokens (current context size),
+		// size = the per-slot n_ctx. Skipped when either is unknown (a backend
+		// that omits usage leaves lastPrompt 0, or n_ctx isn't probed yet), so no
+		// data means no update rather than a misleading empty ring.
+		if size := a.getMainSlotTokens(); size > 0 && r.lastPrompt > 0 {
+			a.sendUpdate(ctx, sid, usageUpdate{Kind: "usage_update", Used: r.lastPrompt, Size: size})
+		}
 		// \n\n keeps the stats on their own markdown line. With the server cache
 		// split, headline the work done (evaluated + gen) plus sent/cached%;
 		// without it, show the final context size — don't guess.

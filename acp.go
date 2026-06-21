@@ -188,6 +188,16 @@ type planUpdate struct {
 	Entries []PlanEntry `json:"entries"`
 }
 
+// usageUpdate is the ACP "usage_update" session notification that drives the
+// client's context-window ring. Used is the tokens currently in context (the
+// last call's prompt_tokens); Size is the total window (per-slot n_ctx). Part
+// of ACP's unstable session-usage feature, so the shape may shift upstream.
+type usageUpdate struct {
+	Kind string `json:"sessionUpdate"` // "usage_update"
+	Used int    `json:"used"`
+	Size int    `json:"size"`
+}
+
 // ---------------------------------------------------------------------------
 // AgentSideConnection — JSON-RPC dispatch + outgoing-request demux on a
 // line-delimited stdio pair. The agent type is concrete (there is only one).
