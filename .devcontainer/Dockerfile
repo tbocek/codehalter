@@ -17,10 +17,10 @@ RUN groupadd --gid 1000 dev \
     && echo "dev ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/dev \
     && install -d -o 1000 -g 1000 /home/dev/.config
 
-RUN curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
-
 USER dev
 WORKDIR /home/dev
+
+RUN curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
 
 RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
     && cd /tmp/yay && makepkg -si --noconfirm \
