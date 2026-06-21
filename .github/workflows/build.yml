@@ -40,8 +40,16 @@ jobs:
         run: |
           GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o codehalter-${{ matrix.goos }}-${{ matrix.goarch }} .
 
-      - name: Upload release assets
-        uses: softprops/action-gh-release@v3
-        with:
-          files: |
-            codehalter-${{ matrix.goos }}-${{ matrix.goarch }}
+      - name: Publish to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.ref_name }}"
+          # First job here creates the release; the rest lose the race and get
+          # "already exists" (harmless, swallowed). Then each uploads its own
+          # asset (distinct names, --clobber so re-runs overwrite) to the one
+          # release, so the parallel jobs never collide on creation.
+          gh release create "$tag" --title "$tag" --notes "" || true
+          # Cover the brief lag before a freshly created release is queryable by tag.
+          for _ in 1 2 3 4 5; do gh release view "$tag" >/dev/null 2>&1 && break; sleep 2; done
+          gh release upload "$tag" "codehalter-${{ matrix.goos }}-${{ matrix.goarch }}" --clobber

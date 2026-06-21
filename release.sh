@@ -29,7 +29,7 @@ echo "$new_tag"
 # moment it concludes unsuccessfully.
 EXPECTED=4   # linux amd64/arm64 + darwin amd64/arm64 (no windows build)
 RETRIES=20
-SLEEP=3
+SLEEP=5
 sha="$(git rev-list -n1 "$new_tag")"
 REL_URL="https://api.github.com/repos/tbocek/codehalter/releases/tags/$new_tag"
 RUNS_URL="https://api.github.com/repos/tbocek/codehalter/actions/workflows/build.yml/runs?head_sha=$sha"
