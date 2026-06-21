@@ -24,9 +24,20 @@ esac
 ASSET="${BINARY}-${OS}-${ARCH}"
 
 # Resolve latest release tag
-LATEST_TAG="$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"tag_name": *"?([^"]+)".*/\1/')"
-if [ -z "$LATEST_TAG" ]; then
-    echo "Failed to resolve latest release tag" >&2
+# Capture the API response and HTTP status (no curl -f, which would swallow the
+# error body) so a non-200 such as a rate limit shows GitHub's own message to
+# the user instead of failing with an empty tag.
+api_url="https://api.github.com/repos/${REPO}/releases/latest"
+response="$(curl -sSL -w $'\n%{http_code}' "$api_url")" || {
+    echo "error: could not reach the GitHub API at ${api_url}" >&2
+    exit 1
+}
+http_code="${response##*$'\n'}"
+body="${response%$'\n'*}"
+LATEST_TAG="$(printf '%s' "$body" | grep '"tag_name":' | sed -E 's/.*"tag_name": *"?([^"]+)".*/\1/')" || true
+if [ "$http_code" != "200" ] || [ -z "$LATEST_TAG" ]; then
+    echo "error: could not resolve the latest ${REPO} release (HTTP ${http_code}). GitHub returned:" >&2
+    echo "$body" >&2
     exit 1
 fi
 echo "Latest release: ${LATEST_TAG}"
