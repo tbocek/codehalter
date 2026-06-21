@@ -29,9 +29,6 @@ jobs:
           - goos: darwin
             goarch: arm64
             runner: macos-latest
-          - goos: windows
-            goarch: amd64
-            runner: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
@@ -41,10 +38,10 @@ jobs:
 
       - name: Build codehalter
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o codehalter-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }} .
+          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build -o codehalter-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            codehalter-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goos == 'windows' && '.exe' || '' }}
+            codehalter-${{ matrix.goos }}-${{ matrix.goarch }}

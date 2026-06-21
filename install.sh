@@ -9,7 +9,6 @@ OS="$(uname -s)"
 case "$OS" in
     Linux*)   OS="linux" ;;
     Darwin*)  OS="darwin" ;;
-    MINGW*|MSYS*|CYGWIN*) OS="windows" ;;
     *)        echo "Unsupported OS: $OS" >&2; exit 1 ;;
 esac
 
@@ -22,11 +21,7 @@ case "$ARCH" in
 esac
 
 # Build asset name
-if [ "$OS" = "windows" ]; then
-    ASSET="${BINARY}-${OS}-${ARCH}.exe"
-else
-    ASSET="${BINARY}-${OS}-${ARCH}"
-fi
+ASSET="${BINARY}-${OS}-${ARCH}"
 
 # Resolve latest release tag
 LATEST_TAG="$(curl -sL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"tag_name": *"?([^"]+)".*/\1/')"

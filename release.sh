@@ -24,22 +24,37 @@ git tag "$new_tag"
 git push --tags
 echo "$new_tag"
 
-# Wait for all 5 release assets to be uploaded
-EXPECTED=5
+# Wait for the release assets. Surface a build failure explicitly instead of
+# silently waiting out the timeout: poll this tag's workflow run and bail the
+# moment it concludes unsuccessfully.
+EXPECTED=4   # linux amd64/arm64 + darwin amd64/arm64 (no windows build)
 RETRIES=20
 SLEEP=3
-URL="https://api.github.com/repos/tbocek/codehalter/releases/tags/$new_tag"
+sha="$(git rev-list -n1 "$new_tag")"
+REL_URL="https://api.github.com/repos/tbocek/codehalter/releases/tags/$new_tag"
+RUNS_URL="https://api.github.com/repos/tbocek/codehalter/actions/workflows/build.yml/runs?head_sha=$sha"
 
-echo "Waiting for $EXPECTED release assets at $URL ..."
+echo "Waiting for $EXPECTED release assets (build $sha) ..."
 for i in $(seq 1 "$RETRIES"); do
-  assets=$(curl -sf "$URL" | jq '.assets | length')
+  # Fail fast if CI finished without success, rather than masking it as a timeout.
+  runs="$(curl -sf "$RUNS_URL" || true)"
+  conclusion="$(printf '%s' "$runs" | jq -r '.workflow_runs[0].conclusion // "pending"' 2>/dev/null || echo pending)"
+  run_url="$(printf '%s' "$runs" | jq -r '.workflow_runs[0].html_url // ""' 2>/dev/null || echo "")"
+  case "$conclusion" in
+    failure|cancelled|timed_out|startup_failure)
+      echo "error: release build did not succeed (conclusion: $conclusion)${run_url:+, see $run_url}" >&2
+      exit 1
+      ;;
+  esac
+
+  assets="$(curl -sf "$REL_URL" | jq '.assets | length' 2>/dev/null || echo 0)"
   if [ "$assets" -ge "$EXPECTED" ]; then
     echo "✓ All $EXPECTED assets uploaded."
     exit 0
   fi
-  echo "  $assets/$EXPECTED assets ready (attempt $i/$RETRIES)..."
+  echo "  $assets/$EXPECTED assets ready (build: $conclusion, attempt $i/$RETRIES)..."
   sleep "$SLEEP"
 done
 
-echo "error: release assets not ready after $((RETRIES * SLEEP))s" >&2
+echo "error: release assets not ready after $((RETRIES * SLEEP))s (last build status: $conclusion)" >&2
 exit 1

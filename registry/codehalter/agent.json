@@ -27,10 +27,6 @@
       "linux-x86_64": {
         "archive": "https://github.com/tbocek/codehalter/releases/download/v25/codehalter-linux-amd64",
         "cmd": "./codehalter-linux-amd64"
-      },
-      "windows-x86_64": {
-        "archive": "https://github.com/tbocek/codehalter/releases/download/v25/codehalter-windows-amd64.exe",
-        "cmd": "./codehalter-windows-amd64.exe"
       }
     }
   }
