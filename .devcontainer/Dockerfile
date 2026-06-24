@@ -20,6 +20,8 @@ RUN groupadd --gid 1000 dev \
 USER dev
 WORKDIR /home/dev
 
+# install.sh installs to ~/.local/bin as the non-root dev user; put it on PATH.
+ENV PATH="/home/dev/.local/bin:${PATH}"
 RUN curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
 
 RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
