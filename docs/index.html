@@ -145,6 +145,16 @@
   .blink{display:inline-block;width:8px;height:15px;background:var(--green);vertical-align:-2px;animation:bl 1.1s steps(1) infinite;}
   @keyframes bl{50%{opacity:0;}}
 
+  /* install */
+  .install-video{background:var(--panel);border:1px solid var(--line);border-radius:13px;overflow:hidden;box-shadow:0 30px 60px -30px rgba(0,0,0,.5);margin-bottom:42px;}
+  .install-video video{display:block;width:100%;height:auto;}
+  ol.steps{list-style:none;counter-reset:s;padding:0;margin:0;display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:26px 38px;}
+  ol.steps li{counter-increment:s;position:relative;padding-left:48px;}
+  ol.steps li::before{content:counter(s,decimal-leading-zero);position:absolute;left:0;top:0;width:33px;height:33px;display:grid;place-items:center;font-size:12px;font-weight:700;color:var(--green);background:var(--panel-2);border:1px solid var(--line);border-radius:8px;}
+  ol.steps h3{font-size:15px;font-weight:700;margin:0 0 5px;letter-spacing:-.01em;}
+  ol.steps p{font-size:13px;color:var(--text-dim);margin:0;line-height:1.6;}
+  ol.steps code{font-size:12px;word-break:break-all;}
+
   /* cta band */
   .band{text-align:center;padding:84px 0;border-top:1px solid var(--line-soft);}
   .band h2{font-size:34px;font-weight:800;letter-spacing:-.035em;margin:0 0 14px;}
@@ -213,7 +223,7 @@
       <div class="pill"><span class="d"></span> For coding: an <b>IDE</b>, not a chat window</div>
       <h1>A holder for <span class="g">your code.</span></h1>
       <p class="lede">codehalter is an ACP coding agent that connects <b>Zed, VS Code, or JetBrains</b> to any OpenAI-compatible model, built for and focused on <b>local LLMs</b>. It has no UI of its own: your editor is the front end, not a CLI. Plan → execute → verify → document, all through the ACP bridge.</p>
-      <div class="cta" id="install">
+      <div class="cta">
         <div class="term">
           <span class="pr">$</span>
           <span class="cmd">curl -sL <span class="arg">https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh</span> | bash</span>
@@ -353,7 +363,46 @@
           <h3>Sets up new projects</h3>
           <p>Point it at a fresh repo and it onboards the whole thing: scaffolds the devcontainer, detects the stack, seeds skills, and offers one-click <b>fix cards</b> to install what's missing, gopls/node/clang, an LSP bridge, a broken <code>mcp.toml</code>, doing it for you when you accept.</p>
         </div>
+        <div class="fcard">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17l6-6 4 4 8-8"/><path d="M17 7h4v4"/></svg></div>
+          <h3>Learns from its own sessions</h3>
+          <p>Run <code>/improve</code> and codehalter reads back its session logs, spots where it stumbled or you corrected it, and proposes concrete edits to its own prompts and skills (<code>PLAN.md</code>, <code>EXECUTE.md</code>, …). You accept or skip each one, so it sharpens to your codebase over time.</p>
+        </div>
       </div>
+    </div>
+  </section>
+
+  <!-- INSTALL -->
+  <section class="section" id="install">
+    <div class="wrap">
+      <div class="eyebrow">// get started</div>
+      <h2 class="sec-title">Up and running in under 30 seconds.</h2>
+      <p class="sec-sub">codehalter is a single binary your editor launches over ACP. The clip is the full Zed setup, start to finish; the steps are below.</p>
+      <div class="install-video">
+        <video src="zed-install.mp4" controls muted loop autoplay playsinline preload="metadata"></video>
+      </div>
+      <ol class="steps">
+          <li>
+            <h3>Download the binary</h3>
+            <p>Run <code>curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash</code>, or grab a prebuilt binary from the <a href="https://github.com/tbocek/codehalter/releases/latest">latest release</a> (Linux / macOS; on Windows use WSL).</p>
+          </li>
+          <li>
+            <h3>Make sure Docker is running</h3>
+            <p>codehalter only ever runs inside a devcontainer, so it needs Docker (or Podman) up. Start Docker Desktop or <code>dockerd</code> before you launch it.</p>
+          </li>
+          <li>
+            <h3>Point it at your model</h3>
+            <p>Run <code>codehalter --setup</code> for the interactive LLM config, or edit <code>~/.config/codehalter/settings.toml</code> and set <code>server</code> + <code>model</code> for any OpenAI-compatible endpoint.</p>
+          </li>
+          <li>
+            <h3>Add it to your editor</h3>
+            <p>In Zed's <code>settings.json</code>, add codehalter under <code>agent_servers</code> with <code>"command": "codehalter"</code>, then pick it in the agent panel.</p>
+          </li>
+          <li>
+            <h3>Open a project, reopen in the container</h3>
+            <p>On first run it scaffolds a <code>.devcontainer</code>. Reopen the project inside it and start the plan, execute, verify, document loop.</p>
+          </li>
+      </ol>
     </div>
   </section>
 
@@ -362,7 +411,7 @@
     <div class="wrap">
       <div class="markwrap" style="margin-bottom:26px"><svg class="mark glow" width="64" height="64"><use href="#ch-mark"/></svg></div>
       <h2>Keep your code in hand.</h2>
-      <p>Free and open source. One command, prebuilt binaries for Linux, macOS, and Windows.</p>
+      <p>Free and open source. One command, prebuilt binaries for Linux and macOS.</p>
       <div class="cta">
         <div class="term">
           <span class="pr">$</span>
