@@ -149,6 +149,9 @@ type ToolUse struct {
 type summariseTask struct {
 	Turn []Message
 	Conn *LLMConnection
+	// Prompt is the SUMMARISE.md body for the paste-mode render (unused in
+	// prefix-extension mode, where it is already baked into Msgs).
+	Prompt string
 	// Msgs, when non-nil, switches the note generation to prefix-extension
 	// mode: the full wire context frozen at turn end plus the summarise
 	// instruction (see appendSummariseMsgs). Frozen at ENQUEUE time so a

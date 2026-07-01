@@ -148,7 +148,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 		return
 	}
 
-	task := summariseTask{Turn: turn, Conn: conn}
+	task := summariseTask{Turn: turn, Conn: conn, Prompt: prompt}
 	// Prefix-extension mode: the note generates on the conn whose KV cache
 	// already holds this conversation, so send the conversation itself plus a
 	// small instruction instead of re-pasting the turn — the server reuses the
@@ -163,9 +163,9 @@ func (a *agent) backgroundSummarise(sess *Session) {
 		defer cancel()
 		var note string
 		if len(t.Msgs) > 0 {
-			note = a.summariseAppend(ctx, sess, t.Conn, t.Msgs, t.Turn)
+			note = a.summariseCall(ctx, sess, t.Conn, t.Msgs, t.Turn)
 		} else {
-			note = a.summariseSlice(ctx, sess, t.Conn, prompt, t.Turn)
+			note = a.summariseSlice(ctx, sess, t.Conn, t.Prompt, t.Turn)
 		}
 		sess.appendShadow(note)
 		// Persist immediately so the note survives a process kill in the idle
@@ -194,13 +194,15 @@ func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message
 	return append(msgs, llmMessage{Role: "user", Content: instr})
 }
 
-// summariseAppend generates the per-turn note from a prefix-extension request
-// (see appendSummariseMsgs) instead of summariseSlice's transcript paste. Same
-// raw fallback and image-reference handling.
-func (a *agent) summariseAppend(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, turn []Message) string {
+// summariseCall is the shared execution core of both note modes: one LLM call
+// over the prepared messages, the raw-transcript fallback when it fails or
+// returns empty, and the image-reference block. Message construction is the
+// only thing that differs between prefix-extension (appendSummariseMsgs) and
+// transcript paste (summariseSlice), so it stays with the callers.
+func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, turn []Message) string {
 	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, nil, nil, nil)
 	if err != nil || strings.TrimSpace(out) == "" {
-		slog.Debug("summariseAppend: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
+		slog.Debug("summarise: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
 		out = fallbackTurnNote(turn)
 	}
 	return attachImageRefs(out, turn)
@@ -242,13 +244,7 @@ func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConn
 	// needs; without it a 100-iteration turn would 400 and degrade to the raw
 	// fallback note.
 	full := prompt + "\n" + clipBytes(turnBuf.String(), maxLLMInputBytes)
-
-	out, _, _, err := a.llmStream(ctx, sess.ID, conn, []llmMessage{{Role: "user", Content: full}}, nil, nil, nil)
-	if err != nil || strings.TrimSpace(out) == "" {
-		slog.Debug("summariseSlice: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
-		out = fallbackTurnNote(turn)
-	}
-	return attachImageRefs(out, turn)
+	return a.summariseCall(ctx, sess, conn, []llmMessage{{Role: "user", Content: full}}, turn)
 }
 
 // attachImageRefs appends the deterministic image-reference block to a note so

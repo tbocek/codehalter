@@ -65,10 +65,11 @@ func TestEnsureSkillsPrunesOtherOS(t *testing.T) {
 	}
 }
 
-// TestArgStringTokens: string values inside JSON args split on whitespace and
-// shed shell punctuation, so paths surface from both structured fields and
-// run_command strings; non-JSON input degrades to a raw split.
-func TestArgStringTokens(t *testing.T) {
+// TestArgTokens: string values inside JSON args split on whitespace and shed
+// shell punctuation, so paths surface from both structured fields and
+// run_command strings; non-JSON input degrades to a raw split. Exercises the
+// collectArgStrings → argTokens pair the way discloseSkills composes them.
+func TestArgTokens(t *testing.T) {
 	cases := []struct {
 		args string
 		want string // one token that must be present
@@ -80,7 +81,7 @@ func TestArgStringTokens(t *testing.T) {
 		{`not json at all Makefile here`, "Makefile"},
 	}
 	for _, c := range cases {
-		toks := argStringTokens(c.args)
+		toks := argTokens(collectArgStrings(c.args))
 		found := false
 		for _, tok := range toks {
 			if tok == c.want {
@@ -89,7 +90,7 @@ func TestArgStringTokens(t *testing.T) {
 			}
 		}
 		if !found {
-			t.Errorf("argStringTokens(%q) = %v, want it to contain %q", c.args, toks, c.want)
+			t.Errorf("argTokens(collectArgStrings(%q)) = %v, want it to contain %q", c.args, toks, c.want)
 		}
 	}
 }

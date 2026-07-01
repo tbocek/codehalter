@@ -360,13 +360,13 @@ func collectArgStrings(rawArgs string) []string {
 	return out
 }
 
-// argStringTokens extracts the whitespace-split tokens of every string value
-// in a tool call's JSON arguments, trimmed of shell punctuation, so both
-// {"path":"cmd/main.go"} and {"command":"cat cmd/main.go && ls"} yield
-// "cmd/main.go". Non-JSON arguments fall back to splitting the raw string.
-func argStringTokens(rawArgs string) []string {
+// argTokens splits already-extracted argument strings into whitespace tokens
+// trimmed of shell punctuation, so both {"path":"cmd/main.go"} and
+// {"command":"cat cmd/main.go && ls"} yield "cmd/main.go". Fed from
+// collectArgStrings so each call's JSON is parsed exactly once.
+func argTokens(strs []string) []string {
 	var out []string
-	for _, s := range collectArgStrings(rawArgs) {
+	for _, s := range strs {
 		for _, tok := range strings.Fields(s) {
 			if tok = strings.Trim(tok, "\"'`;&|()<>,="); tok != "" {
 				out = append(out, tok)
@@ -374,6 +374,14 @@ func argStringTokens(rawArgs string) []string {
 		}
 	}
 	return out
+}
+
+// disclosedSnapshot returns a copy of sess.DisclosedSkills under the session
+// lock, safe to read after release.
+func disclosedSnapshot(sess *Session) []string {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return append([]string(nil), sess.DisclosedSkills...)
 }
 
 // deferredSkillSkip returns the loadSkills filter for this session: nil in
@@ -384,9 +392,7 @@ func (a *agent) deferredSkillSkip(sess *Session) func(name string) bool {
 	if !a.skillsAuto() {
 		return nil
 	}
-	sess.mu.Lock()
-	disclosed := append([]string(nil), sess.DisclosedSkills...)
-	sess.mu.Unlock()
+	disclosed := disclosedSnapshot(sess)
 	return func(name string) bool {
 		return isDeferredSkill(name) && !slices.Contains(disclosed, name)
 	}
@@ -409,17 +415,16 @@ func (a *agent) discloseSkills(sid string, calls []toolCall) []string {
 	if sess == nil {
 		return nil
 	}
-	sess.mu.Lock()
-	disclosed := append([]string(nil), sess.DisclosedSkills...)
-	sess.mu.Unlock()
+	disclosed := disclosedSnapshot(sess)
 
 	var names []string
 	var tokens []string
 	var raws []string
 	for _, tc := range calls {
 		names = append(names, tc.Function.Name)
-		tokens = append(tokens, argStringTokens(tc.Function.Arguments)...)
-		raws = append(raws, collectArgStrings(tc.Function.Arguments)...)
+		rs := collectArgStrings(tc.Function.Arguments)
+		raws = append(raws, rs...)
+		tokens = append(tokens, argTokens(rs)...)
 	}
 
 	var out []string
