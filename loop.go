@@ -959,6 +959,15 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			})
 		}
 
+		// skills="auto": if this batch touched a stack whose deferred SKILL
+		// isn't in context yet, put it on the wire now — appended after the
+		// batch's tool results, so the cached prefix is untouched — and let
+		// discloseSkills persist it for rebuilds and the next compaction's
+		// prompt re-render.
+		for _, body := range a.discloseSkills(sid, calls) {
+			messages = append(messages, llmMessage{Role: "user", Content: body})
+		}
+
 		// Terminal tool called: stream the message to the UI as one chunk
 		// (the model emitted it as tool arguments, which never went through
 		// the text-stream callback) and exit. The repetition ladder below is

@@ -2,10 +2,13 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -228,11 +231,16 @@ func skillFiles(cwd string) []string {
 // it gets picked up; delete one and it stops loading. checkEnv rebuilds the
 // system prompt every turn and assigns only on a byte diff, so a skill added or
 // removed mid-session takes effect on the next turn while an unchanged set
-// keeps the cache prefix stable.
-func loadSkills(cwd string) string {
+// keeps the cache prefix stable. skip (nil = keep all) excludes individual
+// files — skills="auto" passes deferredSkillSkip to withhold untouched
+// language skills from the prefix.
+func loadSkills(cwd string, skip func(name string) bool) string {
 	dir := filepath.Join(cwd, ".codehalter")
 	var b strings.Builder
 	for _, n := range skillFiles(cwd) {
+		if skip != nil && skip(n) {
+			continue
+		}
 		data, err := os.ReadFile(filepath.Join(dir, n))
 		if err != nil {
 			continue
@@ -260,4 +268,170 @@ func listSkills(cwd string) []string {
 		names[i] = strings.TrimSuffix(strings.TrimPrefix(n, "SKILL-"), ".md")
 	}
 	return names
+}
+
+// ---------------------------------------------------------------------------
+// skills="auto": deferred skills, disclosed on first touch
+// ---------------------------------------------------------------------------
+
+// deferredSkill describes one SKILL file that skills="auto" withholds from the
+// system prompt until the session actually touches its stack. A skill is
+// triggered by tool NAME (the per-runner tools imply their stack) or by a
+// token matcher run over the whitespace-split string arguments of every tool
+// call — file paths in edit/read calls, filenames inside run_command strings.
+// Skills not listed here — the container base, the OS skills, bash, and
+// anything the user drops in manually — always stay inline: there is no
+// reliable touch signal to defer them on.
+type deferredSkill struct {
+	name  string
+	tools []string
+	match func(tok string) bool
+}
+
+// Slice, not map: disclosure order inside one batch stays deterministic.
+var deferredSkills = []deferredSkill{
+	{"SKILL-c.md", nil, suffixAny(".c", ".h", ".cpp", ".cc", ".cxx", ".hpp")},
+	{"SKILL-go.md", []string{"go"}, suffixAny(".go")},
+	{"SKILL-java.md", []string{"gradle"}, suffixAny(".java")},
+	{"SKILL-js.md", []string{"npm"}, suffixAny(".js", ".jsx", ".mjs", ".cjs")},
+	{"SKILL-justfile.md", []string{"just"}, baseAny("justfile", "Justfile", ".justfile")},
+	{"SKILL-makefile.md", []string{"make"}, func(tok string) bool {
+		return strings.HasSuffix(tok, ".mk") || baseAny("Makefile", "makefile", "GNUmakefile")(tok)
+	}},
+	{"SKILL-ts.md", nil, suffixAny(".ts", ".tsx")},
+}
+
+func suffixAny(exts ...string) func(string) bool {
+	return func(tok string) bool {
+		for _, e := range exts {
+			if strings.HasSuffix(tok, e) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+func baseAny(names ...string) func(string) bool {
+	return func(tok string) bool {
+		return slices.Contains(names, path.Base(tok))
+	}
+}
+
+func isDeferredSkill(name string) bool {
+	return slices.ContainsFunc(deferredSkills, func(d deferredSkill) bool { return d.name == name })
+}
+
+// argStringTokens extracts the whitespace-split tokens of every string value
+// in a tool call's JSON arguments, trimmed of shell punctuation, so both
+// {"path":"cmd/main.go"} and {"command":"cat cmd/main.go && ls"} yield
+// "cmd/main.go". Non-JSON arguments fall back to splitting the raw string.
+func argStringTokens(rawArgs string) []string {
+	var out []string
+	add := func(s string) {
+		for _, tok := range strings.Fields(s) {
+			if tok = strings.Trim(tok, "\"'`;&|()<>,="); tok != "" {
+				out = append(out, tok)
+			}
+		}
+	}
+	var v any
+	if json.Unmarshal([]byte(rawArgs), &v) != nil {
+		add(rawArgs)
+		return out
+	}
+	var walk func(any)
+	walk = func(x any) {
+		switch t := x.(type) {
+		case string:
+			add(t)
+		case []any:
+			for _, e := range t {
+				walk(e)
+			}
+		case map[string]any:
+			for _, e := range t {
+				walk(e)
+			}
+		}
+	}
+	walk(v)
+	return out
+}
+
+// deferredSkillSkip returns the loadSkills filter for this session: nil in
+// inline mode (everything loads), else a closure excluding deferred skills the
+// session hasn't disclosed yet. Disclosed ones load again, so the
+// compaction-time re-render (history.go) folds them into the cached prefix.
+func (a *agent) deferredSkillSkip(sess *Session) func(name string) bool {
+	if !a.skillsAuto() {
+		return nil
+	}
+	sess.mu.Lock()
+	disclosed := append([]string(nil), sess.DisclosedSkills...)
+	sess.mu.Unlock()
+	return func(name string) bool {
+		return isDeferredSkill(name) && !slices.Contains(disclosed, name)
+	}
+}
+
+// discloseSkills is the skills="auto" trigger: called after each executed tool
+// batch, it returns the wrapped body of every deferred skill this batch
+// touches for the first time. Each disclosure is recorded on the session —
+// DisclosedSkills (persisted; the prompt renderer stops excluding the skill at
+// the next compaction re-render) and promptSkills (so prepare's mid-session
+// seed loop never injects it a second time) — and appended to history via
+// AddUser so a rebuild or resume replays it. The caller puts the returned
+// messages on the live wire; both paths are append-only, so the cached prefix
+// is untouched.
+func (a *agent) discloseSkills(sid string, calls []toolCall) []string {
+	if len(calls) == 0 || !a.skillsAuto() {
+		return nil
+	}
+	sess := a.getSession(sid)
+	if sess == nil {
+		return nil
+	}
+	sess.mu.Lock()
+	disclosed := append([]string(nil), sess.DisclosedSkills...)
+	sess.mu.Unlock()
+
+	var names []string
+	var tokens []string
+	for _, tc := range calls {
+		names = append(names, tc.Function.Name)
+		tokens = append(tokens, argStringTokens(tc.Function.Arguments)...)
+	}
+
+	var out []string
+	for _, d := range deferredSkills {
+		if slices.Contains(disclosed, d.name) {
+			continue
+		}
+		hit := slices.ContainsFunc(names, func(n string) bool { return slices.Contains(d.tools, n) })
+		if !hit && d.match != nil {
+			hit = slices.ContainsFunc(tokens, d.match)
+		}
+		if !hit {
+			continue
+		}
+		body := readSkillBody(sess.Cwd, d.name)
+		if body == "" {
+			continue // not seeded in this project (yet) — check again next batch
+		}
+		msg := "[Skill loaded on first use — " + d.name + ". Follow it for all matching work. It enters the system prompt at the next history compaction; until then it lives here.]\n\n" + body
+		sess.AddUser(msg)
+		sess.mu.Lock()
+		sess.DisclosedSkills = append(sess.DisclosedSkills, d.name)
+		sess.mu.Unlock()
+		if !slices.Contains(sess.promptSkills, d.name) {
+			sess.promptSkills = append(sess.promptSkills, d.name)
+		}
+		a.logSession(sid, "SKILL", "disclosed %s (skills=auto)", d.name)
+		out = append(out, msg)
+	}
+	if len(out) > 0 {
+		sess.saveOrLog()
+	}
+	return out
 }

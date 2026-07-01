@@ -552,6 +552,12 @@ func (a *agent) startIndexing(sid string, cwd string) {
 		if sess != nil {
 			slog.Debug("startIndexing: gitignore done, about to prepare", "sid", sid)
 			a.prepare(ctx, sess, sid)
+			// Prefix-cache prewarm, AFTER prepare: the probe has run, skills are
+			// seeded and SystemPrompt is final, so the warmed bytes match turn
+			// one. Backgrounded so bootstrap (and session/new) never waits; if
+			// the user prompts mid-warm, the conn semaphore queues the real call
+			// behind prompt processing that had to happen anyway.
+			go a.prewarm(sess)
 		}
 		slog.Debug("startIndexing: bootstrap done", "sid", sid)
 	}()

@@ -26,6 +26,20 @@ type Settings struct {
 	// Parallel field caps how many concurrent requests it accepts.
 	LLM []LLMConnection `toml:"llm"`
 
+	// Prewarm fires one background 1-token LLM call at session open so the
+	// server tokenizes and caches the prompt prefix (system prompt + tools)
+	// before the user's first message; turn one then only pays for its own
+	// delta. Only useful on backends with prefix caching (llama.cpp); elsewhere
+	// it wastes one tiny request. nil means on.
+	Prewarm *bool `toml:"prewarm,omitempty"`
+
+	// Skills selects how SKILL-*.md files reach the model. "inline" (default,
+	// also the value for "") concatenates every skill into the system prompt.
+	// "auto" keeps only the always-relevant skills there (container/OS/bash)
+	// and injects each language/build skill the first time a tool call touches
+	// a matching file — shorter prefix, skill arrives on first use.
+	Skills string `toml:"skills,omitempty"`
+
 	path string
 }
 
@@ -212,8 +226,26 @@ func decodeSettings(path string) (Settings, error) {
 	for _, key := range md.Undecoded() {
 		slog.Warn("unknown settings key (ignored — check for a typo)", "key", key.String(), "file", path)
 	}
+	if s.Skills != "" && s.Skills != "inline" && s.Skills != "auto" {
+		slog.Warn("unknown skills value (falling back to \"inline\")", "value", s.Skills, "file", path)
+	}
 	s.path = path
 	return s, nil
+}
+
+// prewarmEnabled / skillsAuto read the two behavior flags under cfgMu.
+// Settings hot-reload each turn (prepare), so an edit takes effect on the
+// next turn without a restart.
+func (a *agent) prewarmEnabled() bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.settings.Prewarm == nil || *a.settings.Prewarm
+}
+
+func (a *agent) skillsAuto() bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.settings.Skills == "auto"
 }
 
 // MainLLM returns the foreground connection (LLM[0]) with role-resolved

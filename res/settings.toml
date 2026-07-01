@@ -1,5 +1,9 @@
 # Codehalter settings. Edit, then restart the Zed session.
 # Machine-wide: move to ~/.config/codehalter/settings.toml (checked first).
+# Top-level keys must stay ABOVE the [[llm]] tables.
+
+# prewarm = true    # warm the server's prefix cache at session open (default on)
+# skills = "auto"   # defer language SKILLs from the prompt until first touch (default "inline")
 
 [[llm]]
 server = "http://localhost:8080"  # host root only, no path

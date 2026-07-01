@@ -226,6 +226,52 @@ func (c *LLMConnection) withThinkingDisabled() *LLMConnection {
 	return &cp
 }
 
+// withMaxTokens returns a shallow copy of the connection with max_tokens
+// forced to n in a copied ExtraBody (llmStream copies ExtraBody into the
+// request first, so this overrides the role default). Slot/Server/Model are
+// unchanged, so it routes to the same connSem. Used by prewarm to cap the
+// warming call at a single generated token.
+func (c *LLMConnection) withMaxTokens(n int) *LLMConnection {
+	cp := *c
+	eb := make(map[string]any, len(c.ExtraBody)+1)
+	maps.Copy(eb, c.ExtraBody)
+	eb["max_tokens"] = n
+	cp.ExtraBody = eb
+	return &cp
+}
+
+// prewarm pays the prompt-processing cost of the session's prefix (system
+// prompt + summary + history + tool schemas) before the user's first message,
+// so turn one only pays for its own delta. One synchronous 1-token call built
+// through the exact renderers a real turn uses (buildLLMContext +
+// llmAllToolDefinitions), which makes the rendered prompt a byte-prefix of the
+// next real request; llama.cpp's longest-prefix slot routing then reuses the
+// KV cache. Callers run it in a goroutine after the first prepare (probe done,
+// skills seeded, SystemPrompt final). sid is passed to llmStream as "" so the
+// call skips session logging and turn stats. Errors are swallowed by design:
+// an unreachable server or a cache-less backend just makes this a no-op, and
+// the real turn will surface any genuine problem.
+func (a *agent) prewarm(sess *Session) {
+	if sess == nil || !a.prewarmEnabled() {
+		return
+	}
+	conn := a.connForSession(context.Background(), sess.ID, "thinking")
+	if conn == nil {
+		return
+	}
+	messages := a.buildLLMContext(sess)
+	if len(messages) == 0 {
+		return
+	}
+	// Generous ceiling: a 10k-token prefix on a slow local model is ~30s of
+	// prompt processing; 122B-class models take a few times that.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	start := time.Now()
+	_, _, _, err := a.llmStream(ctx, "", conn.withMaxTokens(1), messages, llmAllToolDefinitions(), nil, nil)
+	slog.Debug("prewarm: done", "sid", sess.ID, "elapsed", time.Since(start).Round(time.Millisecond), "err", err)
+}
+
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
 // sid scopes the debug log: req body and raw SSE response are appended to
 // .codehalter/session_<sid>.log so a single file captures everything that

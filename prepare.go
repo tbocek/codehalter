@@ -776,6 +776,13 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 			if slices.Contains(sess.promptSkills, name) {
 				continue
 			}
+			// skills="auto": a deferred skill seeded mid-session is NOT injected
+			// here — discloseSkills puts it on the wire the first time a tool
+			// call touches its stack. (Once disclosed it's in promptSkills, so
+			// the Contains above already skips it.)
+			if a.skillsAuto() && isDeferredSkill(name) {
+				continue
+			}
 			if body := readSkillBody(sess.Cwd, name); body != "" {
 				sess.AddUser("[New skill available this session — " + name +
 					". It enters the system prompt at the next history compaction; until then it's here.]\n\n" + body)

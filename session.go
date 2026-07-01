@@ -369,6 +369,12 @@ type Session struct {
 	// as a user message (NOT folded into the prompt — that would bust the KV
 	// prefix cache) until the next compaction re-renders the prompt. Runtime-only.
 	promptSkills []string
+	// DisclosedSkills is the set of deferred SKILL-*.md filenames already
+	// injected into this session under skills="auto" (see discloseSkills). The
+	// system-prompt renderer keeps a deferred skill out of the prefix until it
+	// appears here. Persisted so a resumed session's rebuilt prompt still
+	// carries the skills its history already relies on.
+	DisclosedSkills []string `toml:"disclosed_skills,omitempty"`
 	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
 	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
 	// of role — cache-coherence trumps per-role sampler matching, the conn

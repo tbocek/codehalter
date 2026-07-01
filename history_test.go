@@ -1182,9 +1182,9 @@ func TestLoadSkillsDeterministic(t *testing.T) {
 		}
 	}
 
-	first := loadSkills(dir)
+	first := loadSkills(dir, nil)
 	for i := 0; i < 5; i++ {
-		got := loadSkills(dir)
+		got := loadSkills(dir, nil)
 		if got != first {
 			t.Errorf("loadSkills run %d differs from run 0:\n  run 0: %q\n  run %d: %q", i, first, i, got)
 		}

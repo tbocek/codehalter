@@ -281,3 +281,25 @@ func TestWithThinkingDisabled(t *testing.T) {
 		t.Error("withThinkingDisabled mutated the original conn")
 	}
 }
+
+// TestWithMaxTokens pins the prewarm conn copy: max_tokens is forced in a
+// copied ExtraBody (overriding the role default, since llmStream copies
+// ExtraBody into the request first), sibling params and routing fields
+// survive, and the original conn keeps its own cap.
+func TestWithMaxTokens(t *testing.T) {
+	orig := &LLMConnection{Server: "s", Model: "m", Slot: 1, ExtraBody: map[string]any{
+		"max_tokens":  8192,
+		"temperature": 0.7,
+	}}
+	capped := orig.withMaxTokens(1)
+
+	if capped.Server != "s" || capped.Model != "m" || capped.Slot != 1 {
+		t.Errorf("routing fields changed: %+v", capped)
+	}
+	if capped.ExtraBody["max_tokens"] != 1 || capped.ExtraBody["temperature"] != 0.7 {
+		t.Errorf("ExtraBody: got %+v, want max_tokens=1 + temperature kept", capped.ExtraBody)
+	}
+	if orig.ExtraBody["max_tokens"] != 8192 {
+		t.Error("withMaxTokens mutated the original conn")
+	}
+}
