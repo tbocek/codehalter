@@ -36,10 +36,12 @@ func TestTrimJSON(t *testing.T) {
 	}
 }
 
-// TestBackgroundSlotLabel pins the display-slot routing: the foreground turn
-// reads llm[0], background work reads llm[1] even on a single [[llm]] entry
-// with parallel >= 2 (same connection, distinct display slot), and a second
-// entry routes background to llm[1] proper.
+// TestBackgroundSlotLabel pins the display-slot routing AND the onMain flag
+// that switches background prompts to prefix-extension mode: the foreground
+// turn reads llm[0]; background work on a single [[llm]] entry falls back to
+// llm[0] (onMain=true — its KV holds the conversation, so extend it), labelled
+// llm[1] for display when parallel >= 2; a second entry routes background to
+// llm[1] proper (onMain=false — fresh prompt, no cache to protect there).
 func TestBackgroundSlotLabel(t *testing.T) {
 	// Single entry, parallel=2 → foreground llm[0], background llm[1] (same conn).
 	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2)}}}}
@@ -47,16 +49,16 @@ func TestBackgroundSlotLabel(t *testing.T) {
 	if fg := a.settings.MainLLM("execute"); fg == nil || fg.Slot != 0 {
 		t.Fatalf("MainLLM.Slot = %v, want 0", fg)
 	}
-	bg := a.connForBackgroundLLM()
-	if bg == nil || bg.Slot != 1 || bg.Server != "u" || bg.Model != "m" {
-		t.Fatalf("connForBackgroundLLM = %+v, want Slot 1 on u/m", bg)
+	bg, onMain := a.connForBackgroundLLM()
+	if bg == nil || bg.Slot != 1 || bg.Server != "u" || bg.Model != "m" || !onMain {
+		t.Fatalf("connForBackgroundLLM = %+v onMain=%v, want Slot 1 on u/m, onMain", bg, onMain)
 	}
 
 	// Single entry, parallel=1 → no second slot to label; background stays llm[0].
 	a1 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(1)}}}}
 	a1.buildConnSems()
-	if bg := a1.connForBackgroundLLM(); bg == nil || bg.Slot != 0 {
-		t.Fatalf("single-slot connForBackgroundLLM.Slot = %v, want 0", bg)
+	if bg, onMain := a1.connForBackgroundLLM(); bg == nil || bg.Slot != 0 || !onMain {
+		t.Fatalf("single-slot connForBackgroundLLM = %+v onMain=%v, want Slot 0, onMain", bg, onMain)
 	}
 
 	// Two entries → background routes to the second entry, llm[1].
@@ -65,8 +67,8 @@ func TestBackgroundSlotLabel(t *testing.T) {
 		{Server: "u1", Model: "m1", Parallel: ptr(1)},
 	}}}
 	a2.buildConnSems()
-	if bg := a2.connForBackgroundLLM(); bg == nil || bg.Slot != 1 || bg.Server != "u1" {
-		t.Fatalf("two-entry connForBackgroundLLM = %+v, want Slot 1 on u1", bg)
+	if bg, onMain := a2.connForBackgroundLLM(); bg == nil || bg.Slot != 1 || bg.Server != "u1" || onMain {
+		t.Fatalf("two-entry connForBackgroundLLM = %+v onMain=%v, want Slot 1 on u1, NOT onMain", bg, onMain)
 	}
 }
 
@@ -137,7 +139,7 @@ func TestCfgConcurrentReloadAndRead(t *testing.T) {
 				case <-stop:
 					return
 				default:
-					_ = a.connForBackgroundLLM()
+					_, _ = a.connForBackgroundLLM()
 					_ = a.connForSession(context.Background(), s.ID, "execute")
 				}
 			}

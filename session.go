@@ -143,44 +143,18 @@ type ToolUse struct {
 	DurationMs int64     `toml:"duration_ms,omitempty"`
 }
 
-// bgJob coalesces fan-out of a fire-and-forget background goroutine and lets
-// other goroutines join the in-flight call. TryStart claims the slot AND
-// registers the pending goroutine in one atomic step — the caller must defer
-// Done on every path after a successful TryStart (including early returns
-// from within the launching function, before the goroutine itself fires).
-type bgJob struct {
-	running atomic.Bool
-	pending sync.WaitGroup
-}
-
-// TryStart attempts to acquire the slot. Returns true when the caller is now
-// the active runner (and MUST call Done exactly once); false when another
-// runner is in-flight and this caller should skip.
-func (j *bgJob) TryStart() bool {
-	if !j.running.CompareAndSwap(false, true) {
-		return false
-	}
-	j.pending.Add(1)
-	return true
-}
-
-// Done releases the slot and decrements the pending WaitGroup. Pair with a
-// successful TryStart.
-func (j *bgJob) Done() {
-	j.pending.Done()
-	j.running.Store(false)
-}
-
-// Wait blocks until any in-flight goroutine claimed via TryStart has called
-// Done. Used by joiners that need fresh state.
-func (j *bgJob) Wait() { j.pending.Wait() }
-
 // summariseTask is one queued background-summariser job: the messages of one
 // completed turn to feed the structured-turn prompt. The connection is picked
 // at enqueue time so the runner doesn't have to reach back into the agent.
 type summariseTask struct {
 	Turn []Message
 	Conn *LLMConnection
+	// Msgs, when non-nil, switches the note generation to prefix-extension
+	// mode: the full wire context frozen at turn end plus the summarise
+	// instruction (see appendSummariseMsgs). Frozen at ENQUEUE time so a
+	// queued task still summarises exactly its own turn even when the next
+	// turn has already started by the time the worker runs it.
+	Msgs []llmMessage
 }
 
 type Session struct {
@@ -272,20 +246,6 @@ type Session struct {
 	summariseRunning bool
 	summariseUndone  int
 	summariseCond    *sync.Cond
-	// gitCommitJob coalesces per-LLM-call fan-out: TryStart drops the call
-	// when a prior one is in-flight, and Wait() lets callers
-	// (cleanupGitCommitIfClean) join any pending goroutine before they
-	// read the resulting state. Drop-on-busy is appropriate here because
-	// gitCommitLastHash already short-circuits identical snapshots — there
-	// is no value in committing intermediate file states.
-	gitCommitJob bgJob
-	// gitCommitLastHash is the sha256 of (status + diff) from the last
-	// successful backgroundGitCommit write. Subsequent calls short-circuit
-	// when the snapshot hashes identical — the file on disk is already
-	// up to date, so there's no reason to spend an LLM call. In-memory
-	// only; a restart pays one redundant regeneration on the next turn.
-	gitCommitMu       sync.Mutex
-	gitCommitLastHash [32]byte
 	// readDedup remembers read_file outcomes for the current Prompt() turn
 	// so a literal-repeat read (same path+line+limit, file unchanged) is
 	// rejected instead of re-running. Reset at the top of Prompt(); busted
@@ -348,7 +308,7 @@ type Session struct {
 	// beginImproveScratch, cleared (deferred) by endImproveScratch; preImproveMsgs /
 	// preImproveSummary hold the real conversation snapshot to restore at turn end.
 	// Atomic: sessionFilePath/logSession read it from background goroutines (e.g.
-	// backgroundGitCommit's llmStream logging) concurrently with begin/end.
+	// the background summariser's llmStream logging) concurrently with begin/end.
 	improving atomic.Bool
 	// improveNoLicense caches, for the current /improve run, that the project has
 	// no open-source license — so feedback-API submission is impossible. Set in

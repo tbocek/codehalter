@@ -1812,16 +1812,28 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// Single [[llm]] entry → prefix-extension mode: the request replays the
+	// conversation itself (reusing the foreground KV cache) instead of pasting
+	// a transcript, with the SUMMARISE instruction as the FINAL message,
+	// anchored to the turn's opening user message.
 	req := mock.request(0)
 	msgs, _ := req["messages"].([]any)
-	if len(msgs) == 0 {
-		t.Fatalf("summariser request had no messages: %v", req)
+	if len(msgs) < 2 {
+		t.Fatalf("summariser request should carry the conversation + instruction, got %d messages: %v", len(msgs), req)
 	}
-	content, _ := msgs[0].(map[string]any)["content"].(string)
+	wire, _ := json.Marshal(msgs)
 	for _, want := range []string{"please do the thing", "read_file", "done with the thing"} {
-		if !strings.Contains(content, want) {
-			t.Errorf("summariser prompt missing %q; got:\n%s", want, content)
+		if !strings.Contains(string(wire), want) {
+			t.Errorf("summariser request missing %q; got:\n%s", want, wire)
 		}
+	}
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	instr, _ := last["content"].(string)
+	if last["role"] != "user" || !strings.Contains(instr, "SUMMARISE PROMPT") {
+		t.Errorf("final message should be the SUMMARISE instruction, got role=%v content:\n%s", last["role"], instr)
+	}
+	if !strings.Contains(instr, "please do the thing") {
+		t.Errorf("instruction should anchor the turn's opening user message, got:\n%s", instr)
 	}
 }
 

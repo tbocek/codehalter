@@ -50,7 +50,7 @@ Change a file that exists → ALWAYS `edit_file`; `write_file` = NEW files only 
 ## Git — commit/push ONLY when explicitly asked
 This devcontainer has WRITABLE `.git` + SSH push creds mounted → you can commit/push yourself — but ONLY when user explicitly asks. NEVER commit/push on own initiative, never as side effect of another task.
 Asked to commit (and/or push):
-1. Check `.codehalter/.git_commit` (background task keeps it ~fresh vs `git diff HEAD`). Missing/stale → regenerate w/ `write_file`:
+1. Draft the message from `git status --porcelain` + `git diff HEAD`, use conversation for the WHY. Write it w/ `write_file` to `.codehalter/.git_commit`:
        <imperative subject ≤72 chars>
        <blank line>
        <body: 1-3 short bullets/sentences on WHY, not WHAT>

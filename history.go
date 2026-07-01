@@ -63,7 +63,10 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "🗜 Context limit reached — compacting: summarising completed small turns, keeping the unfinished one…\n"}})
 		var note string
 		if prompt := a.loadPromptFile(sess.ID, "SUMMARISE.md"); prompt != "" {
-			if conn := a.connForBackgroundLLM(); conn != nil {
+			// Always paste-style here, never prefix-extension: this fold runs
+			// BECAUSE the context overflowed, so context + instruction would
+			// overflow too.
+			if conn, _ := a.connForBackgroundLLM(); conn != nil {
 				note = a.summariseSlice(ctx, sess, conn, prompt, inFlightCompleted)
 			}
 		}
@@ -129,7 +132,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	if prompt == "" {
 		return
 	}
-	conn := a.connForBackgroundLLM()
+	conn, onMain := a.connForBackgroundLLM()
 	if conn == nil {
 		return
 	}
@@ -145,15 +148,62 @@ func (a *agent) backgroundSummarise(sess *Session) {
 		return
 	}
 
-	sess.enqueueSummarise(summariseTask{Turn: turn, Conn: conn}, func(t summariseTask) {
+	task := summariseTask{Turn: turn, Conn: conn}
+	// Prefix-extension mode: the note generates on the conn whose KV cache
+	// already holds this conversation, so send the conversation itself plus a
+	// small instruction instead of re-pasting the turn — the server reuses the
+	// whole cached prefix and evaluates only the instruction. This is what
+	// makes a single-slot (parallel = 1) server viable. Depth guard: a
+	// subagent's history lives on its pinned conn, not necessarily here.
+	if onMain && sess.Depth == 0 {
+		task.Msgs = a.appendSummariseMsgs(sess, prompt, turn)
+	}
+	sess.enqueueSummarise(task, func(t summariseTask) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		sess.appendShadow(a.summariseSlice(ctx, sess, t.Conn, prompt, t.Turn))
+		var note string
+		if len(t.Msgs) > 0 {
+			note = a.summariseAppend(ctx, sess, t.Conn, t.Msgs, t.Turn)
+		} else {
+			note = a.summariseSlice(ctx, sess, t.Conn, prompt, t.Turn)
+		}
+		sess.appendShadow(note)
 		// Persist immediately so the note survives a process kill in the idle
 		// gap before the next turn's save — that gap is exactly where the old
 		// in-memory-only buffer lost notes across a restart.
 		sess.saveOrLog()
 	})
+}
+
+// appendSummariseMsgs builds the prefix-extension summarise request: the
+// session's full wire context (byte-identical to the turn that just ran, so
+// the server reuses the cached prefix whole) plus one instruction message.
+// The turn content is NOT pasted — it is already the tail of the context. The
+// anchor quote pins WHICH span is "the final turn": a turn can contain
+// synthetic inner user messages (subtask prompts, skill disclosures), so
+// "everything after the last user message" would be wrong.
+func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message) []llmMessage {
+	msgs := a.buildLLMContext(sess)
+	instr := prompt + "\n\nThe exchange to summarise is the FINAL turn of the conversation above — nothing before it."
+	for _, m := range turn {
+		if m.Role == "user" && strings.TrimSpace(m.Content) != "" {
+			instr += " That turn began with the user message: \"" + clipBytes(strings.TrimSpace(m.Content), 200) + "\""
+			break
+		}
+	}
+	return append(msgs, llmMessage{Role: "user", Content: instr})
+}
+
+// summariseAppend generates the per-turn note from a prefix-extension request
+// (see appendSummariseMsgs) instead of summariseSlice's transcript paste. Same
+// raw fallback and image-reference handling.
+func (a *agent) summariseAppend(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, turn []Message) string {
+	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, nil, nil, nil)
+	if err != nil || strings.TrimSpace(out) == "" {
+		slog.Debug("summariseAppend: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
+		out = fallbackTurnNote(turn)
+	}
+	return attachImageRefs(out, turn)
 }
 
 // summariseSlice renders a contiguous slice of messages and condenses it into a
@@ -165,9 +215,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 // the in-flight large turn, see foldHistory) go through here.
 func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConnection, prompt string, turn []Message) string {
 	var turnBuf strings.Builder
-	var images []ImageData
 	for _, m := range turn {
-		images = append(images, m.Images...)
 		switch m.Role {
 		case "user":
 			turnBuf.WriteString("\n<user_turn>\n")
@@ -200,15 +248,26 @@ func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConn
 		slog.Debug("summariseSlice: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
 		out = fallbackTurnNote(turn)
 	}
-	if len(images) > 0 {
-		var refs strings.Builder
-		refs.WriteString("Attached images:")
-		for _, img := range images {
-			fmt.Fprintf(&refs, "\n- %s (%s) — call view_image id=%s to view", img.ID, img.MimeType, img.ID)
-		}
-		out = strings.TrimRight(out, "\n") + "\n\n" + refs.String()
+	return attachImageRefs(out, turn)
+}
+
+// attachImageRefs appends the deterministic image-reference block to a note so
+// image IDs survive the summariser's paraphrasing and view_image keeps working
+// after compaction. No-op for a turn without images.
+func attachImageRefs(note string, turn []Message) string {
+	var images []ImageData
+	for _, m := range turn {
+		images = append(images, m.Images...)
 	}
-	return out
+	if len(images) == 0 {
+		return note
+	}
+	var refs strings.Builder
+	refs.WriteString("Attached images:")
+	for _, img := range images {
+		fmt.Fprintf(&refs, "\n- %s (%s) — call view_image id=%s to view", img.ID, img.MimeType, img.ID)
+	}
+	return strings.TrimRight(note, "\n") + "\n\n" + refs.String()
 }
 
 // fallbackTurnNote builds a terse, clipped raw transcript of a turn for when the

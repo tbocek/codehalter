@@ -932,20 +932,26 @@ func (a *agent) connForSession(_ context.Context, sid string, role string) *LLMC
 	return a.settings.MainLLM(role)
 }
 
-// connForBackgroundLLM returns the connection to host background work (per-turn
-// summariser, git-commit, document). It walks the background tier LLM[1..x] and
+// connForBackgroundLLM returns the connection to host background work (the
+// per-turn summariser). It walks the background tier LLM[1..x] and
 // returns the first with free semaphore capacity, spreading load across servers
 // instead of stacking on LLM[1]. If all are busy (or none exist) it falls back
 // to LLM[0], labelled llm[1] when that conn has >=2 slots so the meter shows the
 // work routed off the foreground turn. The capacity peek is racy by design —
 // llmStream's semaphore just queues if the slot was taken meanwhile.
-func (a *agent) connForBackgroundLLM() *LLMConnection {
+//
+// The second return reports that fallback: true means the call will land on
+// the server whose KV cache holds the foreground conversation. Callers use it
+// to switch to prefix-extension prompts (conversation context + instruction
+// tail) so the call reuses that cache instead of evicting it — what makes a
+// single-slot (parallel = 1) server viable.
+func (a *agent) connForBackgroundLLM() (*LLMConnection, bool) {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
 	for i := 1; i < len(a.settings.LLM); i++ {
 		if i < len(a.connSems) && a.connSems[i] != nil &&
 			len(a.connSems[i]) < cap(a.connSems[i]) {
-			return a.settings.ConnAt(i, "execute")
+			return a.settings.ConnAt(i, "execute"), false
 		}
 	}
 	// No separate background entry (or all busy): fall back to llm[0]. When it
@@ -956,7 +962,7 @@ func (a *agent) connForBackgroundLLM() *LLMConnection {
 	if c != nil && a.settings.LLM[0].parallelCap() >= 2 {
 		c.Slot = 1
 	}
-	return c
+	return c, true
 }
 
 // buildConnSems sizes one buffered channel per LLM entry to its parallelCap.

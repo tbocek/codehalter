@@ -276,29 +276,39 @@ func listSkills(cwd string) []string {
 
 // deferredSkill describes one SKILL file that skills="auto" withholds from the
 // system prompt until the session actually touches its stack. A skill is
-// triggered by tool NAME (the per-runner tools imply their stack) or by a
-// token matcher run over the whitespace-split string arguments of every tool
-// call — file paths in edit/read calls, filenames inside run_command strings.
-// Skills not listed here — the container base, the OS skills, bash, and
-// anything the user drops in manually — always stay inline: there is no
-// reliable touch signal to defer them on.
+// triggered by tool NAME (the per-runner tools imply their stack), by a token
+// matcher run over the whitespace-split string arguments of every tool call —
+// file paths in edit/read calls, filenames inside run_command strings — or by
+// matchRaw over each WHOLE string argument (line structure intact), which is
+// how shell scripts without a .sh extension are caught: the shebang inside a
+// write_file/edit_file content argument classifies the file the same way
+// `file`(1) would, without exec'ing anything. Skills not listed here — the
+// container base, the OS skills, and anything the user drops in manually —
+// always stay inline: there is no reliable touch signal to defer them on.
 type deferredSkill struct {
-	name  string
-	tools []string
-	match func(tok string) bool
+	name     string
+	tools    []string
+	match    func(tok string) bool
+	matchRaw func(s string) bool
 }
+
+// shebangShell matches a #! interpreter line naming a shell (sh, bash, dash,
+// zsh — not fish, whose "sh" is mid-word). Appears in write_file/edit_file
+// content the moment the model authors a script, extension or not.
+var shebangShell = regexp.MustCompile(`#![^\n]*\b(?:ba|da|z)?sh\b`)
 
 // Slice, not map: disclosure order inside one batch stays deterministic.
 var deferredSkills = []deferredSkill{
-	{"SKILL-c.md", nil, suffixAny(".c", ".h", ".cpp", ".cc", ".cxx", ".hpp")},
-	{"SKILL-go.md", []string{"go"}, suffixAny(".go")},
-	{"SKILL-java.md", []string{"gradle"}, suffixAny(".java")},
-	{"SKILL-js.md", []string{"npm"}, suffixAny(".js", ".jsx", ".mjs", ".cjs")},
-	{"SKILL-justfile.md", []string{"just"}, baseAny("justfile", "Justfile", ".justfile")},
-	{"SKILL-makefile.md", []string{"make"}, func(tok string) bool {
+	{name: "SKILL-bash.md", match: suffixAny(".sh", ".bash"), matchRaw: shebangShell.MatchString},
+	{name: "SKILL-c.md", match: suffixAny(".c", ".h", ".cpp", ".cc", ".cxx", ".hpp")},
+	{name: "SKILL-go.md", tools: []string{"go"}, match: suffixAny(".go")},
+	{name: "SKILL-java.md", tools: []string{"gradle"}, match: suffixAny(".java")},
+	{name: "SKILL-js.md", tools: []string{"npm"}, match: suffixAny(".js", ".jsx", ".mjs", ".cjs")},
+	{name: "SKILL-justfile.md", tools: []string{"just"}, match: baseAny("justfile", "Justfile", ".justfile")},
+	{name: "SKILL-makefile.md", tools: []string{"make"}, match: func(tok string) bool {
 		return strings.HasSuffix(tok, ".mk") || baseAny("Makefile", "makefile", "GNUmakefile")(tok)
 	}},
-	{"SKILL-ts.md", nil, suffixAny(".ts", ".tsx")},
+	{name: "SKILL-ts.md", match: suffixAny(".ts", ".tsx")},
 }
 
 func suffixAny(exts ...string) func(string) bool {
@@ -322,29 +332,20 @@ func isDeferredSkill(name string) bool {
 	return slices.ContainsFunc(deferredSkills, func(d deferredSkill) bool { return d.name == name })
 }
 
-// argStringTokens extracts the whitespace-split tokens of every string value
-// in a tool call's JSON arguments, trimmed of shell punctuation, so both
-// {"path":"cmd/main.go"} and {"command":"cat cmd/main.go && ls"} yield
-// "cmd/main.go". Non-JSON arguments fall back to splitting the raw string.
-func argStringTokens(rawArgs string) []string {
-	var out []string
-	add := func(s string) {
-		for _, tok := range strings.Fields(s) {
-			if tok = strings.Trim(tok, "\"'`;&|()<>,="); tok != "" {
-				out = append(out, tok)
-			}
-		}
-	}
+// collectArgStrings returns every string value in a tool call's JSON
+// arguments, intact (line structure preserved, for matchRaw). Non-JSON
+// arguments degrade to the raw string as one value.
+func collectArgStrings(rawArgs string) []string {
 	var v any
 	if json.Unmarshal([]byte(rawArgs), &v) != nil {
-		add(rawArgs)
-		return out
+		return []string{rawArgs}
 	}
+	var out []string
 	var walk func(any)
 	walk = func(x any) {
 		switch t := x.(type) {
 		case string:
-			add(t)
+			out = append(out, t)
 		case []any:
 			for _, e := range t {
 				walk(e)
@@ -356,6 +357,22 @@ func argStringTokens(rawArgs string) []string {
 		}
 	}
 	walk(v)
+	return out
+}
+
+// argStringTokens extracts the whitespace-split tokens of every string value
+// in a tool call's JSON arguments, trimmed of shell punctuation, so both
+// {"path":"cmd/main.go"} and {"command":"cat cmd/main.go && ls"} yield
+// "cmd/main.go". Non-JSON arguments fall back to splitting the raw string.
+func argStringTokens(rawArgs string) []string {
+	var out []string
+	for _, s := range collectArgStrings(rawArgs) {
+		for _, tok := range strings.Fields(s) {
+			if tok = strings.Trim(tok, "\"'`;&|()<>,="); tok != "" {
+				out = append(out, tok)
+			}
+		}
+	}
 	return out
 }
 
@@ -398,9 +415,11 @@ func (a *agent) discloseSkills(sid string, calls []toolCall) []string {
 
 	var names []string
 	var tokens []string
+	var raws []string
 	for _, tc := range calls {
 		names = append(names, tc.Function.Name)
 		tokens = append(tokens, argStringTokens(tc.Function.Arguments)...)
+		raws = append(raws, collectArgStrings(tc.Function.Arguments)...)
 	}
 
 	var out []string
@@ -411,6 +430,9 @@ func (a *agent) discloseSkills(sid string, calls []toolCall) []string {
 		hit := slices.ContainsFunc(names, func(n string) bool { return slices.Contains(d.tools, n) })
 		if !hit && d.match != nil {
 			hit = slices.ContainsFunc(tokens, d.match)
+		}
+		if !hit && d.matchRaw != nil {
+			hit = slices.ContainsFunc(raws, d.matchRaw)
 		}
 		if !hit {
 			continue

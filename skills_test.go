@@ -114,6 +114,8 @@ func TestDeferredSkillTriggers(t *testing.T) {
 		{"justfile", "SKILL-justfile.md"},
 		{"sub/dir/Makefile", "SKILL-makefile.md"},
 		{"rules.mk", "SKILL-makefile.md"},
+		{"install.sh", "SKILL-bash.md"},
+		{"scripts/run.bash", "SKILL-bash.md"},
 	}
 	for _, c := range tokenCases {
 		var hits []string
@@ -146,10 +148,51 @@ func TestDeferredSkillTriggers(t *testing.T) {
 		}
 	}
 	// Never-deferred skills must stay off the table: they have no touch signal.
-	for _, name := range []string{"SKILL-base.md", "SKILL-bash.md", "SKILL-arch.md", "SKILL-rust.md"} {
+	for _, name := range []string{"SKILL-base.md", "SKILL-arch.md", "SKILL-rust.md"} {
 		if isDeferredSkill(name) {
 			t.Errorf("%s must not be deferred", name)
 		}
+	}
+}
+
+// TestShebangShell pins the extensionless-script signal: a shell shebang in a
+// whole argument string (a write_file content, say) triggers the bash skill,
+// the same classification `file`(1) would make, while other interpreters and
+// mid-word "sh" don't.
+func TestShebangShell(t *testing.T) {
+	hits := []string{
+		"#!/usr/bin/env bash\nset -euo pipefail\n",
+		"#!/bin/sh\necho hi\n",
+		"#!/bin/dash\n",
+		"#!/usr/bin/zsh\n",
+		"leading text\n#!/bin/bash\n", // shebang not at byte 0 still counts
+	}
+	misses := []string{
+		"#!/usr/bin/env python3\nprint()\n",
+		"#!/usr/bin/fish\n", // "sh" mid-word must not match
+		"echo no shebang here",
+		"",
+	}
+	for _, s := range hits {
+		if !shebangShell.MatchString(s) {
+			t.Errorf("shebangShell should match %q", s)
+		}
+	}
+	for _, s := range misses {
+		if shebangShell.MatchString(s) {
+			t.Errorf("shebangShell should NOT match %q", s)
+		}
+	}
+	// End-to-end through the raw extractor: an extensionless script write.
+	raws := collectArgStrings(`{"path":"install","content":"#!/usr/bin/env bash\nset -euo pipefail\n"}`)
+	found := false
+	for _, r := range raws {
+		if shebangShell.MatchString(r) {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("shebang inside write_file content should be caught via collectArgStrings")
 	}
 }
 

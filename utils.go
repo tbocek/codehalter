@@ -212,18 +212,17 @@ func truncate(s string, maxLen int) string {
 }
 
 // maxLLMInputBytes caps the bytes of any single text payload handed to an LLM
-// outside the main tool loop: a clipped per-turn summary / git diff for a
-// background call (backgroundSummarise, backgroundGitCommit, via clipBytes), or
-// a whole-file attachment inlined into the foreground prompt (readLinkedResource).
+// outside the main tool loop: a clipped per-turn summary for a background call
+// (backgroundSummarise, via clipBytes), or a whole-file attachment inlined
+// into the foreground prompt (readLinkedResource).
 // Without it a megabyte blob — a huge run_command dump, a giant attached file —
 // would blow through the LLM's context window.
 const maxLLMInputBytes = 20 * 1024
 
 // clipBytes truncates s to at most max bytes, leaving a marker in the middle
 // when it had to cut. Used to bound any single payload's contribution to a
-// background LLM call (turn summaries via backgroundSummarise, git diffs via
-// backgroundGitCommit) so one giant tool output can't blow the summariser's
-// own context window.
+// background LLM call (turn summaries via backgroundSummarise) so one giant
+// tool output can't blow the summariser's own context window.
 func clipBytes(s string, max int) string {
 	if len(s) <= max {
 		return s
