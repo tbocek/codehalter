@@ -336,7 +336,7 @@
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></div>
           <h3>Prefix-cache discipline</h3>
-          <p>The rendered prompt stays byte- and position-stable turn over turn, so your server's KV cache stays ~90%+ warm. The only deliberate break is a new MCP server coming online.</p>
+          <p>The rendered prompt stays byte- and position-stable turn over turn, so your server's KV cache stays ~90%+ warm. The prefix is <b>pre-warmed at session open</b> (first turn skips the prompt-processing wait), and even a single-slot server stays coherent: background work rides the conversation's own prefix. The only deliberate break is a new MCP server coming online.</p>
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/><path d="M7 6.5h.01M7 17.5h.01"/></svg></div>
