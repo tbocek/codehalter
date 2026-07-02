@@ -16,4 +16,7 @@ USER dev
 WORKDIR /home/dev
 # install.sh installs to ~/.local/bin as the non-root dev user; put it on PATH.
 ENV PATH="/home/dev/.local/bin:${PATH}"
+# ADD re-fetches the tags JSON every build (via ETag): a new codehalter release
+# changes it and busts the cache below; otherwise the install layer stays cached.
+ADD https://api.github.com/repos/tbocek/codehalter/tags /tmp/.codehalter-tags.json
 RUN curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
