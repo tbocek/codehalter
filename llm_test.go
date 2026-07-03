@@ -205,9 +205,17 @@ func TestFinishLengthClassification(t *testing.T) {
 	if err := run(sseTruncated("thinking", 1000, defaultMaxTokens)); err == nil || !isStuckThinking(err) || isContextFull(err) {
 		t.Errorf("reasoning-only cap should be a stuck-thinking stall, got: %v", err)
 	}
-	// Message CONTENT at the cap → verbose/looping output, genuinely not recoverable.
-	if err := run(sseTruncatedContent("verbose output", 1000, defaultMaxTokens)); err == nil || isStuckThinking(err) || isContextFull(err) {
-		t.Errorf("content at the cap should be a non-recoverable cap, got: %v", err)
+	// Message CONTENT at the cap → a typed cap hit carrying the request's
+	// max_tokens, so the tool loop's cap ladder (be-concise nudge, then a
+	// doubled cap) can recover it.
+	err := run(sseTruncatedContent("verbose output", 1000, defaultMaxTokens))
+	if err == nil || isStuckThinking(err) || isContextFull(err) {
+		t.Errorf("content at the cap should be a cap hit, got: %v", err)
+	}
+	if ce := asCapHit(err); ce == nil {
+		t.Errorf("content at the cap should classify as capHitError, got: %v", err)
+	} else if ce.Cap != defaultMaxTokens {
+		t.Errorf("capHitError.Cap = %d, want %d", ce.Cap, defaultMaxTokens)
 	}
 }
 

@@ -45,6 +45,17 @@ func normalizeForHash(s string) string {
 
 const maxSubagentDepth = 2
 
+// subagentFanoutBudget is the per-concurrent-subagent token allowance used to
+// derive the context-based fan-out cap: reserve half the context window for
+// the foreground conversation (and its summariser), then give each concurrent
+// subagent ~20k tokens of prompt + generation headroom in what remains. A
+// 160k window caps the fan-out at 4; at the 32k minimum the cap floors at 1.
+// This keeps concurrent subagents from crowding the foreground's KV cache out
+// of the server's pool (the eviction is what breaks prefix-cache consistency);
+// the per-conn semaphores still bound per-server load underneath, and tasks
+// past the cap queue rather than drop.
+const subagentFanoutBudget = 20_000
+
 type subagentTask struct {
 	Instructions string `json:"instructions"`
 	Context      string `json:"context,omitempty"`
@@ -76,7 +87,7 @@ func (a *agent) registerSubagentTool() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "launch_subagent",
-			"description": "Run 2+ short, independent tasks in parallel. Each task has a `task` field selecting its flow: `execute` (default) runs ONLY the tool loop — use for surgical edits, one lookup, one bounded command the caller has already planned; `thinking` runs plan → execute → verify on the subagent itself — use when the subtask needs its own planning and self-check. Subagents cannot talk to the user. The first subagent in a batch inherits this conversation's full history (it runs on the main LLM, its prefix cache is already warm); the rest start fresh on extra LLM slots and see only their own `instructions` + `context`. Parallelism is bounded by the sum of `parallel` across configured [[llm]] entries; excess tasks queue.",
+			"description": "Run 2+ short, independent tasks in parallel. Each task has a `task` field selecting its flow: `execute` (default) runs ONLY the tool loop — use for surgical edits, one lookup, one bounded command the caller has already planned; `thinking` runs plan → execute → verify on the subagent itself — use when the subtask needs its own planning and self-check. Subagents cannot talk to the user. The first subagent in a batch inherits this conversation's full history (it runs on the main LLM, its prefix cache is already warm); the rest start fresh on extra LLM slots and see only their own `instructions` + `context`. Parallelism is bounded by the sum of `parallel` across configured [[llm]] entries and by a context-window budget (concurrent subagents share the server's KV space with this conversation); excess tasks queue.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"tasks"},
@@ -133,7 +144,9 @@ func (a *agent) registerSubagentTool() {
 
 		type pending struct {
 			task    subagentTask
-			indices []int // original task[] indices sharing this hash
+			indices []int   // original task[] indices sharing this hash
+			pin     PinSlot // (conn, slot) assigned at first dispatch; stable across relaunches
+			ctxFull bool    // last attempt failed on a context-full error (fold-and-relaunch candidate)
 		}
 		uniq := make(map[string]*pending)
 		var order []string // stable launch order: first-seen indices win
@@ -169,19 +182,38 @@ func (a *agent) registerSubagentTool() {
 		if fanout > len(order) {
 			fanout = len(order)
 		}
+		// Context-derived fan-out cap: each concurrent subagent occupies KV
+		// pool next to the foreground conversation, and pool overflow is what
+		// evicts the foreground's cached prefix. Reserve half the window for
+		// the foreground, budget subagentFanoutBudget tokens per concurrent
+		// subagent for the rest — 160k → 4. Purely a concurrency cap: tasks
+		// past it queue inside parallel(), nothing is dropped.
+		if mst := ag.getMainSlotTokens(); mst > 0 {
+			ctxCap := (mst / 2) / subagentFanoutBudget
+			if ctxCap < 1 {
+				ctxCap = 1
+			}
+			if fanout > ctxCap {
+				fanout = ctxCap
+			}
+		}
 
-		// Launch unique tasks in parallel, each pinned to one [[llm]] entry
-		// in breadth-first order. The pin survives the whole subagent run so
-		// the conn's prefix cache stays warm across the tool loop. Tasks past
+		// Pin every unique task up-front in breadth-first order. The pin
+		// survives the whole subagent run so the conn's prefix cache stays
+		// warm across the tool loop, and it's stored on the pending so a
+		// fold-and-relaunch keeps the task on the same conn/slot. Tasks past
 		// pinOrder's length wrap modulo — the per-conn semaphore in llmStream
 		// is what actually enforces the cap, so wrapping just means "extra
 		// tasks queue on already-assigned conns".
-		parallel(len(order), fanout, func(k int) {
-			h := order[k]
+		for k, h := range order {
+			uniq[h].pin = pinOrder[k%len(pinOrder)]
+		}
+
+		runOne := func(h string) {
 			p := uniq[h]
 			primary := p.indices[0]
 			task := p.task
-			pin := pinOrder[k%len(pinOrder)]
+			pin := p.pin
 			subSess := newSubagentSession(sess.Cwd, sid, primary, sess.Depth+1, pin.Conn)
 			subSess.DisplayLabel = fmt.Sprintf("llm%d@%d/%d", primary+1, pin.Conn, pin.Slot)
 			ag.putSession(subSess)
@@ -201,6 +233,7 @@ func (a *agent) registerSubagentTool() {
 			result, err := ag.runSubagent(ctx, subSess, task)
 
 			mu.Lock()
+			p.ctxFull = err != nil && isContextFull(err)
 			if err != nil {
 				for _, i := range p.indices {
 					results[i] = subagentResult{Index: i, Success: false, Error: err.Error()}
@@ -218,7 +251,47 @@ func (a *agent) registerSubagentTool() {
 			} else {
 				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[%s] Done\n\n", subSess.DisplayLabel)}})
 			}
-		})
+		}
+		runBatch := func(hs []string) {
+			f := fanout
+			if f > len(hs) {
+				f = len(hs)
+			}
+			parallel(len(hs), f, func(k int) { runOne(hs[k]) })
+		}
+		runBatch(order)
+
+		// Context-full recovery: a subagent that overflowed (its own inherited
+		// history, or the server's shared KV pool crowded by the foreground)
+		// is relaunched after folding the FOREGROUND session — the parent's
+		// history is what both the pool and the history-inheriting subagent
+		// are full of, and the parent was heading for the same fold on its own
+		// next overflow anyway. Same escalation steps as the tool loop's 400
+		// recovery; one relaunch per fold step, then the failure stands and
+		// the orchestrator replans. Depth-gated like that recovery: only the
+		// real foreground folds — a depth-1 parent just fails upward.
+		if sess.Depth == 0 {
+			recoverKeepFrom := []func(*Session) int{
+				func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
+				(*Session).lastAssistantIndex,
+			}
+			for _, keepFrom := range recoverKeepFrom {
+				var retry []string
+				for _, h := range order {
+					if p := uniq[h]; p.ctxFull {
+						retry = append(retry, h)
+					}
+				}
+				if len(retry) == 0 {
+					break
+				}
+				if !ag.foldHistory(ctx, sess, keepFrom(sess)) {
+					continue // nothing freed at this step — escalate to the next
+				}
+				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ %d subagent(s) hit the context limit — compacted the conversation, relaunching.\n", len(retry))}})
+				runBatch(retry)
+			}
+		}
 
 		// Format results. Surface failure to the orchestrator's verdict: when EVERY
 		// subagent failed the whole fan-out is a real failure (failed=true, so it can

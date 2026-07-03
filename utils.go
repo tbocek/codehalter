@@ -50,6 +50,16 @@ func parallel(n, cap int, fn func(i int)) {
 // and a structurally different approach is needed.
 const failureSimilarityThreshold = 0.6
 
+// stuckOutputSimilarity is the Jaccard ratio above which a re-issued call's
+// output counts as "reproduced" for the repetition ladder even when it isn't
+// byte-identical. Catches the loops the exact hash misses: a re-run failing
+// build whose output embeds a timestamp or duration, a retried command with a
+// changing pid/port in its message. Deliberately much higher than
+// failureSimilarityThreshold: these are full tool outputs, not short reason
+// strings, and long texts share vocabulary easily — only near-identical
+// output should count as no-progress.
+const stuckOutputSimilarity = 0.9
+
 // issueBag tokenises a list of issue strings into a single set of distinct
 // lowercase alphanumeric words. Punctuation, casing and ordering are all
 // discarded so two attempts reporting the same root cause in different

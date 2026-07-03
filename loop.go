@@ -679,6 +679,11 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	// stuckEscalateRounds, bail at stuckBailRounds — and any productive round
 	// resets the streak, so read-after-write and genuine fan-out are never punished.
 	callOutHash := map[string]uint64{}
+	// callOutBag keeps each call's output as a word bag beside the exact hash:
+	// a re-issued call whose output is ≥ stuckOutputSimilarity Jaccard-similar
+	// to its previous output also counts as reproduced. Catches the loops the
+	// hash misses — a re-run failing build with a timestamp in its output.
+	callOutBag := map[string]map[string]bool{}
 	var stuckRounds int
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
@@ -723,6 +728,8 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			callConn = conn.withThinkingDisabled()
 		}
 		thinkingRetried := false // at most one such retry per round
+		capNudged := false       // cap ladder rung 1: one be-concise nudge retry per round
+		capDoubled := false      // cap ladder rung 2: one doubled-max_tokens retry per round
 		transientRetries := 0    // mid-response drops retried up to maxTransientStreamRetries
 		for {
 			text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, tools, on, think)
@@ -741,6 +748,40 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				callConn = callConn.withThinkingDisabled()
 				a.logSession(sid, "RECOVER", "model stuck in <think> — retrying with thinking disabled (rest of run)")
 				continue
+			}
+			// Cap ladder: the generation died AT the requested max_tokens cap with
+			// content or tool calls in flight. The partial is discarded (truncated
+			// tool-call JSON can't be resumed through the chat API). Rung 1: retry
+			// with a be-concise nudge — cheapest, and it keeps the output small,
+			// which is what packs concurrent calls into the KV pool. Rung 2: the
+			// output is genuinely too big for the cap, retry once on a doubled cap
+			// (sampler-side param, so the prefix cache survives). A third hit
+			// surfaces as a normal failure into the replan machinery.
+			if ce := asCapHit(err); ce != nil {
+				if !capNudged {
+					capNudged = true
+					a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
+					if sid != "" {
+						a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n"}})
+					}
+					messages = append(messages, llmMessage{Role: "user", Content: fmt.Sprintf(
+						"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap)})
+					continue
+				}
+				if !capDoubled {
+					capDoubled = true
+					base := ce.Cap
+					if base <= 0 {
+						base = defaultMaxTokens
+					}
+					callConn = callConn.withMaxTokens(base * 2)
+					a.logSession(sid, "RECOVER", "still at the cap after the nudge — one retry with max_tokens=%d", base*2)
+					if sid != "" {
+						a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", base*2)}})
+					}
+					continue
+				}
+				break // both rungs spent — surface as a normal failure (replan)
 			}
 			// Mid-response connection drop (EOF/reset — server or router closed the
 			// stream), distinct from a deliberate cancel. Usually momentary: re-send
@@ -916,11 +957,18 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			// returns NEW output is progress and clears roundStuck.
 			key := tc.Function.Name + "\x00" + tc.Function.Arguments
 			h := fnvHash(tu.Output)
+			bag := issueBag([]string{tu.Output})
 			repeated := false
 			if prev, ok := callOutHash[key]; ok && prev == h {
 				repeated = true
+			} else if prevBag, ok := callOutBag[key]; ok && jaccard(prevBag, bag) >= stuckOutputSimilarity {
+				// Not byte-identical but near-identical in content — a re-run
+				// whose output only differs in noise (timestamp, duration, pid)
+				// made no more progress than an exact repeat.
+				repeated = true
 			}
 			callOutHash[key] = h
+			callOutBag[key] = bag
 			// A SUCCESSFUL run_task/run_command re-run with identical output is a
 			// legitimate re-verify after an edit (re-running just:build / just:test to
 			// confirm a change held), NOT spinning — don't count it as no-progress. A

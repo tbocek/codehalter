@@ -167,6 +167,30 @@ func isContextFull(err error) bool {
 // Only raised when thinking was ON, so the retry can't re-trigger it.
 var errStuckThinking = errors.New("model stuck in reasoning")
 
+// capHitError marks a generation truncated AT the requested max_tokens cap with
+// actual content or tool calls in flight (a reasoning-only burn classifies as
+// errStuckThinking instead): the model needed more room than the cap allowed, or
+// was looping. The partial output is unusable — truncated tool-call JSON can't be
+// resumed through the chat API. Recoverable: the tool loop retries once with a
+// be-concise nudge, then once more on a doubled cap, before surfacing the failure
+// (see the cap ladder in runToolLoopSeeded). Cap carries the request's max_tokens
+// so that retry can compute the doubled budget.
+type capHitError struct {
+	Cap int
+	msg string
+}
+
+func (e *capHitError) Error() string { return e.msg }
+
+// asCapHit returns the capHitError inside err, or nil when err isn't one.
+func asCapHit(err error) *capHitError {
+	var ce *capHitError
+	if errors.As(err, &ce) {
+		return ce
+	}
+	return nil
+}
+
 // isStuckThinking reports whether err is the <think>-loop stall recovered by a
 // thinking-off retry (see errStuckThinking).
 func isStuckThinking(err error) bool { return errors.Is(err, errStuckThinking) }
@@ -618,8 +642,8 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 			err = fmt.Errorf("model stuck in <think> (%d B reasoning, 0 content/calls, role=%s): %w",
 				reasoningText.Len(), conn.Tag, errStuckThinking)
 		} else {
-			err = fmt.Errorf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
-				conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)
+			err = &capHitError{Cap: reqMax, msg: fmt.Sprintf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
+				conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)}
 		}
 	default:
 		err = nil

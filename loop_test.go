@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -246,5 +248,125 @@ func TestJaccardSimilarity(t *testing.T) {
 	// Symmetric.
 	if jaccard(a, b) != jaccard(b, a) {
 		t.Errorf("expected jaccard to be symmetric")
+	}
+}
+
+// TestCapHitLadder pins the cap-hit recovery in runToolLoopSeeded: a generation
+// truncated AT max_tokens first retries with a be-concise nudge appended to the
+// wire context, then once more on a doubled cap, and a response that then
+// succeeds ends the loop normally. Discarded partials never reach the result.
+func TestCapHitLadder(t *testing.T) {
+	mock := newMockLLM(t,
+		sseTruncatedContent("way too long", 1000, defaultMaxTokens),
+		sseTruncatedContent("still too long", 1000, defaultMaxTokens),
+		sseText("done"),
+	)
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.mainSlotTokens = 85248 // ample n_ctx room: these are cap hits, not the ceiling
+
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
+	if err != nil {
+		t.Fatalf("ladder should recover: %v", err)
+	}
+	if got := mock.callCount(); got != 3 {
+		t.Fatalf("callCount = %d, want 3 (cap, nudged cap, success)", got)
+	}
+	if res.Text != "done" {
+		t.Errorf("res.Text = %q, want the successful reply only (partials discarded)", res.Text)
+	}
+
+	// Rung 1: the second request must carry the be-concise nudge as the
+	// trailing user message.
+	req2 := mock.request(1)
+	msgs, _ := req2["messages"].([]any)
+	if len(msgs) == 0 {
+		t.Fatalf("second request has no messages")
+	}
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	if last["role"] != "user" || !strings.Contains(fmt.Sprint(last["content"]), "output limit") {
+		t.Errorf("second request should end with the be-concise nudge, got: %v", last)
+	}
+	if mt, ok := req2["max_tokens"].(float64); !ok || int(mt) != defaultMaxTokens {
+		t.Errorf("second request max_tokens = %v, want unchanged %d", req2["max_tokens"], defaultMaxTokens)
+	}
+
+	// Rung 2: the third request runs on the doubled cap.
+	req3 := mock.request(2)
+	if mt, ok := req3["max_tokens"].(float64); !ok || int(mt) != 2*defaultMaxTokens {
+		t.Errorf("third request max_tokens = %v, want doubled %d", req3["max_tokens"], 2*defaultMaxTokens)
+	}
+}
+
+// TestCapHitLadderExhausted pins the ladder's exit: a third consecutive cap hit
+// stops retrying and surfaces the cap error into the normal failure path
+// (replan), instead of doubling forever.
+func TestCapHitLadderExhausted(t *testing.T) {
+	mock := newMockLLM(t,
+		sseTruncatedContent("too long", 1000, defaultMaxTokens),
+		sseTruncatedContent("too long", 1000, defaultMaxTokens),
+		sseTruncatedContent("too long", 1000, 2*defaultMaxTokens),
+	)
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.mainSlotTokens = 85248
+
+	_, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
+	if asCapHit(err) == nil {
+		t.Fatalf("exhausted ladder should surface the cap error, got: %v", err)
+	}
+	if got := mock.callCount(); got != 3 {
+		t.Errorf("callCount = %d, want 3 (no retries past the ladder)", got)
+	}
+}
+
+// TestStuckLadderFuzzyOutput pins the Jaccard extension of the repetition
+// ladder: a re-issued identical call whose output differs only in noise (an
+// elapsed-time / attempt counter, i.e. a timestamped failing build) counts as
+// reproduced, so the loop bails at stuckBailRounds instead of spinning while
+// the exact output hash keeps changing.
+func TestStuckLadderFuzzyOutput(t *testing.T) {
+	const toolName = "noisy_probe_test_tool"
+	attempt := 0
+	RegisterTool(Tool{Def: map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        toolName,
+			"description": "test-only failing probe with noisy output",
+			"parameters":  map[string]any{"type": "object"},
+		},
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+		attempt++
+		// Long fixed error text + two noise tokens (elapsed, attempt) → Jaccard
+		// ≈ 0.93 between consecutive outputs: above stuckOutputSimilarity while
+		// the fnv hash differs every time.
+		return fmt.Sprintf("build FAILED: cannot load package example.com/foo/bar: import cycle not allowed in dependency graph involving widget factory manager controller service repository handler adapter transport codec parser lexer scanner tokenizer emitter renderer scheduler dispatcher broker queue worker pool cache index shard replica leader follower quorum consensus journal snapshot compaction segment (elapsed %dms, attempt %d)", 1200+attempt*7, attempt), true
+	}})
+	t.Cleanup(func() { UnregisterToolsByPrefix(toolName) })
+
+	call := sseToolCall("c1", toolName, `{}`)
+	responses := make([]string, 12)
+	for i := range responses {
+		responses[i] = call
+	}
+	mock := newMockLLM(t, responses...)
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.mainSlotTokens = 85248
+
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
+	if err != nil {
+		t.Fatalf("stuck bail is a graceful exit, got error: %v", err)
+	}
+	if res.RespondCalled {
+		t.Errorf("bail must not report a terminal exit")
+	}
+	// Round 1 registers the first output; rounds 2-6 are fuzzy-reproduced stuck
+	// rounds, and the ladder bails at stuckBailRounds — 6 calls total.
+	if got := mock.callCount(); got != 1+stuckBailRounds {
+		t.Errorf("callCount = %d, want %d (bail at stuckBailRounds via fuzzy match)", got, 1+stuckBailRounds)
 	}
 }
