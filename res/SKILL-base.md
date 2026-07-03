@@ -1,5 +1,8 @@
 # Container skill
+Today: {{cmd:date +%F}} — trust this over training-data recency; releases after your cutoff exist.
 Run inside container. Workspace bind-mount from host; container=sandbox → pkg-mgr/pip/npm writes persist container lifetime (wiped on rebuild) → test install cheap + reversible.
+
+reuse from history
 
 ## Git — writable, commit/push when asked
 .git bind-mount writable + ~/.gitconfig + SSH agent mounted → commit/push work inside. BUT git action ONLY when user explicit ask (see EXECUTE.md) — never commit/push self.
@@ -14,7 +17,17 @@ Applies execute + verify-fail replan. In plan: emit install + Dockerfile-edit st
    - Declared → image stale → point install line.
    - Not declared → propose add (TEST FIRST, below).
 3. NO retry same cmd unchanged.
+4. Not in the distro repos, or repo version too old (fast-moving: Go, gopls, LSPs) → web_search upstream install docs / releases BEFORE claiming a tool or version unavailable, then follow the install order below.
 Pkg-mgr cmd depends base image → check SKILL-<os>.md (alpine/arch/debian/fedora/ubuntu) or fall back /etc/os-release.
+
+## Install order (any missing tool, incl. lang-ecosystem: gopls, ruff, prettier…)
+1. Distro pkg mgr.
+2. Upstream website — web_search the official install docs, then either:
+   - install script: `curl -fsSL https://…/install.sh | sh` (use the shell the docs name — sh vs bash matters on minimal images);
+   - prebuilt release binary / tarball → drop into ~/.local/bin (already on PATH) or /usr/local/bin;
+   - vendor repo, when the docs offer one → add it with the custom-repo recipe in SKILL-<os>.md, then install via the pkg mgr (repo installs keep getting updates — prefer over a one-off binary when both exist).
+3. Language installer — go install / pipx / npm i -g / cargo install, when upstream documents it. In container these hit root-vs-dev env mismatch (GOBIN/PATH) → binary can land off PATH: verify with `which <tool>` after install and add the installer's bin dir to PATH if missing.
+4. Community repos: AUR, COPR, PPA, backports.
 
 ## Test install live BEFORE patch Dockerfile
 **Execute phase only. Plan stays read-only.**

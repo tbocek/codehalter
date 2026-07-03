@@ -102,6 +102,14 @@ type LLMConnection struct {
 	// distinct slot so you can see which is in use (llama.cpp assigns the real
 	// KV slot). Stamped by MainLLM / ConnAt / connForBackgroundLLM; runtime-only.
 	Slot int `toml:"-"`
+
+	// noTurnStats excludes this call from the per-turn "✅ Done" usage stats.
+	// Set (on a copy) by prewarm: its call logs under the real sid for
+	// diagnosability, but a turn that starts while the warm is still streaming
+	// resets the counters BEFORE the warm's usage lands, so without this flag
+	// the warm's ~10k prefill inflates that turn's "uncached" number.
+	// Runtime-only.
+	noTurnStats bool
 }
 
 // paramsFor returns the sampler params for the given role, falling back to

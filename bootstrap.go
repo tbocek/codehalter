@@ -419,8 +419,9 @@ func containerKind() string {
 // supported-distro slug we use to pick a SKILL-*.md (one of "alpine",
 // "arch", "debian", "fedora", "ubuntu"; "" when missing/unsupported).
 // Fields is every key=value pair from the file (un-lowercased values,
-// quotes stripped) — used to substitute {{VERSION_ID}}, {{PRETTY_NAME}},
-// etc. into the per-OS skill body so the LLM doesn't have to probe.
+// quotes stripped) — the ID/ID_LIKE resolution below reads it. The per-OS
+// skill bodies get their os-release values via {{cmd:...}} seed-time
+// expansion (skills.go) instead, so nothing else consumes the map today.
 type osInfo struct {
 	ID     string
 	Fields map[string]string

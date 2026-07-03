@@ -2,9 +2,15 @@
 FROM debian:trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates curl git sudo openssh-client \
+        ca-certificates curl git sudo gnupg openssh-client \
         firefox-esr \
     && rm -rf /var/lib/apt/lists/*
+
+# Backports pre-enabled for 3rd-choice installs (see SKILL-debian.md); the
+# codename comes from the image itself so a base bump can't desync it.
+RUN . /etc/os-release \
+    && echo "deb http://deb.debian.org/debian ${VERSION_CODENAME}-backports main" \
+        > /etc/apt/sources.list.d/backports.list
 
 RUN groupadd --gid 1000 dev \
     && useradd --uid 1000 --gid 1000 -m -s /bin/bash dev \

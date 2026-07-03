@@ -30,8 +30,7 @@
 - Same for go.mod directives: already read `go X.Y` line this turn → don't re-read.
 
 ## Install gopls (+ other Go tools)
-- Install via OS pkg mgr when it carries tool — Arch `yay -S --noconfirm gopls`. ALWAYS prefer over `go install`: in container root vs `dev` env differs (GOBIN/GOPATH/PATH) → `go install` lands binary off PATH, needs sudo + explicit `GOBIN=` — fragile + slow. Distro pkg = one clean command.
-- Fall back `GOPROXY=direct go install golang.org/x/tools/gopls@latest` ONLY when OS doesn't package it (check first: `yay -Ss gopls`).
+- OS pkg mgr first (universal rule — see container skill). Fall back `GOPROXY=direct go install golang.org/x/tools/gopls@latest` ONLY when the distro doesn't package it.
 
 ## gopls as MCP server
 - gopls 0.20+ ships built-in MCP server. Start as stdio child `gopls mcp` (serves go_symbols / go_references / go_definition / go_hover).

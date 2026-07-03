@@ -1160,11 +1160,6 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 		b.WriteString(skills)
 	}
 	fmt.Fprintf(&b, "Project directory: %s\n", sess.Cwd)
-	// Local/older models often have training data ending well before today —
-	// without this they reason about "future" releases as unreleased and give
-	// stale conclusions. Captured at session start; resumed sessions inherit
-	// that day's date, which is good enough for typical use.
-	fmt.Fprintf(&b, "Today's date: %s\n", time.Now().Format("2006-01-02"))
 	// Project-shipped agent instructions (AGENTS.md and common casings, project
 	// root only): fold them into the cached prefix at session start so they ride
 	// every turn alongside the SKILL files. Stable across the session, so no

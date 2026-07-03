@@ -1,25 +1,17 @@
 # Alpine skill
-Base: Alpine Linux ({{PRETTY_NAME}}, VERSION_ID={{VERSION_ID}}). Pkg mgr apk. libc=musl NOT glibc → prebuilt glibc binaries usually no run. Prefer Alpine pkgs / static binaries.
+Base: Alpine Linux ({{cmd:. /etc/os-release && echo "$PRETTY_NAME, VERSION_ID=$VERSION_ID"}}), {{cmd:apk --version}}. Pkg mgr apk. libc=musl + gcompat installed → most prebuilt glibc binaries run; one with heavier glibc deps may still fail → then use the Alpine pkg or a static/musl build.
 User=non-root `dev`, sudo NOPASSWD. Write ops (add/del/update) need sudo. Read probes (info, list -I) no sudo.
 
-## Probe (only if needed; session-invariant, reuse from history)
-- /etc/os-release in header → no re-cat.
-- apk --version
+## Probe
 - apk list -I → all installed (long → grep).
 - apk info <pkg> → version + desc.
 
 ## Search / install
+Order: 1) apk 2) upstream site / custom repo (below) 3) lang installer.
 - apk update → refresh index (cheap; do before search/install).
 - apk search <pkg> ; -e = exact.
 - apk info <pkg> → version, deps, files.
 - apk add <pkg> → install (no --noconfirm; no prompts).
 - apk del <pkg> → uninstall.
-- Main + community repos split. Most dev tooling in community/ → enable in /etc/apk/repositories. Rolling: apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community/ <pkg>
-
-## Version staleness
-Stable freezes versions. Fast-moving tools (Go, Node, gopls, LSPs): if apk info looks old → web_search upstream before claiming unavailable. Fallback: edge repo, or apk add build-base && make from source.
-
-## Gotchas
-- musl≠glibc: prebuilt may segfault → seek Alpine/musl/static variants.
-- Split pkgs: python3 vs py3-pip, go vs gopls.
-- apk exits 0 on "already installed" → re-run confirms presence.
+- Custom repo: key → /etc/apk/keys/, then echo "https://host/path" >> /etc/apk/repositories && apk update.
+- 4th choice edge (rolling — distinct from the stable community repo, which is already enabled), when stable's version is too old. One-shot pull, does NOT enable edge system-wide: apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community/ <pkg>

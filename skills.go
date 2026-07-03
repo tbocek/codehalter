@@ -1,16 +1,20 @@
 package main
 
 import (
+	"context"
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
 	"strings"
+	"time"
 )
 
 //go:embed res/SKILL-go.md
@@ -173,8 +177,11 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 				return fmt.Errorf("pruning stale %s: %w", path, err)
 			}
 		}
+		// The per-OS skills carry no special templating: their os-release
+		// values come through the same load-time {{cmd:...}} expansion
+		// (sourcing /etc/os-release) as every other skill.
 		if body, ok := osSkills[osi.ID]; ok {
-			if err := seed("SKILL-"+osi.ID+".md", renderOSSkill(body, osi.Fields)); err != nil {
+			if err := seed("SKILL-"+osi.ID+".md", body); err != nil {
 				return err
 			}
 		}
@@ -182,17 +189,35 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 	return nil
 }
 
-// osSkillPlaceholder matches a {{KEY}} placeholder in a per-OS skill body.
-var osSkillPlaceholder = regexp.MustCompile(`{{(\w+)}}`)
+// cmdPlaceholder matches a {{cmd:...}} placeholder in a skill body (single
+// line — `.` doesn't cross newlines). Expanded at LOAD time via `sh -c`,
+// inside the devcontainer, so a skill bakes live facts (today's date, tool
+// versions) into its text instead of spending model turns probing. Load-time
+// (not seed-time) so per-session facts stay fresh — the date must move — while
+// staying byte-stable WITHIN a session: the expanded result is built once at
+// session init (SystemPrompt) and stored, so the cached prefix never shifts
+// mid-session. The placeholder stays in the seeded file, so it also works in
+// user-added and user-edited skills. Trust note: skills live in the project's
+// .codehalter/, so their commands are project-controlled — same trust level as
+// mcp.toml's child processes, and both run inside the devcontainer sandbox.
+var cmdPlaceholder = regexp.MustCompile(`\{\{cmd:(.+?)\}\}`)
 
-// renderOSSkill substitutes {{KEY}} placeholders in the per-OS skill body with
-// the matching /etc/os-release field. A key absent from fields (a non-standard
-// image missing VERSION_ID, say) resolves to "" rather than leaking a literal
-// {{X}} to the LLM. Applied ONLY to per-OS skills — the justfile skill's
-// {{var}}/{{args}} examples are seeded raw and never pass through here.
-func renderOSSkill(body string, fields map[string]string) string {
-	return osSkillPlaceholder.ReplaceAllStringFunc(body, func(m string) string {
-		return fields[m[2:len(m)-2]] // strip the {{ }}, look up (empty if missing)
+// expandCmdPlaceholders runs each {{cmd:...}} through the shell and splices
+// in its trimmed stdout. A failing command (missing binary — e.g. a session
+// on a host without the container's toolchain) leaves the placeholder
+// verbatim in the rendered prompt and logs a warning, instead of silently
+// substituting an empty string.
+func expandCmdPlaceholders(body string) string {
+	return cmdPlaceholder.ReplaceAllStringFunc(body, func(m string) string {
+		cmd := m[len("{{cmd:") : len(m)-2]
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "sh", "-c", cmd).Output()
+		if err != nil {
+			slog.Warn("skill {{cmd:}} failed — leaving the placeholder in place", "cmd", cmd, "err", err)
+			return m
+		}
+		return strings.TrimSpace(string(out))
 	})
 }
 
@@ -203,7 +228,7 @@ func readSkillBody(cwd, name string) string {
 	if err != nil {
 		return ""
 	}
-	return string(data)
+	return expandCmdPlaceholders(string(data))
 }
 
 // skillFiles returns the SKILL-*.md filenames in .codehalter/, sorted — a
@@ -245,7 +270,7 @@ func loadSkills(cwd string, skip func(name string) bool) string {
 		if err != nil {
 			continue
 		}
-		content := string(data)
+		content := expandCmdPlaceholders(string(data))
 		if content != "" {
 			b.WriteString(content)
 			if !strings.HasSuffix(content, "\n") {

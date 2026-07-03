@@ -226,3 +226,57 @@ func TestLoadSkillsSkip(t *testing.T) {
 		t.Errorf("SKILL-base.md should still load, got %q", filtered)
 	}
 }
+
+// TestExpandCmdPlaceholders pins the seed-time {{cmd:...}} templating: stdout
+// is spliced in trimmed, several placeholders on one line all expand, a
+// failing command leaves its placeholder verbatim (visible in the seeded file
+// instead of baking a silent empty string), and the justfile skill's literal
+// {{var}} examples don't match.
+func TestExpandCmdPlaceholders(t *testing.T) {
+	got := expandCmdPlaceholders("v={{cmd:echo  1.2.3 }} on {{cmd:echo alpine}}!")
+	if got != "v=1.2.3 on alpine!" {
+		t.Errorf("expand = %q", got)
+	}
+	// Failing command → placeholder stays.
+	in := "v={{cmd:definitely-not-a-binary-xyz --version}}"
+	if got := expandCmdPlaceholders(in); got != in {
+		t.Errorf("failed cmd should leave the placeholder, got %q", got)
+	}
+	// Non-cmd placeholders (os-release keys, justfile examples) pass through.
+	in = "Base: {{PRETTY_NAME}} and {{var}} stay"
+	if got := expandCmdPlaceholders(in); got != in {
+		t.Errorf("non-cmd placeholders must pass through, got %q", got)
+	}
+}
+
+// TestSkillCmdExpandsAtLoad pins the load-time templating contract: the
+// seeded file keeps its {{cmd:...}} placeholder verbatim (user-ownable,
+// re-expands fresh each session), while every model-facing read — loadSkills
+// for the system prompt, readSkillBody for mid-session disclosure — renders
+// the command output.
+func TestSkillCmdExpandsAtLoad(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	orig := osSkills["alpine"]
+	osSkills["alpine"] = "# Alpine skill\nBase: {{cmd:echo Alpine Test}}, {{cmd:echo apk-tools 9.9}}.\n"
+	defer func() { osSkills["alpine"] = orig }()
+
+	if err := ensureSkills(dir, nil, osInfo{ID: "alpine"}); err != nil {
+		t.Fatalf("ensureSkills: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, ".codehalter", "SKILL-alpine.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "{{cmd:echo Alpine Test}}") {
+		t.Errorf("seeded file should keep the placeholder verbatim:\n%s", raw)
+	}
+	if body := readSkillBody(dir, "SKILL-alpine.md"); !strings.Contains(body, "Base: Alpine Test, apk-tools 9.9.") {
+		t.Errorf("readSkillBody should expand:\n%s", body)
+	}
+	if all := loadSkills(dir, nil); !strings.Contains(all, "Base: Alpine Test, apk-tools 9.9.") {
+		t.Errorf("loadSkills should expand:\n%s", all)
+	}
+}

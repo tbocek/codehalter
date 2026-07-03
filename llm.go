@@ -310,10 +310,13 @@ func (a *agent) prewarm(sess *Session) {
 	start := time.Now()
 	// Log under the real sid so the session log records the prewarm's exact
 	// request bytes and its cached/evaluated split — the only way to diagnose
-	// a turn-one cache miss (diff this request against turn one's). Safe for
-	// the per-turn stats: resetTurnStats at the next turn's start wipes the
-	// prewarm's usage before anything is reported.
-	_, _, _, err := a.llmStream(ctx, sess.ID, conn.withMaxTokens(1), messages, llmAllToolDefinitions(), nil, nil)
+	// a turn-one cache miss (diff this request against turn one's).
+	// noTurnStats: a turn that starts while the warm is still streaming resets
+	// the counters BEFORE the warm's usage lands, which would inflate that
+	// turn's "uncached" stat by the whole prefill.
+	warmConn := conn.withMaxTokens(1)
+	warmConn.noTurnStats = true
+	_, _, _, err := a.llmStream(ctx, sess.ID, warmConn, messages, llmAllToolDefinitions(), nil, nil)
 	elapsed := time.Since(start).Round(time.Millisecond)
 	a.logSession(sess.ID, "PREWARM", "done in %s err=%v", elapsed, err)
 	slog.Debug("prewarm: done", "sid", sess.ID, "elapsed", elapsed, "err", err)
@@ -591,7 +594,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// Sum the server's reported usage into the turn for the "✅ Done" stats line.
 	// sid="" (probes/tests) has no session, skip. A scan failure means the stream
 	// broke before the usage chunk, so the counts are 0 and this is a no-op.
-	if sess := a.getSession(sid); sess != nil {
+	if sess := a.getSession(sid); sess != nil && !conn.noTurnStats {
 		// Derive evaluated (sent-but-not-cached) from cached_tokens when timings are
 		// absent; -1 means no cache info reported. This is the only number we keep —
 		// the gross prompt_tokens (cached prefix re-counted each call) is not summed.
