@@ -308,8 +308,15 @@ func (a *agent) prewarm(sess *Session) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	start := time.Now()
-	_, _, _, err := a.llmStream(ctx, "", conn.withMaxTokens(1), messages, llmAllToolDefinitions(), nil, nil)
-	slog.Debug("prewarm: done", "sid", sess.ID, "elapsed", time.Since(start).Round(time.Millisecond), "err", err)
+	// Log under the real sid so the session log records the prewarm's exact
+	// request bytes and its cached/evaluated split — the only way to diagnose
+	// a turn-one cache miss (diff this request against turn one's). Safe for
+	// the per-turn stats: resetTurnStats at the next turn's start wipes the
+	// prewarm's usage before anything is reported.
+	_, _, _, err := a.llmStream(ctx, sess.ID, conn.withMaxTokens(1), messages, llmAllToolDefinitions(), nil, nil)
+	elapsed := time.Since(start).Round(time.Millisecond)
+	a.logSession(sess.ID, "PREWARM", "done in %s err=%v", elapsed, err)
+	slog.Debug("prewarm: done", "sid", sess.ID, "elapsed", elapsed, "err", err)
 }
 
 // llmStream is the core LLM call. Streams SSE, collects text and tool calls.
