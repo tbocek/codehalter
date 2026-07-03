@@ -34,7 +34,7 @@ An [ACP](https://agentclientprotocol.com)-compatible AI coding agent that connec
 - **Built-in tools**: `read_file`, `continue_read` (paging through a large read), `write_file`, `edit_file`, `list_files`, `search_text` (literal or regex), `run_task`, `run_command` (in-container only), `view_output` (paging spilled large outputs), `view_image` (when the active model has vision), `ask_user`, `web_search`, `web_read`, `web_read_raw`, `launch_subagent`, `respond`, `submit_plan`, `submit_improvement`. Plus any MCP-server tool, registered as `<server-name>__<tool>`.
 - **Synthetic `respond` terminal tool**: the execute and subagent phases expose a `respond(message)` tool that captures the model's final user-facing reply. The turn ends only when `respond` is called, so small local models stay inside the tool-calling grammar they handle best instead of having to decide "tool call vs free text" at exit time. Inspired by [forge](https://github.com/antoinezambelli/forge)'s `respond_tool`.
 - **Stuck-tool-loop detection**: a model that re-issues the same call gets nudged once, then the next attempt escalates to a thinking-sampler retry instead of spinning indefinitely.
-- **Stack-aware skills**: auto-detected stacks (Go, TypeScript, JavaScript, Java, C/C++, Bash), runner configs (Makefile → `SKILL-makefile.md`, justfile → `SKILL-justfile.md`), and container distro (Alpine/Arch/Debian/Fedora/Ubuntu via `/etc/os-release`) seed `SKILL-*.md` files in `.codehalter/`. `SKILL-base.md` is always seeded (codehalter assumes containerised execution and instructs the agent never to commit, push, or rewrite the project's git on its own, only when you ask). All SKILL files are concatenated into the system prompt on the first turn so they ride along in cached history. With `skills = "auto"` in settings.toml, the language/runner skills are instead **withheld until first touch** — the moment a tool call names a matching file (a `.go` path, a shell shebang in a written script, a `Makefile`, …) the skill is injected, keeping the prompt shorter for small models; the container/OS skills always stay inline. Drop your own `SKILL-*.md` to add conventions for any language (user-added skills are always inline).
+- **Stack-aware skills**: auto-detected stacks (Go, TypeScript, JavaScript, Java, C/C++, Bash), runner configs (Makefile → `SKILL-makefile.md`, justfile → `SKILL-justfile.md`), and container distro (Alpine/Arch/Debian/Fedora/Ubuntu via `/etc/os-release`) seed `SKILL-*.md` files in `.codehalter/`. `SKILL-base.md` is always seeded (codehalter assumes containerised execution and instructs the agent never to commit, push, or rewrite the project's git on its own, only when you ask). By default (`skills = "auto"`) the language/runner skills are **withheld until first touch** — the moment a tool call names a matching file (a `.go` path, a shell shebang in a written script, a `Makefile`, …) the skill is injected, keeping the prompt shorter for small models; the container/OS skills always ride inline in the system prompt. With `skills = "inline"` in settings.toml, every SKILL file is instead concatenated into the system prompt on the first turn so it all rides along in cached history. Drop your own `SKILL-*.md` to add conventions for any language (user-added skills are always inline).
 - **Task runner integration**: auto-discovers targets from `justfile`, `Makefile`, `package.json`, `go.mod`, or `Cargo.toml` and classifies them as build/test/lint/format for the startup report.
 - **Empty-project bootstrap**: fresh directories are flagged; the LLM asks on the first turn which language/runner to scaffold before writing anything.
 - **Proactive fix / setup cards**: before each turn codehalter audits the environment and, when something's missing, shows a single yes/no card instead of failing mid-task: install missing tools (gopls, node, clang, a task runner, …), set up code intelligence (lsmcp / clangd), or report an `mcp.toml` parse/start error. Accepting the card dispatches a synthetic fix turn; declining (or editing the file) dismisses it without re-nagging.
@@ -131,7 +131,7 @@ One `[[llm]]` array. Order matters: `llm[0]` is the main connection, `llm[1+]` a
 
 `server` is the base URL of your OpenAI-compatible server, the host root only (e.g. `http://localhost:8080`). codehalter appends the API paths itself: `/v1/chat/completions` for completions, plus `/v1/models` and `/props` for probing. Don't include a path.
 
-Two optional **top-level keys** (they must appear above the `[[llm]]` tables): `prewarm = true` (default on) fires a background 1-token call at session open so the server tokenizes and caches the prompt prefix before your first message; `skills = "auto"` (default `"inline"`) defers language/runner skills out of the system prompt until the session first touches a matching file.
+Two optional **top-level keys** (they must appear above the `[[llm]]` tables): `prewarm = true` (default on) fires a background 1-token call at session open so the server tokenizes and caches the prompt prefix before your first message; `skills = "inline"` (default `"auto"`) puts every language/runner skill into the system prompt up front instead of deferring each until the session first touches a matching file.
 
 ```toml
 [[llm]]
@@ -169,7 +169,7 @@ On first run, codehalter drops the phase templates into `.codehalter/`:
 | `DOCUMENT.md` | Decides when the change is user-visible enough to update the README, then edits it minimally |
 | `SUMMARISE.md` | The per-turn note format the background summariser distils each turn into (feeds compaction) |
 
-Plus per-stack `SKILL-{lang}.md` files for any language detected in the project root (`go.mod` → SKILL-go.md, `package.json`+`tsconfig.json` → SKILL-ts.md, plain `package.json` → SKILL-js.md, `pom.xml`/`build.gradle` → SKILL-java.md, `CMakeLists.txt` or `.c`/`.cpp`/`.h` files → SKILL-c.md, `*.sh`/`*.bash` files → SKILL-bash.md). Skills are concatenated into the system prompt on the first turn so they ride along in cached history (or deferred until first touch with `skills = "auto"`). Designed for smaller local models (Qwen3, Gemma) that need explicit language conventions; larger models can usually have them deleted.
+Plus per-stack `SKILL-{lang}.md` files for any language detected in the project root (`go.mod` → SKILL-go.md, `package.json`+`tsconfig.json` → SKILL-ts.md, plain `package.json` → SKILL-js.md, `pom.xml`/`build.gradle` → SKILL-java.md, `CMakeLists.txt` or `.c`/`.cpp`/`.h` files → SKILL-c.md, `*.sh`/`*.bash` files → SKILL-bash.md). Language skills are deferred until the session first touches a matching file (or concatenated into the system prompt up front with `skills = "inline"`). Designed for smaller local models (Qwen3, Gemma) that need explicit language conventions; larger models can usually have them deleted.
 
 Edit any of them to customize behavior for your project.
 
@@ -244,9 +244,7 @@ Add to your Zed settings (`~/.config/zed/settings.json`):
   "agent_servers": {
     "Codehalter": {
       "type": "custom",
-      "command": "/absolute/path/to/codehalter",
-      "args": [],
-      "env": {}
+      "command": "codehalter"
     }
   }
 }

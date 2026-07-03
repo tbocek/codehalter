@@ -3,7 +3,7 @@
 # Top-level keys must stay ABOVE the [[llm]] tables.
 
 # prewarm = true    # warm the server's prefix cache at session open (default on)
-# skills = "auto"   # defer language SKILLs from the prompt until first touch (default "inline")
+# skills = "inline" # put every language SKILL in the prompt up front (default "auto": defer until first touch)
 
 [[llm]]
 server = "http://localhost:8080"  # host root only, no path

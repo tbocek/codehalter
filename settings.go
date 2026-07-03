@@ -33,11 +33,12 @@ type Settings struct {
 	// it wastes one tiny request. nil means on.
 	Prewarm *bool `toml:"prewarm,omitempty"`
 
-	// Skills selects how SKILL-*.md files reach the model. "inline" (default,
-	// also the value for "") concatenates every skill into the system prompt.
-	// "auto" keeps only the always-relevant skills there (container/OS/bash)
-	// and injects each language/build skill the first time a tool call touches
-	// a matching file — shorter prefix, skill arrives on first use.
+	// Skills selects how SKILL-*.md files reach the model. "auto" (default,
+	// also the value for "") keeps only the always-relevant skills in the
+	// system prompt (container/OS/bash) and injects each language/build skill
+	// the first time a tool call touches a matching file — shorter prefix,
+	// skill arrives on first use. "inline" concatenates every skill into the
+	// system prompt up front.
 	Skills string `toml:"skills,omitempty"`
 
 	path string
@@ -227,7 +228,7 @@ func decodeSettings(path string) (Settings, error) {
 		slog.Warn("unknown settings key (ignored — check for a typo)", "key", key.String(), "file", path)
 	}
 	if s.Skills != "" && s.Skills != "inline" && s.Skills != "auto" {
-		slog.Warn("unknown skills value (falling back to \"inline\")", "value", s.Skills, "file", path)
+		slog.Warn("unknown skills value (falling back to \"auto\")", "value", s.Skills, "file", path)
 	}
 	s.path = path
 	return s, nil
@@ -245,7 +246,9 @@ func (a *agent) prewarmEnabled() bool {
 func (a *agent) skillsAuto() bool {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
-	return a.settings.Skills == "auto"
+	// "auto" is the default: "" and unknown values (warned at load) land here
+	// too; only an explicit "inline" opts out of first-touch deferral.
+	return a.settings.Skills != "inline"
 }
 
 // MainLLM returns the foreground connection (LLM[0]) with role-resolved

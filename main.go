@@ -54,7 +54,7 @@ type agent struct {
 	// mu guards the mutable top-level fields touched from concurrent ACP
 	// handlers and the bootstrap goroutine: cancel, sessions, mode,
 	// abortReason, and the probe-derived LLM fields (mainSlotTokens,
-	// detectedSlots, imagesSupported). MCP state has its own mutex (see
+	// imagesSupported). MCP state has its own mutex (see
 	// mcp mcpState); the per-conn semaphores in connSems lock themselves, but the
 	// connSems slice and settings are reassigned wholesale on reload under cfgMu (below).
 	mu sync.Mutex
@@ -95,14 +95,6 @@ type agent struct {
 	// assume this is ≥ minSlotTokens. Read by the input-size guard (prompt.go) and
 	// the startup banner (prepare.go).
 	mainSlotTokens int
-
-	// detectedSlots is the total slot count summed across every [[llm]] entry as
-	// of the last probeAllLLMs (each conn's parallelCap, after auto-detected
-	// total_slots is back-filled). Stored rather than recomputed live because
-	// ensureLLM resets settings.Parallel via loadSettings every pass — a live
-	// sum would read the post-reset default before the next probe, defeating the
-	// "nothing changed, skip the probe" short-circuit. totalSlots() returns this.
-	detectedSlots int
 
 	// imagesSupported is whether LLM[0] accepts inline images — the agent-wide
 	// image capability advertised over ACP. Derived from LLM[0]'s config

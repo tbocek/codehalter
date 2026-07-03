@@ -904,7 +904,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 				return lastResult, err
 			}
 			a.sendPhase(ctx, sid, 1, false)
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("\n=== Subtask %d/%d: %s ===\n\n", i+1, len(plan.Subtasks), st.Description)}})
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("\n=== Task %d/%d: %s ===\n\n", i+1, len(plan.Subtasks), st.Description)}})
 
 			outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 			lastResult = outcome.Result
@@ -949,7 +949,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		}
 		failureBags = append(failureBags, bag)
 
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Subtask %d/%d failed: %s\n", failedAt+1, len(plan.Subtasks), failedReason)}})
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Task %d/%d failed: %s\n", failedAt+1, len(plan.Subtasks), failedReason)}})
 
 		replans++
 		if replans >= maxReplans {

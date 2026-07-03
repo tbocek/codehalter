@@ -300,20 +300,6 @@ func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
 // to run and surfaces a Retry card the same way an unreachable LLM does.
 const minSlotTokens = 32 * 1024
 
-// totalSlots returns the slot count summed across every [[llm]] entry as of the
-// last probeAllLLMs (which back-fills auto-detected total_slots into each conn's
-// parallelCap before summing into a.detectedSlots). It reads the stored value
-// rather than recomputing live because ensureLLM resets settings.Parallel via
-// loadSettings each pass — a live sum would see the post-reset default before
-// the next probe and defeat the "nothing changed, skip the probe" short-circuit.
-// 0 before the first probe. A single slot is fine: the background summariser
-// runs as a prefix-extension of the foreground context on llm[0] (see
-// connForBackgroundLLM), so it reuses that KV cache instead of needing a slot
-// of its own; renderLLMStatus just notes the serialisation.
-func (a *agent) totalSlots() int {
-	return a.detectedSlots
-}
-
 // ensureLLM blocks until every startup gate passes: at least one [[llm]]
 // connection answers a probe, and llm[0] reports a per-slot context window of
 // at least minSlotTokens. First call scaffolds .codehalter/settings.toml if
@@ -489,7 +475,6 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	conns := a.settings.allConnections()
 	a.connProbe = make(map[string]probeResult, len(conns))
 	a.setMainSlotTokens(0)
-	a.detectedSlots = 0
 	if len(conns) == 0 {
 		a.imagesSupported = false
 		return
@@ -501,7 +486,7 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	})
 	// Record reachability and auto-detect the slot count: when an [[llm]] left
 	// `parallel` unset, adopt llama.cpp's reported total_slots (-np) so connSems,
-	// totalSlots, the summariser's separate-slot gate, and subagent pinning all
+	// the summariser's separate-slot gate, and subagent pinning all
 	// see real server capacity without the user declaring it. An explicit
 	// `parallel` always wins. Re-detected each probe — ensureLLM reloads settings
 	// (resetting Parallel to the file value) right before calling us.
@@ -520,13 +505,6 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	}
 	a.buildConnSems() // resize the per-conn semaphores to the back-filled caps
 	a.cfgMu.Unlock()
-
-	// Persist the total slot count (across all entries) so ensureLLM's pre-probe
-	// short-circuit reads the real number after loadSettings has reset Parallel.
-	a.detectedSlots = 0
-	for i := range a.settings.LLM {
-		a.detectedSlots += a.settings.LLM[i].parallelCap()
-	}
 
 	// LLM[0] owns the foreground session's KV cache, so its per-slot context
 	// window drives compaction sizing. Prefer the server's directly-reported
@@ -629,9 +607,6 @@ func (a *agent) renderLLMStatus() string {
 		} else {
 			fmt.Fprintf(&b, "✅ Context window: %d tokens (max prompt %d)\n\n", a.mainSlotTokens, inputCap)
 		}
-	}
-	if total := a.totalSlots(); total == 1 {
-		fmt.Fprintf(&b, "ℹ Slots: 1 — the background turn-note summariser extends the foreground context on the same slot, so its prefix cache stays warm; it serialises with your turns. Set `parallel = 2` to run it concurrently.\n\n")
 	}
 	return b.String()
 }
