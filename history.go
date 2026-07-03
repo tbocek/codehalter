@@ -163,7 +163,10 @@ func (a *agent) backgroundSummarise(sess *Session) {
 		defer cancel()
 		var note string
 		if len(t.Msgs) > 0 {
-			note = a.summariseCall(ctx, sess, t.Conn, t.Msgs, t.Turn)
+			// Prefix-extension: same tools array as the foreground turn (see
+			// summariseCall — required for the rendered prompt to share the
+			// foreground's prefix), tool_choice=none so the answer is the note.
+			note = a.summariseCall(ctx, sess, t.Conn.withToolChoiceNone(), t.Msgs, llmAllToolDefinitions(), t.Turn)
 		} else {
 			note = a.summariseSlice(ctx, sess, t.Conn, t.Prompt, t.Turn)
 		}
@@ -199,8 +202,17 @@ func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message
 // returns empty, and the image-reference block. Message construction is the
 // only thing that differs between prefix-extension (appendSummariseMsgs) and
 // transcript paste (summariseSlice), so it stays with the callers.
-func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, turn []Message) string {
-	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, nil, nil, nil)
+//
+// tools MUST be the foreground's full tool array in prefix-extension mode and
+// nil in paste mode. The chat template renders the tools array into the HEAD
+// of the prompt, so a prefix-extension call without it produces a rendered
+// prompt that diverges from the foreground's at the very first token — the
+// call re-evaluates the whole context cold AND (on a single slot) evicts the
+// foreground's KV cache, and the next user turn then re-evaluates cold too.
+// The callers pair the tools with tool_choice="none" on the conn so the
+// summariser can't answer with a tool call.
+func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, tools []map[string]any, turn []Message) string {
+	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, tools, nil, nil)
 	if err != nil || strings.TrimSpace(out) == "" {
 		slog.Debug("summarise: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
 		out = fallbackTurnNote(turn)
@@ -244,7 +256,7 @@ func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConn
 	// needs; without it a 100-iteration turn would 400 and degrade to the raw
 	// fallback note.
 	full := prompt + "\n" + clipBytes(turnBuf.String(), maxLLMInputBytes)
-	return a.summariseCall(ctx, sess, conn, []llmMessage{{Role: "user", Content: full}}, turn)
+	return a.summariseCall(ctx, sess, conn, []llmMessage{{Role: "user", Content: full}}, nil, turn)
 }
 
 // attachImageRefs appends the deterministic image-reference block to a note so

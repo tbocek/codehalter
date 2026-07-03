@@ -283,13 +283,6 @@ func (a *agent) drainFixes(ctx context.Context, sid string, fixes []fixProblem) 
 	}
 }
 
-// prepare runs the full pre-flight — checks then fix cards — in one shot. Used
-// at bootstrap, where there is no surrounding turn to split it across; the
-// per-Prompt path calls prepareChecks pre-turn and drainFixes post-turn instead.
-func (a *agent) prepare(ctx context.Context, sess *Session, sid string) {
-	a.drainFixes(ctx, sid, a.prepareChecks(ctx, sess, sid))
-}
-
 // ---------------------------------------------------------------------------
 // ensureLLM — settings load, probe, Retry-card loop
 // ---------------------------------------------------------------------------

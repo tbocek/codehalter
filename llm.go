@@ -264,6 +264,22 @@ func (c *LLMConnection) withMaxTokens(n int) *LLMConnection {
 	return &cp
 }
 
+// withToolChoiceNone returns a shallow copy of the connection that adds
+// tool_choice="none". Used by the prefix-extension summariser: the tools
+// array must still ride the request — the chat template renders it into the
+// HEAD of the prompt, so omitting it changes the rendered bytes from the very
+// first token and evicts the foreground's KV prefix instead of extending it —
+// but generation must not be steered into a tool call; the summariser has to
+// answer with the note text.
+func (c *LLMConnection) withToolChoiceNone() *LLMConnection {
+	cp := *c
+	eb := make(map[string]any, len(c.ExtraBody)+1)
+	maps.Copy(eb, c.ExtraBody)
+	eb["tool_choice"] = "none"
+	cp.ExtraBody = eb
+	return &cp
+}
+
 // prewarm pays the prompt-processing cost of the session's prefix (system
 // prompt + summary + history + tool schemas) before the user's first message,
 // so turn one only pays for its own delta. One synchronous 1-token call built
@@ -665,7 +681,15 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		if fr == "" {
 			fr = "(none)"
 		}
-		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d finish=%s\n", promptTokens, completionTokens, fr)
+		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d finish=%s", promptTokens, completionTokens, fr)
+		// Cache split when the server reported it: cached = prompt tokens served
+		// from the KV cache, evaluated = prompt tokens actually processed. This
+		// is THE line for diagnosing prefix-cache misses ("N k uncached" in the
+		// Done stats without this split is unattributable).
+		if cachedTokens >= 0 || evaluatedTokens >= 0 {
+			fmt.Fprintf(&rb, " cached=%d evaluated=%d", cachedTokens, evaluatedTokens)
+		}
+		rb.WriteString("\n")
 	}
 	if reasoning != "" {
 		fmt.Fprintf(&rb, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)

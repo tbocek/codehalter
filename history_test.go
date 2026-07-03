@@ -1835,6 +1835,17 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 	if !strings.Contains(instr, "please do the thing") {
 		t.Errorf("instruction should anchor the turn's opening user message, got:\n%s", instr)
 	}
+	// Prefix-extension MUST carry the foreground's tools array: the chat
+	// template renders tools into the head of the prompt, so a tools-less
+	// request diverges from the foreground prefix at the first token (cold
+	// re-eval + evicts the single slot's KV). tool_choice=none keeps the
+	// answer a note instead of a tool call.
+	if tools, _ := req["tools"].([]any); len(tools) == 0 {
+		t.Errorf("prefix-extension summarise request must carry the foreground tools array, got none")
+	}
+	if tc, _ := req["tool_choice"].(string); tc != "none" {
+		t.Errorf("prefix-extension summarise request should set tool_choice=none, got %v", req["tool_choice"])
+	}
 }
 
 // TestBuildContextUsesModelCallID pins the cache fix: a rebuilt context must use
@@ -1912,4 +1923,73 @@ func (s *Session) peekShadow() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return strings.Join(s.Shadow, "\n\n")
+}
+
+// TestSummarisePrefixIdentity pins the cache-consistency contract of the
+// prefix-extension summariser at the byte level: its request must render as
+// the foreground request EXTENDED — the exact same tools array, and the
+// foreground's messages as a byte-identical prefix — so the server reuses the
+// foreground's KV cache whole. Anything less (a missing tools array, a
+// re-rendered tool output) diverges the rendered prompt near token 0, which
+// on a single slot evicts the foreground cache AND makes the next user turn
+// re-evaluate cold (the 12k-uncached regression).
+func TestSummarisePrefixIdentity(t *testing.T) {
+	mock := newMockLLM(t,
+		sseText("did it"),                    // foreground call
+		sseText("Goal: g\nProgress: did it"), // prefix-extension summarise
+	)
+	defer mock.Close()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".codehalter", "SUMMARISE.md"), []byte("SUMMARISE PROMPT\n"), 0o644); err != nil {
+		t.Fatalf("write SUMMARISE.md: %v", err)
+	}
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	a := &agent{
+		sessions:       map[string]*Session{s.ID: s},
+		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		mainSlotTokens: 90_000,
+	}
+
+	s.AddUser("do the thing")
+	s.markTurnStart()
+	fgMsgs := a.buildLLMContext(s)
+	if _, _, _, err := a.llmStream(context.Background(), s.ID, a.settings.ConnAt(0, "execute"), fgMsgs, llmAllToolDefinitions(), nil, nil); err != nil {
+		t.Fatalf("foreground call: %v", err)
+	}
+	s.AddAssistant("did it")
+
+	a.backgroundSummarise(s)
+	deadline := time.Now().Add(2 * time.Second)
+	for s.peekShadow() == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("backgroundSummarise never appended a note")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	fg, sm := mock.request(0), mock.request(1)
+	fgTools, _ := json.Marshal(fg["tools"])
+	smTools, _ := json.Marshal(sm["tools"])
+	if !bytes.Equal(fgTools, smTools) {
+		t.Errorf("tools arrays differ between foreground and summarise:\nforeground: %s\nsummarise:  %s", fgTools, smTools)
+	}
+	fgM, _ := fg["messages"].([]any)
+	smM, _ := sm["messages"].([]any)
+	if len(smM) <= len(fgM) {
+		t.Fatalf("summarise request should EXTEND the foreground context: %d vs %d messages", len(smM), len(fgM))
+	}
+	for i := range fgM {
+		fb, _ := json.Marshal(fgM[i])
+		sb, _ := json.Marshal(smM[i])
+		if !bytes.Equal(fb, sb) {
+			t.Errorf("message %d diverges between foreground and summarise:\nforeground: %s\nsummarise:  %s", i, fb, sb)
+		}
+	}
 }

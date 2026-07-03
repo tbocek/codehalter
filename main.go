@@ -539,13 +539,16 @@ func (a *agent) startIndexing(sid string, cwd string) {
 		sess := a.getSession(sid)
 		if sess != nil {
 			slog.Debug("startIndexing: gitignore done, about to prepare", "sid", sid)
-			a.prepare(ctx, sess, sid)
-			// Prefix-cache prewarm, AFTER prepare: the probe has run, skills are
-			// seeded and SystemPrompt is final, so the warmed bytes match turn
-			// one. Backgrounded so bootstrap (and session/new) never waits; if
-			// the user prompts mid-warm, the conn semaphore queues the real call
-			// behind prompt processing that had to happen anyway.
+			fixes := a.prepareChecks(ctx, sess, sid)
+			// Prefix-cache prewarm AFTER the checks (the probe has run, skills
+			// are seeded, SystemPrompt is final — the warmed bytes match turn
+			// one) but BEFORE the fix cards: an accepted card dispatches a full
+			// synthetic turn, and the warm must win the race to that turn's
+			// first call (the conn semaphore serialises them, so at worst the
+			// fix turn queues behind prompt processing it needed anyway).
+			// Backgrounded so bootstrap (and session/new) never waits.
 			go a.prewarm(sess)
+			a.drainFixes(ctx, sid, fixes)
 		}
 		slog.Debug("startIndexing: bootstrap done", "sid", sid)
 	}()
