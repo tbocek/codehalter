@@ -280,7 +280,7 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// EXECUTE.md is in the system prompt now; inject only the specific subtask +
 	// verify recipe, not the full primer (which stacked in the history per subtask).
 	var prompt strings.Builder
-	fmt.Fprintf(&prompt, "EXECUTION phase — Subtask %d/%d\n\n%s\n", idx+1, total, st.Description)
+	fmt.Fprintf(&prompt, "EXECUTION phase — Task %d/%d\n\n%s\n", idx+1, total, st.Description)
 	if len(st.Verify) > 0 {
 		prompt.WriteString("\n## Verify recipe — run every entry via tools before calling respond\n\n")
 		for i, v := range st.Verify {
