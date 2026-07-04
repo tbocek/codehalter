@@ -47,6 +47,15 @@ model = "qwen-m"
 	if cfg.Judge.Name != "main" {
 		t.Fatalf("judge name should default to %q, got %q", "main", cfg.Judge.Name)
 	}
+	// Endpoint semaphores: default parallel=1, channel wired on judge + models.
+	if cfg.Judge.Parallel != 1 || cap(cfg.Judge.sem) != 1 {
+		t.Fatalf("judge parallel/sem = %d/%d, want 1/1", cfg.Judge.Parallel, cap(cfg.Judge.sem))
+	}
+	for _, m := range cfg.Models {
+		if m.Parallel != 1 || cap(m.sem) != 1 {
+			t.Fatalf("model %s parallel/sem = %d/%d, want 1/1", m.Name, m.Parallel, cap(m.sem))
+		}
+	}
 }
 
 func TestLoadConfigSamplesDefault(t *testing.T) {

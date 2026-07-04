@@ -348,8 +348,40 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 	start := time.Now()
 	defer func() { logLLM(m, reqBody, content, reasoning, err, time.Since(start)) }()
 
+	// One slot per Parallel: wait HERE, not in the server's queue — llama.cpp
+	// holds a queued request without headers, which the transport's header
+	// timeout would kill. Held for the whole stream (a slot is busy until the
+	// generation ends). Nil sem (unit tests) skips the gate.
+	if m.sem != nil {
+		select {
+		case m.sem <- struct{}{}:
+			defer func() { <-m.sem }()
+		case <-ctx.Done():
+			return "", "", fmt.Errorf("call %s (%s): cancelled while waiting for a free slot: %w", m.Name, m.Model, ctx.Err())
+		}
+	}
+
+	// Assemble the wire body as a map so m.Params merges verbatim on top of
+	// the named fields (a params key wins over Temperature/TopP/MaxTokens).
 	reqBody.Stream = true
-	body, err := json.Marshal(reqBody)
+	bodyMap := map[string]any{
+		"model":    reqBody.Model,
+		"messages": reqBody.Messages,
+		"stream":   true,
+	}
+	if reqBody.Temperature != nil {
+		bodyMap["temperature"] = *reqBody.Temperature
+	}
+	if reqBody.TopP != nil {
+		bodyMap["top_p"] = *reqBody.TopP
+	}
+	if reqBody.MaxTokens != nil {
+		bodyMap["max_tokens"] = *reqBody.MaxTokens
+	}
+	for k, v := range m.Params {
+		bodyMap[k] = v
+	}
+	body, err := json.Marshal(bodyMap)
 	if err != nil {
 		return "", "", fmt.Errorf("marshal request: %w", err)
 	}

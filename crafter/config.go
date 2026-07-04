@@ -36,6 +36,14 @@ type Settings struct {
 // no folder, so its Name is ignored). Server is the host root only. Model is
 // the id the server exposes at /v1/models. Temperature/TopP/MaxTokens are
 // optional sampler overrides sent verbatim in the request body.
+//
+// Parallel caps concurrent calls to this endpoint, matching the server's slot
+// count (llama-server -np); default 1. sem enforces it client-side: llama.cpp
+// queues a request for a busy slot WITHOUT sending headers, so an
+// over-parallel client turns queue wait into "timeout awaiting response
+// headers" (measured: prefetch segmentation vs probe verdicts on a 1-slot
+// judge). Queuing on our side has no timeout. The chan is shared by all
+// copies of the spec.
 type ModelSpec struct {
 	Name        string   `toml:"name"`
 	Server      string   `toml:"server"`
@@ -44,6 +52,15 @@ type ModelSpec struct {
 	Temperature *float64 `toml:"temperature"`
 	TopP        *float64 `toml:"top_p"`
 	MaxTokens   *int     `toml:"max_tokens"`
+	Parallel    int      `toml:"parallel"`
+
+	// Params is merged verbatim into every request body for this endpoint
+	// (crafter's version of the main package's ExtraBody) — top_k, min_p,
+	// presence_penalty, chat_template_kwargs, anything the server accepts.
+	// Set AFTER the named fields above, so a key here overrides them.
+	Params map[string]any `toml:"params"`
+
+	sem chan struct{}
 }
 
 // endpoint joins the server root with an API path — endpoint("/v1/models") →
@@ -73,6 +90,16 @@ func loadConfig(path string) (*Config, error) {
 	// model, so calls read "call main (…)" unless the user names it.
 	if cfg.Judge.Name == "" {
 		cfg.Judge.Name = "main"
+	}
+	initSem := func(m *ModelSpec) {
+		if m.Parallel < 1 {
+			m.Parallel = 1
+		}
+		m.sem = make(chan struct{}, m.Parallel)
+	}
+	initSem(&cfg.Judge)
+	for i := range cfg.Models {
+		initSem(&cfg.Models[i])
 	}
 	if len(cfg.Models) == 0 {
 		return nil, fmt.Errorf("%s: at least one [[model]] required", path)

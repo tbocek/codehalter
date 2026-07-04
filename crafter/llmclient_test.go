@@ -9,14 +9,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // sse builds a minimal SSE body from chunk payloads plus the [DONE] frame.
 func sse(chunks ...string) string {
 	var b strings.Builder
 	for _, c := range chunks {
-		b.WriteString("data: " + c + "\n\n")
+		b.WriteString("data: ")
+		b.WriteString(c)
+		b.WriteString("\n\n")
 	}
 	b.WriteString("data: [DONE]\n\n")
 	return b.String()
@@ -240,6 +245,70 @@ func TestLLMLogTracesCalls(t *testing.T) {
 	// Failure line: messages still captured, error recorded.
 	if e2.Name != "broken" || len(e2.Messages) != 1 || !strings.Contains(e2.Error, "400") {
 		t.Fatalf("error trace wrong: %+v", e2)
+	}
+}
+
+func TestParamsMergeIntoRequestBody(t *testing.T) {
+	var got map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"ok"}}]}`)))
+	}))
+	defer ts.Close()
+
+	temp := 0.6
+	spec := ModelSpec{
+		Name: "t", Server: ts.URL, Model: "m", Temperature: &temp,
+		Params: map[string]any{"top_k": 20, "presence_penalty": 1.5, "temperature": 0.9},
+	}
+	if _, err := chat(context.Background(), spec, "", "q"); err != nil {
+		t.Fatal(err)
+	}
+	if got["top_k"] != float64(20) || got["presence_penalty"] != 1.5 {
+		t.Fatalf("params not merged: %v", got)
+	}
+	// A params key overrides the named field.
+	if got["temperature"] != 0.9 {
+		t.Fatalf("params should override named temperature, got %v", got["temperature"])
+	}
+	if got["stream"] != true || got["model"] != "m" {
+		t.Fatalf("base fields missing: %v", got)
+	}
+}
+
+func TestChatSerializesPerEndpoint(t *testing.T) {
+	var inFlight, peak int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := atomic.AddInt32(&inFlight, 1)
+		for {
+			p := atomic.LoadInt32(&peak)
+			if cur <= p || atomic.CompareAndSwapInt32(&peak, p, cur) {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond) // hold the "slot" long enough to overlap
+		atomic.AddInt32(&inFlight, -1)
+		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"ok"}}]}`)))
+	}))
+	defer ts.Close()
+
+	spec := ModelSpec{Name: "t", Server: ts.URL, Model: "m", sem: make(chan struct{}, 1)}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := chat(context.Background(), spec, "", "q"); err != nil {
+				t.Errorf("chat: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if p := atomic.LoadInt32(&peak); p != 1 {
+		t.Fatalf("parallel=1 must serialize; peak concurrent requests = %d", p)
 	}
 }
 

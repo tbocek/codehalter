@@ -71,10 +71,13 @@ func TestClaimCacheInvalidation(t *testing.T) {
 }
 
 func TestHashOfStable(t *testing.T) {
-	if hashOf([]byte("x")) != hashOf([]byte("x")) {
+	// Distinct []byte allocations with equal content must hash equal —
+	// separate variables also keep staticcheck SA4000 quiet.
+	a, b := hashOf([]byte("x")), hashOf([]byte("x"))
+	if a != b {
 		t.Fatal("hash not deterministic")
 	}
-	if hashOf([]byte("x")) == hashOf([]byte("y")) {
+	if a == hashOf([]byte("y")) {
 		t.Fatal("distinct inputs collided")
 	}
 }
