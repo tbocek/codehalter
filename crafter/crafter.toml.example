@@ -1,0 +1,42 @@
+# crafter.toml — skill-crafter configuration.
+#
+# One [judge] (the strong reference model that segments skills, authors test
+# questions, and judges A/B answers) and one [[model]] per target model being
+# profiled. Endpoints are OpenAI-compatible: `server` is the host root only —
+# crafter appends /v1/chat/completions itself. Do NOT put /v1/... in `server`.
+#
+# Routers (several models behind one server, e.g. llama-server router mode)
+# work out of the box: every request names its `model`, which makes the router
+# switch — it holds the request while the model loads, then answers normally
+# (measured live; crafter's header timeout absorbs the load). crafter also
+# pings each target before its probe run so the switch is explicit and logged.
+# `model` must match the /v1/models id EXACTLY (word order, suffixes like
+# "; p1") — a mismatch is http 400 "model not found", caught by preflight.
+# Judge and targets sharing one router works but swaps models on every
+# A/B/judge round — keep the judge on its own server when you can.
+
+[settings]
+samples = 3          # A/B repetitions per claim; keep/drop is the majority
+# skills = ["go", "base"]   # restrict to these SKILL-<name>.md; empty = all in ground-skills/
+
+# The reference brain. Use your strongest available model here.
+[judge]
+server = "http://localhost:9001"
+model  = "Qwen3.5 (122B-A10B; 262k ctx; Q5_K_XL)"
+temperature = 0.6    # thinking models loop at low temp (measured: 0.2 → verbatim "Wait, I need to make sure…" loops); 0.6 is Qwen's own floor for thinking mode
+
+# --- target models being profiled -------------------------------------------
+# `name` is the folder created under models/ for this target's results and
+# pruned skills. `model` must match the id the server exposes at /v1/models.
+
+[[model]]
+name   = "gemma-4-31b"
+server = "https://ai.jos.li"
+model  = "Gemma-4 (31B; 128k ctx; visual; Q4_K_XL)"
+api_key = "..." 
+
+[[model]]
+name   = "qwen3.6-27b"
+server = "https://ai.jos.li"
+model  = "Qwen3.6 (27B; 160k ctx; Q4_K_XL; visual; p1)"
+api_key = "..." 

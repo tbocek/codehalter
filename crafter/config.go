@@ -69,6 +69,11 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Judge.Server == "" || cfg.Judge.Model == "" {
 		return nil, fmt.Errorf("%s: [judge] needs both server and model", path)
 	}
+	// Label for logs and the llm.jsonl trace — the judge is the main/reference
+	// model, so calls read "call main (…)" unless the user names it.
+	if cfg.Judge.Name == "" {
+		cfg.Judge.Name = "main"
+	}
 	if len(cfg.Models) == 0 {
 		return nil, fmt.Errorf("%s: at least one [[model]] required", path)
 	}

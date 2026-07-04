@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -215,6 +216,17 @@ const (
 	repStrikes     = 3
 )
 
+// errRepetition marks a stream aborted by the repetition guard. chat retries
+// such a call once with a "conclude now" nudge appended (measured failure:
+// Qwen3.5 thinking looped "Wait, I need to make sure…" verbatim for 14KB) —
+// a stream can't be steered mid-generation, so abort-and-renudge is the only
+// lever. errors.Is on this decides that retry.
+var errRepetition = errors.New("model output looping")
+
+// repetitionNudge is appended to the user message on the retry after a
+// repetition abort.
+const repetitionNudge = "\n\n(Note: your previous attempt on this task was aborted because its reasoning kept repeating itself without concluding. Keep reasoning brief and decisive — come to a conclusion and output the final answer.)"
+
 // repetitionGuard tokenises the stream into lowercase alphanumeric words
 // (same tokenisation as the main package's issueBag), folds them into
 // fixed-size word windows, and counts consecutive high-similarity neighbours.
@@ -266,8 +278,8 @@ func (g *repetitionGuard) flushWord() error {
 	if g.prevBag != nil && jaccard(bag, g.prevBag) >= repSimilarity {
 		g.strikes++
 		if g.strikes >= repStrikes {
-			return fmt.Errorf("repetition loop detected after %d words (%d consecutive %d-word windows ≥ %.2f Jaccard)",
-				g.total, repStrikes, repWindowWords, repSimilarity)
+			return fmt.Errorf("%w after %d words (%d consecutive %d-word windows ≥ %.2f Jaccard)",
+				errRepetition, g.total, repStrikes, repWindowWords, repSimilarity)
 		}
 	} else {
 		g.strikes = 0
@@ -439,20 +451,32 @@ func ping(ctx context.Context, m ModelSpec) error {
 // chat sends one chat completion to the model and returns the visible
 // assistant text. It is the single LLM entry point for the tool's real work —
 // the judge and every target model go through here, differing only in ModelSpec.
+//
+// A call aborted by the repetition guard is not fatal: chat says so on stderr
+// and retries once with a nudge to conclude appended to the user message. Only
+// a second loop surfaces as an error.
 func chat(ctx context.Context, m ModelSpec, system, user string) (string, error) {
-	var msgs []chatMessage
-	if strings.TrimSpace(system) != "" {
-		msgs = append(msgs, chatMessage{Role: "system", Content: system})
+	build := func(userText string) []chatMessage {
+		var msgs []chatMessage
+		if strings.TrimSpace(system) != "" {
+			msgs = append(msgs, chatMessage{Role: "system", Content: system})
+		}
+		return append(msgs, chatMessage{Role: "user", Content: userText})
 	}
-	msgs = append(msgs, chatMessage{Role: "user", Content: user})
-
-	content, reasoning, err := doChat(ctx, m, chatRequest{
+	req := chatRequest{
 		Model:       m.Model,
-		Messages:    msgs,
 		Temperature: m.Temperature,
 		TopP:        m.TopP,
 		MaxTokens:   m.MaxTokens,
-	})
+	}
+
+	req.Messages = build(user)
+	content, reasoning, err := doChat(ctx, m, req)
+	if errors.Is(err, errRepetition) {
+		fmt.Fprintf(os.Stderr, "warn: %s (%s): %v — nudging model to conclude and retrying once\n", m.Name, m.Model, err)
+		req.Messages = build(user + repetitionNudge)
+		content, reasoning, err = doChat(ctx, m, req)
+	}
 	if err != nil {
 		return "", err
 	}

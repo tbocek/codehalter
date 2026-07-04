@@ -121,20 +121,60 @@ func main() {
 	// skill. Each skill's full result (pruned SKILL-*.md, updated stats.json)
 	// lands before the next skill starts, so a long run produces usable output
 	// incrementally instead of all at the end.
-	for _, sk := range skills {
+	//
+	// prepare is the judge-side work for one skill: segment into claims,
+	// author a question per claim. Both are disk-cached, so a prepared skill
+	// that never gets probed (crash, interrupt) costs nothing next run.
+	type preparedSkill struct {
+		src       skillSource
+		orig      []byte
+		claims    []Claim
+		questions map[string]Question
+		err       error
+	}
+	prepare := func(sk skillSource) preparedSkill {
 		orig, err := os.ReadFile(sk.path)
 		if err != nil {
-			log.Fatalf("read %s: %v", sk.path, err)
+			return preparedSkill{src: sk, err: fmt.Errorf("read %s: %w", sk.path, err)}
 		}
 		logf("segmenting %s ...", sk.stack)
 		claims, err := segmentSkill(ctx, cfg.Judge, sk.stack, sk.path, filepath.Join(*cacheFlag, "segments"))
 		if err != nil {
-			log.Fatalf("%v", err)
+			return preparedSkill{src: sk, err: err}
 		}
 		logf("authoring probes for %s (%d claims) ...", sk.stack, len(claims))
 		questions, err := authorClaims(ctx, cfg.Judge, claims, filepath.Join(*cacheFlag, "authored", sk.stack+".json"))
 		if err != nil {
-			log.Fatalf("%v", err)
+			return preparedSkill{src: sk, err: err}
+		}
+		return preparedSkill{src: sk, orig: orig, claims: claims, questions: questions}
+	}
+
+	// One-step lookahead: while skill N is probed on the TARGET servers, skill
+	// N+1 is segmented+authored on the JUDGE server in the background — they
+	// live on different endpoints, so this overlaps otherwise-idle judge time.
+	// (Probing also sends the judge one verdict call per sample; those simply
+	// queue with the prefetch calls on the judge server.) Buffered chan of 1 =
+	// exactly one skill in flight ahead.
+	nextCh := make(chan preparedSkill, 1)
+	go func() { nextCh <- prepare(skills[0]) }()
+
+	for i := range skills {
+		p := <-nextCh
+		if i+1 < len(skills) {
+			next := skills[i+1]
+			go func() { nextCh <- prepare(next) }()
+		}
+		if p.err != nil {
+			// A judge failure on one skill (loop even after the nudge, bad
+			// JSON) must not abort the run — skip the skill, the next run
+			// retries it.
+			logf("warn: skipping skill %s: %v", p.src.stack, p.err)
+			continue
+		}
+		sk, orig, claims, questions := p.src, p.orig, p.claims, p.questions
+		if len(questions) < len(claims) {
+			logf("%s: %d/%d claims authored — the rest stay untested this run", sk.stack, len(questions), len(claims))
 		}
 
 		for _, m := range cfg.Models {
@@ -144,6 +184,9 @@ func main() {
 
 			pending := 0
 			for _, c := range claims {
+				if _, authored := questions[c.ID]; !authored {
+					continue // no question to probe with
+				}
 				if r, ok := dm[c.ID]; !ok || r.Err != "" {
 					pending++
 				}
@@ -167,6 +210,10 @@ func main() {
 				if r, ok := dm[c.ID]; ok && r.Err == "" {
 					continue // already decided; resume skips it
 				}
+				q, ok := questions[c.ID]
+				if !ok {
+					continue // authoring failed for this claim (warned above); counts as errored in stats
+				}
 				select {
 				case <-ctx.Done():
 					logf("interrupted at %s/%s %d/%d — progress saved to %s, re-run to resume", sk.stack, m.Name, idx+1, len(claims), resultsPath)
@@ -175,7 +222,7 @@ func main() {
 				default:
 				}
 				probeStart := time.Now()
-				res := probeClaim(ctx, cfg.Judge, m, c, questions[c.ID], cfg.Settings.Samples)
+				res := probeClaim(ctx, cfg.Judge, m, c, q, cfg.Settings.Samples)
 				res.DurationMs = time.Since(probeStart).Milliseconds()
 				res.EndedAt = time.Now().Format(time.RFC3339)
 				if err := appendResult(resultsPath, res); err != nil {

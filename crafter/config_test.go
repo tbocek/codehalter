@@ -44,6 +44,9 @@ model = "qwen-m"
 	if len(cfg.Models) != 2 || cfg.Models[0].Name != "gemma" {
 		t.Fatalf("models = %+v", cfg.Models)
 	}
+	if cfg.Judge.Name != "main" {
+		t.Fatalf("judge name should default to %q, got %q", "main", cfg.Judge.Name)
+	}
 }
 
 func TestLoadConfigSamplesDefault(t *testing.T) {

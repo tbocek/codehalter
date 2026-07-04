@@ -69,6 +69,13 @@ type ProbeResult struct {
 // authorClaims produces a Question for every claim using the judge model,
 // caching the map (keyed by claim ID) under cachePath so a re-run or a second
 // target model reuses the authored probes instead of paying the judge again.
+//
+// A claim whose authoring fails (judge error even after chat's repetition
+// nudge, or an off-spec reply) is warned about and skipped, not fatal: the
+// claim ends up with no Question, is never probed, and counts as errored in
+// the stats — a flaky judge costs one claim, not the run. A cache-write
+// failure is still an error: losing authored probes silently would re-pay the
+// judge every run.
 func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePath string) (map[string]Question, error) {
 	cache := readQuestionCache(cachePath)
 	dirty := false
@@ -76,12 +83,17 @@ func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePat
 		if _, ok := cache[c.ID]; ok {
 			continue
 		}
+		if ctx.Err() != nil {
+			break // interrupted — keep what we have, cache it below
+		}
 		var q Question
 		if err := chatJSON(ctx, judge, authorPrompt, c.Text, &q); err != nil {
-			return nil, fmt.Errorf("author probe for %s: %w", c.ID, err)
+			fmt.Fprintf(os.Stderr, "warn: author probe for %s failed, claim stays untested: %v\n", c.ID, err)
+			continue
 		}
 		if strings.TrimSpace(q.Question) == "" || strings.TrimSpace(q.Rubric) == "" {
-			return nil, fmt.Errorf("author probe for %s: judge returned empty question or rubric", c.ID)
+			fmt.Fprintf(os.Stderr, "warn: author probe for %s: judge returned empty question or rubric, claim stays untested\n", c.ID)
+			continue
 		}
 		cache[c.ID] = q
 		dirty = true

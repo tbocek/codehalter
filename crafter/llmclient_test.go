@@ -88,26 +88,65 @@ func TestChatReasoningOnlyIsError(t *testing.T) {
 	}
 }
 
-func TestChatRepetitionGuardAborts(t *testing.T) {
-	// Stream the same sentence forever; the guard must abort the call rather
-	// than read until the connection drops.
+// loopHandler streams the same sentence until the client hangs up (guard trip)
+// or the frame budget runs out.
+func loopHandler(w http.ResponseWriter, r *http.Request) {
 	loop := `{"choices":[{"delta":{"content":"the same thing again and again and again. "}}]}`
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fl, _ := w.(http.Flusher)
-		for i := 0; i < 500; i++ {
-			if _, err := fmt.Fprintf(w, "data: %s\n\n", loop); err != nil {
-				return // client hung up — the guard tripped
-			}
-			if fl != nil {
-				fl.Flush()
-			}
+	fl, _ := w.(http.Flusher)
+	for i := 0; i < 500; i++ {
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", loop); err != nil {
+			return
 		}
-		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		if fl != nil {
+			fl.Flush()
+		}
+	}
+	_, _ = w.Write([]byte("data: [DONE]\n\n"))
+}
+
+func TestChatNudgeRecoversFromRepetition(t *testing.T) {
+	// First call loops; the retry must carry the nudge in the user message and
+	// gets a clean answer.
+	var calls, nudged int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var req chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		last := req.Messages[len(req.Messages)-1].Content
+		if strings.Contains(last, "aborted because its reasoning kept repeating") {
+			nudged++
+			_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"final answer"}}]}`)))
+			return
+		}
+		loopHandler(w, r)
+	}))
+	defer ts.Close()
+	got, err := chat(context.Background(), ModelSpec{Name: "t", Server: ts.URL, Model: "m"}, "sys", "q")
+	if err != nil {
+		t.Fatalf("nudged retry should succeed: %v", err)
+	}
+	if got != "final answer" || calls != 2 || nudged != 1 {
+		t.Fatalf("got %q, calls=%d nudged=%d — want answer via exactly one nudged retry", got, calls, nudged)
+	}
+}
+
+func TestChatRepetitionPersistsAfterNudge(t *testing.T) {
+	// Loops on every attempt: chat retries once (nudge), then surfaces the error.
+	var calls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		loopHandler(w, r)
 	}))
 	defer ts.Close()
 	_, err := chat(context.Background(), ModelSpec{Name: "t", Server: ts.URL, Model: "m"}, "", "q")
-	if err == nil || !strings.Contains(err.Error(), "repetition loop") {
-		t.Fatalf("want repetition-loop error, got: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "looping") {
+		t.Fatalf("want looping error after failed nudge, got: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("want exactly 2 attempts (original + nudged), got %d", calls)
 	}
 }
 
