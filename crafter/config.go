@@ -1,0 +1,112 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/BurntSushi/toml"
+)
+
+// Config is the whole crafter.toml. One [judge] table names the strong
+// reference model that segments skills, authors questions, and judges A/B
+// answers. Each [[model]] table is one target model being profiled — the
+// thing we decide statements for. [settings] holds run-wide knobs.
+//
+// Endpoints are OpenAI-compatible (server = host root only, no /v1 path);
+// the client appends /v1/chat/completions itself, matching how the main
+// codehalter LLMConnection works.
+type Config struct {
+	Settings Settings    `toml:"settings"`
+	Judge    ModelSpec   `toml:"judge"`
+	Models   []ModelSpec `toml:"model"`
+}
+
+// Settings are run-wide knobs. Samples is the number of A/B repetitions per
+// claim; the keep/drop verdict is the majority across them. Skills optionally
+// restricts which ground-skills/SKILL-*.md files are probed (bare stack names,
+// e.g. ["go","base"]); empty means every SKILL-*.md in ground-skills/.
+type Settings struct {
+	Samples int      `toml:"samples"`
+	Skills  []string `toml:"skills"`
+}
+
+// ModelSpec is one OpenAI-compatible endpoint. Name is the folder under
+// models/ where this target's results and pruned skills land (the judge has
+// no folder, so its Name is ignored). Server is the host root only. Model is
+// the id the server exposes at /v1/models. Temperature/TopP/MaxTokens are
+// optional sampler overrides sent verbatim in the request body.
+type ModelSpec struct {
+	Name        string   `toml:"name"`
+	Server      string   `toml:"server"`
+	APIKey      string   `toml:"api_key"`
+	Model       string   `toml:"model"`
+	Temperature *float64 `toml:"temperature"`
+	TopP        *float64 `toml:"top_p"`
+	MaxTokens   *int     `toml:"max_tokens"`
+}
+
+// endpoint joins the server root with an API path — endpoint("/v1/models") →
+// "http://host:8080/v1/models". Trailing slashes on Server are tolerated. Same
+// contract as the main package's LLMConnection.endpoint.
+func (m ModelSpec) endpoint(path string) string {
+	return strings.TrimRight(m.Server, "/") + path
+}
+
+// loadConfig reads and validates crafter.toml. A run is worthless without a
+// reachable judge and at least one target, so both are hard errors here rather
+// than a confusing failure deep in the probe loop.
+func loadConfig(path string) (*Config, error) {
+	var cfg Config
+	if _, err := toml.DecodeFile(path, &cfg); err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+
+	if cfg.Settings.Samples <= 0 {
+		cfg.Settings.Samples = 3
+	}
+
+	if cfg.Judge.Server == "" || cfg.Judge.Model == "" {
+		return nil, fmt.Errorf("%s: [judge] needs both server and model", path)
+	}
+	if len(cfg.Models) == 0 {
+		return nil, fmt.Errorf("%s: at least one [[model]] required", path)
+	}
+	seen := map[string]bool{}
+	for i, m := range cfg.Models {
+		if m.Name == "" {
+			return nil, fmt.Errorf("%s: [[model]] #%d needs a name (used as the models/ folder)", path, i+1)
+		}
+		if m.Server == "" || m.Model == "" {
+			return nil, fmt.Errorf("%s: model %q needs both server and model", path, m.Name)
+		}
+		if seen[m.Name] {
+			return nil, fmt.Errorf("%s: duplicate model name %q", path, m.Name)
+		}
+		seen[m.Name] = true
+	}
+	return &cfg, nil
+}
+
+// wantSkill reports whether a bare stack name (e.g. "go" from SKILL-go.md)
+// should be probed given the Settings.Skills filter. Empty filter = probe all.
+func (s Settings) wantSkill(stack string) bool {
+	if len(s.Skills) == 0 {
+		return true
+	}
+	for _, w := range s.Skills {
+		if w == stack {
+			return true
+		}
+	}
+	return false
+}
+
+// mustExist is a small guard used by main to fail fast with a clear message
+// when a required path (crafter.toml, ground-skills/) is missing.
+func mustExist(path, what string) error {
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("%s not found at %s: %w", what, path, err)
+	}
+	return nil
+}
