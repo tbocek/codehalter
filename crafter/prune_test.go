@@ -7,7 +7,7 @@ import (
 
 func TestPruneSkill(t *testing.T) {
 	orig := "# Title\n- keep me\n- drop me\n- keep me too\n"
-	pruned := pruneSkill(orig, map[int]bool{3: true})
+	pruned := pruneSkill(orig, []Claim{{Source: "- drop me", StartLine: 3, EndLine: 3}})
 	if strings.Contains(pruned, "drop me") {
 		t.Fatalf("dropped line survived: %q", pruned)
 	}
@@ -17,38 +17,59 @@ func TestPruneSkill(t *testing.T) {
 }
 
 func TestPruneSkillCollapsesBlankRuns(t *testing.T) {
-	orig := "a\nb\nc\nd\n"
-	// Dropping b and c (lines 2,3) leaves a\n\n\nd → collapse to a\n\nd? Here b,c
-	// are content lines, not blanks, so removal just yields a\nd. Verify a real
-	// blank-run collapse: drop only line 2, but line 3 is already blank.
-	orig2 := "a\n\n\n\nb\n"
-	got := pruneSkill(orig2, map[int]bool{})
+	got := pruneSkill("a\n\n\n\nb\n", nil)
 	if strings.Contains(got, "\n\n\n") {
 		t.Fatalf("blank run not collapsed: %q", got)
 	}
-	_ = orig
 }
 
-func TestDropLineSet(t *testing.T) {
+func TestPruneSkillFragments(t *testing.T) {
+	orig := "Base: arch. Pkg mgr pacman; yay for AUR. Rolling release.\n- probes: no sudo needed here\n"
+	// Drop the middle sentence of line 1: the rest of the line survives, seam tidied.
+	pruned := pruneSkill(orig, []Claim{{Source: "Pkg mgr pacman; yay for AUR.", StartLine: 1, EndLine: 1, Fragment: true}})
+	if strings.Contains(pruned, "pacman") {
+		t.Fatalf("dropped fragment survived: %q", pruned)
+	}
+	if !strings.Contains(pruned, "Base: arch. Rolling release.") {
+		t.Fatalf("remaining sentences mangled: %q", pruned)
+	}
+	if !strings.Contains(pruned, "- probes: no sudo needed here") {
+		t.Fatalf("untouched line changed: %q", pruned)
+	}
+}
+
+func TestPruneSkillFragmentConsumesWholeLine(t *testing.T) {
+	orig := "- only sentence on this line.\n- next line stays\n"
+	// The fragment is the line's entire content: the orphaned "- " marker has
+	// no words left, so the line goes away entirely.
+	pruned := pruneSkill(orig, []Claim{{Source: "only sentence on this line.", StartLine: 1, EndLine: 1, Fragment: true}})
+	if strings.Contains(pruned, "only sentence") || strings.Contains(strings.TrimSpace(pruned), "\n-\n") {
+		t.Fatalf("consumed line not removed cleanly: %q", pruned)
+	}
+	if !strings.Contains(pruned, "- next line stays") {
+		t.Fatalf("untouched line lost: %q", pruned)
+	}
+	if lead := strings.Split(pruned, "\n")[0]; strings.TrimSpace(lead) == "-" {
+		t.Fatalf("orphan bullet survived: %q", pruned)
+	}
+}
+
+func TestDroppedClaims(t *testing.T) {
 	claims := []Claim{
 		{ID: "go#00", StartLine: 2, EndLine: 2},
 		{ID: "go#01", StartLine: 4, EndLine: 5},
 		{ID: "go#02", StartLine: 7, EndLine: 7},
+		{ID: "go#03", StartLine: 9, EndLine: 9, Fragment: true},
 	}
 	results := map[string]ProbeResult{
 		"go#00": {ClaimID: "go#00", Keep: false},           // drop
 		"go#01": {ClaimID: "go#01", Keep: true},            // keep
 		"go#02": {ClaimID: "go#02", Keep: false, Err: "x"}, // errored → keep
+		"go#03": {ClaimID: "go#03", Keep: false},           // drop (fragment)
 	}
-	drop := dropLineSet(claims, results)
-	if !drop[2] {
-		t.Fatalf("go#00 line 2 should be dropped")
-	}
-	if drop[4] || drop[5] {
-		t.Fatalf("kept claim lines must not drop")
-	}
-	if drop[7] {
-		t.Fatalf("errored claim must not drop")
+	got := droppedClaims(claims, results)
+	if len(got) != 2 || got[0].ID != "go#00" || got[1].ID != "go#03" || !got[1].Fragment {
+		t.Fatalf("droppedClaims = %+v", got)
 	}
 }
 

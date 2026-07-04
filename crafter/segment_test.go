@@ -15,23 +15,31 @@ func TestLocateSpan(t *testing.T) {
 
 ## Idioms
 - := declare, = reassign.
+User=non-root dev, sudo NOPASSWD. Write ops need sudo. Read probes no sudo.
 `, "\n"), "\n")
 
 	cases := []struct {
 		name, source       string
 		wantStart, wantEnd int
+		wantFrag           bool
 	}{
-		{"single bullet", "- NO panic for control flow.", 4, 4},
-		{"first bullet", "- Errors = values. Check: if err != nil.", 3, 3},
-		{"trailing space tolerated", "- Idioms line? no", 0, 0},
-		{"multi contiguous", "## Idioms\n- := declare, = reassign.", 6, 7},
-		{"absent", "this is not present", 0, 0},
+		{"single bullet", "- NO panic for control flow.", 4, 4, false},
+		{"first bullet", "- Errors = values. Check: if err != nil.", 3, 3, false},
+		{"no such line", "- Idioms line? no", 0, 0, false},
+		{"multi contiguous", "## Idioms\n- := declare, = reassign.", 6, 7, false},
+		{"absent", "this is not present", 0, 0, false},
+		// Sub-line fragments: one sentence of a multi-sentence line.
+		{"fragment middle sentence", "Write ops need sudo.", 8, 8, true},
+		{"fragment first sentence", "User=non-root dev, sudo NOPASSWD.", 8, 8, true},
+		{"fragment without bullet marker", "NO panic for control flow.", 4, 4, true},
+		// "sudo" appears in several lines → ambiguous, must not match.
+		{"ambiguous fragment", "sudo", 0, 0, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			gs, ge := locateSpan(file, c.source)
-			if gs != c.wantStart || ge != c.wantEnd {
-				t.Fatalf("locateSpan(%q) = (%d,%d), want (%d,%d)", c.source, gs, ge, c.wantStart, c.wantEnd)
+			gs, ge, frag := locateSpan(file, c.source)
+			if gs != c.wantStart || ge != c.wantEnd || frag != c.wantFrag {
+				t.Fatalf("locateSpan(%q) = (%d,%d,%v), want (%d,%d,%v)", c.source, gs, ge, frag, c.wantStart, c.wantEnd, c.wantFrag)
 			}
 		})
 	}
@@ -40,9 +48,9 @@ func TestLocateSpan(t *testing.T) {
 func TestLocateSpanSkipsBlankLines(t *testing.T) {
 	file := []string{"- first", "", "- second"}
 	// A source quoting both bullets with the blank between should still match.
-	gs, ge := locateSpan(file, "- first\n- second")
-	if gs != 1 || ge != 3 {
-		t.Fatalf("got (%d,%d), want (1,3)", gs, ge)
+	gs, ge, frag := locateSpan(file, "- first\n- second")
+	if gs != 1 || ge != 3 || frag {
+		t.Fatalf("got (%d,%d,%v), want (1,3,false)", gs, ge, frag)
 	}
 }
 

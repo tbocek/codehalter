@@ -239,8 +239,7 @@ func main() {
 			// Prune this skill for this model right away and refresh the
 			// accumulated stats.json, so results are on disk per skill, not
 			// only at run end.
-			drop := dropLineSet(claims, dm)
-			pruned := pruneSkill(string(orig), drop)
+			pruned := pruneSkill(string(orig), droppedClaims(claims, dm))
 			outPath := filepath.Join(modelDir, "SKILL-"+sk.stack+".md")
 			if err := os.WriteFile(outPath, []byte(pruned), 0o644); err != nil {
 				log.Fatalf("write %s: %v", outPath, err)

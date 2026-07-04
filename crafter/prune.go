@@ -28,21 +28,52 @@ type ModelStats struct {
 	PrunedBytes int          `json:"pruned_bytes"`
 }
 
-var blankRunRE = regexp.MustCompile(`\n{3,}`)
+var (
+	blankRunRE = regexp.MustCompile(`\n{3,}`)
+	spaceRunRE = regexp.MustCompile(`[ \t]{2,}`)
+)
 
 // pruneSkill removes the source spans of dropped claims from the original skill
 // content, keeping everything else byte-for-byte. Kept and errored claims stay
 // (errored = untested, so we never remove a statement we couldn't prove
-// redundant). Runs of 3+ blank lines left by removals collapse to one.
+// redundant).
 //
-// dropLines is the set of 1-based line numbers to delete, precomputed by the
-// caller from each dropped claim's [StartLine,EndLine] span.
-func pruneSkill(orig string, dropLines map[int]bool) string {
+// Whole-line claims delete their [StartLine,EndLine] lines. Fragment claims
+// remove just their Source substring from the line — the rest of the line's
+// sentences survive. A line left with no words after fragment removal (e.g. an
+// orphaned "- " bullet) is deleted; interior double spaces collapse; runs of
+// 3+ blank lines collapse to one.
+func pruneSkill(orig string, dropped []Claim) string {
+	dropLine := map[int]bool{}
+	fragsByLine := map[int][]string{}
+	for _, c := range dropped {
+		if c.Fragment {
+			fragsByLine[c.StartLine] = append(fragsByLine[c.StartLine], c.Source)
+			continue
+		}
+		for ln := c.StartLine; ln <= c.EndLine; ln++ {
+			dropLine[ln] = true
+		}
+	}
+
 	lines := strings.Split(orig, "\n")
 	kept := make([]string, 0, len(lines))
 	for i, l := range lines {
-		if dropLines[i+1] {
+		n := i + 1
+		if dropLine[n] {
 			continue
+		}
+		if frags := fragsByLine[n]; len(frags) > 0 {
+			for _, src := range frags {
+				l = strings.Replace(l, src, "", 1)
+			}
+			if len(wordBag(l)) == 0 {
+				continue // nothing but markers/punctuation left
+			}
+			// Tidy the seam: collapse interior space runs (keep indentation),
+			// drop trailing whitespace.
+			lead := l[:len(l)-len(strings.TrimLeft(l, " \t"))]
+			l = lead + spaceRunRE.ReplaceAllString(strings.TrimRight(l[len(lead):], " \t"), " ")
 		}
 		kept = append(kept, l)
 	}
@@ -51,21 +82,18 @@ func pruneSkill(orig string, dropLines map[int]bool) string {
 	return out
 }
 
-// dropLineSet turns the dropped claims into the line-number set pruneSkill
-// deletes. Only claims whose Keep is false AND that carry no error are dropped;
-// an errored claim (untested) is left in place.
-func dropLineSet(claims []Claim, results map[string]ProbeResult) map[int]bool {
-	drop := map[int]bool{}
+// droppedClaims filters to the claims pruneSkill removes: verdict "drop" with
+// no error. An errored claim (untested) is left in place.
+func droppedClaims(claims []Claim, results map[string]ProbeResult) []Claim {
+	var out []Claim
 	for _, c := range claims {
 		r, ok := results[c.ID]
 		if !ok || r.Err != "" || r.Keep {
 			continue
 		}
-		for ln := c.StartLine; ln <= c.EndLine; ln++ {
-			drop[ln] = true
-		}
+		out = append(out, c)
 	}
-	return drop
+	return out
 }
 
 // skillStats tallies keep/drop/error counts and byte sizes for one skill.

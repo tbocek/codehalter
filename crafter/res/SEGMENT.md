@@ -23,10 +23,11 @@ Rules for each claim:
   reformat, or merge lines in `source`. If a behavior spans one bullet with its
   sub-lines, copy the whole contiguous block verbatim. Prefer the smallest
   verbatim span that still stands on its own.
-- One `source` span maps to one claim. If a single bullet truly bundles two
-  unrelated behaviors, still emit ONE claim for that bullet (its `source` is the
-  whole bullet) and describe both behaviors in `text` — pruning works on whole
-  verbatim spans, so never split a span.
+- A `source` may also be a CONTIGUOUS FRAGMENT of a single line: when one line
+  packs several independent behaviors as separate sentences, emit one claim per
+  sentence and copy that exact sentence (byte-for-byte, including its trailing
+  punctuation) as the `source`. Never stitch a `source` together from
+  non-adjacent pieces, and never let one `source` span parts of two lines.
 - SKIP lines that assert no testable behavior: section headers, the file title,
   pure meta/framing sentences, and templating directives (e.g. `{{cmd:...}}`).
 
