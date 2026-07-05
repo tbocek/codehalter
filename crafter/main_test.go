@@ -105,6 +105,15 @@ func TestFmtDuration(t *testing.T) {
 	}
 }
 
+func TestCachedOr(t *testing.T) {
+	if got := cachedOr(50 * time.Millisecond); got != "cached" {
+		t.Fatalf("fast step = %q, want cached", got)
+	}
+	if got := cachedOr(65 * time.Second); got != "00:01:05" {
+		t.Fatalf("slow step = %q", got)
+	}
+}
+
 func TestTally(t *testing.T) {
 	ms := ModelStats{Skills: []SkillStats{
 		{Kept: 2, Dropped: 1, Errored: 0},

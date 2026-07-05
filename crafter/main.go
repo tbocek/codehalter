@@ -138,15 +138,22 @@ func main() {
 			return preparedSkill{src: sk, err: fmt.Errorf("read %s: %w", sk.path, err)}
 		}
 		logf("segmenting %s ...", sk.stack)
+		segStart := time.Now()
 		claims, err := segmentSkill(ctx, cfg.Judge, sk.stack, sk.path, filepath.Join(*cacheFlag, "segments"))
 		if err != nil {
 			return preparedSkill{src: sk, err: err}
 		}
-		logf("authoring probes for %s (%d claims) ...", sk.stack, len(claims))
-		questions, err := authorClaims(ctx, cfg.Judge, claims, filepath.Join(*cacheFlag, "authored", sk.stack+".json"))
+		logf("segmented %s: %d claims (%s)", sk.stack, len(claims), cachedOr(time.Since(segStart)))
+		logf("authoring probes for %s ...", sk.stack)
+		authStart := time.Now()
+		questions, err := authorClaims(ctx, cfg.Judge, claims, filepath.Join(*cacheFlag, "authored", sk.stack+".json"),
+			func(done, total int, id string, d time.Duration) {
+				logf("authored %s (%d/%d, %s)", id, done, total, fmtDuration(d))
+			})
 		if err != nil {
 			return preparedSkill{src: sk, err: err}
 		}
+		logf("authored %s: %d/%d probes (%s)", sk.stack, len(questions), len(claims), cachedOr(time.Since(authStart)))
 		return preparedSkill{src: sk, orig: orig, claims: claims, questions: questions}
 	}
 
@@ -182,58 +189,103 @@ func main() {
 			resultsPath := filepath.Join(modelDir, "results.jsonl")
 			dm := done[m.Name]
 
-			pending := 0
-			for _, c := range claims {
-				if _, authored := questions[c.ID]; !authored {
-					continue // no question to probe with
-				}
-				if r, ok := dm[c.ID]; !ok || r.Err != "" {
-					pending++
-				}
+			// Pending list computed up front: the generator goroutine below
+			// must not read dm while the consumer writes it.
+			type pendingClaim struct {
+				idx   int
+				claim Claim
+				q     Question
 			}
-			logf("== %s / %s: %d claims, %d pending ==", sk.stack, m.Name, len(claims), pending)
+			var pend []pendingClaim
+			for idx, c := range claims {
+				q, authored := questions[c.ID]
+				if !authored {
+					continue // no question to probe with (warned above); counts as errored in stats
+				}
+				if r, ok := dm[c.ID]; ok && r.Err == "" {
+					continue // already decided; resume skips it
+				}
+				pend = append(pend, pendingClaim{idx: idx, claim: c, q: q})
+			}
+			logf("== %s / %s: %d claims, %d pending ==", sk.stack, m.Name, len(claims), len(pend))
 
 			// Explicit model-switch request: a routed endpoint loads the model
 			// named in the request, so ping it once up front under a generous
 			// timeout instead of letting the switch inflate (or time out) the
 			// first probe. Harmless one-token call on a dedicated server.
-			if pending > 0 {
+			if len(pend) > 0 {
 				logf("switching endpoint to %s (a router may load the model now) ...", m.Name)
+				switchStart := time.Now()
 				wctx, wcancel := context.WithTimeout(ctx, 10*time.Minute)
 				if err := ping(wctx, m); err != nil {
 					logf("warn: model switch/warm-up for %s failed: %v — probing anyway", m.Name, err)
+				} else {
+					logf("%s ready (%s)", m.Name, cachedOr(time.Since(switchStart)))
 				}
 				wcancel()
 			}
 
-			for idx, c := range claims {
-				if r, ok := dm[c.ID]; ok && r.Err == "" {
-					continue // already decided; resume skips it
+			// Generate/judge pipeline: the TARGET produces claim N+1's A/B
+			// answers while the JUDGE scores claim N's — different servers,
+			// so the overlap is free wall-clock. Buffer 1 = at most one claim
+			// generated ahead.
+			type genItem struct {
+				pc    pendingClaim
+				pairs []samplePair
+				genMs int64
+				err   string
+			}
+			genCh := make(chan genItem, 1)
+			go func() {
+				defer close(genCh)
+				for _, pc := range pend {
+					if ctx.Err() != nil {
+						return
+					}
+					// Announce before and after generating: a claim takes
+					// minutes of target time before its verdict line appears,
+					// and without these the resume start looks hung.
+					logf("[%s %d/%d] %s %s generating %d samples ...", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, cfg.Settings.Samples)
+					genStart := time.Now()
+					pairs, err := generateSamples(ctx, m, pc.claim, pc.q, cfg.Settings.Samples)
+					it := genItem{pc: pc, pairs: pairs, genMs: time.Since(genStart).Milliseconds()}
+					if err != nil {
+						it.err = err.Error()
+					} else {
+						logf("[%s %d/%d] %s %s generated (%dms) → judging", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, it.genMs)
+					}
+					genCh <- it
 				}
-				q, ok := questions[c.ID]
-				if !ok {
-					continue // authoring failed for this claim (warned above); counts as errored in stats
+			}()
+
+			for it := range genCh {
+				judgeStart := time.Now()
+				var res ProbeResult
+				if it.err != "" {
+					res = newProbeResult(m, it.pc.claim, it.pc.q)
+					res.Err = it.err
+				} else {
+					res = judgeSamples(ctx, cfg.Judge, m, it.pc.claim, it.pc.q, it.pairs,
+						func(i, n int, verdict string) {
+							logf("[%s %d/%d] %s %s judged sample %d/%d: %s", sk.stack, it.pc.idx+1, len(claims), m.Name, it.pc.claim.ID, i, n, verdict)
+						})
 				}
-				select {
-				case <-ctx.Done():
-					logf("interrupted at %s/%s %d/%d — progress saved to %s, re-run to resume", sk.stack, m.Name, idx+1, len(claims), resultsPath)
-					finalizeAll()
-					return
-				default:
-				}
-				probeStart := time.Now()
-				res := probeClaim(ctx, cfg.Judge, m, c, q, cfg.Settings.Samples)
-				res.DurationMs = time.Since(probeStart).Milliseconds()
+				res.DurationMs = it.genMs + time.Since(judgeStart).Milliseconds()
 				res.EndedAt = time.Now().Format(time.RFC3339)
 				if err := appendResult(resultsPath, res); err != nil {
 					log.Fatalf("write result: %v", err)
 				}
-				dm[c.ID] = res
+				dm[res.ClaimID] = res
 				if res.Err != "" {
-					logf("[%s %d/%d] %s %s ERROR (%dms): %s", sk.stack, idx+1, len(claims), m.Name, res.ClaimID, res.DurationMs, res.Err)
+					logf("[%s %d/%d] %s %s ERROR (%dms): %s", sk.stack, it.pc.idx+1, len(claims), m.Name, res.ClaimID, res.DurationMs, res.Err)
 				} else {
-					logf("[%s %d/%d] %s %s → %s (%dms)", sk.stack, idx+1, len(claims), m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs)
+					logf("[%s %d/%d] %s %s → %s (%dms: gen %dms + judge)", sk.stack, it.pc.idx+1, len(claims), m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs, it.genMs)
 				}
+			}
+			if ctx.Err() != nil {
+				logf("interrupted during %s/%s — progress saved to %s, re-run to resume", sk.stack, m.Name, resultsPath)
+				finalizeAll()
+				return
 			}
 
 			// Prune this skill for this model right away and refresh the
@@ -255,6 +307,10 @@ func main() {
 			logf("%s / %s: %d kept, %d dropped, %d errored | %d → %d bytes (%s)",
 				sk.stack, m.Name, st.Kept, st.Dropped, st.Errored, st.OrigBytes, st.PrunedBytes, pct(st.OrigBytes, st.PrunedBytes))
 		}
+
+		// Refresh the docs report after every completed skill, not only at run
+		// end — a half-done overnight run should still have a current report.
+		finalizeAll()
 	}
 
 	for _, m := range cfg.Models {
@@ -277,7 +333,7 @@ func finalize(report []ModelStats, cfg *Config, modelsDir, docsPath string) {
 		fmt.Fprintf(os.Stderr, "warn: write report: %v\n", err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "report: %s\n", docsPath)
+	fmt.Fprintf(os.Stderr, "report updated: %s\n", docsPath)
 }
 
 // preflight pings the judge and every target endpoint before any real work, so
@@ -297,6 +353,7 @@ func preflight(ctx context.Context, logf func(string, ...any), cfg *Config) erro
 
 	var failed []string
 	for _, c := range checks {
+		logf("  checking %s (%s) ...", c.label, c.m.Model)
 		// Generous per-endpoint budget: on a routed server the ping itself
 		// triggers the model load. A dead host still fails fast (dial error).
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
@@ -421,6 +478,17 @@ func tally(ms ModelStats) (kept, dropped, errored int) {
 		errored += s.Errored
 	}
 	return
+}
+
+// cachedOr renders a step duration, marking near-instant completions as cache
+// hits — "segmented bash: 20 claims (cached)" reads very differently from
+// "(00:04:55)", and the distinction is what tells a watching user whether the
+// judge actually worked or the run replayed disk state.
+func cachedOr(d time.Duration) string {
+	if d < 2*time.Second {
+		return "cached"
+	}
+	return fmtDuration(d)
 }
 
 // fmtDuration renders a duration as HH:MM:SS for compact, sortable log prefixes.

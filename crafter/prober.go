@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 //go:embed res/AUTHOR.md
@@ -76,7 +77,10 @@ type ProbeResult struct {
 // the stats — a flaky judge costs one claim, not the run. A cache-write
 // failure is still an error: losing authored probes silently would re-pay the
 // judge every run.
-func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePath string) (map[string]Question, error) {
+// progress (nil = silent) is called after each freshly authored claim —
+// authoring a whole skill takes the judge tens of minutes (measured: 42 min
+// for 16 claims), and without per-claim lines that window reads as a hang.
+func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePath string, progress func(done, total int, id string, d time.Duration)) (map[string]Question, error) {
 	cache := readQuestionCache(cachePath)
 	dirty := false
 	for _, c := range claims {
@@ -86,6 +90,7 @@ func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePat
 		if ctx.Err() != nil {
 			break // interrupted — keep what we have, cache it below
 		}
+		cStart := time.Now()
 		var q Question
 		if err := chatJSON(ctx, judge, authorPrompt, c.Text, &q); err != nil {
 			fmt.Fprintf(os.Stderr, "warn: author probe for %s failed, claim stays untested: %v\n", c.ID, err)
@@ -97,6 +102,9 @@ func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePat
 		}
 		cache[c.ID] = q
 		dirty = true
+		if progress != nil {
+			progress(len(cache), len(claims), c.ID, time.Since(cStart))
+		}
 	}
 	if dirty {
 		if err := writeQuestionCache(cachePath, cache); err != nil {
@@ -106,12 +114,19 @@ func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePat
 	return cache, nil
 }
 
-// probeClaim runs the A/B/judge round `samples` times for one claim on one
-// target model and folds them into a majority verdict. A single failed sample
-// aborts the probe and returns a ProbeResult carrying the error — partial
-// sampling would bias the majority.
-func probeClaim(ctx context.Context, judge, target ModelSpec, claim Claim, q Question, samples int) ProbeResult {
-	res := ProbeResult{
+// samplePair is one A/B generation round on the target: the natural answer
+// and the claim-instructed answer, not yet judged. The split from judging lets
+// the target generate claim N+1's pairs while the judge scores claim N's —
+// they run on different servers, so the overlap is free wall-clock.
+type samplePair struct {
+	AnswerA string
+	AnswerB string
+}
+
+// newProbeResult seeds the persisted result for one claim×target with its
+// identifying fields; the caller fills verdict/samples or Err.
+func newProbeResult(target ModelSpec, claim Claim, q Question) ProbeResult {
+	return ProbeResult{
 		Model:    target.Name,
 		Skill:    claim.Skill,
 		ClaimID:  claim.ID,
@@ -119,31 +134,46 @@ func probeClaim(ctx context.Context, judge, target ModelSpec, claim Claim, q Que
 		Question: q.Question,
 		Rubric:   q.Rubric,
 	}
+}
 
+// generateSamples runs the target-only half of a probe: `samples` A/B rounds.
+// A single failed generation aborts the claim — partial sampling would bias
+// the majority.
+func generateSamples(ctx context.Context, target ModelSpec, claim Claim, q Question, samples int) ([]samplePair, error) {
 	// The claim as a system instruction for the treated (B) run. Text is the
 	// self-contained rewrite, so it reads as a standalone directive even when
 	// the verbatim source bullet would not.
 	instruction := claim.Text
 
-	keep := 0
+	pairs := make([]samplePair, 0, samples)
 	for i := 0; i < samples; i++ {
 		// A: natural behavior, no instruction. B: same task, claim injected.
 		answerA, err := chat(ctx, target, "", q.Question)
 		if err != nil {
-			res.Err = fmt.Sprintf("sample %d answer A: %v", i, err)
-			return res
+			return nil, fmt.Errorf("sample %d answer A: %w", i, err)
 		}
 		answerB, err := chat(ctx, target, instruction, q.Question)
 		if err != nil {
-			res.Err = fmt.Sprintf("sample %d answer B: %v", i, err)
-			return res
+			return nil, fmt.Errorf("sample %d answer B: %w", i, err)
 		}
+		pairs = append(pairs, samplePair{AnswerA: answerA, AnswerB: answerB})
+	}
+	return pairs, nil
+}
 
+// judgeSamples runs the judge-only half: score each generated pair against the
+// rubric and fold the verdicts into a majority. A failed judge call records
+// the error on the result (retried on resume). progress (nil = silent) fires
+// after each sample verdict — three verdicts take the judge several minutes.
+func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Question, pairs []samplePair, progress func(i, n int, verdict string)) ProbeResult {
+	res := newProbeResult(target, claim, q)
+	keep := 0
+	for i, p := range pairs {
 		var s Sample
-		s.AnswerA = answerA
-		s.AnswerB = answerB
+		s.AnswerA = p.AnswerA
+		s.AnswerB = p.AnswerB
 		judgeUser := fmt.Sprintf("RUBRIC:\n%s\n\nANSWER A (no instruction):\n%s\n\nANSWER B (with instruction):\n%s",
-			q.Rubric, answerA, answerB)
+			q.Rubric, p.AnswerA, p.AnswerB)
 		if err := chatJSON(ctx, judge, judgePrompt, judgeUser, &s); err != nil {
 			res.Err = fmt.Sprintf("sample %d judge: %v", i, err)
 			return res
@@ -161,10 +191,13 @@ func probeClaim(ctx context.Context, judge, target ModelSpec, claim Claim, q Que
 			keep++
 		}
 		res.Samples = append(res.Samples, s)
+		if progress != nil {
+			progress(i+1, len(pairs), s.Verdict)
+		}
 	}
 
 	// Majority: keep the statement only if a strict majority of samples say so.
-	res.Keep = keep*2 > samples
+	res.Keep = keep*2 > len(pairs)
 	if res.Keep {
 		res.Verdict = "keep"
 	} else {
