@@ -136,11 +136,15 @@ func main() {
 	// while a later skill is being streamlined. Prep + authoring are cached and
 	// model-independent, so model A does the real work and model B reuses it.
 	//
-	// prepSkill streamlines + segments one skill on `judge` (both cached) and, once
-	// the claims are known, GCs any authored-probe entries orphaned by a
-	// segmentation change from that skill's shared question cache.
+	// prepSkill streamlines + segments one skill (both cached) and, once the
+	// claims are known, GCs any authored-probe entries orphaned by a segmentation
+	// change from that skill's shared question cache. Segmentation runs the first
+	// pass on judge A and the repair (re-quote) pass on judge B — a different
+	// endpoint when the pool has more than one, else the same judge.
+	segJudgeA := cfg.Judges[0]
+	segJudgeB := cfg.Judges[len(cfg.Judges)-1]
 	prepSkill := func(judge ModelSpec, sk skillSource, store *probeStore) ([]byte, []Claim, error) {
-		cleanPath, err := ensureCleanSkill(ctx, judge, sk.stack, sk.path, *cleanFlag, filepath.Join(*cacheFlag, "streamline"))
+		cleanPath, err := ensureCleanSkill(ctx, judge, sk.stack, sk.path, *cleanFlag)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -148,7 +152,7 @@ func main() {
 		if err != nil {
 			return nil, nil, fmt.Errorf("read clean skill: %w", err)
 		}
-		claims, err := segmentSkill(ctx, judge, sk.stack, cleanPath, filepath.Join(*cacheFlag, "segments"))
+		claims, err := segmentSkill(ctx, segJudgeA, segJudgeB, sk.stack, cleanPath, filepath.Join(*cacheFlag, "segments"))
 		if err != nil {
 			return nil, nil, err
 		}

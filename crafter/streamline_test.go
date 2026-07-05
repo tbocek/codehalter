@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,9 +12,9 @@ import (
 	"testing"
 )
 
-// streamlineFixture returns a judge server that replies with the given
-// rewrite, counting calls, plus a ground-skill file to streamline.
-func streamlineFixture(t *testing.T, reply, source string) (judge ModelSpec, srcPath, cleanDir, cacheDir string, calls *atomic.Int32) {
+// streamlineFixture returns a judge server that replies with the given rewrite,
+// counting calls, plus a ground-skill file to streamline and the clean dir.
+func streamlineFixture(t *testing.T, reply, source string) (judge ModelSpec, srcPath, cleanDir string, calls *atomic.Int32) {
 	t.Helper()
 	calls = &atomic.Int32{}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -28,72 +27,95 @@ func streamlineFixture(t *testing.T, reply, source string) (judge ModelSpec, src
 	if err := os.WriteFile(srcPath, []byte(source), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	return ModelSpec{Name: "main", Server: ts.URL, Model: "j"},
-		srcPath, filepath.Join(root, "clean-skills"), filepath.Join(root, ".cache", "streamline"), calls
+	return ModelSpec{Name: "main", Server: ts.URL, Model: "j"}, srcPath, filepath.Join(root, "clean-skills"), calls
 }
 
 const streamlineSrc = "# Arch skill\n## Git — writable, commit/push when asked\n- use `git status` first.\n"
 
-func TestEnsureCleanSkillWritesAndCaches(t *testing.T) {
+// The clean file is generated once when absent, then owned by the user: reused
+// as-is regardless of source edits, hand-edits respected, only a delete
+// regenerates it.
+func TestEnsureCleanSkillGeneratedOnceThenOwned(t *testing.T) {
 	rewrite := "# Arch skill\n## Git\n- .git is writable; commit/push only when asked.\n- use `git status` first.\n"
-	judge, src, cleanDir, cacheDir, calls := streamlineFixture(t, rewrite, streamlineSrc)
+	judge, src, cleanDir, calls := streamlineFixture(t, rewrite, streamlineSrc)
 
-	p1, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir, cacheDir)
+	p, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(p1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != rewrite {
+	if got, _ := os.ReadFile(p); string(got) != rewrite {
 		t.Fatalf("clean file = %q, want the rewrite", got)
 	}
 
-	// Second call: cache hit, no judge call.
-	if _, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir, cacheDir); err != nil {
+	// Second call reuses the existing file — no judge call.
+	if _, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir); err != nil {
 		t.Fatal(err)
 	}
 	if calls.Load() != 1 {
-		t.Fatalf("judge called %d times, want 1 (second run must hit the cache)", calls.Load())
+		t.Fatalf("judge called %d times, want 1 (existing clean file must be reused)", calls.Load())
 	}
 
-	// Edited source: cache invalidates, judge called again.
+	// Editing the SOURCE does NOT regenerate — the clean file is owned now.
 	if err := os.WriteFile(src, []byte(streamlineSrc+"- new statement.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir, cacheDir); err != nil {
+	if _, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("judge called %d after a source edit, want 1 (clean file is owned, not regenerated)", calls.Load())
+	}
+
+	// A hand-edit of the clean file is respected verbatim.
+	mine := "# my hand-edited clean skill\n- whatever I want.\n"
+	if err := os.WriteFile(p, []byte(mine), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p2, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(p2); string(got) != mine {
+		t.Fatalf("hand-edit not respected: %q", got)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("judge called %d, want 1 (hand-edit must not trigger a rewrite)", calls.Load())
+	}
+
+	// Deleting the clean file regenerates it (judge called again).
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir); err != nil {
 		t.Fatal(err)
 	}
 	if calls.Load() != 2 {
-		t.Fatalf("judge called %d times after source edit, want 2", calls.Load())
+		t.Fatalf("judge called %d after deleting the clean file, want 2", calls.Load())
 	}
 }
 
 func TestEnsureCleanSkillUnwrapsFence(t *testing.T) {
 	rewrite := "# Arch skill\n## Git\n- commit/push only when asked.\n- use `git status` first.\n"
-	judge, src, cleanDir, cacheDir, _ := streamlineFixture(t, "```markdown\n"+rewrite+"```", streamlineSrc)
-	p, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir, cacheDir)
+	judge, src, cleanDir, _ := streamlineFixture(t, "```markdown\n"+rewrite+"```", streamlineSrc)
+	p, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := os.ReadFile(p)
-	if string(got) != rewrite {
+	if got, _ := os.ReadFile(p); string(got) != rewrite {
 		t.Fatalf("fence not unwrapped: %q", got)
 	}
 }
 
 func TestEnsureCleanSkillGuardsAgainstLoss(t *testing.T) {
 	// The rewrite silently drops the `git status` statement — the guard must
-	// reject it and fall back to the verbatim original.
+	// reject it and write the verbatim original.
 	lossy := "# Arch skill\n## Git\n- .git is writable; commit/push only when asked, and much more prose to defeat any size floor heuristic entirely.\n"
-	judge, src, cleanDir, cacheDir, _ := streamlineFixture(t, lossy, streamlineSrc)
-	p, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir, cacheDir)
+	judge, src, cleanDir, _ := streamlineFixture(t, lossy, streamlineSrc)
+	p, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := os.ReadFile(p)
-	if string(got) != streamlineSrc {
+	if got, _ := os.ReadFile(p); string(got) != streamlineSrc {
 		t.Fatalf("lossy rewrite accepted: %q", got)
 	}
 }
@@ -103,34 +125,13 @@ func TestEnsureCleanSkillGuardsAgainstShrink(t *testing.T) {
 	// suspected statement loss, fall back to the original.
 	src := streamlineSrc + strings.Repeat("- another plain statement without code that matters a lot.\n", 20)
 	shrunk := "# Arch skill\n## Git\n- use `git status` first.\n"
-	judge, srcPath, cleanDir, cacheDir, _ := streamlineFixture(t, shrunk, src)
-	p, err := ensureCleanSkill(context.Background(), judge, "arch", srcPath, cleanDir, cacheDir)
+	judge, srcPath, cleanDir, _ := streamlineFixture(t, shrunk, src)
+	p, err := ensureCleanSkill(context.Background(), judge, "arch", srcPath, cleanDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, _ := os.ReadFile(p)
-	if string(got) != src {
+	if got, _ := os.ReadFile(p); string(got) != src {
 		t.Fatalf("shrunken rewrite accepted (%d bytes vs %d)", len(got), len(src))
-	}
-}
-
-func TestEnsureCleanSkillCachePersists(t *testing.T) {
-	rewrite := "# Arch skill\n## Git\n- commit/push only when asked.\n- use `git status` first.\n"
-	judge, src, cleanDir, cacheDir, _ := streamlineFixture(t, rewrite, streamlineSrc)
-	p, err := ensureCleanSkill(context.Background(), judge, "arch", src, cleanDir, cacheDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var c streamlineCache
-	data, err := os.ReadFile(filepath.Join(cacheDir, "arch.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(data, &c); err != nil || c.Hash == "" {
-		t.Fatalf("cache sidecar invalid: %s (%v)", data, err)
-	}
-	if filepath.Base(p) != "SKILL-arch.md" {
-		t.Fatalf("clean path = %s", p)
 	}
 }
 

@@ -15,6 +15,9 @@ import (
 //go:embed res/SEGMENT.md
 var segmentPrompt string
 
+//go:embed res/REPAIR.md
+var repairPrompt string
+
 // Claim is one atomic behavioral statement pulled from a SKILL file. Text is
 // the self-contained rewrite used to author a test question; Source is the
 // verbatim span it came from — pruning keeps or drops that exact span so the
@@ -36,28 +39,35 @@ type Claim struct {
 	Fragment  bool   `json:"fragment,omitempty"`
 }
 
-// segmentReply is the judge's raw output shape before we locate source spans.
-type segmentReply struct {
-	Claims []struct {
-		Text   string `json:"text"`
-		Source string `json:"source"`
-	} `json:"claims"`
+// rawClaim is one text+source pair as the judge returns it, before we locate
+// the source span. Both segmentation and the repair pass return this shape.
+type rawClaim struct {
+	Text   string `json:"text"`
+	Source string `json:"source"`
 }
 
-// segmentSkill splits one SKILL file into atomic claims using the judge model,
-// caching the result under cacheDir/<skill>.json. Segmentation depends only on
-// the skill text and the judge (not on any target model), so caching lets a
-// resumed or re-run job skip the judge call entirely.
-func segmentSkill(ctx context.Context, judge ModelSpec, skill, skillPath, cacheDir string) ([]Claim, error) {
+// segmentReply is the judge's raw output shape before we locate source spans.
+type segmentReply struct {
+	Claims []rawClaim `json:"claims"`
+}
+
+// segmentSkill splits one SKILL file into atomic claims. judgeA does the first
+// pass; any claim whose source can't be located verbatim (paraphrased/ambiguous)
+// is handed to judgeB in a REPAIR pass that re-quotes the exact span — a
+// second-judge cross-check that recovers claims the first pass would have
+// silently dropped. Only the flagged claims go to repair, so the ones that were
+// already fine keep their (stable) IDs. The result is cached under
+// cacheDir/<skill>.json; it depends only on the skill text + the two prompts, so
+// a re-run skips both judge calls.
+func segmentSkill(ctx context.Context, judgeA, judgeB ModelSpec, skill, skillPath, cacheDir string) ([]Claim, error) {
 	content, err := os.ReadFile(skillPath)
 	if err != nil {
 		return nil, fmt.Errorf("read skill %s: %w", skillPath, err)
 	}
-	// Cache key covers the skill content AND the segmentation prompt: editing
-	// either invalidates it. Content-only keying silently kept old claims
-	// after a SEGMENT.md rule change — measured: the ordered-list rule would
-	// never have applied to already-segmented skills.
-	contentHash := hashOf([]byte(string(content) + segmentPrompt))
+	// Cache key covers the skill content AND both prompts: editing any of them
+	// invalidates it. Content-only keying silently kept old claims after a
+	// SEGMENT.md rule change.
+	contentHash := hashOf([]byte(string(content) + segmentPrompt + repairPrompt))
 
 	cachePath := filepath.Join(cacheDir, skill+".json")
 	if claims, ok := readClaimCache(cachePath, contentHash); ok {
@@ -65,7 +75,7 @@ func segmentSkill(ctx context.Context, judge ModelSpec, skill, skillPath, cacheD
 	}
 
 	var reply segmentReply
-	if err := chatJSON(ctx, judge, segmentPrompt, string(content), &reply); err != nil {
+	if err := chatJSON(ctx, judgeA, segmentPrompt, string(content), &reply); err != nil {
 		return nil, fmt.Errorf("segment %s: %w", skill, err)
 	}
 	if len(reply.Claims) == 0 {
@@ -73,34 +83,46 @@ func segmentSkill(ctx context.Context, judge ModelSpec, skill, skillPath, cacheD
 	}
 
 	lines := strings.Split(string(content), "\n")
-	claims := make([]Claim, 0, len(reply.Claims))
-	for i, rc := range reply.Claims {
-		text := strings.TrimSpace(rc.Text)
-		src := strings.TrimSpace(rc.Source)
-		if text == "" || src == "" {
+	located, broken := buildClaims(skill, lines, reply.Claims)
+
+	// Repair pass: re-quote the unlocatable sources on the second judge.
+	if len(broken) > 0 {
+		repaired, err := repairClaims(ctx, judgeB, skill, string(content), broken)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: %s: repair pass failed, %d claim(s) stay unlocatable: %v\n", skill, len(broken), err)
+		} else {
+			fixed, _ := buildClaims(skill, lines, repaired)
+			recovered := map[string]bool{}
+			for _, c := range fixed {
+				recovered[c.Text] = true
+			}
+			located = append(located, fixed...)
+			var still []rawClaim
+			for _, b := range broken {
+				if !recovered[strings.TrimSpace(b.Text)] {
+					still = append(still, b)
+				}
+			}
+			if len(fixed) > 0 {
+				fmt.Fprintf(os.Stderr, "info: %s: repair recovered %d of %d unlocatable claim(s)\n", skill, len(fixed), len(broken))
+			}
+			broken = still
+		}
+	}
+	for _, b := range broken {
+		fmt.Fprintf(os.Stderr, "warn: %s source not locatable as a unique span (paraphrased, ambiguous, or crossing line boundaries), skipping: %q\n", skill, truncate(strings.TrimSpace(b.Source), 80))
+	}
+
+	// Dedup by ID: the repair pass could re-quote a span the first pass already
+	// located, and a duplicate ID would collide in the downstream caches.
+	claims := make([]Claim, 0, len(located))
+	seen := map[string]bool{}
+	for _, c := range located {
+		if seen[c.ID] {
 			continue
 		}
-		start, end, fragment := locateSpan(lines, src)
-		if start == 0 {
-			// The judge paraphrased the source instead of copying it (or the
-			// fragment is ambiguous), so we can't prune it losslessly. Skip
-			// with a warning rather than emit a claim we can't act on.
-			fmt.Fprintf(os.Stderr, "warn: %s claim %d source not locatable as a unique span (paraphrased, ambiguous, or crossing line boundaries), skipping: %q\n", skill, i, truncate(src, 80))
-			continue
-		}
-		claims = append(claims, Claim{
-			// ID is a content hash of the source span, not a positional index,
-			// so it's stable across reordering/insertion in the skill file —
-			// results.jsonl and the authored-probe cache key on it, and a
-			// shifted line must not silently inherit another claim's verdict.
-			ID:        skill + "#" + hashOf([]byte(src))[:8],
-			Skill:     skill,
-			Text:      text,
-			Source:    src,
-			StartLine: start,
-			EndLine:   end,
-			Fragment:  fragment,
-		})
+		seen[c.ID] = true
+		claims = append(claims, c)
 	}
 	if len(claims) == 0 {
 		return nil, fmt.Errorf("segment %s: no claims had a locatable verbatim source", skill)
@@ -110,6 +132,51 @@ func segmentSkill(ctx context.Context, judge ModelSpec, skill, skillPath, cacheD
 		return nil, fmt.Errorf("cache claims for %s: %w", skill, err)
 	}
 	return claims, nil
+}
+
+// buildClaims turns raw text+source pairs into located Claims, returning the
+// ones whose source is a unique verbatim span plus the raw ones that aren't
+// (empty text/source is dropped outright, not returned as broken). The claim ID
+// is a content hash of the source span — stable across reordering, so a shifted
+// line can't inherit another claim's verdict.
+func buildClaims(skill string, lines []string, raw []rawClaim) (located []Claim, broken []rawClaim) {
+	for _, rc := range raw {
+		text := strings.TrimSpace(rc.Text)
+		src := strings.TrimSpace(rc.Source)
+		if text == "" || src == "" {
+			continue
+		}
+		start, end, fragment := locateSpan(lines, src)
+		if start == 0 {
+			broken = append(broken, rc)
+			continue
+		}
+		located = append(located, Claim{
+			ID:        skill + "#" + hashOf([]byte(src))[:8],
+			Skill:     skill,
+			Text:      text,
+			Source:    src,
+			StartLine: start,
+			EndLine:   end,
+			Fragment:  fragment,
+		})
+	}
+	return located, broken
+}
+
+// repairClaims asks judgeB to re-quote the exact verbatim span for claims whose
+// source the first pass couldn't locate, given the full skill text.
+func repairClaims(ctx context.Context, judge ModelSpec, skill, content string, broken []rawClaim) ([]rawClaim, error) {
+	brokenJSON, err := json.Marshal(broken)
+	if err != nil {
+		return nil, err
+	}
+	user := "SKILL (source text):\n" + content + "\n\nBROKEN CLAIMS (source not found verbatim in the SKILL above):\n" + string(brokenJSON)
+	var reply segmentReply
+	if err := chatJSON(ctx, judge, repairPrompt, user, &reply); err != nil {
+		return nil, err
+	}
+	return reply.Claims, nil
 }
 
 // locateSpan finds the 1-based inclusive line range in fileLines that matches

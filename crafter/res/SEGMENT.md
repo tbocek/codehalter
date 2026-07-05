@@ -36,6 +36,16 @@ Rules for each claim:
   its rank, such a claim asserts the wrong thing. HOW-details belonging to one
   item (its indented sub-bullets) may additionally be their own claims with
   their own spans.
+- A LEAD-IN line that introduces a bulleted list of INDEPENDENT items (e.g.
+  "Cases where `set -e` won't fire:" followed by "- Command substitution: …",
+  "- `local x=$(cmd)` …") is context, not a claim of its own. Emit ONE claim
+  PER BULLET, and set each `source` to that bullet's OWN verbatim line only —
+  never prepend the lead-in line to the `source`. The lead-in and the bullet sit
+  on separate lines, so a merged "lead-in:bullet" span does NOT exist verbatim in
+  the file and cannot be located. If a bullet needs the lead-in's wording to
+  stand on its own, fold that context into `text` — never into `source`. (This
+  differs from the numbered-priority rule above: there the ORDER is the behavior,
+  so it stays one claim; here each bullet is an independent behavior.)
 - SKIP lines that assert no testable behavior: section headers, the file title,
   pure meta/framing sentences, and templating directives (e.g. `{{cmd:...}}`).
 

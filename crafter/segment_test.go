@@ -1,8 +1,14 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -86,5 +92,80 @@ func TestNonBlankTrimmed(t *testing.T) {
 	got := nonBlankTrimmed([]string{"  a  ", "", "   ", "b"})
 	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
 		t.Fatalf("nonBlankTrimmed = %v", got)
+	}
+}
+
+// segJudge serves a fixed segmentation/repair reply (as the model's JSON
+// content) and counts calls.
+func segJudge(t *testing.T, replyJSON string) (ModelSpec, *atomic.Int32) {
+	t.Helper()
+	var calls atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(sse(fmt.Sprintf(`{"choices":[{"delta":{"content":%q}}]}`, replyJSON))))
+	}))
+	t.Cleanup(s.Close)
+	return ModelSpec{Name: "j", Server: s.URL, Model: "j"}, &calls
+}
+
+const segSkill = "# Skill\n- run git status before committing.\n- push only when explicitly asked.\n"
+
+// A first-pass claim whose source is paraphrased (unlocatable) is recovered by
+// the repair pass on judge B, which re-quotes the exact verbatim span.
+func TestSegmentSkillRepairsUnlocatableSource(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "SKILL-go.md")
+	if err := os.WriteFile(src, []byte(segSkill), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Pass 1: one locatable claim + one paraphrased ("push when the user asks"
+	// is not in the text, which says "push only when explicitly asked").
+	judgeA, _ := segJudge(t, `{"claims":[{"text":"check status first","source":"- run git status before committing."},{"text":"push only when asked","source":"push when the user asks"}]}`)
+	judgeB, bCalls := segJudge(t, `{"claims":[{"text":"push only when asked","source":"- push only when explicitly asked."}]}`)
+
+	claims, err := segmentSkill(context.Background(), judgeA, judgeB, "go", src, filepath.Join(root, "seg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 2 {
+		t.Fatalf("claims = %d, want 2 (1 located + 1 repaired)", len(claims))
+	}
+	if bCalls.Load() != 1 {
+		t.Fatalf("repair judge called %d times, want 1", bCalls.Load())
+	}
+	found := false
+	for _, c := range claims {
+		if c.StartLine == 0 {
+			t.Fatalf("claim not located: %+v", c)
+		}
+		if c.Text == "push only when asked" && c.Source == "- push only when explicitly asked." {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("repaired claim missing/wrong: %+v", claims)
+	}
+}
+
+// When the repair pass gives up ("" source), the unlocatable claim stays
+// dropped but the located one survives.
+func TestSegmentSkillRepairGivesUp(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "SKILL-go.md")
+	if err := os.WriteFile(src, []byte(segSkill), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	judgeA, _ := segJudge(t, `{"claims":[{"text":"check status first","source":"- run git status before committing."},{"text":"push only when asked","source":"push when the user asks"}]}`)
+	judgeB, bCalls := segJudge(t, `{"claims":[{"text":"push only when asked","source":""}]}`)
+
+	claims, err := segmentSkill(context.Background(), judgeA, judgeB, "go", src, filepath.Join(root, "seg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Text != "check status first" {
+		t.Fatalf("claims = %+v, want only the located one", claims)
+	}
+	if bCalls.Load() != 1 {
+		t.Fatalf("repair judge called %d times, want 1", bCalls.Load())
 	}
 }

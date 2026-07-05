@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	_ "embed"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,13 +12,6 @@ import (
 
 //go:embed res/STREAMLINE.md
 var streamlinePrompt string
-
-// streamlineCache is the sidecar under .cache/streamline/<skill>.json. Hash
-// covers the SOURCE skill content and STREAMLINE.md, so editing either
-// regenerates the clean version; the clean file itself lives in clean-skills/.
-type streamlineCache struct {
-	Hash string `json:"hash"`
-}
 
 var (
 	codeSpanRE = regexp.MustCompile("`[^`\n]+`")
@@ -33,26 +25,21 @@ var (
 // must survive, size must not collapse) falls back to the verbatim original
 // when the rewrite loses content, so the pipeline never runs on a lossy base.
 //
-// Cached on hash(source + prompt): a re-run or the prefetch of an unchanged
-// skill costs no judge call. Returns the clean file's path.
-func ensureCleanSkill(ctx context.Context, judge ModelSpec, skill, srcPath, cleanDir, cacheDir string) (string, error) {
+// The clean file is generated ONCE, when it's absent, and then owned by you: if
+// it already exists it is used as-is — no judge call, no hash check — so you can
+// hand-edit clean-skills/SKILL-<skill>.md and the run respects your version.
+// Delete the file to regenerate it from the ground skill. (Editing it re-triggers
+// segmentation, which is keyed on the clean content.) Returns the clean path.
+func ensureCleanSkill(ctx context.Context, judge ModelSpec, skill, srcPath, cleanDir string) (string, error) {
+	cleanPath := filepath.Join(cleanDir, "SKILL-"+skill+".md")
+	if _, err := os.Stat(cleanPath); err == nil {
+		return cleanPath, nil // already present → yours to edit; never overwritten
+	}
+
 	content, err := os.ReadFile(srcPath)
 	if err != nil {
 		return "", fmt.Errorf("read skill %s: %w", srcPath, err)
 	}
-	hash := hashOf([]byte(string(content) + streamlinePrompt))
-	cleanPath := filepath.Join(cleanDir, "SKILL-"+skill+".md")
-	cachePath := filepath.Join(cacheDir, skill+".json")
-
-	if data, err := os.ReadFile(cachePath); err == nil {
-		var c streamlineCache
-		if json.Unmarshal(data, &c) == nil && c.Hash == hash {
-			if _, err := os.Stat(cleanPath); err == nil {
-				return cleanPath, nil // cache hit: source, prompt and output all in place
-			}
-		}
-	}
-
 	out, err := chat(ctx, judge, streamlinePrompt, string(content))
 	if err != nil {
 		return "", fmt.Errorf("streamline %s: %w", skill, err)
@@ -71,14 +58,14 @@ func ensureCleanSkill(ctx context.Context, judge ModelSpec, skill, srcPath, clea
 	// No-loss guard: recategorization is fine, dropped statements are not.
 	// Code spans and {{cmd:}} directives are the least paraphrasable content —
 	// any of them missing (or a collapsed size) means the rewrite lost
-	// statements, and the verbatim original is used instead.
+	// statements, and the verbatim original is written instead.
 	if missing := missingSpans(string(content), out); len(missing) > 0 || len(out) < len(content)*4/5 {
 		if len(missing) > 0 {
-			fmt.Fprintf(os.Stderr, "warn: streamline %s dropped content (%d spans missing, e.g. %s) — using the original verbatim; delete %s to retry\n",
-				skill, len(missing), truncate(missing[0], 60), cachePath)
+			fmt.Fprintf(os.Stderr, "warn: streamline %s dropped content (%d spans missing, e.g. %s) — wrote the original verbatim; edit or delete %s to change it\n",
+				skill, len(missing), truncate(missing[0], 60), cleanPath)
 		} else {
-			fmt.Fprintf(os.Stderr, "warn: streamline %s shrank %d → %d bytes (suspected statement loss) — using the original verbatim; delete %s to retry\n",
-				skill, len(content), len(out), cachePath)
+			fmt.Fprintf(os.Stderr, "warn: streamline %s shrank %d → %d bytes (suspected statement loss) — wrote the original verbatim; edit or delete %s to change it\n",
+				skill, len(content), len(out), cleanPath)
 		}
 		out = string(content)
 	}
@@ -88,16 +75,6 @@ func ensureCleanSkill(ctx context.Context, judge ModelSpec, skill, srcPath, clea
 	}
 	if err := os.WriteFile(cleanPath, []byte(out), 0o644); err != nil {
 		return "", fmt.Errorf("write %s: %w", cleanPath, err)
-	}
-	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-		return "", err
-	}
-	data, err := json.Marshal(streamlineCache{Hash: hash})
-	if err != nil {
-		return "", err
-	}
-	if err := os.WriteFile(cachePath, data, 0o644); err != nil {
-		return "", fmt.Errorf("cache streamline %s: %w", skill, err)
 	}
 	return cleanPath, nil
 }
