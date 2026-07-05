@@ -160,7 +160,7 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
 <nav><div class="wrap"><div class="row">
   <span class="wordmark">codehalter</span>
   <span class="spacer"></span>
-  <span class="links"><a href="skill-crafter.html">about</a> <a href="index.html">← home</a></span>
+  <span class="links"><a href="index.html#skill-crafter">about</a> <a href="index.html">← home</a></span>
 </div></div></nav>
 
 <div class="wrap">

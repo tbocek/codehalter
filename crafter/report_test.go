@@ -34,7 +34,7 @@ func TestWriteReport(t *testing.T) {
 	}}
 	cfg := &Config{Judge: ModelSpec{Model: "big-judge"}, Settings: Settings{Samples: 3}}
 
-	out := filepath.Join(root, "docs", "skill-crafter.html")
+	out := filepath.Join(root, "docs", "skill-crafter-report.html")
 	if err := writeReport(out, stats, cfg, modelsDir); err != nil {
 		t.Fatal(err)
 	}

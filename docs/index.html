@@ -168,10 +168,37 @@
   footer .lnks{display:flex;gap:22px;font-size:13px;color:var(--text-dim);}
   footer .lnks a:hover{color:var(--text);}
 
+  /* skill crafter */
+  p.body{color:var(--text-dim);font-size:15px;max-width:70ch;line-height:1.8;margin:0;}
+  p.body b{color:var(--text);font-weight:600;}
+  .ab{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:8px;}
+  .abcard{background:var(--panel);border:1px solid var(--line);border-radius:13px;overflow:hidden;}
+  .abcard .h{padding:12px 18px;border-bottom:1px solid var(--line-soft);font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text-dim);}
+  .abcard .b{padding:18px;font-size:13.5px;color:var(--text);line-height:1.7;}
+  .abcard .b .muted{color:var(--text-dim);}
+  .verdict{display:inline-flex;align-items:center;gap:8px;margin-top:18px;font-size:13px;color:var(--text-dim);}
+  .pill2{font-size:11px;font-weight:700;padding:2px 9px;border-radius:20px;color:var(--green);border:1px solid var(--green-dim);}
+  .cmp{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;}
+  .cmpcard{background:var(--panel);border:1px solid var(--line);border-radius:13px;overflow:hidden;}
+  .cmpcard .h{padding:12px 18px;border-bottom:1px solid var(--line-soft);font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--text-dim);display:flex;gap:8px;align-items:baseline;}
+  .cmpcard .h .sz{margin-left:auto;font-weight:700;color:var(--green);text-transform:none;letter-spacing:0;}
+  .cmpcard .b{padding:18px;font-size:13px;line-height:1.85;color:var(--text);}
+  .cmpcard .b s{color:var(--text-faint);text-decoration-color:color-mix(in srgb, var(--text-faint) 65%, transparent);}
+  .cmp-note{font-size:13px;color:var(--text-dim);margin-top:14px;line-height:1.7;}
+  .cmp-note b{color:var(--text);}
+  .szrow{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line-soft);border:1px solid var(--line-soft);border-radius:12px;overflow:hidden;margin-top:26px;}
+  .szc{background:var(--panel-2);padding:18px 16px;text-align:center;}
+  .szc .num{font-size:22px;font-weight:800;letter-spacing:-.03em;color:var(--green);line-height:1.1;margin-bottom:6px;}
+  .szc .lbl{font-size:12px;color:var(--text-dim);}
+  .refs{margin:18px 0 0;padding-left:22px;font-size:13px;color:var(--text-dim);line-height:1.9;}
+  .refs a{color:var(--text);border-bottom:1px solid var(--line);}
+  .refs a:hover{border-color:var(--green-dim);}
+
   @media(max-width:860px){
     h1{font-size:42px;}
     .pipe,.feat,.stats{grid-template-columns:1fr 1fr;}
     .showcase{grid-template-columns:1fr;gap:32px;}
+    .ab,.cmp,.szrow{grid-template-columns:1fr;}
     nav .links{display:none;}
   }
   @media(max-width:560px){
@@ -203,7 +230,7 @@
         <a href="#how">How it works</a>
         <a href="#features">Features</a>
         <a href="#install">Install</a>
-        <a href="skill-crafter.html">Skill Crafter</a>
+        <a href="#skill-crafter">Skill Crafter</a>
         <a href="https://github.com/tbocek/codehalter">Docs</a>
       </div>
       <a class="ghost" href="https://github.com/tbocek/codehalter">
@@ -399,6 +426,133 @@
             <p>On first run it scaffolds a <code>.devcontainer</code>. Reopen the project inside it and start the plan, execute, verify, document loop.</p>
           </li>
       </ol>
+    </div>
+  </section>
+
+  <!-- SKILL CRAFTER -->
+  <section class="section" id="skill-crafter">
+    <div class="wrap">
+      <div class="eyebrow">Skill Crafter</div>
+      <h2 class="sec-title">Different models need different skills.</h2>
+      <p class="sec-sub">codehalter steers models with <b>SKILL files</b> — short lists of behavioral statements.
+        But a statement only earns its place if the model would get it <b>wrong without it</b>: some behaviors are
+        baked into a model's weights, others aren't, and a finetune shifts the line again. Skill Crafter measures
+        which is which, per model, and prunes the rest. Statement proposals surface via <code>/improve</code>;
+        broadly useful ones graduate into the shared skill base, and every statement then faces the probe.</p>
+
+      <div class="pipe">
+        <div class="step">
+          <div class="n">01 <span class="ln"></span></div>
+          <h3>Segment</h3>
+          <p>A judge model splits a skill file into <b>atomic claims</b> — one testable behavior each, mapped
+            back to its exact source text.</p>
+        </div>
+        <div class="step">
+          <div class="n">02 <span class="ln"></span></div>
+          <h3>Author</h3>
+          <p>For each claim it writes a <b>disguised coding question</b> plus a rubric: what a claim-following
+            answer contains that a claim-ignoring one lacks.</p>
+        </div>
+        <div class="step">
+          <div class="n">03 <span class="ln"></span></div>
+          <h3>A / B probe</h3>
+          <p>The target model answers the question <b>with and without</b> the claim, several times over, to
+            average out noise.</p>
+        </div>
+        <div class="step">
+          <div class="n">04 <span class="ln"></span></div>
+          <h3>Judge &amp; prune</h3>
+          <p>If the answers are alike, the model already knew — <b>drop</b> the line. If the claim fixed it,
+            <b>keep</b> it. Verdicts build a per-model skill file.</p>
+        </div>
+      </div>
+
+      <div style="margin-top:44px">
+        <p class="sec-sub" style="margin-bottom:16px">A single probe, concretely — claim:
+          <code>"in Go, wrap errors with fmt.Errorf and %w"</code></p>
+        <div class="ab">
+          <div class="abcard">
+            <div class="h">Answer A · no instruction</div>
+            <div class="b"><span class="muted">returns the error bare:</span><br><code>return err</code><br>
+              <span class="muted">— loses the call-site context.</span></div>
+          </div>
+          <div class="abcard">
+            <div class="h">Answer B · with the claim</div>
+            <div class="b"><span class="muted">wraps with context:</span><br><code>return fmt.Errorf("load config: %w", err)</code><br>
+              <span class="muted">— chain preserved.</span></div>
+          </div>
+        </div>
+        <div class="verdict"><span class="pill2">KEEP</span> B satisfied the rubric, A did not — this model
+          needs the line.</div>
+      </div>
+
+      <div style="margin-top:52px">
+        <h3 class="sec-title" style="font-size:22px">Measured: same skill, two models, different keeps.</h3>
+        <p class="sec-sub">From a real run (July 2026): the header of <code>SKILL-arch.md</code>, probed with a
+          Qwen3.5-122B judge, 3 A/B samples per claim. <s>Struck text</s> = the model already behaves this way
+          unprompted, so the statement is dropped from that model's skill.</p>
+        <div class="cmp">
+          <div class="cmpcard">
+            <div class="h">Original <span class="sz">1202 B</span></div>
+            <div class="b">Pkg mgr pacman; yay installed for AUR (3rd-choice installs only). Arch rolling →
+              VERSION_ID = image build date only; packages track upstream closely.</div>
+          </div>
+          <div class="cmpcard">
+            <div class="h">gemma-4-31b keeps <span class="sz">549 B · −54%</span></div>
+            <div class="b"><s>Pkg mgr pacman; yay installed for AUR (3rd-choice installs only).</s> Arch rolling →
+              VERSION_ID = image build date only; <s>packages track upstream closely.</s></div>
+          </div>
+          <div class="cmpcard">
+            <div class="h">qwen3.6-27b keeps <span class="sz">699 B · −42%</span></div>
+            <div class="b"><s>Pkg mgr pacman;</s> yay installed for AUR (3rd-choice installs only). Arch rolling →
+              VERSION_ID = image build date only; packages track upstream closely.</div>
+          </div>
+        </div>
+        <p class="cmp-note"><b>Gemma already knows Arch:</b> told nothing, it still reached for pacman and treated
+          AUR as a last resort — those statements are dead weight for it. <b>Qwen needed the yay guidance</b> but
+          not "the package manager is pacman". Neither list could have been written by hand: it falls out of
+          measurement, per model, sentence by sentence.</p>
+        <div class="szrow">
+          <div class="szc"><div class="num">−38% / −44%</div><div class="lbl"><code>SKILL-alpine</code> · gemma / qwen</div></div>
+          <div class="szc"><div class="num">−54% / −42%</div><div class="lbl"><code>SKILL-arch</code> · gemma / qwen</div></div>
+          <div class="szc"><div class="num">−60%</div><div class="lbl"><code>SKILL-base</code> · gemma (qwen in progress)</div></div>
+        </div>
+      </div>
+
+      <div style="margin-top:52px">
+        <h3 class="sec-title" style="font-size:22px">Saved input tokens are saved prefill time.</h3>
+        <p class="body">Skill files ride along in the prompt, so every statement is paid for in <b>prefill</b>:
+          before the model emits its first token, it must process the entire input — that is what
+          time-to-first-token mostly is, and it grows with prompt length (super-linearly on long prompts, because
+          attention compares every token with every other). Prompt-compression research confirms the same claim
+          from the other direction: LLMLingua reports <b>1.7–5.7× end-to-end speedups</b> from shrinking prompts,
+          with little quality loss.</p>
+        <p class="body" style="margin-top:16px">This bites hardest exactly where codehalter lives: local models on
+          modest hardware, where prefill throughput is a few hundred to a few thousand tokens per second. A few KB
+          of statements a model never needed adds seconds before the first token — on <b>every</b> cache-miss
+          turn, for the lifetime of the setup. A pruned skill is prefill you never pay again, and context
+          head-room you get back.</p>
+        <ol class="refs">
+          <li><a href="https://arxiv.org/abs/2310.05736">LLMLingua: Compressing Prompts for Accelerated Inference of LLMs</a> — Jiang et al., EMNLP 2023: up to 20× compression, 1.7–5.7× speedup (<a href="https://www.microsoft.com/en-us/research/blog/llmlingua-innovating-llm-efficiency-with-prompt-compression/">Microsoft Research summary</a>)</li>
+          <li><a href="https://arxiv.org/abs/2604.02985">Prompt Compression in the Wild: Measuring Latency, Rate Adherence, and Quality</a> — direct latency measurements of compressed prompts</li>
+          <li><a href="https://docs.nvidia.com/nim/benchmarking/llm/latest/metrics.html">NVIDIA NIM LLM benchmarking metrics</a> — TTFT: the longer the prompt, the higher the TTFT; prefill is compute-bound</li>
+          <li><a href="https://www.ibm.com/think/topics/time-to-first-token">IBM: Time to First Token</a> — prompt length as a primary TTFT driver</li>
+          <li><a href="https://redis.io/blog/prefill-vs-decode/">Redis: Prefill vs Decode</a> — why input processing scales with (and beyond) prompt length</li>
+        </ol>
+      </div>
+
+      <div style="margin-top:52px">
+        <h3 class="sec-title" style="font-size:22px">Help build the skill base.</h3>
+        <p class="body">This only works with breadth — many models, many finetunes, many probed statements.
+          <b>Run the crafter</b> against a model we don't have and open a PR with its skill set + stats;
+          <b>propose statements</b> via <code>/improve</code> during real sessions; <b>challenge a verdict</b> —
+          every keep/drop ships with both answers and the judge's reasoning; or <b>sharpen the method</b> —
+          question authoring, rubrics, judge bias. It's all open.</p>
+        <div class="cta" style="justify-content:flex-start;margin-top:22px">
+          <a class="btn primary" href="skill-crafter-report.html">Latest results →</a>
+          <a class="btn primary" style="background:transparent;color:var(--text);border:1px solid var(--line)" href="https://github.com/tbocek/codehalter/tree/main/crafter">Get started on GitHub</a>
+        </div>
+      </div>
     </div>
   </section>
 
