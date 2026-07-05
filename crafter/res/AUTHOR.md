@@ -10,7 +10,8 @@ Return ONLY a JSON object, no prose, no code fences:
 
 {
   "question": "<a concrete, self-contained coding task or question to pose to a model>",
-  "rubric":   "<the observable difference: what a claim-FOLLOWING answer contains that a claim-IGNORING answer lacks>"
+  "rubric":   "<the observable difference: what a claim-FOLLOWING answer contains that a claim-IGNORING answer lacks>",
+  "tools":    ["<optional: probe tools to offer, see below>"]
 }
 
 Requirements:
@@ -23,5 +24,15 @@ Requirements:
 - The `rubric` must be a crisp, checkable criterion an independent judge can
   apply to two answers. State the specific thing to look for (a construct used,
   a mistake avoided, a tool chosen), not a vague "is it good".
+- `tools`: set this ONLY when the claim's behavior IS agent-tool usage —
+  choosing a tool, calling one before acting (e.g. web_search before declaring
+  a package unavailable, read_file before edit_file), or preferring one tool
+  over another. List the tools the probe should offer, from EXACTLY this
+  catalog: `run_command`, `read_file`, `edit_file`, `search_text`,
+  `web_search`. The model under test can then actually CALL them (calls are
+  captured, not executed), and the judge sees each answer's TOOL CALLS — so
+  phrase the `question` as an agent task and the `rubric` in terms of which
+  call (or call order) a claim-following run makes. For behaviors observable
+  in plain text, OMIT `tools` — offering tools changes the task.
 
 The claim:

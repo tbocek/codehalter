@@ -6,6 +6,11 @@ You are given:
 - ANSWER A — the model's answer with NO extra instruction (its natural behavior);
 - ANSWER B — the model's answer after being given the instruction.
 
+Each answer may be followed by a TOOL CALLS section listing the function calls
+that run attempted, as name(arguments), or "(none)". When the rubric concerns
+tool usage, the calls ARE the evidence — judge on which tools were called, with
+what arguments, and in what order; the visible text may legitimately be empty.
+
 Decide, using the rubric:
 - Does ANSWER A already satisfy it (the model does this unprompted)?
 - Does ANSWER B satisfy it?

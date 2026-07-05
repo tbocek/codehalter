@@ -312,6 +312,59 @@ func TestChatSerializesPerEndpoint(t *testing.T) {
 	}
 }
 
+func TestChatWithToolsParsesStreamedCalls(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		// Name arrives on the first frame, arguments fragmented over three.
+		_, _ = w.Write([]byte(sse(
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"web_search","arguments":"{\"que"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"ry\":\"kubectl inst"}}]}}]}`,
+			`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"all\"}"}}]}}]}`,
+		)))
+	}))
+	defer ts.Close()
+
+	tools := buildProbeTools([]string{"web_search", "run_command"})
+	content, calls, err := chatWithTools(context.Background(), ModelSpec{Name: "t", Server: ts.URL, Model: "m"}, "sys", "install kubectl", tools)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// No visible text, one call: valid for a tool probe.
+	if content != "" || len(calls) != 1 {
+		t.Fatalf("content=%q calls=%d, want empty content + 1 call", content, len(calls))
+	}
+	if got := calls[0].render(); got != `web_search({"query":"kubectl install"})` {
+		t.Fatalf("call = %q", got)
+	}
+	// The request body must carry the tools array.
+	reqTools, ok := gotBody["tools"].([]any)
+	if !ok || len(reqTools) != 2 {
+		t.Fatalf("tools not sent: %v", gotBody["tools"])
+	}
+}
+
+func TestChatWithToolsEmptyBothIsError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(sse()))
+	}))
+	defer ts.Close()
+	_, _, err := chatWithTools(context.Background(), ModelSpec{Name: "t", Server: ts.URL, Model: "m"}, "", "q", buildProbeTools([]string{"web_search"}))
+	if err == nil || !strings.Contains(err.Error(), "no tool calls") {
+		t.Fatalf("want empty-answer-and-no-calls error, got: %v", err)
+	}
+}
+
+func TestBuildProbeToolsSkipsUnknown(t *testing.T) {
+	tools := buildProbeTools([]string{"web_search", "made_up_tool"})
+	if len(tools) != 1 {
+		t.Fatalf("want 1 resolved tool, got %d", len(tools))
+	}
+}
+
 func TestLLMLogChunksStreamLive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "llm.jsonl")
 	if err := openLLMLog(path); err != nil {

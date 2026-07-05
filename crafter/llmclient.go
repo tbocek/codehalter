@@ -64,7 +64,8 @@ type llmLogEntry struct {
 	Messages   []chatMessage `json:"messages,omitempty"`
 	MaxTokens  *int          `json:"max_tokens,omitempty"`
 	Response   string        `json:"response,omitempty"`
-	Reasoning  string        `json:"reasoning,omitempty"` // thinking-channel output, if the model emitted any
+	Reasoning  string        `json:"reasoning,omitempty"`  // thinking-channel output, if the model emitted any
+	ToolCalls  []string      `json:"tool_calls,omitempty"` // rendered name(arguments) per call
 	Error      string        `json:"error,omitempty"`
 }
 
@@ -98,7 +99,7 @@ func writeTrace(e llmLogEntry) {
 }
 
 // logLLM traces one completed call (final line: full request + full reply).
-func logLLM(m ModelSpec, req chatRequest, content, reasoning string, callErr error, d time.Duration) {
+func logLLM(m ModelSpec, req chatRequest, content, reasoning string, calls []toolCallRec, callErr error, d time.Duration) {
 	if llmLog.f == nil {
 		return
 	}
@@ -111,6 +112,9 @@ func logLLM(m ModelSpec, req chatRequest, content, reasoning string, callErr err
 		MaxTokens:  req.MaxTokens,
 		Response:   content,
 		Reasoning:  reasoning,
+	}
+	for _, c := range calls {
+		e.ToolCalls = append(e.ToolCalls, c.render())
 	}
 	if callErr != nil {
 		e.Error = callErr.Error()
@@ -157,6 +161,21 @@ type chatRequest struct {
 	Temperature *float64      `json:"temperature,omitempty"`
 	TopP        *float64      `json:"top_p,omitempty"`
 	MaxTokens   *int          `json:"max_tokens,omitempty"`
+	// Tools is the OpenAI function-tool array offered to the model. Probes for
+	// tool-usage claims set it so the target can actually CALL web_search /
+	// run_command / … — without it such claims are only testable via proxies.
+	Tools []map[string]any `json:"tools,omitempty"`
+}
+
+// toolCallRec is one accumulated function call from the stream.
+type toolCallRec struct {
+	Name string
+	Args string
+}
+
+// render formats a call for the judge and the trace: name({"query":"…"}).
+func (t toolCallRec) render() string {
+	return t.Name + "(" + strings.TrimSpace(t.Args) + ")"
 }
 
 // streamChunk is one SSE frame of a streamed completion — the delta shapes
@@ -170,6 +189,16 @@ type streamChunk struct {
 			// backends emit. Accumulated separately: it feeds the llm.jsonl
 			// trace and the repetition guard, but never the returned answer.
 			ReasoningContent string `json:"reasoning_content"`
+			// ToolCalls stream in fragments: the name typically arrives once
+			// on the first frame for an index, the JSON arguments split over
+			// many frames — accumulate per Index.
+			ToolCalls []struct {
+				Index    int `json:"index"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -344,9 +373,9 @@ func jaccard(a, b map[string]bool) float64 {
 //
 // Every call is traced to llm.jsonl on every exit path (named returns so the
 // defer sees exactly what the caller gets).
-func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, reasoning string, err error) {
+func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, reasoning string, calls []toolCallRec, err error) {
 	start := time.Now()
-	defer func() { logLLM(m, reqBody, content, reasoning, err, time.Since(start)) }()
+	defer func() { logLLM(m, reqBody, content, reasoning, calls, err, time.Since(start)) }()
 
 	// One slot per Parallel: wait HERE, not in the server's queue — llama.cpp
 	// holds a queued request without headers, which the transport's header
@@ -357,7 +386,7 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 		case m.sem <- struct{}{}:
 			defer func() { <-m.sem }()
 		case <-ctx.Done():
-			return "", "", fmt.Errorf("call %s (%s): cancelled while waiting for a free slot: %w", m.Name, m.Model, ctx.Err())
+			return "", "", nil, fmt.Errorf("call %s (%s): cancelled while waiting for a free slot: %w", m.Name, m.Model, ctx.Err())
 		}
 	}
 
@@ -378,17 +407,20 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 	if reqBody.MaxTokens != nil {
 		bodyMap["max_tokens"] = *reqBody.MaxTokens
 	}
+	if len(reqBody.Tools) > 0 {
+		bodyMap["tools"] = reqBody.Tools
+	}
 	for k, v := range m.Params {
 		bodyMap[k] = v
 	}
 	body, err := json.Marshal(bodyMap)
 	if err != nil {
-		return "", "", fmt.Errorf("marshal request: %w", err)
+		return "", "", nil, fmt.Errorf("marshal request: %w", err)
 	}
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", m.endpoint("/v1/chat/completions"), bytes.NewReader(body))
 	if err != nil {
-		return "", "", fmt.Errorf("build request: %w", err)
+		return "", "", nil, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if m.APIKey != "" {
@@ -397,17 +429,34 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 
 	resp, err := crafterHTTPClient.Do(httpReq)
 	if err != nil {
-		return "", "", fmt.Errorf("call %s (%s): %w", m.Name, m.Model, err)
+		return "", "", nil, fmt.Errorf("call %s (%s): %w", m.Name, m.Model, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", "", fmt.Errorf("call %s (%s): http %d: %s", m.Name, m.Model, resp.StatusCode, strings.TrimSpace(string(raw)))
+		return "", "", nil, fmt.Errorf("call %s (%s): http %d: %s", m.Name, m.Model, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
 	var visible, thinking strings.Builder
 	var guard repetitionGuard
+	// Streamed tool calls: name arrives once per index, arguments in
+	// fragments — accumulate per index, assemble in order at the end.
+	type tcAcc struct {
+		name string
+		args strings.Builder
+	}
+	tcByIndex := map[int]*tcAcc{}
+	maxIndex := -1
+	assembleCalls := func() []toolCallRec {
+		var out []toolCallRec
+		for i := 0; i <= maxIndex; i++ {
+			if a := tcByIndex[i]; a != nil {
+				out = append(out, toolCallRec{Name: a.name, Args: a.args.String()})
+			}
+		}
+		return out
+	}
 	// Live trace: flush a chunk line to llm.jsonl every ~traceChunkSize bytes
 	// of generated text, so a long generation is observable (`tail -f`) while
 	// it runs, not only after. pendResp/pendReason hold the not-yet-flushed
@@ -435,11 +484,11 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 		}
 		var ch streamChunk
 		if err := json.Unmarshal([]byte(payload), &ch); err != nil {
-			return visible.String(), thinking.String(),
+			return visible.String(), thinking.String(), assembleCalls(),
 				fmt.Errorf("call %s (%s): bad SSE chunk: %w (chunk: %s)", m.Name, m.Model, err, truncate(payload, 200))
 		}
 		if msg := chunkError(&ch); msg != "" {
-			return visible.String(), thinking.String(),
+			return visible.String(), thinking.String(), assembleCalls(),
 				fmt.Errorf("call %s (%s): server error mid-stream: %s", m.Name, m.Model, msg)
 		}
 		for _, c := range ch.Choices {
@@ -447,6 +496,26 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 			thinking.WriteString(c.Delta.ReasoningContent)
 			pendResp.WriteString(c.Delta.Content)
 			pendReason.WriteString(c.Delta.ReasoningContent)
+			for _, tc := range c.Delta.ToolCalls {
+				a := tcByIndex[tc.Index]
+				if a == nil {
+					a = &tcAcc{}
+					tcByIndex[tc.Index] = a
+					if tc.Index > maxIndex {
+						maxIndex = tc.Index
+					}
+				}
+				if tc.Function.Name != "" {
+					a.name = tc.Function.Name
+				}
+				a.args.WriteString(tc.Function.Arguments)
+				// Tool arguments count toward the repetition guard too — a
+				// looping model can loop inside a JSON argument as well.
+				if err := guard.add(tc.Function.Arguments); err != nil {
+					flushChunk()
+					return visible.String(), thinking.String(), assembleCalls(), fmt.Errorf("call %s (%s): %w", m.Name, m.Model, err)
+				}
+			}
 			if pendResp.Len()+pendReason.Len() >= traceChunkSize {
 				flushChunk()
 			}
@@ -454,15 +523,15 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 				// Returning closes resp.Body, which aborts the server-side
 				// generation — the loop stops burning GPU time too.
 				flushChunk()
-				return visible.String(), thinking.String(), fmt.Errorf("call %s (%s): %w", m.Name, m.Model, err)
+				return visible.String(), thinking.String(), assembleCalls(), fmt.Errorf("call %s (%s): %w", m.Name, m.Model, err)
 			}
 		}
 	}
 	flushChunk()
 	if err := sc.Err(); err != nil {
-		return visible.String(), thinking.String(), fmt.Errorf("call %s (%s): stream read: %w", m.Name, m.Model, err)
+		return visible.String(), thinking.String(), assembleCalls(), fmt.Errorf("call %s (%s): stream read: %w", m.Name, m.Model, err)
 	}
-	return visible.String(), thinking.String(), nil
+	return visible.String(), thinking.String(), assembleCalls(), nil
 }
 
 // ping verifies a model endpoint is reachable, authorized, and actually serving
@@ -472,7 +541,7 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 // without a transport, HTTP, or server error. Used by the preflight check.
 func ping(ctx context.Context, m ModelSpec) error {
 	one := 1
-	_, _, err := doChat(ctx, m, chatRequest{
+	_, _, _, err := doChat(ctx, m, chatRequest{
 		Model:     m.Model,
 		Messages:  []chatMessage{{Role: "user", Content: "ping"}},
 		MaxTokens: &one,
@@ -480,14 +549,10 @@ func ping(ctx context.Context, m ModelSpec) error {
 	return err
 }
 
-// chat sends one chat completion to the model and returns the visible
-// assistant text. It is the single LLM entry point for the tool's real work —
-// the judge and every target model go through here, differing only in ModelSpec.
-//
-// A call aborted by the repetition guard is not fatal: chat says so on stderr
-// and retries once with a nudge to conclude appended to the user message. Only
-// a second loop surfaces as an error.
-func chat(ctx context.Context, m ModelSpec, system, user string) (string, error) {
+// chatCore sends one completion with the nudge-on-repetition retry and returns
+// the raw accumulated channels. chat and chatWithTools layer their emptiness
+// rules on top.
+func chatCore(ctx context.Context, m ModelSpec, system, user string, tools []map[string]any) (content, reasoning string, calls []toolCallRec, err error) {
 	build := func(userText string) []chatMessage {
 		var msgs []chatMessage
 		if strings.TrimSpace(system) != "" {
@@ -500,15 +565,26 @@ func chat(ctx context.Context, m ModelSpec, system, user string) (string, error)
 		Temperature: m.Temperature,
 		TopP:        m.TopP,
 		MaxTokens:   m.MaxTokens,
+		Tools:       tools,
 	}
 
 	req.Messages = build(user)
-	content, reasoning, err := doChat(ctx, m, req)
+	content, reasoning, calls, err = doChat(ctx, m, req)
 	if errors.Is(err, errRepetition) {
+		// A call aborted by the repetition guard is not fatal: say so and
+		// retry once with a nudge to conclude appended to the user message.
 		fmt.Fprintf(os.Stderr, "warn: %s (%s): %v — nudging model to conclude and retrying once\n", m.Name, m.Model, err)
 		req.Messages = build(user + repetitionNudge)
-		content, reasoning, err = doChat(ctx, m, req)
+		content, reasoning, calls, err = doChat(ctx, m, req)
 	}
+	return content, reasoning, calls, err
+}
+
+// chat sends one chat completion and returns the visible assistant text. It is
+// the LLM entry point for text-only work — the judge and plain probes go
+// through here, differing only in ModelSpec.
+func chat(ctx context.Context, m ModelSpec, system, user string) (string, error) {
+	content, reasoning, _, err := chatCore(ctx, m, system, user, nil)
 	if err != nil {
 		return "", err
 	}
@@ -523,6 +599,25 @@ func chat(ctx context.Context, m ModelSpec, system, user string) (string, error)
 		return "", fmt.Errorf("call %s (%s): empty answer", m.Name, m.Model)
 	}
 	return content, nil
+}
+
+// chatWithTools is chat with a function-tool array offered to the model, for
+// probing tool-usage claims. Unlike chat, an empty visible answer is fine as
+// long as the model called tools — emitting a call INSTEAD of prose is often
+// exactly the behavior under test. Both empty is still an error.
+func chatWithTools(ctx context.Context, m ModelSpec, system, user string, tools []map[string]any) (string, []toolCallRec, error) {
+	content, reasoning, calls, err := chatCore(ctx, m, system, user, tools)
+	if err != nil {
+		return "", nil, err
+	}
+	content = strings.TrimSpace(content)
+	if content == "" && len(calls) == 0 {
+		if reasoning != "" {
+			return "", nil, fmt.Errorf("call %s (%s): empty answer (all output went to the reasoning channel)", m.Name, m.Model)
+		}
+		return "", nil, fmt.Errorf("call %s (%s): empty answer and no tool calls", m.Name, m.Model)
+	}
+	return content, calls, nil
 }
 
 // chatJSON calls chat and unwraps a JSON object from the reply into out. Weak

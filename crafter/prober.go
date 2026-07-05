@@ -22,23 +22,83 @@ var judgePrompt string
 // independent judge applies to two answers. Authoring depends only on the claim
 // and the judge (not on any target model), so it is cached per skill and reused
 // across every target.
+//
+// Tools lists probe-tool names (from probeToolCatalog) offered to the target
+// during the A/B runs. The judge sets it for claims whose behavior IS tool
+// usage (run web_search before claiming unavailable, read before edit, …) —
+// without real tools in the request such claims are only testable via proxies.
 type Question struct {
-	Question string `json:"question"`
-	Rubric   string `json:"rubric"`
+	Question string   `json:"question"`
+	Rubric   string   `json:"rubric"`
+	Tools    []string `json:"tools,omitempty"`
+}
+
+// probeToolCatalog mirrors codehalter's own agent tools with minimal schemas —
+// enough for a target model to express WHICH tool it would call and with what
+// arguments. Calls are never executed; the call itself is the observation.
+var probeToolCatalog = map[string]map[string]any{
+	"run_command": probeTool("run_command", "Run a shell command in the project workspace and return its output.",
+		map[string]any{"command": map[string]any{"type": "string", "description": "the shell command to run"}}, "command"),
+	"read_file": probeTool("read_file", "Read a file from the project and return its content.",
+		map[string]any{"path": map[string]any{"type": "string", "description": "project-relative file path"}}, "path"),
+	"edit_file": probeTool("edit_file", "Replace text in a project file.",
+		map[string]any{
+			"path": map[string]any{"type": "string", "description": "project-relative file path"},
+			"old":  map[string]any{"type": "string", "description": "exact text to replace"},
+			"new":  map[string]any{"type": "string", "description": "replacement text"},
+		}, "path", "old", "new"),
+	"search_text": probeTool("search_text", "Search the project files for a pattern and return matching lines.",
+		map[string]any{"pattern": map[string]any{"type": "string", "description": "text or regex to search for"}}, "pattern"),
+	"web_search": probeTool("web_search", "Search the web and return result snippets with URLs.",
+		map[string]any{"query": map[string]any{"type": "string", "description": "the search query"}}, "query"),
+}
+
+// probeTool assembles one OpenAI function-tool definition.
+func probeTool(name, desc string, props map[string]any, required ...string) map[string]any {
+	return map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        name,
+			"description": desc,
+			"parameters": map[string]any{
+				"type":       "object",
+				"properties": props,
+				"required":   required,
+			},
+		},
+	}
+}
+
+// buildProbeTools resolves the judge-chosen tool names against the catalog.
+// Unknown names are warned and skipped, not fatal — the probe still runs with
+// whatever resolved (or as a plain probe when nothing did).
+func buildProbeTools(names []string) []map[string]any {
+	var out []map[string]any
+	for _, n := range names {
+		t, ok := probeToolCatalog[n]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "warn: authored probe requests unknown tool %q, skipping it\n", n)
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 // Sample is one A/B/judge round for a claim on one target model. AnswerA is the
 // model's natural reply (no instruction); AnswerB is its reply with the claim
-// injected as a system instruction; the rest is the judge's verdict for this
-// round.
+// injected as a system instruction; ACalls/BCalls are the tool calls each run
+// emitted (tool probes only); the rest is the judge's verdict for this round.
 type Sample struct {
-	AnswerA string `json:"answer_a"`
-	AnswerB string `json:"answer_b"`
-	ASat    bool   `json:"a_satisfies"`
-	BSat    bool   `json:"b_satisfies"`
-	Similar bool   `json:"similar"`
-	Verdict string `json:"verdict"` // "keep" | "drop"
-	Reason  string `json:"reason"`
+	AnswerA string   `json:"answer_a"`
+	AnswerB string   `json:"answer_b"`
+	ACalls  []string `json:"a_calls,omitempty"`
+	BCalls  []string `json:"b_calls,omitempty"`
+	ASat    bool     `json:"a_satisfies"`
+	BSat    bool     `json:"b_satisfies"`
+	Similar bool     `json:"similar"`
+	Verdict string   `json:"verdict"` // "keep" | "drop"
+	Reason  string   `json:"reason"`
 }
 
 // ProbeResult is the persisted outcome of probing one claim against one target
@@ -115,12 +175,15 @@ func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePat
 }
 
 // samplePair is one A/B generation round on the target: the natural answer
-// and the claim-instructed answer, not yet judged. The split from judging lets
-// the target generate claim N+1's pairs while the judge scores claim N's —
-// they run on different servers, so the overlap is free wall-clock.
+// and the claim-instructed answer (plus any tool calls each emitted), not yet
+// judged. The split from judging lets the target generate claim N+1's pairs
+// while the judge scores claim N's — they run on different servers, so the
+// overlap is free wall-clock.
 type samplePair struct {
 	AnswerA string
 	AnswerB string
+	ACalls  []string
+	BCalls  []string
 }
 
 // newProbeResult seeds the persisted result for one claim×target with its
@@ -144,21 +207,33 @@ func generateSamples(ctx context.Context, target ModelSpec, claim Claim, q Quest
 	// self-contained rewrite, so it reads as a standalone directive even when
 	// the verbatim source bullet would not.
 	instruction := claim.Text
+	// Tool probes offer the judge-chosen tools so the target can actually CALL
+	// them; the calls are captured, never executed. nil = plain text probe.
+	tools := buildProbeTools(q.Tools)
 
 	pairs := make([]samplePair, 0, samples)
 	for i := 0; i < samples; i++ {
 		// A: natural behavior, no instruction. B: same task, claim injected.
-		answerA, err := chat(ctx, target, "", q.Question)
+		answerA, callsA, err := chatWithTools(ctx, target, "", q.Question, tools)
 		if err != nil {
 			return nil, fmt.Errorf("sample %d answer A: %w", i, err)
 		}
-		answerB, err := chat(ctx, target, instruction, q.Question)
+		answerB, callsB, err := chatWithTools(ctx, target, instruction, q.Question, tools)
 		if err != nil {
 			return nil, fmt.Errorf("sample %d answer B: %w", i, err)
 		}
-		pairs = append(pairs, samplePair{AnswerA: answerA, AnswerB: answerB})
+		pairs = append(pairs, samplePair{AnswerA: answerA, AnswerB: answerB, ACalls: renderCalls(callsA), BCalls: renderCalls(callsB)})
 	}
 	return pairs, nil
+}
+
+// renderCalls formats accumulated tool calls for the judge and the ledger.
+func renderCalls(calls []toolCallRec) []string {
+	var out []string
+	for _, c := range calls {
+		out = append(out, c.render())
+	}
+	return out
 }
 
 // judgeSamples runs the judge-only half: score each generated pair against the
@@ -172,8 +247,16 @@ func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Q
 		var s Sample
 		s.AnswerA = p.AnswerA
 		s.AnswerB = p.AnswerB
+		s.ACalls = p.ACalls
+		s.BCalls = p.BCalls
 		judgeUser := fmt.Sprintf("RUBRIC:\n%s\n\nANSWER A (no instruction):\n%s\n\nANSWER B (with instruction):\n%s",
 			q.Rubric, p.AnswerA, p.AnswerB)
+		if len(q.Tools) > 0 {
+			// Tool probe: show the judge what each run actually called — for
+			// tool-usage rubrics the calls ARE the evidence.
+			judgeUser = fmt.Sprintf("RUBRIC:\n%s\n\nANSWER A (no instruction):\n%s\nTOOL CALLS A:\n%s\n\nANSWER B (with instruction):\n%s\nTOOL CALLS B:\n%s",
+				q.Rubric, orNone(p.AnswerA), callsBlock(p.ACalls), orNone(p.AnswerB), callsBlock(p.BCalls))
+		}
 		if err := chatJSON(ctx, judge, judgePrompt, judgeUser, &s); err != nil {
 			res.Err = fmt.Sprintf("sample %d judge: %v", i, err)
 			return res
@@ -206,25 +289,57 @@ func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Q
 	return res
 }
 
+// callsBlock renders a tool-call list for the judge prompt.
+func callsBlock(calls []string) string {
+	if len(calls) == 0 {
+		return "(none)"
+	}
+	return strings.Join(calls, "\n")
+}
+
+// orNone substitutes a placeholder for an empty visible answer (a tool-probe
+// run may legitimately answer only with calls).
+func orNone(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(no text — see tool calls)"
+	}
+	return s
+}
+
+// questionCache is the on-disk authored-probe cache. Hash covers the AUTHOR
+// prompt, so editing AUTHOR.md invalidates cached probes — content-only keying
+// would silently keep questions authored under the old rules (same latent bug
+// the segment cache had).
+type questionCache struct {
+	Hash      string              `json:"hash"`
+	Questions map[string]Question `json:"questions"`
+}
+
 func readQuestionCache(path string) map[string]Question {
-	out := map[string]Question{}
+	empty := map[string]Question{}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return out // absent cache is the normal first-run case
+		return empty // absent cache is the normal first-run case
 	}
-	if err := json.Unmarshal(data, &out); err != nil {
+	var c questionCache
+	if err := json.Unmarshal(data, &c); err != nil {
 		// Corrupt cache: reset and re-author rather than run on a partial map.
 		fmt.Fprintf(os.Stderr, "warn: %s: unreadable authored-probe cache, re-authoring: %v\n", path, err)
-		return map[string]Question{}
+		return empty
 	}
-	return out
+	// A pre-wrapper cache (bare map) or a different AUTHOR.md both land here.
+	if c.Hash != hashOf([]byte(authorPrompt)) || c.Questions == nil {
+		fmt.Fprintf(os.Stderr, "warn: %s: authored-probe cache stale (authoring prompt changed), re-authoring\n", path)
+		return empty
+	}
+	return c.Questions
 }
 
 func writeQuestionCache(path string, cache map[string]Question) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cache, "", "  ")
+	data, err := json.MarshalIndent(questionCache{Hash: hashOf([]byte(authorPrompt)), Questions: cache}, "", "  ")
 	if err != nil {
 		return err
 	}
