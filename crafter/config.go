@@ -8,27 +8,34 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// Config is the whole crafter.toml. One [judge] table names the strong
-// reference model that segments skills, authors questions, and judges A/B
-// answers. Each [[model]] table is one target model being profiled — the
+// Config is the whole crafter.toml. Judges are the strong reference model
+// endpoints that segment skills, author questions, and judge A/B answers — one
+// or more [[judge]] tables; a second spreads that (bottleneck) work across
+// endpoints. Each [[model]] table is one target model being profiled — the
 // thing we decide statements for. [settings] holds run-wide knobs.
 //
 // Endpoints are OpenAI-compatible (server = host root only, no /v1 path);
 // the client appends /v1/chat/completions itself, matching how the main
 // codehalter LLMConnection works.
 type Config struct {
-	Settings Settings    `toml:"settings"`
-	Judge    ModelSpec   `toml:"judge"`
-	Models   []ModelSpec `toml:"model"`
+	Settings Settings `toml:"settings"`
+	// Judges are the reference endpoints, from one or more [[judge]] tables. Any
+	// judge may author or score any claim, so they should serve the same (or an
+	// equivalent) model; a second endpoint is pure throughput.
+	Judges []ModelSpec `toml:"judge"`
+	Models []ModelSpec `toml:"model"`
 }
 
 // Settings are run-wide knobs. Samples is the number of A/B repetitions per
-// claim; the keep/drop verdict is the majority across them. Skills optionally
-// restricts which ground-skills/SKILL-*.md files are probed (bare stack names,
-// e.g. ["go","base"]); empty means every SKILL-*.md in ground-skills/.
+// claim. KeepThreshold is the minimum number of those samples that must vote
+// "keep" for the statement to be kept (see loadConfig for the default and the
+// asymmetry rationale). Skills optionally restricts which ground-skills/
+// SKILL-*.md files are probed (bare stack names, e.g. ["go","base"]); empty
+// means every SKILL-*.md in ground-skills/.
 type Settings struct {
-	Samples int      `toml:"samples"`
-	Skills  []string `toml:"skills"`
+	Samples       int      `toml:"samples"`
+	KeepThreshold int      `toml:"keep_threshold"`
+	Skills        []string `toml:"skills"`
 }
 
 // ModelSpec is one OpenAI-compatible endpoint. Name is the folder under
@@ -82,14 +89,41 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Settings.Samples <= 0 {
 		cfg.Settings.Samples = 3
 	}
-
-	if cfg.Judge.Server == "" || cfg.Judge.Model == "" {
-		return nil, fmt.Errorf("%s: [judge] needs both server and model", path)
+	// keep_threshold is the minimum "keep" votes (out of Samples) to keep a
+	// statement. Default 1 = keep unless every sample agrees to drop: dropping a
+	// statement the model needs is a silent behavioral regression, keeping one
+	// it doesn't is a few wasted prefill tokens, so a split verdict errs toward
+	// keep. Clamp to [1, Samples] — a threshold above Samples can never be met,
+	// which would silently drop everything.
+	if cfg.Settings.KeepThreshold <= 0 {
+		cfg.Settings.KeepThreshold = 1
 	}
-	// Label for logs and the llm.jsonl trace — the judge is the main/reference
-	// model, so calls read "call main (…)" unless the user names it.
-	if cfg.Judge.Name == "" {
-		cfg.Judge.Name = "main"
+	if cfg.Settings.KeepThreshold > cfg.Settings.Samples {
+		cfg.Settings.KeepThreshold = cfg.Settings.Samples
+	}
+
+	if len(cfg.Judges) == 0 {
+		return nil, fmt.Errorf("%s: needs one or more [[judge]] tables with server and model", path)
+	}
+	seenJudge := map[string]bool{}
+	for i := range cfg.Judges {
+		j := &cfg.Judges[i]
+		if j.Server == "" || j.Model == "" {
+			return nil, fmt.Errorf("%s: judge #%d needs both server and model", path, i+1)
+		}
+		// Label for logs and the llm.jsonl trace — the first/only judge is the
+		// main/reference one ("call main (…)"); extra judges get judge2, judge3…
+		if j.Name == "" {
+			if i == 0 {
+				j.Name = "main"
+			} else {
+				j.Name = fmt.Sprintf("judge%d", i+1)
+			}
+		}
+		if seenJudge[j.Name] {
+			return nil, fmt.Errorf("%s: duplicate judge name %q", path, j.Name)
+		}
+		seenJudge[j.Name] = true
 	}
 	// Parallel is resolved later (resolveParallelism): 0/absent means
 	// auto-detect from the server's slot count, a positive value is an
@@ -142,7 +176,9 @@ func (cfg *Config) resolveParallelism(detect func(ModelSpec) int, logf func(stri
 		}
 		m.sem = make(chan struct{}, m.Parallel)
 	}
-	finalize(&cfg.Judge)
+	for i := range cfg.Judges {
+		finalize(&cfg.Judges[i])
+	}
 	for i := range cfg.Models {
 		finalize(&cfg.Models[i])
 	}

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 )
 
 //go:embed res/AUTHOR.md
@@ -117,6 +116,7 @@ type ProbeResult struct {
 	Rubric   string   `json:"rubric"`
 	Verdict  string   `json:"verdict"` // "keep" | "drop"
 	Keep     bool     `json:"keep"`
+	Unstable bool     `json:"unstable,omitempty"` // samples disagreed (not unanimous) — borderline, worth a look
 	Samples  []Sample `json:"samples"`
 	Err      string   `json:"error,omitempty"`
 
@@ -128,99 +128,23 @@ type ProbeResult struct {
 	DurationMs int64  `json:"duration_ms,omitempty"`
 }
 
-// authorClaims produces a Question for every claim using the judge model,
-// caching the map (keyed by claim ID) under cachePath so a re-run or a second
-// target model reuses the authored probes instead of paying the judge again.
-//
-// A claim whose authoring fails (judge error even after chat's repetition
-// nudge, or an off-spec reply) is warned about and skipped, not fatal: the
-// claim ends up with no Question, is never probed, and counts as errored in
-// the stats — a flaky judge costs one claim, not the run. A cache-write
-// failure is still an error: losing authored probes silently would re-pay the
-// judge every run.
-// progress (nil = silent) is called after each freshly authored claim —
-// authoring a whole skill takes the judge tens of minutes (measured: 42 min
-// for 16 claims), and without per-claim lines that window reads as a hang.
-func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePath string, progress func(done, total int, id string, d time.Duration)) (map[string]Question, error) {
-	cache := readQuestionCache(cachePath)
-	var pending []Claim
-	for _, c := range claims {
-		if _, ok := cache[c.ID]; !ok {
-			pending = append(pending, c)
-		}
+// authorQuestion authors the probe (question + rubric) for one claim with the
+// judge. It is one stage of the scheduler pipeline, peer to generateSamples and
+// judgeSamples. ok is false when the judge errored (even after chat's repetition
+// nudge) or returned an empty question/rubric — the claim then stays untested
+// this run rather than aborting the pass (a flaky judge costs one claim, not the
+// whole run). Callers persist the question and warn on !ok.
+func authorQuestion(ctx context.Context, judge ModelSpec, c Claim) (Question, bool) {
+	var q Question
+	if err := chatJSON(ctx, judge, authorPrompt, c.Text, &q); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: author probe for %s failed, claim stays untested: %v\n", c.ID, err)
+		return q, false
 	}
-
-	// authorOne produces the probe for one claim; failures are warned, not
-	// fatal (the claim stays untested this run). Returns ok when cached.
-	authorOne := func(c Claim) (Question, bool) {
-		var q Question
-		if err := chatJSON(ctx, judge, authorPrompt, c.Text, &q); err != nil {
-			fmt.Fprintf(os.Stderr, "warn: author probe for %s failed, claim stays untested: %v\n", c.ID, err)
-			return q, false
-		}
-		if strings.TrimSpace(q.Question) == "" || strings.TrimSpace(q.Rubric) == "" {
-			fmt.Fprintf(os.Stderr, "warn: author probe for %s: judge returned empty question or rubric, claim stays untested\n", c.ID)
-			return q, false
-		}
-		return q, true
+	if strings.TrimSpace(q.Question) == "" || strings.TrimSpace(q.Rubric) == "" {
+		fmt.Fprintf(os.Stderr, "warn: author probe for %s: judge returned empty question or rubric, claim stays untested\n", c.ID)
+		return q, false
 	}
-
-	// Claims author independently — a multi-slot judge runs judge.Parallel of
-	// them concurrently (the endpoint semaphore gates the real concurrency, so
-	// extra workers just queue). Single slot keeps the serial path.
-	var mu sync.Mutex
-	dirty := false
-	record := func(c Claim, q Question, ok bool, d time.Duration) {
-		if !ok {
-			return
-		}
-		mu.Lock()
-		cache[c.ID] = q
-		done := len(cache)
-		dirty = true
-		mu.Unlock()
-		if progress != nil {
-			progress(done, len(claims), c.ID, d)
-		}
-	}
-	if judge.Parallel >= 2 && len(pending) > 1 {
-		work := make(chan Claim)
-		var wg sync.WaitGroup
-		for w := 0; w < judge.Parallel; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for c := range work {
-					cStart := time.Now()
-					q, ok := authorOne(c)
-					record(c, q, ok, time.Since(cStart))
-				}
-			}()
-		}
-		for _, c := range pending {
-			if ctx.Err() != nil {
-				break // interrupted — keep what we have, cache it below
-			}
-			work <- c
-		}
-		close(work)
-		wg.Wait()
-	} else {
-		for _, c := range pending {
-			if ctx.Err() != nil {
-				break // interrupted — keep what we have, cache it below
-			}
-			cStart := time.Now()
-			q, ok := authorOne(c)
-			record(c, q, ok, time.Since(cStart))
-		}
-	}
-	if dirty {
-		if err := writeQuestionCache(cachePath, cache); err != nil {
-			return nil, fmt.Errorf("cache authored probes: %w", err)
-		}
-	}
-	return cache, nil
+	return q, true
 }
 
 // samplePair is one A/B generation round on the target: the natural answer
@@ -229,10 +153,10 @@ func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePat
 // while the judge scores claim N's — they run on different servers, so the
 // overlap is free wall-clock.
 type samplePair struct {
-	AnswerA string
-	AnswerB string
-	ACalls  []string
-	BCalls  []string
+	AnswerA string   `json:"answer_a"`
+	AnswerB string   `json:"answer_b"`
+	ACalls  []string `json:"a_calls,omitempty"`
+	BCalls  []string `json:"b_calls,omitempty"`
 }
 
 // newProbeResult seeds the persisted result for one claim×target with its
@@ -249,13 +173,12 @@ func newProbeResult(target ModelSpec, claim Claim, q Question) ProbeResult {
 }
 
 // generateSamples runs the target-only half of a probe: `samples` A/B rounds.
-// A single failed generation aborts the claim — partial sampling would bias
-// the majority.
-func generateSamples(ctx context.Context, target ModelSpec, claim Claim, q Question, samples int) ([]samplePair, error) {
-	// The claim as a system instruction for the treated (B) run. Text is the
-	// self-contained rewrite, so it reads as a standalone directive even when
-	// the verbatim source bullet would not.
-	instruction := claim.Text
+// Arm A gets no system prompt (the model's natural behavior); arm B gets
+// bSystem — the whole clean skill — so the claim's behavior is tested in the
+// realistic context the model actually receives, not as one line out of
+// context. A single failed generation aborts the claim — partial sampling would
+// bias the majority.
+func generateSamples(ctx context.Context, target ModelSpec, claim Claim, q Question, samples int, bSystem string) ([]samplePair, error) {
 	// Tool probes offer the judge-chosen tools so the target can actually CALL
 	// them; the calls are captured, never executed. nil = plain text probe.
 	tools := buildProbeTools(q.Tools)
@@ -287,12 +210,12 @@ func generateSamples(ctx context.Context, target ModelSpec, claim Claim, q Quest
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); aAns, aCalls, errA = runArm("") }()
-		go func() { defer wg.Done(); bAns, bCalls, errB = runArm(instruction) }()
+		go func() { defer wg.Done(); bAns, bCalls, errB = runArm(bSystem) }()
 		wg.Wait()
 	} else {
 		aAns, aCalls, errA = runArm("")
 		if errA == nil {
-			bAns, bCalls, errB = runArm(instruction)
+			bAns, bCalls, errB = runArm(bSystem)
 		}
 	}
 	if errA != nil {
@@ -322,7 +245,7 @@ func renderCalls(calls []toolCallRec) []string {
 // rubric and fold the verdicts into a majority. A failed judge call records
 // the error on the result (retried on resume). progress (nil = silent) fires
 // after each sample verdict — three verdicts take the judge several minutes.
-func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Question, pairs []samplePair, progress func(i, n int, verdict string)) ProbeResult {
+func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Question, pairs []samplePair, keepThreshold int, progress func(i, n int, verdict string)) ProbeResult {
 	res := newProbeResult(target, claim, q)
 
 	judgeOne := func(p samplePair) (Sample, error) {
@@ -331,12 +254,12 @@ func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Q
 		s.AnswerB = p.AnswerB
 		s.ACalls = p.ACalls
 		s.BCalls = p.BCalls
-		judgeUser := fmt.Sprintf("RUBRIC:\n%s\n\nANSWER A (no instruction):\n%s\n\nANSWER B (with instruction):\n%s",
+		judgeUser := fmt.Sprintf("RUBRIC:\n%s\n\nANSWER A (without the skill):\n%s\n\nANSWER B (with the skill loaded):\n%s",
 			q.Rubric, p.AnswerA, p.AnswerB)
 		if len(q.Tools) > 0 {
 			// Tool probe: show the judge what each run actually called — for
 			// tool-usage rubrics the calls ARE the evidence.
-			judgeUser = fmt.Sprintf("RUBRIC:\n%s\n\nANSWER A (no instruction):\n%s\nTOOL CALLS A:\n%s\n\nANSWER B (with instruction):\n%s\nTOOL CALLS B:\n%s",
+			judgeUser = fmt.Sprintf("RUBRIC:\n%s\n\nANSWER A (without the skill):\n%s\nTOOL CALLS A:\n%s\n\nANSWER B (with the skill loaded):\n%s\nTOOL CALLS B:\n%s",
 				q.Rubric, orNone(p.AnswerA), callsBlock(p.ACalls), orNone(p.AnswerB), callsBlock(p.BCalls))
 		}
 		if err := chatJSON(ctx, judge, judgePrompt, judgeUser, &s); err != nil {
@@ -397,13 +320,22 @@ func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Q
 		}
 		res.Samples = append(res.Samples, s)
 	}
-	// Majority: keep the statement only if a strict majority of samples say so.
-	res.Keep = keep*2 > len(pairs)
+	// Keep the statement when at least keepThreshold of the samples vote keep.
+	// Threshold 1 (the default) keeps unless the samples unanimously say drop —
+	// the asymmetry is deliberate: a wrong drop silently regresses a behavior,
+	// a wrong keep costs a little prefill. Guard against a caller passing 0/neg.
+	if keepThreshold < 1 {
+		keepThreshold = 1
+	}
+	res.Keep = keep >= keepThreshold
 	if res.Keep {
 		res.Verdict = "keep"
 	} else {
 		res.Verdict = "drop"
 	}
+	// A non-unanimous vote means the model is inconsistent on this claim — the
+	// verdict went one way but it was a judgment call, so flag it for review.
+	res.Unstable = keep != 0 && keep != len(verdicts)
 	return res
 }
 

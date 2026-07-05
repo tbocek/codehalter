@@ -20,7 +20,7 @@ func TestLoadConfigValid(t *testing.T) {
 [settings]
 samples = 5
 
-[judge]
+[[judge]]
 server = "http://j"
 model = "judge-m"
 
@@ -44,19 +44,19 @@ model = "qwen-m"
 	if len(cfg.Models) != 2 || cfg.Models[0].Name != "gemma" {
 		t.Fatalf("models = %+v", cfg.Models)
 	}
-	if cfg.Judge.Name != "main" {
-		t.Fatalf("judge name should default to %q, got %q", "main", cfg.Judge.Name)
+	if len(cfg.Judges) != 1 || cfg.Judges[0].Name != "main" {
+		t.Fatalf("single [judge] should give one judge named %q, got %+v", "main", cfg.Judges)
 	}
 	// loadConfig leaves parallelism unresolved (0 = auto) and the semaphore nil
 	// until resolveParallelism runs.
-	if cfg.Judge.Parallel != 0 || cfg.Judge.sem != nil {
-		t.Fatalf("loadConfig should not resolve parallelism: parallel=%d sem=%v", cfg.Judge.Parallel, cfg.Judge.sem)
+	if cfg.Judges[0].Parallel != 0 || cfg.Judges[0].sem != nil {
+		t.Fatalf("loadConfig should not resolve parallelism: parallel=%d sem=%v", cfg.Judges[0].Parallel, cfg.Judges[0].sem)
 	}
 }
 
 func TestResolveParallelism(t *testing.T) {
 	cfg := &Config{
-		Judge: ModelSpec{Name: "main", Model: "j"}, // unset → auto-detect
+		Judges: []ModelSpec{{Name: "main", Model: "j"}}, // unset → auto-detect
 		Models: []ModelSpec{
 			{Name: "auto", Model: "a"},                  // unset → auto-detect
 			{Name: "explicit", Model: "e", Parallel: 5}, // configured, kept
@@ -84,7 +84,7 @@ func TestResolveParallelism(t *testing.T) {
 			t.Fatalf("%s sem cap = %d, want %d", m.Name, cap(m.sem), want[m.Name])
 		}
 	}
-	check(cfg.Judge)
+	check(cfg.Judges[0])
 	for _, m := range cfg.Models {
 		check(m)
 	}
@@ -92,7 +92,7 @@ func TestResolveParallelism(t *testing.T) {
 
 func TestLoadConfigSamplesDefault(t *testing.T) {
 	p := writeTemp(t, "c.toml", `
-[judge]
+[[judge]]
 server = "http://j"
 model = "m"
 [[model]]
@@ -118,12 +118,12 @@ server = "http://a"
 model = "am"
 `,
 		"no models": `
-[judge]
+[[judge]]
 server = "http://j"
 model = "m"
 `,
 		"dup names": `
-[judge]
+[[judge]]
 server = "http://j"
 model = "m"
 [[model]]
@@ -136,7 +136,7 @@ server = "http://b"
 model = "bm"
 `,
 		"model missing name": `
-[judge]
+[[judge]]
 server = "http://j"
 model = "m"
 [[model]]
@@ -162,5 +162,56 @@ func TestWantSkill(t *testing.T) {
 	only := Settings{Skills: []string{"go", "base"}}
 	if !only.wantSkill("go") || only.wantSkill("ts") {
 		t.Fatal("filter mismatch")
+	}
+}
+
+func TestLoadConfigMultipleJudges(t *testing.T) {
+	p := writeTemp(t, "c.toml", `
+[[judge]]
+server = "http://j1"
+model  = "m1"
+
+[[judge]]
+server = "http://j2"
+model  = "m2"
+
+[[model]]
+name = "a"
+server = "http://a"
+model = "am"
+`)
+	cfg, err := loadConfig(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Judges) != 2 {
+		t.Fatalf("judges = %d, want 2", len(cfg.Judges))
+	}
+	// Unnamed judges default to main, judge2, …
+	if cfg.Judges[0].Name != "main" || cfg.Judges[1].Name != "judge2" {
+		t.Fatalf("judge names = %q,%q, want main,judge2", cfg.Judges[0].Name, cfg.Judges[1].Name)
+	}
+	if cfg.Judges[0].Model != "m1" || cfg.Judges[1].Server != "http://j2" {
+		t.Fatalf("judge fields wrong: %+v", cfg.Judges)
+	}
+}
+
+func TestLoadConfigRejectsDuplicateJudgeNames(t *testing.T) {
+	p := writeTemp(t, "c.toml", `
+[[judge]]
+name = "dup"
+server = "http://j1"
+model  = "m1"
+[[judge]]
+name = "dup"
+server = "http://j2"
+model  = "m2"
+[[model]]
+name = "a"
+server = "http://a"
+model = "am"
+`)
+	if _, err := loadConfig(p); err == nil {
+		t.Fatal("duplicate judge names must error")
 	}
 }

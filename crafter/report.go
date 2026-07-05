@@ -39,7 +39,11 @@ type reportData struct {
 // decisions in each model's results.jsonl. It overwrites docsPath on every run
 // so the page always reflects the latest completed probes.
 func writeReport(docsPath string, stats []ModelStats, cfg *Config, modelsDir string) error {
-	data := reportData{JudgeModel: cfg.Judge.Model, Samples: cfg.Settings.Samples}
+	judgeModel := ""
+	if len(cfg.Judges) > 0 {
+		judgeModel = cfg.Judges[0].Model
+	}
+	data := reportData{JudgeModel: judgeModel, Samples: cfg.Settings.Samples}
 	for _, ms := range stats {
 		rm := reportModel{Model: ms.Model, Stats: ms, SavedPct: pct(ms.OrigBytes, ms.PrunedBytes)}
 		for _, s := range ms.Skills {

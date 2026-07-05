@@ -1,20 +1,18 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-// pipelineFixture spins up fake target and judge servers for probePipeline
-// tests. The target counts its calls; the judge can be given a handler hook.
+// pipelineFixture spins up fake target and judge servers for scheduler tests.
+// The target counts its calls; the judge can be given a handler hook.
 func pipelineFixture(t *testing.T, judgeHook func(targetCalls *atomic.Int32)) (target, judge ModelSpec, targetCalls *atomic.Int32) {
 	t.Helper()
 	targetCalls = &atomic.Int32{}
@@ -33,152 +31,6 @@ func pipelineFixture(t *testing.T, judgeHook func(targetCalls *atomic.Int32)) (t
 	t.Cleanup(js.Close)
 	return ModelSpec{Name: "target", Server: ts.URL, Model: "t"},
 		ModelSpec{Name: "main", Server: js.URL, Model: "j"}, targetCalls
-}
-
-func makePending(n int) []pendingClaim {
-	var pend []pendingClaim
-	for i := 0; i < n; i++ {
-		pend = append(pend, pendingClaim{
-			idx:   i,
-			claim: Claim{ID: fmt.Sprintf("go#%02d", i), Skill: "go", Text: "claim"},
-			q:     Question{Question: "q", Rubric: "r"},
-		})
-	}
-	return pend
-}
-
-// The core promise of the pipeline: while the judge scores claim 1, the target
-// is already generating claim 2. The judge's first call blocks until the
-// target has served claim 2's A/B requests — if generation were serialized
-// behind judging, this would deadlock (and fail via the poll deadline).
-func TestProbePipelineOverlapsGenerationAndJudging(t *testing.T) {
-	var judgeFirstSaw atomic.Int32
-	judgeFirstSaw.Store(-1)
-	var first atomic.Bool
-	first.Store(true)
-	target, judge, targetCalls := pipelineFixture(t, func(tc *atomic.Int32) {
-		if !first.CompareAndSwap(true, false) {
-			return
-		}
-		deadline := time.Now().Add(5 * time.Second)
-		for tc.Load() < 4 && time.Now().Before(deadline) { // claim1 A+B + claim2 A+B
-			time.Sleep(time.Millisecond)
-		}
-		judgeFirstSaw.Store(tc.Load())
-	})
-
-	var got []ProbeResult
-	ev := pipelineEvents{onResult: func(pc pendingClaim, res ProbeResult, genMs int64) error {
-		got = append(got, res)
-		return nil
-	}}
-	if err := probePipeline(context.Background(), judge, target, makePending(3), 1, ev); err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 3 {
-		t.Fatalf("results = %d, want 3", len(got))
-	}
-	// Delivered in pend order despite concurrent generation.
-	for i, r := range got {
-		if r.ClaimID != fmt.Sprintf("go#%02d", i) || !r.Keep {
-			t.Fatalf("result %d = %s/%s", i, r.ClaimID, r.Verdict)
-		}
-	}
-	if s := judgeFirstSaw.Load(); s < 4 {
-		t.Fatalf("no overlap: target had served only %d calls while judge held claim 1 (want ≥4)", s)
-	}
-	if c := targetCalls.Load(); c != 6 {
-		t.Fatalf("target calls = %d, want 6 (3 claims × A/B)", c)
-	}
-}
-
-// A result that cannot be persisted must abort the pipeline (and not hang on
-// the generator's pending send).
-func TestProbePipelineStopsWhenRecordFails(t *testing.T) {
-	target, judge, _ := pipelineFixture(t, nil)
-	boom := fmt.Errorf("disk full")
-	ev := pipelineEvents{onResult: func(pc pendingClaim, res ProbeResult, genMs int64) error {
-		return boom
-	}}
-	done := make(chan error, 1)
-	go func() { done <- probePipeline(context.Background(), judge, target, makePending(4), 1, ev) }()
-	select {
-	case err := <-done:
-		if err != boom {
-			t.Fatalf("err = %v, want %v", err, boom)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("pipeline hung after record failure — generator not unblocked")
-	}
-}
-
-// Cancelling mid-run stops generation at the claim boundary; everything
-// already in flight still lands via onResult, and the pipeline returns.
-func TestProbePipelineCancellation(t *testing.T) {
-	target, judge, _ := pipelineFixture(t, nil)
-	ctx, cancel := context.WithCancel(context.Background())
-	var got int32
-	ev := pipelineEvents{onResult: func(pc pendingClaim, res ProbeResult, genMs int64) error {
-		if atomic.AddInt32(&got, 1) == 1 {
-			cancel() // interrupt after the first recorded verdict
-		}
-		return nil
-	}}
-	done := make(chan error, 1)
-	go func() { done <- probePipeline(ctx, judge, target, makePending(10), 1, ev) }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("cancelled pipeline should return nil, got %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("pipeline hung after cancellation")
-	}
-	if n := atomic.LoadInt32(&got); n < 1 || n > 3 {
-		t.Fatalf("recorded %d results after early cancel, want 1–3 (first + at most in-flight/buffered)", n)
-	}
-}
-
-// An errored generation is recorded as an errored result, and the pipeline
-// carries on with the remaining claims.
-func TestProbePipelineRecordsGenerationErrors(t *testing.T) {
-	var calls atomic.Int32
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 { // first claim's A call fails
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
-			return
-		}
-		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"fine"}}]}`)))
-	}))
-	defer ts.Close()
-	verdict := `{"a_satisfies":false,"b_satisfies":true,"similar":false,"verdict":"keep","reason":"ok"}`
-	js := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(sse(fmt.Sprintf(`{"choices":[{"delta":{"content":%q}}]}`, verdict))))
-	}))
-	defer js.Close()
-
-	var got []ProbeResult
-	ev := pipelineEvents{onResult: func(pc pendingClaim, res ProbeResult, genMs int64) error {
-		got = append(got, res)
-		return nil
-	}}
-	err := probePipeline(context.Background(),
-		ModelSpec{Name: "main", Server: js.URL, Model: "j"},
-		ModelSpec{Name: "target", Server: ts.URL, Model: "t"},
-		makePending(2), 1, ev)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 2 {
-		t.Fatalf("results = %d, want 2", len(got))
-	}
-	if got[0].Err == "" || !strings.Contains(got[0].Err, "boom") {
-		t.Fatalf("first result should carry the generation error, got %+v", got[0])
-	}
-	if got[1].Err != "" || !got[1].Keep {
-		t.Fatalf("second claim should succeed, got %+v", got[1])
-	}
 }
 
 func TestDiscoverSkills(t *testing.T) {

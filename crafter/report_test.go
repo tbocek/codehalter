@@ -32,7 +32,7 @@ func TestWriteReport(t *testing.T) {
 		PrunedBytes: 700,
 		Skills:      []SkillStats{{Skill: "go", Claims: 2, Kept: 1, Dropped: 1, OrigBytes: 1000, PrunedBytes: 700}},
 	}}
-	cfg := &Config{Judge: ModelSpec{Model: "big-judge"}, Settings: Settings{Samples: 3}}
+	cfg := &Config{Judges: []ModelSpec{{Model: "big-judge"}}, Settings: Settings{Samples: 3}}
 
 	out := filepath.Join(root, "docs", "skill-crafter-report.html")
 	if err := writeReport(out, stats, cfg, modelsDir); err != nil {

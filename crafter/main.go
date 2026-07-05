@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -129,183 +130,89 @@ func main() {
 		finalize(report, cfg, *modelsFlag, *docsFlag)
 	}
 
-	// Pipeline runs skill by skill: segment + author ONE skill (judge), then
-	// probe it on every target and prune it (per model), then move to the next
-	// skill. Each skill's full result (pruned SKILL-*.md, updated stats.json)
-	// lands before the next skill starts, so a long run produces usable output
-	// incrementally instead of all at the end.
+	// The whole run streams per model: PREP, AUTHOR, GENERATE and SCORE are
+	// scheduled together, and a free judge slot always does the task that refills
+	// the emptiest upstream queue (AUTHOR > PREP > SCORE) so the target never idles
+	// while a later skill is being streamlined. Prep + authoring are cached and
+	// model-independent, so model A does the real work and model B reuses it.
 	//
-	// prepare is the judge-side work for one skill: segment into claims,
-	// author a question per claim. Both are disk-cached, so a prepared skill
-	// that never gets probed (crash, interrupt) costs nothing next run.
-	type preparedSkill struct {
-		src       skillSource
-		orig      []byte
-		claims    []Claim
-		questions map[string]Question
-		err       error
-	}
-	prepare := func(sk skillSource) preparedSkill {
-		// Stage 0: streamline the ground skill into clean-skills/ (main model,
-		// cached on source+prompt hash). Everything downstream — segmentation,
-		// probing, pruning — runs on the CLEAN version, so the per-model
-		// outputs in models/ are pruned clean skills.
-		logf("streamlining %s ...", sk.stack)
-		cleanStart := time.Now()
-		cleanPath, err := ensureCleanSkill(ctx, cfg.Judge, sk.stack, sk.path, *cleanFlag, filepath.Join(*cacheFlag, "streamline"))
+	// prepSkill streamlines + segments one skill on `judge` (both cached) and, once
+	// the claims are known, GCs any authored-probe entries orphaned by a
+	// segmentation change from that skill's shared question cache.
+	prepSkill := func(judge ModelSpec, sk skillSource, store *probeStore) ([]byte, []Claim, error) {
+		cleanPath, err := ensureCleanSkill(ctx, judge, sk.stack, sk.path, *cleanFlag, filepath.Join(*cacheFlag, "streamline"))
 		if err != nil {
-			return preparedSkill{src: sk, err: err}
+			return nil, nil, err
 		}
 		orig, err := os.ReadFile(cleanPath)
 		if err != nil {
-			return preparedSkill{src: sk, err: fmt.Errorf("read %s: %w", cleanPath, err)}
+			return nil, nil, fmt.Errorf("read clean skill: %w", err)
 		}
-		logf("streamlined %s: %d bytes (%s)", sk.stack, len(orig), cachedOr(time.Since(cleanStart)))
-
-		logf("segmenting %s ...", sk.stack)
-		segStart := time.Now()
-		claims, err := segmentSkill(ctx, cfg.Judge, sk.stack, cleanPath, filepath.Join(*cacheFlag, "segments"))
+		claims, err := segmentSkill(ctx, judge, sk.stack, cleanPath, filepath.Join(*cacheFlag, "segments"))
 		if err != nil {
-			return preparedSkill{src: sk, err: err}
+			return nil, nil, err
 		}
-		logf("segmented %s: %d claims (%s)", sk.stack, len(claims), cachedOr(time.Since(segStart)))
-		logf("authoring probes for %s ...", sk.stack)
-		authStart := time.Now()
-		questions, err := authorClaims(ctx, cfg.Judge, claims, filepath.Join(*cacheFlag, "authored", sk.stack+".json"),
-			func(done, total int, id string, d time.Duration) {
-				logf("authored %s (%d/%d, %s)", id, done, total, fmtDuration(d))
-			})
-		if err != nil {
-			return preparedSkill{src: sk, err: err}
+		store.mu.Lock()
+		if qm := store.questions[sk.stack]; qm != nil {
+			ids := make(map[string]bool, len(claims))
+			for _, c := range claims {
+				ids[c.ID] = true
+			}
+			for id := range qm {
+				if !ids[id] {
+					delete(qm, id)
+				}
+			}
 		}
-		logf("authored %s: %d/%d probes (%s)", sk.stack, len(questions), len(claims), cachedOr(time.Since(authStart)))
-		return preparedSkill{src: sk, orig: orig, claims: claims, questions: questions}
+		store.mu.Unlock()
+		return orig, claims, nil
 	}
 
-	// Model-outer ordering: probe ALL skills on model A, then all on model B.
-	// The targets share one router (ai.jos.li) that swaps models on demand, so
-	// this loads each target model ONCE and keeps its prefix cache warm for the
-	// whole pass, instead of thrashing A<->B every skill. The judge is on a
-	// separate server, so its per-skill prepare work — cached after model A's
-	// pass — never touches the target router.
+	// Model-outer ordering: probe ALL skills on model A, then all on model B. The
+	// targets share one router (ai.jos.li) that swaps models on demand, so this
+	// loads each target ONCE for its whole pass instead of thrashing A<->B.
 	for mi, m := range cfg.Models {
 		modelDir := filepath.Join(*modelsFlag, m.Name)
 		dm := done[m.Name]
 		logf("==== model %d/%d: %s ====", mi+1, len(cfg.Models), m.Name)
 
-		// One-step lookahead over skills: while skill N is probed on the TARGET,
-		// skill N+1 is streamlined/segmented/authored on the JUDGE. On model A's
-		// pass that is real judge work; on later passes it is all cache hits
-		// (near-instant). Buffered chan of 1 = one skill in flight ahead. A
-		// fresh channel per pass so model B doesn't inherit A's queued skill.
-		nextCh := make(chan preparedSkill, 1)
-		go func() { nextCh <- prepare(skills[0]) }()
-
-		// Warm the router to this model at most once per pass, lazily on the
-		// first skill that actually has work — a fully-resumed pass never loads
-		// the model, and within the pass it stays loaded (only m's calls hit
-		// the router), so no per-skill re-switch.
-		warmed := false
-		warmup := func() {
-			if warmed {
-				return
-			}
-			warmed = true
-			logf("switching endpoint to %s (a router may load the model now) ...", m.Name)
-			switchStart := time.Now()
-			wctx, wcancel := context.WithTimeout(ctx, 10*time.Minute)
-			if err := ping(wctx, m); err != nil {
-				logf("warn: model switch/warm-up for %s failed: %v — probing anyway", m.Name, err)
-			} else {
-				logf("%s ready (%s)", m.Name, cachedOr(time.Since(switchStart)))
-			}
-			wcancel()
+		// Resume state, loaded up front. Authored questions are shared across models
+		// and cached per skill (raw here; prepSkill GCs orphans once claims exist);
+		// generated samples are this model's ledger.
+		questions := map[string]map[string]Question{}
+		questionPath := map[string]string{}
+		for _, sk := range skills {
+			path := filepath.Join(*cacheFlag, "authored", sk.stack+".json")
+			questionPath[sk.stack] = path
+			questions[sk.stack] = readQuestionCache(path)
+		}
+		samplesPath := filepath.Join(modelDir, "samples.jsonl")
+		savedSamples := readSamples(samplesPath)
+		store := &probeStore{
+			questions:    questions,
+			questionPath: questionPath,
+			samplesPath:  samplesPath,
+			resultsPath:  filepath.Join(modelDir, "results.jsonl"),
 		}
 
-		for i := range skills {
-			p := <-nextCh
-			if i+1 < len(skills) {
-				next := skills[i+1]
-				go func() { nextCh <- prepare(next) }()
-			}
-			if p.err != nil {
-				// A judge failure on one skill (loop even after the nudge, bad
-				// JSON) must not abort the run — skip the skill, the next run
-				// retries it.
-				logf("warn: skipping skill %s: %v", p.src.stack, p.err)
-				continue
-			}
-			sk, orig, claims, questions := p.src, p.orig, p.claims, p.questions
-			if len(questions) < len(claims) {
-				logf("%s: %d/%d claims authored — the rest stay untested this run", sk.stack, len(questions), len(claims))
-			}
-			resultsPath := filepath.Join(modelDir, "results.jsonl")
-
-			// Pending list computed up front: the generator goroutine inside
-			// probePipeline must not read dm while the consumer writes it.
-			var pend []pendingClaim
-			for idx, c := range claims {
-				q, authored := questions[c.ID]
-				if !authored {
-					continue // no question to probe with (warned above); counts as errored in stats
-				}
-				if r, ok := dm[c.ID]; ok && r.Err == "" {
-					continue // already decided; resume skips it
-				}
-				pend = append(pend, pendingClaim{idx: idx, claim: c, q: q})
-			}
-			logf("== %s / %s: %d claims, %d pending ==", sk.stack, m.Name, len(claims), len(pend))
-			if len(pend) > 0 {
-				warmup()
-			}
-
-			// Generate/judge pipeline: the TARGET produces claim N+1's A/B
-			// answers while the JUDGE scores claim N's — different servers,
-			// so the overlap is free wall-clock.
-			ev := pipelineEvents{
-				onGenerating: func(pc pendingClaim) {
-					// Announce before and after generating: a claim takes
-					// minutes of target time before its verdict line appears,
-					// and without these the resume start looks hung.
-					logf("[%s %d/%d] %s %s generating %d samples ...", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, cfg.Settings.Samples)
-				},
-				onGenerated: func(pc pendingClaim, genMs int64) {
-					logf("[%s %d/%d] %s %s generated (%dms) → judging", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, genMs)
-				},
-				onJudged: func(pc pendingClaim, i, n int, verdict string) {
-					logf("[%s %d/%d] %s %s judged sample %d/%d: %s", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, i, n, verdict)
-				},
-				onResult: func(pc pendingClaim, res ProbeResult, genMs int64) error {
-					if err := appendResult(resultsPath, res); err != nil {
-						return fmt.Errorf("write result: %w", err)
-					}
-					dm[res.ClaimID] = res
-					if res.Err != "" {
-						logf("[%s %d/%d] %s %s ERROR (%dms): %s", sk.stack, pc.idx+1, len(claims), m.Name, res.ClaimID, res.DurationMs, res.Err)
-					} else {
-						logf("[%s %d/%d] %s %s → %s (%dms: gen %dms + judge)", sk.stack, pc.idx+1, len(claims), m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs, genMs)
-					}
-					return nil
-				},
-			}
-			if err := probePipeline(ctx, cfg.Judge, m, pend, cfg.Settings.Samples, ev); err != nil {
-				log.Fatalf("%v", err)
-			}
-			if ctx.Err() != nil {
-				logf("interrupted during %s/%s — progress saved to %s, re-run to resume", sk.stack, m.Name, resultsPath)
-				finalizeAll()
+		// dm is written by judge workers (onResult) and read by resume + pruneOne;
+		// dmMu serializes them. Model-outer means only this model's dm mutates now,
+		// so finalizeAll's read of the other models' (final) stats stays race-free.
+		var dmMu sync.Mutex
+		prunedSkills := map[string]bool{}
+		pruneOne := func(stack string, orig []byte, claims []Claim) {
+			dmMu.Lock()
+			defer dmMu.Unlock()
+			if prunedSkills[stack] {
 				return
 			}
-
-			// Prune this skill for this model right away and refresh the
-			// accumulated stats.json, so results are on disk per skill, not
-			// only at run end.
-			pruned := pruneSkill(string(orig), droppedClaims(claims, dm))
-			outPath := filepath.Join(modelDir, "SKILL-"+sk.stack+".md")
-			if err := os.WriteFile(outPath, []byte(pruned), 0o644); err != nil {
+			prunedSkills[stack] = true
+			out := pruneSkill(string(orig), droppedClaims(claims, dm))
+			outPath := filepath.Join(modelDir, "SKILL-"+stack+".md")
+			if err := os.WriteFile(outPath, []byte(out), 0o644); err != nil {
 				log.Fatalf("write %s: %v", outPath, err)
 			}
-			st := skillStats(sk.stack, string(orig), pruned, claims, dm)
+			st := skillStats(stack, string(orig), out, claims, dm)
 			ms := statsByModel[m.Name]
 			ms.Skills = append(ms.Skills, st)
 			ms.OrigBytes += st.OrigBytes
@@ -314,12 +221,87 @@ func main() {
 				log.Fatalf("write stats: %v", err)
 			}
 			logf("%s / %s: %d kept, %d dropped, %d errored | %d → %d bytes (%s)",
-				sk.stack, m.Name, st.Kept, st.Dropped, st.Errored, st.OrigBytes, st.PrunedBytes, pct(st.OrigBytes, st.PrunedBytes))
-
-			// Refresh the docs report after every completed skill, not only at
-			// run end — a half-done overnight run should still have a current
-			// report.
+				stack, m.Name, st.Kept, st.Dropped, st.Errored, st.OrigBytes, st.PrunedBytes, pct(st.OrigBytes, st.PrunedBytes))
 			finalizeAll()
+		}
+
+		// resume resolves a claim's disk state for this model.
+		resume := func(c Claim) (Question, bool, []samplePair, bool, bool) {
+			dmMu.Lock()
+			r, ok := dm[c.ID]
+			dmMu.Unlock()
+			if ok && r.Err == "" {
+				return Question{}, false, nil, false, true // already decided
+			}
+			store.mu.Lock()
+			q, haveQ := store.questions[c.Skill][c.ID]
+			store.mu.Unlock()
+			var pairs []samplePair
+			havePairs := false
+			if haveQ {
+				if p, ok := savedSamples[c.ID]; ok {
+					pairs, havePairs = p, true
+				}
+			}
+			return q, haveQ, pairs, havePairs, false
+		}
+		prep := func(judge ModelSpec, sk skillSource) ([]byte, []Claim, error) {
+			return prepSkill(judge, sk, store)
+		}
+
+		// Warm the router to this model once before the pass (preflight may have
+		// swapped it out loading a later endpoint). One ping; harmless if resumed.
+		logf("switching endpoint to %s (a router may load the model now) ...", m.Name)
+		switchStart := time.Now()
+		wctx, wcancel := context.WithTimeout(ctx, 10*time.Minute)
+		if err := ping(wctx, m); err != nil {
+			logf("warn: model switch/warm-up for %s failed: %v — probing anyway", m.Name, err)
+		} else {
+			logf("%s ready (%s)", m.Name, cachedOr(time.Since(switchStart)))
+		}
+		wcancel()
+
+		ev := schedEvents{
+			onPrepped: func(j ModelSpec, stack string, claims, pending int, d time.Duration) {
+				logf("prepped %s: %d claims, %d pending (%s)%s", stack, claims, pending, cachedOr(d), judgeTag(j))
+			},
+			onAuthored: func(j ModelSpec, it *probeItem, d time.Duration) {
+				logf("authored %s (%s)%s", it.claim.ID, cachedOr(d), judgeTag(j))
+			},
+			onAuthorFail: func(j ModelSpec, it *probeItem) {
+				logf("warn: %s unauthored — untested this run%s", it.claim.ID, judgeTag(j))
+			},
+			onGenerating: func(it *probeItem) {
+				logf("[%s %d/%d] %s %s generating %d samples ...", it.claim.Skill, it.idx+1, it.nClaims, m.Name, it.claim.ID, cfg.Settings.Samples)
+			},
+			onGenerated: func(it *probeItem, genMs int64) {
+				logf("[%s %d/%d] %s %s generated (%dms) → judging", it.claim.Skill, it.idx+1, it.nClaims, m.Name, it.claim.ID, genMs)
+			},
+			onJudged: func(j ModelSpec, it *probeItem, i, n int, verdict string) {
+				logf("[%s %d/%d] %s %s judged sample %d/%d: %s%s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, it.claim.ID, i, n, verdict, judgeTag(j))
+			},
+			onResult: func(j ModelSpec, it *probeItem, res ProbeResult, genMs int64) {
+				dmMu.Lock()
+				dm[res.ClaimID] = res
+				dmMu.Unlock()
+				switch {
+				case res.Err != "":
+					logf("[%s %d/%d] %s %s ERROR (%dms): %s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, res.ClaimID, res.DurationMs, res.Err)
+				case res.Unstable:
+					logf("[%s %d/%d] %s %s → %s UNSTABLE (%dms: gen %dms + judge)%s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs, genMs, judgeTag(j))
+				default:
+					logf("[%s %d/%d] %s %s → %s (%dms: gen %dms + judge)%s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs, genMs, judgeTag(j))
+				}
+			},
+			onSkillDone: func(stack string, orig []byte, claims []Claim) { pruneOne(stack, orig, claims) },
+		}
+		if err := runProbePass(ctx, cfg.Judges, m, skills, prep, resume, cfg.Settings.Samples, cfg.Settings.KeepThreshold, store, ev); err != nil {
+			log.Fatalf("%v", err)
+		}
+		if ctx.Err() != nil {
+			logf("interrupted during %s — progress saved, re-run to resume", m.Name)
+			finalizeAll()
+			return
 		}
 	}
 
@@ -346,97 +328,6 @@ func finalize(report []ModelStats, cfg *Config, modelsDir, docsPath string) {
 	fmt.Fprintf(os.Stderr, "report updated: %s\n", docsPath)
 }
 
-// pendingClaim is one undecided claim queued for probing, carrying its display
-// index in the skill's full claim list.
-type pendingClaim struct {
-	idx   int
-	claim Claim
-	q     Question
-}
-
-// pipelineEvents are probePipeline's progress callbacks; any may be nil except
-// that a nil onResult silently discards results — main always sets it.
-// onResult persists one finished ProbeResult (with the generation share of its
-// duration for the log split); an error from it aborts the pipeline, because a
-// result that can't be persisted must not be silently lost.
-type pipelineEvents struct {
-	onGenerating func(pc pendingClaim)
-	onGenerated  func(pc pendingClaim, genMs int64)
-	onJudged     func(pc pendingClaim, i, n int, verdict string)
-	onResult     func(pc pendingClaim, res ProbeResult, genMs int64) error
-}
-
-// probePipeline overlaps target-side generation with judge-side verdicts: a
-// goroutine generates each pending claim's A/B pairs while the caller-side
-// loop judges the previous claim's — target and judge live on different
-// servers, so the overlap is free wall-clock. The channel buffer of 1 caps the
-// generator at one finished claim ahead (plus one in flight). Results are
-// delivered in pend order. A cancelled ctx stops generation at the next claim
-// boundary; already-generated items still flow through onResult (recorded as
-// errored when their calls were cut), matching resume semantics.
-func probePipeline(ctx context.Context, judge, target ModelSpec, pend []pendingClaim, samples int, ev pipelineEvents) error {
-	// Own cancel scope: an onResult failure must also stop the generator.
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	type genItem struct {
-		pc    pendingClaim
-		pairs []samplePair
-		genMs int64
-		err   string
-	}
-	genCh := make(chan genItem, 1)
-	go func() {
-		defer close(genCh)
-		for _, pc := range pend {
-			if ctx.Err() != nil {
-				return
-			}
-			if ev.onGenerating != nil {
-				ev.onGenerating(pc)
-			}
-			genStart := time.Now()
-			pairs, err := generateSamples(ctx, target, pc.claim, pc.q, samples)
-			it := genItem{pc: pc, pairs: pairs, genMs: time.Since(genStart).Milliseconds()}
-			if err != nil {
-				it.err = err.Error()
-			} else if ev.onGenerated != nil {
-				ev.onGenerated(pc, it.genMs)
-			}
-			genCh <- it
-		}
-	}()
-
-	for it := range genCh {
-		judgeStart := time.Now()
-		var res ProbeResult
-		if it.err != "" {
-			res = newProbeResult(target, it.pc.claim, it.pc.q)
-			res.Err = it.err
-		} else {
-			var judgeProgress func(i, n int, verdict string)
-			if ev.onJudged != nil {
-				pc := it.pc
-				judgeProgress = func(i, n int, verdict string) { ev.onJudged(pc, i, n, verdict) }
-			}
-			res = judgeSamples(ctx, judge, target, it.pc.claim, it.pc.q, it.pairs, judgeProgress)
-		}
-		res.DurationMs = it.genMs + time.Since(judgeStart).Milliseconds()
-		res.EndedAt = time.Now().Format(time.RFC3339)
-		if ev.onResult != nil {
-			if err := ev.onResult(it.pc, res, it.genMs); err != nil {
-				// Unblock and stop the generator before returning: cancel kills
-				// its in-flight LLM call, the drain frees its pending send.
-				cancel()
-				for range genCh { //nolint:revive // draining
-				}
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 // preflight pings the judge and every target endpoint before any real work, so
 // an unreachable host, wrong key, or unknown model id stops the run up front
 // instead of failing every probe. Each check is bounded so a dead host can't
@@ -446,7 +337,10 @@ func preflight(ctx context.Context, logf func(string, ...any), cfg *Config) erro
 		label string
 		m     ModelSpec
 	}
-	checks := []check{{"judge", cfg.Judge}}
+	var checks []check
+	for _, j := range cfg.Judges {
+		checks = append(checks, check{j.Name, j})
+	}
 	for _, m := range cfg.Models {
 		checks = append(checks, check{m.Name, m})
 	}
@@ -579,6 +473,16 @@ func tally(ms ModelStats) (kept, dropped, errored int) {
 		errored += s.Errored
 	}
 	return
+}
+
+// judgeTag renders " [name @ url]" for the judge endpoint that ran a task, so a
+// multi-judge pool's logs show which judge did what. Empty for the zero ModelSpec
+// (e.g. a generation error, where no judge ran).
+func judgeTag(m ModelSpec) string {
+	if m.Name == "" && m.Server == "" {
+		return ""
+	}
+	return fmt.Sprintf(" [%s @ %s]", m.Name, m.Server)
 }
 
 // cachedOr renders a step duration, marking near-instant completions as cache

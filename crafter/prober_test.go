@@ -37,7 +37,7 @@ func concurrencyServer(t *testing.T, reply string) (url string, peak *int32, tot
 }
 
 func TestGenerateSamples(t *testing.T) {
-	// Count calls and verify the B run carries the claim as system prompt.
+	// Count calls and verify arm B carries the supplied system prompt, arm A none.
 	var calls, withInstruction int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -55,7 +55,7 @@ func TestGenerateSamples(t *testing.T) {
 
 	claim := Claim{ID: "go#x", Skill: "go", Text: "always check errors"}
 	q := Question{Question: "write a file reader", Rubric: "checks the error"}
-	pairs, err := generateSamples(context.Background(), ModelSpec{Name: "t", Server: ts.URL, Model: "m"}, claim, q, 2)
+	pairs, err := generateSamples(context.Background(), ModelSpec{Name: "t", Server: ts.URL, Model: "m"}, claim, q, 2, claim.Text)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestJudgeSamplesMajority(t *testing.T) {
 
 	// Also assert the progress callback fires once per sample.
 	var progressed int
-	res := judgeSamples(context.Background(), judge, target, claim, q, pairs,
+	res := judgeSamples(context.Background(), judge, target, claim, q, pairs, 2, // threshold 2 = strict majority of 3
 		func(i, n int, verdict string) { progressed++ })
 	if progressed != len(pairs) {
 		t.Fatalf("progress fired %d times, want %d", progressed, len(pairs))
@@ -100,6 +100,9 @@ func TestJudgeSamplesMajority(t *testing.T) {
 	}
 	if !res.Keep || res.Verdict != "keep" || len(res.Samples) != 3 {
 		t.Fatalf("majority fold wrong: keep=%v verdict=%s samples=%d", res.Keep, res.Verdict, len(res.Samples))
+	}
+	if !res.Unstable {
+		t.Fatal("keep/drop/keep is non-unanimous — should be flagged Unstable")
 	}
 	if res.Model != "gemma" || res.ClaimID != "go#x" {
 		t.Fatalf("result identity wrong: %+v", res)
@@ -121,7 +124,7 @@ func TestGenerateSamplesWithToolsCapturesCalls(t *testing.T) {
 	defer ts.Close()
 
 	q := Question{Question: "install foo", Rubric: "calls web_search first", Tools: []string{"web_search"}}
-	pairs, err := generateSamples(context.Background(), ModelSpec{Name: "t", Server: ts.URL, Model: "m"}, Claim{ID: "x#1", Text: "web_search before claiming unavailable"}, q, 1)
+	pairs, err := generateSamples(context.Background(), ModelSpec{Name: "t", Server: ts.URL, Model: "m"}, Claim{ID: "x#1", Text: "web_search before claiming unavailable"}, q, 1, "skill")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +151,7 @@ func TestJudgeSamplesShowsToolCalls(t *testing.T) {
 	pairs := []samplePair{{AnswerA: "", ACalls: nil, AnswerB: "", BCalls: []string{`web_search({"query":"docs"})`}}}
 	res := judgeSamples(context.Background(),
 		ModelSpec{Name: "main", Server: ts.URL, Model: "j"}, ModelSpec{Name: "t"},
-		Claim{ID: "x#1"}, q, pairs, nil)
+		Claim{ID: "x#1"}, q, pairs, 1, nil)
 	if res.Err != "" {
 		t.Fatal(res.Err)
 	}
@@ -182,7 +185,7 @@ func TestQuestionCachePromptHashInvalidation(t *testing.T) {
 func TestGenerateSamplesParallelArms(t *testing.T) {
 	url, peak, total := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"answer"}}]}`))
 	target := ModelSpec{Name: "t", Server: url, Model: "m", Parallel: 2, sem: make(chan struct{}, 2)}
-	pairs, err := generateSamples(context.Background(), target, Claim{ID: "x#1", Text: "claim"}, Question{Question: "q", Rubric: "r"}, 3)
+	pairs, err := generateSamples(context.Background(), target, Claim{ID: "x#1", Text: "claim"}, Question{Question: "q", Rubric: "r"}, 3, "skill")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +204,7 @@ func TestGenerateSamplesParallelArms(t *testing.T) {
 func TestGenerateSamplesSerialWhenParallelOne(t *testing.T) {
 	url, peak, total := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"answer"}}]}`))
 	target := ModelSpec{Name: "t", Server: url, Model: "m", Parallel: 1, sem: make(chan struct{}, 1)}
-	if _, err := generateSamples(context.Background(), target, Claim{ID: "x#1", Text: "c"}, Question{Question: "q", Rubric: "r"}, 3); err != nil {
+	if _, err := generateSamples(context.Background(), target, Claim{ID: "x#1", Text: "c"}, Question{Question: "q", Rubric: "r"}, 3, "skill"); err != nil {
 		t.Fatal(err)
 	}
 	if p := atomic.LoadInt32(peak); p != 1 {
@@ -219,7 +222,7 @@ func TestJudgeSamplesParallel(t *testing.T) {
 	pairs := []samplePair{{AnswerA: "a1", AnswerB: "b1"}, {AnswerA: "a2", AnswerB: "b2"}, {AnswerA: "a3", AnswerB: "b3"}}
 
 	var progressed int32
-	res := judgeSamples(context.Background(), judge, ModelSpec{Name: "gemma"}, Claim{ID: "x#1"}, Question{Question: "q", Rubric: "r"}, pairs,
+	res := judgeSamples(context.Background(), judge, ModelSpec{Name: "gemma"}, Claim{ID: "x#1"}, Question{Question: "q", Rubric: "r"}, pairs, 1,
 		func(i, n int, verdict string) { atomic.AddInt32(&progressed, 1) })
 	if res.Err != "" {
 		t.Fatal(res.Err)
@@ -256,56 +259,9 @@ func TestJudgeSamplesParallelPropagatesError(t *testing.T) {
 	defer ts.Close()
 	judge := ModelSpec{Name: "main", Server: ts.URL, Model: "j", Parallel: 3, sem: make(chan struct{}, 3)}
 	res := judgeSamples(context.Background(), judge, ModelSpec{Name: "t"}, Claim{ID: "x#1"},
-		Question{Question: "q", Rubric: "r"}, []samplePair{{}, {}, {}}, nil)
+		Question{Question: "q", Rubric: "r"}, []samplePair{{}, {}, {}}, 1, nil)
 	if res.Err == "" {
 		t.Fatal("a failed judge sample must error the probe")
-	}
-}
-
-func TestAuthorClaimsParallel(t *testing.T) {
-	url, peak, _ := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"{\"question\":\"q\",\"rubric\":\"r\"}"}}]}`))
-	judge := ModelSpec{Name: "main", Server: url, Model: "j", Parallel: 3, sem: make(chan struct{}, 3)}
-	claims := []Claim{{ID: "go#0", Text: "a"}, {ID: "go#1", Text: "b"}, {ID: "go#2", Text: "c"}, {ID: "go#3", Text: "d"}}
-	cache := filepath.Join(t.TempDir(), "go.json")
-
-	got, err := authorClaims(context.Background(), judge, claims, cache, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 4 {
-		t.Fatalf("authored %d, want 4", len(got))
-	}
-	if p := atomic.LoadInt32(peak); p < 2 {
-		t.Fatalf("authoring did not run concurrently; peak = %d", p)
-	}
-	// Second call hits the cache — no new authoring.
-	url2, _, total2 := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"{\"question\":\"q\",\"rubric\":\"r\"}"}}]}`))
-	judge2 := ModelSpec{Name: "main", Server: url2, Model: "j", Parallel: 3, sem: make(chan struct{}, 3)}
-	if _, err := authorClaims(context.Background(), judge2, claims, cache, nil); err != nil {
-		t.Fatal(err)
-	}
-	if c := atomic.LoadInt32(total2); c != 0 {
-		t.Fatalf("cached re-run made %d calls, want 0", c)
-	}
-}
-
-func TestAuthorClaimsParallelIsRaceFree(t *testing.T) {
-	// Stress the shared cache map under the worker pool — the -race detector
-	// catches an unsynchronized write.
-	url, _, _ := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"{\"question\":\"q\",\"rubric\":\"r\"}"}}]}`))
-	judge := ModelSpec{Name: "main", Server: url, Model: "j", Parallel: 4, sem: make(chan struct{}, 4)}
-	var claims []Claim
-	for i := 0; i < 20; i++ {
-		claims = append(claims, Claim{ID: fmt.Sprintf("go#%02d", i), Text: "t"})
-	}
-	var counter int32
-	got, err := authorClaims(context.Background(), judge, claims, filepath.Join(t.TempDir(), "c.json"),
-		func(done, total int, id string, d time.Duration) { atomic.AddInt32(&counter, 1) })
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(got) != 20 || atomic.LoadInt32(&counter) != 20 {
-		t.Fatalf("authored %d, progress %d, want 20/20", len(got), counter)
 	}
 }
 
@@ -319,8 +275,51 @@ func TestJudgeSamplesNormalizesOffSpecVerdict(t *testing.T) {
 
 	res := judgeSamples(context.Background(),
 		ModelSpec{Name: "main", Server: ts.URL, Model: "j"}, ModelSpec{Name: "t"},
-		Claim{ID: "x#1"}, Question{Question: "q", Rubric: "r"}, []samplePair{{AnswerA: "a", AnswerB: "b"}}, nil)
+		Claim{ID: "x#1"}, Question{Question: "q", Rubric: "r"}, []samplePair{{AnswerA: "a", AnswerB: "b"}}, 1, nil)
 	if !res.Keep || res.Samples[0].Verdict != "keep" {
 		t.Fatalf("off-spec verdict not normalized to keep: %+v", res)
+	}
+}
+
+// TestJudgeSamplesKeepThreshold pins the keep/drop fold: keepThreshold is the
+// minimum "keep" votes to keep the statement, and any non-unanimous vote is
+// flagged Unstable. Threshold 1 (the default) keeps unless the samples agree to
+// drop; threshold 2 restores strict majority for 3 samples.
+func TestJudgeSamplesKeepThreshold(t *testing.T) {
+	keep := `{"a_satisfies":false,"b_satisfies":true,"similar":false,"verdict":"keep","reason":"B fixed it"}`
+	drop := `{"a_satisfies":true,"b_satisfies":true,"similar":true,"verdict":"drop","reason":"same"}`
+	cases := []struct {
+		name                   string
+		verdicts               []string
+		threshold              int
+		wantKeep, wantUnstable bool
+	}{
+		{"one keep, threshold 1 → keep", []string{drop, keep, drop}, 1, true, true},
+		{"one keep, threshold 2 → drop", []string{drop, keep, drop}, 2, false, true},
+		{"unanimous drop → drop, stable", []string{drop, drop, drop}, 1, false, false},
+		{"unanimous keep → keep, stable", []string{keep, keep, keep}, 1, true, false},
+		{"two keep, threshold 2 → keep", []string{keep, drop, keep}, 2, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var call int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				i := atomic.AddInt32(&call, 1) - 1
+				_, _ = w.Write([]byte(sse(fmt.Sprintf(`{"choices":[{"delta":{"content":%q}}]}`, tc.verdicts[i]))))
+			}))
+			defer ts.Close()
+			res := judgeSamples(context.Background(),
+				ModelSpec{Name: "main", Server: ts.URL, Model: "j"}, ModelSpec{Name: "t"},
+				Claim{ID: "x#1"}, Question{Question: "q", Rubric: "r"}, make([]samplePair, len(tc.verdicts)), tc.threshold, nil)
+			if res.Err != "" {
+				t.Fatal(res.Err)
+			}
+			if res.Keep != tc.wantKeep {
+				t.Fatalf("keep = %v, want %v", res.Keep, tc.wantKeep)
+			}
+			if res.Unstable != tc.wantUnstable {
+				t.Fatalf("unstable = %v, want %v", res.Unstable, tc.wantUnstable)
+			}
+		})
 	}
 }
