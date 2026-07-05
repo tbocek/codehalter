@@ -47,14 +47,46 @@ model = "qwen-m"
 	if cfg.Judge.Name != "main" {
 		t.Fatalf("judge name should default to %q, got %q", "main", cfg.Judge.Name)
 	}
-	// Endpoint semaphores: default parallel=1, channel wired on judge + models.
-	if cfg.Judge.Parallel != 1 || cap(cfg.Judge.sem) != 1 {
-		t.Fatalf("judge parallel/sem = %d/%d, want 1/1", cfg.Judge.Parallel, cap(cfg.Judge.sem))
+	// loadConfig leaves parallelism unresolved (0 = auto) and the semaphore nil
+	// until resolveParallelism runs.
+	if cfg.Judge.Parallel != 0 || cfg.Judge.sem != nil {
+		t.Fatalf("loadConfig should not resolve parallelism: parallel=%d sem=%v", cfg.Judge.Parallel, cfg.Judge.sem)
 	}
-	for _, m := range cfg.Models {
-		if m.Parallel != 1 || cap(m.sem) != 1 {
-			t.Fatalf("model %s parallel/sem = %d/%d, want 1/1", m.Name, m.Parallel, cap(m.sem))
+}
+
+func TestResolveParallelism(t *testing.T) {
+	cfg := &Config{
+		Judge: ModelSpec{Name: "main", Model: "j"}, // unset → auto-detect
+		Models: []ModelSpec{
+			{Name: "auto", Model: "a"},                  // unset → auto-detect
+			{Name: "explicit", Model: "e", Parallel: 5}, // configured, kept
+			{Name: "undetectable", Model: "u"},          // detect fails → 1
+		},
+	}
+	detect := func(m ModelSpec) int {
+		switch m.Model {
+		case "j":
+			return 3
+		case "a":
+			return 2
+		default:
+			return 0 // detection failed
 		}
+	}
+	cfg.resolveParallelism(detect, func(string, ...any) {})
+
+	want := map[string]int{"main": 3, "auto": 2, "explicit": 5, "undetectable": 1}
+	check := func(m ModelSpec) {
+		if m.Parallel != want[m.Name] {
+			t.Fatalf("%s parallel = %d, want %d", m.Name, m.Parallel, want[m.Name])
+		}
+		if cap(m.sem) != want[m.Name] {
+			t.Fatalf("%s sem cap = %d, want %d", m.Name, cap(m.sem), want[m.Name])
+		}
+	}
+	check(cfg.Judge)
+	for _, m := range cfg.Models {
+		check(m)
 	}
 }
 

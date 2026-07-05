@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -532,6 +533,39 @@ func doChat(ctx context.Context, m ModelSpec, reqBody chatRequest) (content, rea
 		return visible.String(), thinking.String(), assembleCalls(), fmt.Errorf("call %s (%s): stream read: %w", m.Name, m.Model, err)
 	}
 	return visible.String(), thinking.String(), assembleCalls(), nil
+}
+
+// detectSlots asks a llama.cpp server how many parallel slots (-np) it serves,
+// via /props total_slots — the same signal codehalter's own auto-detection
+// uses. Router mode (several models behind one server) reports nothing useful
+// on the bare /props, so it queries /props?model=<url-encoded id> first and
+// falls back to the bare path for a direct llama-server. Returns 0 when the
+// server can't be probed (non-llama.cpp backend, error, missing field) — the
+// caller then keeps parallel at 1.
+func detectSlots(ctx context.Context, m ModelSpec) int {
+	for _, path := range []string{"/props?model=" + url.QueryEscape(m.Model), "/props"} {
+		req, err := http.NewRequestWithContext(ctx, "GET", m.endpoint(path), nil)
+		if err != nil {
+			continue
+		}
+		if m.APIKey != "" {
+			req.Header.Set("Authorization", "Bearer "+m.APIKey)
+		}
+		resp, err := crafterHTTPClient.Do(req)
+		if err != nil {
+			continue
+		}
+		var props struct {
+			TotalSlots int `json:"total_slots"`
+		}
+		decErr := json.NewDecoder(resp.Body).Decode(&props)
+		ok := resp.StatusCode == http.StatusOK
+		resp.Body.Close()
+		if ok && decErr == nil && props.TotalSlots > 0 {
+			return props.TotalSlots
+		}
+	}
+	return 0
 }
 
 // ping verifies a model endpoint is reachable, authorized, and actually serving

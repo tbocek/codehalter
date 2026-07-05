@@ -367,6 +367,41 @@ func TestBuildProbeToolsSkipsUnknown(t *testing.T) {
 
 // parallel=2 must allow exactly two in-flight requests: the cap is enforced
 // (never 3+) and actually used (two overlap given enough concurrent callers).
+func TestDetectSlots(t *testing.T) {
+	t.Run("router props?model", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Router: bare /props reports no slots, /props?model= reports 3.
+			if r.URL.Query().Get("model") == "" {
+				_, _ = w.Write([]byte(`{"total_slots":0}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"total_slots":3}`))
+		}))
+		defer ts.Close()
+		if n := detectSlots(context.Background(), ModelSpec{Server: ts.URL, Model: "Qwen (x; y)"}); n != 3 {
+			t.Fatalf("detected %d, want 3", n)
+		}
+	})
+	t.Run("direct bare props", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"total_slots":2}`))
+		}))
+		defer ts.Close()
+		if n := detectSlots(context.Background(), ModelSpec{Server: ts.URL, Model: "m"}); n != 2 {
+			t.Fatalf("detected %d, want 2", n)
+		}
+	})
+	t.Run("non-llamacpp backend", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer ts.Close()
+		if n := detectSlots(context.Background(), ModelSpec{Server: ts.URL, Model: "m"}); n != 0 {
+			t.Fatalf("undetectable server should yield 0, got %d", n)
+		}
+	})
+}
+
 func TestChatParallelTwoAllowsTwoInFlight(t *testing.T) {
 	var inFlight, peak int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

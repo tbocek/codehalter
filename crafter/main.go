@@ -91,6 +91,18 @@ func main() {
 		}
 	}
 
+	// Resolve each endpoint's concurrency: an unset `parallel` is auto-detected
+	// from the server's slot count (llama.cpp -np), same as the main codehalter
+	// binary. Runs after preflight so a router has loaded the model /props
+	// reports on.
+	logf("resolving endpoint parallelism ...")
+	cfg.resolveParallelism(func(m ModelSpec) int {
+		dctx, dcancel := context.WithTimeout(ctx, 30*time.Second)
+		n := detectSlots(dctx, m)
+		dcancel()
+		return n
+	}, logf)
+
 	// Per-model state, loaded once up front: the resume ledger (claim IDs are
 	// stable content hashes, so ordering doesn't matter) and the stats that
 	// accumulate skill by skill.
@@ -170,37 +182,64 @@ func main() {
 		return preparedSkill{src: sk, orig: orig, claims: claims, questions: questions}
 	}
 
-	// One-step lookahead: while skill N is probed on the TARGET servers, skill
-	// N+1 is segmented+authored on the JUDGE server in the background — they
-	// live on different endpoints, so this overlaps otherwise-idle judge time.
-	// (Probing also sends the judge one verdict call per sample; those simply
-	// queue with the prefetch calls on the judge server.) Buffered chan of 1 =
-	// exactly one skill in flight ahead.
-	nextCh := make(chan preparedSkill, 1)
-	go func() { nextCh <- prepare(skills[0]) }()
+	// Model-outer ordering: probe ALL skills on model A, then all on model B.
+	// The targets share one router (ai.jos.li) that swaps models on demand, so
+	// this loads each target model ONCE and keeps its prefix cache warm for the
+	// whole pass, instead of thrashing A<->B every skill. The judge is on a
+	// separate server, so its per-skill prepare work — cached after model A's
+	// pass — never touches the target router.
+	for mi, m := range cfg.Models {
+		modelDir := filepath.Join(*modelsFlag, m.Name)
+		dm := done[m.Name]
+		logf("==== model %d/%d: %s ====", mi+1, len(cfg.Models), m.Name)
 
-	for i := range skills {
-		p := <-nextCh
-		if i+1 < len(skills) {
-			next := skills[i+1]
-			go func() { nextCh <- prepare(next) }()
-		}
-		if p.err != nil {
-			// A judge failure on one skill (loop even after the nudge, bad
-			// JSON) must not abort the run — skip the skill, the next run
-			// retries it.
-			logf("warn: skipping skill %s: %v", p.src.stack, p.err)
-			continue
-		}
-		sk, orig, claims, questions := p.src, p.orig, p.claims, p.questions
-		if len(questions) < len(claims) {
-			logf("%s: %d/%d claims authored — the rest stay untested this run", sk.stack, len(questions), len(claims))
+		// One-step lookahead over skills: while skill N is probed on the TARGET,
+		// skill N+1 is streamlined/segmented/authored on the JUDGE. On model A's
+		// pass that is real judge work; on later passes it is all cache hits
+		// (near-instant). Buffered chan of 1 = one skill in flight ahead. A
+		// fresh channel per pass so model B doesn't inherit A's queued skill.
+		nextCh := make(chan preparedSkill, 1)
+		go func() { nextCh <- prepare(skills[0]) }()
+
+		// Warm the router to this model at most once per pass, lazily on the
+		// first skill that actually has work — a fully-resumed pass never loads
+		// the model, and within the pass it stays loaded (only m's calls hit
+		// the router), so no per-skill re-switch.
+		warmed := false
+		warmup := func() {
+			if warmed {
+				return
+			}
+			warmed = true
+			logf("switching endpoint to %s (a router may load the model now) ...", m.Name)
+			switchStart := time.Now()
+			wctx, wcancel := context.WithTimeout(ctx, 10*time.Minute)
+			if err := ping(wctx, m); err != nil {
+				logf("warn: model switch/warm-up for %s failed: %v — probing anyway", m.Name, err)
+			} else {
+				logf("%s ready (%s)", m.Name, cachedOr(time.Since(switchStart)))
+			}
+			wcancel()
 		}
 
-		for _, m := range cfg.Models {
-			modelDir := filepath.Join(*modelsFlag, m.Name)
+		for i := range skills {
+			p := <-nextCh
+			if i+1 < len(skills) {
+				next := skills[i+1]
+				go func() { nextCh <- prepare(next) }()
+			}
+			if p.err != nil {
+				// A judge failure on one skill (loop even after the nudge, bad
+				// JSON) must not abort the run — skip the skill, the next run
+				// retries it.
+				logf("warn: skipping skill %s: %v", p.src.stack, p.err)
+				continue
+			}
+			sk, orig, claims, questions := p.src, p.orig, p.claims, p.questions
+			if len(questions) < len(claims) {
+				logf("%s: %d/%d claims authored — the rest stay untested this run", sk.stack, len(questions), len(claims))
+			}
 			resultsPath := filepath.Join(modelDir, "results.jsonl")
-			dm := done[m.Name]
 
 			// Pending list computed up front: the generator goroutine inside
 			// probePipeline must not read dm while the consumer writes it.
@@ -216,21 +255,8 @@ func main() {
 				pend = append(pend, pendingClaim{idx: idx, claim: c, q: q})
 			}
 			logf("== %s / %s: %d claims, %d pending ==", sk.stack, m.Name, len(claims), len(pend))
-
-			// Explicit model-switch request: a routed endpoint loads the model
-			// named in the request, so ping it once up front under a generous
-			// timeout instead of letting the switch inflate (or time out) the
-			// first probe. Harmless one-token call on a dedicated server.
 			if len(pend) > 0 {
-				logf("switching endpoint to %s (a router may load the model now) ...", m.Name)
-				switchStart := time.Now()
-				wctx, wcancel := context.WithTimeout(ctx, 10*time.Minute)
-				if err := ping(wctx, m); err != nil {
-					logf("warn: model switch/warm-up for %s failed: %v — probing anyway", m.Name, err)
-				} else {
-					logf("%s ready (%s)", m.Name, cachedOr(time.Since(switchStart)))
-				}
-				wcancel()
+				warmup()
 			}
 
 			// Generate/judge pipeline: the TARGET produces claim N+1's A/B
@@ -289,11 +315,12 @@ func main() {
 			}
 			logf("%s / %s: %d kept, %d dropped, %d errored | %d → %d bytes (%s)",
 				sk.stack, m.Name, st.Kept, st.Dropped, st.Errored, st.OrigBytes, st.PrunedBytes, pct(st.OrigBytes, st.PrunedBytes))
-		}
 
-		// Refresh the docs report after every completed skill, not only at run
-		// end — a half-done overnight run should still have a current report.
-		finalizeAll()
+			// Refresh the docs report after every completed skill, not only at
+			// run end — a half-done overnight run should still have a current
+			// report.
+			finalizeAll()
+		}
 	}
 
 	for _, m := range cfg.Models {

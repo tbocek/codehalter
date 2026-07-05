@@ -91,16 +91,10 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.Judge.Name == "" {
 		cfg.Judge.Name = "main"
 	}
-	initSem := func(m *ModelSpec) {
-		if m.Parallel < 1 {
-			m.Parallel = 1
-		}
-		m.sem = make(chan struct{}, m.Parallel)
-	}
-	initSem(&cfg.Judge)
-	for i := range cfg.Models {
-		initSem(&cfg.Models[i])
-	}
+	// Parallel is resolved later (resolveParallelism): 0/absent means
+	// auto-detect from the server's slot count, a positive value is an
+	// explicit cap. The semaphore is built there too, once the endpoints are
+	// known reachable.
 	if len(cfg.Models) == 0 {
 		return nil, fmt.Errorf("%s: at least one [[model]] required", path)
 	}
@@ -118,6 +112,40 @@ func loadConfig(path string) (*Config, error) {
 		seen[m.Name] = true
 	}
 	return &cfg, nil
+}
+
+// resolveParallelism finalizes each endpoint's concurrency cap and builds its
+// semaphore. An endpoint with an explicit positive `parallel` in the config
+// keeps it; one left unset (0) is auto-detected from the server's slot count
+// (llama.cpp -np via /props total_slots), falling back to 1 when the server
+// can't be probed. detect is injected so it can be faked in tests. Call once,
+// after preflight has confirmed the endpoints are reachable.
+//
+// The cap must not exceed the server's real slots: a client that sends more
+// requests than there are slots makes the server queue the extras WITHOUT
+// sending headers (the "timeout awaiting response headers" failure) — so an
+// explicit value is the operator's responsibility, and the auto path uses the
+// server's own reported count, which is correct by construction.
+func (cfg *Config) resolveParallelism(detect func(ModelSpec) int, logf func(string, ...any)) {
+	finalize := func(m *ModelSpec) {
+		switch {
+		case m.Parallel >= 1:
+			logf("  %s (%s): parallel = %d (configured)", m.Name, m.Model, m.Parallel)
+		default:
+			if n := detect(*m); n >= 1 {
+				m.Parallel = n
+				logf("  %s (%s): auto-detected %d slot(s) → parallel = %d", m.Name, m.Model, n, n)
+			} else {
+				m.Parallel = 1
+				logf("  %s (%s): slot count not detected → parallel = 1 (set it in crafter.toml to override)", m.Name, m.Model)
+			}
+		}
+		m.sem = make(chan struct{}, m.Parallel)
+	}
+	finalize(&cfg.Judge)
+	for i := range cfg.Models {
+		finalize(&cfg.Models[i])
+	}
 }
 
 // wantSkill reports whether a bare stack name (e.g. "go" from SKILL-go.md)
