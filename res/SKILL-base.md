@@ -21,13 +21,12 @@ Applies execute + verify-fail replan. In plan: emit install + Dockerfile-edit st
 Pkg-mgr cmd depends base image → check SKILL-<os>.md (alpine/arch/debian/fedora/ubuntu) or fall back /etc/os-release.
 
 ## Install order (any missing tool, incl. lang-ecosystem: gopls, ruff, prettier…)
-1. Distro pkg mgr.
-2. Upstream website — web_search the official install docs, then either:
-   - install script: `curl -fsSL https://…/install.sh | sh` (use the shell the docs name — sh vs bash matters on minimal images);
-   - prebuilt release binary / tarball → drop into ~/.local/bin (already on PATH) or /usr/local/bin;
-   - vendor repo, when the docs offer one → add it with the custom-repo recipe in SKILL-<os>.md, then install via the pkg mgr (repo installs keep getting updates — prefer over a one-off binary when both exist).
-3. Language installer — go install / pipx / npm i -g / cargo install, when upstream documents it. In container these hit root-vs-dev env mismatch (GOBIN/PATH) → binary can land off PATH: verify with `which <tool>` after install and add the installer's bin dir to PATH if missing.
-4. Community repos: AUR, COPR, PPA, backports.
+- Order: 1) distro pkg mgr 2) upstream website 3) language installer 4) community repos (AUR, COPR, PPA, backports). Fall to the next option only when the previous has no (or too old a) package.
+- Upstream website: web_search the official install docs, then either:
+  - install script: `curl -fsSL https://…/install.sh | sh` (use the shell the docs name — sh vs bash matters on minimal images);
+  - prebuilt release binary / tarball → drop into ~/.local/bin (already on PATH) or /usr/local/bin;
+  - vendor repo, when the docs offer one → add it with the custom-repo recipe in SKILL-<os>.md, then install via the pkg mgr (repo installs keep getting updates — prefer over a one-off binary when both exist).
+- Language installer: go install / pipx / npm i -g / cargo install, only when upstream documents it. In container these hit root-vs-dev env mismatch (GOBIN/PATH) → binary can land off PATH: verify with `which <tool>` after install and add the installer's bin dir to PATH if missing.
 
 ## Test install live BEFORE patch Dockerfile
 **Execute phase only. Plan stays read-only.**

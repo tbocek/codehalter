@@ -28,6 +28,14 @@ Rules for each claim:
   sentence and copy that exact sentence (byte-for-byte, including its trailing
   punctuation) as the `source`. Never stitch a `source` together from
   non-adjacent pieces, and never let one `source` span parts of two lines.
+- A NUMBERED priority list (items starting "1.", "2)" …) asserts ONE behavior:
+  the ORDER itself. Emit ONE claim for the whole ranking — its `text` states
+  the order ("try X first, then Y; Z only as last resort"), and its `source`
+  is the complete numbered block copied verbatim (every item, including
+  indented sub-lines). Do NOT emit per-item claims like "use Z" — stripped of
+  its rank, such a claim asserts the wrong thing. HOW-details belonging to one
+  item (its indented sub-bullets) may additionally be their own claims with
+  their own spans.
 - SKIP lines that assert no testable behavior: section headers, the file title,
   pure meta/framing sentences, and templating directives (e.g. `{{cmd:...}}`).
 

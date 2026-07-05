@@ -53,11 +53,12 @@ func segmentSkill(ctx context.Context, judge ModelSpec, skill, skillPath, cacheD
 	if err != nil {
 		return nil, fmt.Errorf("read skill %s: %w", skillPath, err)
 	}
-	contentHash := hashOf(content)
+	// Cache key covers the skill content AND the segmentation prompt: editing
+	// either invalidates it. Content-only keying silently kept old claims
+	// after a SEGMENT.md rule change — measured: the ordered-list rule would
+	// never have applied to already-segmented skills.
+	contentHash := hashOf([]byte(string(content) + segmentPrompt))
 
-	// Cache is keyed by the skill's content hash: editing the skill file
-	// invalidates it, so we never reuse stale claims (whose line spans would
-	// point at the wrong lines of the edited file).
 	cachePath := filepath.Join(cacheDir, skill+".json")
 	if claims, ok := readClaimCache(cachePath, contentHash); ok {
 		return claims, nil
