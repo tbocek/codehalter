@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -142,28 +143,76 @@ type ProbeResult struct {
 // for 16 claims), and without per-claim lines that window reads as a hang.
 func authorClaims(ctx context.Context, judge ModelSpec, claims []Claim, cachePath string, progress func(done, total int, id string, d time.Duration)) (map[string]Question, error) {
 	cache := readQuestionCache(cachePath)
-	dirty := false
+	var pending []Claim
 	for _, c := range claims {
-		if _, ok := cache[c.ID]; ok {
-			continue
+		if _, ok := cache[c.ID]; !ok {
+			pending = append(pending, c)
 		}
-		if ctx.Err() != nil {
-			break // interrupted — keep what we have, cache it below
-		}
-		cStart := time.Now()
+	}
+
+	// authorOne produces the probe for one claim; failures are warned, not
+	// fatal (the claim stays untested this run). Returns ok when cached.
+	authorOne := func(c Claim) (Question, bool) {
 		var q Question
 		if err := chatJSON(ctx, judge, authorPrompt, c.Text, &q); err != nil {
 			fmt.Fprintf(os.Stderr, "warn: author probe for %s failed, claim stays untested: %v\n", c.ID, err)
-			continue
+			return q, false
 		}
 		if strings.TrimSpace(q.Question) == "" || strings.TrimSpace(q.Rubric) == "" {
 			fmt.Fprintf(os.Stderr, "warn: author probe for %s: judge returned empty question or rubric, claim stays untested\n", c.ID)
-			continue
+			return q, false
 		}
+		return q, true
+	}
+
+	// Claims author independently — a multi-slot judge runs judge.Parallel of
+	// them concurrently (the endpoint semaphore gates the real concurrency, so
+	// extra workers just queue). Single slot keeps the serial path.
+	var mu sync.Mutex
+	dirty := false
+	record := func(c Claim, q Question, ok bool, d time.Duration) {
+		if !ok {
+			return
+		}
+		mu.Lock()
 		cache[c.ID] = q
+		done := len(cache)
 		dirty = true
+		mu.Unlock()
 		if progress != nil {
-			progress(len(cache), len(claims), c.ID, time.Since(cStart))
+			progress(done, len(claims), c.ID, d)
+		}
+	}
+	if judge.Parallel >= 2 && len(pending) > 1 {
+		work := make(chan Claim)
+		var wg sync.WaitGroup
+		for w := 0; w < judge.Parallel; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for c := range work {
+					cStart := time.Now()
+					q, ok := authorOne(c)
+					record(c, q, ok, time.Since(cStart))
+				}
+			}()
+		}
+		for _, c := range pending {
+			if ctx.Err() != nil {
+				break // interrupted — keep what we have, cache it below
+			}
+			work <- c
+		}
+		close(work)
+		wg.Wait()
+	} else {
+		for _, c := range pending {
+			if ctx.Err() != nil {
+				break // interrupted — keep what we have, cache it below
+			}
+			cStart := time.Now()
+			q, ok := authorOne(c)
+			record(c, q, ok, time.Since(cStart))
 		}
 	}
 	if dirty {
@@ -211,18 +260,51 @@ func generateSamples(ctx context.Context, target ModelSpec, claim Claim, q Quest
 	// them; the calls are captured, never executed. nil = plain text probe.
 	tools := buildProbeTools(q.Tools)
 
+	// Runs are grouped by ARM (all A, then all B) instead of alternating
+	// A,B,A,B: consecutive calls share their full prompt prefix, so the
+	// server's prefix cache prefills the question once per arm instead of
+	// re-evaluating it on every alternation. With parallel >= 2 the two arms
+	// run concurrently on separate slots — each slot keeps its own cache, and
+	// wall time halves.
+	runArm := func(system string) ([]string, [][]string, error) {
+		answers := make([]string, samples)
+		calls := make([][]string, samples)
+		for i := 0; i < samples; i++ {
+			a, c, err := chatWithTools(ctx, target, system, q.Question, tools)
+			if err != nil {
+				return nil, nil, fmt.Errorf("sample %d: %w", i, err)
+			}
+			answers[i] = a
+			calls[i] = renderCalls(c)
+		}
+		return answers, calls, nil
+	}
+
+	var aAns, bAns []string
+	var aCalls, bCalls [][]string
+	var errA, errB error
+	if target.Parallel >= 2 {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); aAns, aCalls, errA = runArm("") }()
+		go func() { defer wg.Done(); bAns, bCalls, errB = runArm(instruction) }()
+		wg.Wait()
+	} else {
+		aAns, aCalls, errA = runArm("")
+		if errA == nil {
+			bAns, bCalls, errB = runArm(instruction)
+		}
+	}
+	if errA != nil {
+		return nil, fmt.Errorf("answer A: %w", errA)
+	}
+	if errB != nil {
+		return nil, fmt.Errorf("answer B: %w", errB)
+	}
+
 	pairs := make([]samplePair, 0, samples)
 	for i := 0; i < samples; i++ {
-		// A: natural behavior, no instruction. B: same task, claim injected.
-		answerA, callsA, err := chatWithTools(ctx, target, "", q.Question, tools)
-		if err != nil {
-			return nil, fmt.Errorf("sample %d answer A: %w", i, err)
-		}
-		answerB, callsB, err := chatWithTools(ctx, target, instruction, q.Question, tools)
-		if err != nil {
-			return nil, fmt.Errorf("sample %d answer B: %w", i, err)
-		}
-		pairs = append(pairs, samplePair{AnswerA: answerA, AnswerB: answerB, ACalls: renderCalls(callsA), BCalls: renderCalls(callsB)})
+		pairs = append(pairs, samplePair{AnswerA: aAns[i], AnswerB: bAns[i], ACalls: aCalls[i], BCalls: bCalls[i]})
 	}
 	return pairs, nil
 }
@@ -242,8 +324,8 @@ func renderCalls(calls []toolCallRec) []string {
 // after each sample verdict — three verdicts take the judge several minutes.
 func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Question, pairs []samplePair, progress func(i, n int, verdict string)) ProbeResult {
 	res := newProbeResult(target, claim, q)
-	keep := 0
-	for i, p := range pairs {
+
+	judgeOne := func(p samplePair) (Sample, error) {
 		var s Sample
 		s.AnswerA = p.AnswerA
 		s.AnswerB = p.AnswerB
@@ -258,8 +340,7 @@ func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Q
 				q.Rubric, orNone(p.AnswerA), callsBlock(p.ACalls), orNone(p.AnswerB), callsBlock(p.BCalls))
 		}
 		if err := chatJSON(ctx, judge, judgePrompt, judgeUser, &s); err != nil {
-			res.Err = fmt.Sprintf("sample %d judge: %v", i, err)
-			return res
+			return s, err
 		}
 		if s.Verdict != "keep" && s.Verdict != "drop" {
 			// Normalize an off-spec verdict from the booleans: keep only when B
@@ -270,15 +351,52 @@ func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Q
 				s.Verdict = "drop"
 			}
 		}
+		return s, nil
+	}
+
+	// The per-sample verdicts are independent — with a multi-slot judge they
+	// run concurrently (the endpoint semaphore gates real concurrency), with a
+	// single slot the serial path keeps deterministic early-abort behavior.
+	verdicts := make([]Sample, len(pairs))
+	errs := make([]error, len(pairs))
+	if judge.Parallel >= 2 {
+		var wg sync.WaitGroup
+		for i, p := range pairs {
+			wg.Add(1)
+			go func(i int, p samplePair) {
+				defer wg.Done()
+				verdicts[i], errs[i] = judgeOne(p)
+				if errs[i] == nil && progress != nil {
+					progress(i+1, len(pairs), verdicts[i].Verdict)
+				}
+			}(i, p)
+		}
+		wg.Wait()
+	} else {
+		for i, p := range pairs {
+			verdicts[i], errs[i] = judgeOne(p)
+			if errs[i] != nil {
+				break // abort remaining samples — partial majorities are recorded as errors anyway
+			}
+			if progress != nil {
+				progress(i+1, len(pairs), verdicts[i].Verdict)
+			}
+		}
+	}
+	for i, err := range errs {
+		if err != nil {
+			res.Err = fmt.Sprintf("sample %d judge: %v", i, err)
+			return res
+		}
+	}
+
+	keep := 0
+	for _, s := range verdicts {
 		if s.Verdict == "keep" {
 			keep++
 		}
 		res.Samples = append(res.Samples, s)
-		if progress != nil {
-			progress(i+1, len(pairs), s.Verdict)
-		}
 	}
-
 	// Majority: keep the statement only if a strict majority of samples say so.
 	res.Keep = keep*2 > len(pairs)
 	if res.Keep {

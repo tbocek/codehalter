@@ -9,8 +9,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// concurrencyServer replies to every chat request after a short hold, tracking
+// how many requests were in flight at once. Reply is a fixed SSE body.
+func concurrencyServer(t *testing.T, reply string) (url string, peak *int32, total *int32) {
+	t.Helper()
+	var inFlight, pk, tot int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&tot, 1)
+		cur := atomic.AddInt32(&inFlight, 1)
+		for {
+			p := atomic.LoadInt32(&pk)
+			if cur <= p || atomic.CompareAndSwapInt32(&pk, p, cur) {
+				break
+			}
+		}
+		time.Sleep(30 * time.Millisecond)
+		atomic.AddInt32(&inFlight, -1)
+		_, _ = w.Write([]byte(reply))
+	}))
+	t.Cleanup(ts.Close)
+	return ts.URL, &pk, &tot
+}
 
 func TestGenerateSamples(t *testing.T) {
 	// Count calls and verify the B run carries the claim as system prompt.
@@ -152,6 +176,136 @@ func TestQuestionCachePromptHashInvalidation(t *testing.T) {
 	}
 	if got := readQuestionCache(path); len(got) != 0 {
 		t.Fatalf("legacy cache must miss, got %d", len(got))
+	}
+}
+
+func TestGenerateSamplesParallelArms(t *testing.T) {
+	url, peak, total := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"answer"}}]}`))
+	target := ModelSpec{Name: "t", Server: url, Model: "m", Parallel: 2, sem: make(chan struct{}, 2)}
+	pairs, err := generateSamples(context.Background(), target, Claim{ID: "x#1", Text: "claim"}, Question{Question: "q", Rubric: "r"}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pairs) != 3 {
+		t.Fatalf("pairs = %d, want 3", len(pairs))
+	}
+	// The A and B arms run concurrently — peak in-flight must reach 2.
+	if p := atomic.LoadInt32(peak); p != 2 {
+		t.Fatalf("peak in-flight = %d, want 2 (A and B arms concurrent)", p)
+	}
+	if c := atomic.LoadInt32(total); c != 6 {
+		t.Fatalf("total calls = %d, want 6 (3 samples × 2 arms)", c)
+	}
+}
+
+func TestGenerateSamplesSerialWhenParallelOne(t *testing.T) {
+	url, peak, total := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"answer"}}]}`))
+	target := ModelSpec{Name: "t", Server: url, Model: "m", Parallel: 1, sem: make(chan struct{}, 1)}
+	if _, err := generateSamples(context.Background(), target, Claim{ID: "x#1", Text: "c"}, Question{Question: "q", Rubric: "r"}, 3); err != nil {
+		t.Fatal(err)
+	}
+	if p := atomic.LoadInt32(peak); p != 1 {
+		t.Fatalf("parallel=1 must serialize; peak = %d", p)
+	}
+	if c := atomic.LoadInt32(total); c != 6 {
+		t.Fatalf("total calls = %d, want 6", c)
+	}
+}
+
+func TestJudgeSamplesParallel(t *testing.T) {
+	verdict := `{"a_satisfies":false,"b_satisfies":true,"similar":false,"verdict":"keep","reason":"ok"}`
+	url, peak, _ := concurrencyServer(t, sse(fmt.Sprintf(`{"choices":[{"delta":{"content":%q}}]}`, verdict)))
+	judge := ModelSpec{Name: "main", Server: url, Model: "j", Parallel: 3, sem: make(chan struct{}, 3)}
+	pairs := []samplePair{{AnswerA: "a1", AnswerB: "b1"}, {AnswerA: "a2", AnswerB: "b2"}, {AnswerA: "a3", AnswerB: "b3"}}
+
+	var progressed int32
+	res := judgeSamples(context.Background(), judge, ModelSpec{Name: "gemma"}, Claim{ID: "x#1"}, Question{Question: "q", Rubric: "r"}, pairs,
+		func(i, n int, verdict string) { atomic.AddInt32(&progressed, 1) })
+	if res.Err != "" {
+		t.Fatal(res.Err)
+	}
+	if !res.Keep || len(res.Samples) != 3 {
+		t.Fatalf("majority fold wrong: keep=%v samples=%d", res.Keep, len(res.Samples))
+	}
+	if atomic.LoadInt32(&progressed) != 3 {
+		t.Fatalf("progress fired %d times, want 3", progressed)
+	}
+	if p := atomic.LoadInt32(peak); p < 2 {
+		t.Fatalf("judge samples did not run concurrently; peak = %d", p)
+	}
+	// Ledger order preserved despite concurrent judging.
+	for i, s := range res.Samples {
+		if s.AnswerA != fmt.Sprintf("a%d", i+1) {
+			t.Fatalf("sample %d out of order: %s", i, s.AnswerA)
+		}
+	}
+}
+
+func TestJudgeSamplesParallelPropagatesError(t *testing.T) {
+	// One judge call 500s; the whole probe must surface an error (a partial
+	// majority would bias the verdict).
+	var n int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) == 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"{\"verdict\":\"drop\",\"reason\":\"x\"}"}}]}`)))
+	}))
+	defer ts.Close()
+	judge := ModelSpec{Name: "main", Server: ts.URL, Model: "j", Parallel: 3, sem: make(chan struct{}, 3)}
+	res := judgeSamples(context.Background(), judge, ModelSpec{Name: "t"}, Claim{ID: "x#1"},
+		Question{Question: "q", Rubric: "r"}, []samplePair{{}, {}, {}}, nil)
+	if res.Err == "" {
+		t.Fatal("a failed judge sample must error the probe")
+	}
+}
+
+func TestAuthorClaimsParallel(t *testing.T) {
+	url, peak, _ := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"{\"question\":\"q\",\"rubric\":\"r\"}"}}]}`))
+	judge := ModelSpec{Name: "main", Server: url, Model: "j", Parallel: 3, sem: make(chan struct{}, 3)}
+	claims := []Claim{{ID: "go#0", Text: "a"}, {ID: "go#1", Text: "b"}, {ID: "go#2", Text: "c"}, {ID: "go#3", Text: "d"}}
+	cache := filepath.Join(t.TempDir(), "go.json")
+
+	got, err := authorClaims(context.Background(), judge, claims, cache, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 {
+		t.Fatalf("authored %d, want 4", len(got))
+	}
+	if p := atomic.LoadInt32(peak); p < 2 {
+		t.Fatalf("authoring did not run concurrently; peak = %d", p)
+	}
+	// Second call hits the cache — no new authoring.
+	url2, _, total2 := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"{\"question\":\"q\",\"rubric\":\"r\"}"}}]}`))
+	judge2 := ModelSpec{Name: "main", Server: url2, Model: "j", Parallel: 3, sem: make(chan struct{}, 3)}
+	if _, err := authorClaims(context.Background(), judge2, claims, cache, nil); err != nil {
+		t.Fatal(err)
+	}
+	if c := atomic.LoadInt32(total2); c != 0 {
+		t.Fatalf("cached re-run made %d calls, want 0", c)
+	}
+}
+
+func TestAuthorClaimsParallelIsRaceFree(t *testing.T) {
+	// Stress the shared cache map under the worker pool — the -race detector
+	// catches an unsynchronized write.
+	url, _, _ := concurrencyServer(t, sse(`{"choices":[{"delta":{"content":"{\"question\":\"q\",\"rubric\":\"r\"}"}}]}`))
+	judge := ModelSpec{Name: "main", Server: url, Model: "j", Parallel: 4, sem: make(chan struct{}, 4)}
+	var claims []Claim
+	for i := 0; i < 20; i++ {
+		claims = append(claims, Claim{ID: fmt.Sprintf("go#%02d", i), Text: "t"})
+	}
+	var counter int32
+	got, err := authorClaims(context.Background(), judge, claims, filepath.Join(t.TempDir(), "c.json"),
+		func(done, total int, id string, d time.Duration) { atomic.AddInt32(&counter, 1) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 20 || atomic.LoadInt32(&counter) != 20 {
+		t.Fatalf("authored %d, progress %d, want 20/20", len(got), counter)
 	}
 }
 
