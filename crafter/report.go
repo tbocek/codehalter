@@ -175,9 +175,9 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
       given model; others tell it to do what it already does. <b>Skill crafter probes each statement per
       model</b> and keeps only the ones that change behavior.</p>
     <p class="lede">For every atomic claim, the judge model (<code>{{.JudgeModel}}</code>) authors a
-      disguised test question and a rubric. The target model answers it <b>with and without</b> the claim,
-      {{.Samples}}× each; the judge decides whether the claim mattered. <b>keep</b> = it did, <b>drop</b> =
-      the model already behaves that way.</p>
+      disguised question and a rubric. The target answers it <b>with the whole skill loaded</b> and with
+      nothing, {{.Samples}}× each; the judge decides whether the skill changed the answer. <b>keep</b> =
+      it did, <b>drop</b> = the model already behaves that way with no skill at all.</p>
   </header>
 
   <section class="section">

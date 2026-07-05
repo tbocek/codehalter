@@ -444,26 +444,26 @@
         <div class="step">
           <div class="n">01 <span class="ln"></span></div>
           <h3>Segment</h3>
-          <p>A judge model splits a skill file into <b>atomic claims</b> — one testable behavior each, mapped
-            back to its exact source text.</p>
+          <p>A judge splits a skill into <b>atomic claims</b> — one testable behavior each, mapped to its exact
+            source; a second judge repairs any citation the first got wrong.</p>
         </div>
         <div class="step">
           <div class="n">02 <span class="ln"></span></div>
           <h3>Author</h3>
-          <p>For each claim it writes a <b>disguised coding question</b> plus a rubric: what a claim-following
-            answer contains that a claim-ignoring one lacks.</p>
+          <p>For each claim it writes a <b>disguised question</b> — usually "how would you approach this?" — plus
+            a rubric for what a claim-following plan contains that an ignoring one lacks.</p>
         </div>
         <div class="step">
           <div class="n">03 <span class="ln"></span></div>
           <h3>A / B probe</h3>
-          <p>The target model answers the question <b>with and without</b> the claim, several times over, to
-            average out noise.</p>
+          <p>The target answers the question <b>with the whole skill loaded</b> and with nothing at all, several
+            times over, to average out noise.</p>
         </div>
         <div class="step">
           <div class="n">04 <span class="ln"></span></div>
           <h3>Judge &amp; prune</h3>
-          <p>If the answers are alike, the model already knew — <b>drop</b> the line. If the claim fixed it,
-            <b>keep</b> it. Verdicts build a per-model skill file.</p>
+          <p>If the model does it unprompted — <b>drop</b> the line. If the skill is what fixed it, <b>keep</b>
+            it (keep-biased: drop only what needs no telling). Verdicts build a per-model skill file.</p>
         </div>
       </div>
 
@@ -477,7 +477,7 @@
               <span class="muted">— loses the call-site context.</span></div>
           </div>
           <div class="abcard">
-            <div class="h">Answer B · with the claim</div>
+            <div class="h">Answer B · with the skill loaded</div>
             <div class="b"><span class="muted">wraps with context:</span><br><code>return fmt.Errorf("load config: %w", err)</code><br>
               <span class="muted">— chain preserved.</span></div>
           </div>
