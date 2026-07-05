@@ -40,6 +40,7 @@ func main() {
 	docsFlag := flag.String("docs", filepath.Join("..", "docs", "skill-crafter-report.html"), "generated results report path (empty disables)")
 	skipPreflightFlag := flag.Bool("skip-preflight", false, "skip the reachability check of judge + model endpoints before starting")
 	llmLogFlag := flag.String("llmlog", "llm.jsonl", "wire-level LLM trace: one JSON line per call with full messages + response (empty disables)")
+	cleanFlag := flag.String("clean", "clean-skills", "directory for the streamlined (clean) skills the pipeline probes; derived from ground-skills, cached")
 	flag.Parse()
 
 	if err := mustExist(*configFlag, "config"); err != nil {
@@ -133,13 +134,25 @@ func main() {
 		err       error
 	}
 	prepare := func(sk skillSource) preparedSkill {
-		orig, err := os.ReadFile(sk.path)
+		// Stage 0: streamline the ground skill into clean-skills/ (main model,
+		// cached on source+prompt hash). Everything downstream — segmentation,
+		// probing, pruning — runs on the CLEAN version, so the per-model
+		// outputs in models/ are pruned clean skills.
+		logf("streamlining %s ...", sk.stack)
+		cleanStart := time.Now()
+		cleanPath, err := ensureCleanSkill(ctx, cfg.Judge, sk.stack, sk.path, *cleanFlag, filepath.Join(*cacheFlag, "streamline"))
 		if err != nil {
-			return preparedSkill{src: sk, err: fmt.Errorf("read %s: %w", sk.path, err)}
+			return preparedSkill{src: sk, err: err}
 		}
+		orig, err := os.ReadFile(cleanPath)
+		if err != nil {
+			return preparedSkill{src: sk, err: fmt.Errorf("read %s: %w", cleanPath, err)}
+		}
+		logf("streamlined %s: %d bytes (%s)", sk.stack, len(orig), cachedOr(time.Since(cleanStart)))
+
 		logf("segmenting %s ...", sk.stack)
 		segStart := time.Now()
-		claims, err := segmentSkill(ctx, cfg.Judge, sk.stack, sk.path, filepath.Join(*cacheFlag, "segments"))
+		claims, err := segmentSkill(ctx, cfg.Judge, sk.stack, cleanPath, filepath.Join(*cacheFlag, "segments"))
 		if err != nil {
 			return preparedSkill{src: sk, err: err}
 		}

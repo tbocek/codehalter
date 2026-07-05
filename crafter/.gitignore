@@ -4,3 +4,5 @@ llm.jsonl
 ground-skills/*.md
 crafter.toml
 models/
+# Streamlined skills, derived from ground-skills by the main model (cached, regenerable).
+clean-skills/

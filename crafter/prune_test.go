@@ -54,6 +54,42 @@ func TestPruneSkillFragmentConsumesWholeLine(t *testing.T) {
 	}
 }
 
+func TestPruneSkillDropsOrphanHeaders(t *testing.T) {
+	orig := `# Arch skill
+Base line stays.
+
+## Probe
+- probe bullet one
+- probe bullet two
+
+## Search
+- search bullet stays
+`
+	// Drop both Probe bullets (lines 5-6): the "## Probe" title must go too.
+	pruned := pruneSkill(orig, []Claim{{Source: "- probe bullet one", StartLine: 5, EndLine: 5}, {Source: "- probe bullet two", StartLine: 6, EndLine: 6}})
+	if strings.Contains(pruned, "## Probe") {
+		t.Fatalf("orphan header survived: %q", pruned)
+	}
+	for _, want := range []string{"# Arch skill", "Base line stays.", "## Search", "- search bullet stays"} {
+		if !strings.Contains(pruned, want) {
+			t.Fatalf("kept content missing %q: %q", want, pruned)
+		}
+	}
+}
+
+func TestPruneSkillOrphanHeaderNesting(t *testing.T) {
+	orig := "## Parent\n### Child\n- child bullet\n"
+	// Nothing dropped: parent kept via populated subsection.
+	if got := pruneSkill(orig, nil); !strings.Contains(got, "## Parent") {
+		t.Fatalf("parent with populated subsection must stay: %q", got)
+	}
+	// Child's only bullet dropped → child AND parent are orphans.
+	got := pruneSkill(orig, []Claim{{Source: "- child bullet", StartLine: 3, EndLine: 3}})
+	if strings.Contains(got, "## Parent") || strings.Contains(got, "### Child") {
+		t.Fatalf("cascading orphan headers survived: %q", got)
+	}
+}
+
 func TestDroppedClaims(t *testing.T) {
 	claims := []Claim{
 		{ID: "go#00", StartLine: 2, EndLine: 2},

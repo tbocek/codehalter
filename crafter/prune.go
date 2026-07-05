@@ -77,7 +77,47 @@ func pruneSkill(orig string, dropped []Claim) string {
 		}
 		kept = append(kept, l)
 	}
-	out := strings.Join(kept, "\n")
+	// Drop orphaned section titles: a header whose section lost every content
+	// line steers nothing (measured: both targets' pruned arch left "## Probe"
+	// heading an empty section). A header survives iff some content line sits
+	// between it and the next header of the same or shallower level — content
+	// under a DEEPER header counts, so a parent with a populated subsection
+	// stays.
+	level := func(s string) int {
+		t := strings.TrimSpace(s)
+		n := 0
+		for n < len(t) && t[n] == '#' {
+			n++
+		}
+		if n == 0 || n >= len(t) || t[n] != ' ' {
+			return 0 // not a header
+		}
+		return n
+	}
+	final := make([]string, 0, len(kept))
+	for i, l := range kept {
+		lv := level(l)
+		if lv == 0 {
+			final = append(final, l)
+			continue
+		}
+		keepHeader := false
+		for j := i + 1; j < len(kept); j++ {
+			jlv := level(kept[j])
+			if jlv > 0 && jlv <= lv {
+				break // next sibling/parent section — ours had no content
+			}
+			if jlv == 0 && strings.TrimSpace(kept[j]) != "" {
+				keepHeader = true
+				break
+			}
+		}
+		if keepHeader {
+			final = append(final, l)
+		}
+	}
+
+	out := strings.Join(final, "\n")
 	out = blankRunRE.ReplaceAllString(out, "\n\n")
 	return out
 }
