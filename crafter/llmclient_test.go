@@ -365,6 +365,94 @@ func TestBuildProbeToolsSkipsUnknown(t *testing.T) {
 	}
 }
 
+// parallel=2 must allow exactly two in-flight requests: the cap is enforced
+// (never 3+) and actually used (two overlap given enough concurrent callers).
+func TestChatParallelTwoAllowsTwoInFlight(t *testing.T) {
+	var inFlight, peak int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := atomic.AddInt32(&inFlight, 1)
+		for {
+			p := atomic.LoadInt32(&peak)
+			if cur <= p || atomic.CompareAndSwapInt32(&peak, p, cur) {
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+		atomic.AddInt32(&inFlight, -1)
+		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"ok"}}]}`)))
+	}))
+	defer ts.Close()
+
+	spec := ModelSpec{Name: "t", Server: ts.URL, Model: "m", sem: make(chan struct{}, 2)}
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := chat(context.Background(), spec, "", "q"); err != nil {
+				t.Errorf("chat: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if p := atomic.LoadInt32(&peak); p != 2 {
+		t.Fatalf("parallel=2: peak in-flight = %d, want exactly 2", p)
+	}
+}
+
+// Concurrent calls (judge prefetch + probe verdicts in the real run) write the
+// trace from multiple goroutines — every line must stay valid, unmangled JSON.
+func TestConcurrentCallsTraceCleanly(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "llm.jsonl")
+	if err := openLLMLog(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { llmLog.f.Close(); llmLog.f = nil })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// >1KB of VARIED text so every call emits chunk lines concurrently
+		// without tripping the repetition guard.
+		var big strings.Builder
+		for i := 0; i < 300; i++ {
+			fmt.Fprintf(&big, "word%d ", i)
+		}
+		_, _ = w.Write([]byte(sse(fmt.Sprintf(`{"choices":[{"delta":{"content":%q}}]}`, big.String()))))
+	}))
+	defer ts.Close()
+
+	const callers = 8
+	var wg sync.WaitGroup
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			spec := ModelSpec{Name: fmt.Sprintf("m%d", i), Server: ts.URL, Model: "m", sem: make(chan struct{}, 1)}
+			if _, err := chat(context.Background(), spec, "", "q"); err != nil {
+				t.Errorf("chat: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finals := 0
+	for n, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		var e llmLogEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("trace line %d corrupted by concurrent writes: %v", n+1, err)
+		}
+		if !e.Chunk {
+			finals++
+		}
+	}
+	if finals != callers {
+		t.Fatalf("finals = %d, want %d", finals, callers)
+	}
+}
+
 func TestLLMLogChunksStreamLive(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "llm.jsonl")
 	if err := openLLMLog(path); err != nil {

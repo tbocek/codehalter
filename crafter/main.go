@@ -189,13 +189,8 @@ func main() {
 			resultsPath := filepath.Join(modelDir, "results.jsonl")
 			dm := done[m.Name]
 
-			// Pending list computed up front: the generator goroutine below
-			// must not read dm while the consumer writes it.
-			type pendingClaim struct {
-				idx   int
-				claim Claim
-				q     Question
-			}
+			// Pending list computed up front: the generator goroutine inside
+			// probePipeline must not read dm while the consumer writes it.
 			var pend []pendingClaim
 			for idx, c := range claims {
 				q, authored := questions[c.ID]
@@ -227,60 +222,35 @@ func main() {
 
 			// Generate/judge pipeline: the TARGET produces claim N+1's A/B
 			// answers while the JUDGE scores claim N's — different servers,
-			// so the overlap is free wall-clock. Buffer 1 = at most one claim
-			// generated ahead.
-			type genItem struct {
-				pc    pendingClaim
-				pairs []samplePair
-				genMs int64
-				err   string
-			}
-			genCh := make(chan genItem, 1)
-			go func() {
-				defer close(genCh)
-				for _, pc := range pend {
-					if ctx.Err() != nil {
-						return
-					}
+			// so the overlap is free wall-clock.
+			ev := pipelineEvents{
+				onGenerating: func(pc pendingClaim) {
 					// Announce before and after generating: a claim takes
 					// minutes of target time before its verdict line appears,
 					// and without these the resume start looks hung.
 					logf("[%s %d/%d] %s %s generating %d samples ...", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, cfg.Settings.Samples)
-					genStart := time.Now()
-					pairs, err := generateSamples(ctx, m, pc.claim, pc.q, cfg.Settings.Samples)
-					it := genItem{pc: pc, pairs: pairs, genMs: time.Since(genStart).Milliseconds()}
-					if err != nil {
-						it.err = err.Error()
-					} else {
-						logf("[%s %d/%d] %s %s generated (%dms) → judging", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, it.genMs)
+				},
+				onGenerated: func(pc pendingClaim, genMs int64) {
+					logf("[%s %d/%d] %s %s generated (%dms) → judging", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, genMs)
+				},
+				onJudged: func(pc pendingClaim, i, n int, verdict string) {
+					logf("[%s %d/%d] %s %s judged sample %d/%d: %s", sk.stack, pc.idx+1, len(claims), m.Name, pc.claim.ID, i, n, verdict)
+				},
+				onResult: func(pc pendingClaim, res ProbeResult, genMs int64) error {
+					if err := appendResult(resultsPath, res); err != nil {
+						return fmt.Errorf("write result: %w", err)
 					}
-					genCh <- it
-				}
-			}()
-
-			for it := range genCh {
-				judgeStart := time.Now()
-				var res ProbeResult
-				if it.err != "" {
-					res = newProbeResult(m, it.pc.claim, it.pc.q)
-					res.Err = it.err
-				} else {
-					res = judgeSamples(ctx, cfg.Judge, m, it.pc.claim, it.pc.q, it.pairs,
-						func(i, n int, verdict string) {
-							logf("[%s %d/%d] %s %s judged sample %d/%d: %s", sk.stack, it.pc.idx+1, len(claims), m.Name, it.pc.claim.ID, i, n, verdict)
-						})
-				}
-				res.DurationMs = it.genMs + time.Since(judgeStart).Milliseconds()
-				res.EndedAt = time.Now().Format(time.RFC3339)
-				if err := appendResult(resultsPath, res); err != nil {
-					log.Fatalf("write result: %v", err)
-				}
-				dm[res.ClaimID] = res
-				if res.Err != "" {
-					logf("[%s %d/%d] %s %s ERROR (%dms): %s", sk.stack, it.pc.idx+1, len(claims), m.Name, res.ClaimID, res.DurationMs, res.Err)
-				} else {
-					logf("[%s %d/%d] %s %s → %s (%dms: gen %dms + judge)", sk.stack, it.pc.idx+1, len(claims), m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs, it.genMs)
-				}
+					dm[res.ClaimID] = res
+					if res.Err != "" {
+						logf("[%s %d/%d] %s %s ERROR (%dms): %s", sk.stack, pc.idx+1, len(claims), m.Name, res.ClaimID, res.DurationMs, res.Err)
+					} else {
+						logf("[%s %d/%d] %s %s → %s (%dms: gen %dms + judge)", sk.stack, pc.idx+1, len(claims), m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs, genMs)
+					}
+					return nil
+				},
+			}
+			if err := probePipeline(ctx, cfg.Judge, m, pend, cfg.Settings.Samples, ev); err != nil {
+				log.Fatalf("%v", err)
 			}
 			if ctx.Err() != nil {
 				logf("interrupted during %s/%s — progress saved to %s, re-run to resume", sk.stack, m.Name, resultsPath)
@@ -334,6 +304,97 @@ func finalize(report []ModelStats, cfg *Config, modelsDir, docsPath string) {
 		return
 	}
 	fmt.Fprintf(os.Stderr, "report updated: %s\n", docsPath)
+}
+
+// pendingClaim is one undecided claim queued for probing, carrying its display
+// index in the skill's full claim list.
+type pendingClaim struct {
+	idx   int
+	claim Claim
+	q     Question
+}
+
+// pipelineEvents are probePipeline's progress callbacks; any may be nil except
+// that a nil onResult silently discards results — main always sets it.
+// onResult persists one finished ProbeResult (with the generation share of its
+// duration for the log split); an error from it aborts the pipeline, because a
+// result that can't be persisted must not be silently lost.
+type pipelineEvents struct {
+	onGenerating func(pc pendingClaim)
+	onGenerated  func(pc pendingClaim, genMs int64)
+	onJudged     func(pc pendingClaim, i, n int, verdict string)
+	onResult     func(pc pendingClaim, res ProbeResult, genMs int64) error
+}
+
+// probePipeline overlaps target-side generation with judge-side verdicts: a
+// goroutine generates each pending claim's A/B pairs while the caller-side
+// loop judges the previous claim's — target and judge live on different
+// servers, so the overlap is free wall-clock. The channel buffer of 1 caps the
+// generator at one finished claim ahead (plus one in flight). Results are
+// delivered in pend order. A cancelled ctx stops generation at the next claim
+// boundary; already-generated items still flow through onResult (recorded as
+// errored when their calls were cut), matching resume semantics.
+func probePipeline(ctx context.Context, judge, target ModelSpec, pend []pendingClaim, samples int, ev pipelineEvents) error {
+	// Own cancel scope: an onResult failure must also stop the generator.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type genItem struct {
+		pc    pendingClaim
+		pairs []samplePair
+		genMs int64
+		err   string
+	}
+	genCh := make(chan genItem, 1)
+	go func() {
+		defer close(genCh)
+		for _, pc := range pend {
+			if ctx.Err() != nil {
+				return
+			}
+			if ev.onGenerating != nil {
+				ev.onGenerating(pc)
+			}
+			genStart := time.Now()
+			pairs, err := generateSamples(ctx, target, pc.claim, pc.q, samples)
+			it := genItem{pc: pc, pairs: pairs, genMs: time.Since(genStart).Milliseconds()}
+			if err != nil {
+				it.err = err.Error()
+			} else if ev.onGenerated != nil {
+				ev.onGenerated(pc, it.genMs)
+			}
+			genCh <- it
+		}
+	}()
+
+	for it := range genCh {
+		judgeStart := time.Now()
+		var res ProbeResult
+		if it.err != "" {
+			res = newProbeResult(target, it.pc.claim, it.pc.q)
+			res.Err = it.err
+		} else {
+			var judgeProgress func(i, n int, verdict string)
+			if ev.onJudged != nil {
+				pc := it.pc
+				judgeProgress = func(i, n int, verdict string) { ev.onJudged(pc, i, n, verdict) }
+			}
+			res = judgeSamples(ctx, judge, target, it.pc.claim, it.pc.q, it.pairs, judgeProgress)
+		}
+		res.DurationMs = it.genMs + time.Since(judgeStart).Milliseconds()
+		res.EndedAt = time.Now().Format(time.RFC3339)
+		if ev.onResult != nil {
+			if err := ev.onResult(it.pc, res, it.genMs); err != nil {
+				// Unblock and stop the generator before returning: cancel kills
+				// its in-flight LLM call, the drain frees its pending send.
+				cancel()
+				for range genCh { //nolint:revive // draining
+				}
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // preflight pings the judge and every target endpoint before any real work, so
