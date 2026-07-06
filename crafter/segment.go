@@ -71,7 +71,10 @@ func segmentSkill(ctx context.Context, judgeA, judgeB ModelSpec, skill, skillPat
 
 	cachePath := filepath.Join(cacheDir, skill+".json")
 	if claims, ok := readClaimCache(cachePath, contentHash); ok {
-		return claims, nil
+		// The {{cmd:}} fact filter (see buildClaims) also applies to claims
+		// cached before the filter existed — filtering on read retires them
+		// without invalidating the whole segmentation.
+		return dropCmdFactClaims(skill, claims), nil
 	}
 
 	var reply segmentReply
@@ -146,6 +149,20 @@ func buildClaims(skill string, lines []string, raw []rawClaim) (located []Claim,
 		if text == "" || src == "" {
 			continue
 		}
+		// A source carrying a {{cmd:...}} templating directive is a FACT line
+		// (environment context, expanded to literal values when the real skill
+		// is seeded), not a behavior — SEGMENT.md says to skip these, but the
+		// judge ignores that often enough that it must be enforced here
+		// (measured: "Base: Fedora ({{cmd:. /etc/os-release …}})" became a
+		// claim demanding mandatory os-release verification, and the strengthen
+		// loop then spliced that invented mandate into the output skill). Also
+		// unprobeable by construction: arm B would show the target the RAW
+		// directive, not the value the real agent sees. Skipped, not repaired —
+		// the line stays in every output skill verbatim.
+		if cmdRE.MatchString(src) {
+			fmt.Fprintf(os.Stderr, "info: %s: claim over a {{cmd:}} fact line is not probed (kept verbatim): %q\n", skill, truncate(text, 80))
+			continue
+		}
 		start, end, fragment := locateSpan(lines, src)
 		if start == 0 {
 			broken = append(broken, rc)
@@ -162,6 +179,21 @@ func buildClaims(skill string, lines []string, raw []rawClaim) (located []Claim,
 		})
 	}
 	return located, broken
+}
+
+// dropCmdFactClaims filters out claims whose source carries a {{cmd:}}
+// templating directive — fact lines, never probed (see buildClaims). Applied to
+// cache-loaded claims so pre-filter caches retire them too.
+func dropCmdFactClaims(skill string, claims []Claim) []Claim {
+	out := claims[:0:0]
+	for _, c := range claims {
+		if cmdRE.MatchString(c.Source) {
+			fmt.Fprintf(os.Stderr, "info: %s: claim over a {{cmd:}} fact line is not probed (kept verbatim): %q\n", skill, truncate(c.Text, 80))
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
 }
 
 // repairClaims asks judgeB to re-quote the exact verbatim span for claims whose

@@ -169,3 +169,47 @@ func TestSegmentSkillRepairGivesUp(t *testing.T) {
 		t.Fatalf("repair judge called %d times, want 1", bCalls.Load())
 	}
 }
+
+// A claim whose source is a {{cmd:}} templating line is a FACT: never probed,
+// filtered at build time and again when loading a pre-filter cache.
+func TestSegmentSkillDropsCmdFactClaims(t *testing.T) {
+	root := t.TempDir()
+	src := filepath.Join(root, "SKILL-go.md")
+	content := "# Skill\n- Base: Fedora ({{cmd:. /etc/os-release && echo x}}).\n- run git status before committing.\n"
+	if err := os.WriteFile(src, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The segmenter (wrongly) claims the fact line alongside a real claim.
+	judgeA, _ := segJudge(t, `{"claims":[{"text":"verify the base environment","source":"- Base: Fedora ({{cmd:. /etc/os-release && echo x}})."},{"text":"check status first","source":"- run git status before committing."}]}`)
+	judgeB, bCalls := segJudge(t, `{"claims":[]}`)
+
+	cacheDir := filepath.Join(root, "seg")
+	claims, err := segmentSkill(context.Background(), judgeA, judgeB, "go", src, cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 1 || claims[0].Text != "check status first" {
+		t.Fatalf("fact claim not filtered: %+v", claims)
+	}
+	if bCalls.Load() != 0 {
+		t.Fatalf("fact claims must be skipped, not repaired (repair called %dx)", bCalls.Load())
+	}
+
+	// Simulate a pre-filter cache that still carries the fact claim: the read
+	// path must retire it without a cache bust.
+	hash := hashOf([]byte(content + segmentPrompt + repairPrompt))
+	stale := append([]Claim{{
+		ID: "go#facts", Skill: "go", Text: "verify the base environment",
+		Source: "- Base: Fedora ({{cmd:. /etc/os-release && echo x}}).", StartLine: 2, EndLine: 2,
+	}}, claims...)
+	if err := writeClaimCache(filepath.Join(cacheDir, "go.json"), hash, stale); err != nil {
+		t.Fatal(err)
+	}
+	got, err := segmentSkill(context.Background(), judgeA, judgeB, "go", src, cacheDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Text != "check status first" {
+		t.Fatalf("cached fact claim not retired on read: %+v", got)
+	}
+}
