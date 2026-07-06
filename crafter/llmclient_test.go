@@ -548,25 +548,63 @@ func TestLLMLogChunksStreamLive(t *testing.T) {
 	}
 }
 
-func TestExtractJSON(t *testing.T) {
+func TestParseJSONReply(t *testing.T) {
+	type verdict struct {
+		A int    `json:"a"`
+		S string `json:"s"`
+	}
 	cases := []struct {
-		name, in, want string
+		name, in string
+		ok       bool
+		want     verdict
 	}{
-		{"bare", `{"a":1}`, `{"a":1}`},
-		{"prefixed", "sure, here:\n{\"a\":1}", `{"a":1}`},
-		{"fenced", "```json\n{\"a\":1}\n```", `{"a":1}`},
-		{"brace in string", `{"a":"has } brace"}`, `{"a":"has } brace"}`},
-		{"escaped quote", `{"a":"say \"hi\""}`, `{"a":"say \"hi\""}`},
-		{"nested", `pre {"a":{"b":2}} post`, `{"a":{"b":2}}`},
-		{"none", `no json here`, ``},
-		{"unbalanced", `{"a":1`, ``},
+		{"bare", `{"a":1}`, true, verdict{A: 1}},
+		{"prefixed", "sure, here:\n{\"a\":1}", true, verdict{A: 1}},
+		{"fenced", "```json\n{\"a\":1}\n```", true, verdict{A: 1}},
+		{"brace in string", `{"a":2,"s":"has } brace"}`, true, verdict{A: 2, S: "has } brace"}},
+		{"escaped quote", `{"a":3,"s":"say \"hi\""}`, true, verdict{A: 3, S: `say "hi"`}},
+		// The bash#c74e12bf failure: brace prose BEFORE the object must not
+		// shadow it — the old first-span extractor returned `{var}` and errored.
+		{"code prose before object", "the answer quotes ${var} correctly, so:\n{\"a\":7}", true, verdict{A: 7}},
+		{"multiple junk candidates", "try {1..5} or {} then {\"a\":9}", true, verdict{A: 9}},
+		// A bare {} in prose parses to a zero value: skipped in favor of the
+		// real object; accepted only when nothing non-zero exists (the caller's
+		// field validation then produces the precise error).
+		{"only empty object", `here: {}`, true, verdict{}},
+		{"none", `no json here`, false, verdict{}},
+		{"unbalanced only", `{"a":1`, false, verdict{}},
+		// A truncated outer object must not stop the scan: a later complete one
+		// still wins.
+		{"truncated then complete", `{"a":1  ... oops. Retry: {"a":5}`, true, verdict{A: 5}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := extractJSON(c.in); got != c.want {
-				t.Fatalf("extractJSON(%q) = %q, want %q", c.in, got, c.want)
+			var got verdict
+			ok := parseJSONReply(c.in, &got)
+			if ok != c.ok {
+				t.Fatalf("parseJSONReply(%q) ok = %v, want %v", c.in, ok, c.ok)
+			}
+			if got != c.want {
+				t.Fatalf("parseJSONReply(%q) = %+v, want %+v", c.in, got, c.want)
 			}
 		})
+	}
+}
+
+// A failed candidate must not leave partial fields behind in out.
+func TestParseJSONReplyNoPartialPollution(t *testing.T) {
+	type v struct {
+		A int    `json:"a"`
+		B string `json:"b"`
+	}
+	// First candidate {"a":1,"b":3} type-errors on b AFTER a would be set;
+	// the real object follows. out must contain exactly the second candidate.
+	var got v
+	if ok := parseJSONReply(`{"a":1,"b":3} then {"a":2,"b":"ok"}`, &got); !ok {
+		t.Fatal("second candidate should parse")
+	}
+	if got.A != 2 || got.B != "ok" {
+		t.Fatalf("partial pollution from failed candidate: %+v", got)
 	}
 }
 
@@ -576,5 +614,23 @@ func TestTruncate(t *testing.T) {
 	}
 	if got := truncate("hello world", 5); got != "hello…" {
 		t.Fatalf("long truncate = %q", got)
+	}
+}
+
+// Callers pre-populate fields the JSON doesn't carry (judgeOne seeds Sample
+// with the answers before parsing the verdict) — the winning candidate must
+// MERGE into out, not replace it. Pinned because the first multi-candidate
+// implementation did dst.Set(fresh) and wiped those fields.
+func TestParseJSONReplyMergesIntoPrepopulated(t *testing.T) {
+	type v struct {
+		Answer  string `json:"answer_zz"` // never in the JSON
+		Verdict string `json:"verdict"`
+	}
+	got := v{Answer: "pre-set"}
+	if ok := parseJSONReply(`the ${var} case again: {"verdict":"keep"}`, &got); !ok {
+		t.Fatal("should parse")
+	}
+	if got.Answer != "pre-set" || got.Verdict != "keep" {
+		t.Fatalf("merge semantics broken: %+v", got)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -657,31 +658,65 @@ func chatWithTools(ctx context.Context, m ModelSpec, system, user string, tools 
 
 // chatJSON calls chat and unwraps a JSON object from the reply into out. Weak
 // models routinely wrap JSON in ```json fences or add a sentence of preamble,
-// so it extracts the outermost {...} span rather than requiring a clean body.
+// so it scans the reply for the object rather than requiring a clean body.
 func chatJSON(ctx context.Context, m ModelSpec, system, user string, out any) error {
 	reply, err := chat(ctx, m, system, user)
 	if err != nil {
 		return err
 	}
-	js := extractJSON(reply)
-	if js == "" {
-		return fmt.Errorf("no JSON object found in %s reply: %s", m.Name, truncate(reply, 400))
-	}
-	if err := json.Unmarshal([]byte(js), out); err != nil {
-		return fmt.Errorf("parse JSON from %s: %w (extracted: %s)", m.Name, err, truncate(js, 400))
+	if !parseJSONReply(reply, out) {
+		return fmt.Errorf("no usable JSON object found in %s reply: %s", m.Name, truncate(reply, 400))
 	}
 	return nil
 }
 
-// extractJSON returns the outermost balanced {...} span in s, ignoring braces
-// inside JSON string literals (so a `}` inside a value doesn't end it early),
-// or "" if there is no balanced object. Good enough for the fenced / prefixed
-// output weak models produce; not a general JSON scanner.
-func extractJSON(s string) string {
-	start := strings.IndexByte(s, '{')
-	if start < 0 {
-		return ""
+// parseJSONReply finds the JSON object in a model's reply and unmarshals it
+// into out (a non-nil pointer), reporting success. It tries EVERY balanced
+// {...} span, in order, and takes the first that unmarshals into a NON-ZERO
+// value — not just the first balanced span: prose before the object often
+// contains brace snippets (`${var}`, `{1..5}` — measured: a judge scoring a
+// bash skill said `${var}` first, and the old first-span extractor returned
+// the two-character `{var}` and errored the claim while the real verdict sat
+// two lines later). The non-zero requirement keeps a bare `{}` in prose from
+// shadowing the real object; if candidates parse but ALL are zero, the first
+// zero one is accepted (the caller's field validation gives the precise error).
+func parseJSONReply(s string, out any) bool {
+	outType := reflect.ValueOf(out).Elem().Type()
+	firstZeroSpan := ""
+	for start := 0; start < len(s); start++ {
+		if s[start] != '{' {
+			continue
+		}
+		span, ok := balancedSpan(s, start)
+		if !ok {
+			continue // unbalanced from here; a later '{' may still open a complete object
+		}
+		// Candidates are probed on a FRESH value: a failed/partial candidate must
+		// not leave stray fields behind, and zero-ness must be judged on what the
+		// JSON itself carries. The winning span is then unmarshalled into out
+		// directly — callers pre-populate fields the JSON doesn't carry (e.g.
+		// judgeOne seeds Sample with the answers) and rely on merge semantics.
+		probe := reflect.New(outType)
+		if json.Unmarshal([]byte(span), probe.Interface()) != nil {
+			continue
+		}
+		if !probe.Elem().IsZero() {
+			return json.Unmarshal([]byte(span), out) == nil
+		}
+		if firstZeroSpan == "" {
+			firstZeroSpan = span
+		}
 	}
+	if firstZeroSpan != "" {
+		return json.Unmarshal([]byte(firstZeroSpan), out) == nil
+	}
+	return false
+}
+
+// balancedSpan returns the balanced {...} span starting at s[start] (which must
+// be '{'), ignoring braces inside JSON string literals, or ok=false when the
+// object never closes.
+func balancedSpan(s string, start int) (string, bool) {
 	depth := 0
 	inStr := false
 	esc := false
@@ -706,11 +741,11 @@ func extractJSON(s string) string {
 		case '}':
 			depth--
 			if depth == 0 {
-				return s[start : i+1]
+				return s[start : i+1], true
 			}
 		}
 	}
-	return ""
+	return "", false
 }
 
 // truncate shortens s to at most n bytes (backing up to a rune boundary so a
