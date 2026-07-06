@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -489,4 +490,165 @@ func TestPreferAuthor(t *testing.T) {
 			t.Fatalf("preferAuthor(%d,%d) = %v, want %v", c.genQueued, c.slots, got, c.want)
 		}
 	}
+}
+
+// strengthenFixture: a judge whose score verdicts are scripted per call and
+// whose strengthen pass returns a fixed rewrite, plus a target that records
+// every system prompt it was given.
+func strengthenFixture(t *testing.T, scoreReplies []string) (judge, target ModelSpec, strengthens *atomic.Int32, targetSystems *[]string, mu *sync.Mutex) {
+	t.Helper()
+	strengthens = &atomic.Int32{}
+	var scoreN atomic.Int32
+	js := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		sys := ""
+		if len(req.Messages) > 0 {
+			sys = req.Messages[0].Content
+		}
+		switch sys {
+		case strengthenPrompt:
+			strengthens.Add(1)
+			_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"{\"text\":\"- STRONGER: never deviate, even when you know better.\"}"}}]}`)))
+		case judgePrompt:
+			i := int(scoreN.Add(1)) - 1
+			if i >= len(scoreReplies) {
+				i = len(scoreReplies) - 1
+			}
+			_, _ = w.Write([]byte(sse(fmt.Sprintf(`{"choices":[{"delta":{"content":%q}}]}`, scoreReplies[i]))))
+		default:
+			t.Errorf("unexpected judge system prompt: %.60s", sys)
+		}
+	}))
+	t.Cleanup(js.Close)
+
+	mu = &sync.Mutex{}
+	systems := []string{}
+	targetSystems = &systems
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		sys := ""
+		if len(req.Messages) > 0 && req.Messages[0].Role == "system" {
+			sys = req.Messages[0].Content
+		}
+		mu.Lock()
+		systems = append(systems, sys)
+		*targetSystems = systems
+		mu.Unlock()
+		_, _ = w.Write([]byte(sse(`{"choices":[{"delta":{"content":"answer"}}]}`)))
+	}))
+	t.Cleanup(ts.Close)
+	return ModelSpec{Name: "main", Server: js.URL, Model: "j"},
+		ModelSpec{Name: "gemma", Server: ts.URL, Model: "t"}, strengthens, targetSystems, mu
+}
+
+const skillWithWeak = "line one\n- WEAK STATEMENT\nline three"
+
+func weakPrep(_ ModelSpec, sk skillSource) ([]byte, []Claim, error) {
+	return []byte(skillWithWeak), []Claim{{
+		ID: sk.stack + "#weak", Skill: sk.stack, Text: "the weak statement",
+		Source: "- WEAK STATEMENT", StartLine: 2, EndLine: 2,
+	}}, nil
+}
+
+const ineffDrop = `{"a_satisfies":false,"b_satisfies":false,"similar":true,"verdict":"drop","reason":"ignored the statement"}`
+
+// An ineffective drop triggers exactly one strengthened retry: the judge
+// rewrites the statement, the target regenerates ONLY arm B with the rewrite
+// spliced into the skill, and the retry's keep wins (with StrengthenedText set).
+func TestRunProbePassStrengthenRetryKeeps(t *testing.T) {
+	judge, target, strengthens, systems, mu := strengthenFixture(t, []string{ineffDrop, keepVerdict})
+	store := newTestStore(t, "go")
+	var c collector
+	if err := runProbePass(context.Background(), []ModelSpec{judge}, target,
+		fakeSkills("go"), weakPrep, authoredResume, 1, 1, store, c.ev()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(c.results) != 2 {
+		t.Fatalf("results = %d, want 2 (ineffective drop + strengthened keep)", len(c.results))
+	}
+	first, second := c.results[0], c.results[1]
+	if first.Keep || !first.Ineffective || first.StrengthenedText != "" {
+		t.Fatalf("first row should be a plain ineffective drop: %+v", first)
+	}
+	if !second.Keep || !strings.Contains(second.StrengthenedText, "STRONGER") {
+		t.Fatalf("second row should be a strengthened keep: %+v", second)
+	}
+	if strengthens.Load() != 1 {
+		t.Fatalf("strengthen calls = %d, want 1", strengthens.Load())
+	}
+	// Ledger: last row wins on resume → the keep.
+	if got := readResults(store.resultsPath); !got["go#weak"].Keep || got["go#weak"].StrengthenedText == "" {
+		t.Fatalf("resume ledger should end on the strengthened keep: %+v", got["go#weak"])
+	}
+	// Target calls: first round A("")+B(skill) = 2, retry = 1 (B only) = 3 total,
+	// and the retry's system is the skill with the rewrite spliced over the span.
+	mu.Lock()
+	defer mu.Unlock()
+	if len(*systems) != 3 {
+		t.Fatalf("target calls = %d, want 3 (A+B, then B-only retry)", len(*systems))
+	}
+	retrySys := (*systems)[2]
+	if !strings.Contains(retrySys, "STRONGER") || strings.Contains(retrySys, "WEAK STATEMENT") ||
+		!strings.Contains(retrySys, "line one") || !strings.Contains(retrySys, "line three") {
+		t.Fatalf("retry B system not the spliced skill: %q", retrySys)
+	}
+}
+
+// If the strengthened retry STILL fails, the claim ends as a drop (ineffective,
+// with the attempted wording recorded) and there is no second retry.
+func TestRunProbePassStrengthenRetryStillIneffective(t *testing.T) {
+	judge, target, strengthens, systems, mu := strengthenFixture(t, []string{ineffDrop, ineffDrop})
+	store := newTestStore(t, "go")
+	var c collector
+	if err := runProbePass(context.Background(), []ModelSpec{judge}, target,
+		fakeSkills("go"), weakPrep, authoredResume, 1, 1, store, c.ev()); err != nil {
+		t.Fatal(err)
+	}
+	if len(c.results) != 2 {
+		t.Fatalf("results = %d, want 2", len(c.results))
+	}
+	final := c.results[1]
+	if final.Keep || !final.Ineffective || !strings.Contains(final.StrengthenedText, "STRONGER") {
+		t.Fatalf("final row should be an ineffective drop recording the attempt: %+v", final)
+	}
+	if strengthens.Load() != 1 {
+		t.Fatalf("strengthen calls = %d, want exactly 1 (no retry loop)", strengthens.Load())
+	}
+	mu.Lock()
+	n := len(*systems)
+	mu.Unlock()
+	if n != 3 {
+		t.Fatalf("target calls = %d, want 3", n)
+	}
+	if len(c.skills) != 1 {
+		t.Fatalf("skill must still finalize once, got %v", c.skills)
+	}
+}
+
+// An empty judge pool is a hard error, not a hang (the worker accounting would
+// otherwise wait forever on a judge worker that was never spawned).
+func TestRunProbePassNoJudgesErrors(t *testing.T) {
+	store := newTestStore(t, "go")
+	done := make(chan error, 1)
+	go func() {
+		done <- runProbePass(context.Background(), nil, ModelSpec{Name: "t"},
+			fakeSkills("go"), fakePrep(1), freshResume, 1, 1, store, collectorEv(t))
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("no judges must be an error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runProbePass hung on an empty judge pool")
+	}
+}
+
+// collectorEv is a throwaway event sink for tests that only care about errors.
+func collectorEv(t *testing.T) schedEvents {
+	t.Helper()
+	return schedEvents{}
 }

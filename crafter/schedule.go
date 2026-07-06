@@ -25,6 +25,13 @@ type probeItem struct {
 	pairs     []samplePair
 	havePairs bool
 	genMs     int64 // generation wall time, carried into the result's duration split
+
+	// Strengthen-and-retry state: after an ineffective drop (model ignored the
+	// statement even with the skill loaded), the judge rewrites it once and the
+	// claim re-runs arm B with `strengthened` spliced over its span. retried
+	// bounds the loop to a single attempt.
+	strengthened string
+	retried      bool
 }
 
 // probeStore persists the three durable artifacts of a pass, each write
@@ -88,6 +95,9 @@ type schedEvents struct {
 	onGenerated  func(it *probeItem, genMs int64)
 	onJudged     func(judge ModelSpec, it *probeItem, i, n int, verdict string)
 	onResult     func(judge ModelSpec, it *probeItem, res ProbeResult, genMs int64)
+	// onStrengthen fires when an ineffective drop earned a strengthened retry:
+	// the judge rewrote the statement and the claim went back to the target.
+	onStrengthen func(judge ModelSpec, it *probeItem, text string)
 	onSkillDone  func(skill string, orig []byte, claims []Claim)
 }
 
@@ -131,6 +141,12 @@ func preferAuthor(genQueued, targetSlots int) bool {
 func runProbePass(ctx context.Context, judges []ModelSpec, target ModelSpec, skills []skillSource, prep prepFunc, resume resumeFunc, samples, keepThreshold int, store *probeStore, ev schedEvents) error {
 	if len(skills) == 0 {
 		return nil
+	}
+	// Guard, not just validation: with zero judges the worker accounting below
+	// would Add(1) for a floored nJudge but spawn no judge worker — Wait() would
+	// then hang forever once the (never-served) queues drain.
+	if len(judges) == 0 {
+		return fmt.Errorf("runProbePass: no judge endpoints")
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -231,6 +247,7 @@ func runProbePass(ctx context.Context, judges []ModelSpec, target ModelSpec, ski
 			prog = func(i, n int, verdict string) { ev.onJudged(judge, pit, i, n, verdict) }
 		}
 		res := judgeSamples(ctx, judge, target, it.claim, it.question, it.pairs, keepThreshold, prog)
+		res.StrengthenedText = it.strengthened // "" on the first round
 		res.DurationMs = it.genMs + time.Since(jStart).Milliseconds()
 		res.EndedAt = time.Now().Format(time.RFC3339)
 		if err := store.saveResult(res); err != nil {
@@ -239,6 +256,25 @@ func runProbePass(ctx context.Context, judges []ModelSpec, target ModelSpec, ski
 		}
 		if ev.onResult != nil {
 			ev.onResult(judge, it, res, it.genMs)
+		}
+		// Strengthen-and-retry: an INEFFECTIVE drop (model failed the rubric even
+		// with the skill loaded — it read the statement and ignored it) gets one
+		// second chance with a judge-strengthened wording. The judge rewrites the
+		// statement from the failing answers; the item goes back to the target to
+		// regenerate arm B only (arm A has no skill, so it's reused). The
+		// ineffective-drop row above stays in the ledger for the audit trail; the
+		// retry's row lands after it and wins on resume (last-line-wins). A crash
+		// between the two leaves the drop — a valid, if unretried, final state.
+		if res.Err == "" && res.Ineffective && !it.retried && ctx.Err() == nil {
+			if text, ok := strengthenClaim(ctx, judge, it.claim, it.question, it.pairs); ok {
+				it.retried = true
+				it.strengthened = text
+				if ev.onStrengthen != nil {
+					ev.onStrengthen(judge, it, text)
+				}
+				genQ <- it // regenerate B with the strengthened skill; NOT terminal yet
+				return true
+			}
 		}
 		terminal(it)
 		return true
@@ -385,11 +421,22 @@ func runProbePass(ctx context.Context, judges []ModelSpec, target ModelSpec, ski
 					ev.onGenerating(it)
 				}
 				gStart := time.Now()
-				pairs, err := generateSamples(ctx, target, it.claim, it.question, samples, it.skillMD)
+				var pairs []samplePair
+				var err error
+				if it.strengthened != "" {
+					// Strengthened retry: splice the rewrite over the claim's span
+					// and regenerate ONLY arm B — arm A saw no skill, so the first
+					// round's A answers are reused as-is.
+					bSkill := pruneSkill(it.skillMD, nil, []replacement{{Claim: it.claim, Text: it.strengthened}})
+					pairs, err = regenerateB(ctx, target, it.question, it.pairs, bSkill)
+				} else {
+					pairs, err = generateSamples(ctx, target, it.claim, it.question, samples, it.skillMD)
+				}
 				it.genMs = time.Since(gStart).Milliseconds()
 				if err != nil {
 					res := newProbeResult(target, it.claim, it.question)
 					res.Err = err.Error()
+					res.StrengthenedText = it.strengthened
 					res.DurationMs = it.genMs
 					res.EndedAt = time.Now().Format(time.RFC3339)
 					if serr := store.saveResult(res); serr != nil {
@@ -403,9 +450,14 @@ func runProbePass(ctx context.Context, judges []ModelSpec, target ModelSpec, ski
 					continue
 				}
 				it.pairs = pairs
-				if err := store.saveSamples(sampleRecord{ClaimID: it.claim.ID, Skill: it.claim.Skill, Pairs: pairs}); err != nil {
-					fail(fmt.Errorf("persist samples %s: %w", it.claim.ID, err))
-					return
+				if it.strengthened == "" {
+					// Retry pairs are deliberately NOT persisted: samples.jsonl is
+					// the resume ledger for the ORIGINAL skill wording; a resumed
+					// run re-judges from those and re-strengthens if still needed.
+					if err := store.saveSamples(sampleRecord{ClaimID: it.claim.ID, Skill: it.claim.Skill, QuestionHash: questionHash(it.question), Pairs: pairs}); err != nil {
+						fail(fmt.Errorf("persist samples %s: %w", it.claim.ID, err))
+						return
+					}
 				}
 				if ev.onGenerated != nil {
 					ev.onGenerated(it, it.genMs)

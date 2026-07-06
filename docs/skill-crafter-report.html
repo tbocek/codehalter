@@ -64,9 +64,9 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
       given model; others tell it to do what it already does. <b>Skill crafter probes each statement per
       model</b> and keeps only the ones that change behavior.</p>
     <p class="lede">For every atomic claim, the judge model (<code>Qwen3.5 (122B-A10B; 262k ctx; Q5_K_XL)</code>) authors a
-      disguised test question and a rubric. The target model answers it <b>with and without</b> the claim,
-      3× each; the judge decides whether the claim mattered. <b>keep</b> = it did, <b>drop</b> =
-      the model already behaves that way.</p>
+      disguised question and a rubric. The target answers it <b>with the whole skill loaded</b> and with
+      nothing, 3× each; the judge decides whether the skill changed the answer. <b>keep</b> =
+      it did, <b>drop</b> = the model already behaves that way with no skill at all.</p>
   </header>
 
   <section class="section">
@@ -78,19 +78,21 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
     <div class="mcard">
       <div class="mhead">
         <h3>gemma-4-31b</h3>
-        <span class="tag">1190 → 961 bytes</span>
+        <span class="tag">3896 → 2738 bytes</span>
       </div>
       <div class="stats">
-        <div class="stat"><div class="num">-19%</div><div class="lbl">size change</div></div>
-        <div class="stat"><div class="num dim">11</div><div class="lbl">kept</div></div>
-        <div class="stat"><div class="num dim">4</div><div class="lbl">dropped</div></div>
-        <div class="stat"><div class="num dim">0</div><div class="lbl">errored</div></div>
+        <div class="stat"><div class="num">-30%</div><div class="lbl">size change</div></div>
+        <div class="stat"><div class="num dim">17</div><div class="lbl">kept</div></div>
+        <div class="stat"><div class="num dim">17</div><div class="lbl">dropped</div></div>
+        <div class="stat"><div class="num dim">1</div><div class="lbl">errored</div></div>
       </div>
       <table>
         <thead><tr><th>skill</th><th class="num">claims</th><th class="num">kept</th><th class="num">dropped</th><th class="num">errored</th><th class="num">bytes</th></tr></thead>
         <tbody>
         
-          <tr><td><code>SKILL-arch</code></td><td class="num">15</td><td class="num">11</td><td class="num">4</td><td class="num">0</td><td class="num">1190 → 961</td></tr>
+          <tr><td><code>SKILL-alpine</code></td><td class="num">16</td><td class="num">9</td><td class="num">7</td><td class="num">0</td><td class="num">1828 → 1270</td></tr>
+        
+          <tr><td><code>SKILL-arch</code></td><td class="num">19</td><td class="num">8</td><td class="num">10</td><td class="num">1</td><td class="num">2068 → 1468</td></tr>
         
         </tbody>
       </table>
@@ -98,43 +100,43 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
       <div style="margin-top:22px;">
         
         <div class="ex">
-          <div class="claim"><span class="pill keep">KEEP</span> Use `apk list -I` to list all installed packages, using grep if the output is long.</div>
-          <div class="reason">Answer A uses &#39;apk info&#39; instead of the required &#39;apk list -I&#39;, while Answer B correctly implements the specific command specified in the rubric. <span class="cid">· alpine#5bc60965</span></div>
+          <div class="claim"><span class="pill keep">KEEP</span> If a prebuilt glibc binary fails due to heavy dependencies, use the Alpine package or a static/musl build.</div>
+          <div class="reason">Neither answer reaches the Alpine/musl/static fallback as a deliberate step—A omits it entirely in favor of glibc-only solutions, and B (answering from an Alpine host) likewise never names a static or musl-linked binary as a fallback—so the instruction produced no rubric-relevant change. <span class="cid">· alpine#03d19e29</span></div>
         </div>
         
         <div class="ex">
-          <div class="claim"><span class="pill keep">KEEP</span> Configure a non-root user named &#39;dev&#39; with NOPASSWD sudo access.</div>
-          <div class="reason">Answer A only adds the user to the sudo group without NOPASSWD, while Answer B explicitly configures NOPASSWD in the sudoers file. <span class="cid">· alpine#74c179ae</span></div>
+          <div class="claim"><span class="pill keep">KEEP</span> Use apk info &lt;pkg&gt; to retrieve the version and description.</div>
+          <div class="reason">Answer A recommends `apk info -v nginx` for version and description while explicitly stating `apk info nginx` only provides description, failing the rubric&#39;s requirement to recommend `apk info nginx` for both, which Answer B satisfies. <span class="cid">· alpine#1260d2a6</span></div>
         </div>
         
         <div class="ex">
-          <div class="claim"><span class="pill keep">KEEP</span> Write operations such as add, delete, and update require sudo.</div>
-          <div class="reason">Answer A already uses sudo via tee to write the file to the privileged directory, satisfying the rubric without the instruction. <span class="cid">· alpine#92b661da</span></div>
+          <div class="claim"><span class="pill keep">KEEP</span> For upstream sites, search official docs first, then choose between an install script with the correct shell, dropping binaries to PATH directories, or adding a vendor repo for updates.</div>
+          <div class="reason">Answer A proposes a single default solution (the /opt symlink pattern) and does not list checking official documentation as step one, while Answer B explicitly starts with documentation discovery and lays out multiple installation strategies (vendor repo, install script, binary, language installer). <span class="cid">· alpine#1c127ae4</span></div>
         </div>
         
         <div class="ex">
-          <div class="claim"><span class="pill keep">KEEP</span> Use apk as the package manager.</div>
-          <div class="reason">Answer A does not use &#39;apk add curl&#39; but lists other package managers, while Answer B uses &#39;apk add curl&#39; as required by the rubric. <span class="cid">· alpine#b5e9db03</span></div>
+          <div class="claim"><span class="pill keep">KEEP</span> Follow the installation order of apk first, then upstream site or custom repo, and finally language installers.</div>
+          <div class="reason">Answer B explicitly orders apk system packages first, upstream/repo sources second, and language-specific installers last (with a summary formula), while Answer A discusses language runtimes in Phase 2 before upstream binaries in Phase 3 and never states the required ordering. <span class="cid">· alpine#5b48cb33</span></div>
         </div>
         
         <div class="ex">
-          <div class="claim"><span class="pill drop">DROP</span> Install gcompat on musl libc to run most prebuilt glibc binaries; if heavier deps fail, use Alpine packages or static/musl builds.</div>
-          <div class="reason">Both answers explicitly recommend installing gcompat via apk add gcompat, so the instruction is not needed. <span class="cid">· alpine#03d19e29</span></div>
+          <div class="claim"><span class="pill drop">DROP</span> Read probes such as info or list -I do not require sudo privileges.</div>
+          <div class="reason">Both A and B use unprivileged, read-only probe commands without any sudo prefix, satisfying the rubric; the only difference (dpkg -l vs dpkg-query -l) is functionally equivalent. <span class="cid">· alpine#15da7514</span></div>
         </div>
         
         <div class="ex">
-          <div class="claim"><span class="pill drop">DROP</span> Use `apk info &lt;pkg&gt;` to retrieve version and description.</div>
-          <div class="reason">Both answers invoke run_command with exactly &#39;apk info openssh&#39;, so the instruction is not needed. <span class="cid">· alpine#1260d2a6</span></div>
+          <div class="claim"><span class="pill drop">DROP</span> Use apk del &lt;pkg&gt; to uninstall packages.</div>
+          <div class="reason">Both answers use `apk del curl` as the uninstall command and provide sensible dependency-conflict fallbacks (A uses `apk info --who-requires curl` and removing dependents; B uses `apk info -R curl` and removing dependents), so the instruction is not needed. <span class="cid">· alpine#19a373eb</span></div>
         </div>
         
         <div class="ex">
-          <div class="claim"><span class="pill drop">DROP</span> Read probes like info and list -I do not require sudo.</div>
-          <div class="reason">Both answers invoke run_command without &#39;sudo&#39; in the command string, so the instruction is not needed. <span class="cid">· alpine#15da7514</span></div>
+          <div class="claim"><span class="pill drop">DROP</span> Run apk update to refresh the index before searching or installing.</div>
+          <div class="reason">Both answers include `apk update` as a discrete step positioned before `apk add nginx`, satisfying all three rubric criteria. <span class="cid">· alpine#37283ac9</span></div>
         </div>
         
         <div class="ex">
-          <div class="claim"><span class="pill drop">DROP</span> Read probes (pacman -Q, -Qi, -Ss, -Si) do not require sudo.</div>
-          <div class="reason">Both answers call run_command with &#39;pacman -Qi git&#39; (no &#39;sudo&#39; prefix), so A already satisfies the rubric and B is materially identical. <span class="cid">· arch#263aab2e</span></div>
+          <div class="claim"><span class="pill drop">DROP</span> Use apk add &lt;pkg&gt; to install without confirmation prompts.</div>
+          <div class="reason">Both answers specify &#39;apk add curl&#39; as the installation command; A already satisfies the rubric without needing the instruction. <span class="cid">· alpine#3a366b37</span></div>
         </div>
         
       </div>

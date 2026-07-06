@@ -10,13 +10,14 @@ import (
 // → removed), or errored (couldn't be tested → kept, to be safe), and the byte
 // sizes before and after pruning.
 type SkillStats struct {
-	Skill       string `json:"skill"`
-	Claims      int    `json:"claims"`
-	Kept        int    `json:"kept"`
-	Dropped     int    `json:"dropped"`
-	Errored     int    `json:"errored"`
-	OrigBytes   int    `json:"orig_bytes"`
-	PrunedBytes int    `json:"pruned_bytes"`
+	Skill        string `json:"skill"`
+	Claims       int    `json:"claims"`
+	Kept         int    `json:"kept"`
+	Strengthened int    `json:"strengthened,omitempty"` // kept, but only after a strengthened retry (subset of Kept)
+	Dropped      int    `json:"dropped"`
+	Errored      int    `json:"errored"`
+	OrigBytes    int    `json:"orig_bytes"`
+	PrunedBytes  int    `json:"pruned_bytes"`
 }
 
 // ModelStats aggregates a target model's per-skill results plus totals — the
@@ -33,17 +34,26 @@ var (
 	spaceRunRE = regexp.MustCompile(`[ \t]{2,}`)
 )
 
+// replacement is one claim whose source span is swapped for new text in the
+// output skill — the strengthened wording a target model needed before it
+// followed the statement.
+type replacement struct {
+	Claim Claim
+	Text  string
+}
+
 // pruneSkill removes the source spans of dropped claims from the original skill
-// content, keeping everything else byte-for-byte. Kept and errored claims stay
-// (errored = untested, so we never remove a statement we couldn't prove
-// redundant).
+// content and splices replacement text over strengthened claims' spans, keeping
+// everything else byte-for-byte. Kept and errored claims stay (errored =
+// untested, so we never remove a statement we couldn't prove redundant).
 //
-// Whole-line claims delete their [StartLine,EndLine] lines. Fragment claims
-// remove just their Source substring from the line — the rest of the line's
-// sentences survive. A line left with no words after fragment removal (e.g. an
-// orphaned "- " bullet) is deleted; interior double spaces collapse; runs of
-// 3+ blank lines collapse to one.
-func pruneSkill(orig string, dropped []Claim) string {
+// Whole-line claims delete their [StartLine,EndLine] lines (replacements emit
+// their text at StartLine instead). Fragment claims remove (or swap) just their
+// Source substring from the line — the rest of the line's sentences survive. A
+// line left with no words after fragment removal (e.g. an orphaned "- " bullet)
+// is deleted; interior double spaces collapse; runs of 3+ blank lines collapse
+// to one.
+func pruneSkill(orig string, dropped []Claim, replaced []replacement) string {
 	dropLine := map[int]bool{}
 	fragsByLine := map[int][]string{}
 	for _, c := range dropped {
@@ -55,13 +65,32 @@ func pruneSkill(orig string, dropped []Claim) string {
 			dropLine[ln] = true
 		}
 	}
+	replAt := map[int]string{} // whole-line replacement: emit text at StartLine …
+	replSkip := map[int]bool{} // … and skip the original StartLine..EndLine
+	fragRepl := map[int][]replacement{}
+	for _, r := range replaced {
+		if r.Claim.Fragment {
+			fragRepl[r.Claim.StartLine] = append(fragRepl[r.Claim.StartLine], r)
+			continue
+		}
+		replAt[r.Claim.StartLine] = r.Text
+		for ln := r.Claim.StartLine; ln <= r.Claim.EndLine; ln++ {
+			replSkip[ln] = true
+		}
+	}
 
 	lines := strings.Split(orig, "\n")
 	kept := make([]string, 0, len(lines))
 	for i, l := range lines {
 		n := i + 1
-		if dropLine[n] {
+		if text, ok := replAt[n]; ok {
+			kept = append(kept, strings.Split(text, "\n")...)
+		}
+		if replSkip[n] || dropLine[n] {
 			continue
+		}
+		for _, r := range fragRepl[n] {
+			l = strings.Replace(l, r.Claim.Source, r.Text, 1)
 		}
 		if frags := fragsByLine[n]; len(frags) > 0 {
 			for _, src := range frags {
@@ -136,6 +165,20 @@ func droppedClaims(claims []Claim, results map[string]ProbeResult) []Claim {
 	return out
 }
 
+// strengthenedClaims filters to the claims kept only after a strengthened
+// retry: their span is replaced with the strengthened wording in the output.
+func strengthenedClaims(claims []Claim, results map[string]ProbeResult) []replacement {
+	var out []replacement
+	for _, c := range claims {
+		r, ok := results[c.ID]
+		if !ok || r.Err != "" || !r.Keep || r.StrengthenedText == "" {
+			continue
+		}
+		out = append(out, replacement{Claim: c, Text: r.StrengthenedText})
+	}
+	return out
+}
+
 // skillStats tallies keep/drop/error counts and byte sizes for one skill.
 func skillStats(skill, orig, pruned string, claims []Claim, results map[string]ProbeResult) SkillStats {
 	st := SkillStats{
@@ -151,6 +194,9 @@ func skillStats(skill, orig, pruned string, claims []Claim, results map[string]P
 			st.Errored++
 		case r.Keep:
 			st.Kept++
+			if r.StrengthenedText != "" {
+				st.Strengthened++
+			}
 		default:
 			st.Dropped++
 		}

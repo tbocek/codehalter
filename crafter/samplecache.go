@@ -16,17 +16,34 @@ import (
 // still wins on resume; once a claim has a verdict its samples are dead weight,
 // kept only for provenance.
 type sampleRecord struct {
-	ClaimID string       `json:"claim_id"`
-	Skill   string       `json:"skill"`
-	Pairs   []samplePair `json:"pairs"`
+	ClaimID string `json:"claim_id"`
+	Skill   string `json:"skill"`
+	// QuestionHash ties the pairs to the exact question that produced them
+	// (question + rubric + tools). Resume reuses saved pairs only when it still
+	// matches the claim's current question — otherwise the answers belong to a
+	// question that is no longer being asked (e.g. AUTHOR.md changed and the
+	// probe re-authored) and judging them against the new rubric would be
+	// silently wrong. Absent on legacy rows → treated as a mismatch.
+	QuestionHash string       `json:"question_hash,omitempty"`
+	Pairs        []samplePair `json:"pairs"`
+}
+
+// questionHash fingerprints the probe a set of pairs answered.
+func questionHash(q Question) string {
+	return hashOf([]byte(q.Question + "\x00" + q.Rubric + "\x00" + strings.Join(q.Tools, ",")))[:16]
+}
+
+// matches reports whether these saved pairs answered exactly this question.
+func (r sampleRecord) matches(q Question) bool {
+	return r.QuestionHash != "" && r.QuestionHash == questionHash(q)
 }
 
 // readSamples loads a model's samples.jsonl into a map keyed by claim ID, last
 // line winning (a regenerated claim overrides the older pairs). A missing file
 // is the normal first-run case. Mirrors readResults so the two ledgers behave
 // identically on malformed/truncated input.
-func readSamples(path string) map[string][]samplePair {
-	out := map[string][]samplePair{}
+func readSamples(path string) map[string]sampleRecord {
+	out := map[string]sampleRecord{}
 	f, err := os.Open(path)
 	if err != nil {
 		return out
@@ -46,7 +63,7 @@ func readSamples(path string) map[string][]samplePair {
 			fmt.Fprintf(os.Stderr, "warn: %s line %d: malformed sample record, skipping (claim will be regenerated): %v\n", path, n, err)
 			continue
 		}
-		out[r.ClaimID] = r.Pairs
+		out[r.ClaimID] = r
 	}
 	if err := sc.Err(); err != nil {
 		fmt.Fprintf(os.Stderr, "warn: %s: read stopped at line %d: %v (some samples may be regenerated)\n", path, n, err)

@@ -42,6 +42,18 @@ follows it and arm A doesn't, and **dropped** when the model already behaves tha
 way with no skill at all. This is keep-biased on purpose (see `keep_threshold`):
 a wrong drop silently regresses a behavior; a wrong keep costs a little prefill.
 
+A drop where the model failed the rubric even *with* the skill loaded (every
+sample `B_sat=false`) is a different animal: the statement isn't redundant, it's
+**ignored** — usually the model's own prior overriding the instruction. Those get
+one **strengthen-and-retry**: the judge rewrites the statement (same meaning,
+added emphasis, rationale, and an exception clause naming the observed
+deviation), the target regenerates arm B with the rewrite spliced into the skill
+(arm A is reused — no skill in it), and the judge re-scores. If the rewrite
+works, the claim is kept and the **strengthened wording replaces the original**
+in that model's output skill; if it still fails, the drop is flagged
+`INEFFECTIVE` — a real finding: this model won't follow that policy regardless
+of phrasing. Both attempts are recorded in `results.jsonl`.
+
 For claims whose whole point is *executing* an action (call `web_search` before
 declaring a package missing; read before edit), the author instead offers real
 **tools** and scores the actual tool calls — the one case where "does it *do* it"
@@ -131,6 +143,8 @@ while it exists.
   couldn't locate.
 - `AUTHOR.md` — the plan-eliciting question + rubric (tools for execution claims).
 - `JUDGE.md` — score arm A vs arm B against the rubric.
+- `STRENGTHEN.md` — rewrite an ignored statement (same meaning, more force) for
+  the one-shot retry.
 
 ## Contribute
 

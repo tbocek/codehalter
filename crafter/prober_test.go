@@ -323,3 +323,95 @@ func TestJudgeSamplesKeepThreshold(t *testing.T) {
 		})
 	}
 }
+
+// TestJudgeSamplesIneffective pins the "model ignores it" signature: a drop
+// where every sample failed the rubric even with the skill loaded (all
+// B_sat=false) is flagged Ineffective; any B success (or a keep) is not.
+func TestJudgeSamplesIneffective(t *testing.T) {
+	dropBoth := `{"a_satisfies":false,"b_satisfies":false,"similar":true,"verdict":"drop","reason":"ignored"}`
+	dropKnown := `{"a_satisfies":true,"b_satisfies":true,"similar":true,"verdict":"drop","reason":"already knows"}`
+	cases := []struct {
+		name     string
+		verdicts []string
+		want     bool
+	}{
+		{"all B fail → ineffective", []string{dropBoth, dropBoth, dropBoth}, true},
+		{"already knows → not ineffective", []string{dropKnown, dropKnown, dropKnown}, false},
+		{"mixed B → not ineffective", []string{dropBoth, dropKnown, dropBoth}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var call int32
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				i := atomic.AddInt32(&call, 1) - 1
+				_, _ = w.Write([]byte(sse(fmt.Sprintf(`{"choices":[{"delta":{"content":%q}}]}`, tc.verdicts[i]))))
+			}))
+			defer ts.Close()
+			res := judgeSamples(context.Background(),
+				ModelSpec{Name: "main", Server: ts.URL, Model: "j"}, ModelSpec{Name: "t"},
+				Claim{ID: "x#1"}, Question{Question: "q", Rubric: "r"}, make([]samplePair, len(tc.verdicts)), 1, nil)
+			if res.Err != "" {
+				t.Fatal(res.Err)
+			}
+			if res.Keep {
+				t.Fatal("all-drop verdicts must not keep")
+			}
+			if res.Ineffective != tc.want {
+				t.Fatalf("ineffective = %v, want %v", res.Ineffective, tc.want)
+			}
+		})
+	}
+}
+
+// TestStrengthenClaim: the judge rewrite is accepted when non-empty and
+// changed, rejected when empty or identical to the original.
+func TestStrengthenClaim(t *testing.T) {
+	for _, tc := range []struct {
+		reply  string
+		wantOK bool
+	}{
+		{`{"text":"- Order: STRICTLY 1) dnf 2) upstream — even when you know a COPR package exists."}`, true},
+		{`{"text":""}`, false},
+		{`{"text":"- original wording"}`, false}, // unchanged → useless
+	} {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(sse(fmt.Sprintf(`{"choices":[{"delta":{"content":%q}}]}`, tc.reply))))
+		}))
+		got, ok := strengthenClaim(context.Background(),
+			ModelSpec{Name: "main", Server: ts.URL, Model: "j"},
+			Claim{ID: "x#1", Source: "- original wording", Text: "original"},
+			Question{Question: "q", Rubric: "r"},
+			[]samplePair{{AnswerB: "wrong answer"}})
+		ts.Close()
+		if ok != tc.wantOK {
+			t.Fatalf("reply %s: ok = %v, want %v (got %q)", tc.reply, ok, tc.wantOK, got)
+		}
+	}
+}
+
+// Zero pairs must never fold into a verdict — no evidence, no drop.
+func TestJudgeSamplesEmptyPairsErrors(t *testing.T) {
+	res := judgeSamples(context.Background(),
+		ModelSpec{Name: "main"}, ModelSpec{Name: "t"},
+		Claim{ID: "x#1"}, Question{Question: "q", Rubric: "r"}, nil, 1, nil)
+	if res.Err == "" {
+		t.Fatalf("empty pairs must produce an errored result, got verdict %q", res.Verdict)
+	}
+	if res.Keep || res.Verdict != "" {
+		t.Fatalf("errored result must carry no verdict: %+v", res)
+	}
+}
+
+// The probe catalog must resolve every agent-default tool AUTHOR.md offers —
+// a name in the prompt but not the catalog silently downgrades those probes
+// to text-only (measured: the judge requested write_file, which was missing).
+func TestProbeToolCatalogCoversAuthorList(t *testing.T) {
+	for _, name := range []string{"run_command", "read_file", "write_file", "edit_file", "list_files", "search_text", "web_search"} {
+		if !strings.Contains(authorPrompt, "`"+name+"`") {
+			t.Errorf("AUTHOR.md does not offer %q", name)
+		}
+		if got := buildProbeTools([]string{name}); len(got) != 1 {
+			t.Errorf("catalog cannot resolve %q", name)
+		}
+	}
+}

@@ -17,6 +17,9 @@ var authorPrompt string
 //go:embed res/JUDGE.md
 var judgePrompt string
 
+//go:embed res/STRENGTHEN.md
+var strengthenPrompt string
+
 // Question is the judge-authored probe for one claim: a coding task that makes
 // the claim's behavior relevant without naming it, plus the rubric an
 // independent judge applies to two answers. Authoring depends only on the claim
@@ -41,12 +44,19 @@ var probeToolCatalog = map[string]map[string]any{
 		map[string]any{"command": map[string]any{"type": "string", "description": "the shell command to run"}}, "command"),
 	"read_file": probeTool("read_file", "Read a file from the project and return its content.",
 		map[string]any{"path": map[string]any{"type": "string", "description": "project-relative file path"}}, "path"),
+	"write_file": probeTool("write_file", "Create a NEW file (or fully regenerate a small one). Use edit_file for targeted changes to an existing file.",
+		map[string]any{
+			"path":    map[string]any{"type": "string", "description": "project-relative file path"},
+			"content": map[string]any{"type": "string", "description": "full file content, replaces the file entirely"},
+		}, "path", "content"),
 	"edit_file": probeTool("edit_file", "Replace text in a project file.",
 		map[string]any{
 			"path": map[string]any{"type": "string", "description": "project-relative file path"},
 			"old":  map[string]any{"type": "string", "description": "exact text to replace"},
 			"new":  map[string]any{"type": "string", "description": "replacement text"},
 		}, "path", "old", "new"),
+	"list_files": probeTool("list_files", "List project files as relative paths, newline-separated.",
+		map[string]any{"path": map[string]any{"type": "string", "description": "subdirectory relative to project root; omit for the root"}}),
 	"search_text": probeTool("search_text", "Search the project files for a pattern and return matching lines.",
 		map[string]any{"pattern": map[string]any{"type": "string", "description": "text or regex to search for"}}, "pattern"),
 	"web_search": probeTool("web_search", "Search the web and return result snippets with URLs.",
@@ -108,17 +118,27 @@ type Sample struct {
 // silently dropped, so resume doesn't retry it forever without the operator
 // seeing it.
 type ProbeResult struct {
-	Model    string   `json:"model"`
-	Skill    string   `json:"skill"`
-	ClaimID  string   `json:"claim_id"`
-	Text     string   `json:"text"`
-	Question string   `json:"question"`
-	Rubric   string   `json:"rubric"`
-	Verdict  string   `json:"verdict"` // "keep" | "drop"
-	Keep     bool     `json:"keep"`
-	Unstable bool     `json:"unstable,omitempty"` // samples disagreed (not unanimous) — borderline, worth a look
-	Samples  []Sample `json:"samples"`
-	Err      string   `json:"error,omitempty"`
+	Model    string `json:"model"`
+	Skill    string `json:"skill"`
+	ClaimID  string `json:"claim_id"`
+	Text     string `json:"text"`
+	Question string `json:"question"`
+	Rubric   string `json:"rubric"`
+	Verdict  string `json:"verdict"` // "keep" | "drop"
+	Keep     bool   `json:"keep"`
+	Unstable bool   `json:"unstable,omitempty"` // samples disagreed (not unanimous) — borderline, worth a look
+	// Ineffective marks the "model ignores it" drop: every sample failed the
+	// rubric even WITH the skill loaded (all B_sat=false). Distinct from the
+	// "already knows" drop (A_sat=true) — this statement isn't redundant, it's
+	// disobeyed, which is what triggers the strengthen-and-retry pass.
+	Ineffective bool `json:"ineffective,omitempty"`
+	// StrengthenedText is set when this verdict came from a strengthened
+	// retry: the judge's rewritten wording that arm B was re-tested with. On a
+	// keep, pruning splices this text over the original span in the output
+	// skill; on a drop it documents what was tried.
+	StrengthenedText string   `json:"strengthened_text,omitempty"`
+	Samples          []Sample `json:"samples"`
+	Err              string   `json:"error,omitempty"`
 
 	// EndedAt and DurationMs record when this probe finished and how long its
 	// LLM calls took, so results.jsonl doubles as a durable timeline — you can
@@ -190,17 +210,7 @@ func generateSamples(ctx context.Context, target ModelSpec, claim Claim, q Quest
 	// run concurrently on separate slots — each slot keeps its own cache, and
 	// wall time halves.
 	runArm := func(system string) ([]string, [][]string, error) {
-		answers := make([]string, samples)
-		calls := make([][]string, samples)
-		for i := 0; i < samples; i++ {
-			a, c, err := chatWithTools(ctx, target, system, q.Question, tools)
-			if err != nil {
-				return nil, nil, fmt.Errorf("sample %d: %w", i, err)
-			}
-			answers[i] = a
-			calls[i] = renderCalls(c)
-		}
-		return answers, calls, nil
+		return genArm(ctx, target, q, tools, samples, system)
 	}
 
 	var aAns, bAns []string
@@ -232,6 +242,69 @@ func generateSamples(ctx context.Context, target ModelSpec, claim Claim, q Quest
 	return pairs, nil
 }
 
+// genArm runs `samples` sequential generations of one probe arm (a fixed system
+// prompt) on the target. Sequential within the arm so consecutive calls share
+// their prompt prefix in the server's cache.
+func genArm(ctx context.Context, target ModelSpec, q Question, tools []map[string]any, samples int, system string) ([]string, [][]string, error) {
+	answers := make([]string, samples)
+	calls := make([][]string, samples)
+	for i := 0; i < samples; i++ {
+		a, c, err := chatWithTools(ctx, target, system, q.Question, tools)
+		if err != nil {
+			return nil, nil, fmt.Errorf("sample %d: %w", i, err)
+		}
+		answers[i] = a
+		calls[i] = renderCalls(c)
+	}
+	return answers, calls, nil
+}
+
+// regenerateB reruns ONLY the B arm with a new system prompt (the skill with a
+// strengthened statement spliced in), pairing the fresh B answers with the A
+// answers from the earlier round. Arm A has no skill in context, so a wording
+// change can't affect it — reusing it halves the retry's generation cost.
+func regenerateB(ctx context.Context, target ModelSpec, q Question, old []samplePair, bSystem string) ([]samplePair, error) {
+	tools := buildProbeTools(q.Tools)
+	bAns, bCalls, err := genArm(ctx, target, q, tools, len(old), bSystem)
+	if err != nil {
+		return nil, fmt.Errorf("answer B (strengthened): %w", err)
+	}
+	pairs := make([]samplePair, len(old))
+	for i := range old {
+		pairs[i] = samplePair{AnswerA: old[i].AnswerA, ACalls: old[i].ACalls, AnswerB: bAns[i], BCalls: bCalls[i]}
+	}
+	return pairs, nil
+}
+
+// strengthenClaim asks the judge to rewrite an ignored statement so it survives
+// the target's prior: same meaning, added emphasis/rationale and an exception
+// clause naming the deviation visible in the failing B answers. ok=false on a
+// judge error or an unusable rewrite (the claim then keeps its ineffective-drop
+// verdict — a flaky strengthen costs the retry, not the run).
+func strengthenClaim(ctx context.Context, judge ModelSpec, claim Claim, q Question, pairs []samplePair) (string, bool) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "STATEMENT (as it appears in the skill):\n%s\n\nSTATEMENT (self-contained):\n%s\n\nRUBRIC it failed:\n%s\n", claim.Source, claim.Text, q.Rubric)
+	for i, p := range pairs {
+		fmt.Fprintf(&b, "\nFAILING ANSWER %d (skill was loaded):\n%s\n", i+1, truncate(p.AnswerB, 1500))
+		if len(p.BCalls) > 0 {
+			fmt.Fprintf(&b, "TOOL CALLS %d:\n%s\n", i+1, callsBlock(p.BCalls))
+		}
+	}
+	var out struct {
+		Text string `json:"text"`
+	}
+	if err := chatJSON(ctx, judge, strengthenPrompt, b.String(), &out); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: strengthen %s failed, keeping the ineffective-drop verdict: %v\n", claim.ID, err)
+		return "", false
+	}
+	text := strings.TrimSpace(out.Text)
+	if text == "" || text == strings.TrimSpace(claim.Source) {
+		fmt.Fprintf(os.Stderr, "warn: strengthen %s: judge returned an empty/unchanged rewrite, keeping the ineffective-drop verdict\n", claim.ID)
+		return "", false
+	}
+	return text, true
+}
+
 // renderCalls formats accumulated tool calls for the judge and the ledger.
 func renderCalls(calls []toolCallRec) []string {
 	var out []string
@@ -247,6 +320,13 @@ func renderCalls(calls []toolCallRec) []string {
 // after each sample verdict — three verdicts take the judge several minutes.
 func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Question, pairs []samplePair, keepThreshold int, progress func(i, n int, verdict string)) ProbeResult {
 	res := newProbeResult(target, claim, q)
+	// No pairs = no evidence: without this guard the fold below would emit a
+	// unanimous "drop" from zero samples (e.g. a truncated samples.jsonl row
+	// resumed from disk). Record an error instead so resume regenerates.
+	if len(pairs) == 0 {
+		res.Err = "no samples to judge (empty pairs — will regenerate on resume)"
+		return res
+	}
 
 	judgeOne := func(p samplePair) (Sample, error) {
 		var s Sample
@@ -336,6 +416,18 @@ func judgeSamples(ctx context.Context, judge, target ModelSpec, claim Claim, q Q
 	// A non-unanimous vote means the model is inconsistent on this claim — the
 	// verdict went one way but it was a judgment call, so flag it for review.
 	res.Unstable = keep != 0 && keep != len(verdicts)
+	// Ineffective: a drop where every sample failed the rubric even WITH the
+	// skill loaded. Not "already knows" (that's A_sat=true) — the model read
+	// the statement and ignored it, so it's the strengthen-retry trigger.
+	if !res.Keep && len(verdicts) > 0 {
+		res.Ineffective = true
+		for _, s := range verdicts {
+			if s.BSat {
+				res.Ineffective = false
+				break
+			}
+		}
+	}
 	return res
 }
 

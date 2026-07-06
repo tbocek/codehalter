@@ -43,7 +43,7 @@ acting, skips it — tools catch that say-versus-do gap). Examples: calling
 web_search before declaring a package unavailable; read_file before edit_file.
 For those:
 - Offer tools from EXACTLY this catalog: `run_command`, `read_file`,
-  `edit_file`, `search_text`, `web_search`.
+  `write_file`, `edit_file`, `list_files`, `search_text`, `web_search`.
 - Phrase the `question` as an agent task to do NOW ("install X", "fix the bug in
   foo.go"), and write the `rubric` in terms of which call — or which FIRST call
   — a claim-following run makes. The model can then actually CALL the tools

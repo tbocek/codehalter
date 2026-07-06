@@ -211,10 +211,15 @@ func main() {
 				return
 			}
 			prunedSkills[stack] = true
-			out := pruneSkill(string(orig), droppedClaims(claims, dm))
+			out := pruneSkill(string(orig), droppedClaims(claims, dm), strengthenedClaims(claims, dm))
 			outPath := filepath.Join(modelDir, "SKILL-"+stack+".md")
+			// Failures here warn, never exit: this runs inside a scheduler worker
+			// (onSkillDone), and the pruned skill + stats are pure derivatives of
+			// results.jsonl — a resume re-prunes them for free, while an exit here
+			// would kill probing that is persisting results just fine.
 			if err := os.WriteFile(outPath, []byte(out), 0o644); err != nil {
-				log.Fatalf("write %s: %v", outPath, err)
+				logf("warn: write %s: %v — pruned skill lost this run, a re-run regenerates it", outPath, err)
+				return
 			}
 			st := skillStats(stack, string(orig), out, claims, dm)
 			ms := statsByModel[m.Name]
@@ -222,7 +227,7 @@ func main() {
 			ms.OrigBytes += st.OrigBytes
 			ms.PrunedBytes += st.PrunedBytes
 			if err := writeJSON(filepath.Join(modelDir, "stats.json"), *ms); err != nil {
-				log.Fatalf("write stats: %v", err)
+				logf("warn: write stats: %v", err)
 			}
 			logf("%s / %s: %d kept, %d dropped, %d errored | %d → %d bytes (%s)",
 				stack, m.Name, st.Kept, st.Dropped, st.Errored, st.OrigBytes, st.PrunedBytes, pct(st.OrigBytes, st.PrunedBytes))
@@ -243,8 +248,11 @@ func main() {
 			var pairs []samplePair
 			havePairs := false
 			if haveQ {
-				if p, ok := savedSamples[c.ID]; ok {
-					pairs, havePairs = p, true
+				// Saved pairs are reused only when they answered THIS question
+				// (hash match) — pairs generated for a since-re-authored question
+				// would otherwise be judged against a rubric they never saw.
+				if p, ok := savedSamples[c.ID]; ok && p.matches(q) {
+					pairs, havePairs = p.Pairs, true
 				}
 			}
 			return q, haveQ, pairs, havePairs, false
@@ -253,17 +261,25 @@ func main() {
 			return prepSkill(judge, sk, store)
 		}
 
-		// Warm the router to this model once before the pass (preflight may have
-		// swapped it out loading a later endpoint). One ping; harmless if resumed.
-		logf("switching endpoint to %s (a router may load the model now) ...", m.Name)
-		switchStart := time.Now()
-		wctx, wcancel := context.WithTimeout(ctx, 10*time.Minute)
-		if err := ping(wctx, m); err != nil {
-			logf("warn: model switch/warm-up for %s failed: %v — probing anyway", m.Name, err)
-		} else {
-			logf("%s ready (%s)", m.Name, cachedOr(time.Since(switchStart)))
+		// Warm the router to this model LAZILY, on the first claim that actually
+		// needs generation — a fully-resumed pass (or a judge-only resume from
+		// saved samples) never loads the model. The Once also gates concurrent
+		// gen workers: they block until the switch completes, so a router loads
+		// the model exactly once instead of racing several first calls into it.
+		var warm sync.Once
+		warmup := func() {
+			warm.Do(func() {
+				logf("switching endpoint to %s (a router may load the model now) ...", m.Name)
+				switchStart := time.Now()
+				wctx, wcancel := context.WithTimeout(ctx, 10*time.Minute)
+				if err := ping(wctx, m); err != nil {
+					logf("warn: model switch/warm-up for %s failed: %v — probing anyway", m.Name, err)
+				} else {
+					logf("%s ready (%s)", m.Name, cachedOr(time.Since(switchStart)))
+				}
+				wcancel()
+			})
 		}
-		wcancel()
 
 		ev := schedEvents{
 			onPrepped: func(j ModelSpec, stack string, claims, pending int, d time.Duration) {
@@ -276,6 +292,11 @@ func main() {
 				logf("warn: %s unauthored — untested this run%s", it.claim.ID, judgeTag(j))
 			},
 			onGenerating: func(it *probeItem) {
+				warmup() // lazy: first generation loads/switches the model, exactly once
+				if it.strengthened != "" {
+					logf("[%s %d/%d] %s %s regenerating arm B with strengthened wording ...", it.claim.Skill, it.idx+1, it.nClaims, m.Name, it.claim.ID)
+					return
+				}
 				logf("[%s %d/%d] %s %s generating %d samples ...", it.claim.Skill, it.idx+1, it.nClaims, m.Name, it.claim.ID, cfg.Settings.Samples)
 			},
 			onGenerated: func(it *probeItem, genMs int64) {
@@ -288,14 +309,27 @@ func main() {
 				dmMu.Lock()
 				dm[res.ClaimID] = res
 				dmMu.Unlock()
-				switch {
-				case res.Err != "":
+				if res.Err != "" {
 					logf("[%s %d/%d] %s %s ERROR (%dms): %s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, res.ClaimID, res.DurationMs, res.Err)
-				case res.Unstable:
-					logf("[%s %d/%d] %s %s → %s UNSTABLE (%dms: gen %dms + judge)%s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs, genMs, judgeTag(j))
-				default:
-					logf("[%s %d/%d] %s %s → %s (%dms: gen %dms + judge)%s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, res.ClaimID, strings.ToUpper(res.Verdict), res.DurationMs, genMs, judgeTag(j))
+					return
 				}
+				// Verdict qualifiers: UNSTABLE = samples disagreed; INEFFECTIVE =
+				// failed the rubric even with the skill loaded; STRENGTHENED =
+				// this verdict came from the rewritten-wording retry.
+				mark := ""
+				if res.Unstable {
+					mark += " UNSTABLE"
+				}
+				if res.Ineffective {
+					mark += " INEFFECTIVE"
+				}
+				if res.StrengthenedText != "" {
+					mark += " STRENGTHENED"
+				}
+				logf("[%s %d/%d] %s %s → %s%s (%dms: gen %dms + judge)%s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, res.ClaimID, strings.ToUpper(res.Verdict), mark, res.DurationMs, genMs, judgeTag(j))
+			},
+			onStrengthen: func(j ModelSpec, it *probeItem, text string) {
+				logf("[%s %d/%d] %s %s ignored the statement — retrying with strengthened wording: %q%s", it.claim.Skill, it.idx+1, it.nClaims, m.Name, it.claim.ID, truncate(text, 100), judgeTag(j))
 			},
 			onSkillDone: func(stack string, orig []byte, claims []Claim) { pruneOne(stack, orig, claims) },
 		}

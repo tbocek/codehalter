@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // crafterHTTPClient mirrors the main package's llmHTTPClient conservatively:
@@ -712,11 +713,15 @@ func extractJSON(s string) string {
 	return ""
 }
 
-// truncate shortens s to n bytes with an ellipsis, for error messages that
-// embed a model's raw reply.
+// truncate shortens s to at most n bytes (backing up to a rune boundary so a
+// multi-byte character is never split) with an ellipsis, for error messages
+// that embed a model's raw reply.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "…"
 }
