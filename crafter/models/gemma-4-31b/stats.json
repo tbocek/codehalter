@@ -1,0 +1,142 @@
+{
+  "model": "gemma-4-31b",
+  "skills": [
+    {
+      "skill": "alpine",
+      "claims": 16,
+      "kept": 9,
+      "dropped": 7,
+      "errored": 0,
+      "orig_bytes": 1828,
+      "pruned_bytes": 1270
+    },
+    {
+      "skill": "arch",
+      "claims": 19,
+      "kept": 8,
+      "dropped": 10,
+      "errored": 1,
+      "orig_bytes": 2068,
+      "pruned_bytes": 1468
+    },
+    {
+      "skill": "base",
+      "claims": 28,
+      "kept": 10,
+      "strengthened": 3,
+      "dropped": 18,
+      "errored": 0,
+      "orig_bytes": 3392,
+      "pruned_bytes": 2677
+    },
+    {
+      "skill": "debian",
+      "claims": 22,
+      "kept": 12,
+      "dropped": 10,
+      "errored": 0,
+      "orig_bytes": 2573,
+      "pruned_bytes": 1819
+    },
+    {
+      "skill": "bash",
+      "claims": 29,
+      "kept": 13,
+      "strengthened": 2,
+      "dropped": 15,
+      "errored": 1,
+      "orig_bytes": 2467,
+      "pruned_bytes": 2092
+    },
+    {
+      "skill": "makefile",
+      "claims": 23,
+      "kept": 10,
+      "dropped": 13,
+      "errored": 0,
+      "orig_bytes": 2029,
+      "pruned_bytes": 965
+    },
+    {
+      "skill": "c",
+      "claims": 44,
+      "kept": 20,
+      "strengthened": 2,
+      "dropped": 23,
+      "errored": 1,
+      "orig_bytes": 3808,
+      "pruned_bytes": 2432
+    },
+    {
+      "skill": "fedora",
+      "claims": 21,
+      "kept": 7,
+      "strengthened": 2,
+      "dropped": 14,
+      "errored": 0,
+      "orig_bytes": 2608,
+      "pruned_bytes": 2037
+    },
+    {
+      "skill": "go",
+      "claims": 53,
+      "kept": 27,
+      "strengthened": 4,
+      "dropped": 26,
+      "errored": 0,
+      "orig_bytes": 4164,
+      "pruned_bytes": 3784
+    },
+    {
+      "skill": "js",
+      "claims": 29,
+      "kept": 10,
+      "dropped": 18,
+      "errored": 1,
+      "orig_bytes": 2375,
+      "pruned_bytes": 1416
+    },
+    {
+      "skill": "java",
+      "claims": 17,
+      "kept": 5,
+      "strengthened": 2,
+      "dropped": 12,
+      "errored": 0,
+      "orig_bytes": 1191,
+      "pruned_bytes": 967
+    },
+    {
+      "skill": "ts",
+      "claims": 35,
+      "kept": 18,
+      "strengthened": 1,
+      "dropped": 17,
+      "errored": 0,
+      "orig_bytes": 3125,
+      "pruned_bytes": 2512
+    },
+    {
+      "skill": "justfile",
+      "claims": 23,
+      "kept": 16,
+      "strengthened": 3,
+      "dropped": 6,
+      "errored": 1,
+      "orig_bytes": 2669,
+      "pruned_bytes": 2653
+    },
+    {
+      "skill": "ubuntu",
+      "claims": 21,
+      "kept": 10,
+      "strengthened": 1,
+      "dropped": 11,
+      "errored": 0,
+      "orig_bytes": 2471,
+      "pruned_bytes": 2161
+    }
+  ],
+  "orig_bytes": 36768,
+  "pruned_bytes": 28253
+}

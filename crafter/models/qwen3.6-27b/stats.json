@@ -1,0 +1,143 @@
+{
+  "model": "qwen3.6-27b",
+  "skills": [
+    {
+      "skill": "debian",
+      "claims": 22,
+      "kept": 14,
+      "dropped": 8,
+      "errored": 0,
+      "orig_bytes": 2573,
+      "pruned_bytes": 1900
+    },
+    {
+      "skill": "java",
+      "claims": 17,
+      "kept": 5,
+      "dropped": 12,
+      "errored": 0,
+      "orig_bytes": 1191,
+      "pruned_bytes": 351
+    },
+    {
+      "skill": "ubuntu",
+      "claims": 21,
+      "kept": 6,
+      "dropped": 4,
+      "errored": 11,
+      "orig_bytes": 2471,
+      "pruned_bytes": 2192
+    },
+    {
+      "skill": "arch",
+      "claims": 19,
+      "kept": 14,
+      "strengthened": 3,
+      "dropped": 5,
+      "errored": 0,
+      "orig_bytes": 2068,
+      "pruned_bytes": 2509
+    },
+    {
+      "skill": "alpine",
+      "claims": 16,
+      "kept": 8,
+      "strengthened": 1,
+      "dropped": 8,
+      "errored": 0,
+      "orig_bytes": 1828,
+      "pruned_bytes": 1952
+    },
+    {
+      "skill": "bash",
+      "claims": 29,
+      "kept": 8,
+      "strengthened": 1,
+      "dropped": 20,
+      "errored": 1,
+      "orig_bytes": 2467,
+      "pruned_bytes": 1519
+    },
+    {
+      "skill": "base",
+      "claims": 28,
+      "kept": 14,
+      "strengthened": 1,
+      "dropped": 13,
+      "errored": 1,
+      "orig_bytes": 3392,
+      "pruned_bytes": 2828
+    },
+    {
+      "skill": "c",
+      "claims": 44,
+      "kept": 21,
+      "strengthened": 5,
+      "dropped": 22,
+      "errored": 1,
+      "orig_bytes": 3808,
+      "pruned_bytes": 3315
+    },
+    {
+      "skill": "fedora",
+      "claims": 21,
+      "kept": 8,
+      "strengthened": 2,
+      "dropped": 13,
+      "errored": 0,
+      "orig_bytes": 2608,
+      "pruned_bytes": 2505
+    },
+    {
+      "skill": "go",
+      "claims": 53,
+      "kept": 30,
+      "strengthened": 4,
+      "dropped": 22,
+      "errored": 1,
+      "orig_bytes": 4164,
+      "pruned_bytes": 4257
+    },
+    {
+      "skill": "js",
+      "claims": 29,
+      "kept": 14,
+      "strengthened": 1,
+      "dropped": 15,
+      "errored": 0,
+      "orig_bytes": 2375,
+      "pruned_bytes": 2038
+    },
+    {
+      "skill": "ts",
+      "claims": 35,
+      "kept": 15,
+      "dropped": 16,
+      "errored": 4,
+      "orig_bytes": 3125,
+      "pruned_bytes": 2368
+    },
+    {
+      "skill": "justfile",
+      "claims": 23,
+      "kept": 13,
+      "strengthened": 2,
+      "dropped": 9,
+      "errored": 1,
+      "orig_bytes": 2669,
+      "pruned_bytes": 2678
+    },
+    {
+      "skill": "makefile",
+      "claims": 23,
+      "kept": 6,
+      "strengthened": 1,
+      "dropped": 14,
+      "errored": 3,
+      "orig_bytes": 2029,
+      "pruned_bytes": 1167
+    }
+  ],
+  "orig_bytes": 36768,
+  "pruned_bytes": 31579
+}

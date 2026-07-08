@@ -78,13 +78,13 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
     <div class="mcard">
       <div class="mhead">
         <h3>gemma-4-31b</h3>
-        <span class="tag">9861 → 7234 bytes</span>
+        <span class="tag">36768 → 28253 bytes</span>
       </div>
       <div class="stats">
-        <div class="stat"><div class="num">-27%</div><div class="lbl">size change</div></div>
-        <div class="stat"><div class="num dim">39</div><div class="lbl">kept</div></div>
-        <div class="stat"><div class="num dim">45</div><div class="lbl">dropped</div></div>
-        <div class="stat"><div class="num dim">1</div><div class="lbl">errored</div></div>
+        <div class="stat"><div class="num">-23%</div><div class="lbl">size change</div></div>
+        <div class="stat"><div class="num dim">175</div><div class="lbl">kept</div></div>
+        <div class="stat"><div class="num dim">200</div><div class="lbl">dropped</div></div>
+        <div class="stat"><div class="num dim">5</div><div class="lbl">errored</div></div>
       </div>
       <table>
         <thead><tr><th>skill</th><th class="num">claims</th><th class="num">kept</th><th class="num">dropped</th><th class="num">errored</th><th class="num">bytes</th></tr></thead>
@@ -97,6 +97,26 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
           <tr><td><code>SKILL-base</code></td><td class="num">28</td><td class="num">10</td><td class="num">18</td><td class="num">0</td><td class="num">3392 → 2677</td></tr>
         
           <tr><td><code>SKILL-debian</code></td><td class="num">22</td><td class="num">12</td><td class="num">10</td><td class="num">0</td><td class="num">2573 → 1819</td></tr>
+        
+          <tr><td><code>SKILL-bash</code></td><td class="num">29</td><td class="num">13</td><td class="num">15</td><td class="num">1</td><td class="num">2467 → 2092</td></tr>
+        
+          <tr><td><code>SKILL-makefile</code></td><td class="num">23</td><td class="num">10</td><td class="num">13</td><td class="num">0</td><td class="num">2029 → 965</td></tr>
+        
+          <tr><td><code>SKILL-c</code></td><td class="num">44</td><td class="num">20</td><td class="num">23</td><td class="num">1</td><td class="num">3808 → 2432</td></tr>
+        
+          <tr><td><code>SKILL-fedora</code></td><td class="num">21</td><td class="num">7</td><td class="num">14</td><td class="num">0</td><td class="num">2608 → 2037</td></tr>
+        
+          <tr><td><code>SKILL-go</code></td><td class="num">53</td><td class="num">27</td><td class="num">26</td><td class="num">0</td><td class="num">4164 → 3784</td></tr>
+        
+          <tr><td><code>SKILL-js</code></td><td class="num">29</td><td class="num">10</td><td class="num">18</td><td class="num">1</td><td class="num">2375 → 1416</td></tr>
+        
+          <tr><td><code>SKILL-java</code></td><td class="num">17</td><td class="num">5</td><td class="num">12</td><td class="num">0</td><td class="num">1191 → 967</td></tr>
+        
+          <tr><td><code>SKILL-ts</code></td><td class="num">35</td><td class="num">18</td><td class="num">17</td><td class="num">0</td><td class="num">3125 → 2512</td></tr>
+        
+          <tr><td><code>SKILL-justfile</code></td><td class="num">23</td><td class="num">16</td><td class="num">6</td><td class="num">1</td><td class="num">2669 → 2653</td></tr>
+        
+          <tr><td><code>SKILL-ubuntu</code></td><td class="num">21</td><td class="num">10</td><td class="num">11</td><td class="num">0</td><td class="num">2471 → 2161</td></tr>
         
         </tbody>
       </table>
@@ -141,6 +161,98 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
         <div class="ex">
           <div class="claim"><span class="pill drop">DROP</span> Use apk add &lt;pkg&gt; to install without confirmation prompts.</div>
           <div class="reason">Both answers specify &#39;apk add curl&#39; as the installation command; A already satisfies the rubric without needing the instruction. <span class="cid">· alpine#3a366b37</span></div>
+        </div>
+        
+      </div>
+      
+    </div>
+    
+    <div class="mcard">
+      <div class="mhead">
+        <h3>qwen3.6-27b</h3>
+        <span class="tag">36768 → 31579 bytes</span>
+      </div>
+      <div class="stats">
+        <div class="stat"><div class="num">-14%</div><div class="lbl">size change</div></div>
+        <div class="stat"><div class="num dim">176</div><div class="lbl">kept</div></div>
+        <div class="stat"><div class="num dim">181</div><div class="lbl">dropped</div></div>
+        <div class="stat"><div class="num dim">23</div><div class="lbl">errored</div></div>
+      </div>
+      <table>
+        <thead><tr><th>skill</th><th class="num">claims</th><th class="num">kept</th><th class="num">dropped</th><th class="num">errored</th><th class="num">bytes</th></tr></thead>
+        <tbody>
+        
+          <tr><td><code>SKILL-debian</code></td><td class="num">22</td><td class="num">14</td><td class="num">8</td><td class="num">0</td><td class="num">2573 → 1900</td></tr>
+        
+          <tr><td><code>SKILL-java</code></td><td class="num">17</td><td class="num">5</td><td class="num">12</td><td class="num">0</td><td class="num">1191 → 351</td></tr>
+        
+          <tr><td><code>SKILL-ubuntu</code></td><td class="num">21</td><td class="num">6</td><td class="num">4</td><td class="num">11</td><td class="num">2471 → 2192</td></tr>
+        
+          <tr><td><code>SKILL-arch</code></td><td class="num">19</td><td class="num">14</td><td class="num">5</td><td class="num">0</td><td class="num">2068 → 2509</td></tr>
+        
+          <tr><td><code>SKILL-alpine</code></td><td class="num">16</td><td class="num">8</td><td class="num">8</td><td class="num">0</td><td class="num">1828 → 1952</td></tr>
+        
+          <tr><td><code>SKILL-bash</code></td><td class="num">29</td><td class="num">8</td><td class="num">20</td><td class="num">1</td><td class="num">2467 → 1519</td></tr>
+        
+          <tr><td><code>SKILL-base</code></td><td class="num">28</td><td class="num">14</td><td class="num">13</td><td class="num">1</td><td class="num">3392 → 2828</td></tr>
+        
+          <tr><td><code>SKILL-c</code></td><td class="num">44</td><td class="num">21</td><td class="num">22</td><td class="num">1</td><td class="num">3808 → 3315</td></tr>
+        
+          <tr><td><code>SKILL-fedora</code></td><td class="num">21</td><td class="num">8</td><td class="num">13</td><td class="num">0</td><td class="num">2608 → 2505</td></tr>
+        
+          <tr><td><code>SKILL-go</code></td><td class="num">53</td><td class="num">30</td><td class="num">22</td><td class="num">1</td><td class="num">4164 → 4257</td></tr>
+        
+          <tr><td><code>SKILL-js</code></td><td class="num">29</td><td class="num">14</td><td class="num">15</td><td class="num">0</td><td class="num">2375 → 2038</td></tr>
+        
+          <tr><td><code>SKILL-ts</code></td><td class="num">35</td><td class="num">15</td><td class="num">16</td><td class="num">4</td><td class="num">3125 → 2368</td></tr>
+        
+          <tr><td><code>SKILL-justfile</code></td><td class="num">23</td><td class="num">13</td><td class="num">9</td><td class="num">1</td><td class="num">2669 → 2678</td></tr>
+        
+          <tr><td><code>SKILL-makefile</code></td><td class="num">23</td><td class="num">6</td><td class="num">14</td><td class="num">3</td><td class="num">2029 → 1167</td></tr>
+        
+        </tbody>
+      </table>
+      
+      <div style="margin-top:22px;">
+        
+        <div class="ex">
+          <div class="claim"><span class="pill keep">KEEP</span> If a prebuilt glibc binary fails due to heavy dependencies, use the Alpine package or a static/musl build.</div>
+          <div class="reason">Answer A mentions musl/static only as something to request from maintainers (Step 6), not as an actionable fallback for the user, while Answer B explicitly presents obtaining/building a static or musl-linked version as a deliberate step in Step 6 when Alpine&#39;s native approach fails. <span class="cid">· alpine#03d19e29</span></div>
+        </div>
+        
+        <div class="ex">
+          <div class="claim"><span class="pill keep">KEEP</span> For upstream sites, search official docs first, then choose between an install script with the correct shell, dropping binaries to PATH directories, or adding a vendor repo for updates.</div>
+          <div class="reason">Answer A lists reviewing documentation as item 2 within Phase 1 rather than explicitly as step one, whereas Answer B correctly prioritizes it as Step 1 per the rubric&#39;s ordering requirement. <span class="cid">· alpine#1c127ae4</span></div>
+        </div>
+        
+        <div class="ex">
+          <div class="claim"><span class="pill keep">KEEP</span> Follow the installation order of apk first, then upstream site or custom repo, and finally language installers.</div>
+          <div class="reason">Answer A places custom upstream binaries after language runtimes, violating the required installation sequence, whereas Answer B explicitly follows the system-upstream-language priority order defined in the rubric. <span class="cid">· alpine#5b48cb33</span></div>
+        </div>
+        
+        <div class="ex">
+          <div class="claim"><span class="pill keep">KEEP</span> Use apk list -I to list all installed packages, using grep if the output is long.</div>
+          <div class="reason">Answer A uses `apk info nginx` and `apk list --installed` (both explicitly disallowed by the rubric), while Answer B correctly uses `apk list -I nginx` to filter for nginx and `apk list -I | wc -l` to count installed packages, showing the instruction produced the correct command pattern. <span class="cid">· alpine#5bc60965</span></div>
+        </div>
+        
+        <div class="ex">
+          <div class="claim"><span class="pill drop">DROP</span> Use apk info &lt;pkg&gt; to retrieve the version and description.</div>
+          <div class="reason">Answer A already recommends `apk info nginx` as the primary method to retrieve both version and description, satisfying the rubric without the instruction. <span class="cid">· alpine#1260d2a6</span></div>
+        </div>
+        
+        <div class="ex">
+          <div class="claim"><span class="pill drop">DROP</span> Read probes such as info or list -I do not require sudo privileges.</div>
+          <div class="reason">Both answers correctly use unprivileged commands without sudo prefixes, meeting the rubric&#39;s core requirement. <span class="cid">· alpine#15da7514</span></div>
+        </div>
+        
+        <div class="ex">
+          <div class="claim"><span class="pill drop">DROP</span> Use apk del &lt;pkg&gt; to uninstall packages.</div>
+          <div class="reason">Both answers use `apk del curl` as the uninstall command and provide sensible dependency-conflict fallbacks (`apk info --rdepends curl`, removing dependent packages first, and `--force`/`--force-depends`-style force removal), so A already satisfies the rubric without the instruction. <span class="cid">· alpine#19a373eb</span></div>
+        </div>
+        
+        <div class="ex">
+          <div class="claim"><span class="pill drop">DROP</span> Run apk update to refresh the index before searching or installing.</div>
+          <div class="reason">Answer A already includes `apk update` as a discrete step before `apk add`, satisfying the rubric without the instruction. <span class="cid">· alpine#37283ac9</span></div>
         </div>
         
       </div>
