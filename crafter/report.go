@@ -182,8 +182,9 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
 
   <section class="section">
     <h2 class="sec-title">Results by model</h2>
-    <p class="sec-sub">Pruned skill = original minus every dropped statement. Errored claims are kept
-      (untested, never removed).</p>
+    <p class="sec-sub">Pruned skill = original minus every dropped statement. <b>untested</b> = the probe
+      didn't complete (an endpoint outage or a judge hiccup mid-run, not a property of the model) — the
+      statement is kept conservatively and re-probed on the next run, so this count drains toward zero.</p>
 
     {{range .Models}}
     <div class="mcard">
@@ -195,10 +196,10 @@ footer{padding:50px 0;color:var(--text-faint);font-size:12px;border-top:1px soli
         <div class="stat"><div class="num">{{.SavedPct}}</div><div class="lbl">size change</div></div>
         <div class="stat"><div class="num dim">{{.KeptTotal}}</div><div class="lbl">kept</div></div>
         <div class="stat"><div class="num dim">{{.DropTotal}}</div><div class="lbl">dropped</div></div>
-        <div class="stat"><div class="num dim">{{.ErrTotal}}</div><div class="lbl">errored</div></div>
+        <div class="stat"><div class="num dim">{{.ErrTotal}}</div><div class="lbl">untested</div></div>
       </div>
       <table>
-        <thead><tr><th>skill</th><th class="num">claims</th><th class="num">kept</th><th class="num">dropped</th><th class="num">errored</th><th class="num">bytes</th></tr></thead>
+        <thead><tr><th>skill</th><th class="num">claims</th><th class="num">kept</th><th class="num">dropped</th><th class="num">untested</th><th class="num">bytes</th></tr></thead>
         <tbody>
         {{range .Stats.Skills}}
           <tr><td><code>SKILL-{{.Skill}}</code></td><td class="num">{{.Claims}}</td><td class="num">{{.Kept}}</td><td class="num">{{.Dropped}}</td><td class="num">{{.Errored}}</td><td class="num">{{.OrigBytes}} → {{.PrunedBytes}}</td></tr>
