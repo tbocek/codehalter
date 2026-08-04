@@ -892,23 +892,23 @@ func mcpSummary(s acpMCPServer) string {
 func mcpTOMLEntry(s acpMCPServer, commented bool) string {
 	var b strings.Builder
 	b.WriteString("[[server]]\n")
-	b.WriteString("name = " + strconv.Quote(s.Name) + "\n")
+	fmt.Fprintf(&b, "name = %q\n", s.Name)
 	if s.URL != "" {
-		b.WriteString("url = " + strconv.Quote(s.URL) + "\n")
+		fmt.Fprintf(&b, "url = %q\n", s.URL)
 		if t := tomlInlineTable(s.Headers); t != "" {
-			b.WriteString("headers = " + t + "\n")
+			fmt.Fprintf(&b, "headers = %s\n", t)
 		}
 	} else {
-		b.WriteString("command = " + strconv.Quote(s.Command) + "\n")
+		fmt.Fprintf(&b, "command = %q\n", s.Command)
 		if len(s.Args) > 0 {
 			quoted := make([]string, len(s.Args))
 			for i, arg := range s.Args {
 				quoted[i] = strconv.Quote(arg)
 			}
-			b.WriteString("args = [" + strings.Join(quoted, ", ") + "]\n")
+			fmt.Fprintf(&b, "args = [%s]\n", strings.Join(quoted, ", "))
 		}
 		if t := tomlInlineTable(s.Env); t != "" {
-			b.WriteString("env = " + t + "\n")
+			fmt.Fprintf(&b, "env = %s\n", t)
 		}
 	}
 	if !commented {
@@ -917,7 +917,7 @@ func mcpTOMLEntry(s acpMCPServer, commented bool) string {
 	var out strings.Builder
 	out.WriteString("\n# Offered by the editor, not enabled. Uncomment to use.\n")
 	for _, line := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
-		out.WriteString("# " + line + "\n")
+		fmt.Fprintf(&out, "# %s\n", line)
 	}
 	return out.String()
 }
