@@ -9,9 +9,9 @@ User=non-root `dev`, sudo NOPASSWD. Write ops (add/del/update) need sudo. Read p
 ## Search / install
 Order: 1) apk 2) upstream site / custom repo (below) 3) lang installer.
 - apk update → refresh index (cheap; do before search/install).
-- apk search <pkg> ; -e = exact.
+- apk search -e <pkg> → exact-name check; bare apk search <pkg> = substring. Output is `<name>-<ver>-r<N>`, NO space after name → `apk search go | grep "^go "` matches 0 lines, reads as unpackaged. Never grep to prove absence.
 - apk info <pkg> → version, deps, files.
 - apk add <pkg> → install (no --noconfirm; no prompts).
 - apk del <pkg> → uninstall.
 - Custom repo: key → /etc/apk/keys/, then echo "https://host/path" >> /etc/apk/repositories && apk update.
-- 4th choice edge (rolling — distinct from the stable community repo, which is already enabled), when stable's version is too old. One-shot pull, does NOT enable edge system-wide: apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community/ <pkg>
+- 4th choice edge (rolling — distinct from the stable community repo, which is already enabled), when stable's version is too old. Prove it: apk search -e <pkg> on stable, quote both versions. Same version in stable = no reason for edge (edge deps in a stable image = rebuild risk). One-shot pull, does NOT enable edge system-wide: apk add --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community/ <pkg>

@@ -22,6 +22,7 @@ Pkg-mgr cmd depends base image → check SKILL-<os>.md (alpine/arch/debian/fedor
 
 ## Install order (any missing tool, incl. lang-ecosystem: gopls, ruff, prettier…)
 - Order: 1) distro pkg mgr 2) upstream website 3) language installer 4) community repos (AUR, COPR, PPA, backports). Fall to the next option only when the previous has no (or too old a) package.
+- "Not in repos" = claim, not fact. Prove with the pkg mgr exact-name query (SKILL-<os>.md). Never grep search output: listings print `name-version`, so `grep "^name "` matches 0 lines = false absence. Same for "too old": quote the version the repo actually offers.
 - Upstream website: web_search the official install docs, then either:
   - install script: `curl -fsSL https://…/install.sh | sh` (use the shell the docs name — sh vs bash matters on minimal images);
   - prebuilt release binary / tarball → drop into ~/.local/bin (already on PATH) or /usr/local/bin;
