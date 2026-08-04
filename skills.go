@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -59,6 +60,17 @@ var skillFedora string
 //go:embed res/SKILL-ubuntu.md
 var skillUbuntu string
 
+// skillVariantsFS carries the per-model pruned skill sets produced by the
+// skill crafter (crafter/): res/skills/<variant>/SKILL-*.md, one directory per
+// profiled model, each skill reduced to the statements that model measurably
+// needs. ALL variants are seeded to .codehalter/skills/ (ensureSkills) so a
+// user can switch models with a settings edit and the matching set is already
+// on disk; loading prefers the active variant's file per skill name and falls
+// back to the generic .codehalter/SKILL-*.md (see skillPath).
+//
+//go:embed all:res/skills
+var skillVariantsFS embed.FS
+
 // defaultSkills maps a per-stack key (language stack from detectStacks)
 // to the embedded skill body. The container / per-OS / per-runner skills
 // live in their own seed paths inside ensureSkills, not here, because
@@ -106,11 +118,15 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			return nil // already seeded (or stat failed otherwise) — leave it
 		}
+		// Variant seeds live in nested skills/<variant>/ dirs.
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return fmt.Errorf("seeding %s: %w", path, err)
+		}
 		// Atomic publish (temp + rename): a concurrent reader (loadSkills) never sees
 		// a half-written seed, and two same-cwd sessions seeding at once just overwrite
 		// with identical bytes instead of racing a partial file. The ".seed-*" temp
 		// name can't match the "SKILL-*.md" load glob.
-		f, err := os.CreateTemp(dir, ".seed-*")
+		f, err := os.CreateTemp(filepath.Dir(path), ".seed-*")
 		if err != nil {
 			return fmt.Errorf("seeding %s: %w", path, err)
 		}
@@ -162,6 +178,30 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 			return err
 		}
 	}
+	// Per-model skill variants: seed EVERY shipped variant wholesale into
+	// .codehalter/skills/<variant>/ — the user may switch models (settings
+	// skill_variant), so all sets must be on disk, not just the active one.
+	// Which files actually LOAD is decided per turn by the generic dir's set
+	// plus skillPath's variant preference; unseleted variants and any stale
+	// other-OS files inside a variant dir are inert bytes. Same seed-once
+	// semantics: a user-edited variant file is left alone.
+	if err := fs.WalkDir(skillVariantsFS, "res/skills", func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel, err := filepath.Rel("res/skills", p)
+		if err != nil {
+			return err
+		}
+		body, err := skillVariantsFS.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return seed(filepath.Join("skills", rel), string(body))
+	}); err != nil {
+		return fmt.Errorf("seeding skill variants: %w", err)
+	}
+
 	// Per-OS skill: prune the other-OS copies, then seed the active one
 	// (rendered with this container's /etc/os-release values).
 	if osi.ID != "" {
@@ -221,10 +261,27 @@ func expandCmdPlaceholders(body string) string {
 	})
 }
 
-// readSkillBody returns the body of one .codehalter/SKILL-*.md, or "" if absent.
-// Used to inject a mid-session-seeded skill as a user message (see checkEnv).
-func readSkillBody(cwd, name string) string {
-	data, err := os.ReadFile(filepath.Join(cwd, ".codehalter", name))
+// skillPath resolves which file backs one skill NAME for the active variant:
+// .codehalter/skills/<variant>/<name> when a variant is set and has that file,
+// else the generic .codehalter/<name>. Per-file fallback, so a variant missing
+// one skill (e.g. crafter hasn't probed it yet) degrades to the generic copy
+// of just that skill. WHAT loads (the set of names) is always decided by the
+// generic dir — see skillFiles — the variant only substitutes bodies.
+func skillPath(cwd, variant, name string) string {
+	if variant != "" {
+		p := filepath.Join(cwd, ".codehalter", "skills", variant, name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return filepath.Join(cwd, ".codehalter", name)
+}
+
+// readSkillBody returns the body of one skill (variant-resolved), or "" if
+// absent. Used to inject a mid-session-seeded skill as a user message (see
+// checkEnv) and by skills="auto" disclosure.
+func readSkillBody(cwd, variant, name string) string {
+	data, err := os.ReadFile(skillPath(cwd, variant, name))
 	if err != nil {
 		return ""
 	}
@@ -258,15 +315,15 @@ func skillFiles(cwd string) []string {
 // removed mid-session takes effect on the next turn while an unchanged set
 // keeps the cache prefix stable. skip (nil = keep all) excludes individual
 // files — skills="auto" passes deferredSkillSkip to withhold untouched
-// language skills from the prefix.
-func loadSkills(cwd string, skip func(name string) bool) string {
-	dir := filepath.Join(cwd, ".codehalter")
+// language skills from the prefix. variant ("" = generic) substitutes each
+// skill's body with the per-model pruned copy when one exists (skillPath).
+func loadSkills(cwd, variant string, skip func(name string) bool) string {
 	var b strings.Builder
 	for _, n := range skillFiles(cwd) {
 		if skip != nil && skip(n) {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, n))
+		data, err := os.ReadFile(skillPath(cwd, variant, n))
 		if err != nil {
 			continue
 		}
@@ -467,7 +524,7 @@ func (a *agent) discloseSkills(sid string, calls []toolCall) []string {
 		if !hit {
 			continue
 		}
-		body := readSkillBody(sess.Cwd, d.name)
+		body := readSkillBody(sess.Cwd, a.skillVariant(), d.name)
 		if body == "" {
 			continue // not seeded in this project (yet) — check again next batch
 		}

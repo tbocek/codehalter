@@ -68,10 +68,19 @@ type LLMConnection struct {
 	// "https://gw.example/myllm". codehalter appends the API paths itself
 	// (see endpoint): /v1/chat/completions for completions, /v1/models and the
 	// root-level /props for probing. Do NOT put /v1/chat/completions here.
-	Server         string         `toml:"server"`
-	APIKey         string         `toml:"api_key,omitempty"`
-	Model          string         `toml:"model"`
-	Tag            string         `toml:"tag,omitempty"`
+	Server string `toml:"server"`
+	APIKey string `toml:"api_key,omitempty"`
+	Model  string `toml:"model"`
+	Tag    string `toml:"tag,omitempty"`
+	// SkillVariant selects a per-model pruned skill set for this model:
+	// .codehalter/skills/<variant>/SKILL-*.md is preferred over the generic
+	// .codehalter/SKILL-*.md, falling back per file. Variants are produced by
+	// the skill crafter (crafter/) — a measured subset of each skill containing
+	// only the statements THIS model actually needs — and every shipped variant
+	// is seeded to .codehalter/skills/ so switching models is a settings edit
+	// away. Empty = generic skills. Only LLM[0]'s variant is used (the
+	// foreground session runs there).
+	SkillVariant   string         `toml:"skill_variant,omitempty"`
 	Parallel       *int           `toml:"parallel,omitempty"`
 	Params         map[string]any `toml:"params,omitempty"`
 	ParamsThinking map[string]any `toml:"params_thinking,omitempty"`
@@ -257,6 +266,20 @@ func (a *agent) skillsAuto() bool {
 	// "auto" is the default: "" and unknown values (warned at load) land here
 	// too; only an explicit "inline" opts out of first-touch deferral.
 	return a.settings.Skills != "inline"
+}
+
+// skillVariant returns LLM[0]'s per-model skill variant ("" = generic). The
+// foreground session runs on LLM[0], so its model decides which pruned skill
+// set the prompt loads. Note: settings hot-reload each turn, so changing the
+// variant mid-session re-renders the system prompt and busts the prefix cache
+// once — same cost as editing a skill file.
+func (a *agent) skillVariant() string {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	if len(a.settings.LLM) == 0 {
+		return ""
+	}
+	return a.settings.LLM[0].SkillVariant
 }
 
 // MainLLM returns the foreground connection (LLM[0]) with role-resolved

@@ -1156,7 +1156,7 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	var b strings.Builder
 	// skills="auto" withholds untouched language skills from the prefix; the
 	// skip closure is nil in inline mode, which loads everything.
-	if skills := loadSkills(sess.Cwd, a.deferredSkillSkip(sess)); skills != "" {
+	if skills := loadSkills(sess.Cwd, a.skillVariant(), a.deferredSkillSkip(sess)); skills != "" {
 		b.WriteString(skills)
 	}
 	fmt.Fprintf(&b, "Project directory: %s\n", sess.Cwd)
