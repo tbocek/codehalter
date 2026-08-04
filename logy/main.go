@@ -9,7 +9,7 @@
 // diff can therefore be smaller than the tokens the server had to re-evaluate.
 //
 // Usage: logy <session_*.log>            (markdown to stdout)
-//        go run ./logy .codehalter/session_xxx.log > session.md
+// e.g.   go run ./logy .codehalter/session_xxx.log > session.md
 package main
 
 import (

@@ -26,21 +26,24 @@ import (
 // them at runtime, so a file bought no editability, only a jump between the
 // format string and the fmt.Sprintf that has to match its verbs.
 const (
-	cardInstallTools = "Missing dev tools in this %s devcontainer: %s.\n" +
+	// cardSetupHeader opens the combined setup card; every cardSetup* line below
+	// is appended to it as one bullet. Split this way so that N problems produce
+	// ONE prompt carrying one PLAN ONLY directive, instead of N prompts that each
+	// repeat it and each cost a full plan/execute/document cycle. They are one job
+	// anyway: the pkg-mgr command that installs the missing tools is the same one
+	// that provides the language server the wiring bullet then points at.
+	cardSetupHeader = "Container setup needed in this %s devcontainer.\n" +
 		"\n" +
-		"PLAN ONLY → execute-phase steps: install each w/ right pkg mgr, verify runs, PERSIST in `.devcontainer/Dockerfile`. Follow SKILL-base.md (install/persist loop) + matching language SKILL for which mgr.\n"
+		"PLAN ONLY → produce execute-phase steps covering every item below, then PERSIST every install in `.devcontainer/Dockerfile`. Follow SKILL-base.md (install order + install/persist loop) and the matching language SKILL for which pkg mgr.\n" +
+		"\n"
 
-	cardSetupGopls = "Go project has no code-intelligence MCP (gopls) wired — without it the model navigates with search_text/read_file instead of go_definition/go_references.\n" +
-		"\n" +
-		"PLAN ONLY → execute-phase steps: wire gopls as an MCP server per SKILL-go.md (\"gopls as MCP server\"); if gopls isn't installed, install it first (also per SKILL-go.md). Persist any install in `.devcontainer/Dockerfile`.\n"
+	cardInstallTools = "- Missing dev tools: %s. Install each, verify each runs.\n"
 
-	cardSetupLsmcp = "TS/JS project has no code-intelligence MCP (lsmcp = gopls analog for JS/TS) configured.\n" +
-		"\n" +
-		"PLAN ONLY → execute-phase steps: set up per SKILL-ts.md, persist installs in `.devcontainer/Dockerfile`.\n"
+	cardSetupGopls = "- No code-intelligence MCP (gopls) wired, so the model navigates with search_text/read_file instead of go_definition/go_references. Install gopls if it's missing, then wire it per SKILL-go.md (\"gopls as MCP server\").\n"
 
-	cardSetupClangd = "C/C++ project has no code-intelligence MCP (clangd = gopls analog for C/C++) configured.\n" +
-		"\n" +
-		"PLAN ONLY → execute-phase steps: set up per SKILL-c.md, persist installs in `.devcontainer/Dockerfile`.\n"
+	cardSetupLsmcp = "- No code-intelligence MCP (lsmcp = gopls analog for JS/TS) configured. Set it up per SKILL-ts.md.\n"
+
+	cardSetupClangd = "- No code-intelligence MCP (clangd = gopls analog for C/C++) configured. Set it up per SKILL-c.md.\n"
 
 	cardMCPParseError = "MCP config `.codehalter/mcp.toml` failed to parse: %s.\n" +
 		"\n" +
@@ -788,51 +791,55 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 		}
 	}
 
-	var problems []fixProblem
-	if detail.Len() > 0 {
-		// Embed the OS we already detected so the LLM doesn't waste a tool
-		// call rediscovering it. The bootstrap step (ensureDevcontainer) only
-		// scaffolds containers based on one of the five supported distros, so
-		// osi.ID is a non-empty supported value by the time prepare runs.
-		distro := osi.Fields["PRETTY_NAME"]
-		if distro == "" {
-			distro = strings.ToUpper(osi.ID[:1]) + osi.ID[1:]
-		}
-		problems = append(problems, fixProblem{
-			desc:   fmt.Sprintf("🟡 Missing dev tools: %s", detail.String()),
-			prompt: fmt.Sprintf(cardInstallTools, distro, detail.String()),
-		})
+	// Everything below folds into ONE card, one accepted turn. Each `want` adds a
+	// short phrase to the card title and a bullet to the single prompt.
+	var titles, steps []string
+	want := func(title, step string) {
+		titles = append(titles, title)
+		steps = append(steps, step)
 	}
-	// Go code-intelligence MCP (gopls). Offered whenever a Go project has no gopls
-	// [[server]] in mcp.toml, installed or not: cardSetupGopls installs it first
-	// when missing, then wires it, all in one turn. mcpMentionsServer (not
-	// mcpServerConfigured): a commented-out entry counts as "already offered and
-	// declined", so we don't nag — which is also why the seed mcp.toml ships no
-	// gopls example. The lsmcp/clangd cards below mirror this for JS/TS and C.
+	if detail.Len() > 0 {
+		want("install "+detail.String(), fmt.Sprintf(cardInstallTools, detail.String()))
+	}
+	// Go code-intelligence MCP (gopls). Wanted whenever a Go project has no gopls
+	// [[server]] in mcp.toml, installed or not: the bullet installs it first when
+	// missing, then wires it. mcpMentionsServer (not mcpServerConfigured): a
+	// commented-out entry counts as "already offered and declined", so we don't
+	// nag — which is also why the seed mcp.toml ships no gopls example. The
+	// lsmcp/clangd bullets below mirror this for JS/TS and C.
 	if slices.Contains(stacks, "go") && !mcpMentionsServer(sess.Cwd, "gopls") {
-		problems = append(problems, fixProblem{
-			desc:   "🟡 Go code intelligence (gopls MCP) not set up",
-			prompt: cardSetupGopls,
-		})
+		want("set up gopls (Go code intelligence)", cardSetupGopls)
 	}
 	// JS/TS code-intelligence MCP (lsmcp), the gopls analog for JS/TS. Offer setup
 	// when a TS/JS project hasn't wired it. (Uses mcpServerConfigured, so it
 	// re-offers until wired, unlike gopls which respects a commented-out decline.)
 	if (slices.Contains(stacks, "ts") || slices.Contains(stacks, "js")) && !mcpServerConfigured(sess.Cwd, "lsmcp") {
-		problems = append(problems, fixProblem{
-			desc:   "🟡 JS/TS code intelligence (lsmcp MCP) not set up",
-			prompt: cardSetupLsmcp,
-		})
+		want("set up lsmcp (JS/TS code intelligence)", cardSetupLsmcp)
 	}
 	// C/C++ code-intelligence MCP (clangd), the gopls analog for C. Same shape as
-	// the lsmcp card above.
+	// the lsmcp bullet above.
 	if slices.Contains(stacks, "c") && !mcpServerConfigured(sess.Cwd, "clangd") {
-		problems = append(problems, fixProblem{
-			desc:   "🟡 C/C++ code intelligence (clangd MCP) not set up",
-			prompt: cardSetupClangd,
-		})
+		want("set up clangd (C/C++ code intelligence)", cardSetupClangd)
 	}
-	return changed, problems
+	if len(steps) == 0 {
+		return changed, nil
+	}
+	// Embed the OS we already detected so the LLM doesn't waste a tool call
+	// rediscovering it. The bootstrap step (ensureDevcontainer) only scaffolds
+	// containers based on one of the five supported distros, so osi.ID normally
+	// has a supported value here; the plain "Linux" fallback is for a container
+	// the user built themselves with no usable /etc/os-release.
+	distro := osi.Fields["PRETTY_NAME"]
+	if distro == "" && osi.ID != "" {
+		distro = strings.ToUpper(osi.ID[:1]) + osi.ID[1:]
+	}
+	if distro == "" {
+		distro = "Linux"
+	}
+	return changed, []fixProblem{{
+		desc:   "🟡 Container setup: " + strings.Join(titles, "; "),
+		prompt: fmt.Sprintf(cardSetupHeader, distro) + strings.Join(steps, ""),
+	}}
 }
 
 // ---------------------------------------------------------------------------

@@ -63,16 +63,15 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	}
 }
 
-// TestCheckEnvAsksAboutGoplsOnce pins the one-card rule for a stack's language
-// server: a Go project with gopls missing and no gopls in mcp.toml gets ONE card,
-// the code-intelligence one, whose prompt installs first then wires. The install
-// card must never also own gopls — when both did, the setup card's
-// gopls-is-present gate forced them into consecutive turns, which is how the
-// user got asked about gopls twice. Declining (a commented-out entry) silences
-// it entirely, exactly as it does for lsmcp and clangd.
-func TestCheckEnvAsksAboutGoplsOnce(t *testing.T) {
+// TestCheckEnvSetupIsOneCard pins the one-card, one-turn rule. Every accepted
+// card dispatches a full plan/execute/document cycle (~14 LLM calls), so a Go
+// project needing both a toolchain install and gopls wiring must produce a
+// SINGLE fixProblem carrying both bullets, not one card per problem. Declining
+// gopls (a commented-out entry) drops just that bullet.
+func TestCheckEnvSetupIsOneCard(t *testing.T) {
 	a, s := newTestAgent(t)
-	// Empty PATH so gopls is missing regardless of the developer's machine.
+	// Empty PATH so every probed binary reads as missing regardless of the
+	// developer's machine.
 	t.Setenv("PATH", "")
 	if err := os.WriteFile(filepath.Join(s.Cwd, "go.mod"), []byte("module x\n\ngo 1.24\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -82,43 +81,36 @@ func TestCheckEnvAsksAboutGoplsOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	descs := func() []string {
-		_, problems := a.checkEnv(s, s.ID)
-		var out []string
-		for _, p := range problems {
-			out = append(out, p.desc)
-		}
-		return out
+	// go.mod makes `go` a missing runner AND makes gopls wiring wanted: two
+	// problems, one card, and the prompt has to carry both.
+	_, problems := a.checkEnv(s, s.ID)
+	if len(problems) != 1 {
+		t.Fatalf("setup must be one card (one turn), got %d: %+v", len(problems), problems)
 	}
-	countMentioning := func(all []string, word string) int {
-		n := 0
-		for _, d := range all {
-			if strings.Contains(d, word) {
-				n++
-			}
-		}
-		return n
+	if !strings.Contains(problems[0].prompt, "Missing dev tools:") {
+		t.Errorf("prompt lost the install bullet: %q", problems[0].prompt)
 	}
-
-	// No mcp.toml at all: exactly one card may mention gopls, and it must be the
-	// code-intelligence one, whose prompt covers install + wiring. The install
-	// card owning gopls here is the two-turn nag this test exists to prevent.
-	all := descs()
-	if got := countMentioning(all, "gopls"); got != 1 {
-		t.Errorf("gopls asked about %d times, want 1: %v", got, all)
+	if !strings.Contains(problems[0].prompt, "gopls") {
+		t.Errorf("prompt lost the gopls bullet: %q", problems[0].prompt)
 	}
-	if got := countMentioning(all, "Go code intelligence"); got != 1 {
-		t.Errorf("the single gopls card must be the code-intelligence one: %v", all)
+	// One PLAN ONLY directive, not one per bullet — that repetition was the sign
+	// of prompts being concatenated rather than merged.
+	if n := strings.Count(problems[0].prompt, "PLAN ONLY"); n != 1 {
+		t.Errorf("want exactly 1 PLAN ONLY directive, got %d: %q", n, problems[0].prompt)
 	}
 
-	// Declined (commented out) → gopls goes quiet, it does not resurface via the
-	// install card. Same contract as lsmcp/clangd: a decline is final.
+	// Declined (commented out) → the gopls bullet goes away, the install bullet
+	// stays, and gopls does not resurface as a "missing dev tool" either.
 	mcp := "# [[server]]\n# name = \"gopls\"\n# command = \"gopls\"\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, "mcp.toml"), []byte(mcp), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if all = descs(); countMentioning(all, "gopls") != 0 {
-		t.Errorf("a commented-out gopls should silence every gopls card: %v", all)
+	_, problems = a.checkEnv(s, s.ID)
+	if len(problems) != 1 {
+		t.Fatalf("still one card after declining gopls, got %d: %+v", len(problems), problems)
+	}
+	if strings.Contains(problems[0].prompt, "gopls") {
+		t.Errorf("a commented-out gopls should silence every gopls mention: %q", problems[0].prompt)
 	}
 }
 
