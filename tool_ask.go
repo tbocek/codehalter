@@ -23,29 +23,33 @@ func (a *agent) shouldAutoAnswer(sid string) (bool, string) {
 	return false, ""
 }
 
-// askYesNoAuto asks the user in interactive mode; in autopilot mode or from a
-// subagent it returns yes immediately and sends a chat note so the user sees
-// what was auto-answered. Callers are still responsible for completing the
-// tool call they opened (typically via CompleteToolCall with a short note).
-func (a *agent) askYesNoAuto(ctx context.Context, sid string, tcId, yesLabel, noLabel string) (bool, error) {
-	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[" + reason + "] " + yesLabel + "\n\n"}})
-		return true, nil
-	}
-	return a.conn.AskYesNo(ctx, sid, tcId, yesLabel, noLabel)
-}
-
 // askChoiceAuto asks the user in interactive mode; in autopilot or from a
 // subagent it returns choices[0] (or "abort" if empty).
-func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId string, choices []string) (string, error) {
+func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId, question string, choices []string) (string, error) {
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
 		if len(choices) == 0 {
 			return "abort", nil
 		}
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[" + reason + "] " + choices[0] + "\n\n"}})
+		a.say(ctx, sid, "["+reason+"] "+choices[0]+"\n\n")
 		return choices[0], nil
 	}
-	return a.conn.AskChoice(ctx, sid, tcId, choices)
+	return a.conn.AskChoice(ctx, sid, tcId, question, choices)
+}
+
+// askFormAuto is askChoiceAuto for the options-plus-free-text form. Under
+// autopilot or in a subagent nobody is there to type, so a free-text-only ask
+// has no answer to give: it returns "" and the caller tells the model to decide
+// for itself rather than inventing a reply on the user's behalf.
+func (a *agent) askFormAuto(ctx context.Context, sid string, tcId, question string, options []string, allowText bool) (string, error) {
+	if auto, reason := a.shouldAutoAnswer(sid); auto {
+		answer, note := "", "no answer available"
+		if len(options) > 0 {
+			answer, note = options[0], options[0]
+		}
+		a.say(ctx, sid, "["+reason+"] "+note+"\n\n")
+		return answer, nil
+	}
+	return a.conn.AskForm(ctx, sid, tcId, question, options, allowText)
 }
 
 // askChoiceWithCard opens a tool card AND asks for permission in a single
@@ -63,7 +67,7 @@ func (a *agent) askChoiceWithCard(ctx context.Context, sid, title, kind string, 
 		if len(choices) == 0 {
 			return "abort", tcId, nil
 		}
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[" + reason + "] " + choices[0] + "\n\n"}})
+		a.say(ctx, sid, "["+reason+"] "+choices[0]+"\n\n")
 		return choices[0], tcId, nil
 	}
 	choice, err := a.conn.AskChoiceWithCard(ctx, sid, tcId, title, kind, choices)
@@ -74,7 +78,7 @@ func (a *agent) askChoiceWithCard(ctx context.Context, sid, title, kind string, 
 func (a *agent) askYesNoWithCard(ctx context.Context, sid, title, kind, yesLabel, noLabel string) (bool, string, error) {
 	tcId := a.StartToolCall(ctx, sid, title, kind, nil)
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[" + reason + "] " + yesLabel + "\n\n"}})
+		a.say(ctx, sid, "["+reason+"] "+yesLabel+"\n\n")
 		return true, tcId, nil
 	}
 	ok, err := a.conn.AskYesNoWithCard(ctx, sid, tcId, title, kind, yesLabel, noLabel)
@@ -90,11 +94,24 @@ func (a *agent) askYesNoWithCard(ctx context.Context, sid, title, kind, yesLabel
 func (a *agent) askAcknowledgeWithCard(ctx context.Context, sid, title, kind, label string) (string, error) {
 	tcId := a.StartToolCall(ctx, sid, title, kind, nil)
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[" + reason + "] " + label + "\n\n"}})
+		a.say(ctx, sid, "["+reason+"] "+label+"\n\n")
 		return tcId, nil
 	}
 	err := a.conn.AskAcknowledgeWithCard(ctx, sid, tcId, title, kind, label)
 	return tcId, err
+}
+
+// isApplySkipAsk reports whether an ask_user call is one of /improve's
+// per-change prompts, which is what improveAskCap counts. Matching on the
+// labels is what keeps the final "submit?" prompt exempt.
+func isApplySkipAsk(options []string) bool {
+	for _, o := range options {
+		o = strings.ToLower(o)
+		if strings.Contains(o, "apply") || strings.Contains(o, "skip") {
+			return true
+		}
+	}
+	return false
 }
 
 func init() {
@@ -102,44 +119,72 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "ask_user",
-			"description": "Ask the user a yes/no question",
+			"description": "Ask the user a question. Pass `options` for a pick-one list, set `allow_text` for a typed answer, or both (the options plus an \"or type your own\" box). With neither, the user gets a plain text box.",
 			"parameters": map[string]any{
 				"type":     "object",
-				"required": []string{"question", "yes_label", "no_label"},
+				"required": []string{"question"},
 				"properties": map[string]any{
-					"question":  map[string]any{"type": "string", "description": "The question to display"},
-					"yes_label": map[string]any{"type": "string", "description": "Label for the yes button"},
-					"no_label":  map[string]any{"type": "string", "description": "Label for the no button"},
+					"question":   map[string]any{"type": "string", "description": "The question to display"},
+					"options":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Answers to offer as buttons. Each string is both the label and the answer you get back. Two options ([\"Yes\", \"No\"]) is a yes/no question."},
+					"allow_text": map[string]any{"type": "boolean", "description": "Let the user type their own answer instead of picking an option."},
 				},
 			},
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-		args := parseArgs(rawArgs)
-		question, yesLabel, noLabel := args["question"], args["yes_label"], args["no_label"]
+		var args struct {
+			Question  string   `json:"question"`
+			Options   []string `json:"options"`
+			AllowText bool     `json:"allow_text"`
+			// Models trained on the older yes/no shape still emit these. Accept
+			// them as a two-option list rather than dropping the question; not
+			// advertised in the schema, since new calls should use `options`.
+			YesLabel string `json:"yes_label"`
+			NoLabel  string `json:"no_label"`
+		}
+		if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
+			return "error: invalid JSON: " + err.Error(), false
+		}
+		if args.Question == "" {
+			return "error: question is required", false
+		}
+		options := args.Options
+		if len(options) == 0 && args.YesLabel != "" && args.NoLabel != "" {
+			options = []string{args.YesLabel, args.NoLabel}
+		}
+		// Nothing to pick means a typed answer is the only one possible.
+		allowText := args.AllowText || len(options) == 0
+
 		// /improve fans out one ask per proposed change; hold the flow to the top
 		// improveAskCap in code so a chatty model can't loop through dozens. Only
 		// the Apply/Skip improvement prompts count — the final Yes/No submit
 		// prompt is exempt (different labels).
-		if strings.Contains(strings.ToLower(yesLabel), "apply") || strings.Contains(strings.ToLower(noLabel), "skip") {
+		if isApplySkipAsk(options) {
 			if sess := a.getSession(sid); sess != nil && sess.improveAskBlocked() {
 				return fmt.Sprintf("[improve cap: you have already presented the top %d improvements (the maximum). Do NOT call ask_user for more improvements. Apply or skip what is shown, then go straight to the submit and verify steps.]", improveAskCap), false
 			}
 		}
-		tcId := a.StartToolCall(ctx, sid, question, "think", nil)
-		ok, err := a.askYesNoAuto(ctx, sid, tcId, yesLabel, noLabel)
-		if err != nil {
+
+		tcId := a.StartToolCall(ctx, sid, args.Question, "think", nil)
+		answer, err := a.askFormAuto(ctx, sid, tcId, args.Question, options, allowText)
+		switch {
+		case errors.Is(err, errNoFreeText):
+			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("This editor has no free-text prompt")})
+			return "error: this editor cannot show a free-text prompt — ask again with `options`", false
+		case errors.Is(err, errPermissionCancelled):
+			// Far likelier with a text box than with two buttons, and not a tool
+			// failure: the user just closed the form.
+			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("No answer")})
+			return "user dismissed the question without answering", false
+		case err != nil:
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error: " + err.Error(), false
 		}
-		chosen := noLabel
-		if ok {
-			chosen = yesLabel
+		if answer == "" || answer == "abort" {
+			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("No answer")})
+			return "no answer given — use your own judgement and continue", false
 		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + chosen)})
-		if ok {
-			return "user said yes", false
-		}
-		return "user said no", false
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User answered: " + answer)})
+		return "user answered: " + answer, false
 	}})
 }
 
@@ -169,6 +214,13 @@ type permissionRequest struct {
 	SessionId string             `json:"sessionId"`
 	ToolCall  permissionToolCall `json:"toolCall"`
 	Options   []permissionOption `json:"options"`
+
+	// Message is the question in prose. It is NOT sent as part of
+	// session/request_permission (whose wire shape has no such field, and a
+	// strict client rejects unknown properties) — it exists because
+	// elicitation/create requires a human-readable message, and only the call
+	// site knows it. The permission path carries the same text as the card title.
+	Message string `json:"-"`
 }
 
 type permissionResponse struct {
@@ -208,6 +260,14 @@ func (a *AgentSideConnection) doPermissionRequest(ctx context.Context, r permiss
 			sess.addHumanWait(time.Since(start))
 		}
 	}()
+	// session/request_permission means "may I do this dangerous thing"; every
+	// caller here is really asking the user a question, which is what
+	// elicitation is for. Prefer it when the client has one, and keep the
+	// permission dialog as the fallback for clients that don't (which is every
+	// client that predates the feature).
+	if a.agent.clientCan("elicitation") {
+		return a.doElicitation(ctx, r)
+	}
 	var raw json.RawMessage
 	var err error
 	for attempt := 0; attempt <= len(unknownSessionBackoffs); attempt++ {
@@ -237,40 +297,185 @@ func (a *AgentSideConnection) doPermissionRequest(ctx context.Context, r permiss
 	return resp.Outcome.OptionId, nil
 }
 
-func (a *AgentSideConnection) requestPermission(ctx context.Context, sid string, toolCallId string, options []permissionOption) (string, error) {
+// elicitChoiceKey is the single form field codehalter asks for. The name is
+// arbitrary but must match between the requested schema and the lookup in the
+// response content.
+const elicitChoiceKey = "choice"
+
+// doElicitation asks the same question as doPermissionRequest, as an
+// elicitation/create form with one single-select enum. The option ids become
+// the enum values and the labels become oneOf titles, so the answer maps back
+// to exactly the optionId the permission path would have returned and every
+// caller is unchanged.
+func (a *AgentSideConnection) doElicitation(ctx context.Context, r permissionRequest) (string, error) {
+	values := make([]map[string]any, 0, len(r.Options))
+	for _, o := range r.Options {
+		values = append(values, map[string]any{"const": o.OptionId, "title": o.Name})
+	}
+	message := r.Message
+	if message == "" {
+		message = r.ToolCall.Title
+	}
+	req := map[string]any{
+		"sessionId": r.SessionId,
+		"mode":      "form",
+		"message":   message,
+		"requestedSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				elicitChoiceKey: map[string]any{"type": "string", "oneOf": values},
+			},
+			"required": []string{elicitChoiceKey},
+		},
+	}
+	if r.ToolCall.ToolCallId != "" {
+		req["toolCallId"] = r.ToolCall.ToolCallId
+	}
+	raw, err := a.sendRequest(ctx, "elicitation/create", req)
+	if err != nil {
+		return "", err
+	}
+	var resp struct {
+		Action  string            `json:"action"`
+		Content map[string]string `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", err
+	}
+	switch resp.Action {
+	case "accept":
+		if choice, ok := resp.Content[elicitChoiceKey]; ok {
+			return choice, nil
+		}
+		// Accepted with nothing in it. Treat as a dismissal rather than silently
+		// returning "" and letting the caller read it as some unnamed option.
+		return "", errPermissionCancelled
+	case "decline":
+		// An explicit "no". The last option is the reject one by construction in
+		// every Ask* builder below, so that is the answer the caller expects.
+		if n := len(r.Options); n > 0 {
+			return r.Options[n-1].OptionId, nil
+		}
+		return "", errPermissionCancelled
+	default:
+		// "cancel", plus any future or vendor action we don't know: dismissed.
+		return "", errPermissionCancelled
+	}
+}
+
+// elicitTextKey is the free-text field of an ask_user form, paired with
+// elicitChoiceKey when the model offers options too ("or type your own").
+const elicitTextKey = "text"
+
+// errNoFreeText is returned when the model wanted a typed answer but the client
+// has no elicitation form and no options to fall back to.
+var errNoFreeText = errors.New("client cannot show a free-text prompt")
+
+// AskForm asks one question as N options, a free-text box, or both. Options
+// alone route through AskChoice, so clients with no elicitation still work via
+// session/request_permission. A text box does NOT: request_permission can only
+// carry buttons, so a typed answer needs elicitation, and without it the caller
+// gets errNoFreeText. Returns the chosen option or the trimmed typed text.
+func (a *AgentSideConnection) AskForm(ctx context.Context, sid, toolCallId, question string, options []string, allowText bool) (string, error) {
+	if !allowText || !a.agent.clientCan("elicitation") {
+		if len(options) == 0 {
+			return "", errNoFreeText
+		}
+		return a.AskChoice(ctx, sid, toolCallId, question, options)
+	}
+
+	// Same human-wait accounting as doPermissionRequest: this blocks on the user,
+	// so the turn's "✅ Done" line must not count it as active time.
+	start := time.Now()
+	defer func() {
+		if sess := a.agent.getSession(sid); sess != nil {
+			sess.addHumanWait(time.Since(start))
+		}
+	}()
+
+	props := map[string]any{}
+	textTitle := "Your answer"
+	var required []string
+	if len(options) > 0 {
+		values := make([]map[string]any, 0, len(options))
+		for _, o := range options {
+			values = append(values, map[string]any{"const": o, "title": o})
+		}
+		props[elicitChoiceKey] = map[string]any{"type": "string", "oneOf": values, "title": "Pick one"}
+		textTitle = "Or type your own"
+	} else {
+		// Nothing to pick, so the box is the whole form and has to be filled.
+		required = []string{elicitTextKey}
+	}
+	props[elicitTextKey] = map[string]any{"type": "string", "title": textTitle}
+
+	req := map[string]any{
+		"sessionId": sid,
+		"mode":      "form",
+		"message":   question,
+		"requestedSchema": map[string]any{
+			"type":       "object",
+			"properties": props,
+			"required":   required,
+		},
+	}
+	if toolCallId != "" {
+		req["toolCallId"] = toolCallId
+	}
+	raw, err := a.sendRequest(ctx, "elicitation/create", req)
+	if err != nil {
+		return "", err
+	}
+	// Content values are a union (string/int/number/bool/string-array), so they
+	// decode into any; only the string case is ever asked for here.
+	var resp struct {
+		Action  string         `json:"action"`
+		Content map[string]any `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", err
+	}
+	if resp.Action != "accept" {
+		// "decline" has no reject-option meaning here (unlike the button-only
+		// form, where the last option IS the no), so it joins "cancel" and any
+		// vendor action as a plain dismissal.
+		return "", errPermissionCancelled
+	}
+	// A typed answer beats a selected option: the user only reaches the text box
+	// by declining to use the buttons.
+	if s, _ := resp.Content[elicitTextKey].(string); strings.TrimSpace(s) != "" {
+		return strings.TrimSpace(s), nil
+	}
+	if s, _ := resp.Content[elicitChoiceKey].(string); s != "" {
+		return s, nil
+	}
+	return "", errPermissionCancelled
+}
+
+func (a *AgentSideConnection) requestPermission(ctx context.Context, sid string, toolCallId, question string, options []permissionOption) (string, error) {
 	return a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
 		ToolCall:  permissionToolCall{ToolCallId: toolCallId},
 		Options:   options,
+		Message:   question,
 	})
 }
 
 var errPermissionCancelled = errors.New("permission dialog dismissed")
 
 // AskChoice shows N green choices + a red Abort. Returns the chosen optionId.
-func (a *AgentSideConnection) AskChoice(ctx context.Context, sid string, toolCallId string, choices []string) (string, error) {
+func (a *AgentSideConnection) AskChoice(ctx context.Context, sid string, toolCallId, question string, choices []string) (string, error) {
 	var options []permissionOption
 	for _, c := range choices {
 		options = append(options, permissionOption{OptionId: c, Name: c, Kind: "allow_once"})
 	}
 	options = append(options, permissionOption{OptionId: "abort", Name: "Abort", Kind: "reject_once"})
 
-	choice, err := a.requestPermission(ctx, sid, toolCallId, options)
+	choice, err := a.requestPermission(ctx, sid, toolCallId, question, options)
 	if err != nil {
 		return "abort", err
 	}
 	return choice, nil
-}
-
-func (a *AgentSideConnection) AskYesNo(ctx context.Context, sid string, toolCallId, yesLabel, noLabel string) (bool, error) {
-	choice, err := a.requestPermission(ctx, sid, toolCallId, []permissionOption{
-		{OptionId: "yes", Name: yesLabel, Kind: "allow_once"},
-		{OptionId: "no", Name: noLabel, Kind: "reject_once"},
-	})
-	if err != nil {
-		return false, err
-	}
-	return choice == "yes", nil
 }
 
 // AskChoiceWithCard is AskChoice that also carries title/kind so Zed can
@@ -287,6 +492,7 @@ func (a *AgentSideConnection) AskChoiceWithCard(ctx context.Context, sid, toolCa
 	choice, err := a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
 		ToolCall:  permissionToolCall{ToolCallId: toolCallId, Title: title, Kind: kind, Status: "in_progress"},
+		Message:   title,
 		Options:   options,
 	})
 	if err != nil {
@@ -301,6 +507,7 @@ func (a *AgentSideConnection) AskYesNoWithCard(ctx context.Context, sid, toolCal
 	choice, err := a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
 		ToolCall:  permissionToolCall{ToolCallId: toolCallId, Title: title, Kind: kind, Status: "in_progress"},
+		Message:   title,
 		Options: []permissionOption{
 			{OptionId: "yes", Name: yesLabel, Kind: "allow_once"},
 			{OptionId: "no", Name: noLabel, Kind: "reject_once"},
@@ -320,6 +527,7 @@ func (a *AgentSideConnection) AskAcknowledgeWithCard(ctx context.Context, sid, t
 	_, err := a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
 		ToolCall:  permissionToolCall{ToolCallId: toolCallId, Title: title, Kind: kind, Status: "in_progress"},
+		Message:   title,
 		Options: []permissionOption{
 			{OptionId: "ack", Name: label, Kind: "allow_once"},
 		},

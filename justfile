@@ -20,24 +20,6 @@ improve: improve-build
 install: build
     sudo install -m 0755 codehalter /usr/local/bin/codehalter
 
-# Build the benchmark harness. Output goes to bench/bench-runner to avoid
-# the collision Go hits when building a binary into a directory of the
-# same name (`bench/bench`).
-bench-build: build
-    go build -o bench/bench-runner ./bench/
-
-# Build then run the benchmark. Runs from bench/ so the default `tests/`
-# glob and `settings.toml` paths resolve.
-#
-#   just bench                                       # all tests, no note
-#   just bench "testing MTP"                         # all tests, tagged in results.jsonl
-#   just bench "qwen30b-a3b" tests/preveltekit_go126.toml  # one test, tagged
-#
-# For other flags (`-work`, `-codehalter`, …) call bench-runner directly:
-#   cd bench && ./bench-runner -note "x" -work /tmp/foo tests/...
-bench note='' *args='': bench-build
-    cd bench && ./bench-runner -note {{quote(note)}} {{args}}
-
 # Build the skill crafter. Output goes to crafter/crafter-runner to avoid the
 # directory-name collision Go hits building into crafter/.
 crafter-build:

@@ -60,7 +60,7 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 	if len(inFlightCompleted) > 0 {
 		// Announce: hitting the limit mid-turn is routine management, NOT an error
 		// (no ⚠/❌). This synchronous summarise can take a moment.
-		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "🗜 Context limit reached — compacting: summarising completed small turns, keeping the unfinished one…\n"}})
+		a.say(ctx, sess.ID, "🗜 Context limit reached — compacting: summarising completed small turns, keeping the unfinished one…\n")
 		var note string
 		if prompt := a.loadPromptFile(sess.ID, "SUMMARISE.md"); prompt != "" {
 			// Always paste-style here, never prefix-extension: this fold runs
@@ -91,7 +91,7 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 
 	archiveID, err := sess.rotate(keepMessages, b.String())
 	if err != nil {
-		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Compaction failed: " + err.Error() + "\n\n"}})
+		a.say(ctx, sess.ID, "⚠ Compaction failed: "+err.Error()+"\n\n")
 		return false
 	}
 	sess.resetTurnStart()
@@ -101,10 +101,10 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 		sess.promptSkills = skillFiles(sess.Cwd)
 	}
 	if err := sess.Save(); err != nil {
-		a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Compacted in-memory but persisting failed: %s. Archive %s is on disk; the live session file will diverge until the next Save.\n\n", err.Error(), archiveID)}})
+		a.say(ctx, sess.ID, fmt.Sprintf("⚠ Compacted in-memory but persisting failed: %s. Archive %s is on disk; the live session file will diverge until the next Save.\n\n", err.Error(), archiveID))
 		return true
 	}
-	a.sendUpdate(ctx, sess.ID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("🗜 Compacted — archived as %s\n\n", archiveID)}})
+	a.say(ctx, sess.ID, fmt.Sprintf("🗜 Compacted — archived as %s\n\n", archiveID))
 	return true
 }
 

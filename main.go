@@ -102,6 +102,13 @@ type agent struct {
 	// history image encoding.
 	imagesSupported bool
 
+	// clientCaps is what the editor told us it supports in the initialize
+	// request. Set once by Initialize (before any session exists) and read by
+	// fsRead/fsWrite to decide between the ACP filesystem and plain disk I/O.
+	// Zero value = "the client advertised nothing", which is the safe reading:
+	// every capability gate falls back to doing the work ourselves.
+	clientCaps ClientCapabilities
+
 	// connSems caps concurrent LLM calls per configured [[llm]] entry —
 	// settings.LLM[i] has a buffered channel at connSems[i] of capacity
 	// LLM[i].parallelCap(). llmStream acquires on entry and releases on exit,
@@ -136,10 +143,10 @@ type agent struct {
 	subagentMeterMu sync.Mutex
 	subagentMeter   map[string]map[string]string
 
-	// bgJobs tracks run_background processes (detached daemons the model starts:
-	// dev servers, watchers) so shutdownBackground can SIGKILL their process
-	// groups on exit instead of orphaning them with a held port. Keyed by the
-	// sequential id shown to the model; bgSeq hands out ids. Guarded by bgMu.
+	// bgJobs tracks run_background jobs (long-lived processes the model starts:
+	// dev servers, watchers) so shutdownBackground can release their terminals on
+	// exit — which kills them — instead of orphaning them with a held port. Keyed
+	// by the sequential id shown to the model; bgSeq hands out ids. Guarded by bgMu.
 	bgMu   sync.Mutex
 	bgJobs map[int]*backgroundJob
 	bgSeq  int
@@ -204,9 +211,22 @@ func main() {
 // ---------------------------------------------------------------------------
 
 func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
+	// Version negotiation is NOT a handshake we may fail: the spec says an agent
+	// that doesn't speak the requested version MUST answer with the latest version
+	// it does support and let the client decide whether to continue. Erroring here
+	// broke every client ahead of us — and with an ACP v2 in alpha, that will be
+	// most of them. res.ProtocolVersion below is always ours, so the reply already
+	// says what we speak; this only logs the mismatch.
 	if req.ProtocolVersion != protocolVersion {
-		return InitializeResponse{}, fmt.Errorf("unsupported protocol version %d (this agent speaks %d)", req.ProtocolVersion, protocolVersion)
+		slog.Info("initialize: client speaks a different protocol version, answering with ours",
+			"client", req.ProtocolVersion, "agent", protocolVersion)
 	}
+	// Remember what the client can do before anything tries to use it. Written
+	// once, here, before any session exists — but handlers run concurrently, so
+	// it takes the same lock as the other agent-wide capability fields.
+	a.mu.Lock()
+	a.clientCaps = req.ClientCapabilities
+	a.mu.Unlock()
 	// Probe the execute/thinking LLM cheaply (metadata endpoints, no
 	// inference) to advertise image support in capabilities. We load the
 	// global settings only here — project-local settings live under a cwd
@@ -226,6 +246,8 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	res.ProtocolVersion = protocolVersion
 	res.AgentCapabilities.LoadSession = true
 	res.AgentCapabilities.PromptCapabilities.Image = a.imagesSupported
+	res.AgentCapabilities.PromptCapabilities.EmbeddedContext = true
+	res.AgentCapabilities.MCPCapabilities.HTTP = true
 	res.AgentCapabilities.SessionCapabilities = &struct {
 		List  *struct{} `json:"list,omitempty"`
 		Close *struct{} `json:"close,omitempty"`
@@ -246,6 +268,28 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	return res, nil
 }
 
+// clientCan reports whether the editor advertised a capability in its
+// initialize request: "read", "write", "elicitation" or "terminal". A client
+// that didn't claim a method must never be sent it, so a false here means we
+// fall back — fsRead/fsWrite do the I/O themselves (the same path subagent
+// sessions already take) and asks go out as session/request_permission. The
+// exception is "terminal", which has no fallback: ensureTerminals refuses the
+// session outright. Zed advertises all four, which is why the missing fs gate
+// went unnoticed.
+func (a *agent) clientCan(which string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	switch which {
+	case "write":
+		return a.clientCaps.Fs.WriteTextFile
+	case "elicitation":
+		return a.clientCaps.Elicitation != nil && a.clientCaps.Elicitation.Form != nil
+	case "terminal":
+		return a.clientCaps.Terminal
+	}
+	return a.clientCaps.Fs.ReadTextFile
+}
+
 func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSessionResponse, error) {
 	cwd, _, err := usableCwd(req.Cwd)
 	if err != nil {
@@ -257,6 +301,10 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 		slog.Debug("NewSession: newSession err", "err", err)
 		return NewSessionResponse{}, err
 	}
+	// Hold the editor's MCP list for offerMCPImport, which runs in the bootstrap
+	// goroutine below: importing needs an elicitation, and session/new must
+	// return the id before the client will accept one.
+	s.mcpOffer = req.McpServers
 	if err := a.initSession(cwd, s); err != nil {
 		slog.Debug("NewSession: initSession err", "err", err, "sid", s.ID)
 		a.deleteSession(s.ID)
@@ -278,7 +326,7 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 	// to restore — tell the user this is a fresh session rather than silently
 	// dropping their old thread's history.
 	if substituted {
-		a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("Started a new session: the workspace this thread was created in (%s) isn't available here, so there was nothing to restore.\n\n", req.Cwd)}})
+		a.say(ctx, req.SessionId, fmt.Sprintf("Started a new session: the workspace this thread was created in (%s) isn't available here, so there was nothing to restore.\n\n", req.Cwd))
 	}
 	s, err := loadSession(cwd, req.SessionId)
 	if err != nil {
@@ -292,6 +340,7 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 			// route. The filename inherits the cached id's stale
 			// timestamp, which is a known cosmetic wart.
 			s = newSessionWithID(cwd, req.SessionId)
+			s.mcpOffer = req.McpServers
 			if err := a.initSession(cwd, s); err != nil {
 				a.deleteSession(s.ID)
 				return LoadSessionResponse{}, err
@@ -301,9 +350,16 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 		}
 		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
 	}
+	s.mcpOffer = req.McpServers
 	if err := a.initSession(cwd, s); err != nil {
 		a.deleteSession(s.ID)
 		return LoadSessionResponse{}, err
+	}
+	// Re-announce the thread's name: the client asked us to restore this
+	// session, so it's ours to label, and a reload otherwise drops back to the
+	// session id.
+	if s.Title != "" {
+		a.sendUpdate(ctx, req.SessionId, sessionInfoUpdate{Kind: "session_info_update", Title: s.Title})
 	}
 	// Replay the restored thread's messages to the client so the UI shows the
 	// prior conversation. An empty chunk of the opposite role is emitted before
@@ -314,7 +370,7 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 	for _, m := range s.Messages {
 		if m.Role == lastRole {
 			if m.Role == "user" {
-				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: ""}})
+				a.say(ctx, req.SessionId, "")
 			} else {
 				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: ""}})
 			}
@@ -333,7 +389,7 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}})
 			}
 		} else {
-			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: m.Content}})
+			a.say(ctx, req.SessionId, m.Content)
 		}
 		lastRole = m.Role
 	}
@@ -367,7 +423,7 @@ func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) e
 		Kind          string `json:"sessionUpdate"`
 		CurrentModeId string `json:"currentModeId"`
 	}{Kind: "current_mode_update", CurrentModeId: req.ModeId})
-	a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Mode: " + req.ModeId + "\n\n"}})
+	a.say(ctx, req.SessionId, "Mode: "+req.ModeId+"\n\n")
 	return nil
 }
 
@@ -543,8 +599,16 @@ func (a *agent) startIndexing(sid string, cwd string) {
 			slog.Debug("startIndexing: ensureDevcontainer false, aborting", "sid", sid)
 			return
 		}
+		if !a.ensureTerminals(ctx, sid) {
+			slog.Debug("startIndexing: client has no terminal capability, aborting", "sid", sid)
+			return
+		}
 		slog.Debug("startIndexing: devcontainer ok, about to ensureGitignore", "sid", sid)
 		a.ensureGitignore(ctx, cwd, sid)
+		// After the gitignore question and before any LLM work: this is the
+		// last interactive gate, and an imported server has to be in the file
+		// before the first turn's reconcileMCP reads it.
+		a.offerMCPImport(ctx, cwd, sid)
 
 		sess := a.getSession(sid)
 		if sess != nil {
@@ -585,7 +649,7 @@ func (a *agent) sessionModes() *SessionModeState {
 			Name        string `json:"name"`
 			Description string `json:"description,omitempty"`
 		}{
-			{Id: "Interactive", Name: "Interactive", Description: "Ask the user before non-trivial actions"},
+			{Id: "Interactive", Name: "Interactive", Description: "Ask before setup and anything outside the container"},
 			{Id: "Autopilot", Name: "Autopilot", Description: "Auto-answer prompts — no user interruption"},
 		},
 	}
@@ -632,6 +696,21 @@ func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 	}
 }
 
+// say emits `text` to the session's chat transcript. This is the overwhelmingly
+// common sendUpdate shape, so it gets a name: everything routed through here is
+// prose the user reads, as opposed to a tool card, a plan entry, or a status
+// line. Callers own their own trailing newlines, because some of these chunks
+// are streamed fragments that must concatenate seamlessly.
+func (a *agent) say(ctx context.Context, sid, text string) {
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: text}})
+}
+
+// sayThought is say for the model's reasoning channel, which clients render
+// collapsed/dimmed rather than as an answer.
+func (a *agent) sayThought(ctx context.Context, sid, text string) {
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: text}})
+}
+
 // sendUpdateAndAbort marks the session as do-not-run and emits the reason to
 // chat. Prompt reads a.abortReason under mu and fails every turn until the
 // process is restarted (inside a container).
@@ -639,7 +718,7 @@ func (a *agent) sendUpdateAndAbort(ctx context.Context, sid, reason string) {
 	a.mu.Lock()
 	a.abortReason = reason
 	a.mu.Unlock()
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: reason + "\n"}})
+	a.say(ctx, sid, reason+"\n")
 }
 
 // ---------------------------------------------------------------------------

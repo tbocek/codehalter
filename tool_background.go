@@ -4,8 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -19,18 +20,38 @@ var bgJobGrace = 700 * time.Millisecond
 // tool result; the model reads the full log via run_command.
 const bgLogTailCap = 8 * 1024
 
-// backgroundJob tracks one detached run_background process so the agent can reap
-// its whole process group at shutdown (it owns no context, so it would otherwise
-// orphan and keep holding a port) and so the grace-period check can tell "still
-// running" from "exited immediately".
+// backgroundJob tracks one long-lived job so the agent can release its terminal
+// at shutdown (releasing kills the process, which is exactly what we want then,
+// and skipping it would leave a dev server holding a port for the container's
+// life) and so the grace-period check can tell "still running" from "exited
+// immediately".
 type backgroundJob struct {
-	id      int
-	cmdStr  string
-	pid     int
-	logPath string
-	cmd     *exec.Cmd
-	done    chan struct{} // closed when cmd.Wait() returns
-	exitErr error         // valid only after done is closed
+	id         int
+	sid        string // the session that launched it; terminal calls are addressed by it
+	cmdStr     string
+	pid        int
+	logPath    string
+	pidPath    string
+	terminalId string
+}
+
+// bgScript wraps the model's command so the job keeps the two handles the model
+// already knows how to use: a log file it reads with `run_command: cat …` and a
+// pid it stops with `run_command: kill …`. Neither is available from an ACP
+// terminal — the client owns the process and only ever tells us a terminal id —
+// so the shell inside the terminal produces them instead.
+//
+// This works because the client's terminal and codehalter share a filesystem
+// (Zed's dev-container flow runs both inside the container), which is the same
+// assumption run_command makes when the model cats a file a command just wrote.
+//
+// `cmd &` then `$!` rather than `$$` + exec: for a simple command bash execs it
+// directly into the backgrounded child, so `$!` is the real process, and for a
+// compound one (`cd x && npm run dev`) it's the subshell — the same pid the
+// old exec.Command path recorded. `wait` keeps the shell alive so the terminal
+// exits when the job does, which is what the grace check reads.
+func bgScript(cmdStr, logPath, pidPath string) string {
+	return fmt.Sprintf("exec > %s 2>&1\n%s &\necho $! > %s\nwait $!", logPath, cmdStr, pidPath)
 }
 
 // nextBgID reserves the next sequential job id (used to name the log file before
@@ -51,9 +72,20 @@ func (a *agent) registerBgJob(job *backgroundJob) {
 	a.bgJobs[job.id] = job
 }
 
-// shutdownBackground SIGKILLs every still-running run_background process group on
-// app exit and removes their log files. Called from main after the connection
-// closes, alongside shutdownMCP.
+// forgetBgJob drops a job from the table and removes its scratch files. Used
+// both for a job that never stayed up and, via shutdownBackground, at exit.
+func (a *agent) forgetBgJob(job *backgroundJob) {
+	a.bgMu.Lock()
+	delete(a.bgJobs, job.id)
+	a.bgMu.Unlock()
+	_ = os.Remove(job.logPath)
+	_ = os.Remove(job.pidPath)
+}
+
+// shutdownBackground releases every still-tracked job's terminal on app exit —
+// which kills the process, since that is what release does — and removes their
+// scratch files. Called from main after the connection closes, alongside
+// shutdownMCP.
 func (a *agent) shutdownBackground() {
 	a.bgMu.Lock()
 	jobs := make([]*backgroundJob, 0, len(a.bgJobs))
@@ -63,14 +95,11 @@ func (a *agent) shutdownBackground() {
 	a.bgJobs = nil
 	a.bgMu.Unlock()
 	for _, j := range jobs {
-		select {
-		case <-j.done: // already exited; nothing to kill
-		default:
-			if j.cmd.Process != nil {
-				_ = killGroup(j.cmd.Process.Pid)
-			}
+		if j.terminalId != "" && a.conn != nil {
+			a.terminalRelease(j.sid, j.terminalId)
 		}
 		_ = os.Remove(j.logPath)
+		_ = os.Remove(j.pidPath)
 	}
 }
 
@@ -87,14 +116,27 @@ func readLogTail(path string, max int) string {
 	return string(data)
 }
 
-// runBackgroundExecute starts a long-running command detached from this tool
-// call, captures its output to a log file, waits a short grace period to catch an
-// immediate crash, then returns the pid + log path while the process keeps
-// running. Cleanup happens at session exit (shutdownBackground) or when the model
-// kills the pid via run_command.
+// readPidFile returns the pid bgScript recorded, or 0 if it isn't there yet.
+func readPidFile(path string) int {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0
+	}
+	return pid
+}
+
+// runBackgroundExecute starts a long-running command in a client terminal that
+// outlives this tool call, waits a short grace period to catch an immediate
+// crash, then returns the pid + log path while the process keeps running.
+// Cleanup happens at session exit (shutdownBackground) or when the model kills
+// the pid via run_command.
 func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
-	cmdStr := args["command"]
+	cmdStr := args.str("command")
 	if cmdStr == "" {
 		return "error: command is required", false
 	}
@@ -107,66 +149,83 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 
 	id := a.nextBgID()
 	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.log", id))
-	logFile, err := os.Create(logPath)
+	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.pid", id))
+	job := &backgroundJob{id: id, sid: sid, cmdStr: cmdStr, logPath: logPath, pidPath: pidPath}
+
+	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", bgScript(cmdStr, logPath, pidPath)}, sess.Cwd)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return "error creating log file: " + err.Error(), false
+		return "error starting terminal: " + err.Error(), false
 	}
-
-	// Detached on purpose: no owning context (it must outlive this tool call so a
-	// later run_command can probe it) and its own process group so shutdown can
-	// SIGKILL the whole tree. Output goes to a log the model tails via run_command.
-	cmd := exec.Command("bash", "-c", cmdStr)
-	cmd.Dir = sess.Cwd
-	cmd.Stdout = logFile
-	cmd.Stderr = logFile
-	setPgid(cmd) // own process group so shutdownBackground can reap the whole tree
-
-	if err := cmd.Start(); err != nil {
-		logFile.Close()
-		_ = os.Remove(logPath)
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return "error starting bash: " + err.Error(), false
-	}
-
-	job := &backgroundJob{id: id, cmdStr: cmdStr, pid: cmd.Process.Pid, logPath: logPath, cmd: cmd, done: make(chan struct{})}
-	go func() {
-		job.exitErr = cmd.Wait()
-		logFile.Close()
-		close(job.done)
-	}()
+	job.terminalId = tid
+	// Registered before the grace wait so a shutdown racing the launch still
+	// releases the terminal instead of orphaning the process.
 	a.registerBgJob(job)
 
+	// The terminal is NOT released here: release kills the process, and this job
+	// is meant to outlive the tool call. It stays embedded in the card, so the
+	// user watches the dev server's output live for as long as it runs.
+	a.sendUpdate(ctx, sid, toolCallUpdate{
+		Kind:       "tool_call_update",
+		ToolCallId: tcId,
+		Status:     "in_progress",
+		Content:    []ToolCallContent{TerminalContent(tid)},
+	})
+
 	// Grace window: catch an immediate exit (failed bind, bad command) before
-	// reporting the job as running.
-	crashed := false
-	select {
-	case <-job.done:
-		crashed = true
-	case <-time.After(bgJobGrace):
+	// reporting the job as running. Polled rather than a flat sleep so a fast
+	// crash is reported without making every healthy launch wait it out.
+	var exit *terminalExit
+	deadline := time.Now().Add(bgJobGrace)
+	for {
+		_, _, status, oerr := a.terminalOutput(ctx, sid, tid)
+		if oerr != nil {
+			a.forgetBgJob(job)
+			a.terminalRelease(sid, tid)
+			a.FailToolCall(ctx, sid, tcId, oerr.Error())
+			return "error reading terminal: " + oerr.Error(), false
+		}
+		if status != nil {
+			exit = status
+			break
+		}
+		if remaining := time.Until(deadline); remaining <= 0 {
+			break
+		} else if remaining > 50*time.Millisecond {
+			time.Sleep(50 * time.Millisecond)
+		} else {
+			time.Sleep(remaining)
+		}
 	}
 
 	tail := readLogTail(logPath, bgLogTailCap)
-	if crashed {
-		exitCode := 0
-		if ee, ok := job.exitErr.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else if job.exitErr != nil {
-			exitCode = -1
-		}
-		// It already exited, so there's nothing to reap: drop it from the table and
-		// remove the log (its output is in the result below).
-		a.bgMu.Lock()
-		delete(a.bgJobs, id)
-		a.bgMu.Unlock()
-		_ = os.Remove(logPath)
-		result := fmt.Sprintf("background job %d exited immediately (exit %d) — it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", id, exitCode, tail)
-		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, exitCode), []ToolCallContent{TextContent(result)})
+	if exit != nil {
+		// It already exited, so there's nothing to keep alive: release the terminal
+		// and drop the job (its output is in the result below).
+		a.terminalRelease(sid, tid)
+		a.forgetBgJob(job)
+		result := fmt.Sprintf("background job %d exited immediately (exit %d) — it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", id, exit.code(), tail)
+		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, exit.code()), []ToolCallContent{TextContent(result)})
 		return result, false
 	}
 
-	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls. Read its output with `run_command: cat %s` (or tail/grep it); stop it with `run_command: kill %d`. Output so far:\n\n%s",
-		id, job.pid, logPath, job.pid, tail)
-	a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (pid %d)", cmdStr, job.pid), []ToolCallContent{TextContent(result)})
+	job.pid = readPidFile(pidPath)
+	stop := fmt.Sprintf("stop it with `run_command: kill %d`", job.pid)
+	if job.pid == 0 {
+		// bgScript writes the pid before anything slow happens, so an empty file
+		// here means the shell died oddly. Say so rather than printing "kill 0",
+		// which would signal the whole process group.
+		stop = "its pid was not recorded, so it can only be stopped by ending the session"
+	}
+	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls. Read its output with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
+		id, job.pid, logPath, stop, tail)
+	// Retitle only: the card is holding the live terminal, and text content here
+	// would replace it with a static snapshot taken at second one of a dev server.
+	a.sendUpdate(ctx, sid, toolCallUpdate{
+		Kind:       "tool_call_update",
+		ToolCallId: tcId,
+		Title:      fmt.Sprintf("Background: %s (pid %d)", cmdStr, job.pid),
+		Status:     "completed",
+	})
 	return result, false
 }

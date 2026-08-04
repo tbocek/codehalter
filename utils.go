@@ -150,7 +150,7 @@ func trimJSON(s string) string {
 }
 
 // cwdOrDefault resolves the session's working directory to a clean absolute
-// path. Clients may pass "." (bench harness) or any relative path; resolvePath
+// path. A client may pass "." or any other relative path; resolvePath
 // then prefix-checks against sess.Cwd, and the check breaks when Cwd isn't
 // absolute because filepath.Clean drops the leading "./" — read_file("go.mod")
 // would resolve to "go.mod" and fail the "outside project directory" check

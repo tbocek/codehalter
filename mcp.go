@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -725,6 +726,244 @@ func (a *agent) shutdownMCP() {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Importing the editor's own MCP servers
+// ---------------------------------------------------------------------------
+
+// mcpConfigPath is the single file MCP is configured from.
+func mcpConfigPath(cwd string) string { return filepath.Join(cwd, sessionDir, "mcp.toml") }
+
+// elicitMCPKey is the one multi-select field offerMCPImport asks for. The name
+// is arbitrary but must match between the requested schema and the lookup in
+// the response content.
+const elicitMCPKey = "servers"
+
+// offerMCPImport asks which of the editor's own MCP servers to adopt, and
+// writes the answer into .codehalter/mcp.toml. session/new (and session/load)
+// carry the list the user configured in Zed; codehalter used to drop it on the
+// floor, because MCP here is file-driven, so those servers were simply
+// invisible with no hint that they existed.
+//
+// Every offered server is written either way: chosen ones as live entries, the
+// rest commented out. That is what makes this a one-time question. The next
+// session finds the name already in the file and stays quiet, and the user
+// enables one later by deleting a '#', which is the enable/disable convention
+// the file already documents (see MCPServerConfig).
+func (a *agent) offerMCPImport(ctx context.Context, cwd, sid string) {
+	sess := a.getSession(sid)
+	if sess == nil || len(sess.mcpOffer) == 0 {
+		return
+	}
+	path := mcpConfigPath(cwd)
+	raw, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		slog.Warn("mcp import: reading config", "path", path, "err", err)
+		return
+	}
+	var fresh []acpMCPServer
+	for _, s := range sess.mcpOffer {
+		// SSE is the one transport we can't run (mcpTransport does stdio and
+		// Streamable HTTP), and Initialize doesn't advertise it, so a
+		// spec-following client never sends one. Skip rather than write an
+		// entry the reconciler would then fail to start.
+		if s.Name == "" || s.Type == "sse" || mcpNameInFile(string(raw), s.Name) {
+			continue
+		}
+		fresh = append(fresh, s)
+	}
+	if len(fresh) == 0 {
+		return
+	}
+
+	chosen := a.askMCPImport(ctx, sid, fresh)
+	var body strings.Builder
+	var added []string
+	for _, s := range fresh {
+		enabled := chosen[s.Name]
+		if enabled {
+			added = append(added, s.Name)
+		}
+		body.WriteString(mcpTOMLEntry(s, !enabled))
+	}
+	// The session dir normally exists by now (initSession scaffolds it), but a
+	// session that has never saved may not have one, and a failed MkdirAll would
+	// otherwise surface as a confusing "no such file" from the append.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		slog.Warn("mcp import: creating config dir", "path", path, "err", err)
+		return
+	}
+	if err := appendFile(path, body.String()); err != nil {
+		slog.Warn("mcp import: writing config", "path", path, "err", err)
+		return
+	}
+
+	msg := fmt.Sprintf("Wrote %d MCP server(s) from your editor's settings into .codehalter/mcp.toml, commented out. Uncomment one to enable it.", len(fresh))
+	if len(added) > 0 {
+		msg = fmt.Sprintf("Added %s to .codehalter/mcp.toml. Starting with your next message.", strings.Join(added, ", "))
+		if rest := len(fresh) - len(added); rest > 0 {
+			msg += fmt.Sprintf(" The other %d are in the file commented out.", rest)
+		}
+	}
+	a.say(ctx, sid, msg+"\n\n")
+}
+
+// askMCPImport puts the offered servers up as one multi-select form and returns
+// the picked names. A client with no elicitation support, a declined form or a
+// transport error all mean "none": the servers still get recorded (commented
+// out), so nothing is lost and the question isn't repeated.
+func (a *agent) askMCPImport(ctx context.Context, sid string, fresh []acpMCPServer) map[string]bool {
+	if a.conn == nil || !a.clientCan("elicitation") {
+		return nil
+	}
+	options := make([]map[string]any, 0, len(fresh))
+	for _, s := range fresh {
+		options = append(options, map[string]any{"const": s.Name, "title": s.Name + " — " + mcpSummary(s)})
+	}
+	raw, err := a.conn.sendRequest(ctx, "elicitation/create", map[string]any{
+		"sessionId": sid,
+		"mode":      "form",
+		"message": "Your editor is configured with MCP servers codehalter isn't using yet. " +
+			"Pick the ones to add to .codehalter/mcp.toml. The rest are written commented out, so you won't be asked again.",
+		"requestedSchema": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				elicitMCPKey: map[string]any{
+					"type":  "array",
+					"title": "MCP servers to enable",
+					"items": map[string]any{"anyOf": options},
+				},
+			},
+		},
+	})
+	if err != nil {
+		slog.Warn("mcp import: elicitation failed", "err", err)
+		return nil
+	}
+	// Content values are a union (string, number, bool, string array), so this
+	// decodes into any and type-asserts rather than map[string]string.
+	var resp struct {
+		Action  string         `json:"action"`
+		Content map[string]any `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		slog.Warn("mcp import: undecodable elicitation response", "err", err)
+		return nil
+	}
+	if resp.Action != "accept" {
+		return nil
+	}
+	picked := map[string]bool{}
+	values, _ := resp.Content[elicitMCPKey].([]any)
+	for _, v := range values {
+		if name, ok := v.(string); ok {
+			picked[name] = true
+		}
+	}
+	return picked
+}
+
+// mcpNameInFile reports whether mcp.toml already mentions a server by this
+// name, INCLUDING inside a comment. Commented-out entries are how a declined
+// server is remembered, so a parse of the live entries alone would re-ask every
+// session.
+func mcpNameInFile(raw, name string) bool {
+	quoted := strconv.Quote(name)
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line), "#"))
+		key, value, ok := strings.Cut(line, "=")
+		if ok && strings.TrimSpace(key) == "name" && strings.TrimSpace(value) == quoted {
+			return true
+		}
+	}
+	return false
+}
+
+// mcpSummary is the one-line "what is this" shown next to a server's name in
+// the form.
+func mcpSummary(s acpMCPServer) string {
+	if s.URL != "" {
+		return "http " + s.URL
+	}
+	return "stdio " + strings.TrimSpace(s.Command+" "+strings.Join(s.Args, " "))
+}
+
+// mcpTOMLEntry renders one server as a [[server]] block, optionally with every
+// line commented out.
+func mcpTOMLEntry(s acpMCPServer, commented bool) string {
+	var b strings.Builder
+	b.WriteString("[[server]]\n")
+	b.WriteString("name = " + strconv.Quote(s.Name) + "\n")
+	if s.URL != "" {
+		b.WriteString("url = " + strconv.Quote(s.URL) + "\n")
+		if t := tomlInlineTable(s.Headers); t != "" {
+			b.WriteString("headers = " + t + "\n")
+		}
+	} else {
+		b.WriteString("command = " + strconv.Quote(s.Command) + "\n")
+		if len(s.Args) > 0 {
+			quoted := make([]string, len(s.Args))
+			for i, arg := range s.Args {
+				quoted[i] = strconv.Quote(arg)
+			}
+			b.WriteString("args = [" + strings.Join(quoted, ", ") + "]\n")
+		}
+		if t := tomlInlineTable(s.Env); t != "" {
+			b.WriteString("env = " + t + "\n")
+		}
+	}
+	if !commented {
+		return "\n" + b.String()
+	}
+	var out strings.Builder
+	out.WriteString("\n# Offered by the editor, not enabled. Uncomment to use.\n")
+	for _, line := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
+		out.WriteString("# " + line + "\n")
+	}
+	return out.String()
+}
+
+// tomlInlineTable renders ACP's [{name, value}] list as a TOML inline table.
+// Header names contain '-', which is a legal TOML bare key, so only genuinely
+// odd keys get quoted.
+func tomlInlineTable(kv []acpNameValue) string {
+	if len(kv) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(kv))
+	for _, e := range kv {
+		parts = append(parts, tomlKey(e.Name)+" = "+strconv.Quote(e.Value))
+	}
+	return "{ " + strings.Join(parts, ", ") + " }"
+}
+
+func tomlKey(k string) string {
+	if k == "" {
+		return `""`
+	}
+	for _, r := range k {
+		bare := r == '-' || r == '_' ||
+			(r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		if !bare {
+			return strconv.Quote(k)
+		}
+	}
+	return k
+}
+
+// appendFile appends to path, creating it if absent. Close is checked: it's
+// where a deferred write actually fails.
+func appendFile(path, body string) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(body); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
 // reconcileMCP brings the running MCP clients in line with .codehalter/mcp.toml.
 // It is idempotent and safe to call on every Prompt(): if the file is
 // unchanged at the semantic level, no UI is emitted. Failures don't block the
@@ -742,7 +981,7 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 	// Read .codehalter/mcp.toml (MCP is opt-in, so a missing file is silently
 	// fine). mtime lets the unchanged-file check below skip the diff so a
 	// persistent start failure doesn't re-emit the same failed card every turn.
-	path := filepath.Join(cwd, sessionDir, "mcp.toml")
+	path := mcpConfigPath(cwd)
 	var cfgs []MCPServerConfig
 	var mtime time.Time
 	var err error

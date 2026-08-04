@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // This file owns the prompt orchestrator. Prompt() is the ACP entry point.
@@ -347,19 +348,6 @@ func (a *agent) setSubagentStatus(ctx context.Context, parentSid, subSid, label,
 	return agg
 }
 
-// phaseActive reports whether a foreground phase is currently in progress for
-// this session — used to gate the waiting-meter's stall warning so a slow
-// background call (summariser / git-commit) doesn't emit a "server busy" line.
-func (a *agent) phaseActive(sid string) bool {
-	sess := a.getSession(sid)
-	if sess == nil {
-		return false
-	}
-	sess.phaseMu.Lock()
-	defer sess.phaseMu.Unlock()
-	return sess.phaseActive
-}
-
 // finalizePlan marks every phase up to and including the currently-active one
 // as completed so the UI stops spinning. Idempotent and safe to call when no
 // phase is active. Used from a Prompt-level defer to cover every exit path:
@@ -413,6 +401,53 @@ func stopReasonFor(ctx context.Context) string {
 	return "end_turn"
 }
 
+// sessionTitleMax is how many runes of the opening message become the thread
+// name. Long enough to keep a real sentence, short enough not to be elided by
+// the client's own thread list.
+const sessionTitleMax = 60
+
+// deriveTitle turns a user message into a one-line thread name: the first
+// non-blank line, whitespace collapsed, cut to sessionTitleMax on a word
+// boundary. Returns "" for a message with no text at all (an image-only
+// prompt), which leaves the thread unnamed rather than naming it "".
+func deriveTitle(raw string) string {
+	var line string
+	for _, l := range strings.Split(raw, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			line = l
+			break
+		}
+	}
+	line = strings.Join(strings.Fields(line), " ")
+	if line == "" || utf8.RuneCountInString(line) <= sessionTitleMax {
+		return line
+	}
+	cut := string([]rune(line)[:sessionTitleMax])
+	// Only back up to a word boundary if one is reasonably close to the limit;
+	// a single 60-rune token would otherwise collapse to almost nothing.
+	if i := strings.LastIndex(cut, " "); i > sessionTitleMax/2 {
+		cut = cut[:i]
+	}
+	return strings.TrimRight(cut, " ,.;:-") + "…"
+}
+
+// setSessionTitle names the thread in the client. ACP has no request for this:
+// the agent volunteers a session_info_update, and a client that doesn't
+// implement it ignores the unknown update kind, so there is no capability to
+// gate on. Title is also persisted, so LoadSession can re-announce it.
+func (a *agent) setSessionTitle(ctx context.Context, sess *Session, raw string) {
+	title := deriveTitle(raw)
+	if title == "" || title == sess.Title {
+		return
+	}
+	sess.Title = title
+	a.sendUpdate(ctx, sess.ID, sessionInfoUpdate{
+		Kind:      "session_info_update",
+		Title:     title,
+		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
 	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
 
@@ -449,7 +484,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	a.mu.Unlock()
 	slog.Debug("Prompt: abort gate", "sid", req.SessionId, "abortReason", abort)
 	if abort != "" {
-		a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: abort + "\n"}})
+		a.say(ctx, req.SessionId, abort+"\n")
 		return a.failPrompt(req.SessionId, errors.New(abort), nil)
 	}
 
@@ -600,6 +635,14 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		}
 	}
 
+	// Name the thread from its opening request. Done here, BEFORE macro
+	// expansion, so `/improve` titles as `/improve` rather than as the first
+	// line of the rendered template. The field is only set on the session; the
+	// saveOrLog that stores this same message persists it.
+	if isFirstMessage && sess != nil {
+		a.setSessionTitle(ctx, sess, userText)
+	}
+
 	// `/<name> <args>` matching a TEMPLATE-<name>.md (user copy in .codehalter,
 	// else the embedded default) expands into a full prompt and runs as a normal
 	// turn. A macro that requires an arg ({{}}) but got none stops here with a
@@ -622,7 +665,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	}
 	if rendered, stopMsg, handled := expandMacro(macroCwd, userText); handled {
 		if stopMsg != "" {
-			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: stopMsg + "\n"}})
+			a.say(ctx, req.SessionId, stopMsg+"\n")
 			return PromptResponse{StopReason: "end_turn"}, nil
 		}
 		userText = rendered
@@ -693,8 +736,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			switch {
 			case errors.Is(err, errUserCancelled):
 				msg = "⏹ Stopped.\n"
-			case sess != nil && sess.pendingPlan != nil:
-				msg = "⏸ Holding the plan — I'll re-show it after your message.\n"
 			case sess == nil || !sess.superseded():
 				// Editor aborted the request (Cancel button, or a client-side
 				// request timeout while the LLM was busy) with nothing taking
@@ -704,18 +745,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 				msg = "⏹ Turn cancelled — " + cancelReason(err) + ".\n"
 			}
 			if msg != "" {
-				a.sendUpdate(context.Background(), req.SessionId, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: msg}})
+				a.say(context.Background(), req.SessionId, msg)
 			}
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, nil)
 	}
-
-	// If the user dismissed a plan card earlier by typing (e.g. a question), it's
-	// preserved in sess.pendingPlan — now that the typed message has been handled,
-	// re-show it (Execute / Replan / Abort) so the plan isn't thrown away. No-op
-	// when nothing is pending.
-	a.reshowPendingPlan(ctx, req.SessionId)
 
 	// Offer any fix cards the pre-turn checks detected, now that the user's
 	// actual request has run. The freshness checks themselves moved pre-turn
@@ -804,7 +839,7 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		// Nudge toward self-improvement: /improve reads this session's logs and
 		// proposes (then applies/submits) refinements to codehalter's own prompts.
 		line += "\n\n💡 Run /improve to analyze this session and improve codehalter."
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: line + "\n"}})
+		a.say(ctx, sid, line+"\n")
 	}
 	return nil
 }
@@ -816,71 +851,62 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
 
-	var plan *planResult
-	if sess != nil && sess.resumePlan != nil {
-		// Resuming a plan the user dismissed earlier and then chose Execute on
-		// when it was re-shown (see reshowPendingPlan). It was already confirmed
-		// there, so skip planning and the initial confirmPlan — straight to the
-		// subtask loop.
-		plan = sess.resumePlan
-		sess.resumePlan = nil
-	} else {
-		a.sendPhase(ctx, sid, 0, false)
-		p, firstToolUses, err := a.runPlanPhase(ctx, sid, "")
-		if err != nil {
-			if isCancelled(err) {
-				return toolLoopResult{}, err
-			}
-			if sess != nil && len(firstToolUses) > 0 {
-				sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
-				sess.saveOrLog()
-			}
+	a.sendPhase(ctx, sid, 0, false)
+	p, firstToolUses, err := a.runPlanPhase(ctx, sid, "")
+	if err != nil {
+		if isCancelled(err) {
 			return toolLoopResult{}, err
 		}
-		if p == nil {
-			// No PLAN.md or unparseable response — pipeline cannot proceed.
-			return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
+		if sess != nil && len(firstToolUses) > 0 {
+			sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
+			sess.saveOrLog()
 		}
-		if len(p.Subtasks) == 0 {
-			// No subtasks: a report_only direct answer — surface it (returning it as
-			// result.Text lets Prompt's epilogue run). If the planner left it empty
-			// even after the plan-phase nudge, warn rather than ending silently —
-			// never leave the user with nothing after a turn that ran.
-			switch {
-			case sess != nil && sess.improving.Load():
-				// /improve workaround: the weak model can't reliably emit a structured
-				// plan here — it answers the analysis with a report-only respond, so
-				// there are no subtasks. The analysis is already in history; synthesize
-				// the apply step as one subtask and fall through to execute, where the
-				// model makes a single structured submit_improvement call and codehalter
-				// drives the Apply/Skip + submit in code (see improvementExecute).
-				applyDesc := "The analysis above already identified the improvements — do NOT re-analyse, and do NOT call ask_user or edit_file. Make ONE submit_improvement call whose `improvements` is a JSON array of the top changes (each object: title; file = the bare .codehalter prompt filename like \"PLAN.md\"; type = add|replace|remove; original = the exact current text to match; new = the added/replacement text; reasoning). codehalter then shows the user each change, asks Apply/Skip, applies the accepted edits, and asks whether to submit. That single call is the whole apply step."
-				if sess.improveNoLicense.Load() {
-					applyDesc += " (This project has no open-source license, so codehalter applies the accepted edits locally and skips submission.)"
-				}
-				p.Subtasks = []subtask{{Description: applyDesc}}
-			case p.answer != "":
-				// Surface the answer, then say WHY the turn ends here: a report_only
-				// plan means the planner judged this a question/diagnosis, not a code
-				// change, so no execute phase runs. Without this note a "Completed
-				// Plan — Planning" card reads as "stopped early", not "answered".
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: p.answer + "\n\nℹ Answered directly — no code change to execute.\n"}})
-				return toolLoopResult{Text: p.answer}, nil
-			default:
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ I couldn't produce a clear answer or a plan for that — try rephrasing, or ask for a specific change.\n"}})
-				return toolLoopResult{}, nil
-			}
-		}
-		// /improve consents by being invoked, so skip the "Execute this plan?" gate
-		// and go straight to execute — the per-improvement Apply/Skip prompts in the
-		// execute phase are the real per-change approval.
-		if sess == nil || !sess.improving.Load() {
-			if err := a.confirmPlan(ctx, sid, p, false); err != nil {
-				return toolLoopResult{}, err
-			}
-		}
-		plan = p
+		return toolLoopResult{}, err
 	}
+	if p == nil {
+		// No PLAN.md or unparseable response — pipeline cannot proceed.
+		return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
+	}
+	if len(p.Subtasks) == 0 {
+		// No subtasks: a report_only direct answer — surface it (returning it as
+		// result.Text lets Prompt's epilogue run). If the planner left it empty
+		// even after the plan-phase nudge, warn rather than ending silently —
+		// never leave the user with nothing after a turn that ran.
+		switch {
+		case sess != nil && sess.improving.Load():
+			// /improve workaround: the weak model can't reliably emit a structured
+			// plan here — it answers the analysis with a report-only respond, so
+			// there are no subtasks. The analysis is already in history; synthesize
+			// the apply step as one subtask and fall through to execute, where the
+			// model makes a single structured submit_improvement call and codehalter
+			// drives the Apply/Skip + submit in code (see improvementExecute).
+			applyDesc := "The analysis above already identified the improvements — do NOT re-analyse, and do NOT call ask_user or edit_file. Make ONE submit_improvement call whose `improvements` is a JSON array of the top changes (each object: title; file = the bare .codehalter prompt filename like \"PLAN.md\"; type = add|replace|remove; original = the exact current text to match; new = the added/replacement text; reasoning). codehalter then shows the user each change, asks Apply/Skip, applies the accepted edits, and asks whether to submit. That single call is the whole apply step."
+			if sess.improveNoLicense.Load() {
+				applyDesc += " (This project has no open-source license, so codehalter applies the accepted edits locally and skips submission.)"
+			}
+			p.Subtasks = []subtask{{Description: applyDesc}}
+		case p.answer != "":
+			// Surface the answer, then say WHY the turn ends here: a report_only
+			// plan means the planner judged this a question/diagnosis, not a code
+			// change, so no execute phase runs. Without this note a "Completed
+			// Plan — Planning" card reads as "stopped early", not "answered".
+			a.say(ctx, sid, p.answer+"\n\nℹ Answered directly — no code change to execute.\n")
+			return toolLoopResult{Text: p.answer}, nil
+		default:
+			a.say(ctx, sid, "⚠ I couldn't produce a clear answer or a plan for that — try rephrasing, or ask for a specific change.\n")
+			return toolLoopResult{}, nil
+		}
+	}
+	// /improve's single subtask is a prompt-shaped paragraph aimed at the model,
+	// not a step worth showing the user, so skip the render for that run.
+	if sess == nil || !sess.improving.Load() {
+		header := "Plan:"
+		if p.ReportOnly {
+			header = "Findings:"
+		}
+		a.renderPlan(ctx, sid, header, p.Subtasks)
+	}
+	plan := p
 
 	var lastResult toolLoopResult
 	var failureBags []map[string]bool
@@ -904,7 +930,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 				return lastResult, err
 			}
 			a.sendPhase(ctx, sid, 1, false)
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("\n=== Task %d/%d: %s ===\n\n", i+1, len(plan.Subtasks), st.Description)}})
+			a.say(ctx, sid, fmt.Sprintf("\n=== Task %d/%d: %s ===\n\n", i+1, len(plan.Subtasks), st.Description))
 
 			outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 			lastResult = outcome.Result
@@ -928,10 +954,10 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		if upserted {
 			upserts++
 			if upserts > maxUpserts {
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Plan revised %d times — stopping to avoid a re-plan loop.\n", upserts)}})
+				a.say(ctx, sid, fmt.Sprintf("⚠ Plan revised %d times — stopping to avoid a re-plan loop.\n", upserts))
 				return lastResult, nil
 			}
-			a.renderPlanUpdate(ctx, sid, plan)
+			a.renderPlan(ctx, sid, "\n📝 Plan updated — remaining:", plan.Subtasks)
 			continue
 		}
 
@@ -949,11 +975,11 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		}
 		failureBags = append(failureBags, bag)
 
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Task %d/%d failed: %s\n", failedAt+1, len(plan.Subtasks), failedReason)}})
+		a.say(ctx, sid, fmt.Sprintf("⚠ Task %d/%d failed: %s\n", failedAt+1, len(plan.Subtasks), failedReason))
 
 		replans++
 		if replans >= maxReplans {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Replan budget (%d) exhausted — giving up.\n", maxReplans)}})
+			a.say(ctx, sid, fmt.Sprintf("⚠ Replan budget (%d) exhausted — giving up.\n", maxReplans))
 			return lastResult, nil
 		}
 
@@ -970,14 +996,12 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			return lastResult, err
 		}
 		if newPlan == nil || len(newPlan.Subtasks) == 0 {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Replan produced no further subtasks — stopping.\n"}})
+			a.say(ctx, sid, "Replan produced no further subtasks — stopping.\n")
 			return lastResult, nil
 		}
 
-		if sess == nil || !sess.improving.Load() { // /improve auto-executes (see initial gate)
-			if err := a.confirmPlan(ctx, sid, newPlan, true); err != nil {
-				return lastResult, err
-			}
+		if sess == nil || !sess.improving.Load() { // see the initial render
+			a.renderPlan(ctx, sid, "Replan:", newPlan.Subtasks)
 		}
 		plan = newPlan
 	}
@@ -995,152 +1019,23 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	return lastResult, nil
 }
 
-// confirmPlan renders the planned subtasks and gates execution on the user:
-// Execute or Abort. Autopilot is the session mode (Zed's Interactive/Autopilot
-// switch, via session/set_mode) — not a card button — so this gate is skipped
-// when already in autopilot, and for report_only plans where no mutating work
-// happens. Replan plans use the same gate so the user sees the new approach
-// before it runs.
-// renderPlanUpdate shows a mid-run plan revision inline (not a confirm card):
-// the initial plan was approved, an upsert is the model adapting — no re-gating.
-func (a *agent) renderPlanUpdate(ctx context.Context, sid string, plan *planResult) {
-	if len(plan.Subtasks) == 0 {
+// renderPlan shows the planned subtasks inline. There is no "Execute?" gate:
+// codehalter runs inside a devcontainer, so the container is the approval and
+// every subtask is confined to it. What the user gets here is visibility, not a
+// question. Building that container is still gated (see bootstrap.go), and so
+// is anything reaching outside it. `header` names the occasion ("Plan:",
+// "Replan:", the mid-run revision notice).
+func (a *agent) renderPlan(ctx context.Context, sid, header string, subtasks []subtask) {
+	if len(subtasks) == 0 {
 		return
 	}
 	var b strings.Builder
-	b.WriteString("\n📝 Plan updated — remaining:\n")
-	for i, st := range plan.Subtasks {
+	b.WriteString(header)
+	b.WriteByte('\n')
+	for i, st := range subtasks {
 		fmt.Fprintf(&b, "%d. %s\n", i+1, st.Description)
 	}
-	b.WriteByte('\n')
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
-}
-
-func (a *agent) confirmPlan(ctx context.Context, sid string, plan *planResult, isReplan bool) error {
-	header := "Plan:"
-	if isReplan {
-		header = "Replan:"
-	}
-	if plan.ReportOnly {
-		header = "Findings:"
-	}
-	// Render the planned subtask list (header + numbered descriptions).
-	if len(plan.Subtasks) > 0 {
-		var planText strings.Builder
-		planText.WriteString(header)
-		planText.WriteByte('\n')
-		for i, st := range plan.Subtasks {
-			fmt.Fprintf(&planText, "%d. %s\n", i+1, st.Description)
-		}
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: planText.String()}})
-	}
-
-	if plan.ReportOnly {
-		return nil
-	}
-	if a.isAutopilot() {
-		return nil
-	}
-	// A user-accepted fix card already got the go-ahead — don't ask "Execute?"
-	// again; just run the install plan it dispatched.
-	if sess := a.getSession(sid); sess != nil && sess.fixAutoExec {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "[fix accepted] Running the plan.\n\n"}})
-		return nil
-	}
-
-	// Remember the plan: if the user dismisses this card (types a question
-	// instead of choosing) Prompt re-shows it after handling the typed message,
-	// so a question doesn't throw the plan away. Cleared below on any real choice.
-	if sess := a.getSession(sid); sess != nil {
-		sess.pendingPlan = plan
-	}
-
-	tcId := a.StartToolCall(ctx, sid, "How should I run these?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Execute"})
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
-
-	sess := a.getSession(sid)
-	if err != nil {
-		// Card dismissed (the user typed instead of choosing) — keep pendingPlan
-		// set so Prompt re-shows it once the typed message is handled.
-		appendAssistantNote(sess, "User dismissed the plan card.")
-		if sess != nil {
-			sess.saveOrLog()
-		}
-		return errUserCancelled
-	}
-	// A real choice was made — this plan is decided, drop the pending copy.
-	if sess != nil {
-		sess.pendingPlan = nil
-	}
-	if choice == "abort" {
-		appendAssistantNote(sess, "User declined execution.")
-		if sess != nil {
-			sess.saveOrLog()
-		}
-		return errUserCancelled
-	}
-
-	return nil
-}
-
-// reshowPendingPlan re-presents a plan whose confirmation card the user
-// dismissed earlier (by typing a question instead of choosing), now that the
-// typed message has been handled. Offers Execute (run that plan as-is, no
-// re-planning), Replan (plan again — the conversation now includes the Q&A, so
-// the question can reshape it), or Abort. No-op when nothing is pending.
-// Called from Prompt after a turn.
-func (a *agent) reshowPendingPlan(ctx context.Context, sid string) {
-	sess := a.getSession(sid)
-	if sess == nil || sess.pendingPlan == nil {
-		return
-	}
-	plan := sess.pendingPlan
-
-	if len(plan.Subtasks) > 0 {
-		var b strings.Builder
-		b.WriteString("Pending plan (from before your question):")
-		b.WriteByte('\n')
-		for i, st := range plan.Subtasks {
-			fmt.Fprintf(&b, "%d. %s\n", i+1, st.Description)
-		}
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
-	}
-
-	tcId := a.StartToolCall(ctx, sid, "Run the earlier plan now?", "think", nil)
-	choice, err := a.askChoiceAuto(ctx, sid, tcId, []string{"Execute", "Replan"})
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
-	if err != nil {
-		// Dismissed again (another question) — leave pendingPlan set for next turn.
-		return
-	}
-	sess.pendingPlan = nil
-
-	switch choice {
-	case "Execute":
-		// Hand the exact plan back to orchestrate, which skips planning + confirm.
-		sess.resumePlan = plan
-		a.runResumedTurn(ctx, sid)
-	case "Replan":
-		// Plain re-plan: the conversation (now with the Q&A) is the planner's
-		// context, so the question reshapes the new plan.
-		a.runResumedTurn(ctx, sid)
-	default: // abort
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Plan discarded.\n"}})
-	}
-}
-
-// runResumedTurn runs a turn dispatched from reshowPendingPlan and surfaces its
-// outcome (Prompt's own runTurn-error handling doesn't cover this nested turn).
-func (a *agent) runResumedTurn(ctx context.Context, sid string) {
-	if err := a.runTurn(ctx, sid); err != nil {
-		if isCancelled(err) {
-			a.sendUpdate(context.Background(), sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⏹ Turn cancelled — " + cancelReason(err) + ".\n"}})
-		} else {
-			slog.Warn("reshowPendingPlan: turn failed", "sid", sid, "err", err)
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ " + err.Error() + "\n"}})
-		}
-	}
+	a.say(ctx, sid, b.String())
 }
 
 // ---------------------------------------------------------------------------

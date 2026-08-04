@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -10,15 +11,15 @@ import (
 
 // TestRunBackgroundStaysRunning pins the core contract: a long-running command
 // returns promptly as a tracked "running" job (not waited on), its log exists,
-// and shutdownBackground reaps it and removes the log.
+// and shutdownBackground reaps it and removes the scratch files.
 func TestRunBackgroundStaysRunning(t *testing.T) {
-	a, s := newTestAgent(t)
-	defer a.shutdownBackground() // leak guard if an assertion aborts early
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground() // leak guard if an assertion aborts early
 	old := bgJobGrace
 	bgJobGrace = 100 * time.Millisecond
 	defer func() { bgJobGrace = old }()
 
-	res, failed := runBackgroundExecute(context.Background(), a, s.ID, `{"command":"sleep 5"}`)
+	res, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 5"}`)
 	if failed {
 		t.Fatalf("run_background marked the turn failed: %s", res)
 	}
@@ -26,42 +27,64 @@ func TestRunBackgroundStaysRunning(t *testing.T) {
 		t.Fatalf("expected a running job, got: %s", res)
 	}
 
-	a.bgMu.Lock()
-	n := len(a.bgJobs)
-	var logPath string
-	for _, j := range a.bgJobs {
-		logPath = j.logPath
+	h.agent.bgMu.Lock()
+	n := len(h.agent.bgJobs)
+	var job *backgroundJob
+	for _, j := range h.agent.bgJobs {
+		job = j
 	}
-	a.bgMu.Unlock()
+	h.agent.bgMu.Unlock()
 	if n != 1 {
 		t.Fatalf("expected 1 tracked job, got %d", n)
 	}
-	if _, err := os.Stat(logPath); err != nil {
+	if _, err := os.Stat(job.logPath); err != nil {
 		t.Fatalf("log file missing: %v", err)
 	}
+	// The pid is the whole point of the wrapper script: without it the model has
+	// no way to stop the job, since the client owns the process.
+	if job.pid <= 0 {
+		t.Errorf("job.pid = %d, want the pid the wrapper recorded", job.pid)
+	}
+	if !strings.Contains(res, fmt.Sprintf("kill %d", job.pid)) {
+		t.Errorf("result should tell the model how to stop it, got: %s", res)
+	}
+	// The terminal is deliberately NOT released while the job should live —
+	// releasing kills the process.
+	if job.terminalId == "" {
+		t.Error("job has no terminal id")
+	}
+	if !h.embeddedTerminal() {
+		t.Error("the background terminal was not embedded; the user sees no live output")
+	}
 
-	a.shutdownBackground()
-	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+	h.agent.shutdownBackground()
+	if _, err := os.Stat(job.logPath); !os.IsNotExist(err) {
 		t.Errorf("shutdownBackground left the log behind: %v", err)
 	}
-	a.bgMu.Lock()
-	left := len(a.bgJobs)
-	a.bgMu.Unlock()
+	if _, err := os.Stat(job.pidPath); !os.IsNotExist(err) {
+		t.Errorf("shutdownBackground left the pid file behind: %v", err)
+	}
+	if !h.sawMethod("terminal/release") {
+		t.Errorf("shutdownBackground never released the terminal; got %v", h.sentMethods())
+	}
+	h.agent.bgMu.Lock()
+	left := len(h.agent.bgJobs)
+	h.agent.bgMu.Unlock()
 	if left != 0 {
 		t.Errorf("shutdownBackground left %d jobs tracked", left)
 	}
 }
 
-// TestRunBackgroundImmediateExit pins that a command which exits during the grace
-// window is reported as a crash (with exit code + captured output) and is not left
-// in the job table.
+// TestRunBackgroundImmediateExit pins that a command which exits during the
+// grace window is reported as a crash (with exit code + captured output) and is
+// not left in the job table.
 func TestRunBackgroundImmediateExit(t *testing.T) {
-	a, s := newTestAgent(t)
+	h := newTerminalHarness(t)
 	old := bgJobGrace
-	bgJobGrace = 3 * time.Second // ample: the select returns as soon as the process exits
+	bgJobGrace = 3 * time.Second // ample: the poll returns as soon as the process exits
 	defer func() { bgJobGrace = old }()
 
-	res, failed := runBackgroundExecute(context.Background(), a, s.ID, `{"command":"echo boom; exit 3"}`)
+	res, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo boom; exit 3"}`)
 	if failed {
 		t.Fatalf("unexpected turn failure: %s", res)
 	}
@@ -71,17 +94,47 @@ func TestRunBackgroundImmediateExit(t *testing.T) {
 	if !strings.Contains(res, "boom") {
 		t.Errorf("expected captured output 'boom', got: %s", res)
 	}
-	a.bgMu.Lock()
-	n := len(a.bgJobs)
-	a.bgMu.Unlock()
+	h.agent.bgMu.Lock()
+	n := len(h.agent.bgJobs)
+	h.agent.bgMu.Unlock()
 	if n != 0 {
 		t.Errorf("crashed job left in table: %d", n)
 	}
 }
 
+// TestBackgroundLogIsReadableByRunCommand pins the assumption the whole design
+// rests on: the client's terminal and codehalter share a filesystem, so the log
+// path handed to the model is one a later `run_command: cat` can actually read.
+// If that ever stops holding, run_background silently loses its output channel.
+func TestBackgroundLogIsReadableByRunCommand(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	old := bgJobGrace
+	bgJobGrace = 300 * time.Millisecond
+	defer func() { bgJobGrace = old }()
+
+	res, _ := runBackgroundExecute(context.Background(), h.agent, h.sess.ID,
+		`{"command":"echo listening on 8765; sleep 5"}`)
+	if !strings.Contains(res, "listening on 8765") {
+		t.Fatalf("startup output not folded into the result: %s", res)
+	}
+
+	h.agent.bgMu.Lock()
+	var logPath string
+	for _, j := range h.agent.bgJobs {
+		logPath = j.logPath
+	}
+	h.agent.bgMu.Unlock()
+
+	out, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"cat `+logPath+`"}`)
+	if !strings.Contains(out, "listening on 8765") {
+		t.Errorf("cat of the job log returned %q, want the job's output", out)
+	}
+}
+
 func TestRunBackgroundRequiresCommand(t *testing.T) {
-	a, s := newTestAgent(t)
-	res, failed := runBackgroundExecute(context.Background(), a, s.ID, `{}`)
+	h := newTerminalHarness(t)
+	res, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{}`)
 	if failed || !strings.Contains(res, "command is required") {
 		t.Fatalf("expected command-required error, got: %s (failed=%v)", res, failed)
 	}

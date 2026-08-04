@@ -59,9 +59,59 @@ type AuthMethod struct {
 	Env         map[string]string `json:"env,omitempty"`
 }
 
+// ClientCapabilities is what the client told us it can do, in the initialize
+// request. Only the parts codehalter acts on are modelled; the rest of the
+// object is ignored, which is what the spec asks of an agent that doesn't use
+// a capability.
+//
+// fs is the load-bearing one: an agent may only send fs/read_text_file and
+// fs/write_text_file to a client that advertised them. Zed does, which is why
+// this went unnoticed, but a client that doesn't (and there are several ACP
+// clients now) would have failed every read_file with an RPC error. See
+// fsRead/fsWrite, which fall back to the disk path the subagent sessions
+// already use.
+type ClientCapabilities struct {
+	Fs struct {
+		ReadTextFile  bool `json:"readTextFile"`
+		WriteTextFile bool `json:"writeTextFile"`
+	} `json:"fs"`
+	Terminal bool `json:"terminal"`
+
+	// Elicitation is the client's structured-input surface. Pointers, not bools,
+	// because the spec spells "supported" as the empty object `{}` and
+	// "unsupported" as omitted-or-null — a bool can't tell those apart.
+	Elicitation *struct {
+		Form *struct{} `json:"form"`
+		URL  *struct{} `json:"url"`
+	} `json:"elicitation"`
+}
+
+// acpMCPServer is one entry of session/new's mcpServers. The wire type is a
+// union discriminated by "type", which is ABSENT for stdio (the transport every
+// agent must support) and "http"/"sse" for the two network ones. Flattening the
+// union into one struct keeps the decode trivial: the fields of the other
+// variants simply come back zero.
+type acpMCPServer struct {
+	Type    string         `json:"type"` // "" (stdio), "http", "sse"
+	Name    string         `json:"name"`
+	Command string         `json:"command"`
+	Args    []string       `json:"args"`
+	Env     []acpNameValue `json:"env"`
+	URL     string         `json:"url"`
+	Headers []acpNameValue `json:"headers"`
+}
+
+// acpNameValue is the {name, value} pair ACP uses for both env variables and
+// HTTP headers, rather than a map.
+type acpNameValue struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
 type (
 	InitializeRequest struct {
-		ProtocolVersion int `json:"protocolVersion"`
+		ProtocolVersion    int                `json:"protocolVersion"`
+		ClientCapabilities ClientCapabilities `json:"clientCapabilities"`
 	}
 	InitializeResponse struct {
 		ProtocolVersion   int `json:"protocolVersion"`
@@ -69,7 +119,21 @@ type (
 			LoadSession        bool `json:"loadSession"`
 			PromptCapabilities struct {
 				Image bool `json:"image,omitempty"`
+				// EmbeddedContext tells the client it may attach ContentBlock
+				// "resource" blocks (Zed's "@ include context": an editor selection
+				// inlined into the prompt). codehalter reads them — see ContentBlock
+				// .Resource — so withholding the flag only makes a spec-following
+				// client send less context than we can handle.
+				EmbeddedContext bool `json:"embeddedContext,omitempty"`
 			} `json:"promptCapabilities"`
+			// MCPCapabilities tells the client which MCP transports it may put in
+			// session/new's mcpServers. stdio needs no flag (every agent must
+			// support it); without http here a client silently withholds its HTTP
+			// servers, which is exactly the set offerMCPImport wants to see. No
+			// sse: codehalter's mcpTransport does stdio and Streamable HTTP only.
+			MCPCapabilities struct {
+				HTTP bool `json:"http"`
+			} `json:"mcpCapabilities"`
 			SessionCapabilities *struct {
 				List  *struct{} `json:"list,omitempty"`
 				Close *struct{} `json:"close,omitempty"`
@@ -81,6 +145,11 @@ type (
 
 	NewSessionRequest struct {
 		Cwd string `json:"cwd,omitempty"`
+		// McpServers is the MCP server list the user configured in their editor.
+		// codehalter runs its own MCP clients from .codehalter/mcp.toml rather
+		// than adopting these silently, so they're offered for import at
+		// bootstrap instead (see offerMCPImport).
+		McpServers []acpMCPServer `json:"mcpServers,omitempty"`
 	}
 	NewSessionResponse struct {
 		SessionId string            `json:"sessionId"`
@@ -93,8 +162,9 @@ type (
 	}
 
 	LoadSessionRequest struct {
-		SessionId string `json:"sessionId"`
-		Cwd       string `json:"cwd"`
+		SessionId  string         `json:"sessionId"`
+		Cwd        string         `json:"cwd"`
+		McpServers []acpMCPServer `json:"mcpServers,omitempty"`
 	}
 	LoadSessionResponse struct {
 		SessionId string            `json:"sessionId,omitempty"`
@@ -190,12 +260,23 @@ type planUpdate struct {
 
 // usageUpdate is the ACP "usage_update" session notification that drives the
 // client's context-window ring. Used is the tokens currently in context (the
-// last call's prompt_tokens); Size is the total window (per-slot n_ctx). Part
-// of ACP's unstable session-usage feature, so the shape may shift upstream.
+// last call's prompt_tokens); Size is the total window (per-slot n_ctx). Stable
+// since schema v1.17 and these two fields are the whole required shape; the
+// spec also allows an optional `cost`, which is meaningless for a local model.
 type usageUpdate struct {
 	Kind string `json:"sessionUpdate"` // "usage_update"
 	Used int    `json:"used"`
 	Size int    `json:"size"`
+}
+
+// sessionInfoUpdate is the ACP "session_info_update" notification, which is how
+// an agent names a thread: without it Zed labels every thread with its id.
+// Every field but the kind is optional and independently patchable, so sending
+// only Title leaves the client's other metadata alone.
+type sessionInfoUpdate struct {
+	Kind      string `json:"sessionUpdate"` // "session_info_update"
+	Title     string `json:"title,omitempty"`
+	UpdatedAt string `json:"updatedAt,omitempty"` // ISO 8601
 }
 
 // ---------------------------------------------------------------------------
@@ -214,15 +295,33 @@ type AgentSideConnection struct {
 	nextID    atomic.Uint64
 	pendingMu sync.Mutex
 	pending   map[string]chan json.RawMessage
+
+	// inflight tracks incoming requests that carry an id, so a client's
+	// $/cancel_request can abort one by id. Keyed by the raw id bytes as they
+	// arrived (a client may number requests 3 or "3"; echoing what we were sent
+	// is the only way the ids match).
+	inflightMu sync.Mutex
+	inflight   map[string]*inflightRequest
+}
+
+// inflightRequest is one incoming request we may still answer. cancel unblocks
+// the handler; answered makes the response single-shot, so a $/cancel_request
+// that replies -32800 immediately cannot be followed by the handler's own late
+// reply to the same id (two responses for one id is a protocol violation, and
+// clients key their pending map by id).
+type inflightRequest struct {
+	cancel   context.CancelFunc
+	answered atomic.Bool
 }
 
 func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader) *AgentSideConnection {
 	c := &AgentSideConnection{
-		w:       w,
-		r:       r,
-		agent:   a,
-		done:    make(chan struct{}),
-		pending: make(map[string]chan json.RawMessage),
+		w:        w,
+		r:        r,
+		agent:    a,
+		done:     make(chan struct{}),
+		pending:  make(map[string]chan json.RawMessage),
+		inflight: make(map[string]*inflightRequest),
 	}
 	go c.serve()
 	return c
@@ -303,6 +402,19 @@ func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, pa
 
 	select {
 	case <-ctx.Done():
+		// Tell the client to drop it. This is the half that matters for
+		// codehalter: session/request_permission and elicitation/create block on
+		// a human, so cancelling the turn while a dialog is open used to leave
+		// that dialog on screen forever, still expecting an answer we will never
+		// read. Best-effort — a client that ignores $/cancel_request is no worse
+		// off than before.
+		if err := a.writeMessage(jsonrpcRequest{
+			JSONRPC: "2.0",
+			Method:  "$/cancel_request",
+			Params:  json.RawMessage(`{"requestId":` + string(idRaw) + `}`),
+		}); err != nil {
+			slog.Debug("$/cancel_request: write failed", "id", idStr, "err", err)
+		}
 		return nil, ctx.Err()
 	case line := <-ch:
 		var resp struct {
@@ -387,22 +499,87 @@ func (a *AgentSideConnection) serve() {
 		}
 		slog.Debug("received", "method", req.Method, "raw", string(line))
 
+		// $/cancel_request must be handled ON the read loop, not in a goroutine:
+		// its whole job is to interrupt a handler that is already running, and
+		// the ordering guarantee only holds if we act before reading further.
+		if req.Method == "$/cancel_request" {
+			a.cancelInflight(&req)
+			continue
+		}
+
 		// Must be async: handlers issue outbound sendRequest calls whose
 		// responses come back through this same read loop. Running handle
 		// inline would block the loop and deadlock the response routing.
-		go func(req *jsonrpcRequest) {
-			defer func() {
-				if r := recover(); r != nil {
-					// A panic in ONE handler must not take down the process and every
-					// other session; isolate it and answer the request if it expects one.
-					slog.Error("handler panic", "method", req.Method, "panic", r, "stack", string(debug.Stack()))
-					if req.ID != nil {
-						a.replyError(req.ID, -32603, fmt.Sprintf("internal error: %v", r))
-					}
-				}
-			}()
-			a.handle(ctx, req)
-		}(&req)
+		go a.runHandler(ctx, &req)
+	}
+}
+
+// runHandler dispatches one incoming message and guarantees exactly one
+// response to an id-carrying request. Requests with an id get their own
+// cancellable context registered in a.inflight so $/cancel_request can reach
+// them; notifications share the connection context and are never registered
+// (there is nothing to cancel and no id to name them by).
+func (a *AgentSideConnection) runHandler(ctx context.Context, req *jsonrpcRequest) {
+	defer func() {
+		if r := recover(); r != nil {
+			// A panic in ONE handler must not take down the process and every
+			// other session; isolate it and answer the request if it expects one.
+			slog.Error("handler panic", "method", req.Method, "panic", r, "stack", string(debug.Stack()))
+			a.replyError(req, -32603, fmt.Sprintf("internal error: %v", r))
+		}
+	}()
+	if req.ID == nil {
+		a.handle(ctx, req)
+		return
+	}
+	key := string(*req.ID)
+	entry := &inflightRequest{}
+	ctx, entry.cancel = context.WithCancel(ctx)
+	defer entry.cancel()
+	a.inflightMu.Lock()
+	a.inflight[key] = entry
+	a.inflightMu.Unlock()
+	defer func() {
+		a.inflightMu.Lock()
+		delete(a.inflight, key)
+		a.inflightMu.Unlock()
+	}()
+	a.handle(ctx, req)
+}
+
+// cancelInflight services an inbound $/cancel_request: abort the named
+// request's context and answer it -32800 right away. We do not wait for the
+// handler to notice — a handler blocked on something that ignores ctx would
+// leave the client hanging on a request it has already given up on, and the
+// answered flag makes sure its eventual reply is dropped rather than sent as a
+// second response for the same id.
+func (a *AgentSideConnection) cancelInflight(req *jsonrpcRequest) {
+	var p struct {
+		RequestId json.RawMessage `json:"requestId"`
+	}
+	if req.Params != nil {
+		if err := json.Unmarshal(req.Params, &p); err != nil {
+			slog.Debug("$/cancel_request: malformed params", "err", err)
+			return
+		}
+	}
+	if len(p.RequestId) == 0 {
+		return
+	}
+	key := string(p.RequestId)
+	a.inflightMu.Lock()
+	entry, ok := a.inflight[key]
+	a.inflightMu.Unlock()
+	if !ok {
+		// Already finished, or an id we never saw. Both are normal races and the
+		// spec says a cancel for an unknown request is simply ignored.
+		slog.Debug("$/cancel_request: no such in-flight request", "requestId", key)
+		return
+	}
+	entry.cancel()
+	id := json.RawMessage(p.RequestId)
+	if entry.answered.CompareAndSwap(false, true) {
+		a.writeError(&id, -32800, "Request cancelled")
 	}
 }
 
@@ -486,9 +663,7 @@ func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
 		a.reply(req, struct{}{}, nil)
 
 	default:
-		if req.ID != nil {
-			a.replyError(req.ID, -32601, fmt.Sprintf("method not found: %s", req.Method))
-		}
+		a.replyError(req, -32601, fmt.Sprintf("method not found: %s", req.Method))
 	}
 }
 
@@ -500,25 +675,22 @@ func (a *AgentSideConnection) decodeParams(req *jsonrpcRequest, dst any) bool {
 		return true
 	}
 	if err := json.Unmarshal(req.Params, dst); err != nil {
-		if req.ID != nil {
-			a.replyError(req.ID, -32602, fmt.Sprintf("invalid params: %v", err))
-		}
+		a.replyError(req, -32602, fmt.Sprintf("invalid params: %v", err))
 		return false
 	}
 	return true
 }
 
 // reply finishes a handler: emit result on success, -32603 error otherwise.
-// Skips entirely when req.ID is nil (notification).
+// Skips entirely when req.ID is nil (notification) or when the request was
+// already answered -32800 by a $/cancel_request.
 func (a *AgentSideConnection) reply(req *jsonrpcRequest, result any, err error) {
 	if err != nil {
 		slog.Error("handler failed", "method", req.Method, "error", err)
-		if req.ID != nil {
-			a.replyError(req.ID, -32603, err.Error())
-		}
+		a.replyError(req, -32603, err.Error())
 		return
 	}
-	if req.ID == nil {
+	if req.ID == nil || !a.claimReply(req.ID) {
 		return
 	}
 	if werr := a.writeMessage(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}); werr != nil {
@@ -526,12 +698,35 @@ func (a *AgentSideConnection) reply(req *jsonrpcRequest, result any, err error) 
 	}
 }
 
-// replyError emits a JSON-RPC error response. We deliberately avoid -32000:
-// ACP reserves it for AUTH_REQUIRED, so using it for generic handler failures
-// makes Zed render a misleading "Authentication Required" red box (with an
-// Authenticate button) for unrelated problems — e.g. an LLM stream cancelled
-// mid-flight by the user.
-func (a *AgentSideConnection) replyError(id *json.RawMessage, code int, message string) {
+// replyError answers a request with an error, unless it is a notification or
+// was already answered. We deliberately avoid -32000: ACP reserves it for
+// AUTH_REQUIRED, so using it for generic handler failures makes Zed render a
+// misleading "Authentication Required" red box (with an Authenticate button)
+// for unrelated problems — e.g. an LLM stream cancelled mid-flight by the user.
+func (a *AgentSideConnection) replyError(req *jsonrpcRequest, code int, message string) {
+	if req.ID == nil || !a.claimReply(req.ID) {
+		return
+	}
+	a.writeError(req.ID, code, message)
+}
+
+// claimReply reserves the single response an id is allowed. Returns false when
+// something already answered it — today only cancelInflight, which wins the
+// race deliberately so the client stops waiting immediately.
+func (a *AgentSideConnection) claimReply(id *json.RawMessage) bool {
+	a.inflightMu.Lock()
+	entry, ok := a.inflight[string(*id)]
+	a.inflightMu.Unlock()
+	if !ok {
+		// Not registered (a nested or synthetic request); nothing to contend with.
+		return true
+	}
+	return entry.answered.CompareAndSwap(false, true)
+}
+
+// writeError puts an error response on the wire with no claim check. Callers
+// must already hold the right to answer this id.
+func (a *AgentSideConnection) writeError(id *json.RawMessage, code int, message string) {
 	if err := a.writeMessage(jsonrpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,

@@ -71,7 +71,7 @@ func (a *agent) discoverRunners(cwd string) {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		task := args["task"]
+		task := args.str("task")
 		parts := strings.SplitN(task, ":", 2)
 		if len(parts) != 2 {
 			return "error: task must be in format runner:target", false
@@ -100,22 +100,21 @@ func (a *agent) discoverRunners(cwd string) {
 
 		tcId := a.StartToolCall(ctx, sid, "Running: "+task, "execute", nil)
 
-		// A cancellable ctx so the scanErr guard (a >1 MB line) can SIGKILL a wedged
-		// runner. No idle watchdog (0): a build can legitimately go quiet (linking,
-		// fetching deps) and must not be reaped; the decoupled drain + bounded
-		// capture still apply, so a chatty build can neither deadlock nor flood.
-		cmdCtx, cancelCmd := context.WithCancel(ctx)
-		defer cancelCmd()
-		cmd := exec.CommandContext(cmdCtx, runner.Command, runner.Args(target)...)
-		cmd.Dir = sess.Cwd
-		detachGroup(cmd) // group-kill on cancel reaps any subprocess the runner spawned
-
-		out, runErr, started, _ := a.runStreamingCmd(ctx, sid, task, cmd, cancelCmd, 0)
+		// No idle watchdog (0): a build can legitimately go quiet (linking, fetching
+		// deps) and must not be reaped. The runner is an argv already, so it goes to
+		// the terminal as-is with no shell in between.
+		out, exit, started, err := a.runTerminalCmd(ctx, sid, tcId, runner.Command, runner.Args(target), sess.Cwd, 0)
 		if !started {
-			a.FailToolCall(ctx, sid, tcId, runErr.Error())
+			a.FailToolCall(ctx, sid, tcId, err.Error())
 			// Couldn't even start the runner: a real failure, not a non-zero exit.
 			// Flag it so verify catches it.
-			return "error starting task: " + runErr.Error(), true
+			return "error starting task: " + err.Error(), true
+		}
+		// A cancelled or client-broken run is a failure too, and its reason reads
+		// where an exit status would.
+		runErr := err
+		if runErr == nil && exit.code() != 0 {
+			runErr = fmt.Errorf("exit status %d", exit.code())
 		}
 
 		// Surface a non-zero exit (or a kill) unambiguously: a banner at the TOP and

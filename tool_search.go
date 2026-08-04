@@ -40,12 +40,12 @@ func init() {
 		if sess == nil {
 			return "error: no session", false
 		}
-		query := args["query"]
+		query := args.str("query")
 		if query == "" {
 			return "error: query is empty", false
 		}
-		multiline := args["multiline"] == "true"
-		useRegex := multiline || args["regex"] == "true"
+		multiline := args.flag("multiline")
+		useRegex := multiline || args.flag("regex")
 
 		var re *regexp.Regexp
 		matcher := func(s string) bool { return strings.Contains(s, query) }
@@ -60,7 +60,7 @@ func init() {
 
 		root := sess.Cwd
 		dir := root
-		subdir := args["path"]
+		subdir := args.str("path")
 		if subdir != "" {
 			resolved, err := a.resolvePath(sid, subdir)
 			if err != nil {

@@ -4,79 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
-	"time"
 )
-
-// TestRunCmdIdleTimeout pins the idle watchdog: a command that prints nothing is
-// SIGKILLed after cmdIdleTimeout instead of parking the turn until the process
-// exits or the user cancels.
-func TestRunCmdIdleTimeout(t *testing.T) {
-	a, s := newTestAgent(t)
-	old := cmdIdleTimeout
-	cmdIdleTimeout = 100 * time.Millisecond
-	defer func() { cmdIdleTimeout = old }()
-
-	start := time.Now()
-	out, _ := runCmdExecute(context.Background(), a, s.ID, `{"command":"sleep 10"}`)
-	if elapsed := time.Since(start); elapsed > 3*time.Second {
-		t.Errorf("silent command should be reaped fast, took %s", elapsed)
-	}
-	if !strings.Contains(out, "timed out") {
-		t.Errorf("expected a timeout note, got: %s", out)
-	}
-}
-
-// TestRunCommandReapsBackgroundChild pins the foreground-done-but-child-alive
-// detection: a command that backgrounds a long-lived process returns PROMPTLY
-// (not after the idle timeout), the child is reaped, and the result steers the
-// model to run_background. This is the case that used to wedge the turn forever.
-func TestRunCommandReapsBackgroundChild(t *testing.T) {
-	a, s := newTestAgent(t)
-	oldGrace, oldIdle := bgLingerGrace, cmdIdleTimeout
-	bgLingerGrace = 20 * time.Millisecond
-	cmdIdleTimeout = 30 * time.Second // far longer than the test: prove we don't wait for it
-	defer func() { bgLingerGrace, cmdIdleTimeout = oldGrace, oldIdle }()
-
-	start := time.Now()
-	out, failed := runCmdExecute(context.Background(), a, s.ID, `{"command":"sleep 30 & echo started"}`)
-	elapsed := time.Since(start)
-
-	if failed {
-		t.Fatalf("unexpected failed=true: %s", out)
-	}
-	if elapsed > 5*time.Second {
-		t.Fatalf("did not return promptly after the foreground exited: took %s", elapsed)
-	}
-	if !strings.Contains(out, "started") {
-		t.Errorf("expected foreground output 'started', got: %s", out)
-	}
-	if !strings.Contains(out, "run_background") {
-		t.Errorf("expected a run_background hint after reaping the child, got: %s", out)
-	}
-}
-
-// TestRunCmdCapturesFullOutput pins that the decoupled drain captures a
-// high-volume command's full output. The old per-line sendUpdate path streamed
-// through a synchronous io.Pipe, so a chatty command could deadlock behind a
-// slow editor; the drain never blocks on the editor (nil conn here makes
-// sendUpdate a no-op), so the command runs to completion and all of it is
-// collected.
-func TestRunCmdCapturesFullOutput(t *testing.T) {
-	a, s := newTestAgent(t)
-	out, failed := runCmdExecute(context.Background(), a, s.ID, `{"command":"seq 1 5000"}`)
-	if failed {
-		t.Fatalf("run_command returned failed=true: %.100s", out)
-	}
-	if !strings.HasPrefix(out, "exit 0") {
-		t.Errorf("missing exit code header: %.80s", out)
-	}
-	if !strings.Contains(out, "\n1\n") || !strings.Contains(out, "\n5000\n") {
-		t.Error("output not fully captured (want lines 1 and 5000)")
-	}
-	if n := strings.Count(out, "\n"); n < 5000 {
-		t.Errorf("expected >= 5000 newlines, got %d", n)
-	}
-}
 
 // TestBoundedOutput pins the head+tail capture: small streams come back verbatim,
 // streams up to headCap+tailCap stitch without duplicating or dropping the
@@ -130,33 +58,89 @@ func TestBoundedOutput(t *testing.T) {
 	}
 }
 
-// TestRunCmdCapsHugeOutput pins the total-output cap: a command that streams far
-// more than cmdOutputCap is captured to a bounded head+tail with an elision
-// marker (so it can't poison a small-context model or grow memory without limit),
-// while the command still runs to completion.
-func TestRunCmdCapsHugeOutput(t *testing.T) {
-	a, s := newTestAgent(t)
-	oldCap, oldEd := cmdOutputCap, editorStreamCap
-	cmdOutputCap, editorStreamCap = 4096, 8192
-	defer func() { cmdOutputCap, editorStreamCap = oldCap, oldEd }()
+// TestRunCommandEndToEnd pins what run_command hands back and what it leaves in
+// the card: the exit code leads the result (a probe exiting non-zero is data,
+// not a failure), the output is there, and the card keeps the live terminal
+// instead of a static text copy of it.
+func TestRunCommandEndToEnd(t *testing.T) {
+	h := newTerminalHarness(t)
 
-	out, failed := runCmdExecute(context.Background(), a, s.ID, `{"command":"seq 1 20000"}`)
+	result, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo hi; exit 2"}`)
 	if failed {
-		t.Fatalf("failed=true: %.100s", out)
+		t.Fatalf("failed = true, want false (a non-zero exit must not fail the turn)")
 	}
-	if !strings.HasPrefix(out, "exit 0") {
-		t.Errorf("missing exit header: %.80s", out)
+	if !strings.HasPrefix(result, "exit 2\n") {
+		t.Errorf("result = %q, want it to start with the exit code", result)
 	}
-	if !strings.Contains(out, "bytes omitted") {
-		t.Errorf("over-cap output should carry an elision marker: %.200s", out)
+	if !strings.Contains(result, "hi") {
+		t.Errorf("result = %q, want the command output", result)
 	}
-	if len(out) > cmdOutputCap+1024 {
-		t.Errorf("captured output not bounded: %d bytes (cap %d)", len(out), cmdOutputCap)
+
+	done := h.waitForStatus("completed")
+	if done == nil {
+		t.Fatal("the tool call was never completed")
 	}
-	if !strings.Contains(out, "\n1\n") {
+	if _, ok := done["content"]; ok {
+		t.Errorf("completing update carries content %v, want it omitted so the terminal stays visible", done["content"])
+	}
+	if done["title"] != "Run: echo hi; exit 2 (exit 2)" {
+		t.Errorf("title = %v, want the exit code in it", done["title"])
+	}
+	if !h.embeddedTerminal() {
+		t.Error("no update embedded the terminal; the user would see an empty card")
+	}
+}
+
+// TestRunCommandIsAShellLine pins that the model's command keeps shell
+// semantics. terminal/create takes an argv, so run_command has to wrap it in
+// bash -c; without that, every pipe, redirect and `&&` would break.
+func TestRunCommandIsAShellLine(t *testing.T) {
+	h := newTerminalHarness(t)
+
+	result, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID,
+		`{"command":"echo one && echo two | tr a-z A-Z"}`)
+	if !strings.Contains(result, "one") || !strings.Contains(result, "TWO") {
+		t.Errorf("result = %q, want both the && and the pipe to have run", result)
+	}
+}
+
+// TestRunCommandCapsHugeOutput pins the total-output cap: a command that prints
+// far more than cmdOutputCap comes back as a bounded head+tail with an elision
+// marker, so it can't poison a small-context model — while still running to
+// completion, with both its first and last lines intact.
+func TestRunCommandCapsHugeOutput(t *testing.T) {
+	h := newTerminalHarness(t)
+	saved := cmdOutputCap
+	cmdOutputCap = 4096
+	t.Cleanup(func() { cmdOutputCap = saved })
+
+	result, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"seq 1 20000"}`)
+	if failed {
+		t.Fatalf("failed=true: %.100s", result)
+	}
+	if !strings.HasPrefix(result, "exit 0") {
+		t.Errorf("missing exit header: %.80s", result)
+	}
+	if !strings.Contains(result, "bytes omitted") {
+		t.Errorf("over-cap output should carry an elision marker: %.200s", result)
+	}
+	if len(result) > cmdOutputCap+1024 {
+		t.Errorf("captured output not bounded: %d bytes (cap %d)", len(result), cmdOutputCap)
+	}
+	if !strings.Contains(result, "\n1\n") {
 		t.Error("head lost: want early line 1")
 	}
-	if !strings.Contains(out, "\n20000\n") {
+	if !strings.Contains(result, "\n20000\n") {
 		t.Error("tail lost: want final line 20000")
+	}
+}
+
+// TestRunCommandRequiresCommand pins the empty-args guard, which the local
+// models hit often enough to matter.
+func TestRunCommandRequiresCommand(t *testing.T) {
+	h := newTerminalHarness(t)
+	res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{}`)
+	if failed || !strings.Contains(res, "command is required") {
+		t.Fatalf("expected command-required error, got: %s (failed=%v)", res, failed)
 	}
 }

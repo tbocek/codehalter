@@ -1030,12 +1030,18 @@ func (a *agent) connForSession(_ context.Context, sid string, role string) *LLMC
 }
 
 // connForBackgroundLLM returns the connection to host background work (the
-// per-turn summariser). It walks the background tier LLM[1..x] and
-// returns the first with free semaphore capacity, spreading load across servers
-// instead of stacking on LLM[1]. If all are busy (or none exist) it falls back
-// to LLM[0], labelled llm[1] when that conn has >=2 slots so the meter shows the
-// work routed off the foreground turn. The capacity peek is racy by design —
-// llmStream's semaphore just queues if the slot was taken meanwhile.
+// per-turn summariser). It walks the entries marked `purpose = "summary"` and
+// returns the first with free semaphore capacity, so marking several spreads
+// load across them instead of stacking on one. If all are busy (or none are
+// marked) it falls back to LLM[0], labelled llm[1] when that conn has >=2 slots
+// so the meter shows the work routed off the foreground turn. The capacity peek
+// is racy by design — llmStream's semaphore just queues if the slot was taken
+// meanwhile; falling back rather than queueing keeps a busy summariser conn from
+// stalling the turn's note behind somebody else's call.
+//
+// Index 0 is skipped in the walk because the fallback below already lands there
+// with the right display slot, so `purpose = "summary"` on LLM[0] means the same
+// thing as not marking anything.
 //
 // The second return reports that fallback: true means the call will land on
 // the server whose KV cache holds the foreground conversation. Callers use it
@@ -1046,13 +1052,16 @@ func (a *agent) connForBackgroundLLM() (*LLMConnection, bool) {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
 	for i := 1; i < len(a.settings.LLM); i++ {
+		if !strings.EqualFold(a.settings.LLM[i].Purpose, purposeSummary) {
+			continue
+		}
 		if i < len(a.connSems) && a.connSems[i] != nil &&
 			len(a.connSems[i]) < cap(a.connSems[i]) {
 			return a.settings.ConnAt(i, "execute"), false
 		}
 	}
-	// No separate background entry (or all busy): fall back to llm[0]. When it
-	// has >= 2 parallel slots, label this as llm[1] — same connection and
+	// No entry designated for the summariser (or all busy): fall back to llm[0].
+	// When it has >= 2 parallel slots, label this as llm[1] — same connection and
 	// semaphore, but a distinct display slot so the meter shows background
 	// routed off the foreground turn (the server picks the real KV slot).
 	c := a.settings.ConnAt(0, "execute")

@@ -155,7 +155,7 @@ func (a *agent) registerSubagentTool() {
 			h := subagentTaskHash(task)
 			if cached, ok := sess.recallSubagent(h); ok {
 				results[i] = subagentResult{Index: i, Success: true, Result: cached}
-				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[subagent %d] Reusing prior result for identical task\n\n", i+1)}})
+				ag.say(ctx, sid, fmt.Sprintf("[subagent %d] Reusing prior result for identical task\n\n", i+1))
 				continue
 			}
 			if p, ok := uniq[h]; ok {
@@ -219,7 +219,7 @@ func (a *agent) registerSubagentTool() {
 			ag.putSession(subSess)
 			defer ag.deleteSession(subSess.ID)
 
-			ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[%s] Starting: %s\n\n", subSess.DisplayLabel, truncate(task.Instructions, 100))}})
+			ag.say(ctx, sid, fmt.Sprintf("[%s] Starting: %s\n\n", subSess.DisplayLabel, truncate(task.Instructions, 100)))
 
 			// All internal plan/execute/verify calls use the subagent's own
 			// session id. That keeps plan steps, tool uses, and assistant
@@ -247,9 +247,9 @@ func (a *agent) registerSubagentTool() {
 			mu.Unlock()
 
 			if len(p.indices) > 1 {
-				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[%s] Done (shared with %d duplicate task(s))\n\n", subSess.DisplayLabel, len(p.indices)-1)}})
+				ag.say(ctx, sid, fmt.Sprintf("[%s] Done (shared with %d duplicate task(s))\n\n", subSess.DisplayLabel, len(p.indices)-1))
 			} else {
-				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[%s] Done\n\n", subSess.DisplayLabel)}})
+				ag.say(ctx, sid, fmt.Sprintf("[%s] Done\n\n", subSess.DisplayLabel))
 			}
 		}
 		runBatch := func(hs []string) {
@@ -288,7 +288,7 @@ func (a *agent) registerSubagentTool() {
 				if !ag.foldHistory(ctx, sess, keepFrom(sess)) {
 					continue // nothing freed at this step — escalate to the next
 				}
-				ag.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ %d subagent(s) hit the context limit — compacted the conversation, relaunching.\n", len(retry))}})
+				ag.say(ctx, sid, fmt.Sprintf("⚠ %d subagent(s) hit the context limit — compacted the conversation, relaunching.\n", len(retry)))
 				runBatch(retry)
 			}
 		}

@@ -17,6 +17,10 @@ import (
 // per-role with `max_tokens` inside params_thinking / params_execute.
 const defaultMaxTokens = 8192
 
+// purposeSummary is the [[llm]] `purpose` value that hosts the per-turn
+// summariser (see LLMConnection.Purpose and connForBackgroundLLM).
+const purposeSummary = "summary"
+
 type Settings struct {
 	// LLM is the ordered list of OpenAI-compatible endpoints codehalter can
 	// dispatch to. LLM[0] is the "main" connection: the foreground session
@@ -88,7 +92,23 @@ type LLMConnection struct {
 	// is seeded to .codehalter/skills/ so switching models is a settings edit
 	// away. Empty = generic skills. Only LLM[0]'s variant is used (the
 	// foreground session runs there).
-	SkillVariant   string         `toml:"skill_variant,omitempty"`
+	SkillVariant string `toml:"skill_variant,omitempty"`
+
+	// Purpose designates which non-foreground work routes to this entry.
+	// "summary" (the only value today) sends the per-turn summariser here
+	// instead of LLM[0]. Empty means no designated background work — the entry
+	// is still a subagent fan-out target, which is what most extras are.
+	//
+	// Named explicitly rather than inferred as "the first free entry after
+	// LLM[0]", because those are different jobs. Once there are two extras the
+	// inferred rule sends the summariser to whichever happens to be idle: a
+	// small fast model on one turn, a slow reasoning model the next, and it
+	// quietly consumes a slot meant for subagent fan-out. Naming the entry makes
+	// the routing stable and lets the summariser live on a machine picked for
+	// it. Marking LLM[0] is allowed and simply means "summarise on the main
+	// conn", which is also what no marking at all yields.
+	Purpose string `toml:"purpose,omitempty"`
+
 	Parallel       *int           `toml:"parallel,omitempty"`
 	Params         map[string]any `toml:"params,omitempty"`
 	ParamsThinking map[string]any `toml:"params_thinking,omitempty"`
@@ -239,13 +259,31 @@ type GlobalConfig struct {
 // loadGlobalConfig reads ~/.config/codehalter/global.toml, best-effort. A missing
 // or unreadable file yields the zero value (all false), the safe default —
 // codehalter just won't add the corresponding optional mount.
+//
+// Best-effort means the zero value is always returned, never an error, but NOT
+// that the failure goes unmentioned: absence is the normal case (install.sh may
+// not have run) and stays silent, while a file that exists and fails to parse is
+// a real misconfiguration. Silently treating it as "no gitconfig on the host"
+// sends you debugging a devcontainer bind mount instead of a typo, the same
+// misdiagnosis decodeSettings warns about below.
 func loadGlobalConfig() GlobalConfig {
 	var g GlobalConfig
 	home, err := os.UserHomeDir()
 	if err != nil {
+		slog.Warn("loadGlobalConfig: no home directory; optional host mounts disabled", "err", err)
 		return g
 	}
-	_, _ = toml.DecodeFile(filepath.Join(home, ".config", "codehalter", "global.toml"), &g)
+	path := filepath.Join(home, ".config", "codehalter", "global.toml")
+	md, err := toml.DecodeFile(path, &g)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("loadGlobalConfig: unreadable global config (ignored — optional host mounts disabled)", "file", path, "err", err)
+		}
+		return GlobalConfig{}
+	}
+	for _, key := range md.Undecoded() {
+		slog.Warn("unknown global config key (ignored — check for a typo)", "key", key.String(), "file", path)
+	}
 	return g
 }
 
@@ -265,6 +303,14 @@ func decodeSettings(path string) (Settings, error) {
 	}
 	if s.Skills != "" && s.Skills != "inline" && s.Skills != "auto" {
 		slog.Warn("unknown skills value (falling back to \"auto\")", "value", s.Skills, "file", path)
+	}
+	// A typo'd purpose is silent otherwise: the entry just never receives the
+	// summariser and the work stays on LLM[0], which looks like the flag not
+	// working rather than the flag not being read.
+	for i := range s.LLM {
+		if p := s.LLM[i].Purpose; p != "" && !strings.EqualFold(p, purposeSummary) {
+			slog.Warn("unknown llm purpose (ignored — the only value is \"summary\")", "purpose", p, "llm", i, "file", path)
+		}
 	}
 	s.path = path
 	return s, nil

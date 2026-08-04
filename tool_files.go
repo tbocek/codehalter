@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 )
 
@@ -445,7 +444,7 @@ func init() {
 		}
 		root := sess.Cwd
 		dir := root
-		if subdir := args["path"]; subdir != "" {
+		if subdir := args.str("path"); subdir != "" {
 			resolved, err := a.resolvePath(sid, subdir)
 			if err != nil {
 				return "error: " + err.Error(), false
@@ -500,24 +499,25 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		path, err := a.resolvePath(sid, args["path"])
+		path, err := a.resolvePath(sid, args.str("path"))
 		if err != nil {
 			return "error: " + err.Error(), false
 		}
 		start := 1
-		if v, e := strconv.Atoi(args["line"]); e == nil && v > 0 {
-			start = v
+		line, haveLine := args.num("line")
+		if haveLine && line > 0 {
+			start = line
 		}
 		maxLines := readChunkLines
-		if v, e := strconv.Atoi(args["limit"]); e == nil && v > 0 {
+		if v, ok := args.num("limit"); ok && v > 0 {
 			maxLines = v
 			if maxLines > maxReadLines {
 				maxLines = maxReadLines
 			}
 		}
 		title := "Reading: " + path
-		if args["line"] != "" {
-			title = fmt.Sprintf("Reading: %s:%s", path, args["line"])
+		if haveLine {
+			title = fmt.Sprintf("Reading: %s:%d", path, line)
 		}
 		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
 		return a.serveRead(ctx, sid, path, start, maxLines, tcId)
@@ -538,7 +538,7 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		path, err := a.resolvePath(sid, args["path"])
+		path, err := a.resolvePath(sid, args.str("path"))
 		if err != nil {
 			return "error: " + err.Error(), false
 		}
@@ -570,14 +570,14 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		if argIsNonString(rawArgs, "content") {
+		if args.wrongType("content") {
 			return "error: `content` must be a JSON string. You sent a non-string value, which would be coerced to an empty string and ERASE the file. Resend with the full file content as a quoted string.", false
 		}
-		path, err := a.resolvePath(sid, args["path"])
+		path, err := a.resolvePath(sid, args.str("path"))
 		if err != nil {
 			return "error: " + err.Error(), false
 		}
-		newContent := args["content"]
+		newContent := args.str("content")
 		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
 		// Pre-edit read for the diff card + formatGuarded's dry run. A missing file
@@ -622,15 +622,15 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		if argIsNonString(rawArgs, "old_text") || argIsNonString(rawArgs, "new_text") {
+		if args.wrongType("old_text") || args.wrongType("new_text") {
 			return "error: `old_text` and `new_text` must be JSON strings; a non-string value is coerced to \"\" and would mis-edit the file. Resend them quoted (use \"\" only to intentionally delete old_text).", false
 		}
-		path, err := a.resolvePath(sid, args["path"])
+		path, err := a.resolvePath(sid, args.str("path"))
 		if err != nil {
 			return "error: " + err.Error(), false
 		}
-		oldText := args["old_text"]
-		newText := args["new_text"]
+		oldText := args.str("old_text")
+		newText := args.str("new_text")
 
 		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
@@ -701,10 +701,13 @@ func init() {
 // honour unsaved buffer state. Subagent sessions were never announced to
 // Zed (newSubagentSession just mints an id locally), so an ACP read would
 // hit -32603 Internal error — we fall back to direct disk I/O for them.
+// A client that did not advertise fs.readTextFile takes the same fallback:
+// ACP forbids sending it a method it never claimed to implement.
 // line/limit are optional: pass nil for both to read the whole file, or
 // non-nil pointers to bound the response to a 1-indexed line window.
 func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit *int) (string, error) {
-	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
+	sess := a.getSession(sid)
+	if (sess != nil && sess.Depth > 0) || !a.clientCan("read") {
 		return directRead(path, line, limit)
 	}
 	raw, err := a.conn.sendRequest(ctx, "fs/read_text_file", struct {
@@ -725,11 +728,14 @@ func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit 
 	return resp.Content, nil
 }
 
-// fsWrite writes a text file. Same subagent fallback as fsRead — Zed has no
-// record of a sub_* session id, so ACP writes are dead and we go straight
-// to disk. Any cached read-dedup entries for this path are dropped here
-// because the file just changed — a subsequent read_file must run.
+// fsWrite writes a text file. Same subagent and capability fallbacks as
+// fsRead — Zed has no record of a sub_* session id, so ACP writes are dead
+// and we go straight to disk. Any cached read-dedup entries for this path
+// are dropped here because the file just changed — a subsequent read_file
+// must run. That invalidation happens before either fallback, so it holds
+// for every path through this function.
 func fsWrite(a *agent, ctx context.Context, sid string, path, content string) error {
+	direct := !a.clientCan("write")
 	if sess := a.getSession(sid); sess != nil {
 		sess.readDedupMu.Lock()
 		for k := range sess.readDedup {
@@ -743,9 +749,10 @@ func fsWrite(a *agent, ctx context.Context, sid string, path, content string) er
 		sess.readCursorMu.Lock()
 		delete(sess.readCursor, path)
 		sess.readCursorMu.Unlock()
-		if sess.Depth > 0 {
-			return os.WriteFile(path, []byte(content), 0644)
-		}
+		direct = direct || sess.Depth > 0
+	}
+	if direct {
+		return os.WriteFile(path, []byte(content), 0644)
 	}
 	_, err := a.conn.sendRequest(ctx, "fs/write_text_file", struct {
 		SessionId string `json:"sessionId"`

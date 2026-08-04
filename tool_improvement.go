@@ -251,7 +251,7 @@ func init() {
 // stops a weak model from skipping the approval.
 func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
-	improvementsJSON := args["improvements"]
+	improvementsJSON := args.str("improvements")
 	if improvementsJSON == "" {
 		return "error: improvements is required (a JSON array of changes)", true
 	}
@@ -287,7 +287,7 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 		fmt.Fprintf(&summary, "(%d further proposal(s) beyond the top %d were not shown)\n", dropped, improveAskCap)
 	}
 	for i, e := range improvements {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n" + renderImprovement(i+1, len(improvements), e) + "\n"}})
+		a.say(ctx, sid, "\n"+renderImprovement(i+1, len(improvements), e)+"\n")
 		ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Apply %d/%d: %s", i+1, len(improvements), e.Title), "edit", "Apply", "Skip")
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
@@ -330,7 +330,7 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Kept local")})
 		return fmt.Sprintf("✅ Applied %d improvement(s); kept local (not submitted).\n\n%s", len(applied), summary.String()), false
 	}
-	result := a.submitImprovements(ctx, sess.Cwd, args["endpoint"], applied)
+	result := a.submitImprovements(ctx, sess.Cwd, args.str("endpoint"), applied)
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
 	return fmt.Sprintf("✅ Applied %d improvement(s); %s.\n\n%s", len(applied), result, summary.String()), false
 }

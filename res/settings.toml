@@ -19,10 +19,13 @@ parallel = 1                      # max concurrent calls to this server
 params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 16384 }
 params_execute = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 8192, chat_template_kwargs = { enable_thinking = false } }
 
-# More [[llm]] entries fan out subagents and host the summariser off llm[0]:
+# More [[llm]] entries fan out subagents. Add purpose = "summary" to one of them
+# to move the per-turn summariser off llm[0] as well — without it, summarising
+# runs on llm[0] (extending the foreground prefix rather than evicting it).
 # [[llm]]
 # server = "http://other-server:9001"
 # model = "your-larger-model-id"
+# purpose = "summary"             # host the per-turn summariser here
 # parallel = 3
 # params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 16384 }
 # params_execute = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 8192, chat_template_kwargs = { enable_thinking = false } }

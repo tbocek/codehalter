@@ -167,6 +167,10 @@ type Session struct {
 	Depth     int       `toml:"depth,omitempty"`
 	ParentID  string    `toml:"parent_id,omitempty"`
 	Summary   string    `toml:"summary,omitempty"`
+	// Title is the thread name shown in the client, derived from the first user
+	// message (see setSessionTitle). Persisted so a reloaded thread keeps the
+	// name it was given instead of reverting to its id.
+	Title string `toml:"title,omitempty"`
 	// SystemPrompt holds the rendered skills + project context that leads
 	// every LLM call. Set on the first user turn (see Prompt) and refreshed
 	// after each foldHistory rotation — so it survives the summariser
@@ -184,6 +188,10 @@ type Session struct {
 	// shows them — they exist only to feed the next compaction.
 	Shadow   []string `toml:"shadow,omitempty"`
 	filePath string
+	// mcpOffer holds the editor's own MCP server list, as it arrived on
+	// session/new. Not persisted: it's the client's configuration, re-sent on
+	// every connect, and offerMCPImport consumes it once at bootstrap.
+	mcpOffer []acpMCPServer
 	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
 	// phaseActive=true means a phase entry is showing as in_progress and
 	// must be marked completed before Prompt returns; phaseCurrent is the
@@ -278,14 +286,6 @@ type Session struct {
 	// Same lifecycle as readDedup: reset at the top of Prompt(). In-memory only.
 	editFailedPathsMu sync.Mutex
 	editFailedPaths   map[string]bool
-	// pendingPlan holds a plan whose "Execute / Abort" card the user
-	// dismissed by typing (e.g. asking a question) instead of choosing. Prompt
-	// re-shows it after the typed message is handled, so a question doesn't throw
-	// the plan away. resumePlan is that plan handed back to orchestrate when the
-	// user picks Execute on the re-show, so it runs without re-planning. Both are
-	// foreground-turn-only (no background goroutine touches them), so unguarded.
-	pendingPlan *planResult
-	resumePlan  *planResult
 	// One turn per session. turnMu is held across the whole turn; a new prompt
 	// cancelTurn()s the in-flight one then Lock()s here, so turns never overlap
 	// (overlap raced compaction → two divergent context snapshots). turnCancel is
@@ -298,10 +298,6 @@ type Session struct {
 	turnCancelMu sync.Mutex
 	turnCancel   context.CancelFunc
 	superseding  bool
-	// fixAutoExec is set while a user-accepted fix card is being dispatched: the
-	// user already approved on the card, so confirmPlan skips its "Execute?" gate
-	// for that turn. Foreground-turn-only, so unguarded like the plans above.
-	fixAutoExec bool
 	// improving marks the current turn as an /improve run. It does double duty,
 	// since both effects begin and end with the same /improve turn: (1) the
 	// per-change ask_user Apply/Skip prompts are capped to improveAskCap in code so

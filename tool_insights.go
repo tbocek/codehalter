@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 )
 
@@ -277,7 +276,7 @@ func init() {
 				"type": "object",
 				"properties": map[string]any{
 					"sessions": map[string]any{
-						"type":        "string",
+						"type":        "integer",
 						"description": "How many of the most recent session logs to analyze (default 3, max 10).",
 					},
 					"file": map[string]any{
@@ -299,17 +298,15 @@ func insightsExecute(ctx context.Context, a *agent, sid string, rawArgs string) 
 	dir := filepath.Join(sess.Cwd, ".codehalter")
 
 	var paths []string
-	if f := strings.TrimSpace(args["file"]); f != "" {
+	if f := strings.TrimSpace(args.str("file")); f != "" {
 		if strings.ContainsAny(f, `/\`) {
 			return "error: file must be a bare session_*.log filename", true
 		}
 		paths = []string{filepath.Join(dir, f)}
 	} else {
 		n := 3
-		if v := strings.TrimSpace(args["sessions"]); v != "" {
-			if p, err := strconv.Atoi(v); err == nil && p >= 1 {
-				n = min(p, 10)
-			}
+		if p, ok := args.num("sessions"); ok && p >= 1 {
+			n = min(p, 10)
 		}
 		matches, _ := filepath.Glob(filepath.Join(dir, "session_*.log"))
 		sort.Slice(matches, func(i, j int) bool { // newest first, by mtime

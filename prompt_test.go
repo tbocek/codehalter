@@ -8,21 +8,6 @@ import (
 	"testing"
 )
 
-// TestConfirmPlanFixAutoExecSkipsGate pins that a user-accepted fix dispatch
-// (fixAutoExec set) skips confirmPlan's "Execute?" gate. Every fix card —
-// missing-tools/npm, lsmcp, mcp errors — routes through proposeFix, which sets
-// the flag, so this one check covers them all. With a nil conn, reaching the
-// gate would call conn.AskChoice and panic; returning nil proves it was skipped.
-func TestConfirmPlanFixAutoExecSkipsGate(t *testing.T) {
-	a, s := newTestAgent(t)
-	plan := &planResult{Subtasks: []subtask{{Description: "install npm + prettier"}}}
-
-	s.fixAutoExec = true
-	if err := a.confirmPlan(context.Background(), s.ID, plan, false); err != nil {
-		t.Errorf("fixAutoExec set: confirmPlan should skip the gate and return nil, got %v", err)
-	}
-}
-
 // TestSubagentStatusFolding pins the subagent-meter fold: a subagent's live
 // status (which Zed would otherwise drop with its sub_* sid) is recorded under
 // its parent and rendered as a compact, labelled, sorted join on the parent's
@@ -250,5 +235,66 @@ func TestSystemPromptIncludesAgentsFile(t *testing.T) {
 	}
 	if !strings.Contains(sp, "## Project instructions (AGENTS.md)") || !strings.Contains(sp, "Always use tabs.") {
 		t.Errorf("system prompt should fold in AGENTS.md:\n%s", sp)
+	}
+}
+
+// TestDeriveTitle pins the thread-naming rules: one line, whitespace collapsed,
+// cut on a word boundary. The title goes to the client as session_info_update
+// and is all the user sees in their thread list, so a mid-word cut or a title
+// containing half a pasted stack trace is the visible failure.
+func TestDeriveTitle(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"short prompt is used as-is", "Fix the login bug", "Fix the login bug"},
+		{"leading blank lines skipped", "\n\n  Add a healthcheck  ", "Add a healthcheck"},
+		{"only the first line", "Update the parser\n\nIt panics on empty input.", "Update the parser"},
+		{"runs of whitespace collapse", "Add   a\ttest", "Add a test"},
+		{"macro name survives", "/improve", "/improve"},
+		{"no text at all", "\n  \n", ""},
+		{
+			"long prompt cut on a word boundary",
+			"Please refactor the terminal watchdog so that it polls the client instead of streaming",
+			"Please refactor the terminal watchdog so that it polls the…",
+		},
+		{
+			"unbreakable token is cut mid-token rather than vanishing",
+			strings.Repeat("x", 100),
+			strings.Repeat("x", sessionTitleMax) + "…",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := deriveTitle(tc.in); got != tc.want {
+				t.Errorf("deriveTitle(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSetSessionTitleAnnouncesOnce pins that the thread name reaches the client
+// as a session_info_update and is not re-sent when it hasn't changed — a
+// notification per turn would make the client re-render the thread list for
+// nothing.
+func TestSetSessionTitleAnnouncesOnce(t *testing.T) {
+	h := newTerminalHarness(t)
+
+	h.agent.setSessionTitle(context.Background(), h.sess, "Wire up the MCP import")
+	u := h.waitForKind("session_info_update")
+	if u == nil {
+		t.Fatalf("no session_info_update sent; got %v", h.sentUpdates())
+	}
+	if u["title"] != "Wire up the MCP import" {
+		t.Errorf("title = %v, want the first line of the prompt", u["title"])
+	}
+	if h.sess.Title != "Wire up the MCP import" {
+		t.Errorf("sess.Title = %q, want it persisted on the session", h.sess.Title)
+	}
+
+	h.agent.setSessionTitle(context.Background(), h.sess, "Wire up the MCP import")
+	h.waitFor(func() bool { return len(h.updatesOfKind("session_info_update")) > 1 })
+	if n := len(h.updatesOfKind("session_info_update")); n != 1 {
+		t.Errorf("sent %d session_info_updates, want 1 — the title didn't change", n)
 	}
 }

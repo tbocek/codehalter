@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	_ "embed"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -18,23 +17,38 @@ import (
 )
 
 // Fix-card prompts — the message dispatched to the executor when the user
-// accepts a 🟡 card. Kept as markdown in res/ (not Go string literals) so the
-// wording is editable without code spelunking; the %s/%q holes are filled by
-// fmt.Sprintf at the call site. Each is a THIN trigger — the actual how-to
-// lives in the SKILL it points at (already in the system prompt).
-var (
-	//go:embed res/card-install-tools.md
-	cardInstallTools string
-	//go:embed res/card-setup-lsmcp.md
-	cardSetupLsmcp string
-	//go:embed res/card-setup-clangd.md
-	cardSetupClangd string
-	//go:embed res/card-setup-gopls.md
-	cardSetupGopls string
-	//go:embed res/card-mcp-parse-error.md
-	cardMCPParseError string
-	//go:embed res/card-mcp-start-error.md
-	cardMCPStartError string
+// accepts a 🟡 card. Each is a THIN trigger: the actual how-to lives in the
+// SKILL it points at (already in the system prompt), so these stay two lines.
+// The %s/%q holes are filled by fmt.Sprintf at the sole call site below.
+//
+// Inline rather than res/*.md like the phase prompts and SKILLs, because these
+// are neither seeded into .codehalter/ nor loadPromptFile-able: nothing reads
+// them at runtime, so a file bought no editability, only a jump between the
+// format string and the fmt.Sprintf that has to match its verbs.
+const (
+	cardInstallTools = "Missing dev tools in this %s devcontainer: %s.\n" +
+		"\n" +
+		"PLAN ONLY → execute-phase steps: install each w/ right pkg mgr, verify runs, PERSIST in `.devcontainer/Dockerfile`. Follow SKILL-base.md (install/persist loop) + matching language SKILL for which mgr.\n"
+
+	cardSetupGopls = "Go project has no code-intelligence MCP (gopls) wired — without it the model navigates with search_text/read_file instead of go_definition/go_references.\n" +
+		"\n" +
+		"PLAN ONLY → execute-phase steps: wire gopls as an MCP server per SKILL-go.md (\"gopls as MCP server\"); if gopls isn't installed, install it first (also per SKILL-go.md). Persist any install in `.devcontainer/Dockerfile`.\n"
+
+	cardSetupLsmcp = "TS/JS project has no code-intelligence MCP (lsmcp = gopls analog for JS/TS) configured.\n" +
+		"\n" +
+		"PLAN ONLY → execute-phase steps: set up per SKILL-ts.md, persist installs in `.devcontainer/Dockerfile`.\n"
+
+	cardSetupClangd = "C/C++ project has no code-intelligence MCP (clangd = gopls analog for C/C++) configured.\n" +
+		"\n" +
+		"PLAN ONLY → execute-phase steps: set up per SKILL-c.md, persist installs in `.devcontainer/Dockerfile`.\n"
+
+	cardMCPParseError = "MCP config `.codehalter/mcp.toml` failed to parse: %s.\n" +
+		"\n" +
+		"Read file (header comments = schema), fix syntax, re-read to confirm parses. Do NOT start servers → codehalter reconciles next prompt.\n"
+
+	cardMCPStartError = "MCP server %q in `.codehalter/mcp.toml` failed to start: %s.\n" +
+		"\n" +
+		"Inspect its `[[server]]` entry; confirm command on PATH + args/env right. Binary missing → install + persist in `.devcontainer/Dockerfile` (see SKILL-base.md).\n"
 )
 
 // ---------------------------------------------------------------------------
@@ -393,11 +407,11 @@ func (a *agent) scaffoldSettings(ctx context.Context, cwd string, sid string) {
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Failed to create " + filepath.Dir(path) + ": " + err.Error() + "\n"}})
+		a.say(ctx, sid, "Failed to create "+filepath.Dir(path)+": "+err.Error()+"\n")
 		return
 	}
 	if err := os.WriteFile(path, []byte(defaultSettingsTOML), 0o644); err != nil {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Failed to write " + path + ": " + err.Error() + "\n"}})
+		a.say(ctx, sid, "Failed to write "+path+": "+err.Error()+"\n")
 		return
 	}
 	// Read the file back before claiming success. On some devcontainer mounts a
@@ -410,7 +424,7 @@ func (a *agent) scaffoldSettings(ctx context.Context, cwd string, sid string) {
 		if err != nil {
 			reason = err.Error()
 		}
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " but could not read it back (" + reason + "). The directory may be read-only or wiped by a reset hook (.codehalter/ is gitignored). Add a global ~/.config/codehalter/settings.toml instead.\n\n"}})
+		a.say(ctx, sid, "Wrote "+path+" but could not read it back ("+reason+"). The directory may be read-only or wiped by a reset hook (.codehalter/ is gitignored). Add a global ~/.config/codehalter/settings.toml instead.\n\n")
 		return
 	}
 	// Keep settings.toml out of git regardless of whether the user tracks the
@@ -419,7 +433,7 @@ func (a *agent) scaffoldSettings(ctx context.Context, cwd string, sid string) {
 	if ensureSettingsGitignored(cwd) {
 		gitignoreNote = " It's listed in .gitignore so your api_key isn't committed."
 	}
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Wrote " + path + " with placeholder values." + gitignoreNote + " Edit `server` and `model` to match your LLM server, then click Retry below. If it is not in your editor's file tree, refresh: agent-created files do not always show up live. Optional: move the edited file to ~/.config/codehalter/settings.toml to share it across every project.\n\n"}})
+	a.say(ctx, sid, "Wrote "+path+" with placeholder values."+gitignoreNote+" Edit `server` and `model` to match your LLM server, then click Retry below. If it is not in your editor's file tree, refresh: agent-created files do not always show up live. Optional: move the edited file to ~/.config/codehalter/settings.toml to share it across every project.\n\n")
 }
 
 // hashSettingsFiles returns hex sha256 of the concatenated contents of the
@@ -877,7 +891,7 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) (bool, 
 	// an actionable problem (failed / parse_error) forces the consolidated
 	// banner, via the changed=true return below.
 	for _, n := range notices {
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: n + "\n"}})
+		a.say(ctx, sid, n+"\n")
 	}
 	return len(problems) > 0, problems
 }
@@ -990,7 +1004,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 		fmt.Fprintf(&b, "✅ MCP: %s\n\n", strings.Join(mcpRunning, ", "))
 	}
 
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: b.String()}})
+	a.say(ctx, sid, b.String())
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,10 +1036,6 @@ func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 	}
 	sess.AddUser(p.prompt)
 	sess.saveOrLog()
-	// The user accepting the fix card IS the execute approval, so auto-run the
-	// plan without a second "Execute?" gate (confirmPlan honours fixAutoExec).
-	sess.fixAutoExec = true
-	defer func() { sess.fixAutoExec = false }()
 	// The accepted fix is its own turn — run it through the same path as a typed
 	// Prompt (runTurn) so it gets the "✅ Done" stats line, git-commit, and
 	// compaction. This used to call orchestrate directly and skip all three.

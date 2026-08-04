@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -227,34 +228,86 @@ func llmAllToolDefinitions() []map[string]any {
 	return defs
 }
 
-// parseArgs extracts string arguments from raw JSON. For simple string params.
-func parseArgs(rawArgs string) map[string]string {
-	var args map[string]string
+// toolArgs is one decoded tool-call argument object.
+//
+// It decodes into map[string]any, NOT map[string]string, because our own tool
+// schemas declare non-string types: read_file's `line`/`limit` are integers,
+// search_text's `regex`/`multiline` are booleans, web_read's `offset`/`limit`
+// are integers. A model that obeys the schema sends `{"line": 42}` — a JSON
+// number — and decoding that into map[string]string fails the whole object with
+// a type error while leaving the offending key set to "". The tool then read
+// from line 1 and reported success, with the only trace a debug log. Keeping the
+// values as `any` and coercing per-key at the point of use is what makes the
+// schema and the decoder agree.
+type toolArgs map[string]any
+
+// parseArgs decodes a tool call's raw JSON arguments. A malformed payload
+// yields an empty (non-nil) map; each tool's own validation reports the missing
+// parameter, which is a better message than a JSON parse error.
+func parseArgs(rawArgs string) toolArgs {
+	var args toolArgs
 	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
 		slog.Debug("parseArgs: tool arguments are not valid JSON", "err", err, "raw", truncate(rawArgs, 200))
 	}
 	if args == nil {
-		args = make(map[string]string)
+		args = make(toolArgs)
 	}
 	return args
 }
 
-// argIsNonString reports whether rawArgs (a JSON object) has `key` present with a
-// NON-string value. parseArgs decodes into map[string]string, silently coercing a
-// number/null/object/array to "", so a tool that writes such a value (write_file's
-// content, edit_file's old/new text) would clobber a file to zero bytes with a
-// success message. Callers reject the call instead of losing data.
-func argIsNonString(rawArgs, key string) bool {
-	var raw map[string]json.RawMessage
-	if json.Unmarshal([]byte(rawArgs), &raw) != nil {
-		return false // not a JSON object; the tool's own validation handles it
-	}
-	v, ok := raw[key]
+// str returns a string-typed argument, or "" when it's absent or some other
+// JSON type. Deliberately does NOT stringify a number or bool: for the keys that
+// carry file content (write_file's `content`, edit_file's `old_text`/`new_text`)
+// a coerced value would clobber a file, so callers pair this with wrongType.
+func (a toolArgs) str(key string) string {
+	s, _ := a[key].(string)
+	return s
+}
+
+// wrongType reports whether `key` is present with a JSON type other than string.
+// write_file / edit_file reject the call on this rather than writing a
+// zero-byte file and reporting success.
+func (a toolArgs) wrongType(key string) bool {
+	v, ok := a[key]
 	if !ok {
 		return false
 	}
-	t := strings.TrimSpace(string(v))
-	return t == "" || t[0] != '"'
+	_, isStr := v.(string)
+	return !isStr
+}
+
+// num returns an integer argument. Accepts both the schema-correct JSON number
+// and a quoted digit string, since models emit either; ok is false when the key
+// is absent or holds neither, so callers can tell "omitted" from "passed 0".
+func (a toolArgs) num(key string) (int, bool) {
+	switch v := a[key].(type) {
+	case float64:
+		return int(v), true
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		return n, err == nil
+	}
+	return 0, false
+}
+
+// flag returns a boolean argument, accepting the JSON literal `true` and the
+// string "true" alike. Anything else, including absence, is false.
+func (a toolArgs) flag(key string) bool {
+	switch v := a[key].(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	return false
+}
+
+// has reports whether the key was supplied at all, whatever its type. Used
+// where the presence of an argument changes behaviour independently of its
+// value (web_read treats any `limit` as a range request).
+func (a toolArgs) has(key string) bool {
+	_, ok := a[key]
+	return ok
 }
 
 func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (string, bool) {
@@ -423,11 +476,12 @@ type toolCallUpdate struct {
 }
 
 type ToolCallContent struct {
-	Type    string        `json:"type"`
-	Content *ContentBlock `json:"content,omitempty"`
-	Path    string        `json:"path,omitempty"`
-	OldText *string       `json:"oldText,omitempty"`
-	NewText string        `json:"newText,omitempty"`
+	Type       string        `json:"type"`
+	Content    *ContentBlock `json:"content,omitempty"`
+	Path       string        `json:"path,omitempty"`
+	OldText    *string       `json:"oldText,omitempty"`
+	NewText    string        `json:"newText,omitempty"`
+	TerminalId string        `json:"terminalId,omitempty"`
 }
 
 type ToolCallLocation struct {
@@ -442,6 +496,14 @@ func TextContent(text string) ToolCallContent {
 
 func DiffContent(path string, oldText *string, newText string) ToolCallContent {
 	return ToolCallContent{Type: "diff", Path: path, OldText: oldText, NewText: newText}
+}
+
+// TerminalContent embeds a terminal created with terminal/create into a tool
+// call, so the client renders its output live instead of us relaying it as
+// message chunks. Must be sent before terminal/release; the client keeps
+// showing the output afterwards.
+func TerminalContent(terminalId string) ToolCallContent {
+	return ToolCallContent{Type: "terminal", TerminalId: terminalId}
 }
 
 func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []ToolCallLocation) string {

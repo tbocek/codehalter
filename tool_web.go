@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -207,25 +206,6 @@ func (b *Browser) Navigate(ctx context.Context, contextID, url string) error {
 	return err
 }
 
-// OpenTab creates a new tab, navigates to the URL, and returns the context ID.
-func (b *Browser) OpenTab(ctx context.Context, url string) (string, error) {
-	result, err := b.Send(ctx, "browsingContext.create", map[string]any{
-		"type": "tab",
-	})
-	if err != nil {
-		return "", err
-	}
-	var ctxResult struct {
-		Context string `json:"context"`
-	}
-	if err := json.Unmarshal(result, &ctxResult); err != nil {
-		return "", fmt.Errorf("decoding create-tab response: %w", err)
-	}
-
-	err = b.Navigate(ctx, ctxResult.Context, url)
-	return ctxResult.Context, err
-}
-
 // CloseTab closes a browsing context.
 func (b *Browser) CloseTab(ctx context.Context, contextID string) {
 	if _, err := b.Send(ctx, "browsingContext.close", map[string]any{
@@ -383,7 +363,7 @@ func init() {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		query := args["query"]
+		query := args.str("query")
 		if query == "" {
 			return "error: query is required", false
 		}
@@ -445,7 +425,7 @@ func init() {
 			[]ToolCallContent{TextContent(formatted)})
 		// Surface the list inline in the chat too, so the user can see the
 		// URLs and snippets without expanding the tool card.
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n" + formatted + "\n"}})
+		a.say(ctx, sid, "\n"+formatted+"\n")
 		a.logSession(sid, "WEB", "results (%d):\n%s", len(results), formatted)
 		return formatted, false
 	}})
@@ -502,19 +482,21 @@ const (
 func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (string, bool) {
 	return func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		targetURL := args["url"]
+		targetURL := args.str("url")
 		if targetURL == "" {
 			return "error: url is required", false
 		}
-		offset, _ := strconv.Atoi(args["offset"])
+		offset, _ := args.num("offset")
 		if offset < 0 {
 			offset = 0
 		}
-		limit, _ := strconv.Atoi(args["limit"])
+		limit, _ := args.num("limit")
 		if limit <= 0 || limit > maxWebRangeChars {
 			limit = maxWebRangeChars
 		}
-		rangeRequest := offset > 0 || args["limit"] != ""
+		// Any supplied `limit` means the model wants a slice, even one we then
+		// clamp — presence is the signal, not the value.
+		rangeRequest := offset > 0 || args.has("limit")
 
 		// Range request hits the cache first — no second HTTP round-trip when
 		// the page was fetched earlier in this session. Cache miss falls

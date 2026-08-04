@@ -170,3 +170,125 @@ func ptrRaw(s string) *json.RawMessage {
 	m := json.RawMessage(s)
 	return &m
 }
+
+// TestCancelRequestAnswersImmediately pins $/cancel_request: the named request
+// gets -32800 right away (not whenever the handler notices), its context is
+// cancelled, and the handler's own late reply is then suppressed — two
+// responses for one id would corrupt the client's pending map.
+func TestCancelRequestAnswersImmediately(t *testing.T) {
+	agentW, agentR, peerW, peerR := pipePair(t)
+	c := NewAgentSideConnection(nil, agentW, agentR)
+
+	// Stand in for a handler that has registered itself and is still running.
+	entry := &inflightRequest{}
+	ctx, cancel := context.WithCancel(context.Background())
+	entry.cancel = cancel
+	c.inflightMu.Lock()
+	c.inflight[`"7"`] = entry
+	c.inflightMu.Unlock()
+
+	cancelReq := jsonrpcRequest{JSONRPC: "2.0", Method: "$/cancel_request", Params: json.RawMessage(`{"requestId":"7"}`)}
+	b, _ := json.Marshal(cancelReq)
+	if _, err := peerW.Write(append(b, '\n')); err != nil {
+		t.Fatal(err)
+	}
+
+	line := readLine(t, peerR)
+	var resp jsonrpcResponse
+	if err := json.Unmarshal(line, &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Code != -32800 {
+		t.Fatalf("got %+v, want error -32800", resp.Error)
+	}
+	if resp.ID == nil || string(*resp.ID) != `"7"` {
+		t.Errorf("answered id %v, want \"7\"", resp.ID)
+	}
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(time.Second):
+		t.Error("handler context was not cancelled")
+	}
+	if c.claimReply(ptrRaw(`"7"`)) {
+		t.Error("handler could still reply after -32800 — that would be a second response for one id")
+	}
+}
+
+// TestCancelRequestUnknownIdIsIgnored: a cancel that races a finished handler
+// must not answer an id nobody is waiting on.
+func TestCancelRequestUnknownIdIsIgnored(t *testing.T) {
+	agentW, agentR, peerW, peerR := pipePair(t)
+	NewAgentSideConnection(nil, agentW, agentR)
+
+	b, _ := json.Marshal(jsonrpcRequest{JSONRPC: "2.0", Method: "$/cancel_request", Params: json.RawMessage(`{"requestId":"404"}`)})
+	if _, err := peerW.Write(append(b, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	// Then a request we know produces a reply — if the cancel wrote anything,
+	// this read returns that instead of the -32601.
+	b, _ = json.Marshal(jsonrpcRequest{JSONRPC: "2.0", ID: ptrRaw(`"1"`), Method: "no/such/method"})
+	if _, err := peerW.Write(append(b, '\n')); err != nil {
+		t.Fatal(err)
+	}
+	var resp jsonrpcResponse
+	if err := json.Unmarshal(readLine(t, peerR), &resp); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if resp.Error == nil || resp.Error.Code != -32601 {
+		t.Fatalf("got %+v, want the -32601 for no/such/method", resp.Error)
+	}
+}
+
+// TestSendRequestCancelsOutboundOnCtxDone pins the other direction: when we
+// abandon a request we told the client to drop it. Without this an open
+// permission/elicitation dialog stays on screen after the turn is cancelled.
+func TestSendRequestCancelsOutboundOnCtxDone(t *testing.T) {
+	agentW, agentR, _, peerR := pipePair(t)
+	c := NewAgentSideConnection(nil, agentW, agentR)
+	br := bufio.NewReader(peerR)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := c.sendRequest(ctx, "session/request_permission", map[string]string{"sessionId": "s1"}); err == nil {
+			t.Error("sendRequest returned nil error after cancel")
+		}
+	}()
+
+	first, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read request: %v", err)
+	}
+	var out jsonrpcRequest
+	if err := json.Unmarshal([]byte(first), &out); err != nil {
+		t.Fatalf("parse request: %v", err)
+	}
+	cancel()
+
+	second, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read cancel: %v", err)
+	}
+	var got jsonrpcRequest
+	if err := json.Unmarshal([]byte(second), &got); err != nil {
+		t.Fatalf("parse cancel: %v", err)
+	}
+	if got.Method != "$/cancel_request" {
+		t.Fatalf("second message was %q, want $/cancel_request", got.Method)
+	}
+	if got.ID != nil {
+		t.Error("$/cancel_request carried an id; it is a notification")
+	}
+	var p struct {
+		RequestId json.RawMessage `json:"requestId"`
+	}
+	if err := json.Unmarshal(got.Params, &p); err != nil {
+		t.Fatalf("parse cancel params: %v", err)
+	}
+	if string(p.RequestId) != string(*out.ID) {
+		t.Errorf("cancelled requestId %s, want %s", p.RequestId, *out.ID)
+	}
+	<-done
+}

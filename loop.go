@@ -210,10 +210,10 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		if question == "" {
 			question = "I'm not sure what you mean. Which of these?"
 		}
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: question}})
+		a.say(ctx, sid, question)
 
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
-		choice, err := a.askChoiceAuto(ctx, sid, tcId, plan.Choices)
+		choice, err := a.askChoiceAuto(ctx, sid, tcId, question, plan.Choices)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
 		// err = the card's ctx was cancelled (the editor aborted this turn to send
@@ -238,7 +238,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		if sess != nil {
 			sess.saveOrLog()
 		}
-		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Understood: " + choice + "\n"}})
+		a.say(ctx, sid, "Understood: "+choice+"\n")
 
 		// Re-run the planner now that the user has clarified. The session already
 		// carries "User chose: X" so the model sees the full context and should
@@ -412,7 +412,7 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// Blank line before the documenter streams, so its output (often just "No
 	// documentation change needed.") starts a fresh markdown paragraph instead
 	// of running into the executor's final sentence.
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n\n"}})
+	a.say(ctx, sid, "\n\n")
 	// Documentation wraps up a finished turn: deny submit_plan (no looping back
 	// to planning). respond is a terminal here too: the model writes docs and
 	// then calls respond to signal "documentation complete" — the same intent as
@@ -627,10 +627,10 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	if stream && sid != "" {
 		var flushOn, flushThink func()
 		on, flushOn = throttledStream(func(chunk string) {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: chunk}})
+			a.say(ctx, sid, chunk)
 		})
 		think, flushThink = throttledStream(func(chunk string) {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: chunk}})
+			a.sayThought(ctx, sid, chunk)
 		})
 		flushStream = func() { flushOn(); flushThink() }
 	}
@@ -782,7 +782,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 					// The partial is already on screen (llmStream streams before it
 					// checks), so say what happened to it — otherwise the retry reads as
 					// the model repeating itself.
-					a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n⟲ Response went off-format and was discarded; re-asking.\n"}})
+					a.say(ctx, sid, "\n⟲ Response went off-format and was discarded; re-asking.\n")
 				}
 				messages = append(messages, llmMessage{Role: "user", Content: ruleRetryMessage(sr)})
 				continue
@@ -800,7 +800,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 					capNudged = true
 					a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
 					if sid != "" {
-						a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n"}})
+						a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
 					}
 					messages = append(messages, llmMessage{Role: "user", Content: fmt.Sprintf(
 						"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap)})
@@ -815,7 +815,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 					callConn = callConn.withMaxTokens(base * 2)
 					a.logSession(sid, "RECOVER", "still at the cap after the nudge — one retry with max_tokens=%d", base*2)
 					if sid != "" {
-						a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", base*2)}})
+						a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", base*2))
 					}
 					continue
 				}
@@ -836,7 +836,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 					// The dropped attempt's partial tokens are already on screen and the
 					// retry re-streams from the top; flag it so the repeated prefix reads
 					// as a reconnect, not a glitch (append-only streaming can't rewind).
-					a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n⟲ Connection dropped mid-response; reconnecting.\n"}})
+					a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
 				}
 				select {
 				case <-time.After(transientStreamBackoff):
@@ -942,7 +942,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			// tool call. Gives the user a live feed of what each subagent is
 			// up to instead of just "Starting…" → 5 minutes → "Done".
 			if sess := a.getSession(sid); sess != nil && sess.ParentID != "" && sess.DisplayLabel != "" {
-				a.sendUpdate(ctx, sess.ParentID, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80))}})
+				a.say(ctx, sess.ParentID, fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80)))
 			}
 			// Live status while the tool runs (the tool-side counterpart of the LLM
 			// streamWaitMeter): "(running web_search… 12s)" ticks so a long tool or a
@@ -1068,7 +1068,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			default:
 				// An empty respond/terminal would end the turn wordlessly; emit a
 				// minimal acknowledgement so a turn that ran is never silent.
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "(done)\n"}})
+				a.say(ctx, sid, "(done)\n")
 			}
 			res.Text = terminalMessage
 			res.RespondCalled = true
@@ -1113,7 +1113,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		}
 		if !nudgedUI && sid != "" {
 			nudgedUI = true
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Repeating with no new information — nudging the model to change course.\n"}})
+			a.say(ctx, sid, "⚠ Repeating with no new information — nudging the model to change course.\n")
 		}
 		// Corrective alongside the (unchanged) tool results, so the next round
 		// sees the break-out instruction next to the output it just got back.
@@ -1133,7 +1133,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				conn = thinkConn
 				escalated = true
 				if sid != "" {
-					a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "⚠ Still repeating — switching to the thinking sampler to break out.\n"}})
+					a.say(ctx, sid, "⚠ Still repeating — switching to the thinking sampler to break out.\n")
 				}
 			}
 		}

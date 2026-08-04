@@ -47,10 +47,11 @@ func TestResolvePathSymlinkEscape(t *testing.T) {
 	}
 }
 
-// TestArgIsNonString pins the guard that stops a non-string tool argument (which
-// parseArgs silently coerces to "") from clobbering a file: a real string (incl.
-// the empty string) passes, every non-string JSON value is flagged.
-func TestArgIsNonString(t *testing.T) {
+// TestArgsWrongType pins the guard that stops a non-string tool argument from
+// clobbering a file: a real string (incl. the empty string) passes, every
+// non-string JSON value is flagged so write_file/edit_file can reject the call
+// instead of writing "".
+func TestArgsWrongType(t *testing.T) {
 	cases := []struct {
 		raw  string
 		want bool
@@ -66,10 +67,79 @@ func TestArgIsNonString(t *testing.T) {
 		{`not json`, false},           // not a JSON object
 	}
 	for _, c := range cases {
-		if got := argIsNonString(c.raw, "content"); got != c.want {
-			t.Errorf("argIsNonString(%q) = %v, want %v", c.raw, got, c.want)
+		if got := parseArgs(c.raw).wrongType("content"); got != c.want {
+			t.Errorf("parseArgs(%q).wrongType(\"content\") = %v, want %v", c.raw, got, c.want)
 		}
 	}
+}
+
+// TestArgsTypedAccessors pins the bug this type exists to prevent: our own tool
+// schemas declare `line`/`limit` as integers and `regex` as a boolean, so a
+// schema-obedient model sends JSON numbers and booleans. Decoding those into
+// map[string]string dropped them to "" and the tool ran with its defaults while
+// reporting success — read_file silently read from line 1. Both the
+// schema-correct form and the quoted form a sloppier model emits must work.
+func TestArgsTypedAccessors(t *testing.T) {
+	t.Run("num from JSON number", func(t *testing.T) {
+		a := parseArgs(`{"path":"x.go","line":42,"limit":10}`)
+		if got := a.str("path"); got != "x.go" {
+			t.Errorf("str(path) = %q, want x.go", got)
+		}
+		if got, ok := a.num("line"); !ok || got != 42 {
+			t.Errorf("num(line) = %d,%v, want 42,true", got, ok)
+		}
+		if got, ok := a.num("limit"); !ok || got != 10 {
+			t.Errorf("num(limit) = %d,%v, want 10,true", got, ok)
+		}
+	})
+	t.Run("num from quoted digits", func(t *testing.T) {
+		a := parseArgs(`{"line":"42"}`)
+		if got, ok := a.num("line"); !ok || got != 42 {
+			t.Errorf("num(line) = %d,%v, want 42,true", got, ok)
+		}
+	})
+	t.Run("num absent or unparseable", func(t *testing.T) {
+		a := parseArgs(`{"line":"abc"}`)
+		if _, ok := a.num("line"); ok {
+			t.Error("num(line) on non-numeric text: ok = true, want false")
+		}
+		if _, ok := a.num("missing"); ok {
+			t.Error("num(missing): ok = true, want false")
+		}
+	})
+	t.Run("flag from JSON bool and string", func(t *testing.T) {
+		for _, raw := range []string{`{"regex":true}`, `{"regex":"true"}`, `{"regex":"TRUE"}`} {
+			if !parseArgs(raw).flag("regex") {
+				t.Errorf("flag(regex) on %s = false, want true", raw)
+			}
+		}
+		for _, raw := range []string{`{"regex":false}`, `{"regex":"no"}`, `{}`} {
+			if parseArgs(raw).flag("regex") {
+				t.Errorf("flag(regex) on %s = true, want false", raw)
+			}
+		}
+	})
+	t.Run("str refuses to coerce", func(t *testing.T) {
+		if got := parseArgs(`{"content":123}`).str("content"); got != "" {
+			t.Errorf("str on a number = %q, want \"\" (the caller rejects via wrongType)", got)
+		}
+	})
+	t.Run("has is type-blind", func(t *testing.T) {
+		a := parseArgs(`{"limit":0}`)
+		if !a.has("limit") {
+			t.Error("has(limit) = false for a supplied zero, want true")
+		}
+		if a.has("offset") {
+			t.Error("has(offset) = true for an absent key, want false")
+		}
+	})
+	t.Run("one bad key does not drop the others", func(t *testing.T) {
+		// The original failure mode: a type error aborted the whole decode.
+		a := parseArgs(`{"path":"x.go","line":42}`)
+		if a.str("path") != "x.go" {
+			t.Errorf("str(path) = %q, want x.go", a.str("path"))
+		}
+	})
 }
 
 // TestSkipToolCall pins that a SKIPPED tool call is non-failing: Failed stays
@@ -269,8 +339,8 @@ func TestParseArgs(t *testing.T) {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 			for k, v := range tc.want {
-				if got[k] != v {
-					t.Errorf("key %q: got %q, want %q", k, got[k], v)
+				if got.str(k) != v {
+					t.Errorf("key %q: got %q, want %q", k, got.str(k), v)
 				}
 			}
 		})

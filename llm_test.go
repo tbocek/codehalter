@@ -40,8 +40,10 @@ func TestTrimJSON(t *testing.T) {
 // that switches background prompts to prefix-extension mode: the foreground
 // turn reads llm[0]; background work on a single [[llm]] entry falls back to
 // llm[0] (onMain=true — its KV holds the conversation, so extend it), labelled
-// llm[1] for display when parallel >= 2; a second entry routes background to
-// llm[1] proper (onMain=false — fresh prompt, no cache to protect there).
+// llm[1] for display when parallel >= 2; an entry marked `purpose = "summary"`
+// routes background to llm[1] proper (onMain=false — fresh prompt, no cache to
+// protect there). An unmarked extra entry is a subagent fan-out target only and
+// must NOT quietly absorb the summariser.
 func TestBackgroundSlotLabel(t *testing.T) {
 	// Single entry, parallel=2 → foreground llm[0], background llm[1] (same conn).
 	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2)}}}}
@@ -61,14 +63,39 @@ func TestBackgroundSlotLabel(t *testing.T) {
 		t.Fatalf("single-slot connForBackgroundLLM = %+v onMain=%v, want Slot 0, onMain", bg, onMain)
 	}
 
-	// Two entries → background routes to the second entry, llm[1].
+	// Two entries, neither designated → the extra is a fan-out target only, so
+	// background stays on llm[0] where it can extend the foreground prefix.
 	a2 := &agent{settings: Settings{LLM: []LLMConnection{
 		{Server: "u0", Model: "m0", Parallel: ptr(1)},
 		{Server: "u1", Model: "m1", Parallel: ptr(1)},
 	}}}
 	a2.buildConnSems()
-	if bg, onMain := a2.connForBackgroundLLM(); bg == nil || bg.Slot != 1 || bg.Server != "u1" || onMain {
-		t.Fatalf("two-entry connForBackgroundLLM = %+v onMain=%v, want Slot 1 on u1, NOT onMain", bg, onMain)
+	if bg, onMain := a2.connForBackgroundLLM(); bg == nil || bg.Server != "u0" || !onMain {
+		t.Fatalf("undesignated extra entry = %+v onMain=%v, want u0 onMain — it must not absorb the summariser", bg, onMain)
+	}
+
+	// Third entry designated → background routes there, past the undesignated one.
+	a3 := &agent{settings: Settings{LLM: []LLMConnection{
+		{Server: "u0", Model: "m0", Parallel: ptr(1)},
+		{Server: "u1", Model: "m1", Parallel: ptr(1)},
+		{Server: "u2", Model: "m2", Parallel: ptr(1), Purpose: "summary"},
+	}}}
+	a3.buildConnSems()
+	if bg, onMain := a3.connForBackgroundLLM(); bg == nil || bg.Slot != 2 || bg.Server != "u2" || onMain {
+		t.Fatalf("designated connForBackgroundLLM = %+v onMain=%v, want Slot 2 on u2, NOT onMain", bg, onMain)
+	}
+
+	// Designated but saturated → fall back to llm[0] rather than queue behind it.
+	a3.connSems[2] <- struct{}{}
+	if bg, onMain := a3.connForBackgroundLLM(); bg == nil || bg.Server != "u0" || !onMain {
+		t.Fatalf("saturated summary conn = %+v onMain=%v, want u0 onMain", bg, onMain)
+	}
+
+	// purpose on llm[0] is the same as no purpose: the fallback already lands there.
+	a4 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2), Purpose: "summary"}}}}
+	a4.buildConnSems()
+	if bg, onMain := a4.connForBackgroundLLM(); bg == nil || bg.Slot != 1 || !onMain {
+		t.Fatalf("purpose on llm[0] = %+v onMain=%v, want Slot 1 onMain", bg, onMain)
 	}
 }
 

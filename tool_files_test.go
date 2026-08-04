@@ -175,6 +175,52 @@ func TestServeReadRefusesWhenInContext(t *testing.T) {
 	}
 }
 
+// TestReadFileHonoursNumericLineAndLimit is the end-to-end regression for the
+// schema/decoder mismatch: read_file declares `line` and `limit` as integers, so
+// a model that obeys the schema sends JSON numbers. Decoding those into
+// map[string]string used to fail the whole object and leave the numeric keys as
+// "", which silently read from line 1 with the default window and reported
+// success — the worst kind of wrong, because the model believes it saw line 42.
+// The string forms stay accepted, since small models often quote everything.
+func TestReadFileHonoursNumericLineAndLimit(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.Depth = 1 // direct disk I/O instead of the ACP wire
+	ctx := context.Background()
+	path := filepath.Join(s.Cwd, "big.txt")
+	writeLines(t, path, 350)
+
+	read := func(t *testing.T, rawArgs string) string {
+		t.Helper()
+		var tc toolCall
+		tc.Function.Name = "read_file"
+		tc.Function.Arguments = rawArgs
+		out, failed := a.executeTool(ctx, s.ID, tc)
+		if failed {
+			t.Fatalf("read_file %s failed: %s", rawArgs, out)
+		}
+		return out
+	}
+
+	numeric := read(t, fmt.Sprintf(`{"path":%q,"line":42,"limit":5}`, path))
+	if strings.Contains(numeric, "L1\n") {
+		t.Errorf("numeric line=42 read from the top instead:\n%s", numeric)
+	}
+	for _, want := range []string{"L42\n", "L46\n"} {
+		if !strings.Contains(numeric, want) {
+			t.Errorf("numeric line/limit missing %q:\n%s", want, numeric)
+		}
+	}
+	if strings.Contains(numeric, "L47\n") {
+		t.Errorf("numeric limit=5 served past line 46:\n%s", numeric)
+	}
+
+	// A different window, so the dedup guard doesn't refuse this as a re-read.
+	quoted := read(t, fmt.Sprintf(`{"path":%q,"line":"200","limit":"5"}`, path))
+	if !strings.Contains(quoted, "L200\n") || strings.Contains(quoted, "L205\n") {
+		t.Errorf("quoted line/limit not honoured:\n%s", quoted)
+	}
+}
+
 // TestEditFileMissFailsAndSteers pins the edit_file recovery contract: a missed
 // old_text reports failed=true (so it feeds the loop's fail cap) and steers the
 // model to read the region and retry a small edit — never rewrite the whole
@@ -329,4 +375,37 @@ func TestEditFileMissQuotesNearbyRegion(t *testing.T) {
 	if string(after) != body {
 		t.Errorf("failed edit modified the file:\n%s", after)
 	}
+}
+
+// TestFsGatedOnClientCapabilities pins that a depth-0 session does its own disk
+// I/O when the client never advertised the ACP filesystem. ACP forbids sending
+// a client a method it didn't claim, and codehalter used to send
+// fs/read_text_file to everyone — invisible against Zed, which advertises both,
+// and a hard failure against any client that doesn't. a.conn is nil here, so an
+// attempted wire call panics rather than silently passing.
+func TestFsGatedOnClientCapabilities(t *testing.T) {
+	a, s := newTestAgent(t)
+	ctx := context.Background()
+	path := filepath.Join(s.Cwd, "f.txt")
+
+	if err := fsWrite(a, ctx, s.ID, path, "hello\n"); err != nil {
+		t.Fatalf("fsWrite with no client fs capability: %v", err)
+	}
+	got, err := fsRead(a, ctx, s.ID, path, nil, nil)
+	if err != nil {
+		t.Fatalf("fsRead with no client fs capability: %v", err)
+	}
+	if got != "hello\n" {
+		t.Errorf("fsRead = %q, want %q", got, "hello\n")
+	}
+
+	// A client advertising the capability takes the wire path instead — with a
+	// nil conn that is a panic, which is exactly how we tell the two apart.
+	a.clientCaps.Fs.ReadTextFile = true
+	func() {
+		defer func() { _ = recover() }()
+		if _, err := fsRead(a, ctx, s.ID, path, nil, nil); err == nil {
+			t.Error("fsRead with fs.readTextFile advertised took the disk path, want the ACP wire")
+		}
+	}()
 }

@@ -393,7 +393,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 		},
 		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 			args := parseArgs(rawArgs)
-			return "echo: " + args["msg"], false
+			return "echo: " + args.str("msg"), false
 		},
 	})
 

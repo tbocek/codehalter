@@ -34,8 +34,8 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		return false
 	}
 
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "codehalter must run inside a container. I can scaffold " +
-		".devcontainer/Dockerfile and .devcontainer/devcontainer.json for you to edit, then you can reopen the project in the container.\n\n"}})
+	a.say(ctx, sid, "codehalter must run inside a container. I can scaffold "+
+		".devcontainer/Dockerfile and .devcontainer/devcontainer.json for you to edit, then you can reopen the project in the container.\n\n")
 
 	choice, tcId, err := a.askChoiceWithCard(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
 	if err != nil {
@@ -170,6 +170,27 @@ func buildDevcontainerJSON(gitWritable, gitconfig, sshAgent bool) string {
 	return out
 }
 
+// ensureTerminals gates the session on the client being able to run commands
+// for us. Every command codehalter runs — run_command, run_background, run_task
+// — goes out as an ACP terminal, so a client that didn't advertise
+// clientCapabilities.terminal leaves the agent with no shell at all. Rather than
+// discover that at the first `go build`, say so up front and refuse the session,
+// the same way ensureDevcontainer refuses to run unsandboxed.
+//
+// There is deliberately no in-process fallback. Running the commands ourselves
+// is the duplicate implementation this replaced, and a silent fallback would
+// also mean the user never learns their client is the thing that needs fixing.
+func (a *agent) ensureTerminals(ctx context.Context, sid string) bool {
+	if a.clientCan("terminal") {
+		return true
+	}
+	a.sendUpdateAndAbort(ctx, sid, "This editor did not advertise ACP terminal support "+
+		"(clientCapabilities.terminal in its initialize request), so codehalter has no way to run commands: "+
+		"builds, tests, and every run_command are unavailable. Use a client with ACP terminal support (Zed does), "+
+		"then start a new Agent Thread.")
+	return false
+}
+
 // hasGitFolder reports whether cwd has a .git directory (a normal clone). A .git
 // FILE (worktree/submodule link) doesn't count — the bind mount targets a dir.
 func hasGitFolder(cwd string) bool {
@@ -246,7 +267,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	if hasGitignore {
 		data, err := os.ReadFile(gitignorePath)
 		if err != nil {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "Failed to read .gitignore: " + err.Error() + "\n"}})
+			a.say(ctx, sid, "Failed to read .gitignore: "+err.Error()+"\n")
 			return
 		}
 		content = string(data)
@@ -312,7 +333,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 		}
 	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: note + "\n"}})
+	a.say(ctx, sid, note+"\n")
 }
 
 // ---------------------------------------------------------------------------

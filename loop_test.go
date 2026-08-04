@@ -179,7 +179,7 @@ func TestPlanResultSubtasksDeserialize(t *testing.T) {
 		t.Errorf("subtasks[2].Verify should be empty (omitempty), got %v", p.Subtasks[2].Verify)
 	}
 
-	// report_only round-trips so confirmPlan can skip the gate.
+	// report_only round-trips so renderPlan can label it "Findings:".
 	rawReport := `{"clear": true, "report_only": true, "subtasks": [{"description": "summarise X"}]}`
 	var p2 planResult
 	if err := json.Unmarshal([]byte(rawReport), &p2); err != nil {
