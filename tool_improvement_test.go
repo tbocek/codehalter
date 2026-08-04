@@ -222,3 +222,56 @@ func TestImprovementExecuteNoLicense(t *testing.T) {
 		t.Errorf("expected no-license note, got: %s", out)
 	}
 }
+
+// TestApplyImprovementCreatesSkill pins the create path: /improve can add a
+// skill the project is missing entirely, but only a skill, only a new one, and
+// only under .codehalter/. loadSkills globs SKILL-*.md, so a file written here
+// is in the system prompt on the next turn — which is exactly why the name and
+// the never-clobber rule are enforced in code rather than trusted to the model.
+func TestApplyImprovementCreatesSkill(t *testing.T) {
+	dir := t.TempDir()
+	ch := filepath.Join(dir, ".codehalter")
+	if err := os.MkdirAll(ch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const body = "# Python skill\n## Idioms\n- Use pathlib, not os.path.join."
+
+	if err := applyImprovement(dir, improvementEntry{File: "SKILL-python.md", Type: "create", New: body}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(ch, "SKILL-python.md"))
+	if err != nil {
+		t.Fatalf("reading created skill: %v", err)
+	}
+	if string(got) != body+"\n" {
+		t.Errorf("created body = %q, want %q", got, body+"\n")
+	}
+	// It must actually reach the system prompt, not just the disk.
+	if !strings.Contains(loadSkills(dir, "", nil), "Use pathlib") {
+		t.Error("created skill is not picked up by loadSkills")
+	}
+
+	// Never clobber: a second create against the same name is refused, and the
+	// existing body survives. Changing a skill is an add/replace.
+	if err := applyImprovement(dir, improvementEntry{File: "SKILL-python.md", Type: "create", New: "# Overwritten"}); err == nil {
+		t.Error("create over an existing skill should error")
+	}
+	if b, _ := os.ReadFile(filepath.Join(ch, "SKILL-python.md")); string(b) != body+"\n" {
+		t.Errorf("refused create still wrote: %q", b)
+	}
+
+	for name, e := range map[string]improvementEntry{
+		"not a skill":     {File: "PLAN.md", Type: "create", New: "x"},
+		"uppercase topic": {File: "SKILL-Python.md", Type: "create", New: "x"},
+		"wrong extension": {File: "SKILL-python.txt", Type: "create", New: "x"},
+		"path escape":     {File: "../SKILL-evil.md", Type: "create", New: "x"},
+		"empty body":      {File: "SKILL-rust.md", Type: "create", New: "  \n "},
+	} {
+		if err := applyImprovement(dir, e); err == nil {
+			t.Errorf("%s: create should error", name)
+		}
+		if _, err := os.Stat(filepath.Join(ch, e.File)); err == nil {
+			t.Errorf("%s: refused create left a file behind", name)
+		}
+	}
+}

@@ -245,3 +245,88 @@ func TestTolerantReplace(t *testing.T) {
 		t.Errorf("no-match: want n=0 empty, got n=%d out=%q", n, out)
 	}
 }
+
+// TestNearMiss covers the failed-edit recovery path: when old_text matches
+// neither exactly nor ignoring whitespace, find the region it was aiming at so
+// the model can retry against real bytes instead of spending a read_file
+// round-trip. The negative cases matter as much as the positive one — quoting
+// the wrong region would send the model to edit the wrong place.
+func TestNearMiss(t *testing.T) {
+	file := "package main\n\nfunc load(p string) error {\n\tf, err := os.Open(p)\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}\n"
+
+	// One line drifted (the model remembers the old parameter name). The region
+	// is still recognisable, so it must be located and quoted verbatim.
+	old := "func load(path string) error {\n\tf, err := os.Open(path)\n\tif err != nil {"
+	line, snippet, ok := nearMiss(file, old)
+	if !ok {
+		t.Fatal("drifted snippet: no near miss found")
+	}
+	if line != 3 {
+		t.Errorf("start line = %d, want 3", line)
+	}
+	if !strings.Contains(snippet, "os.Open(p)") {
+		t.Errorf("snippet is not the file's CURRENT text:\n%s", snippet)
+	}
+	if strings.Contains(snippet, "os.Open(path)") {
+		t.Errorf("snippet echoed the model's stale text back at it:\n%s", snippet)
+	}
+
+	// Wholly unrelated text must not be mapped onto some vaguely-similar region.
+	if _, _, ok := nearMiss(file, "type Server struct {\n\taddr string\n\tport int\n}"); ok {
+		t.Error("unrelated snippet produced a near miss")
+	}
+
+	// Boilerplate alone must not anchor: a lone closing brace appears twice and
+	// carries no information about which region was meant.
+	if _, _, ok := nearMiss("a\n}\nb\n}\nc\n", "}"); ok {
+		t.Error("bare boilerplate line produced a near miss")
+	}
+
+	// Below the score floor: one line out of four is not "the region you meant".
+	if _, _, ok := nearMiss(file, "func load(p string) error {\n\tzzz()\n\tyyy()\n\txxx()"); ok {
+		t.Error("sub-threshold overlap produced a near miss")
+	}
+
+	// Degenerate inputs must not panic or claim a match.
+	for _, old := range []string{"", "\n\n", strings.Repeat("x\n", 100)} {
+		if _, _, ok := nearMiss(file, old); ok {
+			t.Errorf("degenerate old_text %q produced a near miss", truncate(old, 20))
+		}
+	}
+}
+
+// TestEditFileMissQuotesNearbyRegion pins the end-to-end payoff: a drifted
+// edit_file comes back carrying the file's current bytes, and explicitly tells
+// the model NOT to re-read — that saved round-trip is the whole point.
+func TestEditFileMissQuotesNearbyRegion(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.Depth = 1 // direct disk I/O instead of the ACP wire
+	ctx := context.Background()
+	path := filepath.Join(s.Cwd, "g.go")
+	body := "package main\n\nfunc load(p string) error {\n\tf, err := os.Open(p)\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var miss toolCall
+	miss.Function.Name = "edit_file"
+	miss.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func load(path string) error {\n\tf, err := os.Open(path)\n\tif err != nil {","new_text":"x"}`, path)
+	out, failed := a.executeTool(ctx, s.ID, miss)
+	if !failed {
+		t.Error("drifted edit: failed=false, want true (must feed the fail cap)")
+	}
+	if !strings.Contains(out, "os.Open(p)") {
+		t.Errorf("miss message did not quote the current region:\n%s", out)
+	}
+	if !strings.Contains(out, "Do NOT call read_file") {
+		t.Errorf("miss message still sends the model back to read_file:\n%s", out)
+	}
+	// The file must be untouched by a failed edit.
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if string(after) != body {
+		t.Errorf("failed edit modified the file:\n%s", after)
+	}
+}

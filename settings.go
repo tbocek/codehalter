@@ -41,6 +41,14 @@ type Settings struct {
 	// system prompt up front.
 	Skills string `toml:"skills,omitempty"`
 
+	// Diagnostics controls whether a successful write_file / edit_file asks a
+	// wired language server about the file and appends its findings to the tool
+	// result (see postWriteDiagnostics). nil means on. Turn it off for a project
+	// whose language server is slow to answer or noisy enough that the findings
+	// cost more context than the round-trips they save; it has no effect when no
+	// diagnostics-capable MCP server is configured.
+	Diagnostics *bool `toml:"diagnostics,omitempty"`
+
 	path string
 }
 
@@ -119,6 +127,17 @@ type LLMConnection struct {
 	// the warm's ~10k prefill inflates that turn's "uncached" number.
 	// Runtime-only.
 	noTurnStats bool
+
+	// streamRulesArmed opts this call into the stream-rule check (rules.go): a
+	// pattern match aborts the generation mid-token and returns a
+	// streamRuleError. Opt-IN rather than on-by-default because a rule abort is
+	// only useful where something catches it and re-asks — that is the tool
+	// loop's retry ladder and nowhere else. The background summariser, in
+	// particular, passes the foreground's full tools array (for prefix-cache
+	// reasons, see summariseCall) but has no ladder: a rule firing there would
+	// silently downgrade the turn's note to the raw fallback. Set on a copy by
+	// runToolLoop. Runtime-only.
+	streamRulesArmed bool
 }
 
 // paramsFor returns the sampler params for the given role, falling back to

@@ -264,6 +264,16 @@ func (c *LLMConnection) withMaxTokens(n int) *LLMConnection {
 	return &cp
 }
 
+// withStreamRules returns a shallow copy of the connection with the stream-rule
+// check armed. Only the tool loop calls this: it is the one caller with a retry
+// ladder that can act on a rule abort. Nothing about the request body changes,
+// so the prefix cache is unaffected.
+func (c *LLMConnection) withStreamRules() *LLMConnection {
+	cp := *c
+	cp.streamRulesArmed = true
+	return &cp
+}
+
 // withToolChoiceNone returns a shallow copy of the connection that adds
 // tool_choice="none". Used by the prefix-extension summariser: the tools
 // array must still ride the request — the chat template renders it into the
@@ -385,6 +395,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	if slot >= 0 && slot < len(a.connSems) {
 		sem = a.connSems[slot]
 	}
+	// Stream rules ride the same lock (they're reassigned wholesale with the rest
+	// of the config). Armed only where the caller asked for it — see
+	// LLMConnection.streamRulesArmed for why this is opt-in and not simply "any
+	// call that passes tools".
+	var matcher *ruleMatcher
+	if conn.streamRulesArmed && len(a.streamRules) > 0 {
+		matcher = &ruleMatcher{rules: a.streamRules}
+	}
 	a.cfgMu.RUnlock()
 	if sem != nil {
 		// Try non-blocking first; only emit the queued suffix when we're
@@ -486,6 +504,10 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// {"error":…} SSE chunk). Surfaced as the call error so it isn't swallowed
 	// as an empty response.
 	var streamErrMsg string
+	// firedRule is set when a stream rule matched the content and we abandoned
+	// the generation mid-flight. The partial is discarded, so nothing downstream
+	// reads fullText in that case.
+	var firedRule *streamRule
 	var promptTokens, completionTokens int
 	// Server-reported cache split (see sseChunk.Timings / PromptTokensDetails).
 	// evaluatedTokens = prompt tokens actually run through the model this call;
@@ -577,6 +599,16 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 			if on != nil {
 				on(delta.Content)
 			}
+			// Stream rule check. Deliberately AFTER on(): the tokens up to the match
+			// are already on the user's screen, and hiding them would make the
+			// "response discarded, retrying" notice unexplainable. Matching only
+			// content (not reasoning, not tool-call arguments) is the whole design —
+			// see rules.go. On a hit we stop reading the body; the deferred Close
+			// tears down the connection, which is what stops the server generating.
+			if r := matcher.feed(delta.Content); r != nil {
+				firedRule = r
+				break
+			}
 		}
 
 		for _, tc := range delta.ToolCalls {
@@ -630,6 +662,13 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	//     n_ctx ceiling (prompt fit but left no room), recoverable, signalled via
 	//     errContextCeiling so the tool loop folds history and retries.
 	switch {
+	case firedRule != nil:
+		// Checked first: we aborted this stream on purpose, so scanErr (the reader
+		// stopping mid-body) and a missing finish_reason are consequences of that
+		// decision, not independent failures, and either would otherwise shadow the
+		// real cause. The token counts stay 0 — we never reached the usage chunk —
+		// so an aborted generation is simply not attributed in the turn stats.
+		err = &streamRuleError{Rule: firedRule.Name, Reminder: firedRule.Reminder, Matched: fullText.String()}
 	case streamErrMsg != "":
 		err = fmt.Errorf("LLM returned an error mid-stream (role=%s, model=%s): %s", conn.Tag, conn.Model, streamErrMsg)
 	case scanErr != nil:

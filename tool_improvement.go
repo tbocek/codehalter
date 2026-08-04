@@ -62,11 +62,42 @@ func checkLicense(projectDir string) (string, error) {
 	return "", fmt.Errorf("no open-source license found in project root")
 }
 
+// skillFileNameRe is what a `create` may be named. Creation is restricted to
+// skills because they are the only prompt file the loader discovers by glob:
+// loadSkills concatenates every .codehalter/SKILL-*.md it finds, so a new one
+// takes effect on the next turn with nothing else to wire. A new PLAN.md or
+// EXECUTE.md, by contrast, would have to be named exactly right to be read at
+// all, and any other new file would simply sit on disk unread.
+var skillFileNameRe = regexp.MustCompile(`^SKILL-[a-z0-9][a-z0-9._+-]*\.md$`)
+
+// createSkill writes a brand-new .codehalter/SKILL-*.md. O_EXCL rather than a
+// Stat-then-write: an existing skill must be edited through replace/add (which
+// keeps what the crafter already measured), and refusing in the syscall means
+// there is no window in which we could clobber one.
+func createSkill(path, name, body string) error {
+	if !skillFileNameRe.MatchString(name) {
+		return fmt.Errorf("create only makes new skills: %q must be named SKILL-<topic>.md, lowercase (e.g. SKILL-python.md)", name)
+	}
+	if strings.TrimSpace(body) == "" {
+		return fmt.Errorf("create needs `new` text (the skill body)")
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("%s already exists — use add or replace to change it", name)
+		}
+		return fmt.Errorf("create %s: %w", name, err)
+	}
+	defer f.Close()
+	_, err = f.WriteString(strings.TrimRight(body, "\n") + "\n")
+	return err
+}
+
 // applyImprovement applies one structured change to its .codehalter/ prompt
 // file: replace/remove swap out the `original` text, add appends `new` (after
-// `original` when given, else at the end). The user already approved this entry
-// via the Apply card, so the write is direct. Returns a per-entry error the
-// caller surfaces without aborting the rest.
+// `original` when given, else at the end), create writes a new SKILL-*.md. The
+// user already approved this entry via the Apply card, so the write is direct.
+// Returns a per-entry error the caller surfaces without aborting the rest.
 func applyImprovement(cwd string, e improvementEntry) error {
 	name := strings.TrimSpace(e.File)
 	if name == "" {
@@ -78,6 +109,10 @@ func applyImprovement(cwd string, e improvementEntry) error {
 		return fmt.Errorf("file %q must be a bare .codehalter/ prompt filename", name)
 	}
 	path := filepath.Join(cwd, ".codehalter", name)
+	// Handled before the read: the whole point is that the file does not exist yet.
+	if strings.EqualFold(strings.TrimSpace(e.Type), "create") {
+		return createSkill(path, name, e.New)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", name, err)
@@ -110,7 +145,7 @@ func applyImprovement(cwd string, e improvementEntry) error {
 			content = strings.TrimRight(content, "\n") + "\n\n" + e.New + "\n"
 		}
 	default:
-		return fmt.Errorf("unknown type %q (want add, replace, or remove)", e.Type)
+		return fmt.Errorf("unknown type %q (want add, replace, remove, or create)", e.Type)
 	}
 	return os.WriteFile(path, []byte(content), 0o644)
 }
@@ -171,6 +206,11 @@ func renderImprovement(i, n int, e improvementEntry) string {
 		fmt.Fprintf(&b, "%s\n\n", e.Reasoning)
 	}
 	switch strings.ToLower(strings.TrimSpace(e.Type)) {
+	case "create":
+		// A new skill is a whole file, and it joins the system prompt on the next
+		// turn — the user is approving something they'll pay for on every call, so
+		// show more of it than the in-place edits get.
+		fmt.Fprintf(&b, "New skill file, loaded into the system prompt from the next turn on.\n\n```\n%s\n```\n", truncate(strings.TrimSpace(e.New), 2000))
 	case "add":
 		fmt.Fprintf(&b, "```\n+ %s\n```\n", truncate(strings.TrimSpace(e.New), 800))
 	case "remove":
@@ -186,7 +226,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        submitImprovementToolName,
-			"description": "Hand off ALL your proposed prompt improvements in ONE structured call. codehalter then drives the rest itself: it shows the user each change, asks Apply/Skip, applies the accepted ones to the .codehalter/ prompt file, and (for open-source projects) asks whether to submit the applied changes to the feedback API. Do NOT ask_user or edit_file yourself; this single call IS the apply step. `improvements` is a JSON array; each object: title (string), file (bare .codehalter prompt filename, e.g. \"PLAN.md\"), type (add|replace|remove), original (the exact current text to match, for replace/remove), new (the added/replacement text), reasoning (string).",
+			"description": "Hand off ALL your proposed prompt improvements in ONE structured call. codehalter then drives the rest itself: it shows the user each change, asks Apply/Skip, applies the accepted ones to the .codehalter/ prompt file, and (for open-source projects) asks whether to submit the applied changes to the feedback API. Do NOT ask_user or edit_file yourself; this single call IS the apply step. `improvements` is a JSON array; each object: title (string), file (bare .codehalter prompt filename, e.g. \"PLAN.md\"), type (add|replace|remove|create), original (the exact current text to match, for replace/remove), new (the added/replacement text, or the whole file body for create), reasoning (string). Use type \"create\" to add a skill the project is missing entirely: file must then be a new SKILL-<topic>.md (e.g. \"SKILL-python.md\") that does not exist yet, and new is the complete skill body.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"improvements"},
@@ -263,9 +303,13 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 			fmt.Fprintf(&summary, "could not apply %q: %v\n", e.Title, err)
 			continue
 		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Applied to .codehalter/" + e.File)})
+		verb, card := "applied", "Applied to .codehalter/"+e.File
+		if strings.EqualFold(strings.TrimSpace(e.Type), "create") {
+			verb, card = "created", "Created .codehalter/"+e.File
+		}
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(card)})
 		applied = append(applied, e)
-		fmt.Fprintf(&summary, "applied: %s (.codehalter/%s)\n", e.Title, e.File)
+		fmt.Fprintf(&summary, "%s: %s (.codehalter/%s)\n", verb, e.Title, e.File)
 	}
 
 	if len(applied) == 0 {

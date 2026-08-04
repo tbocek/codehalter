@@ -313,3 +313,44 @@ func TestWithMaxTokens(t *testing.T) {
 		t.Error("withMaxTokens mutated the original conn")
 	}
 }
+
+// TestStreamRulesOnlyFireWhenArmed pins the gate that keeps stream rules from
+// breaking the callers that can't recover from them. llmStream is shared by the
+// tool loop (which has a retry ladder) and by the background summariser and
+// prewarm (which do not, and which pass the foreground's full tools array for
+// prefix-cache reasons). Only an explicitly armed connection may abort.
+func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
+	run := func(arm bool) error {
+		t.Helper()
+		mock := newMockLLM(t, sseText("here you go\n<tool_call>{\"name\":\"read_file\"}"))
+		defer mock.Close()
+		a, s := newTestAgent(t)
+		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+		a.streamRules = compileStreamRules(defaultStreamRules)
+		conn := a.connForSession(context.Background(), s.ID, "execute")
+		if conn == nil {
+			t.Fatal("connForSession returned nil")
+		}
+		if arm {
+			conn = conn.withStreamRules()
+		}
+		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, llmAllToolDefinitions(), nil, nil)
+		return err
+	}
+
+	err := run(true)
+	sr := asStreamRule(err)
+	if sr == nil {
+		t.Fatalf("armed conn: err = %v, want a streamRuleError", err)
+	}
+	if sr.Rule != "tool_call_as_text" {
+		t.Errorf("armed conn: fired %q, want tool_call_as_text", sr.Rule)
+	}
+	if sr.Reminder == "" {
+		t.Error("armed conn: error carries no reminder for the retry")
+	}
+
+	if err := run(false); err != nil {
+		t.Errorf("unarmed conn: err = %v, want nil (the summariser must not be aborted)", err)
+	}
+}

@@ -458,6 +458,14 @@ const (
 	transientStreamBackoff    = 3 * time.Second
 )
 
+// maxStreamRuleRetries caps how many times one round re-asks after a stream
+// rule aborted the generation (see rules.go). Two: the first retry carries the
+// reminder, the second is the benefit of the doubt. A model still emitting the
+// same off-format output after both is not going to be corrected by a third
+// reminder, and the failure is more useful surfaced to the replan machinery
+// than spun on here.
+const maxStreamRuleRetries = 2
+
 // streamFlushInterval batches streamed model tokens to the editor at most this
 // often. Per-token sendUpdate is fine at ~45 tg/s, but at higher rates (e.g. 450
 // tg/s) it floods: each call takes the one conn write lock, and a slow editor
@@ -723,14 +731,18 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
 			(*Session).lastAssistantIndex,
 		}
-		callConn := conn // a <think> stall retries (and latches) on a thinking-off copy
+		// Arm the stream-rule check for this round. The tool loop is the only
+		// caller that does: it owns the retry ladder below, which is what makes a
+		// mid-generation abort recoverable rather than just a failed call.
+		callConn := conn.withStreamRules() // a <think> stall retries (and latches) on a thinking-off copy
 		if thinkingStalled {
-			callConn = conn.withThinkingDisabled()
+			callConn = callConn.withThinkingDisabled()
 		}
 		thinkingRetried := false // at most one such retry per round
 		capNudged := false       // cap ladder rung 1: one be-concise nudge retry per round
 		capDoubled := false      // cap ladder rung 2: one doubled-max_tokens retry per round
 		transientRetries := 0    // mid-response drops retried up to maxTransientStreamRetries
+		ruleRetries := 0         // stream-rule aborts re-asked up to maxStreamRuleRetries
 		for {
 			text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, tools, on, think)
 			flushStream() // emit any batched tail of this call's tokens to the UI
@@ -747,6 +759,32 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				thinkingStalled = true
 				callConn = callConn.withThinkingDisabled()
 				a.logSession(sid, "RECOVER", "model stuck in <think> — retrying with thinking disabled (rest of run)")
+				continue
+			}
+			// A stream rule fired: llmStream abandoned the generation the moment the
+			// content matched, so there is no partial to salvage. Re-ask with the
+			// rule's reminder appended as a user turn — the same shape as the cap
+			// nudge below, and cache-cheap for the same reason: the reminder is a
+			// suffix, so the whole prefix is still warm on the server.
+			//
+			// Capped, because a model that ignores the reminder twice is not going to
+			// be talked out of it on the third try; better to let the bad reply
+			// through and end up in the replan machinery than to spin here.
+			if sr := asStreamRule(err); sr != nil {
+				if ruleRetries >= maxStreamRuleRetries {
+					a.logSession(sid, "RECOVER", "stream rule %q fired %d times — giving up on the nudge, letting the turn fail", sr.Rule, ruleRetries+1)
+					break
+				}
+				ruleRetries++
+				a.logSession(sid, "RECOVER", "stream rule %q fired — aborted mid-generation, re-asking with the reminder (%d/%d). Matched: %s",
+					sr.Rule, ruleRetries, maxStreamRuleRetries, truncate(sr.Matched, 200))
+				if sid != "" {
+					// The partial is already on screen (llmStream streams before it
+					// checks), so say what happened to it — otherwise the retry reads as
+					// the model repeating itself.
+					a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "\n⟲ Response went off-format and was discarded; re-asking.\n"}})
+				}
+				messages = append(messages, llmMessage{Role: "user", Content: ruleRetryMessage(sr)})
 				continue
 			}
 			// Cap ladder: the generation died AT the requested max_tokens cap with

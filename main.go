@@ -110,6 +110,13 @@ type agent struct {
 	// reload. nil entry → no semaphore (test mocks).
 	connSems []chan struct{}
 
+	// streamRules is the compiled stream-rule set (see rules.go): patterns that
+	// abort a generation mid-token when the reply goes off the rails. Loaded per
+	// project from .codehalter/rules.toml (else the built-in defaults) by
+	// initSession, and reassigned wholesale like the rest of the config — so it
+	// lives under cfgMu with settings and connSems, not under mu.
+	streamRules []streamRule
+
 	// mcp owns the MCP server children and the bookkeeping reconcileMCP
 	// needs; its mutex guards the whole group (see mcpState).
 	mcp mcpState
@@ -486,6 +493,9 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	a.cfgMu.Lock()
 	a.settings = settings
 	a.buildConnSems()
+	// Stream rules are project config like the rest: reloaded here so editing
+	// .codehalter/rules.toml takes effect on the next session without a rebuild.
+	a.streamRules = loadStreamRules(cwd)
 	a.cfgMu.Unlock()
 	a.discoverRunners(cwd)
 	a.discoverSandbox()

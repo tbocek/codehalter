@@ -113,6 +113,116 @@ func tolerantReplace(content, oldText, newText string) (string, int) {
 	return "", 0
 }
 
+// nearMissMinScore is the fraction of old_text's lines that must match a file
+// window before we're willing to call it "the region you meant". Below this the
+// candidate is more likely to mislead than help, and the model is better served
+// by the plain "go read it" message.
+const nearMissMinScore = 0.5
+
+// nearMissMaxFileLines skips the scan on very large files. The search is
+// O(fileLines × oldLines) string compares; on a 20k-line file with a 10-line
+// snippet that is still only ~200k trivial comparisons, but past that the cost
+// stops being free and the payoff (a model editing a file that big from memory)
+// is dubious anyway.
+const nearMissMaxFileLines = 20_000
+
+// nearMissTieEpsilon is the margin within which two candidate windows count as
+// equally good. Float scores rarely land exactly equal, so a bare `==` would
+// miss the ambiguity this guards against.
+const nearMissTieEpsilon = 1e-9
+
+// nearMissSnippetCap bounds the bytes of file text quoted back in a failed-edit
+// message. Enough for the handful of lines a well-formed old_text should be,
+// and a hard stop on a model that passed half the file as old_text.
+const nearMissSnippetCap = 1500
+
+// nearMiss finds the file region old_text most likely MEANT to match, for the
+// case where both the exact and the whitespace-tolerant match failed.
+//
+// This is the recovery path that matters most for a small model. The failure is
+// almost never "the model invented a snippet"; it is "the model reproduced the
+// region from a read it did four tool calls ago, and something has drifted" — a
+// renamed identifier, an earlier edit of its own, a line it silently dropped.
+// Returning a bare "not found" makes it spend a read_file round-trip to
+// rediscover text codehalter is already holding in memory. Returning the actual
+// current bytes of the region lets it retry immediately.
+//
+// Scoring compares the window to the snippet line by line, positionally, and
+// each line pair by shared prefix and suffix rather than by equality. Equality
+// is too brittle for the dominant case: a renamed identifier changes the whole
+// line, so "one identifier drifted in a six-line block" would score 5/6 on the
+// unchanged lines but 0 on the one that actually moved, and a two-line snippet
+// with one drifted line would score 0.5 and sit right on the floor. Prefix and
+// suffix overlap degrades smoothly instead, which is what makes the common
+// single-token drift recoverable.
+//
+// Returns the 1-based start line and the window's real text, or ok=false when
+// nothing scores above nearMissMinScore or when the best score is a tie —
+// two equally-good candidates means we cannot say which region was meant, and
+// pointing at the wrong one is worse than not pointing at all (the same
+// unique-or-refuse rule tolerantReplace follows).
+func nearMiss(content, oldText string) (startLine int, snippet string, ok bool) {
+	fileLines := strings.Split(content, "\n")
+	oldLines := trimBlankEdges(strings.Split(oldText, "\n"))
+	if len(oldLines) == 0 || len(fileLines) > nearMissMaxFileLines || len(oldLines) > len(fileLines) {
+		return 0, "", false
+	}
+
+	// bestScore starts below every attainable score (which are all ≥ 0) so the
+	// tie test below can't match the initial state — otherwise zero-scoring
+	// windows would count as ties with it.
+	bestStart, bestScore, bestCount := -1, -1.0, 0
+	for i := 0; i+len(oldLines) <= len(fileLines); i++ {
+		sum := 0.0
+		for j := range oldLines {
+			sum += lineSimilarity(oldLines[j], fileLines[i+j])
+		}
+		score := sum / float64(len(oldLines))
+		switch {
+		case score > bestScore+nearMissTieEpsilon:
+			bestStart, bestScore, bestCount = i, score, 1
+		case score > bestScore-nearMissTieEpsilon:
+			// Indistinguishable from the current best: remember that it happened.
+			bestCount++
+		}
+	}
+	// A perfect score is unreachable by construction — an all-lines match would
+	// have been caught by tolerantReplace before we were called — so a high score
+	// here genuinely means "this region, something drifted".
+	if bestStart < 0 || bestScore < nearMissMinScore || bestCount > 1 {
+		return 0, "", false
+	}
+	return bestStart + 1, strings.Join(fileLines[bestStart:bestStart+len(oldLines)], "\n"), true
+}
+
+// lineSimilarity scores two lines in [0,1] by how much of the longer one is
+// covered by a shared prefix plus a shared suffix, ignoring indentation. Cheap
+// (two byte scans, no allocation) and well-shaped for source code, where a
+// drifted line is almost always "same line with something swapped in the
+// middle". Byte-wise rather than rune-wise: a split multi-byte rune only ever
+// costs a fraction of a point, and identifiers in code are ASCII.
+func lineSimilarity(a, b string) float64 {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	switch {
+	case a == b:
+		return 1
+	case a == "" || b == "":
+		return 0
+	}
+	shorter := min(len(a), len(b))
+	p := 0
+	for p < shorter && a[p] == b[p] {
+		p++
+	}
+	// Cap the suffix scan so prefix and suffix can't count the same bytes twice
+	// (e.g. "abc" vs "abcabc" would otherwise score above 1).
+	s := 0
+	for s < shorter-p && a[len(a)-1-s] == b[len(b)-1-s] {
+		s++
+	}
+	return float64(p+s) / float64(max(len(a), len(b)))
+}
+
 var skipDirs = map[string]bool{
 	".git": true, ".codehalter": true, "node_modules": true,
 	"__pycache__": true, ".venv": true, "vendor": true,
@@ -488,7 +598,11 @@ func init() {
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &oldContent, newContent)})
 
-		return "file written successfully", false
+		// Ask a wired language server about the file we just wrote and fold the
+		// answer into this result, so a broken write is visible now rather than at
+		// the next build. Returns "" when there's no server, nothing to report, or
+		// anything went wrong — the write already succeeded and must stay succeeded.
+		return "file written successfully" + a.postWriteDiagnostics(ctx, sid, path), false
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -552,10 +666,19 @@ func init() {
 				if sess := a.getSession(sid); sess != nil {
 					sess.markEditFailed(path)
 				}
-				// Failed=true feeds the loop's fail cap (a model spraying wrong edits
-				// gives up instead of looping to the iteration backstop); the verdict
-				// authority excludes edit_file, so a recovered miss never condemns.
-				return "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit). Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file.", true
+				// Quote the region old_text was probably aiming at, when we can find
+				// one. The model can then retry straight away against text it can see,
+				// instead of spending a read_file round-trip to recover bytes
+				// codehalter already has in hand. Failed=true either way: it feeds the
+				// loop's fail cap (a model spraying wrong edits gives up instead of
+				// looping to the iteration backstop), and the verdict authority
+				// excludes edit_file, so a recovered miss never condemns.
+				if line, snippet, found := nearMiss(content, oldText); found {
+					return fmt.Sprintf("error: old_text not found — the file has drifted from what you remember. The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
+						"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT call read_file first — the text above is the file's current content. Do NOT rewrite the whole file with write_file.",
+						path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap)), true
+				}
+				return "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file.", true
 			}
 		}
 
@@ -568,7 +691,8 @@ func init() {
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
 
-		return okNote, false
+		// See write_file: diagnostics ride along on the successful edit's result.
+		return okNote + a.postWriteDiagnostics(ctx, sid, path), false
 	}})
 }
 

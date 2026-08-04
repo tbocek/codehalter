@@ -12,6 +12,13 @@ A change that would have made the agent behave better on something it actually
 did wrong: fewer wasted or looping turns, a prevented mistake, a correct tool
 choice, a real guardrail that was missing.
 
+Editing an existing prompt is not the only move. When the evidence points at a
+language, build tool, or framework the agent worked in and **there is no
+`SKILL-<that>.md` at all**, the fix is a NEW skill file, not a paragraph bolted
+onto an unrelated one — see "Creating a new skill" below. Bolting Python advice
+onto `SKILL-base.md` makes every session pay for it; a `SKILL-python.md` is
+loaded, pruned, and measured on its own.
+
 **Do NOT propose:**
 
 - **Token-shaving.** "Condense this", "saves ~N tokens", "this is verbose" as the
@@ -68,6 +75,32 @@ the ones your evidence points at. Two hard rules for SKILL edits:
   two behaviors glued with "and". Compound statements can't be probed atomically
   and weaken the measurement.
 
+## Step 2b: Creating a new skill
+
+Run `list_files` on `.codehalter` to see which `SKILL-*.md` files exist. Propose
+a new one — `type: "create"`, `file: "SKILL-<topic>.md"`, `new`: the whole file
+body — only when ALL of these hold:
+
+1. The logs show the agent **repeatedly** fumbling in that language, build tool,
+   or framework (wrong idiom, wrong command, a convention it had to be told).
+   One mistake is not a skill; it is a mistake.
+2. **No existing skill covers it.** If `SKILL-go.md` exists and the failure is
+   about Go, that is an `add` to `SKILL-go.md`, not a new file.
+3. The topic is something the project actually uses, visible in the repo (a
+   `pyproject.toml`, a `Cargo.toml`, a `docker-compose.yml`) — not a language it
+   might use one day.
+
+Name it after the topic, lowercase: `SKILL-python.md`, `SKILL-rust.md`,
+`SKILL-docker.md`. codehalter picks up any `SKILL-*.md` in `.codehalter/`
+automatically; the new skill is in the system prompt from the next turn on.
+
+Write it in the same shape as the existing skills — read one first. A `#` title
+line, then `##` sections, then short imperative bullets, ONE behavior per
+bullet (the crafter probes each statement separately, exactly as above). Every
+line must be something the agent should DO or NOT DO, grounded in what went
+wrong: no tutorials, no history of the language, no "Python is a dynamically
+typed language". If you cannot fill it with concrete behavior, do not create it.
+
 ## Step 3: Rank → top 3
 
 Score each candidate by how much it cost (turns wasted, how wrong the outcome) and
@@ -79,8 +112,8 @@ evidence-backed problems? Present fewer. Do not invent filler to reach 3.
 One numbered list, **3 entries maximum**. Each entry:
 
 1. **Title** — the behavior it fixes
-2. **File/Section** — the file + section you would edit
-3. **Type** — remove / add / replace
+2. **File/Section** — the file + section you would edit, or the new skill file
+3. **Type** — remove / add / replace / create
 4. **Evidence** — the session + symptom you saw (e.g. "session_…: search_text
    'syscall' run 3×, 63 of 100 hits in gitignored bench logs")
 5. **Current text** — short excerpt, max 3 lines
@@ -94,15 +127,21 @@ Make a single `submit_improvement` call. Its `improvements` argument is a JSON
 array of your top changes (max 3), each object:
 
 - `title` — the behavior it fixes
-- `file` — the bare .codehalter prompt filename (e.g. `PLAN.md`, `SKILL-base.md`)
-- `type` — `add`, `replace`, or `remove`
+- `file` — the bare .codehalter prompt filename (e.g. `PLAN.md`, `SKILL-base.md`);
+  for `create`, the new `SKILL-<topic>.md` name
+- `type` — `add`, `replace`, `remove`, or `create`
 - `original` — the EXACT current text to match (for `replace`/`remove`); for
-  `add`, the anchor text to insert after, or empty to append at the end.
-  **Byte-exact or the apply fails**: the applier does a literal string match, so
-  re-read the target file right before submitting and copy the excerpt verbatim
-  — same whitespace, same line breaks, no "..." elisions, no re-wrapping
-- `new` — the added or replacement text (empty for `remove`)
+  `add`, the anchor text to insert after, or empty to append at the end; unused
+  for `create`. **Byte-exact or the apply fails**: the applier does a literal
+  string match, so re-read the target file right before submitting and copy the
+  excerpt verbatim — same whitespace, same line breaks, no "..." elisions, no
+  re-wrapping
+- `new` — the added or replacement text (empty for `remove`; for `create`, the
+  complete body of the new skill file)
 - `reasoning` — why, tied to the evidence
+
+`create` fails if the file already exists — that case is an `add` or a
+`replace` against the existing skill.
 
 **That single call IS the whole apply step. Do NOT call `ask_user` or `edit_file`
 yourself, and do NOT re-analyze.** codehalter takes it from there: it shows the

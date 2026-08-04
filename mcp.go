@@ -95,6 +95,12 @@ type MCPClient struct {
 	name      string
 	transport mcpTransport
 	nextID    atomic.Int64
+	// tools is what this server advertised at tools/list, retained so codehalter
+	// can call one of them on its own initiative rather than only when the model
+	// asks — see postWriteDiagnostics, which needs both the tool's name and its
+	// input schema to build a call. Written once by reconcileMCP BEFORE the
+	// client is published into a.mcp.clients, so readers never race the write.
+	tools []mcpTool
 }
 
 // mcpStartTimeout bounds a server's bring-up (handshake + tools/list) so a
@@ -822,6 +828,12 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 			changes = append(changes, mcpChange{action: "failed", name: name, err: fmt.Errorf("tools/list: %w", err)})
 			continue
 		}
+
+		// Retain the advertised tool list on the client before publishing it, so
+		// agent-initiated calls (postWriteDiagnostics) can look up a tool's schema
+		// without a second tools/list. Set here, pre-publication, so it is written
+		// while no other goroutine can reach the client.
+		newClient.tools = tools
 
 		// New client is ready. Atomically swap: unregister old tools, register
 		// new tools, replace the client handle, close the old client.
