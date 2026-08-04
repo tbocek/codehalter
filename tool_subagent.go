@@ -386,7 +386,10 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 
 	instructions := task.framed()
 
-	subSess.AddUser(instructions)
+	// Leaf subagent: tool loop only, on the "execute" role like runExecutePhase,
+	// so it carries the same reasoning switch (see noThinkSwitch). The "thinking"
+	// task type below omits it — it runs its own plan phase first.
+	subSess.AddUser(instructions + noThinkSwitch)
 	subSess.saveOrLog()
 
 	var b strings.Builder

@@ -269,6 +269,24 @@ type subtaskOutcome struct {
 	Upsert *planResult
 }
 
+// noThinkSwitch turns reasoning off for the phases that don't want it WITHOUT
+// touching chat_template_kwargs. That request field is an argument to the
+// server's chat template, not a sampler, so setting it on one role and not the
+// other makes the server re-render the entire prompt at every phase change:
+// measured on the first execute call of a turn as 9088 of 14436 tokens
+// re-evaluated, 15s, with the very next call (same field) hot again. Qwen's
+// soft switch is plain text in the last user message instead, so everything in
+// front of it stays byte-identical and stays cached.
+//
+// It MUST be part of the STORED message (AddUser), never appended to the wire
+// copy: a wire-only suffix would make the same stored message render one way
+// while it is last and another way once history moves past it, which is the
+// exact break being removed here.
+//
+// Appended by every phase that runs on the "execute" role: the executor, the
+// documenter, and a leaf subagent. The plan phase deliberately omits it.
+const noThinkSwitch = "\n\n/no_think"
+
 // runExecutePhase runs one subtask as a single tool-calling loop. EXECUTE.md
 // plus the subtask description and verify recipe open the loop; the
 // executor runs with all execute tools (web tools excluded — those live in
@@ -287,6 +305,8 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 			fmt.Fprintf(&prompt, "%d. %s\n", i+1, v)
 		}
 	}
+
+	prompt.WriteString(noThinkSwitch)
 
 	if sess != nil {
 		sess.AddUser(prompt.String())
@@ -406,7 +426,7 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// The doc instruction lands in the session as the trailing user turn, so
 	// buildLLMContext hands the documenter the FULL turn — the edits the executor
 	// actually made, not a lossy digest — continuing the cached lineage.
-	sess.AddUser(docPrompt)
+	sess.AddUser(docPrompt + noThinkSwitch)
 	sess.saveOrLog()
 
 	// Blank line before the documenter streams, so its output (often just "No
@@ -1125,9 +1145,14 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				"3. If you are stuck or the task is infeasible, say so and stop.",
 		})
 		// Mid-ladder recovery: warm the sampler once before the bail. Same
-		// server/model (sampler params don't enter the KV cache key, so the
-		// prefix cache survives); the "thinking" role's params let it abandon the
-		// stuck plan. Skip when already on "thinking" (plan phase) — a no-op swap.
+		// server/model, and samplers don't enter the KV cache key, so the prefix
+		// cache survives — but only while the two roles differ in SAMPLERS alone.
+		// Anything a role's params feed to the server's chat template
+		// (chat_template_kwargs) re-renders the whole prompt, which would make
+		// this swap a full prefill at the worst possible moment: deep into a long
+		// execute context. That is why thinking is switched off in the message
+		// text instead (noThinkSwitch), not via chat_template_kwargs.
+		// Skip when already on "thinking" (plan phase) — a no-op swap.
 		if stuckRounds >= stuckEscalateRounds && !escalated && conn != nil && conn.Tag != "thinking" {
 			if thinkConn := a.connForSession(ctx, sid, "thinking"); thinkConn != nil {
 				conn = thinkConn

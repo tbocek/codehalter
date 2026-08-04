@@ -130,6 +130,8 @@ One `[[llm]]` array. Order matters: `llm[0]` is the main connection, `llm[1+]` a
 
 `params` is forwarded verbatim as the OpenAI request's extra body, put samplers and any model-specific knobs (`enable_thinking`, `reasoning_mode`, …) there. Core fields (`model`, `messages`, `stream`, `tools`) always win over `params`.
 
+Keep `params_thinking` and `params_execute` identical in everything that is **not** a sampler. Samplers (`temperature`, `top_p`, `max_tokens`, …) never enter the KV cache key, so they can differ per role for free. Anything the server feeds to its chat template does not: `chat_template_kwargs` re-renders the whole prompt, so a role switch mid-turn (plan → execute) throws the prefix cache away and pays a full prefill. That is why codehalter turns reasoning off for the execute phase with the model's `/no_think` soft switch in the message text instead of with `enable_thinking = false`. `logy` flags this class of change as `⚠ params CHANGED`.
+
 `server` is the base URL of your OpenAI-compatible server, the host root only (e.g. `http://localhost:8080`). codehalter appends the API paths itself: `/v1/chat/completions` for completions, plus `/v1/models` and `/props` for probing. Don't include a path.
 
 Two optional **top-level keys** (they must appear above the `[[llm]]` tables): `prewarm = true` (default on) fires a background 1-token call at session open so the server tokenizes and caches the prompt prefix before your first message; `skills = "inline"` (default `"auto"`) puts every language/runner skill into the system prompt up front instead of deferring each until the session first touches a matching file.

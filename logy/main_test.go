@@ -71,3 +71,37 @@ func TestCanonAndPrefix(t *testing.T) {
 		t.Errorf("differing tool calls should not match, prefix = %d, want 1", p)
 	}
 }
+
+// TestDiffParamsSeparatesSamplersFromTemplate pins the distinction the tool
+// exists for: a temperature/max_tokens change between two calls costs nothing,
+// while a chat_template_kwargs change re-renders the whole prompt and voids the
+// prefix cache even when the message diff is a clean append.
+func TestDiffParamsSeparatesSamplersFromTemplate(t *testing.T) {
+	plan := requestParams(map[string]any{
+		"model": "m", "temperature": 1.0, "max_tokens": 16384,
+		"messages": []any{"ignored"}, "tools": []any{"ignored"},
+	})
+	if _, ok := plan["messages"]; ok {
+		t.Error("requestParams must drop messages")
+	}
+	if _, ok := plan["tools"]; ok {
+		t.Error("requestParams must drop tools")
+	}
+
+	samplersOnly := requestParams(map[string]any{
+		"model": "m", "temperature": 0.6, "max_tokens": 8192,
+	})
+	changed, breaks := diffParams(plan, samplersOnly)
+	if len(changed) != 2 || breaks {
+		t.Errorf("sampler-only diff: changed=%v breaks=%v, want 2 changes and breaks=false", changed, breaks)
+	}
+
+	withTemplate := requestParams(map[string]any{
+		"model": "m", "temperature": 0.6, "max_tokens": 8192,
+		"chat_template_kwargs": map[string]any{"enable_thinking": false},
+	})
+	changed, breaks = diffParams(plan, withTemplate)
+	if !breaks {
+		t.Errorf("chat_template_kwargs must be reported as cache-breaking: changed=%v", changed)
+	}
+}

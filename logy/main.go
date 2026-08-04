@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -102,6 +103,64 @@ func canonMessages(raw []any) []wireMsg {
 	return out
 }
 
+// cacheNeutralParams are request fields that steer generation but never change
+// the prompt the server renders, so a diff in them is free. Everything else
+// (model, chat_template_kwargs, tool_choice, response_format…) can change the
+// tokens the server builds from the same messages, which breaks the prefix
+// cache without any visible message diff — the failure this tool exists to make
+// visible. Unknown fields count as suspect: over-reporting is cheap, a silent
+// full prefill is not.
+var cacheNeutralParams = map[string]bool{
+	"frequency_penalty": true, "max_tokens": true, "min_p": true,
+	"n": true, "presence_penalty": true, "repeat_penalty": true,
+	"seed": true, "stop": true, "stream": true, "stream_options": true,
+	"temperature": true, "timings_per_token": true, "top_k": true, "top_p": true,
+}
+
+// requestParams is everything in the request body except messages and tools,
+// each value canonicalised to JSON so it compares by value.
+func requestParams(req map[string]any) map[string]string {
+	out := map[string]string{}
+	for k, v := range req {
+		if k == "messages" || k == "tools" {
+			continue
+		}
+		b, _ := json.Marshal(v)
+		out[k] = string(b)
+	}
+	return out
+}
+
+// diffParams lists the params that changed between two calls and reports
+// whether any of them can alter the rendered prompt.
+func diffParams(prev, cur map[string]string) (changed []string, breaksCache bool) {
+	keys := map[string]bool{}
+	for k := range prev {
+		keys[k] = true
+	}
+	for k := range cur {
+		keys[k] = true
+	}
+	for k := range keys {
+		if prev[k] == cur[k] {
+			continue
+		}
+		changed = append(changed, fmt.Sprintf("`%s`: %s → %s", k, orAbsent(prev[k]), orAbsent(cur[k])))
+		if !cacheNeutralParams[k] {
+			breaksCache = true
+		}
+	}
+	sort.Strings(changed)
+	return changed, breaksCache
+}
+
+func orAbsent(v string) string {
+	if v == "" {
+		return "(absent)"
+	}
+	return "`" + v + "`"
+}
+
 // commonPrefix returns how many leading messages are identical between the
 // two requests — the region a warm prefix cache serves for free.
 func commonPrefix(prev, cur []wireMsg) int {
@@ -168,6 +227,7 @@ func main() {
 
 	var prevMsgs []wireMsg
 	var prevTools string
+	var prevParams map[string]string
 	callNo := 0
 	for _, e := range parseEntries(string(data)) {
 		switch {
@@ -202,6 +262,21 @@ func main() {
 			} else if prevTools != "" {
 				fmt.Fprintf(&w, "⚠ tools DROPPED (previous call sent %d chars) — this breaks the whole prefix cache!\n\n", len(prevTools))
 			}
+
+			// Params: a sampler change is free, a template/model change silently
+			// re-renders the prompt. Reported before the message diff, because a
+			// "pure extension" below can still cost a full prefill because of it.
+			params := requestParams(req)
+			if prevParams != nil {
+				if changed, breaks := diffParams(prevParams, params); len(changed) > 0 {
+					head := "params changed (generation only — cache-safe)"
+					if breaks {
+						head = "⚠ params CHANGED in a field that feeds the chat template — the server re-renders the whole prompt, so the prefix cache below is NOT free!"
+					}
+					fmt.Fprintf(&w, "%s\n- %s\n\n", head, strings.Join(changed, "\n- "))
+				}
+			}
+			prevParams = params
 
 			msgs := canonMessages(req["messages"].([]any))
 			p := commonPrefix(prevMsgs, msgs)
