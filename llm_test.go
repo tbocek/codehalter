@@ -359,7 +359,7 @@ func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
 			t.Fatal("connForSession returned nil")
 		}
 		if arm {
-			conn = conn.withStreamRules()
+			conn = conn.forToolLoop()
 		}
 		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, llmAllToolDefinitions(), nil, nil)
 		return err

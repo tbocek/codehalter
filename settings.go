@@ -156,8 +156,17 @@ type LLMConnection struct {
 	// particular, passes the foreground's full tools array (for prefix-cache
 	// reasons, see summariseCall) but has no ladder: a rule firing there would
 	// silently downgrade the turn's note to the raw fallback. Set on a copy by
-	// runToolLoop. Runtime-only.
+	// runToolLoop (forToolLoop). Runtime-only.
 	streamRulesArmed bool
+
+	// cacheLineage folds this call into the session's prefix-cache rewind check
+	// (Session.noteCacheLineage). Opt-in for the same reason: the check compares
+	// this call's cached count against the PREVIOUS call's prompt size, which is
+	// only meaningful when the two share a message history. The tool loop's calls
+	// do (each is the last plus an append); the background summariser's do not.
+	// It runs a one-shot prompt on (usually) another server, and counting it would
+	// report a rewind on every turn. Set on a copy by forToolLoop. Runtime-only.
+	cacheLineage bool
 }
 
 // paramsFor returns the sampler params for the given role, falling back to

@@ -836,6 +836,15 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		if r.genMs > 0 && r.completion > 0 {
 			line += " · " + humanRate(r.completion, r.genMs) + " tg/s"
 		}
+		// Prefix cache didn't hold across the turn's calls (noteCacheLineage).
+		// Worth a mark: it is invisible otherwise (the turn still succeeds, just
+		// several times slower), and it is nearly always one line of settings.
+		if r.cacheRewinds > 0 {
+			line += fmt.Sprintf("\n\n⚠ Prefix cache rewound %d× (%s re-read). "+
+				"For Qwen3.6, set `chat_template_kwargs = { preserve_thinking = true }` in BOTH `params_thinking` and `params_execute`; "+
+				"the two roles must not otherwise differ in `chat_template_kwargs`. See the session log (CACHE lines) for the calls.",
+				r.cacheRewinds, humanCount(r.cacheRewound))
+		}
 		// Nudge toward self-improvement: /improve reads this session's logs and
 		// proposes (then applies/submits) refinements to codehalter's own prompts.
 		line += "\n\n💡 Run /improve to analyze this session and improve codehalter."

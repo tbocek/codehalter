@@ -792,7 +792,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		// Arm the stream-rule check for this round. The tool loop is the only
 		// caller that does: it owns the retry ladder below, which is what makes a
 		// mid-generation abort recoverable rather than just a failed call.
-		callConn := conn.withStreamRules() // a <think> stall retries (and latches) on a thinking-off copy
+		callConn := conn.forToolLoop() // a <think> stall retries (and latches) on a thinking-off copy
 		if thinkingStalled {
 			callConn = callConn.withThinkingDisabled()
 		}
@@ -816,6 +816,13 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				thinkingRetried = true
 				thinkingStalled = true
 				callConn = callConn.withThinkingDisabled()
+				if sess := a.getSession(sid); sess != nil {
+					// This changes chat_template_kwargs, so the server re-renders the
+					// whole prompt. That IS a rewind, but a deliberate one we caused;
+					// drop the comparison point so the Done line doesn't blame the
+					// user's settings for it.
+					sess.resetCacheLineage()
+				}
 				a.logSession(sid, "RECOVER", "model stuck in <think> — retrying with thinking disabled (rest of run)")
 				continue
 			}

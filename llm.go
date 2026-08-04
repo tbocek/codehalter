@@ -264,13 +264,16 @@ func (c *LLMConnection) withMaxTokens(n int) *LLMConnection {
 	return &cp
 }
 
-// withStreamRules returns a shallow copy of the connection with the stream-rule
-// check armed. Only the tool loop calls this: it is the one caller with a retry
-// ladder that can act on a rule abort. Nothing about the request body changes,
-// so the prefix cache is unaffected.
-func (c *LLMConnection) withStreamRules() *LLMConnection {
+// forToolLoop returns a shallow copy of the connection marked as a tool-loop
+// call: stream rules armed, and the call folded into the session's prefix-cache
+// lineage. Both belong to the tool loop alone: it is the one caller with a retry
+// ladder that can act on a rule abort, and the one caller whose successive calls
+// are guaranteed to be appends to each other (see noteCacheLineage). Nothing
+// about the request body changes, so the prefix cache is unaffected.
+func (c *LLMConnection) forToolLoop() *LLMConnection {
 	cp := *c
 	cp.streamRulesArmed = true
+	cp.cacheLineage = true
 	return &cp
 }
 
@@ -396,9 +399,9 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		sem = a.connSems[slot]
 	}
 	// Stream rules ride the same lock (they're reassigned wholesale with the rest
-	// of the config). Armed only where the caller asked for it — see
-	// LLMConnection.streamRulesArmed for why this is opt-in and not simply "any
-	// call that passes tools".
+	// of the config). Armed only where the caller asked for it (forToolLoop).
+	// See LLMConnection.streamRulesArmed for why this is opt-in and not simply
+	// "any call that passes tools".
 	var matcher *ruleMatcher
 	if conn.streamRulesArmed && len(a.streamRules) > 0 {
 		matcher = &ruleMatcher{rules: a.streamRules}
@@ -634,6 +637,20 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 			evaluatedTokens = promptTokens - cachedTokens
 		}
 		sess.addTurnTokens(promptTokens, completionTokens, evaluatedTokens)
+		// Prefix-cache rewind check, tool-loop calls only. Each is the previous
+		// call's messages plus an append, so the server should hand back
+		// everything the previous call sent (cached ≈ its prompt) and evaluate
+		// only the tail. A big shortfall means the prompt was re-rendered behind
+		// our backs; logged per call, and reported once on the Done line.
+		if conn.cacheLineage && promptTokens > 0 {
+			if n := sess.noteCacheLineage(promptTokens, cachedTokens); n > 0 {
+				a.logSession(sid, connLabel+" CACHE",
+					"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d). "+
+						"Usual causes: the chat template re-rendered earlier messages (Qwen3.6 needs chat_template_kwargs.preserve_thinking = true "+
+						"in BOTH params_thinking and params_execute), the two roles differ in chat_template_kwargs, or the server dropped the prefix.",
+					n, promptTokens, cachedTokens)
+			}
+		}
 		// Prefer the server's measured times over our TTFT proxy (which includes
 		// queue + cache-load overhead → understates pp/s).
 		pMs, gMs := serverPromptMs, serverGenMs

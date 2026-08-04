@@ -41,6 +41,65 @@ func TestTurnServerCache(t *testing.T) {
 	}
 }
 
+// TestCacheLineage pins the rewind detector against the numbers that motivated
+// it. A healthy tool-loop call gets back everything the previous call sent minus
+// llama.cpp's dropped chunk; the turn that ignored preserve_thinking got back
+// thousands less on four calls. First call, no-cache-info calls and compaction
+// have no comparison point and must never be reported.
+func TestCacheLineage(t *testing.T) {
+	s := &Session{}
+	s.resetTurnStats(time.Now())
+
+	// Real trace of the fixed run: cached is always prompt(n-1) - 4.
+	healthy := [][2]int{{11307, 5348}, {11483, 11303}, {11666, 11479}, {12732, 11662}}
+	for _, c := range healthy {
+		if n := s.noteCacheLineage(c[0], c[1]); n != 0 {
+			t.Errorf("prompt=%d cached=%d: reported a %d-token rewind, want none", c[0], c[1], n)
+		}
+	}
+	if r := s.turnStats(); r.cacheRewinds != 0 {
+		t.Errorf("healthy turn: cacheRewinds=%d, want 0", r.cacheRewinds)
+	}
+
+	// Real trace of the broken run: the boundary moved, the server re-read the
+	// tail behind it. 65 is the same fault with nothing behind the boundary:
+	// under the slack, deliberately not reported.
+	s2 := &Session{}
+	s2.resetTurnStats(time.Now())
+	s2.noteCacheLineage(15346, 5348) // first call: no comparison point
+	broken := [][3]int{{15346, 8475, 6871}, {17000, 7002, 8344}, {17100, 17035, 0}}
+	for _, c := range broken {
+		if n := s2.noteCacheLineage(c[0], c[1]); n != c[2] {
+			t.Errorf("prompt=%d cached=%d: got %d, want %d", c[0], c[1], n, c[2])
+		}
+	}
+	r2 := s2.turnStats()
+	if r2.cacheRewinds != 2 || r2.cacheRewound != 6871+8344 {
+		t.Errorf("broken turn: rewinds=%d rewound=%d, want 2 and %d", r2.cacheRewinds, r2.cacheRewound, 6871+8344)
+	}
+
+	// A backend that reports no cache split (cached = -1) can't be judged, and
+	// must not make the NEXT call look like a rewind either.
+	s3 := &Session{}
+	s3.resetTurnStats(time.Now())
+	s3.noteCacheLineage(9000, -1)
+	if n := s3.noteCacheLineage(9100, -1); n != 0 {
+		t.Errorf("no cache info: got %d, want 0", n)
+	}
+	if n := s3.noteCacheLineage(9200, 9096); n != 0 {
+		t.Errorf("after no cache info: got %d, want 0", n)
+	}
+
+	// Compaction rewrites the front of the context on purpose.
+	s4 := &Session{}
+	s4.resetTurnStats(time.Now())
+	s4.noteCacheLineage(30000, 29996)
+	s4.resetCacheLineage()
+	if n := s4.noteCacheLineage(12000, 0); n != 0 {
+		t.Errorf("after compaction: got %d, want 0", n)
+	}
+}
+
 // TestUpsertLastAssistant pins both branches of UpsertLastAssistant: append a
 // new assistant turn when the trailing role is not assistant, overwrite the
 // existing one otherwise.

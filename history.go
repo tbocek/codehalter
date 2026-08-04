@@ -95,6 +95,10 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 		return false
 	}
 	sess.resetTurnStart()
+	// The fold rewrote the front of the context, so the next call legitimately
+	// re-reads almost everything. Drop the comparison point rather than report
+	// that as a cache fault.
+	sess.resetCacheLineage()
 	// Re-render the system prompt so skills + project context survive the fold.
 	if sysPrompt, err := a.systemPrompt(sess.ID); err == nil {
 		sess.SystemPrompt = sysPrompt

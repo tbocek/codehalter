@@ -403,6 +403,12 @@ type Session struct {
 	haveServerCache     bool
 	turnPromptMs        int64 // eval time (server prompt_ms, else TTFT)
 	turnGenMs           int64 // generation time
+	// Prefix-cache rewind detector, fed by the tool loop's calls only (see
+	// noteCacheLineage). cacheRewinds counts the calls that had to re-read
+	// prompt the previous call already sent; cacheRewound sums those tokens.
+	cachePrevPrompt int
+	cacheRewinds    int
+	cacheRewound    int
 }
 
 // resetTurnStats starts a fresh per-turn measurement window at start.
@@ -416,6 +422,9 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.haveServerCache = false
 	s.turnPromptMs = 0
 	s.turnGenMs = 0
+	s.cachePrevPrompt = 0
+	s.cacheRewinds = 0
+	s.cacheRewound = 0
 	s.turnStatsMu.Unlock()
 }
 
@@ -434,6 +443,59 @@ func (s *Session) addTurnTokens(prompt, completion, evaluated int) {
 		s.turnEvaluatedPrompt += evaluated
 		s.haveServerCache = true
 	}
+	s.turnStatsMu.Unlock()
+}
+
+// cacheRewindSlack is how far below the previous call's prompt this call's
+// cached count may sit before it counts as a rewind. Two things eat into it
+// legitimately: llama.cpp always drops the last cache chunk (measured at 4
+// tokens), and the end-of-turn summariser, when it lands on the foreground
+// connection, extends the prefix with an instruction tail that the next call
+// then trims back off. Both are in the low hundreds. Every rewind we have
+// actually diagnosed was thousands (3129, 4366, 6871, 9998 on one turn), so a
+// threshold here is generous without hiding anything worth reporting.
+const cacheRewindSlack = 1024
+
+// noteCacheLineage folds one tool-loop call's cache split into the turn's
+// rewind detector and returns how many tokens this call re-read that the
+// previous call had already sent (0 when the prefix held).
+//
+// Only the tool loop feeds this (LLMConnection.cacheLineage), because only the
+// tool loop guarantees the premise: each call's message list is the previous
+// call's plus an append, so the server should serve the whole previous prompt
+// from cache and evaluate just the new tail. When cached comes back well below
+// the previous prompt, something re-rendered the middle of the prompt: a
+// chat template that repositions content (Qwen3.6 moves the <think> wrappers
+// when the last user message moves, which chat_template_kwargs.preserve_thinking
+// pins), a role switch that changes chat_template_kwargs, a corrective that
+// reached the wire but not the session, or a server that simply evicted us.
+//
+// cached < 0 means the backend reported no cache split; then there is nothing
+// to compare and the lineage restarts at this call.
+func (s *Session) noteCacheLineage(prompt, cached int) int {
+	s.turnStatsMu.Lock()
+	defer s.turnStatsMu.Unlock()
+	prev := s.cachePrevPrompt
+	s.cachePrevPrompt = prompt
+	if prev <= 0 || cached < 0 {
+		return 0
+	}
+	rewound := prev - cached
+	if rewound <= cacheRewindSlack {
+		return 0
+	}
+	s.cacheRewinds++
+	s.cacheRewound += rewound
+	return rewound
+}
+
+// resetCacheLineage drops the comparison point so the next call can't be read
+// as a rewind. Compaction calls it: rewriting the front of the context throws
+// the prefix away by design, and reporting that as a fault would be crying
+// wolf at the one moment the user was already told what happened.
+func (s *Session) resetCacheLineage() {
+	s.turnStatsMu.Lock()
+	s.cachePrevPrompt = 0
 	s.turnStatsMu.Unlock()
 }
 
@@ -465,6 +527,8 @@ type turnReport struct {
 	haveServerCache bool // a backend reported the cache split
 	promptMs        int64
 	genMs           int64
+	cacheRewinds    int // calls that re-read prompt the previous call had sent
+	cacheRewound    int // Σ of those re-read tokens
 }
 
 func (s *Session) turnStats() turnReport {
@@ -485,6 +549,8 @@ func (s *Session) turnStats() turnReport {
 		haveServerCache: s.haveServerCache,
 		promptMs:        s.turnPromptMs,
 		genMs:           s.turnGenMs,
+		cacheRewinds:    s.cacheRewinds,
+		cacheRewound:    s.cacheRewound,
 	}
 }
 
