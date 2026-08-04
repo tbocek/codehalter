@@ -63,6 +63,65 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	}
 }
 
+// TestCheckEnvAsksAboutGoplsOnce pins the one-card rule for a stack's language
+// server: a Go project with gopls missing and no gopls in mcp.toml gets ONE card,
+// the code-intelligence one, whose prompt installs first then wires. The install
+// card must never also own gopls — when both did, the setup card's
+// gopls-is-present gate forced them into consecutive turns, which is how the
+// user got asked about gopls twice. Declining (a commented-out entry) silences
+// it entirely, exactly as it does for lsmcp and clangd.
+func TestCheckEnvAsksAboutGoplsOnce(t *testing.T) {
+	a, s := newTestAgent(t)
+	// Empty PATH so gopls is missing regardless of the developer's machine.
+	t.Setenv("PATH", "")
+	if err := os.WriteFile(filepath.Join(s.Cwd, "go.mod"), []byte("module x\n\ngo 1.24\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgDir := filepath.Join(s.Cwd, sessionDir)
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	descs := func() []string {
+		_, problems := a.checkEnv(s, s.ID)
+		var out []string
+		for _, p := range problems {
+			out = append(out, p.desc)
+		}
+		return out
+	}
+	countMentioning := func(all []string, word string) int {
+		n := 0
+		for _, d := range all {
+			if strings.Contains(d, word) {
+				n++
+			}
+		}
+		return n
+	}
+
+	// No mcp.toml at all: exactly one card may mention gopls, and it must be the
+	// code-intelligence one, whose prompt covers install + wiring. The install
+	// card owning gopls here is the two-turn nag this test exists to prevent.
+	all := descs()
+	if got := countMentioning(all, "gopls"); got != 1 {
+		t.Errorf("gopls asked about %d times, want 1: %v", got, all)
+	}
+	if got := countMentioning(all, "Go code intelligence"); got != 1 {
+		t.Errorf("the single gopls card must be the code-intelligence one: %v", all)
+	}
+
+	// Declined (commented out) → gopls goes quiet, it does not resurface via the
+	// install card. Same contract as lsmcp/clangd: a decline is final.
+	mcp := "# [[server]]\n# name = \"gopls\"\n# command = \"gopls\"\n"
+	if err := os.WriteFile(filepath.Join(cfgDir, "mcp.toml"), []byte(mcp), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if all = descs(); countMentioning(all, "gopls") != 0 {
+		t.Errorf("a commented-out gopls should silence every gopls card: %v", all)
+	}
+}
+
 // TestDetectFormatters covers both drivers: detected stack (ts → prettier) and
 // formatter config files (.clang-format → clang-format, pyproject [tool.ruff] →
 // ruff), and that an empty project needs nothing.
@@ -452,19 +511,13 @@ func TestScaffoldSettings(t *testing.T) {
 // regardless of which dev tools happen to be installed.
 func TestProbeToolBinsMatchesInlineProbe(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.knownStacks = []string{"go", "rust"}           // go→gopls; rust→"" (skipped)
+	s.knownStacks = []string{"go", "rust"}
 	s.knownRunners = []string{"make", "go", "bogus"} // make→make, go→go; bogus→"" (skipped)
 
-	gotStacks, gotRunners, gotFormatters := a.probeToolBins(s)
+	gotRunners, gotFormatters := a.probeToolBins(s)
 
 	// Independent re-implementation of the pre-refactor inline probe loops.
-	var wantStacks, wantRunners, wantFormatters []toolPresence
-	for _, st := range s.knownStacks {
-		if bin := stackProbeBinary(st); bin != "" {
-			_, err := exec.LookPath(bin)
-			wantStacks = append(wantStacks, toolPresence{bin: bin, label: st, present: err == nil})
-		}
-	}
+	var wantRunners, wantFormatters []toolPresence
 	for _, k := range s.knownRunners {
 		if bin := runnerProbeBinary(k); bin != "" {
 			_, err := exec.LookPath(bin)
@@ -481,9 +534,6 @@ func TestProbeToolBinsMatchesInlineProbe(t *testing.T) {
 		wantFormatters = append(wantFormatters, toolPresence{bin: f.bin, label: f.reason, present: present})
 	}
 
-	if !reflect.DeepEqual(gotStacks, wantStacks) {
-		t.Errorf("stacks: got %+v, want %+v", gotStacks, wantStacks)
-	}
 	if !reflect.DeepEqual(gotRunners, wantRunners) {
 		t.Errorf("runners: got %+v, want %+v", gotRunners, wantRunners)
 	}

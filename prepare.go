@@ -64,20 +64,15 @@ type fixProblem struct {
 	prompt string
 }
 
-// stackProbeBinary returns the binary whose presence on PATH means the
-// stack's required dev tooling is installed. "" means no probe known —
-// checkEnv ignores that stack. One binary per stack by design: gopls
-// stands in for Go because installing it implicitly requires the toolchain.
-// JS/TS has no PATH-binary probe — its code-intelligence path is the lsmcp MCP
-// (a project devDep + mcp.toml entry), which checkEnv offers via its own setup
-// card (mcpServerConfigured), so it's no longer second-class versus gopls.
-func stackProbeBinary(stack string) string {
-	switch stack {
-	case "go":
-		return "gopls"
-	}
-	return ""
-}
+// A stack's dev tooling is NOT probed as a PATH binary. It used to be, via a
+// stackProbeBinary("go") == "gopls" table whose only entry was that one — so the
+// install card and the gopls setup card both owned the same binary, and because
+// the setup card was gated on gopls already being present, the two could never
+// fire in the same batch: install this turn, wire the next. That is the "asked
+// about gopls twice" bug. Every stack now works the way JS/TS and C already did:
+// one code-intelligence card per stack (checkEnv, below) owns install AND wiring
+// in a single turn. The install card is left to cover runners and formatters,
+// which have no card of their own.
 
 // detectRunnerConfigs returns runner-kind names purely from config-file
 // presence in cwd, regardless of whether the runner binary is installed.
@@ -114,8 +109,8 @@ func detectRunnerConfigs(cwd string) []string {
 }
 
 // runnerProbeBinary returns the binary that must be on PATH for a runner
-// kind to be usable. Mirrors stackProbeBinary's shape — kept as a switch
-// rather than a map so adding a new runner is one obvious place to edit.
+// kind to be usable. Kept as a switch rather than a map so adding a new runner
+// is one obvious place to edit.
 func runnerProbeBinary(kind string) string {
 	switch kind {
 	case "just":
@@ -639,16 +634,11 @@ func okMissing(present bool) string {
 	return "missing"
 }
 
-// probeToolBins resolves PATH presence once for every known stack, runner, and
-// formatter binary of the session. envSnapshot, checkEnv, and notifyCapabilities
-// each used to re-run this exec.LookPath loop with the prettier project-local
-// special-case duplicated; they now format this one shared result.
-func (a *agent) probeToolBins(sess *Session) (stacks, runners, formatters []toolPresence) {
-	for _, s := range sess.knownStacks {
-		if bin := stackProbeBinary(s); bin != "" {
-			stacks = append(stacks, toolPresence{bin: bin, label: s, present: onPath(bin)})
-		}
-	}
+// probeToolBins resolves PATH presence once for every runner and formatter
+// binary of the session. envSnapshot, checkEnv, and notifyCapabilities each used
+// to re-run this exec.LookPath loop with the prettier project-local special-case
+// duplicated; they now format this one shared result.
+func (a *agent) probeToolBins(sess *Session) (runners, formatters []toolPresence) {
 	for _, k := range sess.knownRunners {
 		if bin := runnerProbeBinary(k); bin != "" {
 			runners = append(runners, toolPresence{bin: bin, label: k, present: onPath(bin)})
@@ -679,33 +669,40 @@ func (a *agent) envSnapshot(sess *Session) string {
 	}
 	// run_command availability is fully determined by container= above (it's
 	// registered iff in a container), so it needs no separate snapshot line.
-	stacks, runners, formatters := a.probeToolBins(sess)
+	runners, formatters := a.probeToolBins(sess)
 	fmt.Fprintf(&b, "stacks=%s\n", strings.Join(sess.knownStacks, ","))
-	for _, t := range stacks {
-		fmt.Fprintf(&b, "tool[%s]=%s\n", t.bin, okMissing(t.present))
-	}
 	fmt.Fprintf(&b, "runners=%s\n", strings.Join(sess.knownRunners, ","))
 	for _, t := range runners {
 		fmt.Fprintf(&b, "runner[%s]=%s\n", t.bin, okMissing(t.present))
 	}
-	// Formatter + lsmcp presence: so the snapshot flips (and the card stops being
-	// offered) once a missing formatter is installed or lsmcp gets wired.
+	// Formatter + code-intelligence presence: so the snapshot flips (and the card
+	// stops being offered) once a missing formatter is installed or the stack's
+	// language server gets wired. Each line uses the same predicate as the card it
+	// tracks, so "snapshot changed" and "card no longer offered" can't disagree.
 	for _, t := range formatters {
 		fmt.Fprintf(&b, "fmt[%s]=%v\n", t.bin, t.present)
 	}
+	if slices.Contains(sess.knownStacks, "go") {
+		fmt.Fprintf(&b, "gopls=%v\n", mcpMentionsServer(sess.Cwd, "gopls"))
+	}
 	if slices.Contains(sess.knownStacks, "ts") || slices.Contains(sess.knownStacks, "js") {
 		fmt.Fprintf(&b, "lsmcp=%v\n", mcpServerConfigured(sess.Cwd, "lsmcp"))
+	}
+	if slices.Contains(sess.knownStacks, "c") {
+		fmt.Fprintf(&b, "clangd=%v\n", mcpServerConfigured(sess.Cwd, "clangd"))
 	}
 	return b.String()
 }
 
 // checkEnv refreshes sess.knownStacks and sess.knownRunners, probes the
-// environment (container, firefox, run_command, per-stack dev-tool
-// binaries, runner-config binaries on PATH), and reports whether anything
-// is different from sess.envSnapshot. All missing binaries are collapsed
-// into ONE fixProblem so the user sees a single "Install fix? gopls,
-// make, just" card instead of one card per tool. Strictly silent — emits
-// no chat output of its own. Bash and devcontainer are filtered out of
+// environment (container, firefox, run_command, runner-config and formatter
+// binaries on PATH), and reports whether anything is different from
+// sess.envSnapshot. All missing binaries are collapsed into ONE fixProblem so
+// the user sees a single "Install fix? make, just" card instead of one card per
+// tool. Each stack's language server is deliberately NOT in that card: its own
+// code-intelligence card installs and wires it in one turn, and having both own
+// the same binary is what made gopls get asked about twice. Strictly silent —
+// emits no chat output of its own. Bash and devcontainer are filtered out of
 // knownStacks because they're meta-tooling, not stacks.
 func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	var stacks []string
@@ -777,12 +774,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 		}
 		fmt.Fprintf(&detail, "%s (%s)", bin, reason)
 	}
-	binStacks, binRunners, binFormatters := a.probeToolBins(sess)
-	for _, t := range binStacks {
-		if !t.present {
-			note(t.bin, t.label+" stack")
-		}
-	}
+	binRunners, binFormatters := a.probeToolBins(sess)
 	for _, t := range binRunners {
 		if !t.present {
 			note(t.bin, t.label+" runner")
@@ -811,18 +803,13 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 			prompt: fmt.Sprintf(cardInstallTools, distro, detail.String()),
 		})
 	}
-	// Go code-intelligence MCP (gopls). Offer wiring when a Go project has gopls on
-	// PATH but no gopls [[server]] in mcp.toml. mcpMentionsServer (not
+	// Go code-intelligence MCP (gopls). Offered whenever a Go project has no gopls
+	// [[server]] in mcp.toml, installed or not: cardSetupGopls installs it first
+	// when missing, then wires it, all in one turn. mcpMentionsServer (not
 	// mcpServerConfigured): a commented-out entry counts as "already offered and
 	// declined", so we don't nag — which is also why the seed mcp.toml ships no
 	// gopls example. The lsmcp/clangd cards below mirror this for JS/TS and C.
-	goplsPresent := false
-	for _, t := range binStacks {
-		if t.bin == "gopls" {
-			goplsPresent = t.present
-		}
-	}
-	if slices.Contains(stacks, "go") && goplsPresent && !mcpMentionsServer(sess.Cwd, "gopls") {
+	if slices.Contains(stacks, "go") && !mcpMentionsServer(sess.Cwd, "gopls") {
 		problems = append(problems, fixProblem{
 			desc:   "🟡 Go code intelligence (gopls MCP) not set up",
 			prompt: cardSetupGopls,
@@ -932,24 +919,17 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	// run_command is always registered by discoverSandbox at this point.
 	b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only — destructive git commands fail at the FS layer)\n\n")
 
-	// Probe every known stack/runner binary once for the ✅/🟡 lines below.
-	pStacks, pRunners, _ := a.probeToolBins(sess)
+	// Probe every known runner binary once for the ✅/🟡 lines below.
+	pRunners, _ := a.probeToolBins(sess)
 
-	// Stacks paired with their probe binary so the user sees stack →
-	// required-binary status on consecutive lines.
+	// A stack's language server is not listed here: it's covered by the ✅ MCP
+	// line at the bottom once wired, and by its setup card until then.
 	if len(sess.knownStacks) > 0 {
 		fmt.Fprintf(&b, "Stacks: %s", strings.Join(sess.knownStacks, ", "))
 		if len(sess.knownStacks) > 1 {
 			b.WriteString(" (monorepo)")
 		}
 		b.WriteString("\n\n")
-		for _, t := range pStacks {
-			if t.present {
-				fmt.Fprintf(&b, "✅ %s: found (%s stack)\n\n", t.bin, t.label)
-			} else {
-				fmt.Fprintf(&b, "🟡 %s: not on PATH — required for the %s stack\n\n", t.bin, t.label)
-			}
-		}
 	}
 
 	// Task-runner block. Three states:
