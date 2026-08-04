@@ -140,7 +140,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		// runToolLoop builds fresh from the session, so the files the planner read
 		// this turn stay in front of it; the corrective rides as a trailing turn.
 		retry, retryErr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0,
-			llmMessage{Role: "user", Content: "Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."},
+			"Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose.",
 		)
 		planRes.Text = retry.Text
 		planRes.Content = retry.Content
@@ -181,9 +181,8 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		}
 		slog.Info("planner: ambiguous submission, nudging to pick one", "sid", sid, "hasPlan", hasPlan, "hasAnswer", hasAnswer)
 		// runToolLoop builds fresh from the session (reads from this turn stay in
-		// context); the nudge rides as a trailing turn.
-		if retry, rerr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0,
-			llmMessage{Role: "user", Content: nudge}); rerr == nil {
+		// context) and stores the nudge as the trailing turn.
+		if retry, rerr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, nudge); rerr == nil {
 			planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
 			if retry.Terminal == respondToolName {
 				plan = planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(retry.Text)}
@@ -594,17 +593,56 @@ type toolLoopResult struct {
 // maxToolLoopIterations backstop applies.
 // runToolLoop builds the LLM context FRESH from the session each call — never
 // from a caller-held snapshot, which goes stale the instant the loop does work
-// that lands in the session but not the snapshot (the b/c re-read bug). extra
-// carries trailing corrective turns not yet persisted (a nudge, a "call
-// submit_plan" retry). Every phase uses this; only the subagent — which seeds
-// from its PARENT's session for cache warmth — calls runToolLoopSeeded directly.
-func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, policy phasePolicy, phase string, stream bool, failSoftCap int, extra ...llmMessage) (toolLoopResult, error) {
+// that lands in the session but not the snapshot (the b/c re-read bug).
+// corrective carries a caller's retry turn (a nudge, a "call submit_plan"
+// retry). It is STORED before the rebuild instead of appended after it, for the
+// reason addCorrective gives. Every phase uses this; only the subagent — which
+// seeds from its PARENT's session for cache warmth — calls runToolLoopSeeded
+// directly.
+func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, policy phasePolicy, phase string, stream bool, failSoftCap int, corrective ...string) (toolLoopResult, error) {
 	var messages []llmMessage
 	if sess := a.getSession(sid); sess != nil {
+		for _, c := range corrective {
+			sess.AddUser(c)
+		}
+		if len(corrective) > 0 {
+			sess.saveOrLog()
+		}
 		messages = a.buildLLMContext(sess)
+	} else {
+		// No session to store into (probe paths): nothing will ever rebuild this
+		// context, so the wire is the only place the corrective can live.
+		for _, c := range corrective {
+			messages = append(messages, llmMessage{Role: "user", Content: c})
+		}
 	}
-	messages = append(messages, extra...)
 	return a.runToolLoopSeeded(ctx, sid, conn, messages, policy, phase, stream, failSoftCap)
+}
+
+// addCorrective puts a corrective turn on the wire AND stores it in the session.
+// Both, always.
+//
+// A wire-only turn reads as free: it is appended after everything else, so it
+// looks like a pure suffix on a warm prefix. That holds only while it is the
+// last message. runToolLoop rebuilds the context from the session on every
+// entry, and a turn the session never saw is gone from that rebuild — from the
+// MIDDLE of history, shifting every message after it. The server then re-renders
+// from that point. Measured on one plan-phase retry: the no-tool-call nudge
+// vanished at index 8 of 23 and the server re-evaluated 9998 of 15346 tokens,
+// 19s, the single most expensive event in that turn.
+//
+// Same rule noThinkSwitch states: what goes on the wire is what is stored.
+//
+// Storing has two visible consequences, both accepted. The turn stays in context
+// for the rest of the session (a few hundred bytes), and session/load replays it
+// to the client as a user message — which the phase prompts (AddUser at
+// runExecutePhase / runDocumentPhase) and the skill disclosures already do.
+func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []llmMessage {
+	if sess := a.getSession(sid); sess != nil {
+		sess.AddUser(text)
+		sess.saveOrLog()
+	}
+	return append(messages, llmMessage{Role: "user", Content: text})
 }
 
 // startToolMeter ticks the active phase row once per second while a tool runs, so
@@ -783,9 +821,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			}
 			// A stream rule fired: llmStream abandoned the generation the moment the
 			// content matched, so there is no partial to salvage. Re-ask with the
-			// rule's reminder appended as a user turn — the same shape as the cap
-			// nudge below, and cache-cheap for the same reason: the reminder is a
-			// suffix, so the whole prefix is still warm on the server.
+			// rule's reminder added as a user turn — the same shape as the cap nudge
+			// below, and stored for the same reason (addCorrective): a suffix is only
+			// cache-cheap while it stays the last message.
 			//
 			// Capped, because a model that ignores the reminder twice is not going to
 			// be talked out of it on the third try; better to let the bad reply
@@ -804,7 +842,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 					// the model repeating itself.
 					a.say(ctx, sid, "\n⟲ Response went off-format and was discarded; re-asking.\n")
 				}
-				messages = append(messages, llmMessage{Role: "user", Content: ruleRetryMessage(sr)})
+				messages = a.addCorrective(sid, messages, ruleRetryMessage(sr))
 				continue
 			}
 			// Cap ladder: the generation died AT the requested max_tokens cap with
@@ -822,8 +860,8 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 					if sid != "" {
 						a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
 					}
-					messages = append(messages, llmMessage{Role: "user", Content: fmt.Sprintf(
-						"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap)})
+					messages = a.addCorrective(sid, messages, fmt.Sprintf(
+						"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
 					continue
 				}
 				if !capDoubled {
@@ -927,8 +965,10 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 						"another tool if you still have work to do. Do not reply in "+
 						"prose — call a tool.", termList)
 				}
+				// The assistant turn above is already in the session (AddAssistant at
+				// the top of this iteration); only the nudge needs storing.
 				messages = append(messages, llmMessage{Role: "assistant", Content: text})
-				messages = append(messages, llmMessage{Role: "user", Content: nudge})
+				messages = a.addCorrective(sid, messages, nudge)
 				continue
 			}
 			res.Text = allText.String()
@@ -1137,13 +1177,11 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		}
 		// Corrective alongside the (unchanged) tool results, so the next round
 		// sees the break-out instruction next to the output it just got back.
-		messages = append(messages, llmMessage{
-			Role: "user",
-			Content: "Your last tool call(s) returned output you already have — that makes no progress. Do NOT repeat them. Instead:\n" +
-				"1. If a read came back PARTIAL and you need more, call continue_read for the next chunk — never re-read the same window, never rewrite a whole file.\n" +
-				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n" +
-				"3. If you are stuck or the task is infeasible, say so and stop.",
-		})
+		messages = a.addCorrective(sid, messages,
+			"Your last tool call(s) returned output you already have — that makes no progress. Do NOT repeat them. Instead:\n"+
+				"1. If a read came back PARTIAL and you need more, call continue_read for the next chunk — never re-read the same window, never rewrite a whole file.\n"+
+				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n"+
+				"3. If you are stuck or the task is infeasible, say so and stop.")
 		// Mid-ladder recovery: warm the sampler once before the bail. Same
 		// server/model, and samplers don't enter the KV cache key, so the prefix
 		// cache survives — but only while the two roles differ in SAMPLERS alone.

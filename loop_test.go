@@ -370,3 +370,26 @@ func TestStuckLadderFuzzyOutput(t *testing.T) {
 		t.Errorf("callCount = %d, want %d (bail at stuckBailRounds via fuzzy match)", got, 1+stuckBailRounds)
 	}
 }
+
+// TestAddCorrectiveSurvivesRebuild pins the invariant that cost one turn 9998 of
+// 15346 re-evaluated tokens: a corrective turn appended to the wire only is
+// gone from the next runToolLoop rebuild, which drops it out of the MIDDLE of
+// history and shifts everything after it. The wire and a rebuild must agree.
+func TestAddCorrectiveSurvivesRebuild(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.AddUser("do the thing")
+	s.AddAssistant("I'll get right on it")
+
+	wire := a.addCorrective(s.ID, a.buildLLMContext(s), "Call a tool. Do not reply in prose.")
+
+	rebuilt := a.buildLLMContext(s)
+	if len(rebuilt) != len(wire) {
+		t.Fatalf("rebuild has %d messages, wire had %d — the corrective did not persist", len(rebuilt), len(wire))
+	}
+	for i := range wire {
+		if rebuilt[i].Role != wire[i].Role || fmt.Sprint(rebuilt[i].Content) != fmt.Sprint(wire[i].Content) {
+			t.Errorf("message %d diverges\n wire: %s %q\nrebuilt: %s %q",
+				i, wire[i].Role, wire[i].Content, rebuilt[i].Role, rebuilt[i].Content)
+		}
+	}
+}
