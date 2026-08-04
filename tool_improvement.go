@@ -93,22 +93,43 @@ func createSkill(path, name, body string) error {
 	return err
 }
 
+// improveTarget resolves which on-disk file an improvement edits, plus the
+// project-relative path shown to the user. SKILL-*.md edits follow skillPath:
+// the active variant's copy when LLM[0] has one and that file exists — that IS
+// the file the main model loads, so an edit to the generic copy would be
+// invisible to it. Everything else (PLAN.md, EXECUTE.md, …) and `create` stay
+// generic: WHAT loads is decided by the generic dir's file set (skillFiles),
+// so a brand-new skill must land there to load at all.
+func improveTarget(cwd, variant string, e improvementEntry) (path, rel string) {
+	name := strings.TrimSpace(e.File)
+	if strings.HasPrefix(name, "SKILL-") && !strings.EqualFold(strings.TrimSpace(e.Type), "create") {
+		p := skillPath(cwd, variant, name)
+		if r, err := filepath.Rel(cwd, p); err == nil {
+			return p, r
+		}
+		return p, filepath.Join(".codehalter", name)
+	}
+	return filepath.Join(cwd, ".codehalter", name), filepath.Join(".codehalter", name)
+}
+
 // applyImprovement applies one structured change to its .codehalter/ prompt
-// file: replace/remove swap out the `original` text, add appends `new` (after
-// `original` when given, else at the end), create writes a new SKILL-*.md. The
-// user already approved this entry via the Apply card, so the write is direct.
-// Returns a per-entry error the caller surfaces without aborting the rest.
-func applyImprovement(cwd string, e improvementEntry) error {
+// file (variant-resolved via improveTarget): replace/remove swap out the
+// `original` text, add appends `new` (after `original` when given, else at the
+// end), create writes a new SKILL-*.md. The user already approved this entry
+// via the Apply card, so the write is direct. Returns a per-entry error the
+// caller surfaces without aborting the rest.
+func applyImprovement(cwd, variant string, e improvementEntry) error {
 	name := strings.TrimSpace(e.File)
 	if name == "" {
 		return fmt.Errorf("no file given")
 	}
-	// Improvements target the prompt files under .codehalter/ by bare filename;
-	// reject anything that escapes that directory.
+	// Improvements target the prompt files under .codehalter/ by bare filename
+	// (codehalter resolves the variant path itself); reject anything that
+	// escapes that directory.
 	if strings.ContainsAny(name, `/\`) || name == ".." {
 		return fmt.Errorf("file %q must be a bare .codehalter/ prompt filename", name)
 	}
-	path := filepath.Join(cwd, ".codehalter", name)
+	path, _ := improveTarget(cwd, variant, e)
 	// Handled before the read: the whole point is that the file does not exist yet.
 	if strings.EqualFold(strings.TrimSpace(e.Type), "create") {
 		return createSkill(path, name, e.New)
@@ -153,7 +174,7 @@ func applyImprovement(cwd string, e improvementEntry) error {
 // submitImprovements POSTs the applied entries to the feedback endpoint, gated
 // on the project carrying an open-source license. Returns a one-line result
 // (success, or the reason it didn't submit) for the user-facing summary.
-func (a *agent) submitImprovements(ctx context.Context, cwd, endpoint string, entries []improvementEntry) string {
+func (a *agent) submitImprovements(ctx context.Context, sid, cwd, endpoint string, entries []improvementEntry) string {
 	if endpoint == "" {
 		endpoint = "https://ai.jos.li/improve"
 	}
@@ -162,9 +183,12 @@ func (a *agent) submitImprovements(ctx context.Context, cwd, endpoint string, en
 		return fmt.Sprintf("not submitted: %v (only open-source projects are eligible)", err)
 	}
 	// Stamp the model that produced these onto every entry — the LLM writes only
-	// the change fields, and the backend has no other way to know which model ran.
+	// the change fields, and the backend has no other way to know which model
+	// ran. Resolved through connForSession, not MainLLM: an /improve turn may be
+	// routed to the entry marked purpose = "improve", and THAT model authored
+	// the changes.
 	model := ""
-	if c := a.settings.MainLLM("execute"); c != nil {
+	if c := a.connForSession(ctx, sid, "execute"); c != nil {
 		model = c.Model
 	}
 	for i := range entries {
@@ -197,11 +221,39 @@ func (a *agent) submitImprovements(ctx context.Context, cwd, endpoint string, en
 	return fmt.Sprintf("not submitted: HTTP %d: %s", resp.StatusCode, string(respBody))
 }
 
-// renderImprovement is the card body shown before each Apply/Skip prompt, so the
-// user sees exactly what they're approving.
-func renderImprovement(i, n int, e improvementEntry) string {
+// improveVariantNote renders the per-turn note telling /improve which on-disk
+// file each SKILL resolves to under the active variant. Injected into the turn
+// by the Prompt handler (not baked into the template) because the variant is
+// settings state a static template can't know. Empty when no variant is
+// configured — the generic files are then the loaded ones and the template's
+// default instructions already point there. Without this note the model quotes
+// `original` text from the generic copy and the byte-exact match against the
+// variant file fails on apply.
+func improveVariantNote(cwd, variant string) string {
+	if variant == "" {
+		return ""
+	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "### Improvement %d/%d: %s\n`.codehalter/%s` · %s\n\n", i, n, e.Title, e.File, e.Type)
+	fmt.Fprintf(&b, "\n\n[ACTIVE SKILL VARIANT: %s. The main model loads these resolved skill files — read THESE exact files when quoting `original` text and when probing statements; submit_improvement applies each SKILL edit to the same resolved path (keep `file` a bare filename):", variant)
+	for _, n := range skillFiles(cwd) {
+		p := skillPath(cwd, variant, n)
+		rel, err := filepath.Rel(cwd, p)
+		if err != nil {
+			rel = p
+		}
+		fmt.Fprintf(&b, "\n- %s → %s", n, rel)
+	}
+	b.WriteString("\nPLAN.md, EXECUTE.md, DOCUMENT.md, SUMMARISE.md and new skills (type create) always live in .codehalter/ directly.]")
+	return b.String()
+}
+
+// renderImprovement is the card body shown before each Apply/Skip prompt, so
+// the user sees exactly what they're approving. rel is the variant-resolved
+// project-relative path the edit will actually land in (improveTarget) — shown
+// instead of the bare name so a variant write is visible before Apply.
+func renderImprovement(i, n int, e improvementEntry, rel string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "### Improvement %d/%d: %s\n`%s` · %s\n\n", i, n, e.Title, rel, e.Type)
 	if e.Reasoning != "" {
 		fmt.Fprintf(&b, "%s\n\n", e.Reasoning)
 	}
@@ -281,13 +333,19 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 		improvements = improvements[:improveAskCap]
 	}
 
+	// Skill edits land in the file LLM[0] actually loads — the active variant's
+	// copy when one is configured (improveTarget). Resolved once per run so the
+	// card, the write, and the summary all name the same file.
+	variant := a.skillVariant()
+
 	var applied []improvementEntry
 	var summary strings.Builder
 	if dropped > 0 {
 		fmt.Fprintf(&summary, "(%d further proposal(s) beyond the top %d were not shown)\n", dropped, improveAskCap)
 	}
 	for i, e := range improvements {
-		a.say(ctx, sid, "\n"+renderImprovement(i+1, len(improvements), e)+"\n")
+		_, rel := improveTarget(sess.Cwd, variant, e)
+		a.say(ctx, sid, "\n"+renderImprovement(i+1, len(improvements), e, rel)+"\n")
 		ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Apply %d/%d: %s", i+1, len(improvements), e.Title), "edit", "Apply", "Skip")
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
@@ -298,18 +356,18 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 			fmt.Fprintf(&summary, "skipped: %s\n", e.Title)
 			continue
 		}
-		if err := applyImprovement(sess.Cwd, e); err != nil {
+		if err := applyImprovement(sess.Cwd, variant, e); err != nil {
 			a.FailToolCall(ctx, sid, tcId, "apply failed: "+err.Error())
 			fmt.Fprintf(&summary, "could not apply %q: %v\n", e.Title, err)
 			continue
 		}
-		verb, card := "applied", "Applied to .codehalter/"+e.File
+		verb, card := "applied", "Applied to "+rel
 		if strings.EqualFold(strings.TrimSpace(e.Type), "create") {
-			verb, card = "created", "Created .codehalter/"+e.File
+			verb, card = "created", "Created "+rel
 		}
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(card)})
 		applied = append(applied, e)
-		fmt.Fprintf(&summary, "%s: %s (.codehalter/%s)\n", verb, e.Title, e.File)
+		fmt.Fprintf(&summary, "%s: %s (%s)\n", verb, e.Title, rel)
 	}
 
 	if len(applied) == 0 {
@@ -330,7 +388,7 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Kept local")})
 		return fmt.Sprintf("✅ Applied %d improvement(s); kept local (not submitted).\n\n%s", len(applied), summary.String()), false
 	}
-	result := a.submitImprovements(ctx, sess.Cwd, args.str("endpoint"), applied)
+	result := a.submitImprovements(ctx, sid, sess.Cwd, args.str("endpoint"), applied)
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
 	return fmt.Sprintf("✅ Applied %d improvement(s); %s.\n\n%s", len(applied), result, summary.String()), false
 }

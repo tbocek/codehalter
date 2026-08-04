@@ -680,6 +680,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	if sess != nil && sess.improving.Load() && sess.improveNoLicense.Load() {
 		userText += "\n\n[NO OPEN-SOURCE LICENSE in this project's root — feedback-API submission is DISABLED for this run. Do NOT ask the user whether to submit, and do NOT call submit_improvement. Applying the accepted edits locally completes /improve.]"
 	}
+	// /improve with a per-model skill variant on LLM[0]: tell the model which
+	// file each SKILL name resolves to, so it reads (and quotes `original` from)
+	// the copy the main model actually loads — applyImprovement writes to the
+	// same resolved path.
+	if sess != nil && sess.improving.Load() {
+		userText += improveVariantNote(sess.Cwd, a.skillVariant())
+	}
 
 	// The empty-project hint stays folded into the first user message because
 	// it's a one-shot nudge — once the project has files, we want the

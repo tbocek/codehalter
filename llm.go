@@ -1043,6 +1043,21 @@ func (a *agent) connForSession(_ context.Context, sid string, role string) *LLMC
 			return c
 		}
 	}
+	// An /improve turn routes to the entry marked `purpose = "improve"` when one
+	// exists: the analysis wants the strongest model, may run for hours, and on
+	// its own endpoint it can't evict LLM[0]'s KV cache (which still holds the
+	// conversation /improve resumes into). Index 0 is skipped — marking LLM[0]
+	// means the same as not marking anything. Falls through to LLM[0] otherwise.
+	if sess != nil && sess.improving.Load() {
+		for i := 1; i < len(a.settings.LLM); i++ {
+			if !strings.EqualFold(a.settings.LLM[i].Purpose, purposeImprove) {
+				continue
+			}
+			if c := a.settings.ConnAt(i, role); c != nil {
+				return c
+			}
+		}
+	}
 	return a.settings.MainLLM(role)
 }
 
