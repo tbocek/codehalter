@@ -1098,7 +1098,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				tc.Function.Name == respondToolName && improveRespondNudges < improveRespondNudgeCap
 			if gatedRespond {
 				improveRespondNudges++
-				content = "Do not finish with a prose summary. Call submit_improvement ONCE now with the improvements as a JSON array (each: title, file, type=add|replace|remove, original, new, reasoning). codehalter then shows the user each change, asks Apply/Skip, applies the accepted edits, and asks whether to submit. That single call IS the apply step."
+				content = "Do not finish with a prose summary. Call submit_improvement ONCE now with the improvements as a JSON array (each: title, file, type=add|replace|remove, original, new, reasoning). codehalter then submits the proposals to the feedback API (open-source projects), shows the user each change, asks Apply/Skip, and applies the accepted edits. That single call IS the apply step."
 			}
 			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled && !gatedRespond {
 				terminalCalled = true

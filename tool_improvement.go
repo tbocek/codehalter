@@ -16,11 +16,12 @@ import (
 
 // submitImprovementToolName is the terminal tool for an /improve execute pass.
 // The model only PROPOSES improvements (structured); codehalter drives the rest
-// in code: present each change, ask the user Apply/Skip, apply accepted edits to
-// the .codehalter/ prompt file, then ask whether to submit the applied ones.
-// Moving the apply/submit loop out of the (weak) model is what makes /improve
-// reliably ask before changing anything, instead of analysing and bailing with a
-// prose respond.
+// in code: submit the proposals to the feedback API immediately (open-source
+// projects — an overnight run must not lose its results to an unanswered
+// card), then present each change, ask the user Apply/Skip, and apply accepted
+// edits to the .codehalter/ prompt file. Moving the apply loop out of the
+// (weak) model is what makes /improve reliably ask before changing anything,
+// instead of analysing and bailing with a prose respond.
 const submitImprovementToolName = "submit_improvement"
 
 type improvementEntry struct {
@@ -171,7 +172,7 @@ func applyImprovement(cwd, variant string, e improvementEntry) error {
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 
-// submitImprovements POSTs the applied entries to the feedback endpoint, gated
+// submitImprovements POSTs the proposed entries to the feedback endpoint, gated
 // on the project carrying an open-source license. Returns a one-line result
 // (success, or the reason it didn't submit) for the user-facing summary.
 func (a *agent) submitImprovements(ctx context.Context, sid, cwd, endpoint string, entries []improvementEntry) string {
@@ -278,7 +279,7 @@ func init() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        submitImprovementToolName,
-			"description": "Hand off ALL your proposed prompt improvements in ONE structured call. codehalter then drives the rest itself: it shows the user each change, asks Apply/Skip, applies the accepted ones to the .codehalter/ prompt file, and (for open-source projects) asks whether to submit the applied changes to the feedback API. Do NOT ask_user or edit_file yourself; this single call IS the apply step. `improvements` is a JSON array; each object: title (string), file (bare .codehalter prompt filename, e.g. \"PLAN.md\"), type (add|replace|remove|create), original (the exact current text to match, for replace/remove), new (the added/replacement text, or the whole file body for create), reasoning (string). Use type \"create\" to add a skill the project is missing entirely: file must then be a new SKILL-<topic>.md (e.g. \"SKILL-python.md\") that does not exist yet, and new is the complete skill body.",
+			"description": "Hand off ALL your proposed prompt improvements in ONE structured call. codehalter then drives the rest itself: it submits the proposals to the feedback API right away (open-source projects only), then shows the user each change, asks Apply/Skip, and applies the accepted ones to the .codehalter/ prompt file. Do NOT ask_user or edit_file yourself; this single call IS the apply step. `improvements` is a JSON array; each object: title (string), file (bare .codehalter prompt filename, e.g. \"PLAN.md\"), type (add|replace|remove|create), original (the exact current text to match, for replace/remove), new (the added/replacement text, or the whole file body for create), reasoning (string). Use type \"create\" to add a skill the project is missing entirely: file must then be a new SKILL-<topic>.md (e.g. \"SKILL-python.md\") that does not exist yet, and new is the complete skill body.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"improvements"},
@@ -298,9 +299,9 @@ func init() {
 }
 
 // improvementExecute is the code-driven /improve apply loop: the model proposes
-// (structured), codehalter asks Apply/Skip per change, applies the accepted
-// edits, then asks whether to submit. Keeping the loop here (not in the prompt)
-// stops a weak model from skipping the approval.
+// (structured), codehalter submits the proposals to the feedback API up front,
+// then asks Apply/Skip per change and applies the accepted edits. Keeping the
+// loop here (not in the prompt) stops a weak model from skipping the approval.
 func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
 	improvementsJSON := args.str("improvements")
@@ -343,6 +344,17 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 	if dropped > 0 {
 		fmt.Fprintf(&summary, "(%d further proposal(s) beyond the top %d were not shown)\n", dropped, improveAskCap)
 	}
+
+	// Submit-first: the proposals go to the feedback API the moment the analysis
+	// lands, BEFORE the attended Apply/Skip review below — an overnight /improve
+	// then never loses its results to a card nobody answers until morning. The
+	// payload is the proposals as analyzed (top-N capped), whether or not the
+	// user later applies them; the license gate is unchanged.
+	subResult := "not submitted (no open-source license)"
+	if !sess.improveNoLicense.Load() {
+		subResult = a.submitImprovements(ctx, sid, sess.Cwd, args.str("endpoint"), improvements)
+	}
+	fmt.Fprintf(&summary, "feedback API: %s\n", subResult)
 	for i, e := range improvements {
 		_, rel := improveTarget(sess.Cwd, variant, e)
 		a.say(ctx, sid, "\n"+renderImprovement(i+1, len(improvements), e, rel)+"\n")
@@ -373,22 +385,5 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 	if len(applied) == 0 {
 		return "No improvements applied (all skipped or failed):\n\n" + summary.String(), false
 	}
-
-	// Submission only makes sense for open-source projects; when we already know
-	// there's no license (cached at /improve start), skip the ask entirely.
-	if sess.improveNoLicense.Load() {
-		return fmt.Sprintf("✅ Applied %d improvement(s). Not submitted (no open-source license).\n\n%s", len(applied), summary.String()), false
-	}
-	ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Submit %d applied improvement(s) to the feedback API?", len(applied)), "think", "Submit", "Keep local")
-	if err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return fmt.Sprintf("✅ Applied %d improvement(s); the submit prompt failed: %v\n\n%s", len(applied), err, summary.String()), false
-	}
-	if !ok {
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Kept local")})
-		return fmt.Sprintf("✅ Applied %d improvement(s); kept local (not submitted).\n\n%s", len(applied), summary.String()), false
-	}
-	result := a.submitImprovements(ctx, sid, sess.Cwd, args.str("endpoint"), applied)
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(result)})
-	return fmt.Sprintf("✅ Applied %d improvement(s); %s.\n\n%s", len(applied), result, summary.String()), false
+	return fmt.Sprintf("✅ Applied %d improvement(s).\n\n%s", len(applied), summary.String()), false
 }

@@ -147,9 +147,9 @@ func TestApplyImprovementVariant(t *testing.T) {
 }
 
 // TestImprovementExecuteApplyAndSubmit drives the whole code-side flow in
-// autopilot (Apply + Submit auto-answered yes): the structured change is applied
-// to the .codehalter/ file AND the applied entry is POSTed with the license
-// header, no auth token, and the model stamped on.
+// autopilot (the Apply card auto-answered yes): the proposal is POSTed with the
+// license header, no auth token, and the model stamped on, and the structured
+// change is applied to the .codehalter/ file.
 func TestImprovementExecuteApplyAndSubmit(t *testing.T) {
 	var gotBody, gotLicense, gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -196,6 +196,51 @@ func TestImprovementExecuteApplyAndSubmit(t *testing.T) {
 	}
 	if !strings.Contains(out, "Applied 1") || !strings.Contains(out, "submitted") {
 		t.Errorf("summary wrong: %s", out)
+	}
+}
+
+// TestImprovementSubmitsBeforeReview pins the overnight contract: the proposals
+// are POSTed to the feedback API the moment submit_improvement lands, BEFORE
+// the attended Apply/Skip review — here the apply step consents but fails
+// (stale `original`), nothing lands on disk, and the POST happened anyway.
+func TestImprovementSubmitsBeforeReview(t *testing.T) {
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Model: "test-model"}}}
+	a.mu.Lock()
+	a.mode = "Autopilot"
+	a.mu.Unlock()
+	ch := filepath.Join(s.Cwd, ".codehalter")
+	os.MkdirAll(ch, 0o755)
+	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("alpha omega"), 0o644) // no OLD → apply fails
+	os.WriteFile(filepath.Join(s.Cwd, "LICENSE"), []byte("MIT License"), 0o644)
+
+	var tc toolCall
+	tc.Function.Name = submitImprovementToolName
+	tc.Function.Arguments = submitImprovementArgs(t, map[string]string{
+		"endpoint":     srv.URL,
+		"improvements": `[{"title":"t","file":"PLAN.md","type":"replace","original":"OLD","new":"NEW","reasoning":"r"}]`,
+	})
+	out, failed := a.executeTool(context.Background(), s.ID, tc)
+	if failed {
+		t.Fatalf("failed=true: %s", out)
+	}
+	if b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); string(b) != "alpha omega" {
+		t.Fatalf("nothing must be applied (original not found): %q", b)
+	}
+	var p improvementPayload
+	if json.Unmarshal([]byte(gotBody), &p) != nil || len(p.Improvements) != 1 {
+		t.Errorf("proposal must be POSTed before/despite the failed apply: %q", gotBody)
+	}
+	if !strings.Contains(out, "submitted 1 improvement") || !strings.Contains(out, "No improvements applied") {
+		t.Errorf("summary must show submitted-but-not-applied: %s", out)
 	}
 }
 

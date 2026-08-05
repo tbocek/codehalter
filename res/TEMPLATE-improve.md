@@ -114,6 +114,18 @@ line must be something the agent should DO or NOT DO, grounded in what went
 wrong: no tutorials, no history of the language, no "Python is a dynamically
 typed language". If you cannot fill it with concrete behavior, do not create it.
 
+**Token economy — write tightly from the start.** Every skill line rides in the
+main model's system prompt on EVERY turn: each token costs prefill time and
+context window for the life of every future session. Use the fewest tokens that
+still name the behavior — no rationale the agent doesn't need to act, no
+example where the rule alone steers, no restating what the model demonstrably
+does unprompted (when unsure, that's a context-free probe: empty `file`, the
+candidate line as `statement`). This is NOT a license to compress later: the
+token-shaving ban above still holds for existing measured text, and terseness
+never deletes the concrete trigger (the tool name, the command, the exact
+condition) that makes a bullet actionable. The same bar applies to the `new`
+text of every `add` and `replace`.
+
 ## Step 3: Probe candidate skill statements on the main model
 
 Skill statements are MEASURED, not argued about. `probe_statement` answers a
@@ -133,14 +145,38 @@ Rules:
 - Author `question` as a small concrete task that makes the statement's behavior
   observable in plain text WITHOUT naming or hinting at the statement — the
   probe offers no tools, so pick behavior expressible in an answer.
-- **Batch every probe into ONE probe_statement call.** The main model may live
-  behind a routing server that must reload it; one batch = one reload. Collect
-  all candidates first, then probe once.
+- **Batch probes — at most TWO probe_statement calls per run.** The main model
+  may live behind a routing server that must reload it; one batch = one reload.
+  Call 1 screens every candidate at the default samples; call 2 (only if you
+  have rewrites to validate, see Step 3b) validates them all at `samples: 5`.
 - Sampling is stochastic: weigh ALL returned samples. A difference that shows in
   one sample of two is a keep, not a coin toss in your favor.
 
 PLAN.md/EXECUTE.md/DOCUMENT.md/SUMMARISE.md are phase prompts, not probeable
 skills — removals there need overwhelming log evidence and stay rare.
+
+## Step 3b: Validate rewrites — one round, measured, unanimous
+
+When the screening batch shows a statement is IGNORED or steers WRONGLY and
+your fix is a rewording (a `replace`), the new wording is measured too — a
+rewrite you didn't validate is just a guess with better formatting. Exactly
+ONE rewrite round per statement, all rewrites batched into the second
+probe_statement call:
+
+- Probe each rewrite with `replaces` = the exact current statement and
+  `statement` = your new wording. Both arms then drop the original, so the
+  probe measures the rewrite alone (the file on disk still carries the
+  original at this point — never quote the rewrite as if applied).
+- Probe each rewrite on TWO questions: the SAME question you screened with
+  (its no-statement arm is cached from call 1, so it costs half) and ONE fresh
+  question the wording was not tuned on. A rewrite that only wins on the
+  question that inspired it is overfitted to that question.
+- Use `samples: 5` — this batch decides; screening noise must not.
+- Accept the rewrite ONLY when the WITH arm shows the wanted behavior in every
+  sample on BOTH questions and improves on the original's screening answers.
+  Anything less — a 3-of-5 edge, a win on one question only — keep the
+  original text and drop the proposal; that difference is sampling noise. Do
+  NOT reword the rewrite and try again: one round, then it's decided.
 
 ## Step 4: Rank → top 3
 
@@ -187,12 +223,14 @@ array of your top changes (max 3), each object:
 `replace` against the existing skill.
 
 **That single call IS the whole apply step. Do NOT call `ask_user` or `edit_file`
-yourself, and do NOT re-analyze.** codehalter takes it from there: it shows the
-user each change, asks Apply/Skip, applies the accepted edits to the file, and
-(for open-source projects with a LICENSE in the root) asks whether to submit the
-applied ones to the feedback API. The endpoint needs **NO API key**. Don't put
+yourself, and do NOT re-analyze.** codehalter takes it from there: it submits
+the proposals to the feedback API immediately (open-source projects with a
+LICENSE in the root — so an overnight run's results are never lost to an
+unanswered card), then shows the user each change, asks Apply/Skip, and applies
+the accepted edits to the file. The endpoint needs **NO API key**. Don't put
 secrets (keys, tokens, passwords) in any `original`/`new`; the backend also
-redacts known patterns.
+redacts known patterns — remember the proposals are sent BEFORE the user
+reviews them.
 
 If you found no real, evidence-backed problem, say so and stop — do not invent
 filler, and do not call submit_improvement with empty changes.

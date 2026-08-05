@@ -311,9 +311,10 @@ type Session struct {
 	improving atomic.Bool
 	// improveNoLicense caches, for the current /improve run, that the project has
 	// no open-source license — so feedback-API submission is impossible. Set in
-	// beginImproveScratch; read to drop the "Submit?" ask deterministically in
-	// code (the template's prerequisite footnote alone doesn't stop a weak model
-	// from asking, then submit_improvement hard-fails on the same check).
+	// beginImproveScratch; read to skip the up-front submit POST
+	// deterministically in code (the template's prerequisite footnote alone
+	// doesn't stop a weak model from trying, then submit_improvement hard-fails
+	// on the same check).
 	improveNoLicense atomic.Bool
 	// improveDelivered marks that submit_improvement's apply loop has already run
 	// this /improve turn, so a duplicate call (same batch, or after a replan) no-ops
@@ -323,6 +324,13 @@ type Session struct {
 	improveAsks       atomic.Int64
 	preImproveMsgs    []Message
 	preImproveSummary string
+	// probeCache holds probe_statement arm answers generated this /improve run,
+	// keyed by (system prompt, question). A validation re-probe of a rewritten
+	// statement shares its WITHOUT arm byte-for-byte with the screening probe,
+	// so the cache halves that probe's main-model calls. Runtime-only, guarded
+	// by probeMu (not s.mu — probe generation runs long), reset per run.
+	probeMu    sync.Mutex
+	probeCache map[string][]string
 	// promptSkills is the set of SKILL-*.md filenames folded into the current
 	// SystemPrompt. A skill seeded on disk AFTER the prompt was built is injected
 	// as a user message (NOT folded into the prompt — that would bust the KV
@@ -1147,6 +1155,9 @@ func (s *Session) beginImproveScratch() {
 	s.improveDelivered.Store(false)
 	s.improveNoLicense.Store(licErr != nil)
 	s.improving.Store(true)
+	s.probeMu.Lock()
+	s.probeCache = nil
+	s.probeMu.Unlock()
 }
 
 func (s *Session) endImproveScratch() {
@@ -1158,6 +1169,26 @@ func (s *Session) endImproveScratch() {
 	s.preImproveSummary = ""
 	s.improveAsks.Store(0)
 	s.improving.Store(false)
+	s.probeMu.Lock()
+	s.probeCache = nil
+	s.probeMu.Unlock()
+}
+
+// probeCached returns the arm answers already generated this /improve run for
+// one (system, question) pair, and probeStore records them. See probeCache.
+func (s *Session) probeCached(key string) []string {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	return s.probeCache[key]
+}
+
+func (s *Session) probeStore(key string, answers []string) {
+	s.probeMu.Lock()
+	defer s.probeMu.Unlock()
+	if s.probeCache == nil {
+		s.probeCache = make(map[string][]string)
+	}
+	s.probeCache[key] = answers
 }
 
 // sessionFilePath returns where this session's toml/log of basename `name`
