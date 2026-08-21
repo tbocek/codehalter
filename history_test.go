@@ -1750,8 +1750,8 @@ func TestCompressHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
 		mainSlotTokens: 90_000,
 	}
 
-	if !a.foldHistory(context.Background(), s, s.turnStartIndex()) {
-		t.Fatalf("foldHistory(turnStartIndex) did not fold the completed turn")
+	if !a.foldHistory(context.Background(), s, s.turnStartIdx) {
+		t.Fatalf("foldHistory(turnStartIdx) did not fold the completed turn")
 	}
 	if !strings.Contains(s.Summary, "finished turn 1") {
 		t.Errorf("Summary missing the completed turn's note; got %q", s.Summary)
@@ -1765,8 +1765,8 @@ func TestCompressHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
 	if peek := s.peekShadow(); peek != "" {
 		t.Errorf("shadow should be drained after compaction; got %q", peek)
 	}
-	if s.turnStartIndex() != 0 {
-		t.Errorf("turnStart not reset after rotation; got %d", s.turnStartIndex())
+	if s.turnStartIdx != 0 {
+		t.Errorf("turnStart not reset after rotation; got %d", s.turnStartIdx)
 	}
 	if mock.callCount() != 0 {
 		t.Errorf("LLM calls: got %d, want 0", mock.callCount())

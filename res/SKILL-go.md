@@ -1,59 +1,28 @@
 # Go skill
-## Errors
-- Errors = values: `if err != nil { return err }`, or wrap `fmt.Errorf("context: %w", err)`.
-- NO panic for control flow → panic only for unrecoverable bugs.
-- No try/catch; Go has neither.
-- Never swallow an error.
-
-## Idioms
-- `:=` declare-and-assign; `=` reassign.
-- Defer cleanup right after acquiring: `f, err := os.Open(...); ...; defer f.Close()`.
-- `context.Context` = first arg, named `ctx`.
-- Goroutine + channel for concurrency. Always a clear "who closes the channel" rule.
-- Small named interfaces over big (`io.Reader`, not `BigCombinedThing`).
-
-## Style
-- gofmt: tabs indent, brace same line.
-- Exports PascalCase, unexported camelCase.
-- No Java-style getters/setters; expose fields directly when appropriate.
-- Doc comments only when symbol exported AND non-obvious.
-
-## Layout
-- `main.go` = entry. Tests in `*_test.go` beside file under test.
-- Run tests via project task runner (just, make), NOT raw `go test`.
-
-## Build ≠ test
-`go build` / `just:build` proves COMPILES only. `json.Unmarshal`/`json.Decoder` decode by reflection → wrong target (array into struct), a typo in a `json:"..."` tag (field silently stays zero), a missing key (stays zero, no error), a JSON number into a string field, plus nil deref and off-by-one: all compile fine, all fail at RUNTIME → green build on broken code. Wrote/changed code parsing or serialising external input (tool handler, API payload, config)? → write `*_test.go` round-tripping a REAL example of the documented format, success AND error path, run `just:test`, make it pass. NOT just `just:build`.
+- Wrap errors with context: `fmt.Errorf("read %s: %w", path, err)`. Never swallow one.
+- Tests in `*_test.go` beside the file under test. Run them via the project task runner (just, make), NOT raw `go test`.
+- Read-only in planning: `go vet ./...`, `go fix -diff ./...`, `gofmt -d`. Their mutating twins — `go mod tidy`, `go fix ./...`, `gofmt -w`, `go generate ./...` — rewrite files across the repo, so run them ONLY in EXECUTE and only when the task asks for that change.
 
 ## Probe toolchain once
-- `go version`, `go env`, `which go` = session-invariant. Answered once → NO re-run with different cwd/redirect/wrapper (`cd X && go version`, `go version 2>&1`); output won't change.
-- Same for go.mod: read the `go X.Y` line once per turn → don't re-read.
+- `go version`, `go env`, `which go` answered once → do NOT re-run with a different cwd, redirect or wrapper (`cd X && go version`, `go version 2>&1`). Same binary, same answer.
+- ONE exception worth a second look: a nested `go.mod` with its own `toolchain` line can select a different version for that directory. Read the `go`/`toolchain` lines instead of re-running the probe.
 
 ## go.mod vs installed toolchain
-- go.mod wants higher PATCH, same minor (wants 1.26.6, have 1.26.3) → lower `go` directive to installed version, drop any `toolchain` line. Do NOT install newer Go, do NOT let GOTOOLCHAIN fetch one: patch adds no language/stdlib API, nothing breaks.
-- go.mod wants higher MINOR (wants 1.26.x, have 1.25.x) → do NOT lower the directive; minor gap drops language + stdlib features code may use. Raise toolchain instead: newer distro base image = usual carrier (alpine:3.23 = Go 1.25.10, alpine:3.24 = 1.26.3), else distro pkg, else upstream tarball. Unobtainable → stop, report.
+- go.mod wants higher PATCH, same minor (wants 1.26.6, have 1.26.3) → lower the `go` directive to the installed version, drop any `toolchain` line. Do NOT install newer Go, do NOT let GOTOOLCHAIN fetch one: a patch adds no language/stdlib API, nothing breaks. Same-minor alignment is not a downgrade of the user's intent.
+- go.mod wants higher MINOR (wants 1.26.x, have 1.25.x) → do NOT lower the directive; a minor gap drops language + stdlib features the code may use. Raise the toolchain, in this order: 1) bump the base image `FROM` tag (usual carrier: alpine:3.23 = Go 1.25.10, alpine:3.24 = 1.26.3) 2) distro package 3) upstream tarball. Unobtainable → stop, report.
 
 ## Install gopls (+ other Go tools)
-- OS pkg mgr first (universal rule, container skill). Fall back `GOPROXY=direct go install golang.org/x/tools/gopls@latest` ONLY when distro doesn't package it.
+- OS pkg mgr first (universal rule, container skill). Fall back `GOPROXY=direct go install golang.org/x/tools/gopls@latest` ONLY when the distro doesn't package it.
 
 ## gopls as MCP server
-- gopls 0.20+ ships MCP server: stdio child `gopls mcp` → go_symbols / go_references / go_definition / go_hover.
-- Wire: `[[server]]` in `.codehalter/mcp.toml`, `name = "gopls"`, `command = "gopls"`, `args = ["mcp"]`. codehalter reconciles mcp.toml at turn end, starts server + registers tools → live next prompt. Do NOT tell user to restart Zed or start new session; no restart needed.
+- gopls 0.20+ ships an MCP server: stdio child `gopls mcp` → go_symbols / go_references / go_definition / go_hover.
+- Wire: `[[server]]` in `.codehalter/mcp.toml`, `name = "gopls"`, `command = "gopls"`, `args = ["mcp"]`. codehalter reconciles mcp.toml at turn end, starts the server + registers the tools → live next prompt. Do NOT tell the user to restart Zed or start a new session; no restart needed.
 
 ## Read code: outline before bytes (gopls wired)
-LSP navigates; whole-file read = LAST step, not first. Cheaper (signatures not files → fewer tokens, less overflow) + precise (no grep hits on comments/strings/same-named methods of other types).
+LSP navigates; a whole-file read = LAST step, not first. Cheaper (signatures not files → fewer tokens) + precise (no grep hits on comments, strings, or same-named methods of other types).
 - File/package contents? → `go_symbols` (decls+signatures, no bodies), NOT `read_file`.
 - Where is X defined? → `go_definition`, NOT grep/`search_text`.
 - Who calls X / what breaks if I change it? → `go_references` (real call graph); `search_text` over-matches.
 - Signature + doc of X? → `go_hover`.
 - `read_file` ONLY for a function's LOGIC, or exact bytes for `edit_file`. Read the function, not the file.
 Tools = `gopls__go_symbols` / `gopls__go_definition` / `gopls__go_references` / `gopls__go_hover`. Not wired → `search_text` + `read_file`.
-
-## Mutating commands — NEVER in planning
-Rewrite files in place. NOT probes. Never run in PLAN to "see what would change" — they change things, often across hundreds of files:
-- `go fix ./...` (Go 1.26 modernizers, silently rewrites source)
-- `go mod tidy` (rewrites go.mod / go.sum)
-- `gofmt -w`, `goimports -w` (rewrite formatting in place)
-- `go generate ./...` (runs arbitrary //go:generate directives)
-Run ONLY when the task calls for that change, ONLY in EXECUTE.
-Planning equivalents: `go vet ./...` (lint, no writes), `go fix -diff ./...` (preview modernizers), `gofmt -d` / `goimports -d` (would-be diffs).

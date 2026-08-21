@@ -83,7 +83,7 @@ func TestCheckEnvSetupIsOneCard(t *testing.T) {
 
 	// go.mod makes `go` a missing runner AND makes gopls wiring wanted: two
 	// problems, one card, and the prompt has to carry both.
-	_, problems := a.checkEnv(s, s.ID)
+	problems := a.checkEnv(s, s.ID)
 	if len(problems) != 1 {
 		t.Fatalf("setup must be one card (one turn), got %d: %+v", len(problems), problems)
 	}
@@ -105,7 +105,7 @@ func TestCheckEnvSetupIsOneCard(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(cfgDir, "mcp.toml"), []byte(mcp), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, problems = a.checkEnv(s, s.ID)
+	problems = a.checkEnv(s, s.ID)
 	if len(problems) != 1 {
 		t.Fatalf("still one card after declining gopls, got %d: %+v", len(problems), problems)
 	}
@@ -117,6 +117,66 @@ func TestCheckEnvSetupIsOneCard(t *testing.T) {
 // TestDetectFormatters covers both drivers: detected stack (ts → prettier) and
 // formatter config files (.clang-format → clang-format, pyproject [tool.ruff] →
 // ruff), and that an empty project needs nothing.
+// TestPrepareChecksBannerAlwaysShowsOnce: the capabilities banner is all a
+// session open prints, so it must NOT be gated on something having changed
+// since the last run. A project whose settings, tools and MCP servers are
+// exactly as they were is the ordinary case, and gating on change left the
+// thread empty after the gitignore card with no way to tell setup from a
+// hang. First prepareChecks emits it; the second (settings hash unchanged,
+// probe short-circuited) adds nothing.
+func TestPrepareChecksBannerAlwaysShowsOnce(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"gpt-4o"}]}`))
+	}))
+	defer ts.Close()
+
+	// loadSettings merges ~/.config/codehalter/settings.toml on top of the
+	// project file, so without an isolated HOME this test probes the
+	// developer's real LLM servers over the network.
+	t.Setenv("HOME", t.TempDir())
+
+	h := newTerminalHarness(t)
+	a, s := h.agent, h.sess
+	ch := filepath.Join(s.Cwd, ".codehalter")
+	if err := os.MkdirAll(ch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A real settings file: ensureLLM reloads it each call, so the second call
+	// sees an unchanged hash plus a satisfied gate and skips the re-probe —
+	// the "nothing changed" state that used to suppress the banner entirely.
+	cfg := fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"gpt-4o\"\nparallel = 1\ncontext_size = 128000\n", ts.URL)
+	if err := os.WriteFile(filepath.Join(ch, "settings.toml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	banners := func() int {
+		n := 0
+		for _, u := range h.updatesOfKind("agent_message_chunk") {
+			content, _ := u["content"].(map[string]any)
+			text, _ := content["text"].(string)
+			if strings.Contains(text, "Container:") {
+				n++
+			}
+		}
+		return n
+	}
+
+	a.prepareChecks(context.Background(), s, s.ID)
+	h.waitFor(func() bool { return banners() > 0 })
+	if got := banners(); got != 1 {
+		t.Fatalf("first prepareChecks: %d capabilities banners, want 1", got)
+	}
+	a.prepareChecks(context.Background(), s, s.ID)
+	if got := banners(); got != 1 {
+		t.Errorf("second prepareChecks: %d banners, want the first one only (no mid-session re-dump)", got)
+	}
+}
+
 func TestDetectFormatters(t *testing.T) {
 	if !hasFormatterNeed(detectFormatters([]string{"ts"}, t.TempDir()), "prettier") {
 		t.Errorf("ts stack should need prettier")

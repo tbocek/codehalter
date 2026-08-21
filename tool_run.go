@@ -111,9 +111,6 @@ func (b *boundedOutput) Write(p []byte) {
 	}
 }
 
-// truncated reports whether the middle was elided (more bytes seen than kept).
-func (b *boundedOutput) truncated() bool { return b.total > b.headCap+b.tailCap }
-
 // String reassembles the captured window: the whole stream when it fit, else
 // head + an "[... N bytes omitted ...]" marker + the last tailCap bytes, stitched
 // so the overlap case neither duplicates nor drops bytes.

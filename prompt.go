@@ -636,8 +636,8 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	}
 
 	// Name the thread from its opening request. Done here, BEFORE macro
-	// expansion, so `/improve` titles as `/improve` rather than as the first
-	// line of the rendered template. The field is only set on the session; the
+	// expansion, so a slash command titles as the command rather than as the
+	// first line of the rendered template. The field is only set on the session; the
 	// saveOrLog that stores this same message persists it.
 	if isFirstMessage && sess != nil {
 		a.setSessionTitle(ctx, sess, userText)
@@ -651,34 +651,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	if sess != nil {
 		macroCwd = sess.Cwd
 	}
-	macroNm, _ := splitMacro(userText)
-	if sess != nil && macroNm == "improve" {
-		// /improve is throwaway analysis of the on-disk logs, not the live
-		// conversation. Snapshot the real conversation in memory + run on a fresh
-		// context, route this turn's (bulky, self-referential) session files to
-		// /tmp so the real .codehalter/ logs it analyses stay untouched, and arm the
-		// code-level top-N ask cap. beginImproveScratch sets the `improving` flag
-		// that gates all of these; endImproveScratch (deferred) clears it at turn
-		// end on every exit path.
-		sess.beginImproveScratch()
-		defer sess.endImproveScratch()
-	}
 	if rendered, stopMsg, handled := expandMacro(macroCwd, userText); handled {
 		if stopMsg != "" {
 			a.say(ctx, req.SessionId, stopMsg+"\n")
 			return PromptResponse{StopReason: "end_turn"}, nil
 		}
 		userText = rendered
-	}
-
-	// /improve with no open-source license: the feedback backend rejects the
-	// submission and submit_improvement hard-fails on the same check, so disable
-	// the submit step in CODE rather than trusting the model to honour the
-	// template's prerequisite note (a weak model asks "Submit?" anyway, then the
-	// call errors). The fallback apply-subtask in orchestrate gates on the same
-	// flag for the path where the model emits no structured plan.
-	if sess != nil && sess.improving.Load() && sess.improveNoLicense.Load() {
-		userText += "\n\n[NO OPEN-SOURCE LICENSE in this project's root — feedback-API submission is DISABLED for this run. Do NOT ask the user whether to submit, and do NOT call submit_improvement. Applying the accepted edits locally completes /improve.]"
 	}
 
 	// The empty-project hint stays folded into the first user message because
@@ -772,6 +750,16 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 // AND compaction). The caller owns error presentation (Prompt surfaces it over
 // ACP, proposeFix logs it).
 func (a *agent) runTurn(ctx context.Context, sid string) error {
+	// MCP config this turn writes is applied at the BOUNDARY, never inside the
+	// turn: registering tools rewrites the `tools` array, which the chat template
+	// renders ahead of the whole conversation, so an in-turn reconcile would move
+	// the prompt under a loop already running. wait() holds a turn that starts
+	// while the previous flush is still bringing a child up; the deferred
+	// schedule() applies whatever changed once this turn is fully done, coalesced
+	// so a run of turns can never stack reconciles.
+	a.mcp.wait()
+	defer a.mcp.schedule(func() { a.flushMCP(sid) })
+
 	sess := a.getSession(sid)
 	if sess != nil {
 		sess.resetTurnStats(time.Now())
@@ -845,9 +833,6 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 				"the two roles must not otherwise differ in `chat_template_kwargs`. See the session log (CACHE lines) for the calls.",
 				r.cacheRewinds, humanCount(r.cacheRewound))
 		}
-		// Nudge toward self-improvement: /improve reads this session's logs and
-		// proposes (then applies/submits) refinements to codehalter's own prompts.
-		line += "\n\n💡 Run /improve to analyze this session and improve codehalter."
 		a.say(ctx, sid, line+"\n")
 	}
 	return nil
@@ -882,18 +867,6 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		// even after the plan-phase nudge, warn rather than ending silently —
 		// never leave the user with nothing after a turn that ran.
 		switch {
-		case sess != nil && sess.improving.Load():
-			// /improve workaround: the weak model can't reliably emit a structured
-			// plan here — it answers the analysis with a report-only respond, so
-			// there are no subtasks. The analysis is already in history; synthesize
-			// the apply step as one subtask and fall through to execute, where the
-			// model makes a single structured submit_improvement call and codehalter
-			// drives the Apply/Skip + submit in code (see improvementExecute).
-			applyDesc := "The analysis above already identified the improvements — do NOT re-analyse, and do NOT call ask_user or edit_file. Make ONE submit_improvement call whose `improvements` is a JSON array of the top changes (each object: title; file = the bare .codehalter prompt filename like \"PLAN.md\"; type = add|replace|remove; original = the exact current text to match; new = the added/replacement text; reasoning). codehalter then shows the user each change, asks Apply/Skip, applies the accepted edits, and asks whether to submit. That single call is the whole apply step."
-			if sess.improveNoLicense.Load() {
-				applyDesc += " (This project has no open-source license, so codehalter applies the accepted edits locally and skips submission.)"
-			}
-			p.Subtasks = []subtask{{Description: applyDesc}}
 		case p.answer != "":
 			// Surface the answer, then say WHY the turn ends here: a report_only
 			// plan means the planner judged this a question/diagnosis, not a code
@@ -906,15 +879,11 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			return toolLoopResult{}, nil
 		}
 	}
-	// /improve's single subtask is a prompt-shaped paragraph aimed at the model,
-	// not a step worth showing the user, so skip the render for that run.
-	if sess == nil || !sess.improving.Load() {
-		header := "Plan:"
-		if p.ReportOnly {
-			header = "Findings:"
-		}
-		a.renderPlan(ctx, sid, header, p.Subtasks)
+	header := "Plan:"
+	if p.ReportOnly {
+		header = "Findings:"
 	}
+	a.renderPlan(ctx, sid, header, p.Subtasks)
 	plan := p
 
 	var lastResult toolLoopResult
@@ -1009,9 +978,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			return lastResult, nil
 		}
 
-		if sess == nil || !sess.improving.Load() { // see the initial render
-			a.renderPlan(ctx, sid, "Replan:", newPlan.Subtasks)
-		}
+		a.renderPlan(ctx, sid, "Replan:", newPlan.Subtasks)
 		plan = newPlan
 	}
 

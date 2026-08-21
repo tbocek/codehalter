@@ -21,13 +21,6 @@ const defaultMaxTokens = 8192
 // summariser (see LLMConnection.Purpose and connForBackgroundLLM).
 const purposeSummary = "summary"
 
-// purposeImprove is the [[llm]] `purpose` value that hosts /improve turns
-// (see connForSession). /improve is offline analysis that benefits from the
-// strongest model available and can run slowly (e.g. overnight over the day's
-// session logs), so it gets its own routing target instead of tying up — and
-// evicting the KV cache of — the foreground LLM[0].
-const purposeImprove = "improve"
-
 type Settings struct {
 	// LLM is the ordered list of OpenAI-compatible endpoints codehalter can
 	// dispatch to. LLM[0] is the "main" connection: the foreground session
@@ -93,9 +86,6 @@ type LLMConnection struct {
 	Tag    string `toml:"tag,omitempty"`
 	// Purpose designates which non-foreground work routes to this entry.
 	// "summary" sends the per-turn summariser here instead of LLM[0].
-	// "improve" hosts /improve turns: the analysis benefits from the strongest
-	// (slowest) model available, and routing it here leaves LLM[0]'s KV cache
-	// — which holds the very conversation /improve resumes into — untouched.
 	// Empty means no designated background work — the entry is still a
 	// subagent fan-out target, which is what most extras are.
 	//
@@ -321,11 +311,11 @@ func decodeSettings(path string) (Settings, error) {
 		slog.Warn("unknown skills value (falling back to \"auto\")", "value", s.Skills, "file", path)
 	}
 	// A typo'd purpose is silent otherwise: the entry just never receives the
-	// summariser (or the /improve turn) and the work stays on LLM[0], which
-	// looks like the flag not working rather than the flag not being read.
+	// summariser and the work stays on LLM[0], which looks like the flag not
+	// working rather than the flag not being read.
 	for i := range s.LLM {
-		if p := s.LLM[i].Purpose; p != "" && !strings.EqualFold(p, purposeSummary) && !strings.EqualFold(p, purposeImprove) {
-			slog.Warn("unknown llm purpose (ignored — valid values are \"summary\" and \"improve\")", "purpose", p, "llm", i, "file", path)
+		if p := s.LLM[i].Purpose; p != "" && !strings.EqualFold(p, purposeSummary) {
+			slog.Warn("unknown llm purpose (ignored — the only valid value is \"summary\")", "purpose", p, "llm", i, "file", path)
 		}
 	}
 	s.path = path

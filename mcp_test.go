@@ -360,3 +360,84 @@ func TestMCPTOMLEntryRoundTrips(t *testing.T) {
 		t.Errorf("http entry = %+v", f.Server[1])
 	}
 }
+
+// TestMCPFlushCoalesces pins the scheduler contract: at most one flush runs at
+// a time, and any number of requests arriving while one runs collapse into
+// exactly ONE follow-up. Without the collapse a run of turns that each touch
+// mcp.toml would stack reconciles, and every one of them rewrites the tools
+// array the whole conversation is rendered behind.
+func TestMCPFlushCoalesces(t *testing.T) {
+	var m mcpState
+	var runs atomic.Int32
+	entered := make(chan struct{}, 8)
+	release := make(chan struct{})
+	run := func() {
+		runs.Add(1)
+		entered <- struct{}{}
+		<-release
+	}
+
+	m.schedule(run)
+	<-entered // the first flush is now in the middle of its work
+	for i := 0; i < 5; i++ {
+		m.schedule(run)
+	}
+	close(release)
+	m.wait()
+
+	if got := runs.Load(); got != 2 {
+		t.Fatalf("ran %d flushes, want 2 (the in-flight one plus a single coalesced follow-up)", got)
+	}
+	// Idle again, so the next request starts its own run rather than being
+	// swallowed by the finished one.
+	m.schedule(func() { runs.Add(1) })
+	m.wait()
+	if got := runs.Load(); got != 3 {
+		t.Fatalf("ran %d flushes, want 3 — schedule after the queue drained must start a fresh run", got)
+	}
+}
+
+// TestMCPFlushWaitBlocks covers the other half: a turn starting while a flush
+// is still bringing a child up has to wait it out, so tools never appear
+// half-registered in the middle of a turn.
+func TestMCPFlushWaitBlocks(t *testing.T) {
+	var m mcpState
+	started, release := make(chan struct{}), make(chan struct{})
+	m.schedule(func() { close(started); <-release })
+	<-started
+
+	done := make(chan struct{})
+	go func() { m.wait(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("wait returned while a flush was still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("wait did not return after the flush finished")
+	}
+	m.wait() // idle wait is a no-op, not a hang
+}
+
+// TestMCPTakePending: what a background flush parked (it runs between turns,
+// where nothing it says belongs to a turn) is handed to the next checkMCP
+// exactly once, so a notice is not repeated and a card is not offered twice.
+func TestMCPTakePending(t *testing.T) {
+	var m mcpState
+	if notes, fixes := m.takePending(); notes != nil || fixes != nil {
+		t.Fatalf("takePending on an idle state = %v / %v, want nil / nil", notes, fixes)
+	}
+	m.flushNotes = append(m.flushNotes, "gopls started")
+	m.flushFixes = append(m.flushFixes, fixProblem{desc: "boom"})
+
+	notes, fixes := m.takePending()
+	if len(notes) != 1 || notes[0] != "gopls started" || len(fixes) != 1 || fixes[0].desc != "boom" {
+		t.Fatalf("takePending = %v / %v, want the queued notice and card", notes, fixes)
+	}
+	if notes, fixes := m.takePending(); notes != nil || fixes != nil {
+		t.Fatalf("takePending twice = %v / %v, want nil / nil", notes, fixes)
+	}
+}

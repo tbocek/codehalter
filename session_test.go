@@ -2,9 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -151,44 +148,6 @@ func TestSessionTurnControl(t *testing.T) {
 	}
 }
 
-// TestImproveScratch pins the /improve scratch redirect: beginImproveScratch
-// snapshots + resets the conversation in memory and routes saves to scratchDir,
-// so writes during the run land in /tmp and the real .codehalter/ session is left
-// untouched; endImproveScratch restores the conversation.
-func TestImproveScratch(t *testing.T) {
-	dir := t.TempDir()
-	scratch := t.TempDir()
-	old := scratchDir
-	scratchDir = scratch
-	defer func() { scratchDir = old }()
-
-	s, _ := newSession(dir)
-	s.AddUser("real conversation")
-	s.Summary = "prior summary"
-	s.saveOrLog() // the real .codehalter/ session, as the last turn left it
-
-	s.beginImproveScratch()
-	if len(s.Messages) != 0 || s.Summary != "" || !s.improving.Load() {
-		t.Fatalf("begin: messages=%d summary=%q scratch=%v", len(s.Messages), s.Summary, s.improving.Load())
-	}
-	s.AddUser("scratch analysis")
-	s.saveOrLog() // must land in scratchDir, NOT .codehalter/
-
-	real, _ := os.ReadFile(s.filePath)
-	if !strings.Contains(string(real), "real conversation") || strings.Contains(string(real), "scratch analysis") {
-		t.Errorf(".codehalter session was touched during scratch:\n%s", real)
-	}
-	scratchData, err := os.ReadFile(filepath.Join(scratch, filepath.Base(s.filePath)))
-	if err != nil || !strings.Contains(string(scratchData), "scratch analysis") {
-		t.Errorf("scratch write not in scratchDir: err=%v", err)
-	}
-
-	s.endImproveScratch()
-	if s.improving.Load() || len(s.Messages) != 1 || s.Messages[0].Content != "real conversation" || s.Summary != "prior summary" {
-		t.Errorf("restore failed: scratch=%v msgs=%d summary=%q", s.improving.Load(), len(s.Messages), s.Summary)
-	}
-}
-
 // TestSessionSupersedeFlag pins the supersede flag that lets a cancelled turn
 // tell an editor abort (surface the reason) from a new-prompt supersede (stay
 // silent). markSuperseding sets it, superseded reads it, adoptTurn clears it
@@ -238,7 +197,7 @@ func TestKeepWindowStart(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		s.AddAssistant(fmt.Sprintf("step %d", i))
 	}
-	base := s.turnStartIndex() + 1
+	base := s.turnStartIdx + 1
 	for i, pt := range []int{1000, 4000, 7000, 15000, 25000} {
 		s.Messages[base+i].PromptTokens = pt
 	}
@@ -258,7 +217,7 @@ func TestKeepWindowStart(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		s2.AddAssistant(fmt.Sprintf("a%d", i))
 	}
-	b2 := s2.turnStartIndex() + 1
+	b2 := s2.turnStartIdx + 1
 	for i, pt := range []int{500, 1500, 3000} {
 		s2.Messages[b2+i].PromptTokens = pt
 	}
@@ -275,31 +234,4 @@ func TestKeepWindowStart(t *testing.T) {
 	if got := s3.keepWindowStart(10_000); got != s3.lastAssistantIndex() {
 		t.Errorf("no usage: keepWindowStart=%d, want lastAssistantIndex=%d", got, s3.lastAssistantIndex())
 	}
-}
-
-// TestImproveNoLicenseGate pins the deterministic submit gate behind issue #2:
-// beginImproveScratch records whether the project lacks an open-source license,
-// and the /improve flow drops the "Submit?" ask (and submit_improvement) on that
-// flag in code — instead of trusting a weak model to honour the template's
-// license prerequisite.
-func TestImproveNoLicenseGate(t *testing.T) {
-	// No LICENSE file → submission disabled.
-	noLic := &Session{Cwd: t.TempDir()}
-	noLic.beginImproveScratch()
-	if !noLic.improveNoLicense.Load() {
-		t.Errorf("no LICENSE → improveNoLicense should be true (submit disabled)")
-	}
-	noLic.endImproveScratch()
-
-	// MIT LICENSE → submission allowed.
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "LICENSE"), []byte("MIT License\n\nCopyright (c) 2026\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	withLic := &Session{Cwd: dir}
-	withLic.beginImproveScratch()
-	if withLic.improveNoLicense.Load() {
-		t.Errorf("MIT LICENSE present → improveNoLicense should be false (submit allowed)")
-	}
-	withLic.endImproveScratch()
 }

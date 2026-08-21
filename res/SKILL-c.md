@@ -1,35 +1,21 @@
 # C / C++ skill
-Covers C and C++ (.c/.h + .cpp/.cc/.cxx/.hpp). Match file you edit — no C++ idioms in C file or reverse.
+Covers C and C++ (.c/.h + .cpp/.cc/.cxx/.hpp). Match the file you edit — no C++ idioms in a C file or the reverse.
 
-## Build through project build system — NEVER hand-invoke compiler
-Use run_task for declared build (make, cmake --build build, meson compile, ninja), NOT bare `gcc foo.c`. Real project flags, include paths, link order live in build files; hand gcc drops them + "works" misleadingly. Read Makefile / CMakeLists.txt for target.
-- Make: `make` / `make <target>`; check Makefile for what exists.
-- CMake: configure once (`cmake -S . -B build`) → `cmake --build build`.
-- Build w/ warnings on + READ them: `-Wall -Wextra` (often `-Werror` in CI). Clean build w/ warnings = not clean → fix or justify each.
-
-## Conventions
-- Headers: include guard (`#ifndef X_H`/`#define`/`#endif`) or `#pragma once`; include what you use, nothing more; declarations in .h, definitions in .c/.cpp.
-- C: no implicit int, check every malloc/fopen return, free what you alloc, no leaks. C++: prefer RAII / smart pointers over raw new/delete; const-correctness; pass big objects by const&.
-- NEVER introduce undefined behaviour (out-of-bounds, use-after-free, signed overflow, uninit reads) to make something compile/pass → latent crash, not a fix.
+## Build through the project build system
+Use `run_task` on the declared build (make, cmake --build build, meson compile, ninja), NOT bare `gcc foo.c`: real flags, include paths and link order live in the build files. Pick the ONE system the project actually uses (a Makefile that wraps cmake is not a second target to try) and read it for the target name.
+Warnings on and READ them: `-Wall -Wextra` (often `-Werror` in CI). A build with warnings is not a clean build.
+NEVER introduce undefined behaviour (out-of-bounds, use-after-free, signed overflow, uninit reads) to make something compile or pass → latent crash, not a fix.
 
 ## Code intelligence over MCP — clangd (gopls analog)
-Set up ONLY when user asks. clangd = pure LSP → bridge to MCP w/ lsmcp (generic LSP→MCP server). **lsmcp needs Node ≥ 22** — imports `node:sqlite` builtin → on Node 20 crashes immediately w/ `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite`, MCP server never starts. Check `node --version` FIRST.
-1. Install clangd via OS pkg mgr (`apk add clang clang-extra-tools` / `apt-get install -y clangd` / `dnf install -y clang-tools-extra`); verify `clangd --version`.
-2. Install **Node ≥ 22** + project pkg mgr (see SKILL-base.md) — verify `node --version` reports 22+, NOT 20. Then drive clangd via lsmcp. If lsmcp can't drive clangd cleanly (or Node can't bump to 22) → use another LSP→MCP adapter; verify `lsp_*` tools actually appear.
-3. Add to `.codehalter/mcp.toml` (uncomment WHOLE block INCLUDING `[[server]]` header — commented header leaves keys orphan + server never loads). `--bin` REQUIRES a `--files` glob telling lsmcp which files LSP handles, else exits "--files is required when using --bin":
+Set up ONLY when the user asks. clangd = pure LSP → bridge to MCP with lsmcp (generic LSP→MCP server). **lsmcp needs Node ≥ 22** — it imports the `node:sqlite` builtin, so on Node 20 it crashes immediately with `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite` and the MCP server never starts. Check `node --version` FIRST.
+1. Install clangd via the OS pkg mgr (`apk add clang clang-extra-tools` / `apt-get install -y clangd` / `dnf install -y clang-tools-extra`); verify `clangd --version`.
+2. Install **Node ≥ 22** (NOT the distro default 20) + the project pkg manager, and persist both in `.devcontainer/Dockerfile`.
+3. Add to `.codehalter/mcp.toml` (uncomment the WHOLE block INCLUDING the `[[server]]` header — a commented header leaves the keys orphaned and the server never loads). `--bin` REQUIRES a `--files` glob, else lsmcp exits "--files is required when using --bin":
 [[server]]
 name = "clangd"
 command = "npx"
 args = ["-y", "@mizchi/lsmcp", "--bin", "clangd", "--files", "**/*.{c,cpp,cc,h,hpp}"]
-4. clangd needs `compile_commands.json` to resolve includes/flags. **GENERATE from build system — NEVER hand-write** (hand-authored DB duplicates build cmd + silently goes stale when Makefile changes):
-   - Make: `bear -- make` (install bear first if missing — `apt-get install -y bear` / `apk add bear`). bear wraps real build + records exactly what it compiled.
-   - CMake: configure w/ `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
-   Trivial single-file project → `compile_flags.txt` (one flag per line, e.g. `-Wall`) simpler than JSON DB, no build wrapper.
-5. Persist clangd + **Node ≥ 22** (NOT distro default 20) in `.devcontainer/Dockerfile`.
+4. clangd needs `compile_commands.json`. GENERATE it from the build system — `bear -- make`, or cmake with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`. NEVER hand-write it: a hand-authored DB duplicates the build command and goes stale silently. Trivial single-file project → `compile_flags.txt` (one flag per line) is simpler.
 
-## Tooling (install + persist in Dockerfile if missing — see SKILL-base.md)
-- Format: clang-format (honours .clang-format; codehalter auto-formats .c/.h/.cpp on edit when installed).
-- Static analysis: clang-tidy, cppcheck — run before claiming done on non-trivial changes.
-- Sanitizers for runtime bugs: build/test w/ `-fsanitize=address,undefined`; valgrind when sanitizers unavailable.
-- Debug: gdb / lldb.
-These = OS packages (`apk add clang clang-extra-tools` / `apt-get install clang clang-tidy clang-format gdb`), NOT language-package installs.
+## Tooling (OS packages, not language installs — see SKILL-base.md)
+clang-format (codehalter auto-formats .c/.h/.cpp on edit when installed), clang-tidy / cppcheck before claiming done on non-trivial changes, `-fsanitize=address,undefined` or valgrind for runtime bugs, gdb/lldb to debug.

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -140,23 +139,6 @@ func TestArgsTypedAccessors(t *testing.T) {
 			t.Errorf("str(path) = %q, want x.go", a.str("path"))
 		}
 	})
-}
-
-// TestSkipToolCall pins that a SKIPPED tool call is non-failing: Failed stays
-// false (so the subtask-outcome logic won't condemn the subtask the way a denied,
-// Failed=true call did) while the model still gets a benign "skipped: …" result.
-func TestSkipToolCall(t *testing.T) {
-	a, s := newTestAgent(t)
-	var tc toolCall
-	tc.Function.Name = "run_task"
-	tc.Function.Arguments = `{"task":"just:build"}`
-	tu, msg := a.skipToolCall(context.Background(), s.ID, tc, "nothing to build")
-	if tu.Failed {
-		t.Error("skipToolCall must NOT mark the call Failed — that would condemn the subtask")
-	}
-	if tu.Name != "run_task" || !strings.Contains(msg, "skipped") || !strings.Contains(msg, "nothing to build") {
-		t.Errorf("skip result: name=%q msg=%q", tu.Name, msg)
-	}
 }
 
 // TestLiveToolOutput pins the size policy used in BOTH the live call and the

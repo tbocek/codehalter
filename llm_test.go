@@ -381,27 +381,3 @@ func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
 		t.Errorf("unarmed conn: err = %v, want nil (the summariser must not be aborted)", err)
 	}
 }
-
-// TestConnForSessionImproveRouting pins the /improve routing: an improving
-// session runs on the entry marked purpose = "improve" when one exists, and on
-// LLM[0] otherwise; sessions outside an /improve turn never route there.
-func TestConnForSessionImproveRouting(t *testing.T) {
-	a, s := newTestAgent(t)
-	a.settings = Settings{LLM: []LLMConnection{
-		{Server: "http://main", Model: "main-model"},
-		{Server: "http://strong", Model: "strong-model", Purpose: "improve"},
-	}}
-
-	if c := a.connForSession(context.Background(), s.ID, "execute"); c == nil || c.Model != "main-model" {
-		t.Fatalf("normal session should run on LLM[0], got %+v", c)
-	}
-	s.improving.Store(true)
-	if c := a.connForSession(context.Background(), s.ID, "execute"); c == nil || c.Model != "strong-model" || c.Slot != 1 {
-		t.Fatalf("improving session should route to the improve entry, got %+v", c)
-	}
-	// Without an improve-purposed entry, /improve stays on LLM[0].
-	a.settings.LLM[1].Purpose = "summary"
-	if c := a.connForSession(context.Background(), s.ID, "execute"); c == nil || c.Model != "main-model" {
-		t.Fatalf("without an improve entry the turn stays on LLM[0], got %+v", c)
-	}
-}

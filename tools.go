@@ -107,12 +107,10 @@ type Tool struct {
 // exits on respond OR submit_plan).
 type phasePolicy struct {
 	deny      map[string]bool
-	skip      map[string]bool // no-op, NON-failing (vs deny's failed rejection)
 	terminals map[string]bool
 }
 
 func (p phasePolicy) isDenied(name string) bool   { return p.deny[name] }
-func (p phasePolicy) isSkipped(name string) bool  { return p.skip[name] }
 func (p phasePolicy) isTerminal(name string) bool { return p.terminals[name] }
 func (p phasePolicy) hasTerminal() bool           { return len(p.terminals) > 0 }
 
@@ -141,10 +139,11 @@ func denyHint(phase string) string {
 
 // registryMu guards registeredTools. Most writes happen at init() (single
 // goroutine), but the MCP reconciler mutates the registry mid-session — both
-// on startup (parallel server bring-up) and on every Prompt() (diff-and-apply
-// after the user edits mcp.toml). Reads from runToolLoop / subagent dispatch
-// happen after reconcile completes within a Prompt(), but ACP can deliver
-// SessionUpdate to other sessions concurrently, so the lock is mandatory.
+// on startup (parallel server bring-up) and at every turn boundary
+// (diff-and-apply after mcp.toml changed). Reconciles are ordered against
+// turns, never inside one, but they run on their own goroutine and ACP can
+// deliver SessionUpdate to other sessions concurrently, so the lock is
+// mandatory.
 var (
 	registryMu      sync.Mutex
 	registeredTools []Tool
@@ -432,30 +431,6 @@ func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall
 		Input:     tc.Function.Arguments,
 		Output:    msg,
 		Failed:    true,
-		StartedAt: time.Now(),
-	}
-	if sess := a.getSession(sid); sess != nil {
-		sess.AppendToolUse(tu)
-		sess.saveOrLog()
-	}
-	return tu, msg
-}
-
-// skipToolCall records a NON-failing no-op for a tool the phase policy SKIPS (as
-// opposed to denies): a completed card and a benign result, so the model moves on
-// AND the call does not count as a subtask failure (Failed stays false). Used by
-// /improve to short-circuit build/test runners on prompt-file-only edits.
-func (a *agent) skipToolCall(ctx context.Context, sid string, tc toolCall, reason string) (ToolUse, string) {
-	msg := "skipped: " + reason
-	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (skipped)", "tool", nil)
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(msg)})
-	tu := ToolUse{
-		ID:        nextToolUseID(),
-		CallID:    tc.ID,
-		Name:      tc.Function.Name,
-		Input:     tc.Function.Arguments,
-		Output:    msg,
-		Failed:    false,
 		StartedAt: time.Now(),
 	}
 	if sess := a.getSession(sid); sess != nil {

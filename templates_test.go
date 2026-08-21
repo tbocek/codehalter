@@ -100,14 +100,49 @@ func TestExpandMacroGrillMe(t *testing.T) {
 	}
 }
 
-// expandMacro on the real /improve template: it carries no placeholder (the
-// endpoint is keyless, so /improve takes no argument), which means a bare
-// /improve RUNS (renders, no stop message) rather than being rejected for a
-// missing arg. Embed fallback (empty temp cwd) exercises the shipped default.
-func TestExpandMacroImproveRunsBare(t *testing.T) {
+// expandMacro on the real /commit template: it carries no placeholder, which
+// means a bare /commit RUNS (renders, no stop message) rather than being
+// rejected for a missing arg. Embed fallback (empty temp cwd) exercises the
+// shipped default.
+func TestExpandMacroCommitRunsBare(t *testing.T) {
 	dir := t.TempDir()
-	rendered, stopMsg, handled := expandMacro(dir, "/improve")
+	rendered, stopMsg, handled := expandMacro(dir, "/commit")
 	if !handled || stopMsg != "" || rendered == "" {
-		t.Fatalf("bare /improve should run: handled=%v stopMsg=%q renderedEmpty=%v", handled, stopMsg, rendered == "")
+		t.Fatalf("bare /commit should run: handled=%v stopMsg=%q renderedEmpty=%v", handled, stopMsg, rendered == "")
+	}
+}
+
+// TestSeedTemplatesRetiresRemovedMacros: a project seeded before a macro was
+// removed still has the file on disk, and templateNames reads the DIRECTORY —
+// so without the sweep the dead command stays in the slash menu forever.
+func TestSeedTemplatesRetiresRemovedMacros(t *testing.T) {
+	dir := t.TempDir()
+	ch := filepath.Join(dir, ".codehalter")
+	if err := os.MkdirAll(ch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(ch, "TEMPLATE-"+retiredTemplates[0]+".md")
+	if err := os.WriteFile(stale, []byte("old macro body"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := seedTemplates(dir); err != nil {
+		t.Fatalf("seedTemplates: %v", err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("retired template still on disk: %v", err)
+	}
+	for _, n := range templateNames(dir) {
+		if n == retiredTemplates[0] {
+			t.Errorf("retired macro %q still advertised in the slash menu", n)
+		}
+	}
+	// Shipped templates are still seeded, and a second run over a clean tree is
+	// a no-op rather than an error.
+	if _, err := os.Stat(filepath.Join(ch, "TEMPLATE-commit.md")); err != nil {
+		t.Errorf("shipped template not seeded: %v", err)
+	}
+	if err := seedTemplates(dir); err != nil {
+		t.Fatalf("second seedTemplates: %v", err)
 	}
 }

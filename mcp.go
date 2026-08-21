@@ -695,6 +695,69 @@ type mcpChange struct {
 	action string // "started" | "stopped" | "restarted" | "failed" | "parse_error"
 	name   string // server name; "" for parse_error
 	err    error  // populated when action == "failed" or "parse_error"
+	tools  int    // tools the server advertised; "started"/"restarted" only
+}
+
+// schedule runs `run` in the background, at most one at a time. A request that
+// arrives while a run is in flight is coalesced into exactly ONE follow-up run,
+// however many arrive: the file is read fresh at the top of each run, so a
+// single catch-up pass sees the latest state. A request that arrives when idle
+// starts immediately.
+//
+// This is the whole "apply MCP changes at a quiescent point" rule: callers
+// schedule from the turn boundary and never call reconcileMCP mid-turn.
+func (m *mcpState) schedule(run func()) {
+	m.flushMu.Lock()
+	if m.flushing {
+		// Already one more queued → nothing to add; the queued pass will read
+		// the same file this one would have.
+		m.flushPending = true
+		m.flushMu.Unlock()
+		return
+	}
+	m.flushing = true
+	done := make(chan struct{})
+	m.flushDone = done
+	m.flushMu.Unlock()
+
+	go func() {
+		defer close(done)
+		for {
+			run()
+			m.flushMu.Lock()
+			if !m.flushPending {
+				m.flushing = false
+				m.flushDone = nil
+				m.flushMu.Unlock()
+				return
+			}
+			m.flushPending = false
+			m.flushMu.Unlock()
+		}
+	}()
+}
+
+// wait blocks until no scheduled flush is in flight, so a turn never starts
+// while the tool registry is being rewritten. A no-op when idle, which is the
+// common case: the flush from the previous turn's end has long finished by the
+// time the user types again.
+func (m *mcpState) wait() {
+	m.flushMu.Lock()
+	done := m.flushDone
+	m.flushMu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
+
+// takeFixes empties the cards a background flush left behind (see flushFixes).
+// takePending hands over what background flushes have parked, exactly once.
+func (m *mcpState) takePending() (notes []string, fixes []fixProblem) {
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+	notes, fixes = m.flushNotes, m.flushFixes
+	m.flushNotes, m.flushFixes = nil, nil
+	return notes, fixes
 }
 
 // shutdownMCP closes every running MCP child on app exit. stdio servers are
@@ -965,10 +1028,14 @@ func appendFile(path, body string) error {
 }
 
 // reconcileMCP brings the running MCP clients in line with .codehalter/mcp.toml.
-// It is idempotent and safe to call on every Prompt(): if the file is
+// It is idempotent and cheap to call at every turn boundary: if the file is
 // unchanged at the semantic level, no UI is emitted. Failures don't block the
 // caller — the user's turn proceeds with whatever set of tools is currently
 // registered.
+//
+// Callers are the two halves of the boundary, checkMCP (before a turn) and
+// flushMCP (after one), never a running turn: registering tools rewrites the
+// `tools` array the whole conversation is rendered behind.
 //
 // Restart semantics are start-then-stop: a config change brings up the new
 // process first and only kills the old one after the new client is verified
@@ -1090,9 +1157,9 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 		registerMCPTools(newClient, tools)
 		if oldClient != nil {
 			oldClient.Close()
-			changes = append(changes, mcpChange{action: "restarted", name: name})
+			changes = append(changes, mcpChange{action: "restarted", name: name, tools: len(tools)})
 		} else {
-			changes = append(changes, mcpChange{action: "started", name: name})
+			changes = append(changes, mcpChange{action: "started", name: name, tools: len(tools)})
 		}
 	}
 

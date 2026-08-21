@@ -239,8 +239,7 @@ func expandCmdPlaceholders(body string) string {
 }
 
 // skillPath resolves the file backing one skill NAME. One skill set, one
-// location: .codehalter/<name>. Named rather than inlined because the improve
-// and probe paths must resolve the same file the prompt loads.
+// location: .codehalter/<name>.
 func skillPath(cwd, name string) string {
 	return filepath.Join(cwd, ".codehalter", name)
 }

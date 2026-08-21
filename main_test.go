@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -12,6 +13,10 @@ import (
 	"testing"
 	"time"
 )
+
+// ptr returns a pointer to v, for struct literals with *int/*bool fields
+// (Settings.Parallel and friends, which distinguish unset from zero).
+func ptr[T any](v T) *T { return &v }
 
 // newTestAgent returns an agent with one session rooted at a fresh tempdir.
 // a.conn is left nil so sendUpdate becomes a no-op (covered by the nil-check).
@@ -401,5 +406,74 @@ func TestCwdAvailable(t *testing.T) {
 	}
 	if err := cwdAvailable(file); err == nil {
 		t.Errorf("cwdAvailable(file) = nil, want error")
+	}
+}
+
+func TestHeartbeatDotsThenClosesLine(t *testing.T) {
+	h := newTerminalHarness(t)
+	// Real pacing is seconds; the goroutine is the same either way.
+	old := heartbeatEvery
+	heartbeatEvery = 5 * time.Millisecond
+	t.Cleanup(func() { heartbeatEvery = old })
+
+	chunks := func() []string {
+		var out []string
+		for _, u := range h.updatesOfKind("agent_message_chunk") {
+			content, _ := u["content"].(map[string]any)
+			text, _ := content["text"].(string)
+			out = append(out, text)
+		}
+		return out
+	}
+
+	stop := h.agent.heartbeat(context.Background(), h.sess.ID)
+	if !h.waitFor(func() bool { return len(chunks()) >= 2 }) {
+		t.Fatalf("no heartbeat dots arrived, got %q", chunks())
+	}
+	stop()
+
+	// stop() joins the ticker goroutine, but the notifications it wrote are
+	// still in flight over the pipe, so wait for the closing newline to land.
+	last := func() string {
+		c := chunks()
+		if len(c) == 0 {
+			return ""
+		}
+		return c[len(c)-1]
+	}
+	if !h.waitFor(func() bool { return last() == "\n" }) {
+		t.Fatalf("dot line was never closed, got %q", chunks())
+	}
+
+	got := chunks()
+	if len(got) < 3 {
+		t.Fatalf("want dots plus a closing newline, got %q", got)
+	}
+	for i, c := range got[:len(got)-1] {
+		if c != "." {
+			t.Errorf("chunk %d = %q, want a dot", i, c)
+		}
+	}
+
+	// stop() joins the ticker goroutine, so nothing follows the newline.
+	n := len(got)
+	time.Sleep(20 * time.Millisecond)
+	if after := len(chunks()); after != n {
+		t.Errorf("%d chunk(s) arrived after stop", after-n)
+	}
+}
+
+// TestHeartbeatSilentWhenFast pins the no-op case: work that finishes inside
+// one interval must not leave a stray newline in the thread.
+func TestHeartbeatSilentWhenFast(t *testing.T) {
+	h := newTerminalHarness(t)
+	old := heartbeatEvery
+	heartbeatEvery = time.Hour
+	t.Cleanup(func() { heartbeatEvery = old })
+
+	stop := h.agent.heartbeat(context.Background(), h.sess.ID)
+	stop()
+	if got := h.updatesOfKind("agent_message_chunk"); len(got) != 0 {
+		t.Errorf("heartbeat that never ticked emitted %d chunk(s)", len(got))
 	}
 }

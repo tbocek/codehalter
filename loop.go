@@ -97,14 +97,6 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// arguments are the structured plan. Keeping respond out forces the planner
 	// onto submit_plan instead of escaping into execute's exit and emitting a
 	// free-text answer with no plan attached.
-	// Exclude write_file/edit_file: planning is information-gathering only.
-	// When the planner edits files itself, those edits leak into history and
-	// the executor either repeats them or assumes the work is already done.
-	// run_command's `sed -i` is the other edit vector; PLAN.md forbids it
-	// in prose since we can't block it at the tool layer without parsing.
-	// Also exclude launch_subagent: otherwise the planner fans its forbidden
-	// edits out to a leaf-worker subagent (which has the full edit toolkit)
-	// and reports report_only=true, papering over the loophole.
 	// Read-only planning, enforced at dispatch: edit_file/write_file/launch_subagent
 	// are denied (planner edits leak into history; launch_subagent fans them to a
 	// leaf worker). `sed -i` is unblockable here — PLAN.md forbids it in prose.
@@ -316,17 +308,6 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// respond ends the subtask; submit_plan revises the remaining plan in place
 	// (the orchestrator adopts it — see subtaskOutcome).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
-	if sess != nil && sess.improving.Load() {
-		// /improve edits .md prompt files only — nothing to build or test, and the
-		// weak model ignores the "no verify" instruction. SKIP (not deny) the
-		// runners: a non-failing no-op so the model moves on, without the runner
-		// condemning the subtask (a denied/failed run_task fails the whole subtask).
-		policy.skip = map[string]bool{"run_task": true, "run_command": true}
-		// submit_improvement is the /improve apply step: the model proposes the
-		// changes (structured) and submit_improvement drives the Apply/Skip + submit
-		// in code. It ends the subtask like respond (see the funnel in runToolLoopSeeded).
-		policy.terminals[submitImprovementToolName] = true
-	}
 	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
 	// session, stored verbatim by the loop — no post-hoc patch.
@@ -377,8 +358,8 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		// verdicts: edit_file/write_file on a usage error (a recovered edit is a
 		// later edit with a different key, and an unrecovered one is caught by the
 		// verify recipe when the file won't build), view_image on a benign missing
-		// image, submit_improvement on a malformed /improve call. Condemning the
-		// subtask on those triggers spurious replans, so use a positive allowlist.
+		// image. Condemning the subtask on those triggers spurious replans, so use
+		// a positive allowlist.
 		if lastFailed[k] && (k.name == "run_task" || k.name == "run_command") {
 			failedNames = append(failedNames, k.name)
 		}
@@ -720,22 +701,6 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			sess.MarkLastAssistantTiming(res.StartedAt, res.DurationMs, phase)
 		}
 	}
-	// /improve funnel state (persists across rounds): submit_improvement is the
-	// apply step; a weak model that ends with a prose respond after only analysing
-	// gets nudged toward it, up to improveRespondNudgeCap times before respond is
-	// allowed through (graceful give-up, never an infinite loop). Scoped to the
-	// EXECUTE phase only: that's where submit_improvement is the apply terminal. In
-	// plan (a report_only respond is a valid outcome) and document (respond is the
-	// only terminal), gating respond would wrongly push the model toward
-	// submit_improvement and could even re-run the apply loop.
-	const improveRespondNudgeCap = 2
-	var improveSess *Session
-	if phase == "execute" {
-		if s := a.getSession(sid); s != nil && s.improving.Load() {
-			improveSess = s
-		}
-	}
-	improveRespondNudges := 0
 
 	// Repetition ladder state. callOutHash remembers the last output hash of each
 	// (name,args) call this loop; a later call that reproduces it made no progress
@@ -1033,12 +998,6 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			var content any
 			denied := policy.isDenied(tc.Function.Name)
 			switch {
-			case policy.isSkipped(tc.Function.Name):
-				// Non-failing no-op (e.g. /improve's build/test runners): the model
-				// moves on and the call doesn't condemn the subtask.
-				var msg string
-				tu, msg = a.skipToolCall(ctx, sid, tc, "/improve makes only .md prompt-file edits — there is nothing to build or test")
-				content = msg
 			case denied:
 				var msg string
 				tu, msg = a.denyToolCall(ctx, sid, phase, tc)
@@ -1088,19 +1047,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if !repeated {
 				roundStuck = false
 			}
-			// /improve funnel: block a premature prose respond (the weak model's habit
-			// of analysing then bailing without applying) and point it back at
-			// submit_improvement, which drives the Apply/Skip + submit in code. Once
-			// submit_improvement has delivered (improveDelivered, set inside
-			// improvementExecute), respond is allowed to end the turn. Session-scoped so
-			// a replan that re-enters execute can't re-arm it and re-apply.
-			gatedRespond := improveSess != nil && !improveSess.improveDelivered.Load() &&
-				tc.Function.Name == respondToolName && improveRespondNudges < improveRespondNudgeCap
-			if gatedRespond {
-				improveRespondNudges++
-				content = "Do not finish with a prose summary. Call submit_improvement ONCE now with the improvements as a JSON array (each: title, file, type=add|replace|remove, original, new, reasoning). codehalter then shows the user each change, asks Apply/Skip, applies the accepted edits, and asks whether to submit. That single call IS the apply step."
-			}
-			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled && !gatedRespond {
+			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled {
 				terminalCalled = true
 				terminalName = tc.Function.Name
 				terminalMessage = tu.Output

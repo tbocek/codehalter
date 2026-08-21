@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -47,9 +48,23 @@ func isTemplateFile(n string) (name string, ok bool) {
 	return "", false
 }
 
+// retiredTemplates names macros codehalter used to ship and has since dropped.
+// Seeding only ever adds, so a project set up before the removal keeps its
+// seeded copy: templateNames reads the directory, the command stays in the
+// slash menu, and running it aims the model at tools that no longer exist.
+// Sweeping exactly those filenames is what actually retires the command.
+var retiredTemplates = []string{"improve"}
+
 // seedTemplates copies each embedded TEMPLATE-*.md into .codehalter/ when absent
-// (seed-once, like the phase prompts), so the user has editable copies.
+// (seed-once, like the phase prompts), so the user has editable copies, and
+// removes the templates of features that no longer exist.
 func seedTemplates(cwd string) error {
+	for _, name := range retiredTemplates {
+		path := filepath.Join(cwd, ".codehalter", "TEMPLATE-"+name+".md")
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			slog.Warn("removing retired template", "path", path, "err", err)
+		}
+	}
 	entries, _ := templateFS.ReadDir("res")
 	for _, e := range entries {
 		n := e.Name()
@@ -150,8 +165,7 @@ func handleClean(cwd string) (message string, handled bool) {
 }
 
 // splitMacro parses a slash command "/name args" into its name and args. name
-// is "" when userText is not a slash command. Shared by expandMacro and the
-// Prompt handler, which arms the /improve ask cap from the parsed name.
+// is "" when userText is not a slash command.
 func splitMacro(userText string) (name, args string) {
 	if !strings.HasPrefix(userText, "/") {
 		return "", ""

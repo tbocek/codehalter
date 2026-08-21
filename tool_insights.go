@@ -14,8 +14,7 @@ import (
 // session_insights: mechanical failure analytics over session_*.log files.
 //
 // Session logs routinely dwarf a small model's context window, and asking a
-// 27B model to grep-and-skim them (the old /improve step 1) produced shallow,
-// lucky-dip evidence. This tool does the analytics in CODE — parse every
+// 27B model to grep-and-skim them produced shallow, lucky-dip evidence. This tool does the analytics in CODE — parse every
 // requested log, extract the failure signals mechanically, return a digest of
 // a few KB — so the model spends its context on picking the top problems, not
 // on being a log parser. Same lesson as the skills="auto" code-level levers:

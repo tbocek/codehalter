@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -69,83 +67,6 @@ func TestThrottledStream(t *testing.T) {
 	flush() // nothing buffered → no emit
 	if len(emits) != 2 {
 		t.Errorf("empty flush should not emit: %v", emits)
-	}
-}
-
-// TestImproveExecuteSkipsVerify pins that during an /improve execute pass the
-// build/test runners are SKIPPED at the tool layer (the edits are .md only): the
-// model's run_task call never executes, while a normal execute pass runs it. The
-// skip is non-failing (see TestSkipToolCall) so it can't condemn the subtask.
-func TestImproveExecuteSkipsVerify(t *testing.T) {
-	withFreshToolRegistry(t)
-	var ran int
-	RegisterTool(Tool{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "run_task", "description": "x",
-			"parameters": map[string]any{"type": "object"}}},
-		Execute: func(_ context.Context, _ *agent, _, _ string) (string, bool) {
-			ran++
-			return "ran the task", false
-		},
-	})
-
-	run := func(improve bool) {
-		// run_task, then two empty (text) rounds: with a terminal policy the first
-		// empty round is nudged, the second exits.
-		mock := newMockLLM(t, sseToolCall("c0", "run_task", `{"task":"just:build"}`), sseText("a"), sseText("done"))
-		defer mock.Close()
-		a, s := newTestAgent(t)
-		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-		s.improving.Store(improve)
-		a.runExecutePhase(context.Background(), s.ID, subtask{Description: "apply"}, 0, 1)
-	}
-
-	ran = 0
-	run(false)
-	if ran != 1 {
-		t.Errorf("normal execute: run_task should run (ran=%d, want 1)", ran)
-	}
-	ran = 0
-	run(true)
-	if ran != 0 {
-		t.Errorf("/improve execute: run_task must be SKIPPED, but it ran (ran=%d, want 0)", ran)
-	}
-}
-
-// TestImproveRespondFunnel pins the /improve funnel: a bare `respond` must NOT
-// end the turn before submit_improvement ran. The loop nudges respond toward
-// submit_improvement; once that's called, codehalter applies the change in code.
-// Proof: PLAN.md is edited only if the gated respond let the loop continue to the
-// submit_improvement call (a model that just analysed and respond'd would leave it
-// untouched — the original bug).
-func TestImproveRespondFunnel(t *testing.T) {
-	a, s := newTestAgent(t)
-	a.mu.Lock()
-	a.mode = "Autopilot" // auto-answer the Apply card (no editor conn in the test)
-	a.mu.Unlock()
-	s.improving.Store(true)
-
-	ch := filepath.Join(s.Cwd, ".codehalter")
-	os.MkdirAll(ch, 0o755)
-	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("alpha OLD omega"), 0o644)
-	// No LICENSE: the edit applies locally, submission is refused (no HTTP call).
-
-	subArgs := submitImprovementArgs(t, map[string]string{
-		"improvements": `[{"title":"t","file":"PLAN.md","type":"replace","original":"OLD","new":"NEW","reasoning":"r"}]`,
-	})
-	// Round 1: a premature prose respond (the observed failure). Round 2: the
-	// structured submit_improvement the funnel pushes it toward.
-	mock := newMockLLM(t,
-		sseToolCall("c0", "respond", `{"message":"Here is my analysis of the session."}`),
-		sseToolCall("c1", "submit_improvement", subArgs),
-	)
-	defer mock.Close()
-	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-
-	a.runExecutePhase(context.Background(), s.ID, subtask{Description: "apply the analysis"}, 0, 1)
-
-	if b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); string(b) != "alpha NEW omega" {
-		t.Errorf("respond was not funnelled to submit_improvement (PLAN.md unchanged): %q", b)
 	}
 }
 

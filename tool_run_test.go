@@ -19,30 +19,18 @@ func TestBoundedOutput(t *testing.T) {
 	if got := b.String(); got != "abcdefghij" {
 		t.Errorf("fit: got %q", got)
 	}
-	if b.truncated() {
-		t.Error("fit: should not be truncated")
-	}
-
 	// tailCap < total <= headCap+tailCap: head+tail stitched, no marker, no dup/gap.
 	b = newBoundedOutput(16)
 	b.Write([]byte("abcdefghijklmn")) // 14
 	if got := b.String(); got != "abcdefghijklmn" {
 		t.Errorf("stitch: got %q (want full 14, no marker)", got)
 	}
-	if b.truncated() {
-		t.Error("stitch: 14 <= headCap+tailCap, not truncated")
-	}
-
 	// Past the cap: head + marker + last tailCap, middle elided.
 	b = newBoundedOutput(16)
 	b.Write([]byte("abcdefghijklmnopqrst")) // 20
 	if got := b.String(); got != "abcd\n[... 4 bytes omitted ...]\nijklmnopqrst" {
 		t.Errorf("over: got %q", got)
 	}
-	if !b.truncated() {
-		t.Error("over: should be truncated")
-	}
-
 	// Byte-at-a-time matches one-shot, and the ring keeps exactly the last tailCap
 	// even after crossing the 2*tailCap trim point.
 	b = newBoundedOutput(16)

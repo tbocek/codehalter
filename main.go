@@ -178,6 +178,27 @@ type mcpState struct {
 	// persistently-broken server from re-emitting the same failed card on every
 	// prompt. Zero value means "never reconciled yet".
 	appliedMtime time.Time
+	// Deferred-reconcile scheduler (see mcpState.schedule). The model writing
+	// mcp.toml mid-turn must NOT be applied mid-turn: registering tools rewrites
+	// the `tools` array, which the chat template renders ahead of the whole
+	// conversation, so the prompt would move under a turn already in flight. The
+	// reconcile is therefore scheduled at the turn boundary and coalesced.
+	// flushMu guards this group only. It is a leaf and is never held across a
+	// reconcile (which takes mu), so the two never deadlock.
+	flushMu      sync.Mutex
+	flushing     bool
+	flushPending bool
+	// flushDone is closed when the running flush finishes; nil while idle, so a
+	// starting turn can wait one out (mcpState.wait).
+	flushDone chan struct{}
+	// flushNotes / flushFixes hold what a background flush produced: one-line
+	// notices ("gopls started") and cards (a parse error, a server that would
+	// not start). A flush runs BETWEEN turns, and anything said there lands
+	// outside any prompt — a card has no turn to dispatch from, and a notice is
+	// at the mercy of whether the client renders out-of-turn updates. So both
+	// are parked here and the next checkMCP replays them from inside a turn.
+	flushNotes []string
+	flushFixes []fixProblem
 }
 
 // ---------------------------------------------------------------------------
@@ -613,6 +634,12 @@ func (a *agent) startIndexing(sid string, cwd string) {
 		sess := a.getSession(sid)
 		if sess != nil {
 			slog.Debug("startIndexing: gitignore done, about to prepare", "sid", sid)
+			// prepareChecks is the longest silent stretch of a session open: it
+			// probes every LLM (a local server that still has to load a 27B
+			// model answers in tens of seconds), seeds skills, and reconciles
+			// MCP servers. Without this line the thread sits empty after the
+			// gitignore card and a slow probe is indistinguishable from a hang.
+			a.say(ctx, sid, "Setting up: probing the LLM, seeding skills, checking project tooling. The first probe can take a while if your server still has to load the model.\n\n")
 			fixes := a.prepareChecks(ctx, sess, sid)
 			// Prefix-cache prewarm AFTER the checks (the probe has run, skills
 			// are seeded, SystemPrompt is final — the warmed bytes match turn
@@ -703,6 +730,47 @@ func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 // are streamed fragments that must concatenate seamlessly.
 func (a *agent) say(ctx context.Context, sid, text string) {
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: text}})
+}
+
+// heartbeatEvery paces the "I am still here" dots. A var, not a const, so a
+// test can shorten it instead of sleeping for real seconds.
+var heartbeatEvery = 2 * time.Second
+
+// heartbeat streams one dot into the chat every heartbeatEvery until the
+// returned stop func is called, which also closes the line if any dot was
+// emitted. Session bootstrap blocks for tens of seconds on work the user
+// cannot see (probing every configured LLM server, starting MCP children),
+// and a thread that prints nothing is indistinguishable from a hang.
+//
+// Wrap ONLY work that cannot ask the user anything: a heartbeat around a card
+// would keep ticking for as long as the card sits there waiting for a click.
+func (a *agent) heartbeat(ctx context.Context, sid string) func() {
+	tickCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	ticks := 0
+	go func() {
+		defer close(done)
+		t := time.NewTicker(heartbeatEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-tickCtx.Done():
+				return
+			case <-t.C:
+				ticks++
+				a.say(tickCtx, sid, ".")
+			}
+		}
+	}()
+	// ticks is written only by the goroutine above and read only after <-done,
+	// so the channel close orders the two — no lock needed.
+	return func() {
+		cancel()
+		<-done
+		if ticks > 0 {
+			a.say(ctx, sid, "\n")
+		}
+	}
 }
 
 // sayThought is say for the model's reasoning channel, which clients render

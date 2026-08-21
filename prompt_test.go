@@ -252,7 +252,7 @@ func TestDeriveTitle(t *testing.T) {
 		{"leading blank lines skipped", "\n\n  Add a healthcheck  ", "Add a healthcheck"},
 		{"only the first line", "Update the parser\n\nIt panics on empty input.", "Update the parser"},
 		{"runs of whitespace collapse", "Add   a\ttest", "Add a test"},
-		{"macro name survives", "/improve", "/improve"},
+		{"macro name survives", "/commit", "/commit"},
 		{"no text at all", "\n  \n", ""},
 		{
 			"long prompt cut on a word boundary",

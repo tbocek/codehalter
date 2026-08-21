@@ -9,25 +9,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/BurntSushi/toml"
 )
-
-// improveAskCap is the maximum number of improvements /improve may present per
-// run; the per-change ask_user loop is held to this in code (tool_ask.go).
-const improveAskCap = 3
-
-// improveAskBlocked counts one /improve Apply/Skip prompt and reports whether it
-// exceeds improveAskCap. A no-op returning false outside an /improve turn. Once
-// the cap is passed it stays blocked, forcing the per-change loop to stop.
-func (s *Session) improveAskBlocked() bool {
-	if !s.improving.Load() {
-		return false
-	}
-	return s.improveAsks.Add(1) > improveAskCap
-}
 
 // beginTurn registers the in-flight turn's cancel.
 func (s *Session) beginTurn(c context.CancelFunc) {
@@ -298,31 +283,6 @@ type Session struct {
 	turnCancelMu sync.Mutex
 	turnCancel   context.CancelFunc
 	superseding  bool
-	// improving marks the current turn as an /improve run. It does double duty,
-	// since both effects begin and end with the same /improve turn: (1) the
-	// per-change ask_user Apply/Skip prompts are capped to improveAskCap in code so
-	// a chatty model can't loop through dozens (improveAsks counts them), and (2)
-	// this session's toml + log writes are routed to scratchDir (/tmp) instead of
-	// .codehalter/, for the run's throwaway, self-referential logs. Set by
-	// beginImproveScratch, cleared (deferred) by endImproveScratch; preImproveMsgs /
-	// preImproveSummary hold the real conversation snapshot to restore at turn end.
-	// Atomic: sessionFilePath/logSession read it from background goroutines (e.g.
-	// the background summariser's llmStream logging) concurrently with begin/end.
-	improving atomic.Bool
-	// improveNoLicense caches, for the current /improve run, that the project has
-	// no open-source license — so feedback-API submission is impossible. Set in
-	// beginImproveScratch; read to drop the "Submit?" ask deterministically in
-	// code (the template's prerequisite footnote alone doesn't stop a weak model
-	// from asking, then submit_improvement hard-fails on the same check).
-	improveNoLicense atomic.Bool
-	// improveDelivered marks that submit_improvement's apply loop has already run
-	// this /improve turn, so a duplicate call (same batch, or after a replan) no-ops
-	// instead of re-applying, and the respond-funnel stops re-arming. Reset in
-	// beginImproveScratch.
-	improveDelivered  atomic.Bool
-	improveAsks       atomic.Int64
-	preImproveMsgs    []Message
-	preImproveSummary string
 	// promptSkills is the set of SKILL-*.md filenames folded into the current
 	// SystemPrompt. A skill seeded on disk AFTER the prompt was built is injected
 	// as a user message (NOT folded into the prompt — that would bust the KV
@@ -369,18 +329,12 @@ type Session struct {
 	// file presence so we can flag "user has a justfile but `just` not on
 	// PATH" as a fixable problem, distinct from "no runner at all".
 	knownRunners []string `toml:"-"`
-	// envSnapshot is the canonical string from checkEnv covering everything
-	// the consolidated banner can display (container, firefox, run_command,
-	// stacks, runner configs, per-tool probe binaries). checkEnv compares
-	// against it to decide whether to flag envChanged so prepare re-emits
-	// the banner. Not persisted — restart re-emits the banner once on the
-	// first turn.
-	envSnapshot string `toml:"-"`
 	// capabilitiesShown gates the full capabilities banner to once per session.
-	// The first prepare (bootstrap) emits it to establish state; afterwards
-	// routine changes (a tool installed, an MCP server starting, a re-probe)
-	// surface as one-line notices / fix cards instead of re-dumping the whole
-	// setup screen mid-conversation. Not persisted — a restart re-shows it once.
+	// The first prepare (bootstrap) always emits it, so a session opens with a
+	// visible statement of what codehalter found; afterwards routine changes
+	// (a tool installed, an MCP server starting, a re-probe) surface as
+	// one-line notices / fix cards instead of re-dumping the whole setup
+	// screen mid-conversation. Not persisted — a restart re-shows it once.
 	capabilitiesShown bool `toml:"-"`
 
 	// Per-turn stats for the "✅ Done" line: reset at Prompt start, summed
@@ -898,7 +852,7 @@ func (s *Session) drainShadow() string {
 
 // markTurnStart records where the current top-level turn begins: the index of
 // the just-appended human/card prompt. Called at runTurn entry. Mid-turn
-// compaction reads it via turnStartIndex to decide what to keep verbatim.
+// compaction reads turnStartIdx to decide what to keep verbatim.
 func (s *Session) markTurnStart() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -908,22 +862,10 @@ func (s *Session) markTurnStart() {
 	}
 }
 
-// turnStartIndex returns the in-flight turn's start index, clamped to the
-// current Messages length (a rotation may have shrunk Messages out from under
-// a stale value).
-func (s *Session) turnStartIndex() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.turnStartIdx > len(s.Messages) {
-		return len(s.Messages)
-	}
-	return s.turnStartIdx
-}
-
 // lastAssistantIndex returns the index of the most recent assistant message in
 // the in-flight large turn (at or after turnStartIdx), i.e. the start of the
 // unfinished small turn. The 400 recovery folds everything before it and keeps
-// it verbatim. Falls back to turnStartIndex when the turn has no assistant
+// it verbatim. Falls back to turnStartIdx when the turn has no assistant
 // message yet (its first call 400'd), so foldHistory then keeps the whole
 // in-flight turn rather than slicing into a prompt-only window.
 func (s *Session) lastAssistantIndex() int {
@@ -1121,51 +1063,9 @@ func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	return archiveID, nil
 }
 
-// scratchDir is where an /improve run's throwaway session files go (its bulky,
-// self-referential logs must not bloat or pollute the .codehalter/ logs it
-// analyses). A var so tests can point it at a tempdir.
-var scratchDir = "/tmp"
-
-// beginImproveScratch marks the turn as an /improve run (arming the ask cap and
-// the scratchDir log redirect), snapshots the real conversation IN MEMORY, and
-// resets the session to a fresh context (so /improve has full budget to read
-// every log). Nothing touches disk here, so the real .codehalter/session_*.toml
-// stays exactly as the last turn left it. endImproveScratch restores the
-// snapshot at turn end (every exit path), so the user's conversation resumes
-// untouched and the /improve bulk is discarded with the /tmp files.
-func (s *Session) beginImproveScratch() {
-	// Compute the license verdict before taking the lock (it does file I/O) so
-	// the submit step can be gated deterministically for this run.
-	_, licErr := checkLicense(s.Cwd)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.preImproveMsgs = s.Messages
-	s.preImproveSummary = s.Summary
-	s.Messages = nil
-	s.Summary = ""
-	s.improveAsks.Store(0)
-	s.improveDelivered.Store(false)
-	s.improveNoLicense.Store(licErr != nil)
-	s.improving.Store(true)
-}
-
-func (s *Session) endImproveScratch() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Messages = s.preImproveMsgs
-	s.Summary = s.preImproveSummary
-	s.preImproveMsgs = nil
-	s.preImproveSummary = ""
-	s.improveAsks.Store(0)
-	s.improving.Store(false)
-}
-
 // sessionFilePath returns where this session's toml/log of basename `name`
-// should be written: scratchDir during an /improve run, else .codehalter/.
+// should be written: the project's .codehalter/ directory.
 func (s *Session) sessionFilePath(name string) string {
-	if s.improving.Load() {
-		return filepath.Join(scratchDir, name)
-	}
 	return filepath.Join(s.Cwd, sessionDir, name)
 }
 

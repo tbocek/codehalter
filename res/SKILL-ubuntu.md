@@ -10,10 +10,10 @@ User=non-root `dev`, sudo NOPASSWD. Prefix apt update/install/remove, apt-get, a
 ## Search / install
 Order: 1) apt-get 2) upstream site / custom repo (below) 3) lang installer 4) PPA — details in container skill.
 Use apt-get, not apt — apt's progress chatter breaks output parsing.
-- apt-get update → refresh index. Required after add-apt-repository or source edits.
+- sudo apt-get update → refresh index. Required after add-apt-repository or source edits.
 - apt-cache search <pkg> → fuzzy.
 - apt-cache policy <pkg> → installed + candidate + source. Always check before claiming a version isn't available.
-- DEBIAN_FRONTEND=noninteractive apt-get install -y <pkg> → install (never hangs on config prompts).
-- apt-get remove/purge -y <pkg> → uninstall.
+- sudo DEBIAN_FRONTEND=noninteractive apt-get install -y <pkg> → install (never hangs on config prompts). The env var goes AFTER sudo — before it, sudo strips it.
+- sudo apt-get remove/purge -y <pkg> → uninstall.
 - Custom repo: curl -fsSL <key-url> | sudo tee /etc/apt/keyrings/<name>.asc && echo "deb [signed-by=/etc/apt/keyrings/<name>.asc] <repo-url> <suite> main" | sudo tee /etc/apt/sources.list.d/<name>.list && apt-get update.
 - 4th choice PPA (add-apt-repository preinstalled): sudo add-apt-repository -y ppa:<owner>/<name> && apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y <pkg>

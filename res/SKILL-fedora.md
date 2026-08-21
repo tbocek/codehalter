@@ -13,8 +13,8 @@ Order: 1) dnf 2) upstream site / custom repo (below) 3) lang installer 4) COPR �
 - dnf check-update → refresh metadata + list upgradable. Cheap.
 - dnf search <pkg> → fuzzy.
 - dnf info <pkg> → version, repo, desc, size.
-- dnf install -y <pkg> → install (exits 0 on "already installed" → re-run confirms presence).
-- dnf remove <pkg> → uninstall.
+- sudo dnf install -y <pkg> → install (exits 0 on "already installed" → re-run confirms presence).
+- sudo dnf remove <pkg> → uninstall.
 - dnf provides <path-or-cmd> → which package owns a file (e.g. `dnf provides */gopls`).
 - Split pkgs: <pkg> (runtime) vs <pkg>-devel (headers). "Missing header X" usually → need <pkg>-devel.
 - Custom repo: dnf config-manager --add-repo <repo-or-.repo-url> (plugin installed), or curl the .repo file into /etc/yum.repos.d/, then dnf install -y <pkg>.

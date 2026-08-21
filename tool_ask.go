@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 )
@@ -101,19 +100,6 @@ func (a *agent) askAcknowledgeWithCard(ctx context.Context, sid, title, kind, la
 	return tcId, err
 }
 
-// isApplySkipAsk reports whether an ask_user call is one of /improve's
-// per-change prompts, which is what improveAskCap counts. Matching on the
-// labels is what keeps the final "submit?" prompt exempt.
-func isApplySkipAsk(options []string) bool {
-	for _, o := range options {
-		o = strings.ToLower(o)
-		if strings.Contains(o, "apply") || strings.Contains(o, "skip") {
-			return true
-		}
-	}
-	return false
-}
-
 func init() {
 	RegisterTool(Tool{Def: map[string]any{
 		"type": "function",
@@ -153,16 +139,6 @@ func init() {
 		}
 		// Nothing to pick means a typed answer is the only one possible.
 		allowText := args.AllowText || len(options) == 0
-
-		// /improve fans out one ask per proposed change; hold the flow to the top
-		// improveAskCap in code so a chatty model can't loop through dozens. Only
-		// the Apply/Skip improvement prompts count — the final Yes/No submit
-		// prompt is exempt (different labels).
-		if isApplySkipAsk(options) {
-			if sess := a.getSession(sid); sess != nil && sess.improveAskBlocked() {
-				return fmt.Sprintf("[improve cap: you have already presented the top %d improvements (the maximum). Do NOT call ask_user for more improvements. Apply or skip what is shown, then go straight to the submit and verify steps.]", improveAskCap), false
-			}
-		}
 
 		tcId := a.StartToolCall(ctx, sid, args.Question, "think", nil)
 		answer, err := a.askFormAuto(ctx, sid, tcId, args.Question, options, allowText)

@@ -264,21 +264,23 @@ func (a *agent) prepareChecks(ctx context.Context, sess *Session, sid string) []
 	}
 	slog.Debug("prepareChecks: start", "sid", sid, "cwd", sess.Cwd)
 	a.sendAvailableCommands(ctx, sid) // re-advertise the slash-macro menu each turn
-	llmChanged := a.ensureLLM(ctx, sess, sid)
-	envChanged, envProblems := a.checkEnv(sess, sid)
-	mcpChanged, mcpProblems := a.checkMCP(ctx, sess, sid)
-	// Full capabilities banner: emit it ONCE per session (the first prepare,
-	// at bootstrap, when state is established — so it never fires mid-session).
-	// After that, suppress the re-dump on routine changes — a tool getting
-	// installed, an MCP server starting, a re-probe — those are surfaced as
-	// one-line notices (checkMCP) or fix cards (drainFixes), not by re-printing
-	// the whole setup screen in the middle of an unrelated turn. It stays here
-	// with the checks because it reads the change flags they produce.
-	if !sess.capabilitiesShown && (llmChanged || envChanged || mcpChanged) {
+	a.ensureLLM(ctx, sess, sid)
+	envProblems := a.checkEnv(sess, sid)
+	mcpProblems := a.checkMCP(ctx, sess, sid)
+	// Full capabilities banner: ONCE per session, on the first prepare (which
+	// runs at bootstrap, once state is established). Unconditional: it used to
+	// require that ensureLLM / checkEnv / checkMCP had reported a change, so
+	// the ordinary case — same settings, same tools, same MCP servers as last
+	// time — printed nothing at all and left the user staring at an empty
+	// thread after the gitignore card, with no way to tell setup from a hang.
+	// Every LATER prepare stays silent: a tool getting installed or a server
+	// starting mid-session surfaces as a one-line notice (checkMCP) or a fix
+	// card (drainFixes), not by re-printing the whole setup screen.
+	if !sess.capabilitiesShown {
 		a.notifyCapabilities(ctx, sess, sid)
 		sess.capabilitiesShown = true
 	}
-	slog.Debug("prepareChecks: done", "sid", sid, "hasLLM", a.hasReachableLLM(), "stacks", sess.knownStacks, "envChanged", envChanged, "mcpChanged", mcpChanged, "llmChanged", llmChanged)
+	slog.Debug("prepareChecks: done", "sid", sid, "hasLLM", a.hasReachableLLM(), "stacks", sess.knownStacks)
 	return append(envProblems, mcpProblems...)
 }
 
@@ -316,23 +318,16 @@ const minSlotTokens = 32 * 1024
 // regardless of hash (the user may have changed network or launch settings
 // outside the file).
 //
-// Returns true when something observable changed since the last call
-// (new hash, new reachability, or n_ctx newly discovered) — prepare uses
-// this to decide whether to re-emit the consolidated capabilities banner.
-// Steady-state turns short-circuit and return false.
-//
 // There is no Abort: codehalter cannot function without an LLM. In auto-
 // answer modes (autopilot, subagents) we cap retries at 3 to avoid
 // spinning forever — those callers handle "no LLM" gracefully via
 // connForSession.
-func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
+func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
 	auto, _ := a.shouldAutoAnswer(sid)
 	const autoCap = 3
-	prevHash := sess.llmHash
 	ready := func() bool {
 		return a.hasReachableLLM() && a.mainSlotTokens >= minSlotTokens
 	}
-	prevReady := ready()
 	forceRetry := false
 	for attempt := 0; ; attempt++ {
 		if loaded, err := loadSettings(sess.Cwd); err == nil {
@@ -352,15 +347,20 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 		}
 		currentHash := hashSettingsFiles(sess.Cwd)
 		if !forceRetry && currentHash != "" && currentHash == sess.llmHash && ready() {
-			return false
+			return
 		}
+		// Every configured server gets probed here, each one a network round
+		// trip that a local backend answers only once the model is resident:
+		// the single slowest silent stretch of a session open.
+		stopBeat := a.heartbeat(ctx, sid)
 		a.probeAllLLMs(ctx)
+		stopBeat()
 		sess.llmHash = currentHash
 		if ready() {
-			return sess.llmHash != prevHash || !prevReady
+			return
 		}
 		if auto && attempt >= autoCap-1 {
-			return sess.llmHash != prevHash || prevReady
+			return
 		}
 		var msg string
 		switch {
@@ -387,7 +387,7 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) bool {
 		tcId, err := a.askAcknowledgeWithCard(ctx, sid, msg, "think", "Retry")
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return sess.llmHash != prevHash || prevReady
+			return
 		}
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Retrying LLM probe")})
 		forceRetry = true
@@ -630,13 +630,6 @@ type toolPresence struct {
 
 func onPath(bin string) bool { _, err := exec.LookPath(bin); return err == nil }
 
-func okMissing(present bool) string {
-	if present {
-		return "ok"
-	}
-	return "missing"
-}
-
 // probeToolBins resolves PATH presence once for every runner and formatter
 // binary of the session. envSnapshot, checkEnv, and notifyCapabilities each used
 // to re-run this exec.LookPath loop with the prettier project-local special-case
@@ -657,57 +650,16 @@ func (a *agent) probeToolBins(sess *Session) (runners, formatters []toolPresence
 	return
 }
 
-// envSnapshot builds the canonical string that represents the entire
-// environment as currently observable. Two calls return identical strings
-// iff nothing the user can see in the capabilities banner has changed.
-// Stack and runner-config lists are taken in their detection functions'
-// fixed orders so reordering can't false-positive a diff.
-func (a *agent) envSnapshot(sess *Session) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "container=%s\n", containerKind())
-	if _, err := findFirefox(); err == nil {
-		b.WriteString("firefox=ok\n")
-	} else {
-		b.WriteString("firefox=missing\n")
-	}
-	// run_command availability is fully determined by container= above (it's
-	// registered iff in a container), so it needs no separate snapshot line.
-	runners, formatters := a.probeToolBins(sess)
-	fmt.Fprintf(&b, "stacks=%s\n", strings.Join(sess.knownStacks, ","))
-	fmt.Fprintf(&b, "runners=%s\n", strings.Join(sess.knownRunners, ","))
-	for _, t := range runners {
-		fmt.Fprintf(&b, "runner[%s]=%s\n", t.bin, okMissing(t.present))
-	}
-	// Formatter + code-intelligence presence: so the snapshot flips (and the card
-	// stops being offered) once a missing formatter is installed or the stack's
-	// language server gets wired. Each line uses the same predicate as the card it
-	// tracks, so "snapshot changed" and "card no longer offered" can't disagree.
-	for _, t := range formatters {
-		fmt.Fprintf(&b, "fmt[%s]=%v\n", t.bin, t.present)
-	}
-	if slices.Contains(sess.knownStacks, "go") {
-		fmt.Fprintf(&b, "gopls=%v\n", mcpMentionsServer(sess.Cwd, "gopls"))
-	}
-	if slices.Contains(sess.knownStacks, "ts") || slices.Contains(sess.knownStacks, "js") {
-		fmt.Fprintf(&b, "lsmcp=%v\n", mcpServerConfigured(sess.Cwd, "lsmcp"))
-	}
-	if slices.Contains(sess.knownStacks, "c") {
-		fmt.Fprintf(&b, "clangd=%v\n", mcpServerConfigured(sess.Cwd, "clangd"))
-	}
-	return b.String()
-}
-
 // checkEnv refreshes sess.knownStacks and sess.knownRunners, probes the
 // environment (container, firefox, run_command, runner-config and formatter
-// binaries on PATH), and reports whether anything is different from
-// sess.envSnapshot. All missing binaries are collapsed into ONE fixProblem so
+// binaries on PATH), and reports what is missing. All missing binaries are collapsed into ONE fixProblem so
 // the user sees a single "Install fix? make, just" card instead of one card per
 // tool. Each stack's language server is deliberately NOT in that card: its own
 // code-intelligence card installs and wires it in one turn, and having both own
 // the same binary is what made gopls get asked about twice. Strictly silent —
 // emits no chat output of its own. Bash and devcontainer are filtered out of
 // knownStacks because they're meta-tooling, not stacks.
-func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
+func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 	var stacks []string
 	for _, s := range detectStacks(sess.Cwd) {
 		if s == "bash" || s == "devcontainer" {
@@ -764,10 +716,6 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 		}
 	}
 
-	snap := a.envSnapshot(sess)
-	changed := snap != sess.envSnapshot
-	sess.envSnapshot = snap
-
 	// Build the "gopls (go stack), make (Makefile), …" detail as we find each
 	// missing probe binary — one consolidated fixProblem covers them all.
 	var detail strings.Builder
@@ -822,7 +770,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 		want("set up clangd (C/C++ code intelligence)", cardSetupClangd)
 	}
 	if len(steps) == 0 {
-		return changed, nil
+		return nil
 	}
 	// Embed the OS we already detected so the LLM doesn't waste a tool call
 	// rediscovering it. The bootstrap step (ensureDevcontainer) only scaffolds
@@ -836,7 +784,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 	if distro == "" {
 		distro = "Linux"
 	}
-	return changed, []fixProblem{{
+	return []fixProblem{{
 		desc:   "🟡 Container setup: " + strings.Join(titles, "; "),
 		prompt: fmt.Sprintf(cardSetupHeader, distro) + strings.Join(steps, ""),
 	}}
@@ -846,19 +794,60 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 // checkMCP — mtime-gated reconcile + parse/start fix proposals
 // ---------------------------------------------------------------------------
 
-// checkMCP runs the per-prompt mcp.toml reconcile (mtime-gated inside
-// reconcileMCP) and converts parse_error / failed changes into fixProblem
-// proposals so prepare can offer the user a one-click "fix the file"
-// prompt. Returns changed=true when reconcileMCP reported anything at all
-// (started / stopped / restarted / failed / parse_error) so prepare re-
-// emits the consolidated banner that now reflects the new MCP state.
-func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) (bool, []fixProblem) {
+// checkMCP is the pre-turn half of the reconcile. The turn-end flush
+// (flushMCP) applies whatever the model changed during a turn, so by here there
+// is usually nothing to do: wait out a flush still starting its child, say the
+// notices and collect the cards it parked, and run one mtime-gated reconcile of
+// its own. That
+// last pass is what catches an mcp.toml edited by hand while no turn was
+// running — nothing watches the file, so this stat is how such an edit is seen.
+func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) []fixProblem {
+	// Starting a stdio MCP child (gopls, lsmcp, …) can take seconds before it
+	// answers the handshake, and neither the wait nor reconcile says anything
+	// until it is done.
+	stopBeat := a.heartbeat(ctx, sid)
+	a.mcp.wait()
 	changes := a.reconcileMCP(ctx, sess.Cwd)
-	if len(changes) == 0 {
-		return false, nil
+	stopBeat()
+
+	notes, fixes := a.mcp.takePending()
+	ownNotes, ownFixes := renderMCPChanges(changes)
+	// Benign starts/stops/restarts get a one-line notice, NOT a re-dump of the
+	// whole capabilities banner — that full re-emit on a routine server start
+	// (e.g. gopls coming up the turn after it was added) was pure noise. Said
+	// here, from inside the turn, including the ones a background flush parked.
+	for _, n := range append(notes, ownNotes...) {
+		a.say(ctx, sid, n+"\n")
 	}
-	var problems []fixProblem
-	var notices []string
+	return append(fixes, ownFixes...)
+}
+
+// flushMCP is the turn-end half: apply the mcp.toml the just-finished turn may
+// have written, now that no turn is in flight to have its prompt moved under
+// it. Runs on a background context (the turn's is done, possibly cancelled) via
+// mcpState.schedule, so a slow stdio start happens while the user reads the
+// answer instead of in front of their next prompt. Its notices and cards are
+// parked for the next checkMCP rather than said here, since nothing it emits
+// belongs to a turn.
+func (a *agent) flushMCP(sid string) {
+	sess := a.getSession(sid)
+	if sess == nil {
+		return
+	}
+	notes, fixes := renderMCPChanges(a.reconcileMCP(context.Background(), sess.Cwd))
+	if len(notes) == 0 && len(fixes) == 0 {
+		return
+	}
+	a.mcp.flushMu.Lock()
+	a.mcp.flushNotes = append(a.mcp.flushNotes, notes...)
+	a.mcp.flushFixes = append(a.mcp.flushFixes, fixes...)
+	a.mcp.flushMu.Unlock()
+}
+
+// renderMCPChanges splits a reconcile's changes into one-line notices and
+// fixProblem proposals (from which prepare offers a one-click "fix the file"
+// prompt). Pure, so the caller decides when the notices are safe to say.
+func renderMCPChanges(changes []mcpChange) (notices []string, problems []fixProblem) {
 	for _, ch := range changes {
 		switch ch.action {
 		case "parse_error":
@@ -871,23 +860,18 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) (bool, 
 				desc:   fmt.Sprintf("🟡 MCP server %q failed to start: %s", ch.name, ch.err),
 				prompt: fmt.Sprintf(cardMCPStartError, ch.name, ch.err),
 			})
-		case "started":
-			notices = append(notices, fmt.Sprintf("✅ MCP server %q started", ch.name))
-		case "restarted":
-			notices = append(notices, fmt.Sprintf("✅ MCP server %q restarted", ch.name))
+		case "started", "restarted":
+			// Name the tool count and the one-off cost: those tools join the
+			// `tools` array, which the chat template renders ahead of the whole
+			// conversation, so the next call re-reads the context once. Without
+			// this line that shows up as an unexplained slow turn.
+			notices = append(notices, fmt.Sprintf("✅ MCP server %q %s (%d tools). This turn re-reads its context once to pick them up.",
+				ch.name, ch.action, ch.tools))
 		case "stopped":
 			notices = append(notices, fmt.Sprintf("MCP server %q stopped", ch.name))
 		}
 	}
-	// Benign starts/stops/restarts get a one-line notice, NOT a re-dump of the
-	// whole capabilities banner — that full re-emit on a routine server start
-	// (e.g. gopls coming up the turn after it was added) was pure noise. Only
-	// an actionable problem (failed / parse_error) forces the consolidated
-	// banner, via the changed=true return below.
-	for _, n := range notices {
-		a.say(ctx, sid, n+"\n")
-	}
-	return len(problems) > 0, problems
+	return notices, problems
 }
 
 // ---------------------------------------------------------------------------
@@ -898,9 +882,8 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) (bool, 
 // the user needs to see at the top of a turn: settings.toml path, LLM
 // status, project tooling (runners), detected stacks, container, firefox,
 // run_command, MCP servers, and per-stack dev-tool probes (✅ found / 🟡
-// missing). Called by prepare only when one of ensureLLM / checkEnv /
-// checkMCP reported a change since the last turn. Steady-state turns
-// emit nothing.
+// missing). Called by prepare exactly once per session, on the first
+// prepare; later turns emit nothing.
 func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid string) {
 	var b strings.Builder
 
