@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"maps"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -50,6 +52,10 @@ type mcpRequest struct {
 	ID      int64  `json:"id"`
 	Method  string `json:"method"`
 	Params  any    `json:"params,omitempty"`
+	// headers are the modern spec's HTTP header mirrors for this request
+	// (MCP-Protocol-Version, Mcp-Method, Mcp-Name, Mcp-Param-*). Unexported,
+	// so they never appear in the JSON body; stdio ignores them.
+	headers map[string]string
 }
 
 type mcpNotification struct {
@@ -68,6 +74,65 @@ type mcpResponse struct {
 		Message string          `json:"message"`
 		Data    json.RawMessage `json:"data,omitempty"`
 	} `json:"error,omitempty"`
+}
+
+// mcpRPCError is a JSON-RPC error from the server, surfaced as a typed error
+// so era detection can branch on the code (see isModernRPCError).
+type mcpRPCError struct {
+	Code    int
+	Message string
+	Data    json.RawMessage
+}
+
+func (e *mcpRPCError) Error() string { return fmt.Sprintf("mcp error %d: %s", e.Code, e.Message) }
+
+const (
+	// mcpModernVersion is the stateless, per-request-metadata revision
+	// ("MCP 2"): no initialize handshake, no sessions, _meta on every request.
+	mcpModernVersion = "2026-07-28"
+	// mcpLegacyVersion is the initialize-handshake revision spoken as the
+	// fallback for the servers that dominate the wild today.
+	mcpLegacyVersion = "2025-06-18"
+
+	// Error codes only a modern server emits (the spec's reserved range).
+	mcpErrHeaderMismatch     = -32020
+	mcpErrMissingCapability  = -32021
+	mcpErrUnsupportedVersion = -32022
+)
+
+// legacyEraVersions are the initialize-based revisions. A modern server that
+// rejects our probe but lists one of these as supported is dual-era — fall
+// back to the handshake instead of failing.
+var legacyEraVersions = []string{"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
+
+// mcpProbeTimeout bounds the server/discover era probe. Legacy SDK servers
+// answer unknown methods with -32601 near-instantly; the timeout is for the
+// rare one that ignores pre-initialize traffic. A var so tests can shrink it.
+var mcpProbeTimeout = 5 * time.Second
+
+// isModernRPCError reports whether err is a JSON-RPC error only a modern
+// (2026-07-28+) server emits. Per the spec's backward-compatibility rule,
+// seeing one during the era probe identifies a modern server — the client
+// must NOT fall back to the legacy handshake on it.
+func isModernRPCError(err error) bool {
+	var rpc *mcpRPCError
+	if !errors.As(err, &rpc) {
+		return false
+	}
+	return rpc.Code == mcpErrHeaderMismatch || rpc.Code == mcpErrMissingCapability || rpc.Code == mcpErrUnsupportedVersion
+}
+
+// modernMeta is the _meta block every modern-era request carries: protocol
+// version (mirrored into the MCP-Protocol-Version header on HTTP), client
+// identity, and capabilities. Capabilities stay empty on purpose — codehalter
+// doesn't service sampling/elicitation/roots, so servers must not solicit
+// MRTR input from us.
+func modernMeta() map[string]any {
+	return map[string]any{
+		"io.modelcontextprotocol/protocolVersion":    mcpModernVersion,
+		"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "codehalter", "version": "0.1.0"},
+		"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +161,15 @@ type MCPClient struct {
 	name      string
 	transport mcpTransport
 	nextID    atomic.Int64
+	// modern is true when the server speaks the stateless 2026-07-28 revision:
+	// no handshake, per-request _meta, mirrored headers on HTTP. Decided once
+	// by the era probe in StartMCPClient, before the client is published, and
+	// cached for the client's lifetime (the era is a property of the server).
+	modern bool
+	// initialized is set after a successful legacy handshake. It gates the
+	// MCP-Protocol-Version header, which legacy servers expect only on
+	// post-initialize requests.
+	initialized bool
 	// tools is what this server advertised at tools/list, retained so codehalter
 	// can call one of them on its own initiative rather than only when the model
 	// asks — see postWriteDiagnostics, which needs both the tool's name and its
@@ -140,14 +214,61 @@ func StartMCPClient(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPC
 		return nil, fmt.Errorf("mcp config %q has neither command nor url", cfg.Name)
 	}
 
-	c := &MCPClient{name: cfg.Name, transport: t}
-	// MCP handshake: send `initialize`, then the `notifications/initialized`
-	// notification. After both succeed the server accepts tools/list and tools/call.
-	_, err := c.send(ctx, "initialize", map[string]any{
-		"protocolVersion": "2025-06-18",
+	c := &MCPClient{name: cfg.Name, transport: t, modern: true}
+	if err := c.detectEra(ctx); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("initialize %s: %w", cfg.Name, err)
+	}
+	proto := mcpModernVersion
+	if !c.modern {
+		proto = mcpLegacyVersion
+	}
+	slog.Info("mcp ready", "name", cfg.Name, "protocol", proto)
+	return c, nil
+}
+
+// detectEra decides whether the server speaks the stateless 2026-07-28
+// revision or needs the legacy initialize handshake, and completes whichever
+// bring-up applies. Probe-first, per the spec's backward-compatibility rules:
+// server/discover is sent as a modern request; a DiscoverResult (or a
+// recognized modern error) identifies a modern server, while anything else —
+// -32601 from a legacy SDK, a bare HTTP 400 for a missing session, a probe
+// timeout — identifies a legacy one and we fall back to `initialize` +
+// `notifications/initialized`.
+func (c *MCPClient) detectEra(ctx context.Context) error {
+	probeCtx, cancel := context.WithTimeout(ctx, mcpProbeTimeout)
+	raw, err := c.send(probeCtx, "server/discover", nil, nil)
+	cancel()
+	switch {
+	case err == nil:
+		var disc struct {
+			SupportedVersions []string `json:"supportedVersions"`
+		}
+		if jerr := json.Unmarshal(raw, &disc); jerr == nil && slices.Contains(disc.SupportedVersions, mcpModernVersion) {
+			return nil // modern confirmed — stateless, no handshake
+		}
+		// A DiscoverResult without our modern version: a dual-era server on
+		// some other revision. Negotiate the legacy path below.
+	case isModernRPCError(err):
+		// Definitely a modern server — falling back on these errors would
+		// violate the spec. If it lists a legacy revision as supported it is
+		// dual-era and the handshake works; otherwise no common version.
+		var rpc *mcpRPCError
+		errors.As(err, &rpc)
+		if rpc.Code != mcpErrUnsupportedVersion || !supportsLegacyEra(rpc.Data) {
+			return fmt.Errorf("no protocol version in common (client speaks %s and %s): %w", mcpModernVersion, mcpLegacyVersion, err)
+		}
+	default:
+		// Legacy server — or a broken one, in which case the handshake below
+		// fails with the real reason (e.g. the child's captured stderr).
+	}
+
+	c.modern = false
+	_, err = c.send(ctx, "initialize", map[string]any{
+		"protocolVersion": mcpLegacyVersion,
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "codehalter", "version": "0.1.0"},
-	})
+	}, nil)
 	if err == nil {
 		err = c.transport.notify(ctx, mcpNotification{
 			JSONRPC: "2.0",
@@ -156,21 +277,59 @@ func StartMCPClient(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPC
 		})
 	}
 	if err != nil {
-		c.Close()
-		return nil, fmt.Errorf("initialize %s: %w", cfg.Name, err)
+		return err
 	}
-	slog.Info("mcp ready", "name", cfg.Name)
-	return c, nil
+	c.initialized = true
+	return nil
 }
 
-func (c *MCPClient) send(ctx context.Context, method string, params any) (json.RawMessage, error) {
-	id := c.nextID.Add(1)
-	resp, err := c.transport.send(ctx, mcpRequest{JSONRPC: "2.0", ID: id, Method: method, Params: params})
+// supportsLegacyEra reports whether an UnsupportedProtocolVersionError's data
+// lists an initialize-based revision, i.e. the server is dual-era.
+func supportsLegacyEra(data json.RawMessage) bool {
+	var d struct {
+		Supported []string `json:"supported"`
+	}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return false
+	}
+	return slices.ContainsFunc(d.Supported, func(v string) bool {
+		return slices.Contains(legacyEraVersions, v)
+	})
+}
+
+// send issues one request. extraHeaders carries per-call Mcp-Param-* mirrors
+// (see headerParamValues); nil for everything else.
+func (c *MCPClient) send(ctx context.Context, method string, params map[string]any, extraHeaders map[string]string) (json.RawMessage, error) {
+	req := mcpRequest{JSONRPC: "2.0", ID: c.nextID.Add(1), Method: method}
+	headers := map[string]string{}
+	if c.modern {
+		// Every modern request self-describes: version and identity ride in
+		// _meta (and, on HTTP, mirrored headers) instead of a session.
+		p := make(map[string]any, len(params)+1)
+		maps.Copy(p, params)
+		p["_meta"] = modernMeta()
+		params = p
+		headers["MCP-Protocol-Version"] = mcpModernVersion
+		headers["Mcp-Method"] = method
+		if method == "tools/call" {
+			if name, ok := params["name"].(string); ok {
+				headers["Mcp-Name"] = encodeMCPHeaderValue(name)
+			}
+		}
+		maps.Copy(headers, extraHeaders)
+	} else if c.initialized {
+		headers["MCP-Protocol-Version"] = mcpLegacyVersion
+	}
+	if params != nil {
+		req.Params = params
+	}
+	req.headers = headers
+	resp, err := c.transport.send(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 	if resp.Error != nil {
-		return nil, fmt.Errorf("mcp error %d: %s", resp.Error.Code, resp.Error.Message)
+		return nil, &mcpRPCError{Code: resp.Error.Code, Message: resp.Error.Message, Data: resp.Error.Data}
 	}
 	return resp.Result, nil
 }
@@ -399,12 +558,13 @@ func (t *stdioTransport) close() {
 // httpTransport — MCP Streamable HTTP (spec 2025-06-18)
 // ---------------------------------------------------------------------------
 
-// httpTransport speaks MCP over HTTP per the 2025-06-18 spec. Each request
-// is a POST whose body is the JSON-RPC envelope; the server replies with
-// either a single JSON object or an SSE stream. The first server response
-// carries the Mcp-Session-Id header (if the server is session-aware), and
-// every subsequent request must echo it. close DELETEs the URL to release
-// the server-side session before returning.
+// httpTransport speaks MCP Streamable HTTP across both eras. Each request is
+// a POST whose body is the JSON-RPC envelope; the server replies with either
+// a single JSON object or an SSE stream. Era-specific behavior lives in the
+// request the client hands us (modern _meta + mirrored headers vs legacy
+// bare envelopes); the session-id plumbing below is legacy-only in practice —
+// a modern server never mints one, so sessionId stays empty, no session id
+// is echoed, and close's DELETE is skipped.
 type httpTransport struct {
 	name      string
 	url       string
@@ -419,7 +579,7 @@ func (t *httpTransport) send(ctx context.Context, req mcpRequest) (mcpResponse, 
 	if err != nil {
 		return mcpResponse{}, err
 	}
-	return t.do(ctx, body)
+	return t.do(ctx, body, req.headers)
 }
 
 func (t *httpTransport) notify(ctx context.Context, n mcpNotification) error {
@@ -431,13 +591,13 @@ func (t *httpTransport) notify(ctx context.Context, n mcpNotification) error {
 	// notifications. We still issue the round trip so the session id flows
 	// through; an empty/202 response decodes to a zero mcpResponse, which
 	// we just discard.
-	_, err = t.do(ctx, body)
+	_, err = t.do(ctx, body, nil)
 	return err
 }
 
 // do issues one HTTP request and decodes the response. Handles both JSON
 // and SSE response bodies and captures any Mcp-Session-Id the server emits.
-func (t *httpTransport) do(ctx context.Context, body []byte) (mcpResponse, error) {
+func (t *httpTransport) do(ctx context.Context, body []byte, headers map[string]string) (mcpResponse, error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, bytes.NewReader(body))
 	if err != nil {
 		return mcpResponse{}, err
@@ -445,6 +605,11 @@ func (t *httpTransport) do(ctx context.Context, body []byte) (mcpResponse, error
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json, text/event-stream")
 	for k, v := range t.headers {
+		httpReq.Header.Set(k, v)
+	}
+	// Per-request mirrors (modern era) go last so they can't be shadowed by a
+	// stale user-configured header of the same name.
+	for k, v := range headers {
 		httpReq.Header.Set(k, v)
 	}
 	t.sessionMu.Lock()
@@ -470,6 +635,14 @@ func (t *httpTransport) do(ctx context.Context, body []byte) (mcpResponse, error
 	}
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		buf, _ := io.ReadAll(io.LimitReader(httpResp.Body, 2048))
+		// Modern servers put JSON-RPC errors (UnsupportedProtocolVersion,
+		// HeaderMismatch, method-not-found) in 4xx bodies. Surface those as
+		// envelopes so the era probe can tell "a modern server said no" from
+		// "a legacy server didn't understand the request".
+		var resp mcpResponse
+		if jerr := json.Unmarshal(buf, &resp); jerr == nil && resp.Error != nil {
+			return resp, nil
+		}
 		return mcpResponse{}, fmt.Errorf("mcp http %d: %s", httpResp.StatusCode, string(buf))
 	}
 
@@ -563,6 +736,10 @@ type mcpTool struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	InputSchema map[string]any `json:"inputSchema"`
+	// headerParams are the schema's x-mcp-header annotations (modern HTTP
+	// only), precomputed by vetTools so each tools/call can mirror the
+	// designated arguments into Mcp-Param-* headers.
+	headerParams []mcpHeaderParam
 }
 
 // listTools enumerates every tool the server exposes. Some servers paginate
@@ -575,7 +752,7 @@ func (c *MCPClient) listTools(ctx context.Context) ([]mcpTool, error) {
 		if cursor != "" {
 			params["cursor"] = cursor
 		}
-		raw, err := c.send(ctx, "tools/list", params)
+		raw, err := c.send(ctx, "tools/list", params, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -606,15 +783,28 @@ func (c *MCPClient) callTool(ctx context.Context, name string, args json.RawMess
 			argsField = parsed
 		}
 	}
+	// x-mcp-header mirrors: a modern HTTP server may designate arguments to be
+	// repeated as Mcp-Param-* headers. vetTools precomputed the paths; nil
+	// everywhere else (stdio, legacy, unannotated tools).
+	var extra map[string]string
+	if argMap, ok := argsField.(map[string]any); ok {
+		for _, tl := range c.tools {
+			if tl.Name == name {
+				extra = headerParamValues(tl.headerParams, argMap)
+				break
+			}
+		}
+	}
 	raw, err := c.send(ctx, "tools/call", map[string]any{
 		"name":      name,
 		"arguments": argsField,
-	})
+	}, extra)
 	if err != nil {
 		return "", false, err
 	}
 	var result struct {
-		Content []struct {
+		ResultType string `json:"resultType,omitempty"`
+		Content    []struct {
 			Type string `json:"type"`
 			Text string `json:"text,omitempty"`
 		} `json:"content"`
@@ -622,6 +812,14 @@ func (c *MCPClient) callTool(ctx context.Context, name string, args json.RawMess
 	}
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return "", false, fmt.Errorf("tools/call decode: %w", err)
+	}
+	// MRTR (modern era): a server needing client-side input returns an interim
+	// "input_required" result instead of a final one. We advertise no client
+	// capabilities so this shouldn't happen; if it does, fail loudly rather
+	// than hand the LLM an interim result as the tool's output. A missing
+	// resultType means "complete" per spec (and covers every legacy server).
+	if result.ResultType == "input_required" {
+		return "", false, fmt.Errorf("tool %q requires interactive client input (MRTR), which codehalter does not support", name)
 	}
 	var b strings.Builder
 	for _, block := range result.Content {
@@ -682,6 +880,211 @@ func registerMCPTools(c *MCPClient, tools []mcpTool) {
 		})
 	}
 	slog.Info("mcp tools registered", "server", c.name, "count", len(tools))
+}
+
+// ---------------------------------------------------------------------------
+// x-mcp-header (Mcp-Param-*) mirrors — modern Streamable HTTP only
+// ---------------------------------------------------------------------------
+
+// mcpHeaderParam is one x-mcp-header annotation: mirror the argument at path
+// into the Mcp-Param-<header> HTTP header on each tools/call.
+type mcpHeaderParam struct {
+	header string   // name portion of Mcp-Param-{name}
+	path   []string // properties chain from the schema root to the argument
+	typ    string   // "string" | "integer" | "boolean"
+}
+
+// vetTools enforces the client side of the x-mcp-header contract on modern
+// HTTP transports: tools whose annotations violate the spec's constraints are
+// excluded (with a warning) so one malformed definition doesn't block the
+// rest; valid annotations are precomputed onto the tool. stdio and legacy
+// servers pass through untouched — the extension is defined for the modern
+// HTTP transport only.
+func (c *MCPClient) vetTools(tools []mcpTool) []mcpTool {
+	if _, isHTTP := c.transport.(*httpTransport); !isHTTP || !c.modern {
+		return tools
+	}
+	kept := make([]mcpTool, 0, len(tools))
+	for _, tl := range tools {
+		hp, err := collectHeaderParams(tl.InputSchema)
+		if err != nil {
+			slog.Warn("mcp: rejecting tool with invalid x-mcp-header annotation", "server", c.name, "tool", tl.Name, "err", err)
+			continue
+		}
+		tl.headerParams = hp
+		kept = append(kept, tl)
+	}
+	return kept
+}
+
+// collectHeaderParams walks a tool's inputSchema for x-mcp-header annotations
+// and validates the spec's constraints: header-token names, primitive types
+// (number excluded), case-insensitive uniqueness, and static reachability —
+// the annotated property must be reachable from the root through `properties`
+// keys only. An annotation anywhere else (inside items, oneOf/anyOf/allOf,
+// not, if/then/else, $defs, …) invalidates the whole tool definition.
+func collectHeaderParams(schema map[string]any) ([]mcpHeaderParam, error) {
+	if schema == nil {
+		return nil, nil
+	}
+	var out []mcpHeaderParam
+	seen := map[string]bool{} // lowercased header names, for the uniqueness rule
+	var walk func(node map[string]any, path []string) error
+	walk = func(node map[string]any, path []string) error {
+		if hv, ok := node["x-mcp-header"]; ok {
+			name, ok := hv.(string)
+			if !ok || !headerToken(name) {
+				return fmt.Errorf("x-mcp-header %v at %q: not a valid header token", hv, strings.Join(path, "."))
+			}
+			if len(path) == 0 {
+				return fmt.Errorf("x-mcp-header %q on the schema root, not a parameter", name)
+			}
+			typ, _ := node["type"].(string)
+			if typ != "string" && typ != "integer" && typ != "boolean" {
+				return fmt.Errorf("x-mcp-header %q at %q: type %q not allowed (string/integer/boolean only)", name, strings.Join(path, "."), typ)
+			}
+			if lower := strings.ToLower(name); seen[lower] {
+				return fmt.Errorf("x-mcp-header %q: duplicate (case-insensitive)", name)
+			} else { //nolint:revive // symmetric with the check above
+				seen[lower] = true
+			}
+			out = append(out, mcpHeaderParam{header: name, path: slices.Clone(path), typ: typ})
+		}
+		for k, v := range node {
+			if k == "x-mcp-header" {
+				continue
+			}
+			if k == "properties" {
+				props, ok := v.(map[string]any)
+				if !ok {
+					continue
+				}
+				for pname, pv := range props {
+					if sub, ok := pv.(map[string]any); ok {
+						if err := walk(sub, append(path, pname)); err != nil {
+							return err
+						}
+					}
+				}
+				continue
+			}
+			// Every other keyword (items, composition, conditionals, $defs,
+			// plain values) is off the reachable chain — an annotation inside
+			// it poisons the tool.
+			if err := noHeaderAnnotations(v); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if err := walk(schema, nil); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// noHeaderAnnotations errors if any map nested under v carries an
+// x-mcp-header annotation. Only string values count — a *property* merely
+// named "x-mcp-header" maps to a schema object, not a string.
+func noHeaderAnnotations(v any) error {
+	switch n := v.(type) {
+	case map[string]any:
+		if s, ok := n["x-mcp-header"].(string); ok {
+			return fmt.Errorf("x-mcp-header %q is not reachable via properties keys only", s)
+		}
+		for _, sub := range n {
+			if err := noHeaderAnnotations(sub); err != nil {
+				return err
+			}
+		}
+	case []any:
+		for _, sub := range n {
+			if err := noHeaderAnnotations(sub); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// headerToken reports whether s is a valid HTTP field-name token
+// (RFC 9110 tchar).
+func headerToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		ok := r == '!' || r == '#' || r == '$' || r == '%' || r == '&' || r == '\'' ||
+			r == '*' || r == '+' || r == '-' || r == '.' || r == '^' || r == '_' ||
+			r == '`' || r == '|' || r == '~' ||
+			(r >= '0' && r <= '9') || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// headerParamValues extracts the annotated argument values for one call.
+// Absent, null, or type-mismatched values omit the header, per spec.
+func headerParamValues(params []mcpHeaderParam, args map[string]any) map[string]string {
+	if len(params) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for _, p := range params {
+		node := any(args)
+		for _, step := range p.path {
+			m, ok := node.(map[string]any)
+			if !ok {
+				node = nil
+				break
+			}
+			node = m[step]
+		}
+		var val string
+		switch v := node.(type) {
+		case string:
+			if p.typ != "string" {
+				continue
+			}
+			val = v
+		case bool:
+			if p.typ != "boolean" {
+				continue
+			}
+			val = strconv.FormatBool(v)
+		case float64: // encoding/json's number type; integers only per the schema rule
+			if p.typ != "integer" || v != math.Trunc(v) {
+				continue
+			}
+			val = strconv.FormatInt(int64(v), 10)
+		default:
+			continue
+		}
+		out["Mcp-Param-"+p.header] = encodeMCPHeaderValue(val)
+	}
+	return out
+}
+
+// encodeMCPHeaderValue renders v as an HTTP header value, applying the spec's
+// Base64 sentinel (=?base64?…?=) when v isn't plain printable ASCII, has
+// leading/trailing whitespace, or itself matches the sentinel pattern.
+func encodeMCPHeaderValue(v string) string {
+	safe := v == strings.TrimSpace(v) &&
+		!(strings.HasPrefix(v, "=?base64?") && strings.HasSuffix(v, "?="))
+	if safe {
+		for _, r := range v {
+			if r != ' ' && r != '\t' && (r < 0x21 || r > 0x7e) {
+				safe = false
+				break
+			}
+		}
+	}
+	if safe {
+		return v
+	}
+	return "=?base64?" + base64.StdEncoding.EncodeToString([]byte(v)) + "?="
 }
 
 // ---------------------------------------------------------------------------
@@ -1134,6 +1537,9 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 			changes = append(changes, mcpChange{action: "failed", name: name, err: fmt.Errorf("tools/list: %w", err)})
 			continue
 		}
+		// Enforce the modern-HTTP x-mcp-header contract (and precompute the
+		// Mcp-Param-* mirrors) before the list is retained or registered.
+		tools = newClient.vetTools(tools)
 
 		// Retain the advertised tool list on the client before publishing it, so
 		// agent-initiated calls (postWriteDiagnostics) can look up a tool's schema
