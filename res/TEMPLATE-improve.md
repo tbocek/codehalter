@@ -74,17 +74,13 @@ Editable files are the prompts under .codehalter/: PLAN.md, EXECUTE.md,
 DOCUMENT.md, SUMMARISE.md, and the SKILL-*.md files — read with read_file ONLY
 the ones your evidence points at. Two hard rules for SKILL edits:
 
-- **Read the copy the main model actually loads.** When llm[0] has a skill
-  variant configured, the turn carries an `[ACTIVE SKILL VARIANT: …]` note
-  mapping each SKILL name to its resolved path (usually
-  `.codehalter/skills/<variant>/SKILL-<x>.md`) — read THAT file, and quote
-  `original` text from it byte-exactly; submit_improvement applies each SKILL
-  edit to the same resolved path. No note = no variant = the generic
-  `.codehalter/SKILL-<x>.md` is the loaded copy. In `file` you always pass the
-  bare filename; codehalter resolves the path.
+- **Quote `original` byte-exactly.** There is one skill set:
+  `.codehalter/SKILL-<x>.md` is the file the main model loads and the file
+  submit_improvement edits. Read it and copy the text verbatim — an inexact
+  `original` fails to apply. In `file` you pass the bare filename.
 - **One behavior per bullet, self-contained.** Statements are probed in
-  isolation (your probe_statement calls now, the offline skill crafter later),
-  so a proposed statement must stand alone: name the tool/language, no pronouns
+  isolation by your probe_statement calls, so a proposed statement must stand
+  alone: name the tool/language, no pronouns
   referring to neighbors, no two behaviors glued with "and". Compound
   statements can't be probed atomically and weaken the measurement.
 
@@ -109,7 +105,7 @@ automatically; the new skill is in the system prompt from the next turn on.
 
 Write it in the same shape as the existing skills — read one first. A `#` title
 line, then `##` sections, then short imperative bullets, ONE behavior per
-bullet (the crafter probes each statement separately, exactly as above). Every
+bullet (probe_statement tests each statement separately, exactly as above). Every
 line must be something the agent should DO or NOT DO, grounded in what went
 wrong: no tutorials, no history of the language, no "Python is a dynamically
 typed language". If you cannot fill it with concrete behavior, do not create it.
@@ -128,8 +124,8 @@ skill and returns every answer verbatim for you to judge. Use it for:
 
 Rules:
 
-- Copy `statement` byte-exactly from the RESOLVED skill file (the variant note's
-  path when present), or a removal probe can't find it.
+- Copy `statement` byte-exactly from `.codehalter/SKILL-<x>.md`, or a removal
+  probe can't find it.
 - Author `question` as a small concrete task that makes the statement's behavior
   observable in plain text WITHOUT naming or hinting at the statement — the
   probe offers no tools, so pick behavior expressible in an answer.
@@ -175,9 +171,8 @@ array of your top changes (max 3), each object:
 - `original` — the EXACT current text to match (for `replace`/`remove`); for
   `add`, the anchor text to insert after, or empty to append at the end; unused
   for `create`. **Byte-exact or the apply fails**: the applier does a literal
-  string match, so re-read the target file (the variant-RESOLVED path for SKILL
-  files, per the variant note) right before submitting and copy the excerpt
-  verbatim — same whitespace, same line breaks, no "..." elisions, no
+  string match, so re-read the target file right before submitting and copy the
+  excerpt verbatim — same whitespace, same line breaks, no "..." elisions, no
   re-wrapping
 - `new` — the added or replacement text (empty for `remove`; for `create`, the
   complete body of the new skill file)

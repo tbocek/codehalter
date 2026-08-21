@@ -23,7 +23,7 @@
 - Run tests via project task runner (just, make), NOT raw `go test`.
 
 ## Build ≠ test
-`go build` / `just:build` proves COMPILES only. Wrong `json.Unmarshal` target (array into struct), nil deref, off-by-one: compile fine, fail at RUNTIME → green build on broken code. Wrote/changed code parsing or serialising external input (tool handler, API payload, config)? → write `*_test.go` round-tripping a REAL example of the documented format, success AND error path, run `just:test`, make it pass. NOT just `just:build`.
+`go build` / `just:build` proves COMPILES only. `json.Unmarshal`/`json.Decoder` decode by reflection → wrong target (array into struct), a typo in a `json:"..."` tag (field silently stays zero), a missing key (stays zero, no error), a JSON number into a string field, plus nil deref and off-by-one: all compile fine, all fail at RUNTIME → green build on broken code. Wrote/changed code parsing or serialising external input (tool handler, API payload, config)? → write `*_test.go` round-tripping a REAL example of the documented format, success AND error path, run `just:test`, make it pass. NOT just `just:build`.
 
 ## Probe toolchain once
 - `go version`, `go env`, `which go` = session-invariant. Answered once → NO re-run with different cwd/redirect/wrapper (`cd X && go version`, `go version 2>&1`); output won't change.

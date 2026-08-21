@@ -65,6 +65,31 @@ func TestEnsureSkillsPrunesOtherOS(t *testing.T) {
 	}
 }
 
+// TestEnsureSkillsPrunesVariantDir: projects seeded by an older codehalter
+// still carry .codehalter/skills/<variant>/ from the per-model skill split.
+// Nothing loads it now (skillFiles globs the top level only), so ensureSkills
+// clears it rather than leaving dead prompt copies in the tree.
+func TestEnsureSkillsPrunesVariantDir(t *testing.T) {
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".codehalter")
+	vdir := filepath.Join(dir, "skills", "gemma-4-31b")
+	if err := os.MkdirAll(vdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vdir, "SKILL-base.md"), []byte("pruned variant"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureSkills(cwd, nil, osInfo{}); err != nil {
+		t.Fatalf("ensureSkills err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "skills")); !os.IsNotExist(err) {
+		t.Errorf(".codehalter/skills should have been removed, stat err = %v", err)
+	}
+	if readSkill(t, dir, "SKILL-base.md") == "" {
+		t.Errorf("the generic skill set must still seed after the prune")
+	}
+}
+
 // TestArgTokens: string values inside JSON args split on whitespace and shed
 // shell punctuation, so paths surface from both structured fields and
 // run_command strings; non-JSON input degrades to a raw split. Exercises the
@@ -214,11 +239,11 @@ func TestLoadSkillsSkip(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	all := loadSkills(cwd, "", nil)
+	all := loadSkills(cwd, nil)
 	if !strings.Contains(all, "base body") || !strings.Contains(all, "go body") {
 		t.Fatalf("nil skip should load everything, got %q", all)
 	}
-	filtered := loadSkills(cwd, "", func(name string) bool { return name == "SKILL-go.md" })
+	filtered := loadSkills(cwd, func(name string) bool { return name == "SKILL-go.md" })
 	if strings.Contains(filtered, "go body") {
 		t.Errorf("SKILL-go.md should have been skipped, got %q", filtered)
 	}
@@ -273,72 +298,10 @@ func TestSkillCmdExpandsAtLoad(t *testing.T) {
 	if !strings.Contains(string(raw), "{{cmd:echo Alpine Test}}") {
 		t.Errorf("seeded file should keep the placeholder verbatim:\n%s", raw)
 	}
-	if body := readSkillBody(dir, "", "SKILL-alpine.md"); !strings.Contains(body, "Base: Alpine Test, apk-tools 9.9.") {
+	if body := readSkillBody(dir, "SKILL-alpine.md"); !strings.Contains(body, "Base: Alpine Test, apk-tools 9.9.") {
 		t.Errorf("readSkillBody should expand:\n%s", body)
 	}
-	if all := loadSkills(dir, "", nil); !strings.Contains(all, "Base: Alpine Test, apk-tools 9.9.") {
+	if all := loadSkills(dir, nil); !strings.Contains(all, "Base: Alpine Test, apk-tools 9.9.") {
 		t.Errorf("loadSkills should expand:\n%s", all)
-	}
-}
-
-// TestSkillVariants: every shipped variant seeds wholesale (the user may
-// switch models), loading prefers the active variant's file per skill and
-// falls back to the generic copy, and "" loads generic only.
-func TestSkillVariants(t *testing.T) {
-	cwd := t.TempDir()
-	dir := filepath.Join(cwd, ".codehalter")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := ensureSkills(cwd, []string{"go"}, osInfo{}); err != nil {
-		t.Fatal(err)
-	}
-	// All shipped variants are on disk, not just one.
-	for _, v := range []string{"gemma-4-31b", "qwen3.6-27b"} {
-		if readSkill(t, dir, filepath.Join("skills", v, "SKILL-base.md")) == "" {
-			t.Fatalf("variant %s not seeded", v)
-		}
-	}
-
-	// Make bodies distinguishable: overwrite the seeded copies.
-	if err := os.WriteFile(filepath.Join(dir, "SKILL-base.md"), []byte("GENERIC-BASE"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "skills", "gemma-4-31b", "SKILL-base.md"), []byte("GEMMA-BASE"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// The variant dir deliberately has NO SKILL-go.md → per-file fallback.
-	if err := os.Remove(filepath.Join(dir, "skills", "gemma-4-31b", "SKILL-go.md")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "SKILL-go.md"), []byte("GENERIC-GO"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	got := loadSkills(cwd, "gemma-4-31b", nil)
-	if !strings.Contains(got, "GEMMA-BASE") || strings.Contains(got, "GENERIC-BASE") {
-		t.Fatalf("variant body not preferred: %q", got)
-	}
-	if !strings.Contains(got, "GENERIC-GO") {
-		t.Fatalf("missing per-file fallback to generic: %q", got)
-	}
-	if got := loadSkills(cwd, "", nil); !strings.Contains(got, "GENERIC-BASE") || strings.Contains(got, "GEMMA-BASE") {
-		t.Fatalf("empty variant must load generic only: %q", got)
-	}
-	// Unknown variant → everything falls back to generic.
-	if got := loadSkills(cwd, "no-such-model", nil); !strings.Contains(got, "GENERIC-BASE") {
-		t.Fatalf("unknown variant must fall back: %q", got)
-	}
-	// readSkillBody resolves the same way.
-	if b := readSkillBody(cwd, "gemma-4-31b", "SKILL-base.md"); b != "GEMMA-BASE" {
-		t.Fatalf("readSkillBody variant = %q", b)
-	}
-	// The load SET stays generic-dir-driven: a skill present ONLY in a variant
-	// dir does not load.
-	if err := os.WriteFile(filepath.Join(dir, "skills", "gemma-4-31b", "SKILL-rust.md"), []byte("VARIANT-ONLY"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if got := loadSkills(cwd, "gemma-4-31b", nil); strings.Contains(got, "VARIANT-ONLY") {
-		t.Fatalf("variant-only skill must not join the set: %q", got)
 	}
 }

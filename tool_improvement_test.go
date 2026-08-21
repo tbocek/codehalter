@@ -35,7 +35,7 @@ func TestApplyImprovement(t *testing.T) {
 	read := func() string { b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); return string(b) }
 
 	write("alpha OLD omega")
-	if err := applyImprovement(dir, "", improvementEntry{File: "PLAN.md", Type: "replace", Original: "OLD", New: "NEW"}); err != nil {
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "replace", Original: "OLD", New: "NEW"}); err != nil {
 		t.Fatalf("replace: %v", err)
 	}
 	if read() != "alpha NEW omega" {
@@ -43,7 +43,7 @@ func TestApplyImprovement(t *testing.T) {
 	}
 
 	write("head\nanchor\ntail")
-	if err := applyImprovement(dir, "", improvementEntry{File: "PLAN.md", Type: "add", Original: "anchor", New: "MORE"}); err != nil {
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "add", Original: "anchor", New: "MORE"}); err != nil {
 		t.Fatalf("add-anchor: %v", err)
 	}
 	if !strings.Contains(read(), "anchor\n\nMORE") {
@@ -51,7 +51,7 @@ func TestApplyImprovement(t *testing.T) {
 	}
 
 	write("body")
-	if err := applyImprovement(dir, "", improvementEntry{File: "PLAN.md", Type: "add", New: "APPENDED"}); err != nil {
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "add", New: "APPENDED"}); err != nil {
 		t.Fatalf("add-append: %v", err)
 	}
 	if !strings.HasSuffix(read(), "APPENDED\n") {
@@ -59,7 +59,7 @@ func TestApplyImprovement(t *testing.T) {
 	}
 
 	write("keep DROP keep")
-	if err := applyImprovement(dir, "", improvementEntry{File: "PLAN.md", Type: "remove", Original: " DROP"}); err != nil {
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "remove", Original: " DROP"}); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	if read() != "keep keep" {
@@ -68,81 +68,17 @@ func TestApplyImprovement(t *testing.T) {
 
 	// Errors, none of which should write.
 	write("nothing here")
-	if err := applyImprovement(dir, "", improvementEntry{File: "PLAN.md", Type: "replace", Original: "MISSING", New: "X"}); err == nil {
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "replace", Original: "MISSING", New: "X"}); err == nil {
 		t.Error("missing original should error")
 	}
-	if err := applyImprovement(dir, "", improvementEntry{File: "../escape.md", Type: "add", New: "x"}); err == nil {
+	if err := applyImprovement(dir, improvementEntry{File: "../escape.md", Type: "add", New: "x"}); err == nil {
 		t.Error("path escape should error")
 	}
-	if err := applyImprovement(dir, "", improvementEntry{File: "PLAN.md", Type: "frobnicate", New: "x"}); err == nil {
+	if err := applyImprovement(dir, improvementEntry{File: "PLAN.md", Type: "frobnicate", New: "x"}); err == nil {
 		t.Error("unknown type should error")
 	}
 	if read() != "nothing here" {
 		t.Errorf("error cases must not write: got %q", read())
-	}
-}
-
-// TestApplyImprovementVariant pins where an edit lands when LLM[0] has a skill
-// variant: SKILL edits go to the variant copy the main model actually loads
-// (skillPath), a SKILL the variant lacks falls back to the generic file, phase
-// prompts (PLAN.md) stay generic, and `create` writes the generic dir — a new
-// skill only LOADS from there (skillFiles decides the set).
-func TestApplyImprovementVariant(t *testing.T) {
-	dir := t.TempDir()
-	ch := filepath.Join(dir, ".codehalter")
-	vdir := filepath.Join(ch, "skills", "test-variant")
-	if err := os.MkdirAll(vdir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	os.WriteFile(filepath.Join(ch, "SKILL-go.md"), []byte("generic OLD text"), 0o644)
-	os.WriteFile(filepath.Join(vdir, "SKILL-go.md"), []byte("variant OLD text"), 0o644)
-	os.WriteFile(filepath.Join(ch, "SKILL-bash.md"), []byte("bash OLD text"), 0o644)
-	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("plan OLD text"), 0o644)
-
-	// SKILL with a variant copy: the variant file is edited, the generic is not.
-	if err := applyImprovement(dir, "test-variant", improvementEntry{File: "SKILL-go.md", Type: "replace", Original: "OLD", New: "NEW"}); err != nil {
-		t.Fatalf("variant replace: %v", err)
-	}
-	if b, _ := os.ReadFile(filepath.Join(vdir, "SKILL-go.md")); string(b) != "variant NEW text" {
-		t.Errorf("variant copy not edited: %q", b)
-	}
-	if b, _ := os.ReadFile(filepath.Join(ch, "SKILL-go.md")); string(b) != "generic OLD text" {
-		t.Errorf("generic copy must stay untouched: %q", b)
-	}
-
-	// SKILL the variant lacks: falls back to the generic file (that's what loads).
-	if err := applyImprovement(dir, "test-variant", improvementEntry{File: "SKILL-bash.md", Type: "replace", Original: "OLD", New: "NEW"}); err != nil {
-		t.Fatalf("fallback replace: %v", err)
-	}
-	if b, _ := os.ReadFile(filepath.Join(ch, "SKILL-bash.md")); string(b) != "bash NEW text" {
-		t.Errorf("generic fallback not edited: %q", b)
-	}
-
-	// Phase prompts are never variant-resolved.
-	if err := applyImprovement(dir, "test-variant", improvementEntry{File: "PLAN.md", Type: "replace", Original: "OLD", New: "NEW"}); err != nil {
-		t.Fatalf("plan replace: %v", err)
-	}
-	if b, _ := os.ReadFile(filepath.Join(ch, "PLAN.md")); string(b) != "plan NEW text" {
-		t.Errorf("PLAN.md not edited in generic dir: %q", b)
-	}
-
-	// create lands in the generic dir even with a variant active.
-	if err := applyImprovement(dir, "test-variant", improvementEntry{File: "SKILL-python.md", Type: "create", New: "# Python"}); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(ch, "SKILL-python.md")); err != nil {
-		t.Errorf("created skill missing from generic dir: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(vdir, "SKILL-python.md")); err == nil {
-		t.Error("created skill must not land in the variant dir")
-	}
-
-	// The display path names the variant copy for variant-resolved edits.
-	if _, rel := improveTarget(dir, "test-variant", improvementEntry{File: "SKILL-go.md", Type: "replace"}); rel != filepath.Join(".codehalter", "skills", "test-variant", "SKILL-go.md") {
-		t.Errorf("improveTarget rel = %q", rel)
-	}
-	if _, rel := improveTarget(dir, "test-variant", improvementEntry{File: "SKILL-python.md", Type: "create"}); rel != filepath.Join(".codehalter", "SKILL-python.md") {
-		t.Errorf("improveTarget create rel = %q", rel)
 	}
 }
 
@@ -300,7 +236,7 @@ func TestApplyImprovementCreatesSkill(t *testing.T) {
 	}
 	const body = "# Python skill\n## Idioms\n- Use pathlib, not os.path.join."
 
-	if err := applyImprovement(dir, "", improvementEntry{File: "SKILL-python.md", Type: "create", New: body}); err != nil {
+	if err := applyImprovement(dir, improvementEntry{File: "SKILL-python.md", Type: "create", New: body}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(ch, "SKILL-python.md"))
@@ -311,13 +247,13 @@ func TestApplyImprovementCreatesSkill(t *testing.T) {
 		t.Errorf("created body = %q, want %q", got, body+"\n")
 	}
 	// It must actually reach the system prompt, not just the disk.
-	if !strings.Contains(loadSkills(dir, "", nil), "Use pathlib") {
+	if !strings.Contains(loadSkills(dir, nil), "Use pathlib") {
 		t.Error("created skill is not picked up by loadSkills")
 	}
 
 	// Never clobber: a second create against the same name is refused, and the
 	// existing body survives. Changing a skill is an add/replace.
-	if err := applyImprovement(dir, "", improvementEntry{File: "SKILL-python.md", Type: "create", New: "# Overwritten"}); err == nil {
+	if err := applyImprovement(dir, improvementEntry{File: "SKILL-python.md", Type: "create", New: "# Overwritten"}); err == nil {
 		t.Error("create over an existing skill should error")
 	}
 	if b, _ := os.ReadFile(filepath.Join(ch, "SKILL-python.md")); string(b) != body+"\n" {
@@ -331,7 +267,7 @@ func TestApplyImprovementCreatesSkill(t *testing.T) {
 		"path escape":     {File: "../SKILL-evil.md", Type: "create", New: "x"},
 		"empty body":      {File: "SKILL-rust.md", Type: "create", New: "  \n "},
 	} {
-		if err := applyImprovement(dir, "", e); err == nil {
+		if err := applyImprovement(dir, e); err == nil {
 			t.Errorf("%s: create should error", name)
 		}
 		if _, err := os.Stat(filepath.Join(ch, e.File)); err == nil {

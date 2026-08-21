@@ -12,8 +12,7 @@ import (
 // probeStatementToolName is /improve's measurement tool: it A/B-tests skill
 // statements on the MAIN model (LLM[0]) — the model the skills actually serve —
 // while the /improve analysis itself may run on a stronger model (purpose =
-// "improve"). Same idea as the crafter's probe, scaled down to the handful of
-// statements /improve suspects: answer a question with and without the
+// "improve"): answer a question with and without the
 // statement in the skill, and let the (strong) improve model judge whether the
 // statement changed anything. A statement that changes nothing is removable
 // evidence-first, instead of "this looks verbose".
@@ -52,10 +51,10 @@ const (
 )
 
 // probeArms derives the two system prompts for a spec against the on-disk
-// (variant-resolved) skill. Returned mode names the check for the report.
+// skill. Returned mode names the check for the report.
 // Placeholders are expanded AFTER the with/without split, so both arms match
 // what loadSkills would actually feed the main model.
-func probeArms(cwd, variant string, p probeSpec) (without, with, mode string, err error) {
+func probeArms(cwd string, p probeSpec) (without, with, mode string, err error) {
 	if strings.TrimSpace(p.Statement) == "" {
 		return "", "", "", fmt.Errorf("statement is required")
 	}
@@ -66,7 +65,7 @@ func probeArms(cwd, variant string, p probeSpec) (without, with, mode string, er
 	if !skillFileNameRe.MatchString(name) {
 		return "", "", "", fmt.Errorf("file %q must be a bare SKILL-<topic>.md filename (or empty for a context-free probe)", name)
 	}
-	raw, err := os.ReadFile(skillPath(cwd, variant, name))
+	raw, err := os.ReadFile(skillPath(cwd, name))
 	if err != nil {
 		return "", "", "", fmt.Errorf("read %s: %w", name, err)
 	}
@@ -85,7 +84,7 @@ func probeArms(cwd, variant string, p probeSpec) (without, with, mode string, er
 
 // probeGenerate runs `samples` generations of one arm on the main model.
 // Sequential within the arm, arms grouped by the caller — consecutive calls
-// share their prompt prefix in the server's cache (same trick as the crafter).
+// share their prompt prefix in the server's cache.
 func (a *agent) probeGenerate(ctx context.Context, sid string, conn *LLMConnection, system, question string, samples int) ([]string, error) {
 	var msgs []llmMessage
 	if system != "" {
@@ -175,7 +174,6 @@ func probeStatementExecute(ctx context.Context, a *agent, sid string, rawArgs st
 	if conn == nil {
 		return "error: no main LLM configured to probe", true
 	}
-	variant := a.skillVariant()
 
 	var b strings.Builder
 	if dropped > 0 {
@@ -184,7 +182,7 @@ func probeStatementExecute(ctx context.Context, a *agent, sid string, rawArgs st
 	failures := 0
 	for i, p := range probes {
 		fmt.Fprintf(&b, "## Probe %d/%d — %s\nStatement: %s\n", i+1, len(probes), orGeneric(p.File), p.Statement)
-		without, with, mode, err := probeArms(sess.Cwd, variant, p)
+		without, with, mode, err := probeArms(sess.Cwd, p)
 		if err != nil {
 			failures++
 			fmt.Fprintf(&b, "ERROR: %v\n\n", err)

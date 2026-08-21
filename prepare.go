@@ -756,7 +756,7 @@ func (a *agent) checkEnv(sess *Session, sid string) (bool, []fixProblem) {
 			if a.skillsAuto() && isDeferredSkill(name) {
 				continue
 			}
-			if body := readSkillBody(sess.Cwd, a.skillVariant(), name); body != "" {
+			if body := readSkillBody(sess.Cwd, name); body != "" {
 				sess.AddUser("[New skill available this session — " + name +
 					". It enters the system prompt at the next history compaction; until then it's here.]\n\n" + body)
 				sess.promptSkills = append(sess.promptSkills, name)

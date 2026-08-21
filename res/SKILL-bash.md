@@ -3,6 +3,13 @@
 - `#!/usr/bin/env bash` + `set -euo pipefail`.
 - `IFS=$'\n\t'` if script iterates `$@` or split data.
 
+## `set -e` won't fire here — know before trusting it
+- Command substitution: `x=$(false; echo hi)` → no exit. `shopt -s inherit_errexit` (bash 4.4+) makes it respect `set -e`.
+- `local x=$(cmd)` → `local` masks the failure. Split it: `local x; x=$(cmd)`.
+- Function used as a conditional (`if f`, `f &&`, `f ||`, `while f`) → `set -e` is disabled *inside* f.
+- Append `|| true` to EACH command allowed to fail (docker stop, rm -rf, kill/fuser/lsof). Never substitute `if/then` blocks or `set +e` for it.
+- `trap 'echo "line $LINENO failed" >&2' ERR` → error reporting with the real line.
+
 ## Quoting
 - Quote ALL var expansions: `"$var"`, `"$@"`, `"${arr[@]}"`. Unquoted → splits on whitespace + globs.
 - Never `$*` for arg forwarding → use `"$@"`.
@@ -22,7 +29,7 @@
 - Check `${PIPESTATUS[@]}` on long pipelines if need which stage failed.
 
 ## Style
-- Mental shellcheck → silence SC2086 (quoting), SC2046 (word split).
+- Run real `shellcheck` (not "mentally") + `bash -n` for syntax. Fix SC2086 (quoting), SC2046 (word split).
 - No Bashisms (`[[`, arrays, `${var//pat/repl}`) in scripts that run under /bin/sh.
 
 ## Debug "failed on line N"

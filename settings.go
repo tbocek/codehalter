@@ -91,16 +91,6 @@ type LLMConnection struct {
 	APIKey string `toml:"api_key,omitempty"`
 	Model  string `toml:"model"`
 	Tag    string `toml:"tag,omitempty"`
-	// SkillVariant selects a per-model pruned skill set for this model:
-	// .codehalter/skills/<variant>/SKILL-*.md is preferred over the generic
-	// .codehalter/SKILL-*.md, falling back per file. Variants are produced by
-	// the skill crafter (crafter/) — a measured subset of each skill containing
-	// only the statements THIS model actually needs — and every shipped variant
-	// is seeded to .codehalter/skills/ so switching models is a settings edit
-	// away. Empty = generic skills. Only LLM[0]'s variant is used (the
-	// foreground session runs there).
-	SkillVariant string `toml:"skill_variant,omitempty"`
-
 	// Purpose designates which non-foreground work routes to this entry.
 	// "summary" sends the per-turn summariser here instead of LLM[0].
 	// "improve" hosts /improve turns: the analysis benefits from the strongest
@@ -318,6 +308,13 @@ func decodeSettings(path string) (Settings, error) {
 	// Surface every unmatched key here so the misconfiguration is named at load
 	// time instead of misdiagnosed three layers down.
 	for _, key := range md.Undecoded() {
+		// skill_variant selected a per-model pruned skill set; those were folded
+		// into the single .codehalter/SKILL-*.md set. Named here so an existing
+		// config does not get told it has a typo.
+		if k := key.String(); strings.HasSuffix(k, "skill_variant") {
+			slog.Warn("skill_variant is no longer supported (ignored — there is one skill set now, .codehalter/SKILL-*.md; delete the line)", "key", k, "file", path)
+			continue
+		}
 		slog.Warn("unknown settings key (ignored — check for a typo)", "key", key.String(), "file", path)
 	}
 	if s.Skills != "" && s.Skills != "inline" && s.Skills != "auto" {
@@ -350,20 +347,6 @@ func (a *agent) skillsAuto() bool {
 	// "auto" is the default: "" and unknown values (warned at load) land here
 	// too; only an explicit "inline" opts out of first-touch deferral.
 	return a.settings.Skills != "inline"
-}
-
-// skillVariant returns LLM[0]'s per-model skill variant ("" = generic). The
-// foreground session runs on LLM[0], so its model decides which pruned skill
-// set the prompt loads. Note: settings hot-reload each turn, so changing the
-// variant mid-session re-renders the system prompt and busts the prefix cache
-// once — same cost as editing a skill file.
-func (a *agent) skillVariant() string {
-	a.cfgMu.RLock()
-	defer a.cfgMu.RUnlock()
-	if len(a.settings.LLM) == 0 {
-		return ""
-	}
-	return a.settings.LLM[0].SkillVariant
 }
 
 // MainLLM returns the foreground connection (LLM[0]) with role-resolved

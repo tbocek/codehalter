@@ -71,9 +71,9 @@ func checkLicense(projectDir string) (string, error) {
 var skillFileNameRe = regexp.MustCompile(`^SKILL-[a-z0-9][a-z0-9._+-]*\.md$`)
 
 // createSkill writes a brand-new .codehalter/SKILL-*.md. O_EXCL rather than a
-// Stat-then-write: an existing skill must be edited through replace/add (which
-// keeps what the crafter already measured), and refusing in the syscall means
-// there is no window in which we could clobber one.
+// Stat-then-write: an existing skill must be edited through replace/add, and
+// refusing in the syscall means there is no window in which we could clobber
+// one.
 func createSkill(path, name, body string) error {
 	if !skillFileNameRe.MatchString(name) {
 		return fmt.Errorf("create only makes new skills: %q must be named SKILL-<topic>.md, lowercase (e.g. SKILL-python.md)", name)
@@ -93,43 +93,23 @@ func createSkill(path, name, body string) error {
 	return err
 }
 
-// improveTarget resolves which on-disk file an improvement edits, plus the
-// project-relative path shown to the user. SKILL-*.md edits follow skillPath:
-// the active variant's copy when LLM[0] has one and that file exists — that IS
-// the file the main model loads, so an edit to the generic copy would be
-// invisible to it. Everything else (PLAN.md, EXECUTE.md, …) and `create` stay
-// generic: WHAT loads is decided by the generic dir's file set (skillFiles),
-// so a brand-new skill must land there to load at all.
-func improveTarget(cwd, variant string, e improvementEntry) (path, rel string) {
-	name := strings.TrimSpace(e.File)
-	if strings.HasPrefix(name, "SKILL-") && !strings.EqualFold(strings.TrimSpace(e.Type), "create") {
-		p := skillPath(cwd, variant, name)
-		if r, err := filepath.Rel(cwd, p); err == nil {
-			return p, r
-		}
-		return p, filepath.Join(".codehalter", name)
-	}
-	return filepath.Join(cwd, ".codehalter", name), filepath.Join(".codehalter", name)
-}
-
 // applyImprovement applies one structured change to its .codehalter/ prompt
-// file (variant-resolved via improveTarget): replace/remove swap out the
+// file: replace/remove swap out the
 // `original` text, add appends `new` (after `original` when given, else at the
 // end), create writes a new SKILL-*.md. The user already approved this entry
 // via the Apply card, so the write is direct. Returns a per-entry error the
 // caller surfaces without aborting the rest.
-func applyImprovement(cwd, variant string, e improvementEntry) error {
+func applyImprovement(cwd string, e improvementEntry) error {
 	name := strings.TrimSpace(e.File)
 	if name == "" {
 		return fmt.Errorf("no file given")
 	}
-	// Improvements target the prompt files under .codehalter/ by bare filename
-	// (codehalter resolves the variant path itself); reject anything that
-	// escapes that directory.
+	// Improvements target the prompt files under .codehalter/ by bare filename;
+	// reject anything that escapes that directory.
 	if strings.ContainsAny(name, `/\`) || name == ".." {
 		return fmt.Errorf("file %q must be a bare .codehalter/ prompt filename", name)
 	}
-	path, _ := improveTarget(cwd, variant, e)
+	path := filepath.Join(cwd, ".codehalter", name)
 	// Handled before the read: the whole point is that the file does not exist yet.
 	if strings.EqualFold(strings.TrimSpace(e.Type), "create") {
 		return createSkill(path, name, e.New)
@@ -221,36 +201,10 @@ func (a *agent) submitImprovements(ctx context.Context, sid, cwd, endpoint strin
 	return fmt.Sprintf("not submitted: HTTP %d: %s", resp.StatusCode, string(respBody))
 }
 
-// improveVariantNote renders the per-turn note telling /improve which on-disk
-// file each SKILL resolves to under the active variant. Injected into the turn
-// by the Prompt handler (not baked into the template) because the variant is
-// settings state a static template can't know. Empty when no variant is
-// configured — the generic files are then the loaded ones and the template's
-// default instructions already point there. Without this note the model quotes
-// `original` text from the generic copy and the byte-exact match against the
-// variant file fails on apply.
-func improveVariantNote(cwd, variant string) string {
-	if variant == "" {
-		return ""
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "\n\n[ACTIVE SKILL VARIANT: %s. The main model loads these resolved skill files — read THESE exact files when quoting `original` text and when probing statements; submit_improvement applies each SKILL edit to the same resolved path (keep `file` a bare filename):", variant)
-	for _, n := range skillFiles(cwd) {
-		p := skillPath(cwd, variant, n)
-		rel, err := filepath.Rel(cwd, p)
-		if err != nil {
-			rel = p
-		}
-		fmt.Fprintf(&b, "\n- %s → %s", n, rel)
-	}
-	b.WriteString("\nPLAN.md, EXECUTE.md, DOCUMENT.md, SUMMARISE.md and new skills (type create) always live in .codehalter/ directly.]")
-	return b.String()
-}
-
 // renderImprovement is the card body shown before each Apply/Skip prompt, so
-// the user sees exactly what they're approving. rel is the variant-resolved
-// project-relative path the edit will actually land in (improveTarget) — shown
-// instead of the bare name so a variant write is visible before Apply.
+// the user sees exactly what they're approving. rel is the project-relative
+// path the edit lands in, shown instead of the bare name so the file is
+// unambiguous before Apply.
 func renderImprovement(i, n int, e improvementEntry, rel string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "### Improvement %d/%d: %s\n`%s` · %s\n\n", i, n, e.Title, rel, e.Type)
@@ -333,18 +287,13 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 		improvements = improvements[:improveAskCap]
 	}
 
-	// Skill edits land in the file LLM[0] actually loads — the active variant's
-	// copy when one is configured (improveTarget). Resolved once per run so the
-	// card, the write, and the summary all name the same file.
-	variant := a.skillVariant()
-
 	var applied []improvementEntry
 	var summary strings.Builder
 	if dropped > 0 {
 		fmt.Fprintf(&summary, "(%d further proposal(s) beyond the top %d were not shown)\n", dropped, improveAskCap)
 	}
 	for i, e := range improvements {
-		_, rel := improveTarget(sess.Cwd, variant, e)
+		rel := filepath.Join(".codehalter", strings.TrimSpace(e.File))
 		a.say(ctx, sid, "\n"+renderImprovement(i+1, len(improvements), e, rel)+"\n")
 		ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Apply %d/%d: %s", i+1, len(improvements), e.Title), "edit", "Apply", "Skip")
 		if err != nil {
@@ -356,7 +305,7 @@ func improvementExecute(ctx context.Context, a *agent, sid string, rawArgs strin
 			fmt.Fprintf(&summary, "skipped: %s\n", e.Title)
 			continue
 		}
-		if err := applyImprovement(sess.Cwd, variant, e); err != nil {
+		if err := applyImprovement(sess.Cwd, e); err != nil {
 			a.FailToolCall(ctx, sid, tcId, "apply failed: "+err.Error())
 			fmt.Fprintf(&summary, "could not apply %q: %v\n", e.Title, err)
 			continue

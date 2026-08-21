@@ -9,10 +9,6 @@
 server = "http://localhost:8080"  # host root only, no path
 # api_key = "..."                 # if your server needs bearer auth
 model = "your-model-id"           # must match /v1/models
-# skill_variant = "gemma-4-31b"   # per-model pruned skills (.codehalter/skills/<variant>/),
-#                                 # measured by the skill crafter: only the statements THIS
-#                                 # model needs. Shipped: gemma-4-31b, qwen3.6-27b. Falls back
-#                                 # to the generic SKILL per file; omit for generic skills.
 parallel = 1                      # max concurrent calls to this server
 # context_size = 128000           # required for non-llama.cpp backends
 # image_support = true            # for non-llama.cpp vision models

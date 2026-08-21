@@ -21,7 +21,7 @@ func TestProbeArms(t *testing.T) {
 	}
 	os.WriteFile(filepath.Join(ch, "SKILL-go.md"), []byte("line one\n- DROP ME\nline three\n"), 0o644)
 
-	without, with, mode, err := probeArms(dir, "", probeSpec{File: "SKILL-go.md", Statement: "- DROP ME\n"})
+	without, with, mode, err := probeArms(dir, probeSpec{File: "SKILL-go.md", Statement: "- DROP ME\n"})
 	if err != nil {
 		t.Fatalf("removal: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestProbeArms(t *testing.T) {
 		t.Errorf("removal arms wrong: without=%q with=%q mode=%q", without, with, mode)
 	}
 
-	without, with, mode, err = probeArms(dir, "", probeSpec{File: "SKILL-go.md", Statement: "- NEW RULE"})
+	without, with, mode, err = probeArms(dir, probeSpec{File: "SKILL-go.md", Statement: "- NEW RULE"})
 	if err != nil {
 		t.Fatalf("addition: %v", err)
 	}
@@ -37,24 +37,12 @@ func TestProbeArms(t *testing.T) {
 		t.Errorf("addition arms wrong: without=%q with=%q mode=%q", without, with, mode)
 	}
 
-	without, with, _, err = probeArms(dir, "", probeSpec{Statement: "- SOLO"})
+	without, with, _, err = probeArms(dir, probeSpec{Statement: "- SOLO"})
 	if err != nil {
 		t.Fatalf("context-free: %v", err)
 	}
 	if without != "" || with != "- SOLO" {
 		t.Errorf("context-free arms wrong: without=%q with=%q", without, with)
-	}
-
-	// The variant copy is the loaded one, so arms derive from it.
-	vdir := filepath.Join(ch, "skills", "v1")
-	os.MkdirAll(vdir, 0o755)
-	os.WriteFile(filepath.Join(vdir, "SKILL-go.md"), []byte("variant body\n- V RULE\n"), 0o644)
-	_, with, _, err = probeArms(dir, "v1", probeSpec{File: "SKILL-go.md", Statement: "- V RULE\n"})
-	if err != nil {
-		t.Fatalf("variant: %v", err)
-	}
-	if !strings.Contains(with, "variant body") {
-		t.Errorf("variant probe should read the variant copy, got %q", with)
 	}
 
 	for name, p := range map[string]probeSpec{
@@ -63,7 +51,7 @@ func TestProbeArms(t *testing.T) {
 		"path escape":     {File: "../SKILL-evil.md", Statement: "x"},
 		"missing skill":   {File: "SKILL-rust.md", Statement: "x"},
 	} {
-		if _, _, _, err := probeArms(dir, "", p); err == nil {
+		if _, _, _, err := probeArms(dir, p); err == nil {
 			t.Errorf("%s: should error", name)
 		}
 	}
