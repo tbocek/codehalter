@@ -21,6 +21,10 @@
 - Once a result shows answer → do NOT re-run with diff cwd/redirect/wrapper (`cd X && go version`, `go version 2>&1`); output won't change.
 - Always read `go.mod` exactly once per turn and extract ALL directives you need (Go version, module path, dependencies) from that single read. Never split into separate `read_file` calls per directive, and never use `go version` or `go list` to re-derive what `go.mod` already declares — one read, all extractions, no re-reads even when other commands seem more idiomatic.
 
+## go.mod version vs installed toolchain
+- go.mod asks a higher PATCH of the SAME minor than `go version` reports (wants `go 1.26.6`, have 1.26.3) → lower the `go` directive in go.mod to the installed version and drop any `toolchain` line. Do NOT install a newer Go, do NOT let GOTOOLCHAIN download one: a patch release adds no language or stdlib API, so nothing in the code breaks.
+- go.mod asks a higher MINOR than installed (wants 1.26.x, have 1.25.x) → do NOT lower the `go` directive; a minor gap removes language and stdlib features the code may use. Raise the toolchain instead: a newer distro base image is the usual carrier (alpine:3.23 ships Go 1.25.10, alpine:3.24 ships 1.26.3), else the distro pkg, else the upstream tarball. Can't get it → stop and report.
+
 ## gopls install
 - Fall back to `GOPROXY=direct go install golang.org/x/tools/gopls@latest` ONLY when the distro doesn't package it.
 

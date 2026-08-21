@@ -263,7 +263,7 @@ Codehalter edits files and runs build/test commands. Running it inside a [devcon
 
 | Distro | Base image |
 |--------|-----------|
-| Alpine | `alpine:3.23` |
+| Alpine | `alpine:3.24` |
 | Arch | `quay.io/archlinux/archlinux:base-devel` (+ `yay` AUR helper) |
 | Debian | `debian:trixie` |
 | Fedora | `fedora:44` |

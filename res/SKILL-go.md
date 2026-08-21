@@ -1,58 +1,59 @@
 # Go skill
 ## Errors
-- Errors = values. Check: `if err != nil { return err }` or wrap `fmt.Errorf("context: %w", err)`.
-- NO panic for control flow → reserve panics for unrecoverable bugs.
+- Errors = values: `if err != nil { return err }`, or wrap `fmt.Errorf("context: %w", err)`.
+- NO panic for control flow → panic only for unrecoverable bugs.
 - No try/catch; Go has neither.
-- Never swallow error.
+- Never swallow an error.
 
 ## Idioms
 - `:=` declare-and-assign; `=` reassign.
-- Defer cleanup right after acquiring resource: `f, err := os.Open(...); ...; defer f.Close()`.
-- Pass `context.Context` as first arg, named `ctx`.
-- Goroutine + channel for concurrency. Always clear "who closes the channel" rule.
+- Defer cleanup right after acquiring: `f, err := os.Open(...); ...; defer f.Close()`.
+- `context.Context` = first arg, named `ctx`.
+- Goroutine + channel for concurrency. Always a clear "who closes the channel" rule.
 - Small named interfaces over big (`io.Reader`, not `BigCombinedThing`).
 
 ## Style
-- gofmt: tabs for indent, brace same line.
+- gofmt: tabs indent, brace same line.
 - Exports PascalCase, unexported camelCase.
 - No Java-style getters/setters; expose fields directly when appropriate.
 - Doc comments only when symbol exported AND non-obvious.
 
-## Standard layout
-- `main.go` = entry. Tests in `*_test.go` next to file under test.
-- Run tests via project task runner (just, make, etc.), NOT raw `go test`.
+## Layout
+- `main.go` = entry. Tests in `*_test.go` beside file under test.
+- Run tests via project task runner (just, make), NOT raw `go test`.
 
 ## Build ≠ test
-`just:build` / `go build` only proves it COMPILES. A wrong `json.Unmarshal` target (array into a struct), nil deref, or off-by-one compiles fine and fails only at RUNTIME — build stays green on broken code. Wrote or changed code that parses/serialises external input (a tool handler, an API payload, config)? → write a `*_test.go` that round-trips a REAL example of the documented format (success AND error path), run `just:test`, make it pass. NOT just `just:build`.
+`go build` / `just:build` proves COMPILES only. Wrong `json.Unmarshal` target (array into struct), nil deref, off-by-one: compile fine, fail at RUNTIME → green build on broken code. Wrote/changed code parsing or serialising external input (tool handler, API payload, config)? → write `*_test.go` round-tripping a REAL example of the documented format, success AND error path, run `just:test`, make it pass. NOT just `just:build`.
 
 ## Probe toolchain once
-- `go version`, `go env`, `which go` = session-invariant. Once a result shows answer → do NOT re-run with diff cwd/redirect/wrapper (`cd X && go version`, `go version 2>&1`); output won't change.
-- Same for go.mod directives: already read `go X.Y` line this turn → don't re-read.
+- `go version`, `go env`, `which go` = session-invariant. Answered once → NO re-run with different cwd/redirect/wrapper (`cd X && go version`, `go version 2>&1`); output won't change.
+- Same for go.mod: read the `go X.Y` line once per turn → don't re-read.
+
+## go.mod vs installed toolchain
+- go.mod wants higher PATCH, same minor (wants 1.26.6, have 1.26.3) → lower `go` directive to installed version, drop any `toolchain` line. Do NOT install newer Go, do NOT let GOTOOLCHAIN fetch one: patch adds no language/stdlib API, nothing breaks.
+- go.mod wants higher MINOR (wants 1.26.x, have 1.25.x) → do NOT lower the directive; minor gap drops language + stdlib features code may use. Raise toolchain instead: newer distro base image = usual carrier (alpine:3.23 = Go 1.25.10, alpine:3.24 = 1.26.3), else distro pkg, else upstream tarball. Unobtainable → stop, report.
 
 ## Install gopls (+ other Go tools)
-- OS pkg mgr first (universal rule — see container skill). Fall back `GOPROXY=direct go install golang.org/x/tools/gopls@latest` ONLY when the distro doesn't package it.
+- OS pkg mgr first (universal rule, container skill). Fall back `GOPROXY=direct go install golang.org/x/tools/gopls@latest` ONLY when distro doesn't package it.
 
 ## gopls as MCP server
-- gopls 0.20+ ships built-in MCP server. Start as stdio child `gopls mcp` (serves go_symbols / go_references / go_definition / go_hover).
-- Wire: add `[[server]]` block to `.codehalter/mcp.toml` with `name = "gopls"`, `command = "gopls"`, `args = ["mcp"]`. codehalter reconciles mcp.toml automatically at end of turn — starts server + registers tools itself → live on next prompt. Do NOT tell user to restart Zed or start new session; no restart needed.
+- gopls 0.20+ ships MCP server: stdio child `gopls mcp` → go_symbols / go_references / go_definition / go_hover.
+- Wire: `[[server]]` in `.codehalter/mcp.toml`, `name = "gopls"`, `command = "gopls"`, `args = ["mcp"]`. codehalter reconciles mcp.toml at turn end, starts server + registers tools → live next prompt. Do NOT tell user to restart Zed or start new session; no restart needed.
 
-## Read code: outline before bytes (when gopls MCP is wired)
-Default to the language server to NAVIGATE; reading a whole file is the LAST step, not the first. Cheaper (signatures, not whole files → far fewer tokens, less context overflow) and precise (no grep false hits on comments/strings/same-named methods on other types).
-- What's in a file/package? → `go_symbols` (every decl + signature, no bodies). NOT `read_file` to "see what's there".
-- Where is X defined? → `go_definition`. NOT grep / `search_text`.
-- Who calls X / what breaks if I change it? → `go_references` (real call graph). `search_text` over-matches.
+## Read code: outline before bytes (gopls wired)
+LSP navigates; whole-file read = LAST step, not first. Cheaper (signatures not files → fewer tokens, less overflow) + precise (no grep hits on comments/strings/same-named methods of other types).
+- File/package contents? → `go_symbols` (decls+signatures, no bodies), NOT `read_file`.
+- Where is X defined? → `go_definition`, NOT grep/`search_text`.
+- Who calls X / what breaks if I change it? → `go_references` (real call graph); `search_text` over-matches.
 - Signature + doc of X? → `go_hover`.
-- `read_file` ONLY to read a function's actual LOGIC, or to grab the exact bytes for an `edit_file`. Read the function, not the file.
-Tools register as `gopls__go_symbols` / `gopls__go_definition` / `gopls__go_references` / `gopls__go_hover` once gopls is wired (above). gopls NOT wired → fall back to `search_text` + `read_file`.
+- `read_file` ONLY for a function's LOGIC, or exact bytes for `edit_file`. Read the function, not the file.
+Tools = `gopls__go_symbols` / `gopls__go_definition` / `gopls__go_references` / `gopls__go_hover`. Not wired → `search_text` + `read_file`.
 
-## Mutating commands — NEVER during planning
-These rewrite files in place. NOT probes. Don't run during PLAN to "see what would change" — they actually change things, often across hundreds of files:
-- `go fix ./...` (Go 1.26 modernizers — silently updates source)
+## Mutating commands — NEVER in planning
+Rewrite files in place. NOT probes. Never run in PLAN to "see what would change" — they change things, often across hundreds of files:
+- `go fix ./...` (Go 1.26 modernizers, silently rewrites source)
 - `go mod tidy` (rewrites go.mod / go.sum)
 - `gofmt -w`, `goimports -w` (rewrite formatting in place)
 - `go generate ./...` (runs arbitrary //go:generate directives)
-Run ONLY when task explicitly calls for that change, ONLY during EXECUTE.
-Read-only equivalents for planning:
-- `go vet ./...` → lint without writing.
-- `go fix -diff ./...` → preview modernizer changes.
-- `gofmt -d`, `goimports -d` → show would-be diffs.
+Run ONLY when the task calls for that change, ONLY in EXECUTE.
+Planning equivalents: `go vet ./...` (lint, no writes), `go fix -diff ./...` (preview modernizers), `gofmt -d` / `goimports -d` (would-be diffs).

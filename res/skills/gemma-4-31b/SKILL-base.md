@@ -20,6 +20,7 @@ Applies execute + verify-fail replan.
 ## Test install live BEFORE patch Dockerfile
 Install persists container lifetime → re-run project build/test, confirm end-to-end.
 Test OK → propose Dockerfile edit w/ exact verified cmds + tell user rebuild.
+Base image tag goes stale: old `FROM` tag = frozen package set = outdated toolchain (alpine:3.23 → older Go than alpine:3.24). Touching a Dockerfile → first check the tag is still current stable (`web_search` distro releases, or Docker Hub `latest`). Moved → propose the bump in the same edit. Stable tags ONLY, never edge/rawhide/sid/devel.
 
 ## run_command NOT for
 - Replacing run_task → declared project task (just build, npm test) keep run_task so user sees same UI.

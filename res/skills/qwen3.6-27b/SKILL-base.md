@@ -21,6 +21,7 @@ Before write `RUN <pkg-mgr> install <pkg>` (or pip, npm i -g) into Dockerfile, f
 Install persists container lifetime → re-run project build/test, confirm end-to-end.
 Install fail (wrong name, repo missing, version mismatch) → debug HERE (alt source, search release page) before commit Dockerfile change. Untested patch = guess.
 Test OK → propose Dockerfile edit w/ exact verified cmds + tell user rebuild.
+Base image tag goes stale: old `FROM` tag = frozen package set = outdated toolchain (alpine:3.23 → older Go than alpine:3.24). Touching a Dockerfile → first check the tag is still current stable (`web_search` distro releases, or Docker Hub `latest`). Moved → propose the bump in the same edit. Stable tags ONLY, never edge/rawhide/sid/devel.
 
 ## run_command NOT for
 - Long-running service → die w/ codehalter. No daemon. Use run_background
