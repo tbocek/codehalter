@@ -82,10 +82,10 @@ go build -o codehalter .
 
 Codehalter looks for settings in two places, in this order:
 
-1. `~/.config/codehalter/settings.toml` (global, preferred, used across every project)
-2. `<project>/.codehalter/settings.toml` (project-local fallback)
+1. `<project>/.codehalter/settings.toml` (project-local, preferred)
+2. `~/.config/codehalter/settings.toml` (global fallback, used across every project that has no local file)
 
-On first run with neither file present, codehalter prompts to write a commented skeleton into `<project>/.codehalter/settings.toml`. Edit it, then move it to `~/.config/codehalter/` to share across projects (the project-local copy can be deleted once the global one exists).
+On first run with neither file present, codehalter prompts to write a commented skeleton into `<project>/.codehalter/settings.toml`. Edit it, then move it to `~/.config/codehalter/` to share across projects (a project-local file always wins over the global one, so delete it if you want the project to use the shared config).
 
 ### Interactive setup
 
@@ -251,7 +251,7 @@ Each image installs a **minimal** toolchain (git, curl, sudo, openssh, Firefox),
 
 1. Bind-mounts `${localWorkspaceFolder}/.git` (read-write) plus the SSH agent socket, so the agent can run git fully, including `git commit` / `git push`, **but it is instructed to do so only when you explicitly ask**, never on its own initiative or as a side effect. (Want a hard guarantee rather than an instruction? Add `,readonly` to this mount; the agent then falls back to handing you the commit command.)
 2. Bind-mounts `${localEnv:HOME}/.gitconfig` read-only into the dev user's home, so the in-container `git` sees your real `user.name` / `user.email` / signing key without any per-project setup.
-3. Bind-mounts `~/.config/codehalter` read-only so `settings.toml` is shared across every project.
+3. Bind-mounts `~/.config/codehalter` read-only so `settings.toml` is shared across every project as the global fallback (a project-local `.codehalter/settings.toml` still wins when present).
 4. Sets `containerEnv.DEVCONTAINER=true` so codehalter's startup banner shows `Container: devcontainer` and the `run_command` tool is registered.
 
 After the container is built, point Zed at the in-container codehalter binary:

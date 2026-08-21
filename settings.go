@@ -195,8 +195,8 @@ func (c *LLMConnection) parallelCap() int {
 }
 
 // loadSettings looks for settings.toml in this order:
-// 1. ~/.config/codehalter/settings.toml (global, preferred)
-// 2. <cwd>/.codehalter/settings.toml (project-local fallback)
+// 1. <cwd>/.codehalter/settings.toml (project-local, preferred)
+// 2. ~/.config/codehalter/settings.toml (global fallback)
 // Always creates .codehalter/ in the project if it doesn't exist. When
 // neither file exists, returns an empty Settings (with path "") and a nil
 // error so callers can prompt the user to create one without aborting the
@@ -212,20 +212,21 @@ func loadSettings(cwd string) (Settings, error) {
 		slog.Warn("loadSettings: could not create project .codehalter dir", "dir", projectDir, "err", err)
 	}
 
-	// Global first — once a user has a global config it serves every project,
-	// so we don't need to nag with the project-local prompt anymore.
+	// Project-local first — a project-specific settings.toml wins over the
+	// global file, so per-project overrides (a different server, a project
+	// model) are honoured even when a machine-wide config exists.
+	projectPath := filepath.Join(projectDir, "settings.toml")
+	if _, err := os.Stat(projectPath); err == nil {
+		return decodeSettings(projectPath)
+	}
+
+	// Global fallback — serves every project that has no local file, so we
+	// don't need to nag with the project-local prompt anymore.
 	if home, err := os.UserHomeDir(); err == nil {
 		globalPath := filepath.Join(home, ".config", "codehalter", "settings.toml")
 		if _, err := os.Stat(globalPath); err == nil {
 			return decodeSettings(globalPath)
 		}
-	}
-
-	// Project-local fallback (typically the skeleton written by scaffoldSettings
-	// on first run; users are encouraged to promote it to the global path).
-	projectPath := filepath.Join(projectDir, "settings.toml")
-	if _, err := os.Stat(projectPath); err == nil {
-		return decodeSettings(projectPath)
 	}
 
 	return Settings{}, nil

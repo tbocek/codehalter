@@ -135,9 +135,9 @@ func TestPrepareChecksBannerAlwaysShowsOnce(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// loadSettings merges ~/.config/codehalter/settings.toml on top of the
-	// project file, so without an isolated HOME this test probes the
-	// developer's real LLM servers over the network.
+	// loadSettings prefers the project-local settings.toml over the global
+	// ~/.config/codehalter/settings.toml, so without an isolated HOME this
+	// test probes the developer's real LLM servers over the network.
 	t.Setenv("HOME", t.TempDir())
 
 	h := newTerminalHarness(t)

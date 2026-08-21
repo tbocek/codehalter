@@ -1,5 +1,6 @@
 # Codehalter settings. Edit, then restart the Zed session.
-# Machine-wide: move to ~/.config/codehalter/settings.toml (checked first).
+# This project-local file is checked first; ~/.config/codehalter/settings.toml
+# is the machine-wide fallback, used only when a project has no local file.
 # Top-level keys must stay ABOVE the [[llm]] tables.
 
 # prewarm = true    # warm the server's prefix cache at session open (default on)
