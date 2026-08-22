@@ -62,12 +62,20 @@ func (a *agent) discoverSandbox() {
 	}, Execute: runBackgroundExecute})
 }
 
-// cmdIdleTimeout reaps a run_command that prints NOTHING for this long. It's an
-// IDLE timeout, not a total one: a command that keeps producing output runs
-// unbounded (a long build is fine), but a silent/hung one is killed so it can't
-// park a turn forever (the parent ctx only fires on a user Stop). It doubles as
-// the poll interval of the terminal watchdog. A var so tests can shorten it.
-var cmdIdleTimeout = 60 * time.Second
+// cmdIdleTimeout reaps a run_command that prints NOTHING for this long: no
+// output, no IO, nothing on the console. It is an IDLE timeout and deliberately
+// not a total one. A command that keeps producing output is making progress and
+// runs unbounded, however long that takes: a `grep -rln` over an archived
+// lecture site (thousands of files, gigabytes of video) took 9 minutes here and
+// exited 0 with the 14 matches that answered the question. A total cap would
+// have killed that at the 5 minute mark and thrown the answer away, while the
+// case it is supposed to catch, a hung command, is silent and this already
+// catches it. Only a user Stop overrides.
+//
+// 120s rather than 60s because "quiet" is not "hung": a compile step, a
+// download that buffers, or a walk over a slow bind mount can all go a full
+// minute without printing.
+var cmdIdleTimeout = 120 * time.Second
 
 // cmdOutputCap bounds how many bytes of a command's output we hand the model.
 // The idle watchdog only fires on SILENCE, so a steadily-printing command

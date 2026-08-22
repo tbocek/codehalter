@@ -12,6 +12,15 @@ import (
 	"time"
 )
 
+// meterCall builds the one tool call shape startToolMeter reads: a name and a
+// raw JSON argument string.
+func meterCall(name, args string) toolCall {
+	tc := toolCall{ID: "tc1"}
+	tc.Function.Name = name
+	tc.Function.Arguments = args
+	return tc
+}
+
 // TestStartToolMeter pins the tool status meter's lifecycle: stop() halts the
 // ticker and joins its goroutine promptly (no deadlock, no leak), and a cancelled
 // ctx also lets stop() return. It does not assert the 1s-tick text: that is
@@ -20,7 +29,7 @@ func TestStartToolMeter(t *testing.T) {
 	a, s := newTestAgent(t)
 
 	// Normal stop joins quickly.
-	stop := a.startToolMeter(context.Background(), s.ID, "web_search")
+	stop := a.startToolMeter(context.Background(), s.ID, meterCall("web_search", `{"query":"goldmark tables"}`))
 	if stop == nil {
 		t.Fatal("startToolMeter returned a nil stop")
 	}
@@ -34,7 +43,7 @@ func TestStartToolMeter(t *testing.T) {
 
 	// A cancelled ctx also unblocks stop().
 	ctx, cancel := context.WithCancel(context.Background())
-	stop2 := a.startToolMeter(ctx, s.ID, "run_command")
+	stop2 := a.startToolMeter(ctx, s.ID, meterCall("run_command", `{"command":"sleep 1"}`))
 	cancel()
 	done2 := make(chan struct{})
 	go func() { stop2(); close(done2) }()
@@ -291,6 +300,53 @@ func TestStuckLadderFuzzyOutput(t *testing.T) {
 	// rounds, and the ladder bails at stuckBailRounds — 6 calls total.
 	if got := mock.callCount(); got != 1+stuckBailRounds {
 		t.Errorf("callCount = %d, want %d (bail at stuckBailRounds via fuzzy match)", got, 1+stuckBailRounds)
+	}
+}
+
+// TestToolMeterShowsTheArgument pins what the status row is FOR: "run_command"
+// sitting at 77s says something is slow but not what, and the arguments have
+// scrolled away in the transcript by then. The row carries the command itself.
+func TestToolMeterShowsTheArgument(t *testing.T) {
+	h := newTerminalHarness(t)
+	a, s := h.agent, h.sess
+	s.phaseMu.Lock()
+	s.phaseActive, s.phaseCurrent = true, 0
+	s.phaseMu.Unlock()
+
+	long := strings.Repeat("x", 200)
+	for _, tc := range []struct {
+		name, args, want string
+	}{
+		{"run_command", `{"command":"go build ./..."}`, "run_command go build ./..."},
+		{"run_task", `{"task":"just:build"}`, "run_task just:build"},
+		{"search_text", `{"query":"LoadAll","path":"src"}`, "search_text LoadAll"}, // query wins over path
+		{"read_file", `{"path":"loop.go","limit":40}`, "read_file loop.go"},
+		{"web_search", `{"query":"line one\nline two"}`, "web_search line one line two"}, // no row-breaking newline
+		{"launch_subagent", `{"tasks":[{"instructions":"go"}]}`, "launch_subagent"},      // no string arg → bare name
+		{"run_command", `{"command":"` + long + `"}`, "run_command " + strings.Repeat("x", toolMeterArgRunes)},
+		{"read_file", `not json at all`, "read_file"},
+	} {
+		stop := a.startToolMeter(context.Background(), s.ID, meterCall(tc.name, tc.args))
+		stop()
+		if !h.waitFor(func() bool { return len(h.updatesOfKind("plan")) > 0 }) {
+			t.Fatalf("%s: no plan update", tc.name)
+		}
+		var got string
+		for _, u := range h.updatesOfKind("plan") {
+			entries, _ := u["entries"].([]any)
+			for _, e := range entries {
+				em, _ := e.(map[string]any)
+				if em["status"] == "in_progress" {
+					got, _ = em["content"].(string)
+				}
+			}
+		}
+		if want := " (running " + tc.want + "…)"; !strings.HasSuffix(got, want) {
+			t.Errorf("%s(%s) row = %q, want it to end in %q", tc.name, tc.args, got, want)
+		}
+		h.mu.Lock()
+		h.updates = nil
+		h.mu.Unlock()
 	}
 }
 

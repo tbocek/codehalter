@@ -76,6 +76,33 @@ func TestTerminalIdleWatchdogKills(t *testing.T) {
 	}
 }
 
+// TestTerminalIdleWatchdogMeasuresRealSilence pins WHEN the kill lands, which
+// is the difference between the notice being true and being a guess. Polling
+// once per timeout could not kill before TWO intervals, so a command advertised
+// as dying after 2m of silence really died somewhere between 2m and 4m.
+// Timestamping the last change puts it at the timeout itself.
+//
+// The command prints nothing at all, so there is no output-arrival jitter to
+// blur the measurement: silence starts when the command does.
+func TestTerminalIdleWatchdogMeasuresRealSilence(t *testing.T) {
+	h := newTerminalHarness(t)
+
+	const idle = time.Second
+	start := time.Now()
+	_, _, started, err := h.agent.runTerminalCmd(context.Background(), h.sess.ID, "tc1",
+		"bash", []string{"-c", "sleep 30"}, h.sess.Cwd, idle)
+	if !started || err != nil {
+		t.Fatalf("started=%v err=%v", started, err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < idle {
+		t.Errorf("reaped after %s, before the %s timeout was even up", elapsed, idle)
+	}
+	if elapsed > idle+idle/2 {
+		t.Errorf("reaped after %s, want ~%s — the kill is quantised to the poll interval again", elapsed, idle)
+	}
+}
+
 // TestTerminalIdleWatchdogSpareChattyCommand pins the other half of the
 // watchdog: a command that keeps printing is never reaped, however long it
 // runs. The fingerprint is a hash rather than a byte count for this reason —

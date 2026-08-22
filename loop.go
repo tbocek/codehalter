@@ -671,16 +671,46 @@ func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []
 	return append(messages, llmMessage{Role: "user", Content: text})
 }
 
-// startToolMeter shows "(running web_search… 12s)" for as long as a tool runs,
-// so a slow tool or a subagent's tool call reads as busy rather than frozen. For
-// a subagent session setStatus folds it into the parent's row.
-func (a *agent) startToolMeter(ctx context.Context, sid, tool string) (stop func()) {
+// startToolMeter shows "(running run_command go build ./...… 12s)" for as long
+// as a tool runs, so a slow tool or a subagent's tool call reads as busy rather
+// than frozen. For a subagent session setStatus folds it into the parent's row.
+//
+// The tool name alone doesn't answer the question the row raises: "run_command"
+// sitting at 77s says something is slow but not WHAT, and the arguments are only
+// in the transcript above, scrolled away behind whatever streamed since. So the
+// one argument that identifies the call rides along.
+func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (stop func()) {
+	label := tc.Function.Name
+	// Tried in priority order: a tool can carry several of these (search_text has
+	// both a query and a path) and only one fits the row. Whitespace runs collapse
+	// to single spaces because a heredoc or a multi-line command would otherwise
+	// break the row apart, and the cut is on runes so it can't split one in half.
+	var args map[string]any
+	if json.Unmarshal([]byte(tc.Function.Arguments), &args) == nil {
+		for _, key := range []string{"command", "task", "query", "path", "id"} {
+			v, _ := args[key].(string)
+			if v = strings.Join(strings.Fields(v), " "); v == "" {
+				continue
+			}
+			if r := []rune(v); len(r) > toolMeterArgRunes {
+				v = string(r[:toolMeterArgRunes])
+			}
+			label += " " + v
+			break
+		}
+	}
 	start := time.Now()
-	a.setStatus(ctx, sid, " (running "+tool+"…)") // immediate, before the first tick
+	a.setStatus(ctx, sid, " (running "+label+"…)") // immediate, before the first tick
 	return a.startStatusMeter(ctx, sid, func() string {
-		return fmt.Sprintf(" (running %s… %ds)", tool, int(time.Since(start).Seconds()))
+		return fmt.Sprintf(" (running %s… %ds)", label, int(time.Since(start).Seconds()))
 	})
 }
+
+// toolMeterArgRunes caps the argument shown in the status row. The row is one
+// line in a plan entry: past this the phase name and the seconds counter get
+// pushed out of view, which costs more than the tail of a long command is worth.
+// The trailing "…" the meter already prints doubles as the cut marker.
+const toolMeterArgRunes = 48
 
 // toolLoopCaller holds everything a tool loop needs to make ONE round's LLM
 // call, so the per-round entry point takes only what changes between rounds.
@@ -1152,7 +1182,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if tc.Function.Name == "launch_subagent" {
 				a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
 			} else {
-				stopMeter = a.startToolMeter(ctx, sid, tc.Function.Name)
+				stopMeter = a.startToolMeter(ctx, sid, tc)
 			}
 
 			// runToolCall (tools.go) executes the tool, caches its full output

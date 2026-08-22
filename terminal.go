@@ -32,8 +32,9 @@ import (
 //     still holds. The steer to run_background lives in the tool description.
 //   - The idle watchdog is a poll, not a stream. terminal/wait_for_exit blocks
 //     and there is no output stream to watch, so silence is detected by
-//     re-reading terminal/output on a timer. Same timer the exec path used;
-//     only kill latency is quantised to the poll interval. See runTerminalCmd.
+//     re-reading terminal/output on a timer and timestamping the last change.
+//     Kill latency is bounded by the poll interval, not by the timeout. See
+//     runTerminalCmd.
 
 // terminalOutputLimit is the byte cap we ask the client to enforce. The client
 // truncates from the FRONT (it keeps the tail), which loses the head of a long
@@ -193,14 +194,24 @@ func (a *agent) runTerminalCmd(ctx context.Context, sid, tcId, command string, a
 
 	idleKilled := false
 	if idle > 0 {
-		// One poll per idle interval, not per tick: each poll drags the whole
-		// accumulated output across the wire, so a chatty build would otherwise
-		// re-transfer megabytes. The cost is that a silent command dies somewhere
-		// between one and two intervals instead of at exactly one.
-		ticker := time.NewTicker(idle)
+		// Polled at HALF the timeout, and silence measured from a timestamp rather
+		// than from "the last two polls matched". A poll that fires only once per
+		// interval cannot tell 1s of silence from 59s, so the old scheme killed
+		// somewhere between one and two intervals: with a 2m timeout that is a
+		// command dying anywhere from 2 to 4 minutes in, and the notice it hands
+		// the model ("no output for 2m0s") would be a lie half the time. Two polls
+		// per interval bound the error at idle/2 and cost exactly what one poll
+		// per interval cost at the old, shorter timeout: each poll drags the whole
+		// accumulated output across the wire, which is why this is not polled
+		// faster.
+		ticker := time.NewTicker(idle / 2)
 		defer ticker.Stop()
-		var lastHash uint64
-		first := true
+		// Seeded with the hash of EMPTY output, not the zero value: a command that
+		// never prints anything would otherwise register its first poll as a
+		// "change" and get measured from there, buying a hung command an extra
+		// poll interval of life for having produced nothing.
+		lastHash := hashOutput("")
+		lastChange := time.Now()
 	wait:
 		for {
 			select {
@@ -226,15 +237,17 @@ func (a *agent) runTerminalCmd(ctx context.Context, sid, tcId, command string, a
 				if status != nil {
 					continue // finished between ticks; wait_for_exit is about to return
 				}
-				h := hashOutput(out)
-				if first || h != lastHash {
-					first, lastHash = false, h
+				if h := hashOutput(out); h != lastHash {
+					lastHash, lastChange = h, time.Now()
 					continue
 				}
 				if idleKilled {
 					continue // already killed; still waiting for wait_for_exit to land
 				}
-				// Nothing new for a whole interval: silent or hung. Kill it, but do
+				if time.Since(lastChange) < idle {
+					continue // quiet, but not yet quiet for long enough
+				}
+				// Nothing new for a whole timeout: silent or hung. Kill it, but do
 				// NOT release yet — we still want to read what it printed.
 				idleKilled = true
 				if kerr := a.terminalKill(ctx, sid, tid); kerr != nil {
