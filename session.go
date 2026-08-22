@@ -187,6 +187,13 @@ type Session struct {
 	phaseMu      sync.Mutex
 	phaseActive  bool
 	phaseCurrent int
+	// planTableShown records that the planner's subtasks already streamed into
+	// the transcript as a live table (see planTableSink), so renderPlan prints
+	// its heading alone instead of repeating the list. Consumed on read: a later
+	// mid-run revision never went through submit_plan, has nothing on screen, and
+	// must still render in full. Under phaseMu for the same reason as the fields
+	// above, it is written from the SSE read loop.
+	planTableShown bool
 	// launchedSubagents caches results of completed launch_subagent tasks,
 	// keyed by a hash of (instructions, context). When the model re-asks for
 	// an identical subagent (within or across launch_subagent tool calls in

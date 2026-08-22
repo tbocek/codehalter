@@ -299,6 +299,7 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 		nil,
 		func(tok string) { collected.WriteString(tok) },
 		nil,
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("llmStream: %v", err)
@@ -352,7 +353,7 @@ func TestLLMStreamSurfacesInStreamError(t *testing.T) {
 			a := &agent{}
 			_, _, _, err := a.llmStream(
 				context.Background(), "", mock.conn("execute"),
-				[]llmMessage{{Role: "user", Content: "hi"}}, nil, nil, nil,
+				[]llmMessage{{Role: "user", Content: "hi"}}, nil, nil, nil, nil,
 			)
 			if err == nil {
 				t.Fatal("llmStream: got nil error, want the in-stream error surfaced")
@@ -1960,7 +1961,7 @@ func TestSummarisePrefixIdentity(t *testing.T) {
 	s.AddUser("do the thing")
 	s.markTurnStart()
 	fgMsgs := a.buildLLMContext(s)
-	if _, _, _, err := a.llmStream(context.Background(), s.ID, a.settings.ConnAt(0, "execute"), fgMsgs, llmAllToolDefinitions(), nil, nil); err != nil {
+	if _, _, _, err := a.llmStream(context.Background(), s.ID, a.settings.ConnAt(0, "execute"), fgMsgs, llmAllToolDefinitions(), nil, nil, nil); err != nil {
 		t.Fatalf("foreground call: %v", err)
 	}
 	s.AddAssistant("did it")

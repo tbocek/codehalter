@@ -1005,11 +1005,28 @@ func (a *agent) renderPlan(ctx context.Context, sid, header string, subtasks []s
 	if len(subtasks) == 0 {
 		return
 	}
+	// Already on screen: submit_plan's arguments streamed in as a live table
+	// (planTableSink) carrying the full text, so repeating the list here would
+	// show every subtask twice. The heading still prints, because the table has
+	// none and cannot have one (see planTable) and "Plan:" versus "Findings:" is
+	// the difference between work that will run and work that won't. The flag is
+	// consumed, not just read: a later mid-run revision never streamed and must
+	// still render in full.
+	if sess := a.getSession(sid); sess != nil {
+		sess.phaseMu.Lock()
+		shown := sess.planTableShown
+		sess.planTableShown = false
+		sess.phaseMu.Unlock()
+		if shown {
+			a.say(ctx, sid, header+"\n")
+			return
+		}
+	}
 	var b strings.Builder
 	b.WriteString(header)
-	b.WriteByte('\n')
-	for i, st := range subtasks {
-		fmt.Fprintf(&b, "%d. %s\n", i+1, st.Description)
+	b.WriteString(planTableHead)
+	for _, st := range subtasks {
+		b.WriteString(planRow(st))
 	}
 	a.say(ctx, sid, b.String())
 }
@@ -1102,6 +1119,22 @@ func humanCount(n int) string {
 		return trimUnit(float64(n)/1e6, "m")
 	default:
 		return trimUnit(float64(n)/1e9, "g")
+	}
+}
+
+// humanBytes renders a wire-payload size compactly in binary units: 900 →
+// "900b", 12288 → "12kb", 2508268 → "2.4mb". Same trimUnit idiom as humanCount
+// so the two halves of the LLM meter read alike, and it steps up to mb — the
+// old fixed "%.2fkb" printed a 2 MB request body as "2451.39kb", which is both
+// unreadable and easy to mistake for the ↓ side's token count.
+func humanBytes(n int) string {
+	switch {
+	case n < 1024:
+		return strconv.Itoa(n) + "b"
+	case n < 1024*1024:
+		return trimUnit(float64(n)/1024, "kb")
+	default:
+		return trimUnit(float64(n)/(1024*1024), "mb")
 	}
 }
 

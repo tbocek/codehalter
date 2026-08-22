@@ -209,7 +209,7 @@ func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message
 // The callers pair the tools with tool_choice="none" on the conn so the
 // summariser can't answer with a tool call.
 func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, tools []map[string]any, turn []Message) string {
-	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, tools, nil, nil)
+	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, tools, nil, nil, nil)
 	if err != nil || strings.TrimSpace(out) == "" {
 		slog.Debug("summarise: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
 		out = fallbackTurnNote(turn)

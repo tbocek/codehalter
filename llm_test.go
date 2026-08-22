@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -215,7 +217,7 @@ func TestFinishLengthClassification(t *testing.T) {
 		}
 		// sid="" disables session logging; the finish=length classification works
 		// off the locally-parsed usage tokens regardless.
-		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil)
+		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil)
 		return err
 	}
 
@@ -243,6 +245,43 @@ func TestFinishLengthClassification(t *testing.T) {
 		t.Errorf("content at the cap should classify as capHitError, got: %v", err)
 	} else if ce.Cap != defaultMaxTokens {
 		t.Errorf("capHitError.Cap = %d, want %d", ce.Cap, defaultMaxTokens)
+	}
+}
+
+// TestReasoningArrivesUnderEitherSpelling pins the two names the chain-of-thought
+// channel travels under. llama.cpp sends the OpenAI-compatible reasoning_content;
+// the user's vLLM-backed llmhub sends reasoning, and reading only the former
+// silently dropped every thinking token that backend produced.
+func TestReasoningArrivesUnderEitherSpelling(t *testing.T) {
+	sse := func(field string) string {
+		c, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
+			"delta": map[string]any{field: "weighing the options"},
+		}}})
+		return fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", c)
+	}
+	for _, field := range []string{"reasoning_content", "reasoning"} {
+		mock := newMockLLM(t, sse(field))
+		a, s := newTestAgent(t)
+		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+		conn := a.connForSession(context.Background(), s.ID, "thinking")
+		if conn == nil {
+			mock.Close()
+			t.Fatalf("%s: connForSession returned nil", field)
+		}
+		var streamed strings.Builder
+		_, _, reasoning, err := a.llmStream(context.Background(), "", conn,
+			[]llmMessage{{Role: "user", Content: "go"}}, nil, nil,
+			func(s string) { streamed.WriteString(s) }, nil)
+		mock.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", field, err)
+		}
+		if reasoning != "weighing the options" {
+			t.Errorf("%s: accumulated reasoning = %q, want it kept", field, reasoning)
+		}
+		if streamed.String() != "weighing the options" {
+			t.Errorf("%s: streamed to the thought channel = %q, want it forwarded", field, streamed.String())
+		}
 	}
 }
 
@@ -361,7 +400,7 @@ func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
 		if arm {
 			conn = conn.forToolLoop()
 		}
-		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, llmAllToolDefinitions(), nil, nil)
+		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, llmAllToolDefinitions(), nil, nil, nil)
 		return err
 	}
 

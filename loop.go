@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -91,6 +92,13 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	if sess != nil {
 		sess.AddUser(marker)
 		sess.saveOrLog()
+		// Only renderPlan clears this, and a plan phase that streamed its first row
+		// and then errored or was cancelled never reaches it. Clearing here means
+		// the only thing that can suppress this phase's list is this phase's own
+		// table, never a leftover from the turn before.
+		sess.phaseMu.Lock()
+		sess.planTableShown = false
+		sess.phaseMu.Unlock()
 	}
 
 	// Exclude respond: planning has its OWN terminal tool, submit_plan, whose
@@ -127,13 +135,37 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		return &planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(planRes.Text)}, planRes.ToolUses, nil
 	}
 	parseErr := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
-	if parseErr != nil && !planRes.RespondCalled {
-		slog.Info("planner skipped submit_plan and JSON parse failed; retrying with corrective", "snippet", truncate(planRes.Text, 200))
+	if parseErr != nil {
+		// Two different failures land here and they need different correctives:
+		// the planner answered in prose without ever calling submit_plan, or it
+		// called it with arguments that aren't valid JSON. The second used to skip
+		// this retry outright (the condition also demanded !RespondCalled), so one
+		// malformed argument list failed the whole turn with nothing said.
+		corrective := "Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."
+		wrong := "the planner replied in prose instead of calling submit_plan"
+		if planRes.RespondCalled {
+			corrective = fmt.Sprintf("Your `submit_plan` arguments were not valid JSON (%v). Call it again, emitting the arguments as one well-formed JSON object.", parseErr)
+			wrong = fmt.Sprintf("submit_plan's arguments were not valid JSON (%v)", parseErr)
+		}
+		// Rows only stream once their object closes, so some may already be on
+		// screen. Name the count: the user just watched a plan appear and has to
+		// know it is not the one that will run.
+		salvaged := ""
+		var partial struct {
+			Subtasks []subtask `json:"subtasks"`
+		}
+		if json.Unmarshal([]byte(repairJSON(planRes.Text)), &partial) == nil && len(partial.Subtasks) > 0 {
+			salvaged = fmt.Sprintf(" %d subtask(s) already reached the table and are not final.", len(partial.Subtasks))
+		}
+		// Say it out loud. Planning runs with stream=false, so without this the
+		// user watches the Planning row sit through an entire extra round trip
+		// with no hint that anything went wrong.
+		a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning went wrong! %s.%s Asking the planner to try again.\n", wrong, salvaged))
+		slog.Info("planner produced no parsable plan; retrying with corrective",
+			"sid", sid, "calledSubmitPlan", planRes.RespondCalled, "err", parseErr, "snippet", truncate(planRes.Text, 200))
 		// runToolLoop builds fresh from the session, so the files the planner read
 		// this turn stay in front of it; the corrective rides as a trailing turn.
-		retry, retryErr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0,
-			"Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose.",
-		)
+		retry, retryErr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, corrective)
 		planRes.Text = retry.Text
 		planRes.Content = retry.Content
 		planRes.RespondCalled = retry.RespondCalled
@@ -145,6 +177,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		parseErr = json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
 	}
 	if parseErr != nil {
+		a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning failed! The planner could not produce a valid plan even after a corrective retry (%v). Nothing will run.\n", parseErr))
 		return nil, planRes.ToolUses, fmt.Errorf("plan not valid JSON: %w", parseErr)
 	}
 
@@ -171,23 +204,36 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		if hasPlan {
 			nudge = "You submitted BOTH a final answer and a plan. Pick one: answer the user completely now (report_only=true, no subtasks), OR drop the message and submit only the subtasks to execute."
 		}
+		wrong := "submitted neither an answer nor any subtasks"
+		if hasPlan {
+			wrong = "submitted a final answer AND a plan at once"
+		}
+		a.say(ctx, sid, "\n⚠ The planner "+wrong+"! Asking it to pick one.\n")
 		slog.Info("planner: ambiguous submission, nudging to pick one", "sid", sid, "hasPlan", hasPlan, "hasAnswer", hasAnswer)
 		// runToolLoop builds fresh from the session (reads from this turn stay in
 		// context) and stores the nudge as the trailing turn.
-		if retry, rerr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, nudge); rerr == nil {
+		retry, rerr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, nudge)
+		switch {
+		case rerr != nil:
+			// Recoverable: the ambiguous submission still stands and orchestrate can
+			// work with it. Not silent, though, because what runs next is then the
+			// thing that was just called ambiguous.
+			a.say(ctx, sid, fmt.Sprintf("⚠ The corrective round failed (%v)! Going ahead with the planner's first submission.\n", rerr))
+		default:
 			planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
-			if retry.Terminal == respondToolName {
+			var rp planResult
+			switch {
+			case retry.Terminal == respondToolName:
 				plan = planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(retry.Text)}
-			} else {
-				var rp planResult
-				if json.Unmarshal([]byte(trimJSON(retry.Text)), &rp) == nil {
-					plan = rp
-					if retry.RespondCalled {
-						plan.answer = strings.TrimSpace(retry.Content)
-					} else {
-						plan.answer = strings.TrimSpace(strings.Replace(retry.Text, trimJSON(retry.Text), "", 1))
-					}
+			case json.Unmarshal([]byte(trimJSON(retry.Text)), &rp) == nil:
+				plan = rp
+				if retry.RespondCalled {
+					plan.answer = strings.TrimSpace(retry.Content)
+				} else {
+					plan.answer = strings.TrimSpace(strings.Replace(retry.Text, trimJSON(retry.Text), "", 1))
 				}
+			default:
+				a.say(ctx, sid, "⚠ The corrected reply was not valid JSON either! Going ahead with the planner's first submission.\n")
 			}
 		}
 	}
@@ -659,19 +705,30 @@ func (a *agent) startToolMeter(ctx context.Context, sid, tool string) (stop func
 // single-use, so the stale-snapshot risk runToolLoop removes doesn't apply. The
 // failSoftCap / loop-exit semantics in the doc above apply here too.
 func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
-	// Stream model text/reasoning to the UI unless this is a silent internal
-	// pass (the planner's JSON). nil callbacks are no-ops in the loop below.
+	// `stream` gates the TEXT channel only. Reasoning always streams when there
+	// is a session to stream to: it is the sole live signal during a long call,
+	// and it is never the machinery `stream=false` exists to hide — the planner's
+	// output arrives as submit_plan arguments and text, not on the reasoning
+	// channel. Silencing both left the planner showing a ↓ counter climbing past
+	// 8k tokens with nothing on screen. nil callbacks are no-ops in the loop below.
 	var on, think func(string)
 	flushStream := func() {} // no-op unless streaming; flushes the batched tail
-	if stream && sid != "" {
+	if sid != "" {
 		var flushOn, flushThink func()
-		on, flushOn = throttledStream(func(chunk string) {
-			a.say(ctx, sid, chunk)
-		})
+		if stream {
+			on, flushOn = throttledStream(func(chunk string) {
+				a.say(ctx, sid, chunk)
+			})
+		}
 		think, flushThink = throttledStream(func(chunk string) {
 			a.sayThought(ctx, sid, chunk)
 		})
-		flushStream = func() { flushOn(); flushThink() }
+		flushStream = func() {
+			if flushOn != nil { // nil when stream=false: no text channel to flush
+				flushOn()
+			}
+			flushThink()
+		}
 	}
 	tools := llmAllToolDefinitions()
 
@@ -767,7 +824,12 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		transientRetries := 0    // mid-response drops retried up to maxTransientStreamRetries
 		ruleRetries := 0         // stream-rule aborts re-asked up to maxStreamRuleRetries
 		for {
-			text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, tools, on, think)
+			// The plan-table sink is built fresh per attempt: a retry re-sends the
+			// request from scratch, so the aborted attempt's partial arguments must
+			// not carry into the next one. Rows already on screen stay there (the
+			// same convention as an aborted stream-rule response) and the retry
+			// simply renders a second table.
+			text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, tools, on, think, a.planTableSink(ctx, sid))
 			flushStream() // emit any batched tail of this call's tokens to the UI
 			if err == nil {
 				break
@@ -982,6 +1044,33 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			// launch_subagent is excluded: its subagents fold their OWN meters into
 			// this same parent row (setSubagentStatus), so a ticker here would fight
 			// them; a one-time marker holds until they take over.
+			// Show what the tool was actually asked to do. Only its NAME reaches the
+			// status ticker ("running run_command… 94s"), so a long tool ran with
+			// nothing on screen saying which command it was, and no ACP tool-call
+			// update carries it either. Terminal tools are skipped because their
+			// payload is already rendered: submit_plan as the streamed table,
+			// respond as the turn's own text.
+			if !policy.isTerminal(tc.Function.Name) {
+				shown := tc.Function.Arguments
+				var pretty bytes.Buffer
+				if json.Indent(&pretty, []byte(shown), "", "  ") == nil {
+					shown = pretty.String()
+				} // arguments too malformed to indent are shown raw, never dropped
+				if shown == "" || shown == "{}" {
+					a.say(ctx, sid, "\n**"+tc.Function.Name+"**\n")
+				} else {
+					// A fence longer than any backtick run inside it: an argument
+					// carrying ``` would otherwise close the block early and spill the
+					// rest of the JSON into the transcript as prose.
+					fence := "```"
+					for strings.Contains(shown, fence) {
+						fence += "`"
+					}
+					a.say(ctx, sid, fmt.Sprintf("\n**%s**\n%sjson\n%s\n%s\n",
+						tc.Function.Name, fence, shown, fence))
+				}
+			}
+
 			var stopMeter func()
 			if tc.Function.Name == "launch_subagent" {
 				a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")

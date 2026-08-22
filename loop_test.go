@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -312,5 +314,35 @@ func TestAddCorrectiveSurvivesRebuild(t *testing.T) {
 			t.Errorf("message %d diverges\n wire: %s %q\nrebuilt: %s %q",
 				i, wire[i].Role, wire[i].Content, rebuilt[i].Role, rebuilt[i].Content)
 		}
+	}
+}
+
+// TestPlanRecoversFromMalformedSubmitPlanArguments pins the recovery hole: a
+// planner that CALLS submit_plan but writes arguments which aren't valid JSON
+// used to skip the corrective retry entirely (the guard also demanded
+// !RespondCalled) and fail the whole turn on the first malformed argument list.
+func TestPlanRecoversFromMalformedSubmitPlanArguments(t *testing.T) {
+	broken := sseToolCall("c1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do the thing"`)
+	fixed := sseToolCall("c2", submitPlanToolName,
+		`{"clear":true,"subtasks":[{"description":"do the thing","verify":["go build ./..."]}],"report_only":false}`)
+	mock := newMockLLM(t, broken, fixed)
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+	// An empty PLAN.md disables planning outright, so seed one: the content is
+	// irrelevant here, only its presence gates the phase.
+	if err := os.MkdirAll(filepath.Join(s.Cwd, ".codehalter"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Cwd, ".codehalter", "PLAN.md"), []byte("plan things"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("malformed arguments should recover via the corrective retry, got: %v", err)
+	}
+	if plan == nil || len(plan.Subtasks) != 1 || plan.Subtasks[0].Description != "do the thing" {
+		t.Fatalf("plan = %+v, want the retry's single subtask", plan)
 	}
 }
