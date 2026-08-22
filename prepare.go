@@ -584,6 +584,30 @@ func (a *agent) renderLLMStatus() string {
 			continue
 		}
 		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.Server, c.parallelCap())
+		// The one settings mistake that costs real time and shows no symptom.
+		// Everything that is not a sampler is an argument to the server's chat
+		// template, so two roles that disagree there ask for two different
+		// renderings of the same conversation. The server keeps a prompt state
+		// per rendering, which means each phase switch re-evaluates everything
+		// the OTHER role appended since this one last ran. Measured over one
+		// 11.6h session: 99582 tokens re-read across two switches. The rewind
+		// detector already reports this, but only after the tokens are spent,
+		// and the counts alone do not say which key caused it. Say it here,
+		// before the first call, and name the two renderings.
+		if think, exec := renderKey(c.paramsFor("thinking")), renderKey(c.paramsFor("execute")); think != exec {
+			// "(none)" rather than an empty string: no template params at all is
+			// the good configuration and should not read like missing data.
+			show := func(k string) string {
+				if k == "" {
+					return "(none)"
+				}
+				return k
+			}
+			fmt.Fprintf(&b, "❕ %s: the two roles ask for different renderings — `params_thinking` %s vs `params_execute` %s. "+
+				"Anything that is not a sampler is an argument to the chat template, so every plan ↔ execute switch re-evaluates "+
+				"whatever the other role appended in between. Make them agree, or keep the split deliberately if you have priced it.\n\n",
+				label, show(think), show(exec))
+		}
 		if firstReachable < 0 {
 			firstReachable = i
 		}

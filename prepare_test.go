@@ -405,6 +405,55 @@ func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
 	}
 }
 
+// TestRenderLLMStatusWarnsRoleRenderSplit pins the startup warning for the one
+// settings mistake that costs real time and produces no symptom at all: the two
+// roles asking the server for two different renderings of the same
+// conversation. Anything that is not a sampler is an argument to the chat
+// template, so the server keeps a prompt state per rendering and every plan <->
+// execute switch re-evaluates whatever the other role appended in between. One
+// 11.6h session paid 99582 tokens over two switches.
+//
+// The rewind detector already catches it, but only after the tokens are spent,
+// and prompt/cached alone never name the key at fault. This is the same
+// diagnosis for free, before the first call.
+func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"m"}]}`))
+	}))
+	defer ts.Close()
+
+	base := LLMConnection{Server: ts.URL, Model: "m", Parallel: ptr(1), ContextSize: ptr(128000)}
+	status := func(t *testing.T, think, exec map[string]any) string {
+		t.Helper()
+		c := base
+		c.ParamsThinking, c.ParamsExecute = think, exec
+		a := &agent{settings: Settings{LLM: []LLMConnection{c}}}
+		a.probeAllLLMs(context.Background())
+		return a.renderLLMStatus()
+	}
+
+	// Samplers may differ freely: they never reach the chat template, so the two
+	// roles still render identically. Warning here would be noise on a correct
+	// and quite common configuration.
+	quiet := status(t,
+		map[string]any{"temperature": 1.0, "top_p": 0.95},
+		map[string]any{"temperature": 0.6, "max_tokens": 8192})
+	if strings.Contains(quiet, "different renderings") {
+		t.Errorf("warned about a sampler-only difference:\n%s", quiet)
+	}
+
+	// A chat-template argument on one role only: the real shape of the fault.
+	loud := status(t,
+		map[string]any{"temperature": 1.0},
+		map[string]any{"temperature": 0.6, "chat_template_kwargs": map[string]any{"enable_thinking": false}})
+	for _, want := range []string{"different renderings", "enable_thinking", "params_execute", "(none)"} {
+		if !strings.Contains(loud, want) {
+			t.Errorf("banner missing %q.\nGot:\n%s", want, loud)
+		}
+	}
+}
+
 // TestProbeAllLLMsExplicitFalseHonoured: a model that DOES auto-detect as
 // vision-capable but the user wants disabled via image_support = false must
 // stay disabled — *bool lets us distinguish "not set" from "explicitly off".

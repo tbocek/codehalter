@@ -364,6 +364,13 @@ type Session struct {
 	turnStart            time.Time
 	turnHumanWaitMs      int64
 	turnCompletionTokens int
+	// turnWastedCompletion is decode the harness threw away: a <think> stall, a
+	// stream-rule abort, a cap retry. It is already inside turnCompletionTokens,
+	// so without a name of its own it reads as productive output. It is usually
+	// the largest single cost in a bad turn: one measured stall burned 8192
+	// tokens, which at that server's 37.7 tok/s is 3.6 min, against 57 s for the
+	// prefix loss the same event caused.
+	turnWastedCompletion int
 	// turnEvaluatedPrompt is the sent-but-not-cached prompt total (Σ of each call's
 	// prompt_tokens − cached_tokens) — the real prompt work, shown on the Done line.
 	// We deliberately do NOT sum the gross prompt_tokens (which re-counts the cached
@@ -396,8 +403,15 @@ type Session struct {
 	// Not persisted, like the rest of the lineage: a restart re-prefills anyway,
 	// so there is no cache to reason about across process boundaries.
 	cachePrevRender string
-	cacheRewinds    int
-	cacheRewound    int
+	// cachePrevAt is when the previous call landed. A rewind cannot say why on
+	// token counts alone, and the gap separates the two causes better than
+	// anything else in the record: on the 11.6h session that motivated this
+	// detector, every stable-rendering rewind sat behind an idle gap (2h06 and
+	// 13min), while the calls seconds apart never lost a prefix. Servers reclaim
+	// idle slots, and no line of settings.toml prevents that.
+	cachePrevAt  time.Time
+	cacheRewinds int
+	cacheRewound int
 	// cacheRewindsRender is the subset of cacheRewinds where the two calls
 	// carried different template params. Split out because the fix differs: for
 	// those the user has one line of settings.toml to change, for the rest the
@@ -411,6 +425,7 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.turnStart = start
 	s.turnHumanWaitMs = 0
 	s.turnCompletionTokens = 0
+	s.turnWastedCompletion = 0
 	s.turnEvaluatedPrompt = 0
 	s.turnLastPrompt = 0
 	s.haveServerCache = false
@@ -452,41 +467,69 @@ func (s *Session) addTurnTokens(prompt, completion, evaluated int) {
 // threshold here is generous without hiding anything worth reporting.
 const cacheRewindSlack = 1024
 
+// idleEvictionSuspect is the gap after which a rewind under an unchanged
+// rendering is more likely the server reclaiming an idle slot than anything
+// codehalter did. There is no protocol signal for an eviction, so this is a
+// judgement call from the record: on the 11.6h session that motivated the
+// detector, every same-rendering rewind sat behind a gap of minutes or hours
+// (2h06 and 13min), while the hundreds of calls seconds apart never lost a
+// prefix. One minute is comfortably above the largest gap a tool loop puts
+// between two calls on its own and well below any of the observed evictions.
+const idleEvictionSuspect = time.Minute
+
+// wastedCompletionFloor is how much discarded decode a turn has to accumulate
+// before the Done line names it. A stream-rule abort throws away a few dozen
+// tokens as a matter of course and saying so every turn would be noise; the
+// events worth seeing are cap-length stalls and retries, which are thousands.
+// 256 tokens is ~7s of decode on the hardware this was measured on.
+const wastedCompletionFloor = 256
+
+// cacheRewind is one detected rewind. tokens == 0 means there is nothing to
+// report; the other fields exist to answer "and whose fault is it", which the
+// token counts on their own cannot: the same prompt/cached pair is produced by
+// a rendering change, a rewritten message, and a server-side eviction alike.
+type cacheRewind struct {
+	tokens        int           // prompt the previous call had already sent, re-read now
+	prevRender    string        // the previous call's renderKey
+	renderChanged bool          // ... and this call asked for a different one
+	idle          time.Duration // wall gap since the previous call (0 if unknown)
+}
+
 // noteCacheLineage folds one tool-loop call's cache split into the turn's
-// rewind detector and returns how many tokens this call re-read that the
-// previous call had already sent (0 when the prefix held), plus the previous
-// call's renderKey and whether it differs from this call's.
+// rewind detector and describes what it found. render is this call's renderKey
+// and now is its wall time; both are recorded for the next call to compare
+// against, whether or not this one rewound.
 //
-// render is this call's renderKey. When it changed, the rewind is explained:
-// the two calls asked the server for two different renderings of the same
-// conversation, so there was no shared prefix to hit. When it did NOT change,
-// that is just as informative: it rules the settings out and points at
-// compaction, a tool result that replayed differently, or a server-side
-// eviction.
+// When the rendering changed, the rewind is explained: the two calls asked the
+// server for two different renderings of the same conversation, and a rendering
+// the server has never held has no shared prefix to hit. When it did NOT
+// change, that is just as informative: it rules the settings out and leaves the
+// idle gap to separate the remaining two causes, a server-side eviction from
+// something rewriting the middle of the prompt (a tool result that replayed
+// differently than it was sent, or a template that repositions content).
 //
 // Only the tool loop feeds this (LLMConnection.cacheLineage), because only the
 // tool loop guarantees the premise: each call's message list is the previous
 // call's plus an append, so the server should serve the whole previous prompt
 // from cache and evaluate just the new tail. The premise holds ACROSS turn
 // boundaries too (the next turn's first call is the same list plus one user
-// message), which is why the comparison point outlives resetTurnStats: the two
+// message), which is why the comparison point outlives resetTurnStats: the one
 // place where it genuinely does not hold drops it by hand (resetCacheLineage,
-// called by compaction). When cached comes back well below
-// the previous prompt, something re-rendered the middle of the prompt: a
-// chat template that repositions content (Qwen3.6 moves the <think> wrappers
-// when the last user message moves, which chat_template_kwargs.preserve_thinking
-// pins), a role switch that changes chat_template_kwargs, a corrective that
-// reached the wire but not the session, or a server that simply evicted us.
+// called by compaction).
 //
 // cached < 0 means the backend reported no cache split; then there is nothing
 // to compare and the lineage restarts at this call.
-func (s *Session) noteCacheLineage(prompt, cached int, render string) (int, string, bool) {
+func (s *Session) noteCacheLineage(prompt, cached int, render string, now time.Time) cacheRewind {
 	s.turnStatsMu.Lock()
 	defer s.turnStatsMu.Unlock()
-	prev, prevRender := s.cachePrevPrompt, s.cachePrevRender
-	s.cachePrevPrompt, s.cachePrevRender = prompt, render
+	prev, prevRender, prevAt := s.cachePrevPrompt, s.cachePrevRender, s.cachePrevAt
+	s.cachePrevPrompt, s.cachePrevRender, s.cachePrevAt = prompt, render, now
+	out := cacheRewind{prevRender: prevRender}
+	if !prevAt.IsZero() && now.After(prevAt) {
+		out.idle = now.Sub(prevAt)
+	}
 	if prev <= 0 || cached < 0 {
-		return 0, prevRender, false
+		return out
 	}
 	// A shrinking prompt is not a rewind: an extension can only grow, so if this
 	// call is SMALLER than the previous one the message list was rewritten and
@@ -495,19 +538,28 @@ func (s *Session) noteCacheLineage(prompt, cached int, render string) (int, stri
 	// session, this guard is the difference between 16 reported rewinds (10 of
 	// them a compaction dropping 115135 tokens to 5970) and the 6 that were real.
 	if prompt+cacheRewindSlack < prev {
-		return 0, prevRender, false
+		return out
 	}
 	rewound := prev - cached
 	if rewound <= cacheRewindSlack {
-		return 0, prevRender, false
+		return out
 	}
 	s.cacheRewinds++
 	s.cacheRewound += rewound
+	out.tokens = rewound
 	if prevRender != render {
 		s.cacheRewindsRender++
-		return rewound, prevRender, true
+		out.renderChanged = true
 	}
-	return rewound, prevRender, false
+	return out
+}
+
+// addWastedCompletion records completion tokens that were generated and then
+// discarded. See turnWastedCompletion.
+func (s *Session) addWastedCompletion(n int) {
+	s.turnStatsMu.Lock()
+	s.turnWastedCompletion += n
+	s.turnStatsMu.Unlock()
 }
 
 // resetCacheLineage drops the comparison point so the next call can't be read
@@ -518,6 +570,7 @@ func (s *Session) resetCacheLineage() {
 	s.turnStatsMu.Lock()
 	s.cachePrevPrompt = 0
 	s.cachePrevRender = ""
+	s.cachePrevAt = time.Time{}
 	s.turnStatsMu.Unlock()
 }
 
@@ -554,6 +607,9 @@ type turnReport struct {
 	// cacheRewindsRender is how many of cacheRewinds we caused ourselves by
 	// changing the template params between the two calls.
 	cacheRewindsRender int
+	// wastedCompletion is the part of completion that was generated and then
+	// discarded.
+	wastedCompletion int
 }
 
 func (s *Session) turnStats() turnReport {
@@ -577,6 +633,7 @@ func (s *Session) turnStats() turnReport {
 		cacheRewinds:       s.cacheRewinds,
 		cacheRewound:       s.cacheRewound,
 		cacheRewindsRender: s.cacheRewindsRender,
+		wastedCompletion:   s.turnWastedCompletion,
 	}
 }
 

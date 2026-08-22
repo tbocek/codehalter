@@ -44,13 +44,14 @@ func TestTurnServerCache(t *testing.T) {
 // thousands less on four calls. First call, no-cache-info calls and compaction
 // have no comparison point and must never be reported.
 func TestCacheLineage(t *testing.T) {
+	at := lineageClock()
 	s := &Session{}
 	s.resetTurnStats(time.Now())
 
 	// Real trace of the fixed run: cached is always prompt(n-1) - 4.
 	healthy := [][2]int{{11307, 5348}, {11483, 11303}, {11666, 11479}, {12732, 11662}}
 	for _, c := range healthy {
-		if n, _, _ := s.noteCacheLineage(c[0], c[1], ""); n != 0 {
+		if n := s.noteCacheLineage(c[0], c[1], "", at()).tokens; n != 0 {
 			t.Errorf("prompt=%d cached=%d: reported a %d-token rewind, want none", c[0], c[1], n)
 		}
 	}
@@ -63,10 +64,10 @@ func TestCacheLineage(t *testing.T) {
 	// under the slack, deliberately not reported.
 	s2 := &Session{}
 	s2.resetTurnStats(time.Now())
-	s2.noteCacheLineage(15346, 5348, "") // first call: no comparison point
+	s2.noteCacheLineage(15346, 5348, "", at()) // first call: no comparison point
 	broken := [][3]int{{15346, 8475, 6871}, {17000, 7002, 8344}, {17100, 17035, 0}}
 	for _, c := range broken {
-		if n, _, _ := s2.noteCacheLineage(c[0], c[1], ""); n != c[2] {
+		if n := s2.noteCacheLineage(c[0], c[1], "", at()).tokens; n != c[2] {
 			t.Errorf("prompt=%d cached=%d: got %d, want %d", c[0], c[1], n, c[2])
 		}
 	}
@@ -79,11 +80,11 @@ func TestCacheLineage(t *testing.T) {
 	// must not make the NEXT call look like a rewind either.
 	s3 := &Session{}
 	s3.resetTurnStats(time.Now())
-	s3.noteCacheLineage(9000, -1, "")
-	if n, _, _ := s3.noteCacheLineage(9100, -1, ""); n != 0 {
+	s3.noteCacheLineage(9000, -1, "", at())
+	if n := s3.noteCacheLineage(9100, -1, "", at()).tokens; n != 0 {
 		t.Errorf("no cache info: got %d, want 0", n)
 	}
-	if n, _, _ := s3.noteCacheLineage(9200, 9096, ""); n != 0 {
+	if n := s3.noteCacheLineage(9200, 9096, "", at()).tokens; n != 0 {
 		t.Errorf("after no cache info: got %d, want 0", n)
 	}
 
@@ -95,23 +96,23 @@ func TestCacheLineage(t *testing.T) {
 	// (72033 -> 71997, a 36-token shrink from the thinking-off flip) still counts.
 	s5 := &Session{}
 	s5.resetTurnStats(time.Now())
-	s5.noteCacheLineage(115135, 115000, "")
-	if n, _, _ := s5.noteCacheLineage(5970, 0, ""); n != 0 {
+	s5.noteCacheLineage(115135, 115000, "", at())
+	if n := s5.noteCacheLineage(5970, 0, "", at()).tokens; n != 0 {
 		t.Errorf("context reset reported as a %d-token rewind", n)
 	}
 	s6 := &Session{}
 	s6.resetTurnStats(time.Now())
-	s6.noteCacheLineage(72033, 71900, "")
-	if n, _, _ := s6.noteCacheLineage(71997, 0, ""); n != 72033 {
+	s6.noteCacheLineage(72033, 71900, "", at())
+	if n := s6.noteCacheLineage(71997, 0, "", at()).tokens; n != 72033 {
 		t.Errorf("genuine loss after a 36-token shrink: got %d, want 72033", n)
 	}
 
 	// Compaction rewrites the front of the context on purpose.
 	s4 := &Session{}
 	s4.resetTurnStats(time.Now())
-	s4.noteCacheLineage(30000, 29996, "")
+	s4.noteCacheLineage(30000, 29996, "", at())
 	s4.resetCacheLineage()
-	if n, _, _ := s4.noteCacheLineage(12000, 0, ""); n != 0 {
+	if n := s4.noteCacheLineage(12000, 0, "", at()).tokens; n != 0 {
 		t.Errorf("after compaction: got %d, want 0", n)
 	}
 }
@@ -125,14 +126,15 @@ func TestCacheLineage(t *testing.T) {
 // boundary. The next turn's first call is still the previous list plus one user
 // message, so the premise holds and the check must survive the reset.
 func TestCacheLineageSpansTurns(t *testing.T) {
+	at := lineageClock()
 	s := &Session{}
 	s.resetTurnStats(time.Now())
-	s.noteCacheLineage(51594, 51590, "") // last call of turn 1
+	s.noteCacheLineage(51594, 51590, "", at()) // last call of turn 1
 
 	s.resetTurnStats(time.Now()) // turn 2 begins
 	// First call of turn 2: an image dropped out of the middle of the prompt, so
 	// the server could only reuse the part in front of it.
-	if n, _, _ := s.noteCacheLineage(51163, 21128, ""); n != 51594-21128 {
+	if n := s.noteCacheLineage(51163, 21128, "", at()).tokens; n != 51594-21128 {
 		t.Errorf("first call after a turn boundary: got %d, want %d", n, 51594-21128)
 	}
 	if r := s.turnStats(); r.cacheRewinds != 1 {
@@ -145,7 +147,7 @@ func TestCacheLineageSpansTurns(t *testing.T) {
 	if r := s.turnStats(); r.cacheRewinds != 0 || r.cacheRewound != 0 {
 		t.Errorf("turn 3: rewinds=%d rewound=%d, want 0 and 0", r.cacheRewinds, r.cacheRewound)
 	}
-	if n, _, _ := s.noteCacheLineage(51500, 51159, ""); n != 0 {
+	if n := s.noteCacheLineage(51500, 51159, "", at()).tokens; n != 0 {
 		t.Errorf("healthy first call of turn 3: got %d, want 0", n)
 	}
 }
@@ -306,33 +308,34 @@ func TestKeepWindowStart(t *testing.T) {
 // whose two roles disagree on chat_template_kwargs reproduces it exactly, and
 // the numbers below are what that costs.
 func TestCacheLineageNamesTheRenderChange(t *testing.T) {
+	at := lineageClock()
 	const (
 		think = `{"chat_template_kwargs":{"preserve_thinking":true}}`
 		exec  = `{"chat_template_kwargs":{"enable_thinking":false}}`
 	)
 	s := &Session{}
 	s.resetTurnStats(time.Now())
-	s.noteCacheLineage(71997, 71000, think)
+	s.noteCacheLineage(71997, 71000, think, at())
 
 	// Same conversation, different rendering asked for: the server had nothing
 	// to reuse.
-	n, prev, changed := s.noteCacheLineage(71997, 0, exec)
-	if n != 71997 || !changed {
-		t.Errorf("flip to %s: got n=%d changed=%v, want 71997 and true", exec, n, changed)
+	rw := s.noteCacheLineage(71997, 0, exec, at())
+	if rw.tokens != 71997 || !rw.renderChanged {
+		t.Errorf("flip to %s: got n=%d changed=%v, want 71997 and true", exec, rw.tokens, rw.renderChanged)
 	}
-	if prev != think {
-		t.Errorf("previous rendering = %q, want %q", prev, think)
+	if rw.prevRender != think {
+		t.Errorf("previous rendering = %q, want %q", rw.prevRender, think)
 	}
 
 	// The run continues under the new rendering and the prefix holds again: the
 	// cost is the switch, not the setting.
-	if n, _, changed := s.noteCacheLineage(99614, 71993, exec); n != 0 || changed {
-		t.Errorf("second call under the new rendering: got n=%d changed=%v, want 0 and false", n, changed)
+	if rw := s.noteCacheLineage(99614, 71993, exec, at()); rw.tokens != 0 || rw.renderChanged {
+		t.Errorf("second call under the new rendering: got n=%d changed=%v, want 0 and false", rw.tokens, rw.renderChanged)
 	}
 
 	// Switching back re-reads what the other rendering left behind.
-	if n, _, changed := s.noteCacheLineage(99614, 72029, think); n != 27585 || !changed {
-		t.Errorf("flip back: got n=%d changed=%v, want 27585 and true", n, changed)
+	if rw := s.noteCacheLineage(99614, 72029, think, at()); rw.tokens != 27585 || !rw.renderChanged {
+		t.Errorf("flip back: got n=%d changed=%v, want 27585 and true", rw.tokens, rw.renderChanged)
 	}
 	if r := s.turnStats(); r.cacheRewinds != 2 || r.cacheRewindsRender != 2 {
 		t.Errorf("rewinds=%d of which render changes=%d, want 2 and 2", r.cacheRewinds, r.cacheRewindsRender)
@@ -342,9 +345,9 @@ func TestCacheLineageNamesTheRenderChange(t *testing.T) {
 	// blamed on the settings.
 	s2 := &Session{}
 	s2.resetTurnStats(time.Now())
-	s2.noteCacheLineage(51594, 51590, think)
-	if n, _, changed := s2.noteCacheLineage(51163, 21128, think); n == 0 || changed {
-		t.Errorf("rewind with a stable rendering: got n=%d changed=%v, want a rewind and false", n, changed)
+	s2.noteCacheLineage(51594, 51590, think, at())
+	if rw := s2.noteCacheLineage(51163, 21128, think, at()); rw.tokens == 0 || rw.renderChanged {
+		t.Errorf("rewind with a stable rendering: got n=%d changed=%v, want a rewind and false", rw.tokens, rw.renderChanged)
 	}
 	if r := s2.turnStats(); r.cacheRewinds != 1 || r.cacheRewindsRender != 0 {
 		t.Errorf("rewinds=%d of which render changes=%d, want 1 and 0", r.cacheRewinds, r.cacheRewindsRender)
@@ -353,8 +356,79 @@ func TestCacheLineageNamesTheRenderChange(t *testing.T) {
 	// Compaction drops the whole comparison point, rendering included, so the
 	// call after it is neither a rewind nor a render change.
 	s2.resetCacheLineage()
-	if n, prev, changed := s2.noteCacheLineage(9000, 0, exec); n != 0 || changed || prev != "" {
-		t.Errorf("after compaction: got n=%d prev=%q changed=%v, want 0, \"\" and false", n, prev, changed)
+	if rw := s2.noteCacheLineage(9000, 0, exec, at()); rw.tokens != 0 || rw.renderChanged || rw.prevRender != "" {
+		t.Errorf("after compaction: got n=%d prev=%q changed=%v, want 0, \"\" and false", rw.tokens, rw.prevRender, rw.renderChanged)
+	}
+}
+
+// TestCacheLineageTimesTheGap pins the field that tells the two remaining
+// causes apart once the rendering is ruled out. A prompt/cached pair looks
+// exactly the same whether something rewrote the middle of the prompt or the
+// server simply reclaimed a slot we left sitting, and only one of those is
+// worth acting on. The gap before the call is the discriminator: on the 11.6h
+// session that motivated the detector every same-rendering rewind sat behind a
+// gap of minutes or hours, while the hundreds of calls seconds apart never lost
+// a prefix.
+func TestCacheLineageTimesTheGap(t *testing.T) {
+	base := time.Date(2026, 8, 21, 22, 0, 0, 0, time.UTC)
+	s := &Session{}
+	s.resetTurnStats(base)
+
+	// First call of a lineage: there is no previous call to be idle since, and
+	// reporting the process uptime here would read as a two-hour stall.
+	if rw := s.noteCacheLineage(51594, 51590, "", base); rw.idle != 0 {
+		t.Errorf("first call: idle=%v, want 0", rw.idle)
+	}
+	// A tool loop's own cadence, measured whether or not anything went wrong.
+	if rw := s.noteCacheLineage(51700, 51590, "", base.Add(3*time.Second)); rw.idle != 3*time.Second {
+		t.Errorf("healthy call: idle=%v, want 3s", rw.idle)
+	}
+	// The real shape of the logged eviction: two hours between turns, then a
+	// rewind the rendering cannot explain. The gap has to reach the call that
+	// reports the rewind, not just the ones before it.
+	rw := s.noteCacheLineage(51700, 0, "", base.Add(2*time.Hour+6*time.Minute))
+	if rw.tokens == 0 {
+		t.Fatal("the rewind itself went unreported")
+	}
+	if rw.idle < idleEvictionSuspect {
+		t.Errorf("idle=%v, want at least %v so the log can name it an eviction", rw.idle, idleEvictionSuspect)
+	}
+	// Compaction drops the clock along with the rest of the comparison point:
+	// the call after it must not be charged for a gap it never sat through.
+	s.resetCacheLineage()
+	if rw := s.noteCacheLineage(9000, 0, "", base.Add(3*time.Hour)); rw.idle != 0 {
+		t.Errorf("after compaction: idle=%v, want 0", rw.idle)
+	}
+}
+
+// TestTurnStatsNamesDiscardedDecode pins the split between generation the user
+// got and generation the harness threw away. They are the same tokens to the
+// server and the same seconds on the clock, so the discarded half has to be
+// counted inside the completion total; but left unnamed there it reads as
+// output, and the worst turns report as the most productive ones. On this
+// hardware it is the single most expensive thing that can go wrong in a turn:
+// one measured <think> stall burned the full 8192-token cap, 3m36s at 37.7
+// tok/s, against 57s for the prefix loss the same event caused.
+func TestTurnStatsNamesDiscardedDecode(t *testing.T) {
+	s := &Session{}
+	s.resetTurnStats(time.Now())
+	s.addTurnTokens(11000, 8192, 900) // the stalled call, generated then dropped
+	s.addWastedCompletion(8192)
+	s.addTurnTokens(11400, 400, 300) // the retry that produced the answer
+
+	r := s.turnStats()
+	if r.completion != 8592 {
+		t.Errorf("completion=%d, want 8592: discarded decode is still decode the server performed", r.completion)
+	}
+	if r.wastedCompletion != 8192 {
+		t.Errorf("wastedCompletion=%d, want 8192", r.wastedCompletion)
+	}
+
+	// Per turn, like every other figure on the Done line: a stall in the turn
+	// before this one is not this turn's cost.
+	s.resetTurnStats(time.Now())
+	if r := s.turnStats(); r.wastedCompletion != 0 {
+		t.Errorf("after resetTurnStats: wastedCompletion=%d, want 0", r.wastedCompletion)
 	}
 }
 

@@ -824,6 +824,19 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		if r.genMs > 0 && r.completion > 0 {
 			line += " · " + humanRate(r.completion, r.genMs) + " tg/s"
 		}
+		// Decode that was generated and then thrown away is already inside the
+		// gen figure above, where it reads as productive output. Split it out: on
+		// this hardware it is the most expensive thing that can go wrong in a
+		// turn. One measured <think> stall burned the full 8192-token cap, 3m36s
+		// at that server's 37.7 tok/s, against 57s for the prefix loss the same
+		// event caused. Priced in the turn's own decode rate rather than a
+		// constant, so it stays honest across backends.
+		if r.wastedCompletion >= wastedCompletionFloor {
+			line += fmt.Sprintf(" · %s discarded", humanCount(r.wastedCompletion))
+			if r.genMs > 0 && r.completion > 0 {
+				line += " (" + humanDuration(r.genMs*int64(r.wastedCompletion)/int64(r.completion)) + ")"
+			}
+		}
 		// Prefix cache didn't hold across the turn's calls (noteCacheLineage).
 		// Worth a mark: it is invisible otherwise (the turn still succeeds, just
 		// several times slower), and it is nearly always one line of settings.
@@ -845,10 +858,10 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 				// recommend, changes nothing: same prompt tokens, cached=11507 of
 				// 11511 with the flag removed, even with <think> blocks left inline
 				// in the history. It is a no-op wherever the template ignores it.
-				line += "The rendering never changed, so it is not the role split: check the gap before each call. " +
-					"Minutes apart means the server dropped an idle slot and no setting will fix it. Seconds apart means " +
-					"something rewrote the middle of the prompt: a tool result that replayed differently, or a chat template " +
-					"that repositions content as the conversation grows. "
+				line += "The rendering never changed, so it is not the role split, and the CACHE lines say which of the other " +
+					"two it was: a gap of minutes means the server dropped an idle slot and no setting will fix it, seconds " +
+					"apart means something rewrote the middle of the prompt (a tool result that replayed differently, or a " +
+					"chat template that repositions content as the conversation grows). "
 			}
 			line += "See the session log (CACHE lines) for the calls."
 		}

@@ -20,6 +20,20 @@ func ptr[T any](v T) *T { return &v }
 
 // newTestAgent returns an agent with one session rooted at a fresh tempdir.
 // a.conn is left nil so sendUpdate becomes a no-op (covered by the nil-check).
+// lineageClock hands out call times one second apart. Most of the lineage
+// tests do not care when their calls happened, but noteCacheLineage records the
+// gap between them now, and feeding it one frozen instant everywhere would
+// leave that arithmetic exercised nowhere. A second is a healthy tool-loop
+// cadence, so every call these tests make reads as "too soon to be an idle
+// eviction" unless a test says otherwise.
+func lineageClock() func() time.Time {
+	at := time.Date(2026, 8, 21, 22, 0, 0, 0, time.UTC)
+	return func() time.Time {
+		at = at.Add(time.Second)
+		return at
+	}
+}
+
 func newTestAgent(t *testing.T) (*agent, *Session) {
 	t.Helper()
 	s, err := newSession(t.TempDir())

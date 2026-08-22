@@ -741,32 +741,47 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		// our backs; logged per call, and reported once on the Done line.
 		if conn.cacheLineage && promptTokens > 0 {
 			render := renderKey(conn.ExtraBody)
-			n, prevRender, changed := sess.noteCacheLineage(promptTokens, cachedTokens, render)
-			if n > 0 {
+			rw := sess.noteCacheLineage(promptTokens, cachedTokens, render, time.Now())
+			if rw.tokens > 0 {
 				// Print "(none)" rather than an empty string: a params table with
 				// no template fields at all is the good configuration, and it
 				// should not read like missing data.
-				was, now := prevRender, render
+				was, now := rw.prevRender, render
 				if was == "" {
 					was = "(none)"
 				}
 				if now == "" {
 					now = "(none)"
 				}
-				if changed {
+				// The gap since the previous call, because token counts alone
+				// cannot separate "something re-rendered the prompt" from "the
+				// server reclaimed a slot we left sitting". Both look identical in
+				// prompt/cached, and only one of them is worth acting on. There is
+				// always a previous call here (a rewind needs one), so this is
+				// always a real measurement.
+				gap := humanDuration(rw.idle.Milliseconds())
+				if rw.renderChanged {
+					a.logSession(sid, connLabel+" CACHE",
+						"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d, %s since that call). "+
+							"Cause: we asked for a different rendering than last call. Template params went %s -> %s. The server keeps "+
+							"a prompt state per rendering, so this call could only reuse what THIS rendering held last time and had to "+
+							"re-evaluate everything the other role appended since. Make params_thinking and params_execute agree on "+
+							"everything that is not a sampler.",
+						rw.tokens, promptTokens, cachedTokens, gap, was, now)
+				} else if rw.idle >= idleEvictionSuspect {
 					a.logSession(sid, connLabel+" CACHE",
 						"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d). "+
-							"Cause: we asked for a different rendering than last call. Template params went %s -> %s, "+
-							"which re-renders the whole prompt. Make params_thinking and params_execute agree on everything "+
-							"that is not a sampler, or give this server a KV slot per rendering (parallel >= 2).",
-						n, promptTokens, cachedTokens, was, now)
+							"Both calls asked for the same rendering (%s) and the slot sat idle %s beforehand, which is the "+
+							"likeliest cause: servers reclaim idle slots and no setting prevents it. Nothing to fix unless the "+
+							"gap surprises you.",
+						rw.tokens, promptTokens, cachedTokens, now, gap)
 				} else {
 					a.logSession(sid, connLabel+" CACHE",
 						"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d). "+
-							"Both calls asked for the same rendering (%s), so this is not a role switch: the chat template "+
-							"repositioned earlier messages on its own (Qwen3.6 does this unless chat_template_kwargs.preserve_thinking = true), "+
-							"a tool result replayed differently than it was sent, or the server dropped the prefix after an idle gap.",
-						n, promptTokens, cachedTokens, now)
+							"Both calls asked for the same rendering (%s) and they were only %s apart, so an idle eviction is "+
+							"unlikely: something rewrote the middle of the prompt. A tool result that replayed differently than "+
+							"it was sent, or a chat template that repositions earlier messages as the conversation grows.",
+						rw.tokens, promptTokens, cachedTokens, now, gap)
 				}
 			}
 		}
@@ -852,6 +867,14 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		}
 	default:
 		err = nil
+	}
+	// A generation the caller cannot use is decode time spent for nothing, and
+	// it is already inside the turn's completion total. Name it, or the Done
+	// line reports the worst turns as the most productive ones.
+	if err != nil && completionTokens > 0 {
+		if sess := a.getSession(sid); sess != nil && !conn.noTurnStats {
+			sess.addWastedCompletion(completionTokens)
+		}
 	}
 
 	// One RESPONSE block per call, on every exit path. The raw SSE wire is one
