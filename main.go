@@ -25,6 +25,9 @@ var defaultDocumentMD string
 //go:embed res/SUMMARISE.md
 var defaultSummariseMD string
 
+//go:embed res/RESUMMARISE.md
+var defaultResummariseMD string
+
 //go:embed res/Dockerfile.devcontainer.alpine
 var defaultDevcontainerDockerfileAlpine string
 
@@ -84,6 +87,13 @@ type agent struct {
 	// probeAllLLMs; nil before the first prepare — a nil-map read is the zero
 	// probeResult, so renderLLMStatus stays safe.
 	connProbe map[string]probeResult
+
+	// ctkIgnored remembers which Server+Model has already been reported for
+	// accepting chat_template_kwargs and ignoring it, so the warning fires once
+	// per deployment instead of once per call. Its own map, not under a.mu:
+	// llmStream reaches it from every background goroutine and must not queue
+	// behind a foreground handler for a bool.
+	ctkIgnored sync.Map
 
 	// mainSlotTokens is the per-slot context window for LLM[0] in tokens.
 	// Discovered by the startup probe: llama.cpp /props reports it per-slot
@@ -506,7 +516,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	a.putSession(s)
 
 	// Seed .codehalter/ defaults when absent. Phase prompts
-	// (PLAN/EXECUTE/DOCUMENT/SUMMARISE) are user-owned templates seeded once;
+	// (PLAN/EXECUTE/DOCUMENT/SUMMARISE/RESUMMARISE) are user-owned templates seeded once;
 	// every SKILL-*.md (including the always-on container skill) is owned by
 	// ensureSkills (skills.go), which seeds it once and otherwise leaves it.
 	dir := filepath.Join(cwd, ".codehalter")
@@ -518,6 +528,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 		{"EXECUTE.md", defaultExecuteMD},
 		{"DOCUMENT.md", defaultDocumentMD},
 		{"SUMMARISE.md", defaultSummariseMD},
+		{"RESUMMARISE.md", defaultResummariseMD},
 	} {
 		path := filepath.Join(dir, f.name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {

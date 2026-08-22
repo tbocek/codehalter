@@ -152,6 +152,16 @@ type Session struct {
 	Depth     int       `toml:"depth,omitempty"`
 	ParentID  string    `toml:"parent_id,omitempty"`
 	Summary   string    `toml:"summary,omitempty"`
+	// FoldedSummary is a shorter rewrite of Summary, produced in the background
+	// after a compaction (scheduleSummaryFold) and consumed as the BASE of the
+	// next one. Empty means "no rewrite ready", which is not an error: the next
+	// compaction then concatenates onto Summary exactly as it always did.
+	//
+	// It is a separate field rather than an in-place shrink of Summary because
+	// Summary leads every request. Rewriting it between compactions would
+	// re-render the entire prompt behind it for a saving nothing reads until the
+	// next compaction, which is the one moment the prefix is already gone.
+	FoldedSummary string `toml:"folded_summary,omitempty"`
 	// Title is the thread name shown in the client, derived from the first user
 	// message (see setSessionTitle). Persisted so a reloaded thread keeps the
 	// name it was given instead of reverting to its id.
@@ -367,9 +377,32 @@ type Session struct {
 	// Prefix-cache rewind detector, fed by the tool loop's calls only (see
 	// noteCacheLineage). cacheRewinds counts the calls that had to re-read
 	// prompt the previous call already sent; cacheRewound sums those tokens.
+	//
+	// cachePrevPrompt deliberately does NOT reset per turn (resetTurnStats
+	// leaves it alone): the comparison point is a property of the conversation,
+	// not of the turn. Zeroing it at every turn start exempted the FIRST call of
+	// every turn from the check, which is the one place message-list mutations
+	// actually land (compaction, a summariser fold, a tool result that replays
+	// differently than it was sent). An 11.6h session logged zero CACHE lines
+	// with a 30466-token rewind sitting in it, at exactly such a boundary.
 	cachePrevPrompt int
+	// cachePrevRender is the previous call's renderKey: the template-affecting
+	// params it was sent with. Kept next to cachePrevPrompt, and dropped by the
+	// same two callers, because it answers the question the token counts raise
+	// but cannot settle: a rewind means the prompt was re-rendered, and this
+	// says whether WE asked for that (a role switch across differing
+	// chat_template_kwargs) or the server did it on its own.
+	//
+	// Not persisted, like the rest of the lineage: a restart re-prefills anyway,
+	// so there is no cache to reason about across process boundaries.
+	cachePrevRender string
 	cacheRewinds    int
 	cacheRewound    int
+	// cacheRewindsRender is the subset of cacheRewinds where the two calls
+	// carried different template params. Split out because the fix differs: for
+	// those the user has one line of settings.toml to change, for the rest the
+	// cause is elsewhere entirely.
+	cacheRewindsRender int
 }
 
 // resetTurnStats starts a fresh per-turn measurement window at start.
@@ -383,9 +416,11 @@ func (s *Session) resetTurnStats(start time.Time) {
 	s.haveServerCache = false
 	s.turnPromptMs = 0
 	s.turnGenMs = 0
-	s.cachePrevPrompt = 0
+	// cachePrevPrompt survives on purpose — see its declaration. The counters
+	// below are per-turn reporting and do reset.
 	s.cacheRewinds = 0
 	s.cacheRewound = 0
+	s.cacheRewindsRender = 0
 	s.turnStatsMu.Unlock()
 }
 
@@ -419,12 +454,24 @@ const cacheRewindSlack = 1024
 
 // noteCacheLineage folds one tool-loop call's cache split into the turn's
 // rewind detector and returns how many tokens this call re-read that the
-// previous call had already sent (0 when the prefix held).
+// previous call had already sent (0 when the prefix held), plus the previous
+// call's renderKey and whether it differs from this call's.
+//
+// render is this call's renderKey. When it changed, the rewind is explained:
+// the two calls asked the server for two different renderings of the same
+// conversation, so there was no shared prefix to hit. When it did NOT change,
+// that is just as informative: it rules the settings out and points at
+// compaction, a tool result that replayed differently, or a server-side
+// eviction.
 //
 // Only the tool loop feeds this (LLMConnection.cacheLineage), because only the
 // tool loop guarantees the premise: each call's message list is the previous
 // call's plus an append, so the server should serve the whole previous prompt
-// from cache and evaluate just the new tail. When cached comes back well below
+// from cache and evaluate just the new tail. The premise holds ACROSS turn
+// boundaries too (the next turn's first call is the same list plus one user
+// message), which is why the comparison point outlives resetTurnStats: the two
+// place where it genuinely does not hold drops it by hand (resetCacheLineage,
+// called by compaction). When cached comes back well below
 // the previous prompt, something re-rendered the middle of the prompt: a
 // chat template that repositions content (Qwen3.6 moves the <think> wrappers
 // when the last user message moves, which chat_template_kwargs.preserve_thinking
@@ -433,21 +480,34 @@ const cacheRewindSlack = 1024
 //
 // cached < 0 means the backend reported no cache split; then there is nothing
 // to compare and the lineage restarts at this call.
-func (s *Session) noteCacheLineage(prompt, cached int) int {
+func (s *Session) noteCacheLineage(prompt, cached int, render string) (int, string, bool) {
 	s.turnStatsMu.Lock()
 	defer s.turnStatsMu.Unlock()
-	prev := s.cachePrevPrompt
-	s.cachePrevPrompt = prompt
+	prev, prevRender := s.cachePrevPrompt, s.cachePrevRender
+	s.cachePrevPrompt, s.cachePrevRender = prompt, render
 	if prev <= 0 || cached < 0 {
-		return 0
+		return 0, prevRender, false
+	}
+	// A shrinking prompt is not a rewind: an extension can only grow, so if this
+	// call is SMALLER than the previous one the message list was rewritten and
+	// there was never a prefix to reuse. Reporting prev-cached there invents
+	// enormous faults out of ordinary context resets. Measured against one 11.6h
+	// session, this guard is the difference between 16 reported rewinds (10 of
+	// them a compaction dropping 115135 tokens to 5970) and the 6 that were real.
+	if prompt+cacheRewindSlack < prev {
+		return 0, prevRender, false
 	}
 	rewound := prev - cached
 	if rewound <= cacheRewindSlack {
-		return 0
+		return 0, prevRender, false
 	}
 	s.cacheRewinds++
 	s.cacheRewound += rewound
-	return rewound
+	if prevRender != render {
+		s.cacheRewindsRender++
+		return rewound, prevRender, true
+	}
+	return rewound, prevRender, false
 }
 
 // resetCacheLineage drops the comparison point so the next call can't be read
@@ -457,6 +517,7 @@ func (s *Session) noteCacheLineage(prompt, cached int) int {
 func (s *Session) resetCacheLineage() {
 	s.turnStatsMu.Lock()
 	s.cachePrevPrompt = 0
+	s.cachePrevRender = ""
 	s.turnStatsMu.Unlock()
 }
 
@@ -490,6 +551,9 @@ type turnReport struct {
 	genMs           int64
 	cacheRewinds    int // calls that re-read prompt the previous call had sent
 	cacheRewound    int // Σ of those re-read tokens
+	// cacheRewindsRender is how many of cacheRewinds we caused ourselves by
+	// changing the template params between the two calls.
+	cacheRewindsRender int
 }
 
 func (s *Session) turnStats() turnReport {
@@ -503,15 +567,16 @@ func (s *Session) turnStats() turnReport {
 		activeMs = 0
 	}
 	return turnReport{
-		activeMs:        activeMs,
-		completion:      s.turnCompletionTokens,
-		evaluatedPrompt: s.turnEvaluatedPrompt,
-		lastPrompt:      s.turnLastPrompt,
-		haveServerCache: s.haveServerCache,
-		promptMs:        s.turnPromptMs,
-		genMs:           s.turnGenMs,
-		cacheRewinds:    s.cacheRewinds,
-		cacheRewound:    s.cacheRewound,
+		activeMs:           activeMs,
+		completion:         s.turnCompletionTokens,
+		evaluatedPrompt:    s.turnEvaluatedPrompt,
+		lastPrompt:         s.turnLastPrompt,
+		haveServerCache:    s.haveServerCache,
+		promptMs:           s.turnPromptMs,
+		genMs:              s.turnGenMs,
+		cacheRewinds:       s.cacheRewinds,
+		cacheRewound:       s.cacheRewound,
+		cacheRewindsRender: s.cacheRewindsRender,
 	}
 }
 

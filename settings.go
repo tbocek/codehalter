@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -130,6 +131,17 @@ type LLMConnection struct {
 	// KV slot). Stamped by MainLLM / ConnAt / connForBackgroundLLM; runtime-only.
 	Slot int `toml:"-"`
 
+	// noThinkPrefill suppresses reasoning by APPENDING a closed think block to
+	// the messages instead of changing chat_template_kwargs. Set (on a copy) by
+	// withThinkingDisabled. A kwargs change re-runs the template over the whole
+	// conversation, so the server sees a token sequence it has never held and
+	// re-prefills from zero; an appended message is an extension, so every token
+	// before it still matches. Measured against ai.jos.li on a 13,972-token
+	// prompt: enable_thinking=false came back cached=0, the prefill came back
+	// cached=13,968 of 13,978 and suppressed reasoning just as completely.
+	// Runtime-only.
+	noThinkPrefill bool
+
 	// noTurnStats excludes this call from the per-turn "✅ Done" usage stats.
 	// Set (on a copy) by prewarm: its call logs under the real sid for
 	// diagnosability, but a turn that starts while the warm is still streaming
@@ -159,6 +171,49 @@ type LLMConnection struct {
 	cacheLineage bool
 }
 
+// samplerParams are the request fields that only steer generation. They never
+// reach the server's chat template, so two calls that differ only in these
+// render the same tokens and share a KV prefix. Everything else in a params
+// table is assumed to change the rendering.
+var samplerParams = map[string]bool{
+	"frequency_penalty": true, "max_tokens": true, "min_p": true,
+	"n": true, "presence_penalty": true, "repeat_penalty": true,
+	"seed": true, "stop": true, "temperature": true, "top_k": true, "top_p": true,
+}
+
+// renderKey fingerprints the params that reach the server's chat template:
+// everything the role configured except the samplers. Two calls with the same
+// key render the same messages to the same tokens, so the second extends the
+// first's KV prefix. Two different keys are two different token sequences, and
+// a server with one slot can only hold one of them.
+//
+// Built from the role's params, not from the assembled request body: model,
+// messages, tools and stream are codehalter's own and identical by
+// construction. "" means "nothing that touches the template was configured".
+//
+// It exists so a detected rewind can NAME its cause. Without it the log can
+// only list the four things that could have done it and let the user guess,
+// which is what turned one real diagnosis into an offline analysis of a 397 MB
+// session log.
+func renderKey(extra map[string]any) string {
+	keep := map[string]any{}
+	for k, v := range extra {
+		if !samplerParams[k] {
+			keep[k] = v
+		}
+	}
+	if len(keep) == 0 {
+		return ""
+	}
+	// encoding/json sorts map keys, so the same params always yield the same
+	// key regardless of TOML ordering or map iteration order.
+	b, err := json.Marshal(keep)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // paramsFor returns the sampler params for the given role, falling back to
 // the legacy single `params` set when the role-specific one isn't configured.
 // An empty map (nil) is fine — llmStream just won't add any extra body keys.
@@ -172,9 +227,48 @@ func (c *LLMConnection) paramsFor(role string) map[string]any {
 		if len(c.ParamsExecute) > 0 {
 			return c.ParamsExecute
 		}
+		return c.Params
 	}
 	return c.Params
 }
+
+// Why paramsFor hands back the role's params untouched, and in particular never
+// adds chat_template_kwargs of its own:
+//
+// Turning reasoning off for execute is worth a lot on a thinking model.
+// Measured over one 11.6h session against Qwen3.8-27B: 308 execute calls,
+// 169030 completion tokens, 71.2 minutes of pure decode, of which reasoning was
+// roughly 70%. Qwen's documented soft switch does not deliver it — 237 of 388
+// execute responses carrying /no_think in the last user message still returned
+// reasoning_content. chat_template_kwargs.enable_thinking=false does: 71
+// responses, 0 with reasoning, 20.7s -> 8.8s per call.
+//
+// Setting it here anyway would be a bad trade on a single-slot server, which is
+// the default. That field is an argument to the server's Jinja chat template,
+// so giving execute a different value from thinking gives the two roles
+// different renderings, and the two alternate: 35 role switches over 436 calls
+// in that same session, one every ~12 calls. With identical renderings those 35
+// switches re-evaluated 121748 tokens between them (median 1526 per switch,
+// 97.4% cached), which is 4.2 minutes at the server's measured 483 tok/s
+// prefill. The same 35 calls carried 2414262 prompt tokens, so re-prefilling
+// each from scratch is 83.3 minutes. That is more than the ~50 minutes of
+// decode the change was buying.
+//
+// Sum, not 35x the median: the switch prompts are right-skewed (median 55308,
+// mean 68978, max 136803) and the deep ones dominate the total.
+//
+// And re-prefill is what was actually observed. The one time the two renderings
+// diverged in that session (the stuck-thinking retry, 22:32Z) the server came
+// back with cached=0 on a 71997-token prompt, then 27585 re-evaluated switching
+// back: a complete cache loss in both directions, on this server, at this
+// context depth. n=1, but it is the only direct measurement and it points the
+// conservative way.
+//
+// So it is a per-connection decision the user makes, not a default codehalter
+// imposes, because the answer depends on the slot count of the server in front
+// of it. res/settings.toml documents when to take it. On a server holding two
+// or more slots each rendering keeps its own KV cache and the switch is cheap;
+// on one slot it is the 83 minutes above.
 
 // endpoint joins the configured server base with an API path, e.g.
 // endpoint("/v1/models") → "http://host:8080/v1/models". The user configures

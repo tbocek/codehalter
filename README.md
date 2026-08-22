@@ -279,6 +279,48 @@ The agent never commits or pushes on its own, only when you explicitly ask. When
 
 `.codehalter/` is gitignored on first bootstrap, so the draft file never accidentally gets staged.
 
+## Glossary
+
+These words mean one specific thing each. The code uses them in comments; this is the reference.
+
+**Session**: one Zed thread. Persisted to `.codehalter/session_<id>.toml` and reloaded on restart. One user, one project, one conversation.
+
+**Large turn** (also "user turn"): one user prompt until the `✅ Done` line, i.e. until you can type again. One `orchestrate()` call. It contains the whole pipeline: plan, every subtask, every replan, document. Elsewhere in this README the word "prompt" means this.
+
+**Small turn** (also "harness turn"): one LLM request/response plus the tool results it triggered. Stored as one assistant message, stamped with its phase and with that call's `prompt_tokens`. A large turn is typically tens of small turns.
+
+**In-flight turn**: the large turn currently running, and inside it the small turn not yet answered. Compaction always keeps the in-flight small turn; that is the one thing it can never fold away.
+
+**Phase**: which stage of the pipeline a small turn belongs to: `plan`, `execute`, `document` or `subagent`. Recorded per message.
+
+**Role**: which params table a call is sent with: `thinking` (plan and replan) or `execute` (subtasks, document, subagents, web summarisation). Both roles are the *same* `[[llm]]` entry, i.e. the same server and the same model. Only `params_thinking` vs `params_execute` differ.
+
+**LLM call**: one HTTP request to the server. This is the unit the prefix cache sees. One small turn is one LLM call.
+
+**Rendering**: the flat token sequence the server's chat template produces from (messages, tools, `chat_template_kwargs`). You send JSON; the server caches *tokens*. The same conversation sent with two different `chat_template_kwargs` produces two different renderings.
+
+**Prefix cache / KV slot**: the server-side KV cache holding one rendering. `parallel = N` gives the server N slots. Reuse is longest-common-prefix from token 0: position 40,000 is reusable only if tokens 0 to 39,999 are identical to last time.
+
+**Rewind**: an LLM call whose `cached` count came back below the previous call's `prompt` count, meaning the server re-read tokens it already had. Logged as `CACHE` lines in the session log and counted on the `✅ Done` line.
+
+**Compaction**: the reactive fold triggered by a context-overflow `400`. Keeps the in-flight small turn (plus recent completed small turns on the first step) and folds everything older into the Summary.
+
+**Turn note**: a seven-section structured note the background LLM writes about each *completed large turn*.
+
+**Shadow buffer**: where turn notes accumulate between compactions. Persisted, so it survives a restart.
+
+**Summary**: the rolling prose that leads the context after a compaction. **Folded summary** is a shorter rewrite of it, produced in the background and used as the base of the *next* compaction, so summaries do not grow without bound.
+
+**Background LLM**: the `purpose = "summary"` entry. Runs turn notes and the git-commit drafter off the foreground slot. With only one slot available it rides the foreground context as a prefix extension instead.
+
+### Why a role switch can cost a full re-prefill
+
+Inside a *single* large turn the role changes at least once: plan runs on `thinking`, then the first subtask switches to `execute`. Every replan switches back to `thinking` and forward again, so a turn that replans twice switches five times. If `params_thinking` and `params_execute` differ in anything that reaches the chat template (`chat_template_kwargs` above all), those calls ask the server for two different renderings of the same conversation. A rendering the server has never held costs a full prefill; after that it may keep both and serve either, in which case a switch costs only what was appended under the other rendering since you last used this one. Probed against llama.cpp on a 13,972-token prompt: adding `enable_thinking = false` returned `cached = 0`, and the same request repeated returned `cached = 13,932`. So the floor is one full re-prefill per rendering and the running cost is roughly double the prefill work of a single rendering, since each switch re-reads what the other role wrote. Samplers (`temperature`, `top_p`, `max_tokens`, …) never enter the rendering and may differ freely.
+
+Measured on one 11.6 h session against a single-slot 27B: 436 LLM calls on the foreground connection, 35 role switches, one every ~12 calls. With both roles rendering identically those switches re-read 121,748 tokens in total (median 1,526 each, 97.4 % cached), which is 4.2 min at the server's measured 483 tok/s. The same 35 calls carried 2,414,262 prompt tokens between them, so re-prefilling each from scratch is 83.3 min. Six calls in that session did lose a prefix, and only one was a rendering change: the stuck-in-`<think>` retry, which then flipped `enable_thinking`. Entering that window cost 71,997 tokens at `cached = 0` and leaving it 27,585 more, the span generated while the flag was on. The other four losses were idle evictions and noise.
+
+codehalter no longer does that. The retry now appends an already-closed `<think></think>` as a trailing assistant message and asks the server to continue it, which is exactly what the template emits for `enable_thinking = false` but reached by extension rather than re-rendering. Same suppression, no divergence: probed on that server with a tools array attached, the prefill returned `cached = 14,263` of 14,273 and still emitted its tool call, where the kwargs flip returned `cached = 0`. The detector above stays because a `settings.toml` whose two roles disagree reproduces the old cost exactly. `res/settings.toml` carries the same note next to the params tables.
+
 ## How it works
 
 1. Zed spawns `codehalter` as a subprocess and communicates via JSON-RPC 2.0 over stdio.

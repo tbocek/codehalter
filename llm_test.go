@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -314,8 +316,10 @@ func TestIsTransientStreamError(t *testing.T) {
 }
 
 // TestThinkingOn pins the guard deciding whether a <think> stall is recoverable:
-// thinking counts as ON unless chat_template_kwargs.enable_thinking is explicitly
-// false (a thinking-off retry), so the retry can't loop.
+// thinking counts as ON unless the request already suppressed it, so the retry
+// can't loop. Two ways it can be suppressed: the user's own
+// chat_template_kwargs.enable_thinking=false, or codehalter's own retry
+// continuing a prefilled closed <think></think> (continue_final_message).
 func TestThinkingOn(t *testing.T) {
 	cases := []struct {
 		name string
@@ -326,6 +330,11 @@ func TestThinkingOn(t *testing.T) {
 		{"empty kwargs", map[string]any{"chat_template_kwargs": map[string]any{}}, true},
 		{"enabled", map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": true}}, true},
 		{"disabled", map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}, false},
+		{"prefill continued", map[string]any{"continue_final_message": true}, false},
+		{"prefill, kwargs say on", map[string]any{
+			"continue_final_message": true,
+			"chat_template_kwargs":   map[string]any{"preserve_thinking": true},
+		}, false},
 	}
 	for _, c := range cases {
 		if got := thinkingOn(c.body); got != c.want {
@@ -334,27 +343,80 @@ func TestThinkingOn(t *testing.T) {
 	}
 }
 
-// TestWithThinkingDisabled pins the retry conn copy: enable_thinking is forced
-// false, sibling params and routing fields survive, and the original is untouched.
+// TestWithThinkingDisabled pins the retry conn copy: it arms the prefill and
+// leaves ExtraBody alone, so the two calls still render the same way. Routing
+// fields survive and the original is untouched.
+//
+// ExtraBody is what renderKey fingerprints. If the retry wrote
+// chat_template_kwargs (as it once did), the server would re-render the whole
+// conversation and hand back cached=0; the append leaves every earlier token in
+// place. Measured against ai.jos.li on the same 13,972-token prompt: kwargs
+// cached=0, prefill cached=13,968 of 13,978, reasoning suppressed either way.
 func TestWithThinkingDisabled(t *testing.T) {
 	orig := &LLMConnection{Server: "s", Model: "m", Slot: 2, ExtraBody: map[string]any{
 		"temperature":          0.7,
-		"chat_template_kwargs": map[string]any{"enable_thinking": true, "keep": 1},
+		"chat_template_kwargs": map[string]any{"preserve_thinking": true},
 	}}
 	off := orig.withThinkingDisabled()
 
 	if off.Server != "s" || off.Model != "m" || off.Slot != 2 {
 		t.Errorf("routing fields changed: %+v", off)
 	}
-	ctk := off.ExtraBody["chat_template_kwargs"].(map[string]any)
-	if ctk["enable_thinking"] != false || ctk["keep"] != 1 {
-		t.Errorf("kwargs: got %+v, want enable_thinking=false + keep=1", ctk)
+	if !off.noThinkPrefill {
+		t.Error("withThinkingDisabled did not arm the prefill")
+	}
+	if renderKey(off.ExtraBody) != renderKey(orig.ExtraBody) {
+		t.Errorf("the retry changed the rendering: %s vs %s",
+			renderKey(off.ExtraBody), renderKey(orig.ExtraBody))
+	}
+	if _, set := off.ExtraBody["chat_template_kwargs"].(map[string]any)["enable_thinking"]; set {
+		t.Errorf("the retry still writes enable_thinking: %+v", off.ExtraBody)
 	}
 	if off.ExtraBody["temperature"] != 0.7 {
 		t.Errorf("sibling params dropped: %+v", off.ExtraBody)
 	}
-	if orig.ExtraBody["chat_template_kwargs"].(map[string]any)["enable_thinking"] != true {
+	if orig.noThinkPrefill {
 		t.Error("withThinkingDisabled mutated the original conn")
+	}
+}
+
+// TestPrefillIsAppendedNotRendered pins what goes on the wire for the stall
+// retry: the closed think block arrives as a trailing assistant message the
+// server is told to continue, the earlier messages are untouched (that is the
+// whole point: an append keeps the prefix cache, a re-render does not), and the
+// caller's slice is not mutated.
+func TestPrefillIsAppendedNotRendered(t *testing.T) {
+	mock := newMockLLM(t, sseText("done"))
+	defer mock.Close()
+	a, sess := newTestAgent(t)
+
+	conn := mock.conn("test").withThinkingDisabled()
+	msgs := []llmMessage{{Role: "user", Content: "hi"}}
+	if _, _, _, err := a.llmStream(context.Background(), sess.ID, conn, msgs, nil, nil, nil, nil); err != nil {
+		t.Fatalf("llmStream: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Errorf("llmStream mutated the caller's messages: %+v", msgs)
+	}
+	body := mock.request(0)
+	if body["add_generation_prompt"] != false || body["continue_final_message"] != true {
+		t.Errorf("continuation flags missing: add_generation_prompt=%v continue_final_message=%v",
+			body["add_generation_prompt"], body["continue_final_message"])
+	}
+	if _, set := body["chat_template_kwargs"]; set {
+		t.Errorf("the retry re-rendered the prompt instead of appending: %v", body["chat_template_kwargs"])
+	}
+	sent, _ := body["messages"].([]any)
+	if len(sent) != 2 {
+		t.Fatalf("messages: got %d, want the original plus the prefill: %v", len(sent), sent)
+	}
+	first, _ := sent[0].(map[string]any)
+	if first["role"] != "user" || first["content"] != "hi" {
+		t.Errorf("the original message changed: %v", first)
+	}
+	last, _ := sent[1].(map[string]any)
+	if last["role"] != "assistant" || last["content"] != noThinkPrefillContent {
+		t.Errorf("prefill: got %v, want an assistant %q", last, noThinkPrefillContent)
 	}
 }
 
@@ -418,5 +480,82 @@ func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
 
 	if err := run(false); err != nil {
 		t.Errorf("unarmed conn: err = %v, want nil (the summariser must not be aborted)", err)
+	}
+}
+
+// TestWarnsWhenServerIgnoresThinkingOff pins the detector for the failure mode
+// that has no error attached to it: an OpenAI-compatible server accepts
+// chat_template_kwargs, drops it, and reasons anyway. The answers stay correct
+// and arrive at half speed, so nothing surfaces: it took a log analysis over an
+// 11.6h session to spot it the first time. Fires once per Server+Model
+// (LoadOrStore), since it is a property of the deployment, not of the call.
+//
+// Only a user who wrote enable_thinking=false into a params table gets this;
+// codehalter never sets it itself (paramsFor), so an unconfigured connection
+// has nothing to be disappointed about.
+func TestWarnsWhenServerIgnoresThinkingOff(t *testing.T) {
+	reasoned, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
+		"delta": map[string]any{"reasoning_content": "still thinking about it"},
+	}}})
+	sseReasoned := fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", reasoned)
+
+	warned := func(t *testing.T, role, body string) bool {
+		t.Helper()
+		mock := newMockLLM(t, body)
+		defer mock.Close()
+		a, s := newTestAgent(t)
+		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m",
+			ParamsExecute: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}}}}
+		conn := a.connForSession(context.Background(), s.ID, role)
+		if conn == nil {
+			t.Fatalf("connForSession(%s) returned nil", role)
+		}
+		if _, _, _, err := a.llmStream(context.Background(), s.ID, conn,
+			[]llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil); err != nil {
+			t.Fatalf("llmStream(%s): %v", role, err)
+		}
+		_, seen := a.ctkIgnored.Load(conn.Server + "\x00" + conn.Model)
+		return seen
+	}
+
+	// execute carries enable_thinking=false, and the server reasoned regardless.
+	if !warned(t, "execute", sseReasoned) {
+		t.Error("server ignored enable_thinking=false and nothing was reported")
+	}
+	// thinking asked for no such thing, so reasoning is exactly what was ordered.
+	if warned(t, "thinking", sseReasoned) {
+		t.Error("warned about reasoning on the role that requested it")
+	}
+	// execute with an obedient server: nothing to say.
+	if warned(t, "execute", sseText("done")) {
+		t.Error("warned although the server produced no reasoning")
+	}
+}
+
+// TestRejectedChatTemplateKwargsNamesTheSetting pins that a backend refusing the
+// field (the OpenAI API answers 400 unrecognized_keys) produces an error naming
+// where it came from. chat_template_kwargs is a llama.cpp / vLLM extension that
+// only reaches the wire from a params_* table, quite possibly written months
+// earlier against a different server.
+func TestRejectedChatTemplateKwargsNamesTheSetting(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":{"message":"Unrecognized request argument supplied: chat_template_kwargs"}}`, http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "gpt-x",
+		ParamsExecute: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}}}}
+	conn := a.connForSession(context.Background(), s.ID, "execute")
+	if conn == nil {
+		t.Fatal("connForSession returned nil")
+	}
+	_, _, _, err := a.llmStream(context.Background(), s.ID, conn,
+		[]llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil)
+	if err == nil {
+		t.Fatal("a 400 should be an error")
+	}
+	if !strings.Contains(err.Error(), "params_execute") {
+		t.Errorf("rejection error does not say where the field came from:\n%v", err)
 	}
 }

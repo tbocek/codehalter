@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1992,5 +1993,305 @@ func TestSummarisePrefixIdentity(t *testing.T) {
 		if !bytes.Equal(fb, sb) {
 			t.Errorf("message %d diverges between foreground and summarise:\nforeground: %s\nsummarise:  %s", i, fb, sb)
 		}
+	}
+}
+
+// TestReplayToolOutputViewImage pins the byte-for-byte replay of a view_image
+// tool result. The live call puts []any{text, image_url} on the wire but stores
+// only the text half in tu.Output, so rebuilding from tu.Output alone drops an
+// image out of the MIDDLE of the prompt and shifts every message behind it. A
+// real session paid 30035 re-evaluated tokens to save 431.
+func TestReplayToolOutputViewImage(t *testing.T) {
+	dir := t.TempDir()
+	id := "img_00ff11ee22dd33cc"
+	if err := writeImageFile(dir, id, "image/png", []byte("PNG bytes here")); err != nil {
+		t.Fatalf("writeImageFile: %v", err)
+	}
+	sess := &Session{Cwd: dir}
+	a := &agent{imagesSupported: true}
+
+	// What the live call put on the wire (tools.go runToolCall).
+	text, live, failed := dispatchViewImage(sess, fmt.Sprintf(`{"id":%q}`, id))
+	if failed {
+		t.Fatalf("dispatchViewImage: failed=true (%s)", text)
+	}
+	tu := ToolUse{ID: "tu_1", Name: "view_image", Input: fmt.Sprintf(`{"id":%q}`, id), Output: text}
+
+	got := a.replayToolOutput(sess, tu)
+	parts, ok := got.([]any)
+	if !ok {
+		t.Fatalf("replay returned %T, want []any — the image was dropped from history", got)
+	}
+	if !reflect.DeepEqual(parts, live) {
+		t.Errorf("replay differs from the live wire:\n got %#v\nwant %#v", parts, live)
+	}
+
+	// A failed view_image never carried parts, so it must replay as text.
+	if bad := a.replayToolOutput(sess, ToolUse{ID: "tu_2", Name: "view_image", Failed: true,
+		Input: `{"id":"img_gone"}`, Output: "view_image: image not found"}); bad != "view_image: image not found" {
+		t.Errorf("failed view_image replayed as %#v, want the stored text", bad)
+	}
+	// A server without image support never carried parts either.
+	noImg := &agent{imagesSupported: false}
+	if bad := noImg.replayToolOutput(sess, tu); bad != text {
+		t.Errorf("images-off replay = %#v, want the stored text", bad)
+	}
+	// Any other tool is untouched.
+	if got := a.replayToolOutput(sess, ToolUse{ID: "tu_3", Name: "read_file", Output: "hello"}); got != "hello" {
+		t.Errorf("read_file replay = %#v, want %q", got, "hello")
+	}
+}
+
+// TestReplayToolOutputViewImageFileGone: the bytes vanished between the live
+// call and the rebuild. Nothing can make that replay identical, so it degrades
+// to the stored text instead of failing the turn.
+func TestReplayToolOutputViewImageFileGone(t *testing.T) {
+	sess := &Session{Cwd: t.TempDir()}
+	a := &agent{imagesSupported: true}
+	tu := ToolUse{ID: "tu_1", Name: "view_image", Input: `{"id":"img_deadbeefdeadbeef"}`,
+		Output: "[Image img_deadbeefdeadbeef re-delivered.]"}
+	if got := a.replayToolOutput(sess, tu); got != tu.Output {
+		t.Errorf("replay with the file gone = %#v, want the stored text", got)
+	}
+}
+
+// TestKeepImageRefs: the fold is told to copy image references through
+// verbatim, but a reference it paraphrases away is unrecoverable — nothing else
+// in the session ever names that id again. They are restored deterministically.
+func TestKeepImageRefs(t *testing.T) {
+	old := "Goal: one\n\nAttached images:\n" +
+		"- img_1111111111111111 (image/png) — call view_image id=img_1111111111111111 to view\n" +
+		"- img_2222222222222222 (image/png) — call view_image id=img_2222222222222222 to view\n" +
+		"\nGoal: two\n\nAttached images:\n" +
+		"- img_1111111111111111 (image/png) — call view_image id=img_1111111111111111 to view"
+
+	// The fold kept one id and dropped the other.
+	got := keepImageRefs(old, "Goal: merged\nCritical Context: img_2222222222222222 is the screenshot")
+	if !strings.Contains(got, "id=img_1111111111111111 to view") {
+		t.Errorf("dropped reference not restored:\n%s", got)
+	}
+	if n := strings.Count(got, "img_2222222222222222"); n != 1 {
+		t.Errorf("id already present was re-appended (%d occurrences):\n%s", n, got)
+	}
+	// The same id referenced twice in the old summary is restored once.
+	got = keepImageRefs(old, "Goal: merged, no ids at all")
+	if n := strings.Count(got, "id=img_1111111111111111 to view"); n != 1 {
+		t.Errorf("duplicate reference restored %d times, want 1:\n%s", n, got)
+	}
+	// Nothing missing: the fold is returned untouched.
+	folded := "Goal: merged\n" + old
+	if got := keepImageRefs(old, folded); got != folded {
+		t.Errorf("no-op case rewrote the fold:\n%s", got)
+	}
+}
+
+// TestBoundSummaryUnderBound: below maxSummaryBytes nothing is folded and no
+// LLM call is made — a.settings has no connection here, so a call would be
+// visible as an empty/failed result rather than the input coming back.
+func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
+	// Under the bound there is nothing to fold and nothing is queued.
+	a0, s0 := newTestAgent(t)
+	a0.scheduleSummaryFold(s0, strings.Repeat("Goal: small\n", 8))
+	s0.waitSummarise()
+	if s0.FoldedSummary != "" {
+		t.Errorf("a summary under the bound was folded: %q", s0.FoldedSummary)
+	}
+
+	folded := "Goal: everything so far, in one line."
+	mock := newMockLLM(t, sseText(folded))
+	defer mock.Close()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
+		t.Fatalf("mkdir .codehalter: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".codehalter", "RESUMMARISE.md"), []byte("RESUMMARISE PROMPT\n"), 0o644); err != nil {
+		t.Fatalf("write RESUMMARISE.md: %v", err)
+	}
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	big := strings.Repeat("Goal: big\n", maxSummaryBytes/10+64)
+	s.Summary = big
+	a := &agent{
+		sessions:       map[string]*Session{s.ID: s},
+		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		mainSlotTokens: 90_000,
+	}
+
+	// Deferred: the call that schedules the fold returns before the LLM does,
+	// and Summary is untouched. Summary leads every request, so rewriting it
+	// here would re-prefill the whole prompt behind it.
+	a.scheduleSummaryFold(s, big)
+	s.waitSummarise()
+	if s.Summary != big {
+		t.Error("the fold rewrote Summary; it must only ever write FoldedSummary")
+	}
+	if s.FoldedSummary != folded {
+		t.Fatalf("FoldedSummary = %q, want %q", s.FoldedSummary, folded)
+	}
+	if req := mock.request(0); !strings.Contains(req["messages"].([]any)[0].(map[string]any)["content"].(string), "RESUMMARISE PROMPT") {
+		t.Errorf("fold request did not carry RESUMMARISE.md: %v", req)
+	}
+
+	// The next compaction consumes it as the base, in place of the long
+	// Summary, and clears it. Without an LLM for the notes the in-flight slice
+	// falls back to a raw excerpt, which is fine: what matters is the base.
+	s.AddUser("next question")
+	s.markTurnStart()
+	s.AddAssistant("next answer")
+	s.appendShadow("Goal: the turn after the fold\nProgress: done")
+	if !a.foldHistory(context.Background(), s, len(s.Messages)) {
+		t.Fatal("foldHistory did not fold")
+	}
+	if strings.Contains(s.Summary, big) || !strings.HasPrefix(s.Summary, folded) {
+		t.Errorf("compaction did not build on the folded summary; got %d bytes starting %q", len(s.Summary), clipBytes(s.Summary, 80))
+	}
+	if !strings.Contains(s.Summary, "the turn after the fold") {
+		t.Error("compaction dropped the notes it was folding in")
+	}
+	if s.FoldedSummary != "" {
+		t.Errorf("FoldedSummary survived the compaction that consumed it: %q", s.FoldedSummary)
+	}
+}
+
+// TestSummaryFoldKeepsSummaryOnFailure pins the direction every failure falls
+// in: an unreachable or unhelpful summariser must leave the record alone rather
+// than replace it with something shorter and worse. Growing beats losing.
+func TestSummaryFoldKeepsSummaryOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
+		t.Fatalf("mkdir .codehalter: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".codehalter", "RESUMMARISE.md"), []byte("RESUMMARISE PROMPT\n"), 0o644); err != nil {
+		t.Fatalf("write RESUMMARISE.md: %v", err)
+	}
+	big := strings.Repeat("Goal: big\n", maxSummaryBytes/10+64)
+
+	// No reachable summariser at all.
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s.Summary = big
+	a := &agent{sessions: map[string]*Session{s.ID: s}}
+	a.scheduleSummaryFold(s, big)
+	s.waitSummarise()
+	if s.FoldedSummary != "" || s.Summary != big {
+		t.Errorf("unreachable summariser changed the record: folded=%d summary=%d", len(s.FoldedSummary), len(s.Summary))
+	}
+
+	// A "fold" that came back longer than its input is not a fold.
+	mock := newMockLLM(t, sseText(big+"and more"))
+	defer mock.Close()
+	s2, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s2.Summary = big
+	a2 := &agent{
+		sessions:       map[string]*Session{s2.ID: s2},
+		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		mainSlotTokens: 90_000,
+	}
+	a2.scheduleSummaryFold(s2, big)
+	s2.waitSummarise()
+	if s2.FoldedSummary != "" {
+		t.Errorf("a longer rewrite was accepted as a fold: %d bytes", len(s2.FoldedSummary))
+	}
+}
+
+// TestPasteSummariseCarriesPriorSummary pins that a paste-mode note is written
+// with the rolling Summary in front of it. Prefix-extension mode replays the
+// real wire context, which already renders Summary; a paste sees only the turn
+// slice, so without this the first note after a compaction is written by
+// something that does not know the session's own goal, and it restates what is
+// already recorded directly above where the note will land.
+func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
+	note := sseText("Goal: g\nProgress: did it")
+	mock := newMockLLM(t, note, note)
+	defer mock.Close()
+
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
+		t.Fatalf("mkdir .codehalter: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".codehalter", "SUMMARISE.md"), []byte("SUMMARISE PROMPT\n"), 0o644); err != nil {
+		t.Fatalf("write SUMMARISE.md: %v", err)
+	}
+
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	// Depth > 0 takes the paste branch: a subagent's history is not what this
+	// conn holds, so prefix extension would not line up.
+	s.Depth = 1
+	s.Summary = "Goal: port xdocc to the new API\nConstraint: never touch vendor/"
+	s.AddUser("keep going")
+	s.markTurnStart()
+	s.AddAssistant("kept going")
+
+	a := &agent{
+		sessions:       map[string]*Session{s.ID: s},
+		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		mainSlotTokens: 90_000,
+	}
+	a.backgroundSummarise(s)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for s.peekShadow() == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("backgroundSummarise never appended a note")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	msgs, _ := mock.request(0)["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("paste mode should send one message, got %d", len(msgs))
+	}
+	m, _ := msgs[0].(map[string]any)
+	paste, _ := m["content"].(string)
+	for _, want := range []string{
+		"SUMMARISE PROMPT",
+		"port xdocc to the new API",
+		"never touch vendor/",
+		"Do NOT repeat any of it",
+		"kept going",
+	} {
+		if !strings.Contains(paste, want) {
+			t.Errorf("paste missing %q; got:\n%s", want, paste)
+		}
+	}
+	// Order matters: the recorded block is background for the turn, so it has to
+	// arrive before the transcript it is meant to contextualise.
+	if strings.Index(paste, "</already_recorded>") > strings.Index(paste, "kept going") {
+		t.Errorf("prior summary must precede the turn transcript; got:\n%s", paste)
+	}
+
+	// An empty Summary adds nothing: no stray tags, no wasted prompt tokens.
+	s2, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s2.Depth = 1
+	s2.AddUser("first turn")
+	s2.markTurnStart()
+	s2.AddAssistant("done")
+	a.sessions[s2.ID] = s2
+	a.backgroundSummarise(s2)
+	deadline = time.Now().Add(2 * time.Second)
+	for s2.peekShadow() == "" {
+		if time.Now().After(deadline) {
+			t.Fatalf("second backgroundSummarise never appended a note")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	msgs, _ = mock.request(1)["messages"].([]any)
+	m, _ = msgs[0].(map[string]any)
+	if paste, _ := m["content"].(string); strings.Contains(paste, "already_recorded") {
+		t.Errorf("empty Summary should add no block; got:\n%s", paste)
 	}
 }

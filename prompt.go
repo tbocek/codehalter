@@ -828,10 +828,29 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		// Worth a mark: it is invisible otherwise (the turn still succeeds, just
 		// several times slower), and it is nearly always one line of settings.
 		if r.cacheRewinds > 0 {
-			line += fmt.Sprintf("\n\n⚠ Prefix cache rewound %d× (%s re-read). "+
-				"For Qwen3.6, set `chat_template_kwargs = { preserve_thinking = true }` in BOTH `params_thinking` and `params_execute`; "+
-				"the two roles must not otherwise differ in `chat_template_kwargs`. See the session log (CACHE lines) for the calls.",
+			line += fmt.Sprintf("\n\n⚠ Prefix cache rewound %d× (%s re-read). ",
 				r.cacheRewinds, humanCount(r.cacheRewound))
+			// Two different faults, two different fixes. Say which one this was
+			// instead of listing both: the render-change case is one line of
+			// settings.toml, the other is not in settings.toml at all.
+			if r.cacheRewindsRender > 0 {
+				line += fmt.Sprintf("%d of those switched rendering mid-turn: `params_thinking` and `params_execute` must agree on "+
+					"everything that is not a sampler (`chat_template_kwargs` above all), or this server needs `parallel = 2` "+
+					"so each rendering keeps its own KV slot. ", r.cacheRewindsRender)
+			} else {
+				// Deliberately not naming a magic setting here. On the one 11.6h
+				// session measured this way every stable-rendering rewind was an
+				// idle eviction (gaps of 2h and 14min), and probing the server
+				// afterwards showed preserve_thinking, the flag this line used to
+				// recommend, changes nothing: same prompt tokens, cached=11507 of
+				// 11511 with the flag removed, even with <think> blocks left inline
+				// in the history. It is a no-op wherever the template ignores it.
+				line += "The rendering never changed, so it is not the role split: check the gap before each call. " +
+					"Minutes apart means the server dropped an idle slot and no setting will fix it. Seconds apart means " +
+					"something rewrote the middle of the prompt: a tool result that replayed differently, or a chat template " +
+					"that repositions content as the conversation grows. "
+			}
+			line += "See the session log (CACHE lines) for the calls."
 		}
 		a.say(ctx, sid, line+"\n")
 	}

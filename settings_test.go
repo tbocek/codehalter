@@ -3,20 +3,10 @@ package main
 import (
 	"os"
 	"path/filepath"
-	"reflect"
 	"testing"
 
 	"github.com/BurntSushi/toml"
 )
-
-// samplerParams are the request fields that only steer generation. They never
-// reach the server's chat template, so the two roles may differ in them freely.
-// Anything else is assumed to change the rendered prompt.
-var samplerParams = map[string]bool{
-	"frequency_penalty": true, "max_tokens": true, "min_p": true,
-	"n": true, "presence_penalty": true, "repeat_penalty": true,
-	"seed": true, "stop": true, "temperature": true, "top_k": true, "top_p": true,
-}
 
 // TestLoadSettingsProjectLocalFirst pins the settings precedence: the
 // project-local .codehalter/settings.toml wins over the global
@@ -94,15 +84,23 @@ func TestLoadSettingsProjectLocalFirst(t *testing.T) {
 	}
 }
 
-// TestSeedSettingsRolesDifferInSamplersOnly pins the rule that made a turn pay a
-// full prefill twice: params_execute carried chat_template_kwargs =
-// { enable_thinking = false } and params_thinking did not. That field is an
-// argument to the server's chat template, not a sampler, so the plan → execute
-// role switch re-rendered the entire prompt — 9088 of 14436 tokens
-// re-evaluated, 15s, with the next call (same field) hot again. Reasoning is
-// turned off for execute in the message text now (noThinkSwitch), which the
-// cache doesn't see. Sampler differences stay allowed: they don't enter the KV
-// cache key.
+// TestSeedSettingsRolesDifferInSamplersOnly pins the rule that the SEEDED
+// settings.toml gives both roles the same renderKey. Samplers may differ freely
+// (temperature, max_tokens and friends never reach the chat template); anything
+// else means the two roles ask the server for two different token sequences of
+// the same conversation, and on a one-slot server they evict each other at
+// every plan -> execute switch.
+//
+// Measured over one 11.6h session: 35 role switches carrying 2414262 prompt
+// tokens between them at 483 tok/s prefill. 4.2 minutes with identical
+// renderings (121748 tokens actually re-read), 83.3 if each re-prefills. A user may still opt into the divergence per
+// connection (it turns reasoning off for execute, worth ~50 minutes of decode
+// on that session) and res/settings.toml says when it pays. What ships by
+// default must not, because the default server holds one slot.
+//
+// Asserted through renderKey itself, not a re-implementation of it: the
+// fingerprint the rewind detector compares at runtime is the thing that has to
+// match.
 func TestSeedSettingsRolesDifferInSamplersOnly(t *testing.T) {
 	var s Settings
 	if _, err := toml.Decode(defaultSettingsTOML, &s); err != nil {
@@ -112,23 +110,60 @@ func TestSeedSettingsRolesDifferInSamplersOnly(t *testing.T) {
 		t.Fatal("res/settings.toml declares no [[llm]] entry")
 	}
 	for i, c := range s.LLM {
-		keys := map[string]bool{}
-		for k := range c.ParamsThinking {
-			keys[k] = true
+		think, exec := renderKey(c.ParamsThinking), renderKey(c.ParamsExecute)
+		if think != exec {
+			t.Errorf("llm[%d] renders differently per role (thinking=%s execute=%s): "+
+				"non-sampler params re-render the prompt, so every phase switch re-prefills the context",
+				i, think, exec)
 		}
-		for k := range c.ParamsExecute {
-			keys[k] = true
+	}
+}
+
+// TestParamsForInventsNoChatTemplateKwargs pins that codehalter never puts a
+// chat-template argument on the wire that the user did not write. It is
+// tempting to: turning reasoning off for the execute role is worth ~50 minutes
+// of decode on an 11.6h session against Qwen3.8-27B, and Qwen's /no_think text
+// switch does not deliver it (237 of 388 execute responses reasoned anyway).
+//
+// But it gives the two roles different renderings, and on a one-slot server
+// they evict each other on every plan -> execute switch: 35 switches in that
+// session carrying 2414262 prompt tokens, at 483 tok/s prefill, so 83.3 minutes
+// of re-prefill against the 50 it saves. It is the user's call per connection
+// (res/settings.toml costs it), so paramsFor hands back exactly what was
+// configured.
+func TestParamsForInventsNoChatTemplateKwargs(t *testing.T) {
+	c := LLMConnection{
+		ParamsThinking: map[string]any{"temperature": 1.0},
+		ParamsExecute:  map[string]any{"temperature": 0.6},
+	}
+	for _, role := range []string{"thinking", "execute"} {
+		if _, set := c.paramsFor(role)["chat_template_kwargs"]; set {
+			t.Errorf("%s: codehalter invented chat_template_kwargs: %v", role, c.paramsFor(role))
 		}
-		for k := range keys {
-			if samplerParams[k] {
-				continue
-			}
-			// DeepEqual, not ==: a nested TOML table decodes to a map, and == on two
-			// maps of the same type panics.
-			tv, ev := c.ParamsThinking[k], c.ParamsExecute[k]
-			if !reflect.DeepEqual(tv, ev) {
-				t.Errorf("llm[%d] %q differs between roles (thinking=%v execute=%v): non-sampler params re-render the prompt and break the prefix cache on every phase switch", i, k, tv, ev)
-			}
-		}
+	}
+	// The legacy single `params` set gets the same treatment.
+	legacy := LLMConnection{Params: map[string]any{"temperature": 0.7}}
+	if _, set := legacy.paramsFor("execute")["chat_template_kwargs"]; set {
+		t.Errorf("legacy params: codehalter invented chat_template_kwargs: %v", legacy.paramsFor("execute"))
+	}
+
+	// What the user DID write is passed through untouched, on the role they put
+	// it on and only that role. The divergence is theirs to place.
+	opted := LLMConnection{
+		ParamsThinking: map[string]any{"temperature": 1.0},
+		ParamsExecute: map[string]any{
+			"temperature":          0.6,
+			"chat_template_kwargs": map[string]any{"enable_thinking": false},
+		},
+	}
+	ctk, _ := opted.paramsFor("execute")["chat_template_kwargs"].(map[string]any)
+	if ctk["enable_thinking"] != false {
+		t.Errorf("the user's own kwargs did not survive: %v", opted.paramsFor("execute"))
+	}
+	if _, set := opted.paramsFor("thinking")["chat_template_kwargs"]; set {
+		t.Error("params_execute kwargs leaked onto the thinking role")
+	}
+	if got := opted.paramsFor("execute")["temperature"]; got != 0.6 {
+		t.Errorf("temperature = %v, want 0.6", got)
 	}
 }

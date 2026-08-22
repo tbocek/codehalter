@@ -50,7 +50,7 @@ func TestCacheLineage(t *testing.T) {
 	// Real trace of the fixed run: cached is always prompt(n-1) - 4.
 	healthy := [][2]int{{11307, 5348}, {11483, 11303}, {11666, 11479}, {12732, 11662}}
 	for _, c := range healthy {
-		if n := s.noteCacheLineage(c[0], c[1]); n != 0 {
+		if n, _, _ := s.noteCacheLineage(c[0], c[1], ""); n != 0 {
 			t.Errorf("prompt=%d cached=%d: reported a %d-token rewind, want none", c[0], c[1], n)
 		}
 	}
@@ -63,10 +63,10 @@ func TestCacheLineage(t *testing.T) {
 	// under the slack, deliberately not reported.
 	s2 := &Session{}
 	s2.resetTurnStats(time.Now())
-	s2.noteCacheLineage(15346, 5348) // first call: no comparison point
+	s2.noteCacheLineage(15346, 5348, "") // first call: no comparison point
 	broken := [][3]int{{15346, 8475, 6871}, {17000, 7002, 8344}, {17100, 17035, 0}}
 	for _, c := range broken {
-		if n := s2.noteCacheLineage(c[0], c[1]); n != c[2] {
+		if n, _, _ := s2.noteCacheLineage(c[0], c[1], ""); n != c[2] {
 			t.Errorf("prompt=%d cached=%d: got %d, want %d", c[0], c[1], n, c[2])
 		}
 	}
@@ -79,21 +79,74 @@ func TestCacheLineage(t *testing.T) {
 	// must not make the NEXT call look like a rewind either.
 	s3 := &Session{}
 	s3.resetTurnStats(time.Now())
-	s3.noteCacheLineage(9000, -1)
-	if n := s3.noteCacheLineage(9100, -1); n != 0 {
+	s3.noteCacheLineage(9000, -1, "")
+	if n, _, _ := s3.noteCacheLineage(9100, -1, ""); n != 0 {
 		t.Errorf("no cache info: got %d, want 0", n)
 	}
-	if n := s3.noteCacheLineage(9200, 9096); n != 0 {
+	if n, _, _ := s3.noteCacheLineage(9200, 9096, ""); n != 0 {
 		t.Errorf("after no cache info: got %d, want 0", n)
+	}
+
+	// A prompt far SMALLER than the previous one is a context reset, not a
+	// rewind: nothing could have been reused because it is not the same list any
+	// more. Real trace, 2026-08-21T21:24Z: a 115135-token execute call followed
+	// by a 5970-token plan call at cached=0. Counting prev-cached there reports a
+	// 115135-token fault that never happened. The genuine loss three hours later
+	// (72033 -> 71997, a 36-token shrink from the thinking-off flip) still counts.
+	s5 := &Session{}
+	s5.resetTurnStats(time.Now())
+	s5.noteCacheLineage(115135, 115000, "")
+	if n, _, _ := s5.noteCacheLineage(5970, 0, ""); n != 0 {
+		t.Errorf("context reset reported as a %d-token rewind", n)
+	}
+	s6 := &Session{}
+	s6.resetTurnStats(time.Now())
+	s6.noteCacheLineage(72033, 71900, "")
+	if n, _, _ := s6.noteCacheLineage(71997, 0, ""); n != 72033 {
+		t.Errorf("genuine loss after a 36-token shrink: got %d, want 72033", n)
 	}
 
 	// Compaction rewrites the front of the context on purpose.
 	s4 := &Session{}
 	s4.resetTurnStats(time.Now())
-	s4.noteCacheLineage(30000, 29996)
+	s4.noteCacheLineage(30000, 29996, "")
 	s4.resetCacheLineage()
-	if n := s4.noteCacheLineage(12000, 0); n != 0 {
+	if n, _, _ := s4.noteCacheLineage(12000, 0, ""); n != 0 {
 		t.Errorf("after compaction: got %d, want 0", n)
+	}
+}
+
+// TestCacheLineageSpansTurns pins the blind spot that made every rewind above
+// invisible in practice: resetTurnStats used to zero the comparison point, so
+// the FIRST call of every turn was exempt — and a turn boundary is the one place
+// the message list actually gets mutated (compaction, a summariser fold, a tool
+// result that replays differently than it was sent). One 11.6h session logged
+// zero CACHE lines while carrying a 30466-token rewind at exactly such a
+// boundary. The next turn's first call is still the previous list plus one user
+// message, so the premise holds and the check must survive the reset.
+func TestCacheLineageSpansTurns(t *testing.T) {
+	s := &Session{}
+	s.resetTurnStats(time.Now())
+	s.noteCacheLineage(51594, 51590, "") // last call of turn 1
+
+	s.resetTurnStats(time.Now()) // turn 2 begins
+	// First call of turn 2: an image dropped out of the middle of the prompt, so
+	// the server could only reuse the part in front of it.
+	if n, _, _ := s.noteCacheLineage(51163, 21128, ""); n != 51594-21128 {
+		t.Errorf("first call after a turn boundary: got %d, want %d", n, 51594-21128)
+	}
+	if r := s.turnStats(); r.cacheRewinds != 1 {
+		t.Errorf("cacheRewinds=%d, want 1 — the rewind was not reported", r.cacheRewinds)
+	}
+
+	// The per-turn counters DO reset, so turn 3 starts its report clean while
+	// keeping the comparison point.
+	s.resetTurnStats(time.Now())
+	if r := s.turnStats(); r.cacheRewinds != 0 || r.cacheRewound != 0 {
+		t.Errorf("turn 3: rewinds=%d rewound=%d, want 0 and 0", r.cacheRewinds, r.cacheRewound)
+	}
+	if n, _, _ := s.noteCacheLineage(51500, 51159, ""); n != 0 {
+		t.Errorf("healthy first call of turn 3: got %d, want 0", n)
 	}
 }
 
@@ -233,5 +286,102 @@ func TestKeepWindowStart(t *testing.T) {
 	s3.AddAssistant("a2")
 	if got := s3.keepWindowStart(10_000); got != s3.lastAssistantIndex() {
 		t.Errorf("no usage: keepWindowStart=%d, want lastAssistantIndex=%d", got, s3.lastAssistantIndex())
+	}
+}
+
+// TestCacheLineageNamesTheRenderChange pins the attribution half of the rewind
+// detector. The token counts alone say the prompt was re-rendered; they cannot
+// say who did it. Recording the renderKey of each call answers that, and the
+// two answers have nothing in common: a rendering that changed is one line of
+// settings.toml, a rendering that held is compaction, a tool result that
+// replayed differently, or a server-side eviction.
+//
+// The trace here is the real one from an 11.6h session against a one-slot
+// server: the thinking-off retry flipped enable_thinking mid-run, the next call
+// came back cached=0 on a 71997-token prompt, and switching back re-read 27585
+// more. 99582 tokens for one setting, and nothing in the log said so.
+//
+// codehalter no longer causes this: the retry appends a closed <think></think>
+// instead (see withThinkingDisabled). The detector stays because a settings.toml
+// whose two roles disagree on chat_template_kwargs reproduces it exactly, and
+// the numbers below are what that costs.
+func TestCacheLineageNamesTheRenderChange(t *testing.T) {
+	const (
+		think = `{"chat_template_kwargs":{"preserve_thinking":true}}`
+		exec  = `{"chat_template_kwargs":{"enable_thinking":false}}`
+	)
+	s := &Session{}
+	s.resetTurnStats(time.Now())
+	s.noteCacheLineage(71997, 71000, think)
+
+	// Same conversation, different rendering asked for: the server had nothing
+	// to reuse.
+	n, prev, changed := s.noteCacheLineage(71997, 0, exec)
+	if n != 71997 || !changed {
+		t.Errorf("flip to %s: got n=%d changed=%v, want 71997 and true", exec, n, changed)
+	}
+	if prev != think {
+		t.Errorf("previous rendering = %q, want %q", prev, think)
+	}
+
+	// The run continues under the new rendering and the prefix holds again: the
+	// cost is the switch, not the setting.
+	if n, _, changed := s.noteCacheLineage(99614, 71993, exec); n != 0 || changed {
+		t.Errorf("second call under the new rendering: got n=%d changed=%v, want 0 and false", n, changed)
+	}
+
+	// Switching back re-reads what the other rendering left behind.
+	if n, _, changed := s.noteCacheLineage(99614, 72029, think); n != 27585 || !changed {
+		t.Errorf("flip back: got n=%d changed=%v, want 27585 and true", n, changed)
+	}
+	if r := s.turnStats(); r.cacheRewinds != 2 || r.cacheRewindsRender != 2 {
+		t.Errorf("rewinds=%d of which render changes=%d, want 2 and 2", r.cacheRewinds, r.cacheRewindsRender)
+	}
+
+	// A rewind with the rendering unchanged is a different fault and must not be
+	// blamed on the settings.
+	s2 := &Session{}
+	s2.resetTurnStats(time.Now())
+	s2.noteCacheLineage(51594, 51590, think)
+	if n, _, changed := s2.noteCacheLineage(51163, 21128, think); n == 0 || changed {
+		t.Errorf("rewind with a stable rendering: got n=%d changed=%v, want a rewind and false", n, changed)
+	}
+	if r := s2.turnStats(); r.cacheRewinds != 1 || r.cacheRewindsRender != 0 {
+		t.Errorf("rewinds=%d of which render changes=%d, want 1 and 0", r.cacheRewinds, r.cacheRewindsRender)
+	}
+
+	// Compaction drops the whole comparison point, rendering included, so the
+	// call after it is neither a rewind nor a render change.
+	s2.resetCacheLineage()
+	if n, prev, changed := s2.noteCacheLineage(9000, 0, exec); n != 0 || changed || prev != "" {
+		t.Errorf("after compaction: got n=%d prev=%q changed=%v, want 0, \"\" and false", n, prev, changed)
+	}
+}
+
+// TestRenderKeyIgnoresSamplers pins what goes into the fingerprint. Samplers
+// never reach the chat template, so two roles may differ in them without
+// costing a re-prefill; anything else must be treated as a rendering change,
+// including fields nobody has thought of yet (Qwen3.8 reads a top-level
+// reasoning_effort, for instance).
+func TestRenderKeyIgnoresSamplers(t *testing.T) {
+	plan := renderKey(map[string]any{"temperature": 1.0, "top_p": 0.95, "max_tokens": 8000})
+	exec := renderKey(map[string]any{"temperature": 0.6, "top_p": 0.8, "max_tokens": 4000})
+	if plan != "" || exec != "" {
+		t.Errorf("samplers entered the key: thinking=%q execute=%q", plan, exec)
+	}
+
+	// Same kwargs, written in a different order, must fingerprint identically:
+	// Go map iteration is randomised, and a key that flapped would report a
+	// rewind on every other call.
+	a := renderKey(map[string]any{"temperature": 1.0, "chat_template_kwargs": map[string]any{"preserve_thinking": true, "enable_thinking": true}})
+	b := renderKey(map[string]any{"temperature": 0.6, "chat_template_kwargs": map[string]any{"enable_thinking": true, "preserve_thinking": true}})
+	if a != b || a == "" {
+		t.Errorf("kwargs key is not canonical: %q vs %q", a, b)
+	}
+
+	// An unknown non-sampler counts: assuming it is harmless is how the
+	// expensive kind of rewind goes unnoticed.
+	if k := renderKey(map[string]any{"reasoning_effort": "low"}); k == "" {
+		t.Error("reasoning_effort was dropped from the key")
 	}
 }

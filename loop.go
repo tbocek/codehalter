@@ -306,14 +306,18 @@ type subtaskOutcome struct {
 	Upsert *planResult
 }
 
-// noThinkSwitch turns reasoning off for the phases that don't want it WITHOUT
-// touching chat_template_kwargs. That request field is an argument to the
-// server's chat template, not a sampler, so setting it on one role and not the
-// other makes the server re-render the entire prompt at every phase change:
-// measured on the first execute call of a turn as 9088 of 14436 tokens
-// re-evaluated, 15s, with the very next call (same field) hot again. Qwen's
-// soft switch is plain text in the last user message instead, so everything in
-// front of it stays byte-identical and stays cached.
+// noThinkSwitch is Qwen's documented soft switch for turning reasoning off:
+// plain text in the last user message, so everything in front of it stays
+// byte-identical and stays cached. It costs nothing and some builds honour it.
+//
+// It does NOT reliably work. Measured over one 11.6h session against
+// Qwen3.8-27B, 237 of 388 execute responses carrying /no_think still came back
+// with reasoning_content. The lever that does work is
+// chat_template_kwargs.enable_thinking=false, which is a per-connection setting
+// the user opts into (see paramsFor, where the trade is costed) because it
+// gives the two roles different prompt renderings. This stays because it is
+// free, it works on the builds that honour it, and it is the only thing
+// available on a backend that rejects chat_template_kwargs.
 //
 // It MUST be part of the STORED message (AddUser), never appended to the wire
 // copy: a wire-only suffix would make the same stored message render one way
@@ -842,15 +846,19 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if isStuckThinking(err) && !thinkingRetried {
 				thinkingRetried = true
 				thinkingStalled = true
+				// withThinkingDisabled appends a closed <think></think> for the
+				// model to continue instead of re-rendering the prompt, so the
+				// prefix cache survives both the retry and the return to normal at
+				// the end of this loop. No cache-lineage reset is needed: the next
+				// call extends the previous tokens like any other.
+				//
+				// This used to change chat_template_kwargs, and one real session
+				// paid for it: 71997 tokens re-evaluated at cached=0 entering the
+				// thinking-off window, then 27585 more leaving it, for a 99614-token
+				// context. Probed against the same server afterwards, the append
+				// keeps 13968 of 13978 tokens where the kwargs change kept none.
 				callConn = callConn.withThinkingDisabled()
-				if sess := a.getSession(sid); sess != nil {
-					// This changes chat_template_kwargs, so the server re-renders the
-					// whole prompt. That IS a rewind, but a deliberate one we caused;
-					// drop the comparison point so the Done line doesn't blame the
-					// user's settings for it.
-					sess.resetCacheLineage()
-				}
-				a.logSession(sid, "RECOVER", "model stuck in <think> — retrying with thinking disabled (rest of run)")
+				a.logSession(sid, "RECOVER", "model stuck in <think>: continuing a closed <think></think> for the rest of this tool loop")
 				continue
 			}
 			// A stream rule fired: llmStream abandoned the generation the moment the
@@ -1226,13 +1234,14 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n"+
 				"3. If you are stuck or the task is infeasible, say so and stop.")
 		// Mid-ladder recovery: warm the sampler once before the bail. Same
-		// server/model, and samplers don't enter the KV cache key, so the prefix
-		// cache survives — but only while the two roles differ in SAMPLERS alone.
-		// Anything a role's params feed to the server's chat template
-		// (chat_template_kwargs) re-renders the whole prompt, which would make
-		// this swap a full prefill at the worst possible moment: deep into a long
-		// execute context. That is why thinking is switched off in the message
-		// text instead (noThinkSwitch), not via chat_template_kwargs.
+		// server/model, so it routes to the same slot gate.
+		//
+		// Same server/model, and samplers don't enter the KV cache key, so the
+		// prefix cache survives — but only while the two roles differ in SAMPLERS
+		// alone. A role whose params carry chat_template_kwargs renders the prompt
+		// differently, which would make this swap a re-prefill at the worst
+		// possible moment: deep into a long execute context. res/settings.toml
+		// costs that trade; this is one of the places that pays for it.
 		// Skip when already on "thinking" (plan phase) — a no-op swap.
 		if stuckRounds >= stuckEscalateRounds && !escalated && conn != nil && conn.Tag != "thinking" {
 			if thinkConn := a.connForSession(ctx, sid, "thinking"); thinkConn != nil {

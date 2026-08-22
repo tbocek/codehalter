@@ -227,9 +227,15 @@ func isTransientStreamError(err error) bool {
 
 // thinkingOn reports whether the request had reasoning enabled. Absent
 // chat_template_kwargs (or an absent enable_thinking) counts as on, since the
-// stall is only classified when reasoning_content was actually produced; an
-// explicit enable_thinking=false (a retry) counts as off so it can't loop.
+// stall is only classified when reasoning_content was actually produced. Two
+// things count as off so a retry can't loop: the user's own
+// enable_thinking=false, and our own prefilled-and-continued <think></think>.
 func thinkingOn(reqBody map[string]any) bool {
+	// The stall retry continues an already-closed <think></think> block, so the
+	// model cannot open one no matter what the template says.
+	if cont, _ := reqBody["continue_final_message"].(bool); cont {
+		return false
+	}
 	ctk, ok := reqBody["chat_template_kwargs"].(map[string]any)
 	if !ok {
 		return true
@@ -238,21 +244,71 @@ func thinkingOn(reqBody map[string]any) bool {
 	return !ok || et
 }
 
-// withThinkingDisabled returns a shallow copy of the connection with
-// chat_template_kwargs.enable_thinking forced false in a deep-copied ExtraBody,
-// so the stuck-in-<think> retry answers directly. Slot/Server/Model are
-// unchanged, so it routes to the same connSem. The original conn is untouched.
+// warnChatTemplateKwargsIgnored says so, once per model, when the server sent
+// back reasoning after being asked not to reason. An OpenAI-compatible server
+// is free to accept chat_template_kwargs and drop it on the floor, and several
+// do: Ollama substitutes its own template, llama.cpp without --jinja runs a
+// fallback template that has no enable_thinking to read. The symptom is
+// invisible — correct answers, arriving at half speed, with the whole reasoning
+// budget silently spent. It took a log analysis across an 11.6h session to
+// notice it the first time, which is the argument for saying it out loud at the
+// moment it happens. Setting enable_thinking=false costs a separate rendering
+// (see paramsFor), so paying that and getting nothing back is the worst case of
+// the trade.
+//
+// Once per Server+Model, not per session or per call: it is a property of the
+// deployment, and a per-call warning on a 400-call session is worse than
+// silence.
+func (a *agent) warnChatTemplateKwargsIgnored(ctx context.Context, sid string, conn *LLMConnection, reqBody map[string]any, reasoningBytes int) {
+	if reasoningBytes == 0 || sid == "" || thinkingOn(reqBody) {
+		return
+	}
+	if _, seen := a.ctkIgnored.LoadOrStore(conn.Server+"\x00"+conn.Model, true); seen {
+		return
+	}
+	// Two different mechanisms land here, so the advice has to split. The stall
+	// retry continues a prefilled <think></think>; everything else got here
+	// because the user's own params carry enable_thinking=false.
+	if cont, _ := reqBody["continue_final_message"].(bool); cont {
+		slog.Warn("server ignored the thinking-off prefill",
+			"server", conn.Server, "model", conn.Model, "reasoning_bytes", reasoningBytes)
+		a.say(ctx, sid, "⚠ "+conn.Model+" kept reasoning after being handed a closed <think></think> to continue.\n"+
+			"  The server started a fresh assistant turn instead of continuing the prefilled one, so it does not honour\n"+
+			"  continue_final_message / add_generation_prompt=false. The stuck-in-<think> retry cannot suppress reasoning here;\n"+
+			"  it will still cap the damage, since the reasoning that follows a closed block is short.\n"+
+			"  If this model does not delimit reasoning with <think>/</think>, that is the likelier cause.\n\n")
+		return
+	}
+	slog.Warn("server ignored chat_template_kwargs.enable_thinking=false",
+		"server", conn.Server, "model", conn.Model, "reasoning_bytes", reasoningBytes)
+	a.say(ctx, sid, "⚠ "+conn.Model+" kept reasoning after being asked not to: this server accepts chat_template_kwargs and ignores it.\n"+
+		"  llama.cpp: start llama-server with --jinja, or the built-in fallback template runs and has no enable_thinking to read.\n"+
+		"  vLLM: serve with --reasoning-parser qwen3, or set the default with --default-chat-template-kwargs '{\"enable_thinking\": false}'.\n"+
+		"  Ollama: it substitutes its own template, so per-request kwargs cannot work; use llama.cpp or vLLM.\n"+
+		"  Otherwise drop enable_thinking from params_execute: it is buying a second prompt rendering and nothing else.\n\n")
+}
+
+// noThinkPrefillContent is the assistant prefix the stall retry continues from:
+// an already-closed reasoning block, so the model has no way to open one. This
+// is what Qwen3's own template emits for enable_thinking=false, written as
+// message content instead of asked for as a template argument.
+//
+// It is the one model-specific literal in the retry path. A model whose
+// reasoning delimiters are not <think>/</think> needs a different string here,
+// where chat_template_kwargs would have delegated that to the server's
+// template. That is the price of the append: the payoff is that the prefix
+// cache survives the retry, and the round trip back to normal, for free.
+const noThinkPrefillContent = "<think>\n\n</think>\n\n"
+
+// withThinkingDisabled returns a shallow copy of the connection whose next call
+// answers directly instead of reasoning. It does NOT touch ExtraBody: llmStream
+// appends noThinkPrefillContent as a trailing assistant message and asks the
+// server to continue it, which leaves every earlier token identical and so
+// keeps the prefix cache. Slot/Server/Model are unchanged, so it routes to the
+// same connSem. The original conn is untouched.
 func (c *LLMConnection) withThinkingDisabled() *LLMConnection {
 	cp := *c
-	eb := make(map[string]any, len(c.ExtraBody)+1)
-	maps.Copy(eb, c.ExtraBody)
-	ctk := map[string]any{}
-	if existing, ok := eb["chat_template_kwargs"].(map[string]any); ok {
-		maps.Copy(ctk, existing)
-	}
-	ctk["enable_thinking"] = false
-	eb["chat_template_kwargs"] = ctk
-	cp.ExtraBody = eb
+	cp.noThinkPrefill = true
 	return &cp
 }
 
@@ -372,6 +428,20 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	// detail.
 	reqBody["stream_options"] = map[string]any{"include_usage": true}
 	reqBody["messages"] = messages
+	if conn.noThinkPrefill {
+		// Append the closed think block and tell the server to continue that
+		// message rather than open a fresh assistant turn. Written straight onto
+		// reqBody and not into ExtraBody on purpose: renderKey reads ExtraBody to
+		// decide whether two calls asked for different renderings, and this pair
+		// must not read as one. Verified streaming against llama.cpp: the
+		// continued prefix is not echoed back in the deltas, so the content
+		// arrives clean and needs no stripping.
+		withPrefill := make([]llmMessage, len(messages), len(messages)+1)
+		copy(withPrefill, messages)
+		reqBody["messages"] = append(withPrefill, llmMessage{Role: "assistant", Content: noThinkPrefillContent})
+		reqBody["add_generation_prompt"] = false
+		reqBody["continue_final_message"] = true
+	}
 	if tools != nil {
 		reqBody["tools"] = tools
 	}
@@ -506,6 +576,13 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		}
 		if json.Unmarshal(bodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
 			msg = apiErr.Error.Message
+		}
+		// chat_template_kwargs is a llama.cpp / vLLM extension, not part of the
+		// OpenAI API, and it only ever reaches the wire from a params_* table. Say
+		// where it came from: the OpenAI API's "unrecognized request argument" is
+		// otherwise a puzzle about a field the user set months ago.
+		if strings.Contains(msg, "chat_template_kwargs") {
+			msg += "\n\nThis backend does not accept chat_template_kwargs (it is a llama.cpp / vLLM extension). Remove it from params_thinking / params_execute for this [[llm]] entry."
 		}
 		return "", nil, "", &llmHTTPError{Status: resp.StatusCode, Body: msg, URL: resp.Request.URL.String()}
 	}
@@ -663,12 +740,34 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		// only the tail. A big shortfall means the prompt was re-rendered behind
 		// our backs; logged per call, and reported once on the Done line.
 		if conn.cacheLineage && promptTokens > 0 {
-			if n := sess.noteCacheLineage(promptTokens, cachedTokens); n > 0 {
-				a.logSession(sid, connLabel+" CACHE",
-					"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d). "+
-						"Usual causes: the chat template re-rendered earlier messages (Qwen3.6 needs chat_template_kwargs.preserve_thinking = true "+
-						"in BOTH params_thinking and params_execute), the two roles differ in chat_template_kwargs, or the server dropped the prefix.",
-					n, promptTokens, cachedTokens)
+			render := renderKey(conn.ExtraBody)
+			n, prevRender, changed := sess.noteCacheLineage(promptTokens, cachedTokens, render)
+			if n > 0 {
+				// Print "(none)" rather than an empty string: a params table with
+				// no template fields at all is the good configuration, and it
+				// should not read like missing data.
+				was, now := prevRender, render
+				if was == "" {
+					was = "(none)"
+				}
+				if now == "" {
+					now = "(none)"
+				}
+				if changed {
+					a.logSession(sid, connLabel+" CACHE",
+						"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d). "+
+							"Cause: we asked for a different rendering than last call. Template params went %s -> %s, "+
+							"which re-renders the whole prompt. Make params_thinking and params_execute agree on everything "+
+							"that is not a sampler, or give this server a KV slot per rendering (parallel >= 2).",
+						n, promptTokens, cachedTokens, was, now)
+				} else {
+					a.logSession(sid, connLabel+" CACHE",
+						"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d). "+
+							"Both calls asked for the same rendering (%s), so this is not a role switch: the chat template "+
+							"repositioned earlier messages on its own (Qwen3.6 does this unless chat_template_kwargs.preserve_thinking = true), "+
+							"a tool result replayed differently than it was sent, or the server dropped the prefix after an idle gap.",
+						n, promptTokens, cachedTokens, now)
+				}
 			}
 		}
 		// Prefer the server's measured times over our TTFT proxy (which includes
@@ -698,6 +797,10 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	//     bail (the message guides tuning); if it stopped BELOW the cap it hit the
 	//     n_ctx ceiling (prompt fit but left no room), recoverable, signalled via
 	//     errContextCeiling so the tool loop folds history and retries.
+	// A server that quietly ignores chat_template_kwargs looks exactly like a
+	// server that honours it, right up until the reasoning tokens arrive.
+	a.warnChatTemplateKwargsIgnored(ctx, sid, conn, reqBody, reasoningText.Len())
+
 	switch {
 	case firedRule != nil:
 		// Checked first: we aborted this stream on purpose, so scanErr (the reader
