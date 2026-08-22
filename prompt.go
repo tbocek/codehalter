@@ -293,6 +293,35 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
+// startStatusMeter refreshes the active phase row once a second with whatever
+// render() returns, so anything that takes a while (an LLM round trip, a slow
+// tool) shows a climbing counter instead of a frozen row. setStatus is a no-op
+// when no phase is active, so this is safe to run unconditionally.
+//
+// The returned stop() halts the ticker AND waits for the goroutine, so a late
+// tick can never re-set the row after the caller has cleared it. Callers that
+// also `defer a.setStatus(ctx, sid, "")` must register that defer FIRST, so LIFO
+// runs the join before the clear.
+func (a *agent) startStatusMeter(ctx context.Context, sid string, render func() string) (stop func()) {
+	done, stopped := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				a.setStatus(ctx, sid, render())
+			}
+		}
+	}()
+	return func() { close(done); <-stopped }
+}
+
 // setSubagentStatus records (suffix non-empty) or clears (suffix empty) one
 // subagent's live meter under its parent, then re-renders the parent's
 // in-progress row as a compact " (labelA …metersA · labelB …metersB)" join of

@@ -559,3 +559,130 @@ func TestRejectedChatTemplateKwargsNamesTheSetting(t *testing.T) {
 		t.Errorf("rejection error does not say where the field came from:\n%v", err)
 	}
 }
+
+// TestLLMStreamParsesTextAndTools verifies the SSE parser collects streamed
+// text and tool calls correctly from the mock server.
+func TestLLMStreamParsesTextAndTools(t *testing.T) {
+	// Build an SSE body that mixes text + a tool call, split across chunks.
+	var b strings.Builder
+	// Chunk 1: text delta.
+	c1, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{{
+			"delta": map[string]any{"content": "Hello "},
+		}},
+	})
+	fmt.Fprintf(&b, "data: %s\n\n", c1)
+	// Chunk 2: more text.
+	c2, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{{
+			"delta": map[string]any{"content": "world"},
+		}},
+	})
+	fmt.Fprintf(&b, "data: %s\n\n", c2)
+	// Chunk 3: tool call start (has id).
+	c3, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{{
+			"delta": map[string]any{
+				"tool_calls": []map[string]any{{
+					"id":       "call_1",
+					"type":     "function",
+					"function": map[string]any{"name": "read_file", "arguments": `{"pa`},
+				}},
+			},
+		}},
+	})
+	fmt.Fprintf(&b, "data: %s\n\n", c3)
+	// Chunk 4: tool args continuation (no id → appends to last call).
+	c4, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{{
+			"delta": map[string]any{
+				"tool_calls": []map[string]any{{
+					"function": map[string]any{"arguments": `th":"x.go"}`},
+				}},
+			},
+		}},
+	})
+	fmt.Fprintf(&b, "data: %s\n\n", c4)
+	b.WriteString("data: [DONE]\n\n")
+
+	mock := newMockLLM(t, b.String())
+	defer mock.Close()
+
+	a := &agent{}
+	var collected strings.Builder
+	text, calls, _, err := a.llmStream(
+		context.Background(),
+		"", // unscoped: no session log
+		mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "hi"}},
+		nil,
+		func(tok string) { collected.WriteString(tok) },
+		nil,
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("llmStream: %v", err)
+	}
+	if text != "Hello world" {
+		t.Errorf("text: got %q, want %q", text, "Hello world")
+	}
+	if collected.String() != "Hello world" {
+		t.Errorf("onToken: got %q, want %q", collected.String(), "Hello world")
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls: got %d, want 1", len(calls))
+	}
+	if calls[0].Function.Name != "read_file" {
+		t.Errorf("tool name: got %q", calls[0].Function.Name)
+	}
+	if calls[0].Function.Arguments != `{"path":"x.go"}` {
+		t.Errorf("tool args: got %q", calls[0].Function.Arguments)
+	}
+}
+
+// TestLLMStreamSurfacesInStreamError pins the fix for the swallowed gateway
+// error. Some servers (llama.cpp, llama-swap, the llmhub gateway) return HTTP
+// 200 and put the failure in an {"error":…} SSE chunk with empty choices — e.g.
+// when the prompt exceeds the model's real context length. That chunk used to
+// be skipped at the empty-choices guard, so the whole call looked like a silent
+// "(empty response)" and surfaced three layers up as "plan not valid JSON:
+// unexpected end of JSON input". llmStream must now raise the server's message.
+func TestLLMStreamSurfacesInStreamError(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "nested openai shape",
+			body: `data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}` + "\n\n" +
+				`data: {"error":{"message":"The number of tokens to keep from the initial prompt is greater than the context length"}}` + "\n\n" +
+				"data: [DONE]\n\n",
+		},
+		{
+			name: "bare top-level message",
+			body: `data: {"message":"The number of tokens to keep from the initial prompt is greater than the context length"}` + "\n\n" +
+				"data: [DONE]\n\n",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockLLM(t, tc.body)
+			defer mock.Close()
+
+			a := &agent{}
+			_, _, _, err := a.llmStream(
+				context.Background(), "", mock.conn("execute"),
+				[]llmMessage{{Role: "user", Content: "hi"}}, nil, nil, nil, nil,
+			)
+			if err == nil {
+				t.Fatal("llmStream: got nil error, want the in-stream error surfaced")
+			}
+			if !strings.Contains(err.Error(), "greater than the context length") {
+				t.Errorf("error must carry the server's message verbatim, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), "mid-stream") {
+				t.Errorf("error should be framed as a mid-stream failure, got: %v", err)
+			}
+		})
+	}
+}

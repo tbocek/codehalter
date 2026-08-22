@@ -306,28 +306,6 @@ type subtaskOutcome struct {
 	Upsert *planResult
 }
 
-// noThinkSwitch is Qwen's documented soft switch for turning reasoning off:
-// plain text in the last user message, so everything in front of it stays
-// byte-identical and stays cached. It costs nothing and some builds honour it.
-//
-// It does NOT reliably work. Measured over one 11.6h session against
-// Qwen3.8-27B, 237 of 388 execute responses carrying /no_think still came back
-// with reasoning_content. The lever that does work is
-// chat_template_kwargs.enable_thinking=false, which is a per-connection setting
-// the user opts into (see paramsFor, where the trade is costed) because it
-// gives the two roles different prompt renderings. This stays because it is
-// free, it works on the builds that honour it, and it is the only thing
-// available on a backend that rejects chat_template_kwargs.
-//
-// It MUST be part of the STORED message (AddUser), never appended to the wire
-// copy: a wire-only suffix would make the same stored message render one way
-// while it is last and another way once history moves past it, which is the
-// exact break being removed here.
-//
-// Appended by every phase that runs on the "execute" role: the executor, the
-// documenter, and a leaf subagent. The plan phase deliberately omits it.
-const noThinkSwitch = "\n\n/no_think"
-
 // runExecutePhase runs one subtask as a single tool-calling loop. EXECUTE.md
 // plus the subtask description and verify recipe open the loop; the
 // executor runs with all execute tools (web tools excluded — those live in
@@ -347,8 +325,6 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		}
 	}
 
-	prompt.WriteString(noThinkSwitch)
-
 	if sess != nil {
 		sess.AddUser(prompt.String())
 		sess.saveOrLog()
@@ -358,7 +334,11 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// respond ends the subtask; submit_plan revises the remaining plan in place
 	// (the orchestrator adopts it — see subtaskOutcome).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
-	res, err := a.runToolLoop(ctx, sid, a.connForSession(ctx, sid, "execute"), policy, "execute", true, executeFailCap)
+	// Reasoning off for the whole subtask: withThinkingDisabled appends a closed
+	// <think></think> for the model to continue, which suppresses it without
+	// changing a single earlier token (see llm.go).
+	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
+	res, err := a.runToolLoop(ctx, sid, conn, policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
 	// session, stored verbatim by the loop — no post-hoc patch.
 
@@ -448,7 +428,8 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// not background work — only the summariser and git-commit drafter belong on
 	// the background LLM. Run it on the SAME connection as execute so it reuses
 	// execute's warm KV prefix instead of cold-prefilling a separate slot.
-	conn := a.connForSession(ctx, sid, "execute")
+	// Reasoning off, like the executor it follows (see withThinkingDisabled).
+	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
 	if conn == nil {
 		return exec, nil
 	}
@@ -456,7 +437,7 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// The doc instruction lands in the session as the trailing user turn, so
 	// buildLLMContext hands the documenter the FULL turn — the edits the executor
 	// actually made, not a lossy digest — continuing the cached lineage.
-	sess.AddUser(docPrompt + noThinkSwitch)
+	sess.AddUser(docPrompt)
 	sess.saveOrLog()
 
 	// Blank line before the documenter streams, so its output (often just "No
@@ -662,7 +643,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 // vanished at index 8 of 23 and the server re-evaluated 9998 of 15346 tokens,
 // 19s, the single most expensive event in that turn.
 //
-// Same rule noThinkSwitch states: what goes on the wire is what is stored.
+// One rule, no exceptions: what goes on the wire is what is stored.
 //
 // Storing has two visible consequences, both accepted. The turn stays in context
 // for the rest of the session (a few hundred bytes), and session/load replays it
@@ -676,32 +657,294 @@ func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []
 	return append(messages, llmMessage{Role: "user", Content: text})
 }
 
-// startToolMeter ticks the active phase row once per second while a tool runs, so
-// a slow tool (run_command, web_search) or a subagent's tool call shows
-// "(running web_search… 12s)" instead of a frozen "(running web_search…)". It is
-// the tool-side counterpart of streamWaitMeter; for a subagent session setStatus
-// folds it into the parent's row. The returned stop() halts the ticker AND waits
-// for it, so no late tick can clobber the next status update.
+// startToolMeter shows "(running web_search… 12s)" for as long as a tool runs,
+// so a slow tool or a subagent's tool call reads as busy rather than frozen. For
+// a subagent session setStatus folds it into the parent's row.
 func (a *agent) startToolMeter(ctx context.Context, sid, tool string) (stop func()) {
 	start := time.Now()
 	a.setStatus(ctx, sid, " (running "+tool+"…)") // immediate, before the first tick
-	done, stopped := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(stopped)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
+	return a.startStatusMeter(ctx, sid, func() string {
+		return fmt.Sprintf(" (running %s… %ds)", tool, int(time.Since(start).Seconds()))
+	})
+}
+
+// toolLoopCaller holds everything a tool loop needs to make ONE round's LLM
+// call, so the per-round entry point takes only what changes between rounds.
+// Built once per runToolLoopSeeded; conn is swapped in place by the repetition
+// ladder's sampler escalation, and stalled latches in place by the <think>
+// recovery below.
+type toolLoopCaller struct {
+	a     *agent
+	sid   string
+	phase string
+	conn  *LLMConnection
+	tools []map[string]any
+	// on/think are the UI sinks (nil for a silent internal pass); flush emits
+	// whatever the throttled sinks still hold.
+	on, think func(string)
+	flush     func()
+	// stalled latches once the model burns a whole budget looping in <think>:
+	// every later round then starts with thinking off, so a chronically-stalling
+	// model can't re-waste ~max_tokens of reasoning each round. Scoped to one
+	// tool loop — the next phase/subtask re-enables thinking.
+	stalled bool
+}
+
+// round makes one LLM call and runs the whole recovery ladder around it: the
+// stuck-<think> swap, the stream-rule re-ask, the two max_tokens cap rungs, the
+// transient-drop retries, and the context-full history fold. It returns the
+// model's text, tool calls and reasoning, plus the message slice — which the
+// ladder rewrites as it goes, since a corrective turn or a fold changes the
+// context the next attempt is made against.
+//
+// It is its own function because the ladder is a self-contained state machine
+// over a single call, with five independent retry latches; inline, it buried
+// the loop's actual shape (call → run tools → repeat) 150 lines deep.
+func (c *toolLoopCaller) round(ctx context.Context, messages []llmMessage) (string, []toolCall, string, []llmMessage, error) {
+	a, sid := c.a, c.sid
+	var text, reasoning string
+	var calls []toolCall
+	var err error
+	// On a context-overflow 400 (ground truth from the server), escalate the fold
+	// and retry: step 1 keeps the unfinished small turn plus the most recent
+	// ~keepSmallTurnTokens of completed small turns (folding everything older,
+	// including the rest of the in-flight large turn); if that still 400s, step 2
+	// keeps ONLY the unfinished small turn. Each step strictly shrinks the
+	// context, so it terminates: out of steps, the 400 surfaces.
+	recoverStep := 0
+	recoverKeepFrom := []func(*Session) int{
+		func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
+		(*Session).lastAssistantIndex,
+	}
+	// Arm the stream-rule check for this round. The tool loop is the only
+	// caller that does: it owns the retry ladder below, which is what makes a
+	// mid-generation abort recoverable rather than just a failed call.
+	callConn := c.conn.forToolLoop() // a <think> stall retries (and latches) on a thinking-off copy
+	if c.stalled {
+		callConn = callConn.withThinkingDisabled()
+	}
+	thinkingRetried := false // at most one such retry per round
+	capNudged := false       // cap ladder rung 1: one be-concise nudge retry per round
+	capDoubled := false      // cap ladder rung 2: one doubled-max_tokens retry per round
+	transientRetries := 0    // mid-response drops retried up to maxTransientStreamRetries
+	ruleRetries := 0         // stream-rule aborts re-asked up to maxStreamRuleRetries
+	for {
+		// The plan-table sink is built fresh per attempt: a retry re-sends the
+		// request from scratch, so the aborted attempt's partial arguments must
+		// not carry into the next one. Rows already on screen stay there (the
+		// same convention as an aborted stream-rule response) and the retry
+		// simply renders a second table.
+		text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, c.tools, c.on, c.think, a.planTableSink(ctx, sid))
+		c.flush() // emit any batched tail of this call's tokens to the UI
+		if err == nil {
+			return text, calls, reasoning, messages, nil
+		}
+		// Stuck in <think>: the model burned the whole budget on reasoning with
+		// no content and no tool calls. Retry once on a thinking-off copy so it
+		// must answer directly, and latch it for the rest of the run so it can't
+		// re-burn the budget next round. Any phase/depth — swaps the conn, no
+		// history fold needed.
+		if isStuckThinking(err) && !thinkingRetried {
+			thinkingRetried = true
+			c.stalled = true
+			// withThinkingDisabled appends a closed <think></think> for the
+			// model to continue instead of re-rendering the prompt, so the
+			// prefix cache survives both the retry and the return to normal at
+			// the end of this loop. No cache-lineage reset is needed: the next
+			// call extends the previous tokens like any other.
+			//
+			// This used to change chat_template_kwargs, and one real session
+			// paid for it: 71997 tokens re-evaluated at cached=0 entering the
+			// thinking-off window, then 27585 more leaving it, for a 99614-token
+			// context. Probed against the same server afterwards, the append
+			// keeps 13968 of 13978 tokens where the kwargs change kept none.
+			callConn = callConn.withThinkingDisabled()
+			a.logSession(sid, "RECOVER", "model stuck in <think>: continuing a closed <think></think> for the rest of this tool loop")
+			continue
+		}
+		// A stream rule fired: llmStream abandoned the generation the moment the
+		// content matched, so there is no partial to salvage. Re-ask with the
+		// rule's reminder added as a user turn — the same shape as the cap nudge
+		// below, and stored for the same reason (addCorrective): a suffix is only
+		// cache-cheap while it stays the last message.
+		//
+		// Capped, because a model that ignores the reminder twice is not going to
+		// be talked out of it on the third try; better to let the bad reply
+		// through and end up in the replan machinery than to spin here.
+		if sr := asStreamRule(err); sr != nil {
+			if ruleRetries >= maxStreamRuleRetries {
+				a.logSession(sid, "RECOVER", "stream rule %q fired %d times — giving up on the nudge, letting the turn fail", sr.Rule, ruleRetries+1)
+				break
+			}
+			ruleRetries++
+			a.logSession(sid, "RECOVER", "stream rule %q fired — aborted mid-generation, re-asking with the reminder (%d/%d). Matched: %s",
+				sr.Rule, ruleRetries, maxStreamRuleRetries, truncate(sr.Matched, 200))
+			if sid != "" {
+				// The partial is already on screen (llmStream streams before it
+				// checks), so say what happened to it — otherwise the retry reads as
+				// the model repeating itself.
+				a.say(ctx, sid, "\n⟲ Response went off-format and was discarded; re-asking.\n")
+			}
+			messages = a.addCorrective(sid, messages, ruleRetryMessage(sr))
+			continue
+		}
+		// Cap ladder: the generation died AT the requested max_tokens cap with
+		// content or tool calls in flight. The partial is discarded (truncated
+		// tool-call JSON can't be resumed through the chat API). Rung 1: retry
+		// with a be-concise nudge — cheapest, and it keeps the output small,
+		// which is what packs concurrent calls into the KV pool. Rung 2: the
+		// output is genuinely too big for the cap, retry once on a doubled cap
+		// (sampler-side param, so the prefix cache survives). A third hit
+		// surfaces as a normal failure into the replan machinery.
+		if ce := asCapHit(err); ce != nil {
+			if !capNudged {
+				capNudged = true
+				a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
+				if sid != "" {
+					a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
+				}
+				messages = a.addCorrective(sid, messages, fmt.Sprintf(
+					"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
+				continue
+			}
+			if !capDoubled {
+				capDoubled = true
+				base := ce.Cap
+				if base <= 0 {
+					base = defaultMaxTokens
+				}
+				callConn = callConn.withMaxTokens(base * 2)
+				a.logSession(sid, "RECOVER", "still at the cap after the nudge — one retry with max_tokens=%d", base*2)
+				if sid != "" {
+					a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", base*2))
+				}
+				continue
+			}
+			break // both rungs spent — surface as a normal failure (replan)
+		}
+		// Mid-response connection drop (EOF/reset — server or router closed the
+		// stream), distinct from a deliberate cancel. Usually momentary: re-send
+		// a few times, then surface a clear, actionable message instead of the
+		// raw EOF so the user knows it's transient.
+		if isTransientStreamError(err) {
+			if transientRetries >= maxTransientStreamRetries {
+				err = fmt.Errorf("lost the connection to the LLM mid-response %d times (the server or router dropped the stream); this is usually transient — try again in a moment", transientRetries+1)
+				break
+			}
+			transientRetries++
+			a.logSession(sid, "RECOVER", "stream dropped mid-response (%v) — retry %d/%d", err, transientRetries, maxTransientStreamRetries)
+			if sid != "" {
+				// The dropped attempt's partial tokens are already on screen and the
+				// retry re-streams from the top; flag it so the repeated prefix reads
+				// as a reconnect, not a glitch (append-only streaming can't rewind).
+				a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
+			}
 			select {
-			case <-done:
-				return
+			case <-time.After(transientStreamBackoff):
+				continue
 			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				a.setStatus(ctx, sid, fmt.Sprintf(" (running %s… %ds)", tool, int(time.Since(start).Seconds())))
+				err = ctx.Err() // cancelled during backoff → falls through to the cancel path
 			}
 		}
-	}()
-	return func() { close(done); <-stopped }
+		if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
+			(c.phase != "plan" && c.phase != "execute") || sid == "" {
+			break
+		}
+		s := a.getSession(sid)
+		if s == nil || s.Depth != 0 {
+			break
+		}
+		// Advance through fold steps until one frees something.
+		folded := false
+		for recoverStep < len(recoverKeepFrom) {
+			keepFrom := recoverKeepFrom[recoverStep](s)
+			recoverStep++
+			if a.foldHistory(ctx, s, keepFrom) {
+				folded = true
+				break
+			}
+		}
+		if !folded {
+			break
+		}
+		messages = a.buildLLMContext(s)
+	}
+	return text, calls, reasoning, messages, err
+}
+
+// repetitionTracker answers one question per tool call: did this exact
+// (name,args) call reproduce output it already produced in this loop? An
+// interleaved revisit counts, not just a consecutive one, which is why it is a
+// map and not a last-call comparison.
+type repetitionTracker struct {
+	// hash is the last output hash of each call, bag the same output as a word
+	// bag: a re-issued call whose output is ≥ stuckOutputSimilarity
+	// Jaccard-similar to its previous output also counts as reproduced. That
+	// catches the loops the hash misses — a re-run failing build with a
+	// timestamp in its output.
+	hash map[string]uint64
+	bag  map[string]map[string]bool
+}
+
+func newRepetitionTracker() *repetitionTracker {
+	return &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
+}
+
+// sawAgain records this call's output and reports whether it made no progress.
+func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
+	key := tc.Function.Name + "\x00" + tc.Function.Arguments
+	h := fnvHash(tu.Output)
+	bag := issueBag([]string{tu.Output})
+	repeated := false
+	if prev, ok := rt.hash[key]; ok && prev == h {
+		repeated = true
+	} else if prevBag, ok := rt.bag[key]; ok && jaccard(prevBag, bag) >= stuckOutputSimilarity {
+		// Not byte-identical but near-identical in content — a re-run whose
+		// output only differs in noise (timestamp, duration, pid) made no more
+		// progress than an exact repeat.
+		repeated = true
+	}
+	rt.hash[key] = h
+	rt.bag[key] = bag
+	// A SUCCESSFUL run_task/run_command re-run with identical output is a
+	// legitimate re-verify after an edit (re-running just:build / just:test to
+	// confirm a change held), NOT spinning — don't count it as no-progress. A
+	// FAILED re-run still counts: the model IS stuck on a red build/test.
+	if repeated && !tu.Failed && (tc.Function.Name == "run_task" || tc.Function.Name == "run_command") {
+		repeated = false
+	}
+	// read_file/continue_read/search_text also honour the content-dedup marker —
+	// serveRead prepends a note on a repeat, which would otherwise defeat the
+	// hash on the first re-read.
+	if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read" || tc.Function.Name == "search_text") &&
+		strings.Contains(tu.Output, readUnchangedMarker) {
+		repeated = true
+	}
+	return repeated
+}
+
+// announceToolCall shows what the tool was actually asked to do. Only its NAME
+// reaches the status ticker ("running run_command… 94s"), so without this a long
+// tool ran with nothing on screen saying which command it was, and no ACP
+// tool-call update carries it either.
+func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
+	shown := tc.Function.Arguments
+	var pretty bytes.Buffer
+	if json.Indent(&pretty, []byte(shown), "", "  ") == nil {
+		shown = pretty.String()
+	} // arguments too malformed to indent are shown raw, never dropped
+	if shown == "" || shown == "{}" {
+		a.say(ctx, sid, "\n**"+tc.Function.Name+"**\n")
+		return
+	}
+	// A fence longer than any backtick run inside it: an argument carrying ```
+	// would otherwise close the block early and spill the rest of the JSON into
+	// the transcript as prose.
+	fence := "```"
+	for strings.Contains(shown, fence) {
+		fence += "`"
+	}
+	a.say(ctx, sid, fmt.Sprintf("\n**%s**\n%sjson\n%s\n%s\n", tc.Function.Name, fence, shown, fence))
 }
 
 // runToolLoopSeeded runs the agentic loop with an EXPLICIT initial context. Only
@@ -763,19 +1006,13 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		}
 	}
 
-	// Repetition ladder state. callOutHash remembers the last output hash of each
-	// (name,args) call this loop; a later call that reproduces it made no progress
-	// (an interleaved revisit counts, not just a consecutive one). A round whose
-	// every call reproduced known output is "stuck"; consecutive stuck rounds
-	// climb one ladder — corrective nudge each round, warm the sampler at
-	// stuckEscalateRounds, bail at stuckBailRounds — and any productive round
-	// resets the streak, so read-after-write and genuine fan-out are never punished.
-	callOutHash := map[string]uint64{}
-	// callOutBag keeps each call's output as a word bag beside the exact hash:
-	// a re-issued call whose output is ≥ stuckOutputSimilarity Jaccard-similar
-	// to its previous output also counts as reproduced. Catches the loops the
-	// hash misses — a re-run failing build with a timestamp in its output.
-	callOutBag := map[string]map[string]bool{}
+	// Repetition ladder state; repetitionTracker owns what counts as a repeat. A
+	// round whose every call reproduced known output is "stuck"; consecutive
+	// stuck rounds climb one ladder — corrective nudge each round, warm the
+	// sampler at stuckEscalateRounds, bail at stuckBailRounds — and any
+	// productive round resets the streak, so read-after-write and genuine fan-out
+	// are never punished.
+	repeats := newRepetitionTracker()
 	var stuckRounds int
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
@@ -786,11 +1023,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	// failedRounds counts iterations whose tool batch produced a failure; the
 	// failSoftCap check below bounces the loop once it accumulates too many.
 	var failedRounds int
-	// thinkingStalled latches once the model burns a whole budget looping in
-	// <think>: every later round in THIS run then starts with thinking off, so a
-	// chronically-stalling model can't re-waste ~max_tokens of reasoning each
-	// round. Scoped to this run — the next phase/subtask re-enables thinking.
-	thinkingStalled := false
+	// Everything one round's LLM call needs, built once. Its conn is swapped in
+	// place by the sampler escalation at the bottom of this loop.
+	caller := &toolLoopCaller{a: a, sid: sid, phase: phase, conn: conn, tools: tools, on: on, think: think, flush: flushStream}
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			res.Text = allText.String()
@@ -801,173 +1036,13 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		if res.StartedAt.IsZero() {
 			res.StartedAt = streamStart
 		}
-		// Call the model. On a context-overflow 400 (ground truth from the server),
-		// escalate the fold and retry: step 1 keeps the unfinished small turn plus
-		// the most recent ~keepSmallTurnTokens of completed small turns (folding
-		// everything older, including the rest of the in-flight large turn); if that
-		// still 400s, step 2 keeps ONLY the unfinished small turn. Each step strictly
-		// shrinks the context, so it terminates: out of steps, the 400 surfaces.
+		// Call the model, with the whole recovery ladder around it (see
+		// toolLoopCaller.round). messages comes back rewritten when the ladder
+		// added a corrective turn or folded history to make the context fit.
 		var text, reasoning string
 		var calls []toolCall
 		var err error
-		recoverStep := 0
-		recoverKeepFrom := []func(*Session) int{
-			func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
-			(*Session).lastAssistantIndex,
-		}
-		// Arm the stream-rule check for this round. The tool loop is the only
-		// caller that does: it owns the retry ladder below, which is what makes a
-		// mid-generation abort recoverable rather than just a failed call.
-		callConn := conn.forToolLoop() // a <think> stall retries (and latches) on a thinking-off copy
-		if thinkingStalled {
-			callConn = callConn.withThinkingDisabled()
-		}
-		thinkingRetried := false // at most one such retry per round
-		capNudged := false       // cap ladder rung 1: one be-concise nudge retry per round
-		capDoubled := false      // cap ladder rung 2: one doubled-max_tokens retry per round
-		transientRetries := 0    // mid-response drops retried up to maxTransientStreamRetries
-		ruleRetries := 0         // stream-rule aborts re-asked up to maxStreamRuleRetries
-		for {
-			// The plan-table sink is built fresh per attempt: a retry re-sends the
-			// request from scratch, so the aborted attempt's partial arguments must
-			// not carry into the next one. Rows already on screen stay there (the
-			// same convention as an aborted stream-rule response) and the retry
-			// simply renders a second table.
-			text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, tools, on, think, a.planTableSink(ctx, sid))
-			flushStream() // emit any batched tail of this call's tokens to the UI
-			if err == nil {
-				break
-			}
-			// Stuck in <think>: the model burned the whole budget on reasoning with
-			// no content and no tool calls. Retry once on a thinking-off copy so it
-			// must answer directly, and latch it for the rest of the run so it can't
-			// re-burn the budget next round. Any phase/depth — swaps the conn, no
-			// history fold needed.
-			if isStuckThinking(err) && !thinkingRetried {
-				thinkingRetried = true
-				thinkingStalled = true
-				// withThinkingDisabled appends a closed <think></think> for the
-				// model to continue instead of re-rendering the prompt, so the
-				// prefix cache survives both the retry and the return to normal at
-				// the end of this loop. No cache-lineage reset is needed: the next
-				// call extends the previous tokens like any other.
-				//
-				// This used to change chat_template_kwargs, and one real session
-				// paid for it: 71997 tokens re-evaluated at cached=0 entering the
-				// thinking-off window, then 27585 more leaving it, for a 99614-token
-				// context. Probed against the same server afterwards, the append
-				// keeps 13968 of 13978 tokens where the kwargs change kept none.
-				callConn = callConn.withThinkingDisabled()
-				a.logSession(sid, "RECOVER", "model stuck in <think>: continuing a closed <think></think> for the rest of this tool loop")
-				continue
-			}
-			// A stream rule fired: llmStream abandoned the generation the moment the
-			// content matched, so there is no partial to salvage. Re-ask with the
-			// rule's reminder added as a user turn — the same shape as the cap nudge
-			// below, and stored for the same reason (addCorrective): a suffix is only
-			// cache-cheap while it stays the last message.
-			//
-			// Capped, because a model that ignores the reminder twice is not going to
-			// be talked out of it on the third try; better to let the bad reply
-			// through and end up in the replan machinery than to spin here.
-			if sr := asStreamRule(err); sr != nil {
-				if ruleRetries >= maxStreamRuleRetries {
-					a.logSession(sid, "RECOVER", "stream rule %q fired %d times — giving up on the nudge, letting the turn fail", sr.Rule, ruleRetries+1)
-					break
-				}
-				ruleRetries++
-				a.logSession(sid, "RECOVER", "stream rule %q fired — aborted mid-generation, re-asking with the reminder (%d/%d). Matched: %s",
-					sr.Rule, ruleRetries, maxStreamRuleRetries, truncate(sr.Matched, 200))
-				if sid != "" {
-					// The partial is already on screen (llmStream streams before it
-					// checks), so say what happened to it — otherwise the retry reads as
-					// the model repeating itself.
-					a.say(ctx, sid, "\n⟲ Response went off-format and was discarded; re-asking.\n")
-				}
-				messages = a.addCorrective(sid, messages, ruleRetryMessage(sr))
-				continue
-			}
-			// Cap ladder: the generation died AT the requested max_tokens cap with
-			// content or tool calls in flight. The partial is discarded (truncated
-			// tool-call JSON can't be resumed through the chat API). Rung 1: retry
-			// with a be-concise nudge — cheapest, and it keeps the output small,
-			// which is what packs concurrent calls into the KV pool. Rung 2: the
-			// output is genuinely too big for the cap, retry once on a doubled cap
-			// (sampler-side param, so the prefix cache survives). A third hit
-			// surfaces as a normal failure into the replan machinery.
-			if ce := asCapHit(err); ce != nil {
-				if !capNudged {
-					capNudged = true
-					a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
-					if sid != "" {
-						a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
-					}
-					messages = a.addCorrective(sid, messages, fmt.Sprintf(
-						"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
-					continue
-				}
-				if !capDoubled {
-					capDoubled = true
-					base := ce.Cap
-					if base <= 0 {
-						base = defaultMaxTokens
-					}
-					callConn = callConn.withMaxTokens(base * 2)
-					a.logSession(sid, "RECOVER", "still at the cap after the nudge — one retry with max_tokens=%d", base*2)
-					if sid != "" {
-						a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", base*2))
-					}
-					continue
-				}
-				break // both rungs spent — surface as a normal failure (replan)
-			}
-			// Mid-response connection drop (EOF/reset — server or router closed the
-			// stream), distinct from a deliberate cancel. Usually momentary: re-send
-			// a few times, then surface a clear, actionable message instead of the
-			// raw EOF so the user knows it's transient.
-			if isTransientStreamError(err) {
-				if transientRetries >= maxTransientStreamRetries {
-					err = fmt.Errorf("lost the connection to the LLM mid-response %d times (the server or router dropped the stream); this is usually transient — try again in a moment", transientRetries+1)
-					break
-				}
-				transientRetries++
-				a.logSession(sid, "RECOVER", "stream dropped mid-response (%v) — retry %d/%d", err, transientRetries, maxTransientStreamRetries)
-				if sid != "" {
-					// The dropped attempt's partial tokens are already on screen and the
-					// retry re-streams from the top; flag it so the repeated prefix reads
-					// as a reconnect, not a glitch (append-only streaming can't rewind).
-					a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
-				}
-				select {
-				case <-time.After(transientStreamBackoff):
-					continue
-				case <-ctx.Done():
-					err = ctx.Err() // cancelled during backoff → falls through to the cancel path
-				}
-			}
-			if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
-				(phase != "plan" && phase != "execute") || sid == "" {
-				break
-			}
-			s := a.getSession(sid)
-			if s == nil || s.Depth != 0 {
-				break
-			}
-			// Advance through fold steps until one frees something.
-			folded := false
-			for recoverStep < len(recoverKeepFrom) {
-				keepFrom := recoverKeepFrom[recoverStep](s)
-				recoverStep++
-				if a.foldHistory(ctx, s, keepFrom) {
-					folded = true
-					break
-				}
-			}
-			if !folded {
-				break
-			}
-			messages = a.buildLLMContext(s)
-		}
+		text, calls, reasoning, messages, err = caller.round(ctx, messages)
 		genElapsed += time.Since(streamStart)
 		if err != nil {
 			res.Text = allText.String()
@@ -1046,39 +1121,19 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if sess := a.getSession(sid); sess != nil && sess.ParentID != "" && sess.DisplayLabel != "" {
 				a.say(ctx, sess.ParentID, fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80)))
 			}
+			// Terminal tools are skipped because their payload is already
+			// rendered: submit_plan as the streamed table, respond as the turn's
+			// own text.
+			if !policy.isTerminal(tc.Function.Name) {
+				a.announceToolCall(ctx, sid, tc)
+			}
+
 			// Live status while the tool runs (the tool-side counterpart of the LLM
-			// streamWaitMeter): "(running web_search… 12s)" ticks so a long tool or a
+			// meter in llmStream): "(running web_search… 12s)" ticks so a long tool or a
 			// subagent's tool call shows liveness instead of a frozen row.
 			// launch_subagent is excluded: its subagents fold their OWN meters into
 			// this same parent row (setSubagentStatus), so a ticker here would fight
 			// them; a one-time marker holds until they take over.
-			// Show what the tool was actually asked to do. Only its NAME reaches the
-			// status ticker ("running run_command… 94s"), so a long tool ran with
-			// nothing on screen saying which command it was, and no ACP tool-call
-			// update carries it either. Terminal tools are skipped because their
-			// payload is already rendered: submit_plan as the streamed table,
-			// respond as the turn's own text.
-			if !policy.isTerminal(tc.Function.Name) {
-				shown := tc.Function.Arguments
-				var pretty bytes.Buffer
-				if json.Indent(&pretty, []byte(shown), "", "  ") == nil {
-					shown = pretty.String()
-				} // arguments too malformed to indent are shown raw, never dropped
-				if shown == "" || shown == "{}" {
-					a.say(ctx, sid, "\n**"+tc.Function.Name+"**\n")
-				} else {
-					// A fence longer than any backtick run inside it: an argument
-					// carrying ``` would otherwise close the block early and spill the
-					// rest of the JSON into the transcript as prose.
-					fence := "```"
-					for strings.Contains(shown, fence) {
-						fence += "`"
-					}
-					a.say(ctx, sid, fmt.Sprintf("\n**%s**\n%sjson\n%s\n%s\n",
-						tc.Function.Name, fence, shown, fence))
-				}
-			}
-
 			var stopMeter func()
 			if tc.Function.Name == "launch_subagent" {
 				a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
@@ -1111,37 +1166,8 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if tu.Failed && !denied {
 				failedThisRound = true
 			}
-			// Did this exact (name,args) call reproduce output it already
-			// produced this loop? read_file/continue_read also honour the
-			// content-dedup marker — serveRead prepends a note on a repeat, which
-			// would otherwise defeat the hash on the first re-read. A call that
-			// returns NEW output is progress and clears roundStuck.
-			key := tc.Function.Name + "\x00" + tc.Function.Arguments
-			h := fnvHash(tu.Output)
-			bag := issueBag([]string{tu.Output})
-			repeated := false
-			if prev, ok := callOutHash[key]; ok && prev == h {
-				repeated = true
-			} else if prevBag, ok := callOutBag[key]; ok && jaccard(prevBag, bag) >= stuckOutputSimilarity {
-				// Not byte-identical but near-identical in content — a re-run
-				// whose output only differs in noise (timestamp, duration, pid)
-				// made no more progress than an exact repeat.
-				repeated = true
-			}
-			callOutHash[key] = h
-			callOutBag[key] = bag
-			// A SUCCESSFUL run_task/run_command re-run with identical output is a
-			// legitimate re-verify after an edit (re-running just:build / just:test to
-			// confirm a change held), NOT spinning — don't count it as no-progress. A
-			// FAILED re-run still counts: the model IS stuck on a red build/test.
-			if repeated && !tu.Failed && (tc.Function.Name == "run_task" || tc.Function.Name == "run_command") {
-				repeated = false
-			}
-			if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read" || tc.Function.Name == "search_text") &&
-				strings.Contains(tu.Output, readUnchangedMarker) {
-				repeated = true
-			}
-			if !repeated {
+			// A call that returns NEW output is progress and clears roundStuck.
+			if !repeats.sawAgain(tc, tu) {
 				roundStuck = false
 			}
 			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled {
@@ -1243,9 +1269,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		// possible moment: deep into a long execute context. res/settings.toml
 		// costs that trade; this is one of the places that pays for it.
 		// Skip when already on "thinking" (plan phase) — a no-op swap.
-		if stuckRounds >= stuckEscalateRounds && !escalated && conn != nil && conn.Tag != "thinking" {
+		if stuckRounds >= stuckEscalateRounds && !escalated && caller.conn != nil && caller.conn.Tag != "thinking" {
 			if thinkConn := a.connForSession(ctx, sid, "thinking"); thinkConn != nil {
-				conn = thinkConn
+				caller.conn = thinkConn
 				escalated = true
 				if sid != "" {
 					a.say(ctx, sid, "⚠ Still repeating — switching to the thinking sampler to break out.\n")

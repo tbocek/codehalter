@@ -305,3 +305,43 @@ func TestSkillCmdExpandsAtLoad(t *testing.T) {
 		t.Errorf("loadSkills should expand:\n%s", all)
 	}
 }
+
+// TestLoadSkillsDeterministic verifies loadSkills sorts entries so the
+// concatenated system-prompt prefix is byte-stable across calls — a moving
+// SKILL order would invalidate the cache on every session start.
+func TestLoadSkillsDeterministic(t *testing.T) {
+	dir := t.TempDir()
+	cfgDir := filepath.Join(dir, ".codehalter")
+	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// Write in non-alphabetical order; readdir order is filesystem-dependent.
+	files := map[string]string{
+		"SKILL-ts.md":   "# TS\n",
+		"SKILL-go.md":   "# Go\n",
+		"SKILL-bash.md": "# Bash\n",
+		"SKILL-java.md": "# Java\n",
+	}
+	for name, body := range files {
+		if err := os.WriteFile(filepath.Join(cfgDir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	first := loadSkills(dir, nil)
+	for i := 0; i < 5; i++ {
+		got := loadSkills(dir, nil)
+		if got != first {
+			t.Errorf("loadSkills run %d differs from run 0:\n  run 0: %q\n  run %d: %q", i, first, i, got)
+		}
+	}
+	// Bash should come first alphabetically; TS should be last. Looking at
+	// the order via index ensures we catch a swap, not just presence.
+	idx := func(needle string) int { return strings.Index(first, needle) }
+	if idx("# Bash") != 0 {
+		t.Errorf("expected loadSkills to start with Bash; got %q", truncate(first, 80))
+	}
+	if !(idx("# Bash") < idx("# Go") && idx("# Go") < idx("# Java") && idx("# Java") < idx("# TS")) {
+		t.Errorf("loadSkills not alphabetical:\n%s", first)
+	}
+}

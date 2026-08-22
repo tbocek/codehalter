@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -457,5 +458,129 @@ func TestRenderKeyIgnoresSamplers(t *testing.T) {
 	// expensive kind of rewind goes unnoticed.
 	if k := renderKey(map[string]any{"reasoning_effort": "low"}); k == "" {
 		t.Error("reasoning_effort was dropped from the key")
+	}
+}
+
+// TestSessionRoundtrip verifies the TOML schema for Session is stable: what we
+// write in memory comes back byte-for-byte on reload.
+func TestSessionRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s.AddUser("hello")
+	s.AddAssistant("hi there")
+	s.AppendToolUse(ToolUse{Name: "read_file", Input: `{"path":"x.go"}`, Output: "file content"})
+	s.Summary = "earlier summary"
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	loaded, err := loadSession(dir, s.ID)
+	if err != nil {
+		t.Fatalf("loadSession: %v", err)
+	}
+	if got := len(loaded.Messages); got != 2 {
+		t.Fatalf("Messages len: got %d, want 2", got)
+	}
+	if loaded.Messages[0].Role != "user" || loaded.Messages[0].Content != "hello" {
+		t.Errorf("Messages[0]: got %+v", loaded.Messages[0])
+	}
+	if loaded.Messages[1].Role != "assistant" || loaded.Messages[1].Content != "hi there" {
+		t.Errorf("Messages[1]: got %+v", loaded.Messages[1])
+	}
+	if got := len(loaded.Messages[1].ToolUses); got != 1 {
+		t.Fatalf("ToolUses len: got %d, want 1", got)
+	}
+	tu := loaded.Messages[1].ToolUses[0]
+	if tu.Name != "read_file" || tu.Output != "file content" {
+		t.Errorf("ToolUse: got %+v", tu)
+	}
+	if loaded.Summary != "earlier summary" {
+		t.Errorf("Summary mismatch: got %q, want %q", loaded.Summary, "earlier summary")
+	}
+}
+
+// TestAppendToolUseCreatesAssistantMessage verifies that recording a tool use
+// when the last message is a user turn creates a new empty assistant message
+// to hold it (rather than attaching to the user).
+func TestAppendToolUseCreatesAssistantMessage(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	s.AddUser("do a thing")
+	s.AppendToolUse(ToolUse{Name: "read_file", Input: "{}", Output: "ok"})
+
+	if got := len(s.Messages); got != 2 {
+		t.Fatalf("Messages len: got %d, want 2", got)
+	}
+	if s.Messages[1].Role != "assistant" {
+		t.Errorf("expected assistant message to be created, got role %q", s.Messages[1].Role)
+	}
+	if len(s.Messages[1].ToolUses) != 1 {
+		t.Errorf("tool use not appended to assistant message: %+v", s.Messages[1])
+	}
+
+	// A second tool use must stay on the same assistant message.
+	s.AppendToolUse(ToolUse{Name: "write_file", Input: "{}", Output: "ok"})
+	if got := len(s.Messages); got != 2 {
+		t.Fatalf("Messages len after second AppendToolUse: got %d, want 2", got)
+	}
+	if got := len(s.Messages[1].ToolUses); got != 2 {
+		t.Fatalf("ToolUses len: got %d, want 2", got)
+	}
+}
+
+// TestConcurrentSessionWritesAreRaceFree exercises the Session mutex by
+// racing session mutations against concurrent Save() calls. Run with -race to
+// catch regressions in the locking that fix #4 introduced.
+func TestConcurrentSessionWritesAreRaceFree(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+
+	const workers = 8
+	const perWorker = 50
+	var wg sync.WaitGroup
+	wg.Add(workers * 3)
+
+	// Writers: exercise each mutator type concurrently.
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				s.AddUser("u")
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				s.AppendToolUse(ToolUse{Name: "x", Input: "{}", Output: "ok"})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				_ = s.Save()
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Loosely assert that all AddUser calls landed — exact count verifies
+	// that no append was lost to a concurrent slice-grow race.
+	userCount := 0
+	for _, m := range s.Messages {
+		if m.Role == "user" {
+			userCount++
+		}
+	}
+	if want := workers * perWorker; userCount != want {
+		t.Errorf("user message count: got %d, want %d", userCount, want)
 	}
 }

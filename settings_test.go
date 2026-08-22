@@ -122,15 +122,16 @@ func TestSeedSettingsRolesDifferInSamplersOnly(t *testing.T) {
 // TestParamsForInventsNoChatTemplateKwargs pins that codehalter never puts a
 // chat-template argument on the wire that the user did not write. It is
 // tempting to: turning reasoning off for the execute role is worth ~50 minutes
-// of decode on an 11.6h session against Qwen3.8-27B, and Qwen's /no_think text
-// switch does not deliver it (237 of 388 execute responses reasoned anyway).
+// of decode on an 11.6h session against Qwen3.8-27B.
 //
 // But it gives the two roles different renderings, and on a one-slot server
 // they evict each other on every plan -> execute switch: 35 switches in that
 // session carrying 2414262 prompt tokens, at 483 tok/s prefill, so 83.3 minutes
-// of re-prefill against the 50 it saves. It is the user's call per connection
-// (res/settings.toml costs it), so paramsFor hands back exactly what was
-// configured.
+// of re-prefill against the 50 it saves. codehalter banks that decode win by
+// appending a closed <think></think> instead (withThinkingDisabled), which is
+// a suffix and leaves the rendering alone. The kwargs field stays the user's
+// call per connection (res/settings.toml costs it), so paramsFor hands back
+// exactly what was configured.
 func TestParamsForInventsNoChatTemplateKwargs(t *testing.T) {
 	c := LLMConnection{
 		ParamsThinking: map[string]any{"temperature": 1.0},

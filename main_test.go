@@ -5,11 +5,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -18,8 +23,6 @@ import (
 // (Settings.Parallel and friends, which distinguish unset from zero).
 func ptr[T any](v T) *T { return &v }
 
-// newTestAgent returns an agent with one session rooted at a fresh tempdir.
-// a.conn is left nil so sendUpdate becomes a no-op (covered by the nil-check).
 // lineageClock hands out call times one second apart. Most of the lineage
 // tests do not care when their calls happened, but noteCacheLineage records the
 // gap between them now, and feeding it one frozen instant everywhere would
@@ -34,6 +37,8 @@ func lineageClock() func() time.Time {
 	}
 }
 
+// newTestAgent returns an agent with one session rooted at a fresh tempdir.
+// a.conn is left nil so sendUpdate becomes a no-op (covered by the nil-check).
 func newTestAgent(t *testing.T) (*agent, *Session) {
 	t.Helper()
 	s, err := newSession(t.TempDir())
@@ -377,6 +382,175 @@ func withFreshToolRegistry(t *testing.T) {
 	saved := registeredTools
 	registeredTools = nil
 	t.Cleanup(func() { registeredTools = saved })
+}
+
+// ---------------------------------------------------------------------------
+// Fake LLM server
+// ---------------------------------------------------------------------------
+
+// mockLLM stands up an httptest server that accepts OpenAI chat-completions
+// requests and returns a queued SSE response for each call. Tests queue one
+// response per LLM call they expect; an unexpected call fails the test.
+type mockLLM struct {
+	ts    *httptest.Server
+	resps []string
+
+	mu   sync.Mutex
+	reqs []map[string]any // captured request bodies, in order
+	idx  atomic.Int32
+	t    *testing.T
+}
+
+func newMockLLM(t *testing.T, responses ...string) *mockLLM {
+	t.Helper()
+	m := &mockLLM{resps: responses, t: t}
+	m.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Runtime callers probe /slots before each LLM call. Mock doesn't
+		// implement it — 404 lets connForSession treat the server as "unknown,
+		// assume available" so the chat-completions path still runs.
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("mockLLM: decode request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		m.mu.Lock()
+		m.reqs = append(m.reqs, body)
+		m.mu.Unlock()
+
+		i := int(m.idx.Add(1)) - 1
+		if i >= len(m.resps) {
+			t.Errorf("mockLLM: unexpected call %d (only %d responses queued)", i+1, len(m.resps))
+			http.Error(w, "no response queued", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(m.resps[i]))
+	}))
+	return m
+}
+
+func (m *mockLLM) Close() { m.ts.Close() }
+
+func (m *mockLLM) conn(name string) *LLMConnection {
+	return &LLMConnection{Tag: name, Server: m.ts.URL, Model: "test-model"}
+}
+
+func (m *mockLLM) callCount() int { return int(m.idx.Load()) }
+
+func (m *mockLLM) request(i int) map[string]any {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if i < 0 || i >= len(m.reqs) {
+		return nil
+	}
+	return m.reqs[i]
+}
+
+// sseText builds an SSE body with a single text-delta chunk followed by [DONE].
+func sseText(text string) string {
+	chunk := map[string]any{
+		"choices": []map[string]any{{
+			"delta": map[string]any{"content": text},
+		}},
+	}
+	data, _ := json.Marshal(chunk)
+	return fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", data)
+}
+
+// sseTruncated emits a reasoning delta with finish_reason="length", then a usage
+// chunk, then [DONE] — a generation that truncated at a length limit.
+func sseTruncated(reasoning string, promptTokens, completionTokens int) string {
+	var b strings.Builder
+	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
+		"delta":         map[string]any{"reasoning_content": reasoning},
+		"finish_reason": "length",
+	}}})
+	fmt.Fprintf(&b, "data: %s\n\n", c1)
+	c2, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{},
+		"usage":   map[string]any{"prompt_tokens": promptTokens, "completion_tokens": completionTokens},
+	})
+	fmt.Fprintf(&b, "data: %s\n\n", c2)
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+// sseTruncatedContent is sseTruncated's cousin where the truncated output is
+// message content (not reasoning) — a verbose/looping generation rather than a
+// <think> stall, so it classifies as a genuine max_tokens cap (not recoverable).
+func sseTruncatedContent(content string, promptTokens, completionTokens int) string {
+	var b strings.Builder
+	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
+		"delta":         map[string]any{"content": content},
+		"finish_reason": "length",
+	}}})
+	fmt.Fprintf(&b, "data: %s\n\n", c1)
+	c2, _ := json.Marshal(map[string]any{
+		"choices": []map[string]any{},
+		"usage":   map[string]any{"prompt_tokens": promptTokens, "completion_tokens": completionTokens},
+	})
+	fmt.Fprintf(&b, "data: %s\n\n", c2)
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+// sseToolCall builds an SSE body that emits a single tool call with the given
+// name + JSON args, then [DONE]. First chunk carries the tool-call id (triggers
+// append); the second delta extends arguments (per the llmStream protocol).
+func sseToolCall(id, name, args string) string {
+	var b strings.Builder
+	first := map[string]any{
+		"choices": []map[string]any{{
+			"delta": map[string]any{
+				"tool_calls": []map[string]any{{
+					"id":   id,
+					"type": "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": args,
+					},
+				}},
+			},
+		}},
+	}
+	d, _ := json.Marshal(first)
+	fmt.Fprintf(&b, "data: %s\n\n", d)
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+// sseContentThenToolCall emits a content delta (assistant prose) followed by a
+// single tool call, then [DONE] — the shape a planner produces when it writes a
+// direct answer AND calls submit_plan in the same turn.
+func sseContentThenToolCall(text, id, name, args string) string {
+	var b strings.Builder
+	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"content": text}}}})
+	fmt.Fprintf(&b, "data: %s\n\n", c1)
+	c2, _ := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"tool_calls": []map[string]any{{
+		"id": id, "type": "function", "function": map[string]any{"name": name, "arguments": args},
+	}}}}}})
+	fmt.Fprintf(&b, "data: %s\n\n", c2)
+	b.WriteString("data: [DONE]\n\n")
+	return b.String()
+}
+
+// sseReasoning emits a reasoning_content delta with NO visible content and no
+// tool call — a thinking model that dumped everything into its (never-shown)
+// reasoning channel.
+func sseReasoning(reasoning string) string {
+	chunk := map[string]any{
+		"choices": []map[string]any{{
+			"delta": map[string]any{"reasoning_content": reasoning},
+		}},
+	}
+	data, _ := json.Marshal(chunk)
+	return fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", data)
 }
 
 // TestCwdOrDefaultAbsolutes pins the contract that sess.Cwd is always an

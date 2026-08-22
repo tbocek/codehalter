@@ -27,16 +27,20 @@ parallel = 1                      # max concurrent calls to this server
 #
 # The one thing worth weighing against that is turning reasoning off for
 # execute. On a thinking model it is large: 71 min of the same session's decode
-# went to execute completions and ~70% of that was reasoning, and Qwen's
-# /no_think text switch does NOT deliver it (237 of 388 execute responses
-# reasoned anyway). Only chat_template_kwargs does:
+# went to execute completions and ~70% of that was reasoning. codehalter already
+# takes that win WITHOUT a second rendering: every execute-role phase appends an
+# already-closed <think></think> for the model to continue, which suppresses
+# reasoning just as completely while leaving every earlier token in place
+# (probed on a 13978-token prompt: the kwargs change came back cached=0, the
+# append cached=13968). So you do not need this:
 #
 #   params_execute = { ..., chat_template_kwargs = { enable_thinking = false } }
 #
-# Take it ONLY if this server holds 2+ slots (parallel >= 2), so each rendering
-# keeps its own KV cache and the switch stays cheap. On one slot the 83 min
-# above is more than the ~50 min it saves. Set it on ONE role, never both
-# halfway.
+# Reach for it only if this model's reasoning delimiters are not
+# <think>/</think>, and then ONLY if this server holds 2+ slots (parallel >= 2),
+# so each rendering keeps its own KV cache and the switch stays cheap. On one
+# slot the 83 min above is more than the ~50 min it saves. Set it on ONE role,
+# never both halfway.
 #   vLLM:      works per request; --reasoning-parser qwen3 also puts reasoning
 #              in reasoning_content instead of inline <think>. Server-wide
 #              equivalent: --default-chat-template-kwargs '{"enable_thinking":false}'.

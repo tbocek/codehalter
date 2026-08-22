@@ -231,7 +231,7 @@ func isTransientStreamError(err error) bool {
 // things count as off so a retry can't loop: the user's own
 // enable_thinking=false, and our own prefilled-and-continued <think></think>.
 func thinkingOn(reqBody map[string]any) bool {
-	// The stall retry continues an already-closed <think></think> block, so the
+	// A continued prefill is an already-closed <think></think> block, so the
 	// model cannot open one no matter what the template says.
 	if cont, _ := reqBody["continue_final_message"].(bool); cont {
 		return false
@@ -266,17 +266,20 @@ func (a *agent) warnChatTemplateKwargsIgnored(ctx context.Context, sid string, c
 	if _, seen := a.ctkIgnored.LoadOrStore(conn.Server+"\x00"+conn.Model, true); seen {
 		return
 	}
-	// Two different mechanisms land here, so the advice has to split. The stall
-	// retry continues a prefilled <think></think>; everything else got here
-	// because the user's own params carry enable_thinking=false.
+	// Two different mechanisms land here, so the advice has to split. The
+	// execute-role phases and the stall retry continue a prefilled
+	// <think></think>; everything else got here because the user's own params
+	// carry enable_thinking=false.
 	if cont, _ := reqBody["continue_final_message"].(bool); cont {
 		slog.Warn("server ignored the thinking-off prefill",
 			"server", conn.Server, "model", conn.Model, "reasoning_bytes", reasoningBytes)
 		a.say(ctx, sid, "⚠ "+conn.Model+" kept reasoning after being handed a closed <think></think> to continue.\n"+
 			"  The server started a fresh assistant turn instead of continuing the prefilled one, so it does not honour\n"+
-			"  continue_final_message / add_generation_prompt=false. The stuck-in-<think> retry cannot suppress reasoning here;\n"+
-			"  it will still cap the damage, since the reasoning that follows a closed block is short.\n"+
-			"  If this model does not delimit reasoning with <think>/</think>, that is the likelier cause.\n\n")
+			"  continue_final_message / add_generation_prompt=false. Execute-role calls will keep reasoning here, which\n"+
+			"  costs decode time but nothing else; the damage stays capped, since reasoning that follows a closed block is short.\n"+
+			"  If this model does not delimit reasoning with <think>/</think>, that is the likelier cause.\n"+
+			"  The fallback is params_execute chat_template_kwargs = { enable_thinking = false }, which costs a second\n"+
+			"  prompt rendering — worth it only on a server with 2+ slots (see settings.toml).\n\n")
 		return
 	}
 	slog.Warn("server ignored chat_template_kwargs.enable_thinking=false",
@@ -288,16 +291,16 @@ func (a *agent) warnChatTemplateKwargsIgnored(ctx context.Context, sid string, c
 		"  Otherwise drop enable_thinking from params_execute: it is buying a second prompt rendering and nothing else.\n\n")
 }
 
-// noThinkPrefillContent is the assistant prefix the stall retry continues from:
-// an already-closed reasoning block, so the model has no way to open one. This
-// is what Qwen3's own template emits for enable_thinking=false, written as
+// noThinkPrefillContent is the assistant prefix a thinking-off call continues
+// from: an already-closed reasoning block, so the model has no way to open one.
+// This is what Qwen3's own template emits for enable_thinking=false, written as
 // message content instead of asked for as a template argument.
 //
-// It is the one model-specific literal in the retry path. A model whose
-// reasoning delimiters are not <think>/</think> needs a different string here,
-// where chat_template_kwargs would have delegated that to the server's
-// template. That is the price of the append: the payoff is that the prefix
-// cache survives the retry, and the round trip back to normal, for free.
+// It is the one model-specific literal on that path. A model whose reasoning
+// delimiters are not <think>/</think> needs a different string here, where
+// chat_template_kwargs would have delegated that to the server's template. That
+// is the price of the append: the payoff is that the prefix cache survives both
+// the switch to thinking-off and the switch back, for free.
 const noThinkPrefillContent = "<think>\n\n</think>\n\n"
 
 // withThinkingDisabled returns a shallow copy of the connection whose next call
@@ -306,7 +309,22 @@ const noThinkPrefillContent = "<think>\n\n</think>\n\n"
 // server to continue it, which leaves every earlier token identical and so
 // keeps the prefix cache. Slot/Server/Model are unchanged, so it routes to the
 // same connSem. The original conn is untouched.
+//
+// This is how codehalter turns reasoning off for the "execute" role: the
+// executor, the documenter and a leaf subagent all call it, and so does the
+// tool loop's <think>-stall retry. The alternative levers both cost more than
+// they save. Qwen's /no_think text switch is unreliable (237 of 388 execute
+// responses carrying it reasoned anyway, over one 11.6h session), and
+// chat_template_kwargs.enable_thinking=false gives the two roles different
+// prompt renderings, which on a one-slot server evicts the other role's KV at
+// every phase switch (see paramsFor, where that trade is costed).
+//
+// nil in, nil out: connForSession returns nil when no connection is configured
+// and callers chain this straight onto it.
 func (c *LLMConnection) withThinkingDisabled() *LLMConnection {
+	if c == nil {
+		return nil
+	}
 	cp := *c
 	cp.noThinkPrefill = true
 	return &cp
@@ -397,17 +415,11 @@ func (a *agent) prewarm(sess *Session) {
 	slog.Debug("prewarm: done", "sid", sess.ID, "elapsed", elapsed, "err", err)
 }
 
-// llmStream is the core LLM call. Streams SSE, collects text and tool calls.
-// sid scopes the debug log: req body and raw SSE response are appended to
-// .codehalter/session_<sid>.log so a single file captures everything that
-// went over the wire for a session. Pass "" to disable logging (used by tests
-// and pre-session probes). think (nil to discard) receives reasoning_content
-// tokens — kept separate from `on` so callers can surface chain-of-thought to
-// the UI as agent_thought_chunk without polluting agent_message_chunk. onArgs
-// (nil to discard) receives each tool-call argument delta tagged with its call
-// index and tool name, which is the only way to see a structured terminal tool
-// being written: its payload never reaches `on`.
-func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string), onArgs func(idx int, name, delta string)) (string, []toolCall, string, error) {
+// buildChatRequest assembles the OpenAI chat-completions body for one call.
+// Split out of llmStream because it is the whole of what goes on the wire and
+// nothing else: a pure function of the connection and the messages, so a test
+// can assert the shape without standing a server up.
+func buildChatRequest(conn *LLMConnection, messages []llmMessage, tools []map[string]any) map[string]any {
 	// Seed with extra_body (per-role sampler/reasoning overrides), then write
 	// core fields last so model/messages/stream/tools can't be hijacked from
 	// settings.toml.
@@ -445,7 +457,385 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	if tools != nil {
 		reqBody["tools"] = tools
 	}
+	return reqBody
+}
 
+// streamResult is everything one SSE stream produced: the reconstructed
+// response, the server's own accounting of it, and how it ended. It exists so
+// the three passes that run after the scan — turn stats, outcome
+// classification, the RESPONSE log — can each take one value instead of a
+// dozen arguments.
+type streamResult struct {
+	text      strings.Builder
+	reasoning strings.Builder
+	calls     []toolCall
+
+	// finishReason is the server's own word for how generation ended: "stop",
+	// "length", "tool_calls", or "" when the stream broke before it said.
+	finishReason string
+	// streamErrMsg holds an error the server delivered in-band (HTTP 200, an
+	// {"error":…} SSE chunk). Surfaced as the call error so it isn't swallowed
+	// as an empty response.
+	streamErrMsg string
+	// scanErr is set when the stream broke mid-flight with no in-band error to
+	// explain it.
+	scanErr error
+	// firedRule is set when a stream rule matched the content and the generation
+	// was abandoned mid-flight. The partial is discarded, so nothing downstream
+	// reads text in that case.
+	firedRule *streamRule
+
+	promptTokens, completionTokens int
+	// Server-reported cache split (see sseChunk.Timings / PromptTokensDetails).
+	// evaluatedTokens = prompt tokens actually run through the model this call;
+	// cachedTokens = reused from KV cache. -1 = the server didn't report it.
+	evaluatedTokens, cachedTokens int
+	// Server-measured eval/gen times (ms) — exact, vs the TTFT proxy below.
+	serverPromptMs, serverGenMs float64
+
+	// TTFT (readStart→firstTokenAt) and gen (firstTokenAt→end): the rate timing
+	// fallback for when the server sends no _ms.
+	readStart, firstTokenAt time.Time
+}
+
+// readSSEStream consumes the chat-completions event stream, forwarding deltas to
+// the caller's sinks as they arrive and accumulating the reconstructed response.
+// It returns on [DONE], on an in-band error chunk, on a stream-rule hit, or when
+// the body ends. It never closes the body: the caller's deferred Close is what
+// tears the connection down, which is what stops the server generating after a
+// rule hit.
+//
+// genChars counts generated bytes for the live status meter, which reads it from
+// another goroutine — hence the pointer and the atomics.
+func readSSEStream(body io.Reader, conn *LLMConnection, matcher *ruleMatcher, on, think func(string), onArgs func(idx int, name, delta string), genChars *int64) *streamResult {
+	r := &streamResult{evaluatedTokens: -1, cachedTokens: -1}
+
+	scanner := bufio.NewScanner(body)
+	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
+	// line limit silently truncates. 4 MB matches common reverse-proxy caps.
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	r.readStart = time.Now()
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var chunk sseChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			// Don't drop a malformed frame silently: an off-shape chunk would
+			// otherwise make a backend look like a terse model with no trail.
+			slog.Debug("llm: skipped unparseable SSE frame", "role", conn.Tag, "err", err, "frame", truncate(data, 200))
+			continue
+		}
+		// In-band error: the gateway/llama.cpp can return HTTP 200 and put the
+		// failure in an {"error":…} chunk (empty Choices). Capture and stop —
+		// checked before the empty-Choices skip below, which would drop it and
+		// leave the call looking like a silent "(empty response)".
+		if msg := chunkErrorMessage(&chunk); msg != "" {
+			r.streamErrMsg = msg
+			break
+		}
+		// Usage arrives in its own trailing chunk (choices empty) when
+		// stream_options.include_usage=true. Capture and keep going — there
+		// may still be a [DONE] line after it.
+		if chunk.Usage != nil {
+			if chunk.Usage.PromptTokens > 0 {
+				r.promptTokens = chunk.Usage.PromptTokens
+			}
+			if chunk.Usage.CompletionTokens > 0 {
+				r.completionTokens = chunk.Usage.CompletionTokens
+			}
+			if d := chunk.Usage.PromptTokensDetails; d != nil {
+				r.cachedTokens = d.CachedTokens
+			}
+		}
+		// llama.cpp timings (prefer over usage cached_tokens — it carries both
+		// sides directly): prompt_n = evaluated, cache_n = reused.
+		if chunk.Timings != nil {
+			r.evaluatedTokens = chunk.Timings.PromptN
+			r.cachedTokens = chunk.Timings.CacheN
+			r.serverPromptMs = chunk.Timings.PromptMs
+			r.serverGenMs = chunk.Timings.PredictedMs
+		}
+		if len(chunk.Choices) == 0 {
+			continue
+		}
+
+		if fr := chunk.Choices[0].FinishReason; fr != "" {
+			r.finishReason = fr
+		}
+
+		delta := chunk.Choices[0].Delta
+		if delta.ReasoningContent == "" { // fold vLLM's spelling into the standard one
+			delta.ReasoningContent = delta.Reasoning
+		}
+
+		if r.firstTokenAt.IsZero() && (delta.Content != "" || delta.ReasoningContent != "" || len(delta.ToolCalls) > 0) {
+			r.firstTokenAt = time.Now()
+		}
+
+		if delta.ReasoningContent != "" {
+			r.reasoning.WriteString(delta.ReasoningContent)
+			atomic.AddInt64(genChars, int64(len(delta.ReasoningContent)))
+			if think != nil {
+				think(delta.ReasoningContent)
+			}
+		}
+
+		if delta.Content != "" {
+			r.text.WriteString(delta.Content)
+			atomic.AddInt64(genChars, int64(len(delta.Content)))
+			if on != nil {
+				on(delta.Content)
+			}
+			// Stream rule check. Deliberately AFTER on(): the tokens up to the match
+			// are already on the user's screen, and hiding them would make the
+			// "response discarded, retrying" notice unexplainable. Matching only
+			// content (not reasoning, not tool-call arguments) is the whole design —
+			// see rules.go. On a hit we stop reading the body; the caller's deferred
+			// Close tears down the connection, which is what stops the server
+			// generating.
+			if fired := matcher.feed(delta.Content); fired != nil {
+				r.firedRule = fired
+				break
+			}
+		}
+
+		for _, tc := range delta.ToolCalls {
+			atomic.AddInt64(genChars, int64(len(tc.Function.Name)+len(tc.Function.Arguments)))
+			if tc.ID != "" {
+				r.calls = append(r.calls, tc)
+			} else if len(r.calls) > 0 {
+				last := &r.calls[len(r.calls)-1]
+				last.Function.Arguments += tc.Function.Arguments
+			}
+			// Surface the delta live. The name rides only the ID-bearing first
+			// chunk, so read it back off the accumulator rather than from tc, which
+			// is empty for every continuation.
+			if onArgs != nil && tc.Function.Arguments != "" && len(r.calls) > 0 {
+				onArgs(len(r.calls)-1, r.calls[len(r.calls)-1].Function.Name, tc.Function.Arguments)
+			}
+		}
+	}
+	r.scanErr = scanner.Err()
+	return r
+}
+
+// recordStreamStats folds one call's server-reported usage and timings into the
+// turn's running totals for the "✅ Done" line, and runs the prefix-cache rewind
+// check on tool-loop calls. sid="" (probes/tests) has no session, so it is a
+// no-op there; so is a stream that broke before the usage chunk, whose counts
+// are all 0.
+func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r *streamResult) {
+	sess := a.getSession(sid)
+	if sess == nil || conn.noTurnStats {
+		return
+	}
+	// Derive evaluated (sent-but-not-cached) from cached_tokens when timings are
+	// absent; -1 means no cache info reported. This is the only number we keep —
+	// the gross prompt_tokens (cached prefix re-counted each call) is not summed.
+	if r.evaluatedTokens < 0 && r.cachedTokens >= 0 && r.promptTokens > 0 {
+		r.evaluatedTokens = r.promptTokens - r.cachedTokens
+	}
+	sess.addTurnTokens(r.promptTokens, r.completionTokens, r.evaluatedTokens)
+	// Prefix-cache rewind check, tool-loop calls only. Each is the previous
+	// call's messages plus an append, so the server should hand back
+	// everything the previous call sent (cached ≈ its prompt) and evaluate
+	// only the tail. A big shortfall means the prompt was re-rendered behind
+	// our backs; logged per call, and reported once on the Done line.
+	if conn.cacheLineage && r.promptTokens > 0 {
+		render := renderKey(conn.ExtraBody)
+		rw := sess.noteCacheLineage(r.promptTokens, r.cachedTokens, render, time.Now())
+		if rw.tokens > 0 {
+			// "(none)" rather than an empty string: a params table with no
+			// template fields at all is the good configuration, and it should
+			// not read like missing data.
+			orNone := func(s string) string {
+				if s == "" {
+					return "(none)"
+				}
+				return s
+			}
+			// One line, three causes. The header is the same measurement every
+			// time (how much was re-read, and how long the slot sat idle first,
+			// because token counts alone cannot separate "something re-rendered
+			// the prompt" from "the server reclaimed a slot we left sitting").
+			// Only the diagnosis differs, so only the diagnosis branches.
+			var cause string
+			switch {
+			case rw.renderChanged:
+				cause = fmt.Sprintf("We asked for a different rendering than last call: template params went %s -> %s. "+
+					"The server keeps a prompt state per rendering, so this call could only reuse what THIS rendering held "+
+					"last time and had to re-evaluate everything the other role appended since. Make params_thinking and "+
+					"params_execute agree on everything that is not a sampler.", orNone(rw.prevRender), orNone(render))
+			case rw.idle >= idleEvictionSuspect:
+				cause = fmt.Sprintf("Both calls asked for the same rendering (%s) and the slot sat idle that whole time, "+
+					"which is the likeliest cause: servers reclaim idle slots and no setting prevents it. Nothing to fix "+
+					"unless the gap surprises you.", orNone(render))
+			default:
+				cause = fmt.Sprintf("Both calls asked for the same rendering (%s) and came back to back, so an idle "+
+					"eviction is unlikely: something rewrote the middle of the prompt. A tool result that replayed "+
+					"differently than it was sent, or a chat template that repositions earlier messages as the "+
+					"conversation grows.", orNone(render))
+			}
+			a.logSession(sid, connLabel+" CACHE",
+				"prefix cache rewound: %d tokens the previous call had already sent were re-read "+
+					"(prompt=%d cached=%d, %s since that call). %s",
+				rw.tokens, r.promptTokens, r.cachedTokens, humanDuration(rw.idle.Milliseconds()), cause)
+		}
+	}
+	// Prefer the server's measured times over our TTFT proxy (which includes
+	// queue + cache-load overhead → understates pp/s).
+	pMs, gMs := r.serverPromptMs, r.serverGenMs
+	if pMs == 0 && gMs == 0 && !r.firstTokenAt.IsZero() {
+		pMs = float64(r.firstTokenAt.Sub(r.readStart).Milliseconds())
+		gMs = float64(time.Since(r.firstTokenAt).Milliseconds())
+	}
+	if pMs > 0 || gMs > 0 {
+		sess.addTurnTiming(int64(pMs), int64(gMs))
+	}
+}
+
+// streamOutcomeError turns how the stream ended into the one error llmStream
+// returns and the RESPONSE log records. Order matters: an explicit in-band
+// server error is checked FIRST, because gateways commonly emit an {"error":…}
+// chunk and THEN drop the socket. Checking the transport error first would
+// shadow the server's verbatim cause (e.g. "prompt exceeds n_ctx") behind a
+// generic "unexpected EOF", and send a fatal prompt down the useless
+// transient-retry path instead of surfacing the real reason.
+//   - firedRule: we abandoned the generation ourselves.
+//   - streamErrMsg: server sent an {"error":…} chunk under HTTP 200; surface
+//     its message verbatim (it names the real cause, e.g. prompt > n_ctx).
+//   - scanErr: stream broke mid-flight (e.g. a router model swap force-kills
+//     the connection) with no in-band error to explain it.
+//   - finish_reason="length": truncated at a length limit. If completion hit
+//     the requested max_tokens cap the model is genuinely verbose/looping and we
+//     bail (the message guides tuning); if it stopped BELOW the cap it hit the
+//     n_ctx ceiling (prompt fit but left no room), recoverable, signalled via
+//     errContextCeiling so the tool loop folds history and retries.
+func (a *agent) streamOutcomeError(conn *LLMConnection, reqBody map[string]any, r *streamResult) error {
+	switch {
+	case r.firedRule != nil:
+		// Checked first: we aborted this stream on purpose, so scanErr (the reader
+		// stopping mid-body) and a missing finish_reason are consequences of that
+		// decision, not independent failures, and either would otherwise shadow the
+		// real cause. The token counts stay 0 — we never reached the usage chunk —
+		// so an aborted generation is simply not attributed in the turn stats.
+		return &streamRuleError{Rule: r.firedRule.Name, Reminder: r.firedRule.Reminder, Matched: r.text.String()}
+	case r.streamErrMsg != "":
+		return fmt.Errorf("LLM returned an error mid-stream (role=%s, model=%s): %s", conn.Tag, conn.Model, r.streamErrMsg)
+	case r.scanErr != nil:
+		return fmt.Errorf("reading SSE stream: %w", r.scanErr)
+	case r.finishReason == "length":
+		// Two very different causes. (1) completion reached the requested max_tokens
+		// cap → the model is genuinely verbose/looping; bail (the message guides
+		// tuning). (2) completion is BELOW the cap → it hit the n_ctx ceiling: the
+		// prompt fit but left no room to generate. (2) is recoverable — the context
+		// is too full, same as a 400 — so signal isContextFull and let the tool loop
+		// fold history and retry.
+		reqMax := 0
+		switch v := reqBody["max_tokens"].(type) {
+		case int:
+			reqMax = v
+		case int64:
+			reqMax = int(v)
+		case float64:
+			reqMax = int(v)
+		}
+		// The length limit was the n_ctx ceiling, not the cap, when EITHER the
+		// generation stopped below the cap (completion < reqMax), OR the prompt
+		// left less than a full generation of room (prompt + reqMax > n_ctx). The
+		// second form still catches the ceiling when the server omits
+		// completion_tokens (completion == 0), so it can't be compared to the cap.
+		belowCap := r.completionTokens > 0 && reqMax > 0 && r.completionTokens < reqMax
+		mst := a.getMainSlotTokens()
+		noRoom := r.promptTokens > 0 && reqMax > 0 && mst > 0 && r.promptTokens+reqMax > mst
+		switch {
+		case belowCap || noRoom:
+			return fmt.Errorf("generation hit the context ceiling (prompt=%d gen=%d, n_ctx=%d, role=%s): %w",
+				r.promptTokens, r.completionTokens, mst, conn.Tag, errContextCeiling)
+		case r.text.Len() == 0 && len(r.calls) == 0 && r.reasoning.Len() > 0 && thinkingOn(reqBody):
+			// All budget went to reasoning with nothing to show — the model looped
+			// in <think>. Recoverable: the tool loop retries once with thinking off
+			// so it answers directly (see errStuckThinking).
+			return fmt.Errorf("model stuck in <think> (%d B reasoning, 0 content/calls, role=%s): %w",
+				r.reasoning.Len(), conn.Tag, errStuckThinking)
+		default:
+			return &capHitError{Cap: reqMax, msg: fmt.Sprintf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
+				conn.Tag, conn.Model, r.text.Len(), r.reasoning.Len(), len(r.calls), conn.Tag)}
+		}
+	default:
+		return nil
+	}
+}
+
+// logStreamResponse writes the one RESPONSE block per call, on every exit path.
+// The raw SSE wire is one event per token (~100 lines for a short reply,
+// thousands for a tool-call argument blob) — useless for skimming; this
+// collapses the deltas into the reconstructed transcript. The token counts are
+// the server's exact ones from the trailing usage chunk (0 when the backend
+// didn't report them).
+func (a *agent) logStreamResponse(sid, connLabel string, r *streamResult, err error) {
+	text, reasoning := r.text.String(), r.reasoning.String()
+	var rb strings.Builder
+	if r.promptTokens > 0 || r.completionTokens > 0 || r.finishReason != "" {
+		// finish: "stop" = model ended; "length" = hit max_tokens (truncated);
+		// "tool_calls" = ended on a tool call; "(none)" = stream broke with no
+		// finish_reason (interrupted). Distinguishes a cap/interrupt from a clean end.
+		fr := r.finishReason
+		if fr == "" {
+			fr = "(none)"
+		}
+		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d finish=%s", r.promptTokens, r.completionTokens, fr)
+		// Cache split when the server reported it: cached = prompt tokens served
+		// from the KV cache, evaluated = prompt tokens actually processed. This
+		// is THE line for diagnosing prefix-cache misses ("N k uncached" in the
+		// Done stats without this split is unattributable).
+		if r.cachedTokens >= 0 || r.evaluatedTokens >= 0 {
+			fmt.Fprintf(&rb, " cached=%d evaluated=%d", r.cachedTokens, r.evaluatedTokens)
+		}
+		rb.WriteString("\n")
+	}
+	if reasoning != "" {
+		fmt.Fprintf(&rb, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
+	}
+	if text != "" {
+		fmt.Fprintf(&rb, "content:\n%s\n", text)
+	}
+	for i, c := range r.calls {
+		fmt.Fprintf(&rb, "tool_call[%d] %s id=%s args=%s\n", i, c.Function.Name, c.ID, c.Function.Arguments)
+	}
+	if text == "" && reasoning == "" && len(r.calls) == 0 {
+		rb.WriteString("(empty response)\n")
+	}
+	if err != nil {
+		fmt.Fprintf(&rb, "[stream error] %v\n", err)
+	}
+	a.logSession(sid, connLabel+" RESPONSE", "%s", rb.String())
+}
+
+// llmStream is the core LLM call. Streams SSE, collects text and tool calls.
+// sid scopes the debug log: req body and raw SSE response are appended to
+// .codehalter/session_<sid>.log so a single file captures everything that
+// went over the wire for a session. Pass "" to disable logging (used by tests
+// and pre-session probes). think (nil to discard) receives reasoning_content
+// tokens — kept separate from `on` so callers can surface chain-of-thought to
+// the UI as agent_thought_chunk without polluting agent_message_chunk. onArgs
+// (nil to discard) receives each tool-call argument delta tagged with its call
+// index and tool name, which is the only way to see a structured terminal tool
+// being written: its payload never reaches `on`.
+//
+// The body it sends, the stream it reads, and the three passes over the result
+// (turn stats, outcome classification, the RESPONSE log) each live in their own
+// function above; what is left here is the round trip itself — the concurrency
+// gate, the status meter, the HTTP call and its non-200 handling.
+func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string), onArgs func(idx int, name, delta string)) (string, []toolCall, string, error) {
+	reqBody := buildChatRequest(conn, messages, tools)
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", nil, "", fmt.Errorf("marshalling LLM request body: %w", err)
@@ -514,23 +904,32 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 
 	// Drive the phase-row suffix across the round-trip: "(sent…)" until the first
 	// token, then the live ↑/↓ meter (setStatus is a no-op when no phase active).
-	// ↑ is THIS call's request-body size on the wire, ↓ (in streamWaitMeter) is
+	// ↑ is THIS call's request-body size on the wire, ↓ (below) is
 	// generated tokens. Two different quantities in one row, so each carries its
 	// own unit: a bare "↑2451.39kb ↓8.5k" reads as if ↓ were kb too. Display-only.
 	upLabel := humanBytes(len(body))
 	a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent…)", slotLabel, upLabel))
 	defer a.setStatus(ctx, sid, "")
 
-	// streamWaitMeter (see its doc) refreshes the phase row each second for the
-	// whole call. genChars is the running generated-byte count it reads per tick,
-	// written concurrently by the scanner loop below — hence atomic.
+	// Until the first generated byte the row shows "(sent… Ns)", so a busy or
+	// queuing server reads as "(sent… 25s)" rather than a frozen "(sent…)"; once
+	// bytes arrive it switches to the live "↑<body bytes> ↓<gen tokens>" estimate.
+	// The two halves are different quantities, hence the explicit "tok" suffix.
+	// genChars is written by readSSEStream while this reads it, hence atomic. No
+	// warning is ever emitted from here: while the call is alive the climbing
+	// counter is the signal, and if it dies llmStream surfaces the transport
+	// error directly.
+	//
+	// Registered after the status-clear defer above so LIFO joins the meter first.
 	var genChars int64
-	waitDone := make(chan struct{})
-	waitStopped := make(chan struct{})
-	go a.streamWaitMeter(ctx, sid, slotLabel, upLabel, time.Now(), &genChars, waitDone, waitStopped)
-	// Join the meter before the deferred status clear (registered above) runs, so a
-	// late tick can't re-set the row after it's cleared (mirrors startToolMeter).
-	defer func() { close(waitDone); <-waitStopped }()
+	meterStart := time.Now()
+	defer a.startStatusMeter(ctx, sid, func() string {
+		if g := atomic.LoadInt64(&genChars); g > 0 {
+			// approx tokens (chars/4), compact via humanCount. Display-only.
+			return fmt.Sprintf(" (llm[%s] ↑%s ↓%s tok…)", slotLabel, upLabel, humanCount(int(g)/4))
+		}
+		return fmt.Sprintf(" (llm[%s] ↑%s sent… %ds)", slotLabel, upLabel, int(time.Since(meterStart).Seconds()))
+	})()
 
 	// Per-session log: a REQUEST block now, one aggregated RESPONSE block at the
 	// end (the per-token SSE wire is too noisy to skim). connLabel carries
@@ -587,372 +986,24 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		return "", nil, "", &llmHTTPError{Status: resp.StatusCode, Body: msg, URL: resp.Request.URL.String()}
 	}
 
-	var fullText strings.Builder
-	var reasoningText strings.Builder
-	var calls []toolCall
-	var finishReason string
-	// streamErrMsg holds an error the server delivered in-band (HTTP 200, an
-	// {"error":…} SSE chunk). Surfaced as the call error so it isn't swallowed
-	// as an empty response.
-	var streamErrMsg string
-	// firedRule is set when a stream rule matched the content and we abandoned
-	// the generation mid-flight. The partial is discarded, so nothing downstream
-	// reads fullText in that case.
-	var firedRule *streamRule
-	var promptTokens, completionTokens int
-	// Server-reported cache split (see sseChunk.Timings / PromptTokensDetails).
-	// evaluatedTokens = prompt tokens actually run through the model this call;
-	// cachedTokens = reused from KV cache. -1 = the server didn't report it.
-	evaluatedTokens, cachedTokens := -1, -1
-	// Server-measured eval/gen times (ms) — exact, vs our TTFT proxy.
-	var serverPromptMs, serverGenMs float64
+	res := readSSEStream(resp.Body, conn, matcher, on, think, onArgs, &genChars)
+	a.recordStreamStats(sid, connLabel, conn, res)
 
-	scanner := bufio.NewScanner(resp.Body)
-	// SSE chunks can carry large tool-call argument blobs; the default 64 KB
-	// line limit silently truncates. 4 MB matches common reverse-proxy caps.
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	// TTFT (readStart→firstToken) and gen (firstToken→end) — the rate timing
-	// fallback when the server sends no _ms.
-	readStart := time.Now()
-	var firstTokenAt time.Time
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		data := strings.TrimPrefix(line, "data: ")
-		if data == "[DONE]" {
-			break
-		}
-
-		var chunk sseChunk
-		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
-			// Don't drop a malformed frame silently: an off-shape chunk would
-			// otherwise make a backend look like a terse model with no trail.
-			slog.Debug("llm: skipped unparseable SSE frame", "role", conn.Tag, "err", err, "frame", truncate(data, 200))
-			continue
-		}
-		// In-band error: the gateway/llama.cpp can return HTTP 200 and put the
-		// failure in an {"error":…} chunk (empty Choices). Capture and stop —
-		// checked before the empty-Choices skip below, which would drop it and
-		// leave the call looking like a silent "(empty response)".
-		if msg := chunkErrorMessage(&chunk); msg != "" {
-			streamErrMsg = msg
-			break
-		}
-		// Usage arrives in its own trailing chunk (choices empty) when
-		// stream_options.include_usage=true. Capture and keep going — there
-		// may still be a [DONE] line after it.
-		if chunk.Usage != nil {
-			if chunk.Usage.PromptTokens > 0 {
-				promptTokens = chunk.Usage.PromptTokens
-			}
-			if chunk.Usage.CompletionTokens > 0 {
-				completionTokens = chunk.Usage.CompletionTokens
-			}
-			if d := chunk.Usage.PromptTokensDetails; d != nil {
-				cachedTokens = d.CachedTokens
-			}
-		}
-		// llama.cpp timings (prefer over usage cached_tokens — it carries both
-		// sides directly): prompt_n = evaluated, cache_n = reused.
-		if chunk.Timings != nil {
-			evaluatedTokens = chunk.Timings.PromptN
-			cachedTokens = chunk.Timings.CacheN
-			serverPromptMs = chunk.Timings.PromptMs
-			serverGenMs = chunk.Timings.PredictedMs
-		}
-		if len(chunk.Choices) == 0 {
-			continue
-		}
-
-		if r := chunk.Choices[0].FinishReason; r != "" {
-			finishReason = r
-		}
-
-		delta := chunk.Choices[0].Delta
-		if delta.ReasoningContent == "" { // fold vLLM's spelling into the standard one
-			delta.ReasoningContent = delta.Reasoning
-		}
-
-		if firstTokenAt.IsZero() && (delta.Content != "" || delta.ReasoningContent != "" || len(delta.ToolCalls) > 0) {
-			firstTokenAt = time.Now()
-		}
-
-		if delta.ReasoningContent != "" {
-			reasoningText.WriteString(delta.ReasoningContent)
-			atomic.AddInt64(&genChars, int64(len(delta.ReasoningContent)))
-			if think != nil {
-				think(delta.ReasoningContent)
-			}
-		}
-
-		if delta.Content != "" {
-			fullText.WriteString(delta.Content)
-			atomic.AddInt64(&genChars, int64(len(delta.Content)))
-			if on != nil {
-				on(delta.Content)
-			}
-			// Stream rule check. Deliberately AFTER on(): the tokens up to the match
-			// are already on the user's screen, and hiding them would make the
-			// "response discarded, retrying" notice unexplainable. Matching only
-			// content (not reasoning, not tool-call arguments) is the whole design —
-			// see rules.go. On a hit we stop reading the body; the deferred Close
-			// tears down the connection, which is what stops the server generating.
-			if r := matcher.feed(delta.Content); r != nil {
-				firedRule = r
-				break
-			}
-		}
-
-		for _, tc := range delta.ToolCalls {
-			atomic.AddInt64(&genChars, int64(len(tc.Function.Name)+len(tc.Function.Arguments)))
-			if tc.ID != "" {
-				calls = append(calls, tc)
-			} else if len(calls) > 0 {
-				last := &calls[len(calls)-1]
-				last.Function.Arguments += tc.Function.Arguments
-			}
-			// Surface the delta live. The name rides only the ID-bearing first
-			// chunk, so read it back off the accumulator rather than from tc, which
-			// is empty for every continuation.
-			if onArgs != nil && tc.Function.Arguments != "" && len(calls) > 0 {
-				onArgs(len(calls)-1, calls[len(calls)-1].Function.Name, tc.Function.Arguments)
-			}
-		}
-	}
-	scanErr := scanner.Err()
-
-	// Sum the server's reported usage into the turn for the "✅ Done" stats line.
-	// sid="" (probes/tests) has no session, skip. A scan failure means the stream
-	// broke before the usage chunk, so the counts are 0 and this is a no-op.
-	if sess := a.getSession(sid); sess != nil && !conn.noTurnStats {
-		// Derive evaluated (sent-but-not-cached) from cached_tokens when timings are
-		// absent; -1 means no cache info reported. This is the only number we keep —
-		// the gross prompt_tokens (cached prefix re-counted each call) is not summed.
-		if evaluatedTokens < 0 && cachedTokens >= 0 && promptTokens > 0 {
-			evaluatedTokens = promptTokens - cachedTokens
-		}
-		sess.addTurnTokens(promptTokens, completionTokens, evaluatedTokens)
-		// Prefix-cache rewind check, tool-loop calls only. Each is the previous
-		// call's messages plus an append, so the server should hand back
-		// everything the previous call sent (cached ≈ its prompt) and evaluate
-		// only the tail. A big shortfall means the prompt was re-rendered behind
-		// our backs; logged per call, and reported once on the Done line.
-		if conn.cacheLineage && promptTokens > 0 {
-			render := renderKey(conn.ExtraBody)
-			rw := sess.noteCacheLineage(promptTokens, cachedTokens, render, time.Now())
-			if rw.tokens > 0 {
-				// Print "(none)" rather than an empty string: a params table with
-				// no template fields at all is the good configuration, and it
-				// should not read like missing data.
-				was, now := rw.prevRender, render
-				if was == "" {
-					was = "(none)"
-				}
-				if now == "" {
-					now = "(none)"
-				}
-				// The gap since the previous call, because token counts alone
-				// cannot separate "something re-rendered the prompt" from "the
-				// server reclaimed a slot we left sitting". Both look identical in
-				// prompt/cached, and only one of them is worth acting on. There is
-				// always a previous call here (a rewind needs one), so this is
-				// always a real measurement.
-				gap := humanDuration(rw.idle.Milliseconds())
-				if rw.renderChanged {
-					a.logSession(sid, connLabel+" CACHE",
-						"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d, %s since that call). "+
-							"Cause: we asked for a different rendering than last call. Template params went %s -> %s. The server keeps "+
-							"a prompt state per rendering, so this call could only reuse what THIS rendering held last time and had to "+
-							"re-evaluate everything the other role appended since. Make params_thinking and params_execute agree on "+
-							"everything that is not a sampler.",
-						rw.tokens, promptTokens, cachedTokens, gap, was, now)
-				} else if rw.idle >= idleEvictionSuspect {
-					a.logSession(sid, connLabel+" CACHE",
-						"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d). "+
-							"Both calls asked for the same rendering (%s) and the slot sat idle %s beforehand, which is the "+
-							"likeliest cause: servers reclaim idle slots and no setting prevents it. Nothing to fix unless the "+
-							"gap surprises you.",
-						rw.tokens, promptTokens, cachedTokens, now, gap)
-				} else {
-					a.logSession(sid, connLabel+" CACHE",
-						"prefix cache rewound: %d tokens the previous call had already sent were re-read (prompt=%d cached=%d). "+
-							"Both calls asked for the same rendering (%s) and they were only %s apart, so an idle eviction is "+
-							"unlikely: something rewrote the middle of the prompt. A tool result that replayed differently than "+
-							"it was sent, or a chat template that repositions earlier messages as the conversation grows.",
-						rw.tokens, promptTokens, cachedTokens, now, gap)
-				}
-			}
-		}
-		// Prefer the server's measured times over our TTFT proxy (which includes
-		// queue + cache-load overhead → understates pp/s).
-		pMs, gMs := serverPromptMs, serverGenMs
-		if pMs == 0 && gMs == 0 && !firstTokenAt.IsZero() {
-			pMs = float64(firstTokenAt.Sub(readStart).Milliseconds())
-			gMs = float64(time.Since(firstTokenAt).Milliseconds())
-		}
-		if pMs > 0 || gMs > 0 {
-			sess.addTurnTiming(int64(pMs), int64(gMs))
-		}
-	}
-
-	// One outcome error, shared by the RESPONSE log block and the return. Order
-	// matters: an explicit in-band server error is checked FIRST, because gateways
-	// commonly emit an {"error":…} chunk and THEN drop the socket. Checking the
-	// transport error first would shadow the server's verbatim cause (e.g. "prompt
-	// exceeds n_ctx") behind a generic "unexpected EOF", and send a fatal prompt
-	// down the useless transient-retry path instead of surfacing the real reason.
-	//   - streamErrMsg: server sent an {"error":…} chunk under HTTP 200; surface
-	//     its message verbatim (it names the real cause, e.g. prompt > n_ctx).
-	//   - scanErr: stream broke mid-flight (e.g. a router model swap force-kills
-	//     the connection) with no in-band error to explain it.
-	//   - finish_reason="length": truncated at a length limit. If completion hit
-	//     the requested max_tokens cap the model is genuinely verbose/looping and we
-	//     bail (the message guides tuning); if it stopped BELOW the cap it hit the
-	//     n_ctx ceiling (prompt fit but left no room), recoverable, signalled via
-	//     errContextCeiling so the tool loop folds history and retries.
 	// A server that quietly ignores chat_template_kwargs looks exactly like a
 	// server that honours it, right up until the reasoning tokens arrive.
-	a.warnChatTemplateKwargsIgnored(ctx, sid, conn, reqBody, reasoningText.Len())
+	a.warnChatTemplateKwargsIgnored(ctx, sid, conn, reqBody, res.reasoning.Len())
 
-	switch {
-	case firedRule != nil:
-		// Checked first: we aborted this stream on purpose, so scanErr (the reader
-		// stopping mid-body) and a missing finish_reason are consequences of that
-		// decision, not independent failures, and either would otherwise shadow the
-		// real cause. The token counts stay 0 — we never reached the usage chunk —
-		// so an aborted generation is simply not attributed in the turn stats.
-		err = &streamRuleError{Rule: firedRule.Name, Reminder: firedRule.Reminder, Matched: fullText.String()}
-	case streamErrMsg != "":
-		err = fmt.Errorf("LLM returned an error mid-stream (role=%s, model=%s): %s", conn.Tag, conn.Model, streamErrMsg)
-	case scanErr != nil:
-		err = fmt.Errorf("reading SSE stream: %w", scanErr)
-	case finishReason == "length":
-		// Two very different causes. (1) completion reached the requested max_tokens
-		// cap → the model is genuinely verbose/looping; bail (the message guides
-		// tuning). (2) completion is BELOW the cap → it hit the n_ctx ceiling: the
-		// prompt fit but left no room to generate. (2) is recoverable — the context
-		// is too full, same as a 400 — so signal isContextFull and let the tool loop
-		// fold history and retry.
-		reqMax := 0
-		switch v := reqBody["max_tokens"].(type) {
-		case int:
-			reqMax = v
-		case int64:
-			reqMax = int(v)
-		case float64:
-			reqMax = int(v)
-		}
-		// The length limit was the n_ctx ceiling, not the cap, when EITHER the
-		// generation stopped below the cap (completion < reqMax), OR the prompt
-		// left less than a full generation of room (prompt + reqMax > n_ctx). The
-		// second form still catches the ceiling when the server omits
-		// completion_tokens (completion == 0), so it can't be compared to the cap.
-		belowCap := completionTokens > 0 && reqMax > 0 && completionTokens < reqMax
-		mst := a.getMainSlotTokens()
-		noRoom := promptTokens > 0 && reqMax > 0 && mst > 0 && promptTokens+reqMax > mst
-		if belowCap || noRoom {
-			err = fmt.Errorf("generation hit the context ceiling (prompt=%d gen=%d, n_ctx=%d, role=%s): %w",
-				promptTokens, completionTokens, mst, conn.Tag, errContextCeiling)
-		} else if fullText.Len() == 0 && len(calls) == 0 && reasoningText.Len() > 0 && thinkingOn(reqBody) {
-			// All budget went to reasoning with nothing to show — the model looped
-			// in <think>. Recoverable: the tool loop retries once with thinking off
-			// so it answers directly (see errStuckThinking).
-			err = fmt.Errorf("model stuck in <think> (%d B reasoning, 0 content/calls, role=%s): %w",
-				reasoningText.Len(), conn.Tag, errStuckThinking)
-		} else {
-			err = &capHitError{Cap: reqMax, msg: fmt.Sprintf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
-				conn.Tag, conn.Model, fullText.Len(), reasoningText.Len(), len(calls), conn.Tag)}
-		}
-	default:
-		err = nil
-	}
+	err = a.streamOutcomeError(conn, reqBody, res)
 	// A generation the caller cannot use is decode time spent for nothing, and
 	// it is already inside the turn's completion total. Name it, or the Done
 	// line reports the worst turns as the most productive ones.
-	if err != nil && completionTokens > 0 {
+	if err != nil && res.completionTokens > 0 {
 		if sess := a.getSession(sid); sess != nil && !conn.noTurnStats {
-			sess.addWastedCompletion(completionTokens)
+			sess.addWastedCompletion(res.completionTokens)
 		}
 	}
-
-	// One RESPONSE block per call, on every exit path. The raw SSE wire is one
-	// event per token (~100 lines for a short reply, thousands for a tool-call
-	// argument blob) — useless for skimming; this collapses the deltas into the
-	// reconstructed transcript. promptTokens/completionTokens are the server's
-	// exact counts from the trailing usage chunk (0 when the backend didn't
-	// report them).
-	text, reasoning := fullText.String(), reasoningText.String()
-	var rb strings.Builder
-	if promptTokens > 0 || completionTokens > 0 || finishReason != "" {
-		// finish: "stop" = model ended; "length" = hit max_tokens (truncated);
-		// "tool_calls" = ended on a tool call; "(none)" = stream broke with no
-		// finish_reason (interrupted). Distinguishes a cap/interrupt from a clean end.
-		fr := finishReason
-		if fr == "" {
-			fr = "(none)"
-		}
-		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d finish=%s", promptTokens, completionTokens, fr)
-		// Cache split when the server reported it: cached = prompt tokens served
-		// from the KV cache, evaluated = prompt tokens actually processed. This
-		// is THE line for diagnosing prefix-cache misses ("N k uncached" in the
-		// Done stats without this split is unattributable).
-		if cachedTokens >= 0 || evaluatedTokens >= 0 {
-			fmt.Fprintf(&rb, " cached=%d evaluated=%d", cachedTokens, evaluatedTokens)
-		}
-		rb.WriteString("\n")
-	}
-	if reasoning != "" {
-		fmt.Fprintf(&rb, "reasoning_content (%d B):\n%s\n", len(reasoning), reasoning)
-	}
-	if text != "" {
-		fmt.Fprintf(&rb, "content:\n%s\n", text)
-	}
-	for i, c := range calls {
-		fmt.Fprintf(&rb, "tool_call[%d] %s id=%s args=%s\n", i, c.Function.Name, c.ID, c.Function.Arguments)
-	}
-	if text == "" && reasoning == "" && len(calls) == 0 {
-		rb.WriteString("(empty response)\n")
-	}
-	if err != nil {
-		fmt.Fprintf(&rb, "[stream error] %v\n", err)
-	}
-	a.logSession(sid, connLabel+" RESPONSE", "%s", rb.String())
-	return fullText.String(), calls, reasoningText.String(), err
-}
-
-// streamWaitMeter refreshes the active phase row once per second for the whole
-// LLM call. Until the first generated byte (genChars==0) it shows "(sent… Ns)"
-// so a busy/queuing server reads as "(sent… 25s)" instead of a frozen
-// "(sent…)"; once bytes arrive it shows the live "↑<body bytes> ↓<gen tokens>"
-// estimate. The two halves are different units, hence the explicit "tok" suffix.
-// genChars is read atomically — the scanner loop writes it concurrently.
-// Returns when the call ends (done closed) or ctx is cancelled; it never aborts
-// the request. No warning is emitted: while the call is alive the climbing
-// counter is the signal, and if it dies (e.g. a router model swap force-kills
-// the connection) llmStream surfaces the transport error directly.
-func (a *agent) streamWaitMeter(ctx context.Context, sid, slotLabel, upLabel string, start time.Time, genChars *int64, done <-chan struct{}, stopped chan struct{}) {
-	defer close(stopped)
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-done:
-			return
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if g := atomic.LoadInt64(genChars); g > 0 {
-				// approx tokens (chars/4), compact via humanCount. Display-only.
-				tok := humanCount(int(g) / 4)
-				a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s ↓%s tok…)", slotLabel, upLabel, tok))
-			} else {
-				elapsed := int(time.Since(start).Seconds())
-				a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent… %ds)", slotLabel, upLabel, elapsed))
-			}
-		}
-	}
+	a.logStreamResponse(sid, connLabel, res, err)
+	return res.text.String(), res.calls, res.reasoning.String(), err
 }
 
 // probeResult is what a single LLM probe call yields: server reachability,
@@ -1044,6 +1095,42 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	return r
 }
 
+// probeGetJSON issues an authenticated GET against conn and decodes a 200 JSON
+// body into v. It reports whether it got that far; false means the server is not
+// usable through this endpoint, and the reason is already in the log.
+//
+// Both probes want exactly this, and writing it out per probe let them drift on
+// the half that matters: one logged the non-200 status and body, the other
+// returned silently, so a probe that said "unreachable" about a server that was
+// plainly up left nothing to read. Now every failure names itself.
+func probeGetJSON(ctx context.Context, conn *LLMConnection, path, who string, v any) bool {
+	url := conn.endpoint(path)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		slog.Info(who+": unusable request URL", "url", url, "err", err)
+		return false
+	}
+	if conn.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.Info(who+": request failed", "url", url, "err", err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		slog.Info(who+": non-OK", "url", url, "status", resp.StatusCode, "body", string(body))
+		return false
+	}
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		slog.Info(who+": undecodable body", "url", url, "err", err)
+		return false
+	}
+	return true
+}
+
 // probeViaModels asks /v1/models for the configured model. Always confirms
 // reachability + model presence; image_support / context_size only land
 // when the response carries llama-swap-style `status.args` (--mmproj /
@@ -1054,23 +1141,6 @@ func (a *agent) probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 // enumerated id in AvailableModels so renderLLMStatus can show the real names
 // when the configured model isn't found.
 func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
-	modelsURL := conn.endpoint("/v1/models")
-	req, err := http.NewRequestWithContext(ctx, "GET", modelsURL, nil)
-	if err == nil && conn.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
-	}
-	var resp *http.Response
-	if err == nil {
-		resp, err = http.DefaultClient.Do(req)
-	}
-	if err != nil {
-		slog.Info("probeViaModels: request failed", "url", modelsURL, "err", err)
-		return probeResult{}, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return probeResult{}, false
-	}
 	var models struct {
 		Data []struct {
 			ID     string `json:"id"`
@@ -1079,7 +1149,7 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 			} `json:"status"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
+	if !probeGetJSON(ctx, conn, "/v1/models", "probeViaModels", &models) {
 		return probeResult{}, false
 	}
 	r := probeResult{Reachable: true, ModelKnown: true}
@@ -1125,25 +1195,6 @@ func (a *agent) probeViaModels(ctx context.Context, conn *LLMConnection) (probeR
 // to reach a specific model in llama.cpp router mode (whose bare /props reports
 // n_ctx=0).
 func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection, path string) (probeResult, bool) {
-	propsURL := conn.endpoint(path)
-	req, err := http.NewRequestWithContext(ctx, "GET", propsURL, nil)
-	if err == nil && conn.APIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
-	}
-	var resp *http.Response
-	if err == nil {
-		resp, err = http.DefaultClient.Do(req)
-	}
-	if err != nil {
-		slog.Info("probeViaProps: request failed", "url", propsURL, "err", err)
-		return probeResult{}, false
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
-		slog.Info("probeViaProps: non-OK", "url", propsURL, "status", resp.StatusCode, "body", string(body))
-		return probeResult{}, false
-	}
 	var props struct {
 		Modalities *struct {
 			Vision bool `json:"vision"`
@@ -1158,7 +1209,7 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection, path str
 		NCtx       int `json:"n_ctx"`
 		TotalSlots int `json:"total_slots"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&props); err != nil {
+	if !probeGetJSON(ctx, conn, path, "probeViaProps", &props) {
 		return probeResult{}, false
 	}
 	r := probeResult{Reachable: true, ContextSize: props.NCtx, TotalSlots: props.TotalSlots}

@@ -387,9 +387,9 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 	instructions := task.framed()
 
 	// Leaf subagent: tool loop only, on the "execute" role like runExecutePhase,
-	// so it carries the same reasoning switch (see noThinkSwitch). The "thinking"
-	// task type below omits it — it runs its own plan phase first.
-	subSess.AddUser(instructions + noThinkSwitch)
+	// so it gets the same reasoning switch below (see withThinkingDisabled). The
+	// "thinking" task type omits it — it runs its own plan phase first.
+	subSess.AddUser(instructions)
 	subSess.saveOrLog()
 
 	var b strings.Builder
@@ -432,7 +432,8 @@ func (a *agent) runSubagentExecute(ctx context.Context, subSess *Session, task s
 	}
 	policy := phasePolicy{deny: deny, terminals: map[string]bool{respondToolName: true}}
 
-	result, err := a.runToolLoopSeeded(ctx, sid, a.connForSession(ctx, sid, "execute"), messages, policy, "subagent", true, 0)
+	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
+	result, err := a.runToolLoopSeeded(ctx, sid, conn, messages, policy, "subagent", true, 0)
 	if err != nil {
 		return result.Text, err
 	}

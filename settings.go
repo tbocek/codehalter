@@ -238,9 +238,7 @@ func (c *LLMConnection) paramsFor(role string) map[string]any {
 // Turning reasoning off for execute is worth a lot on a thinking model.
 // Measured over one 11.6h session against Qwen3.8-27B: 308 execute calls,
 // 169030 completion tokens, 71.2 minutes of pure decode, of which reasoning was
-// roughly 70%. Qwen's documented soft switch does not deliver it — 237 of 388
-// execute responses carrying /no_think in the last user message still returned
-// reasoning_content. chat_template_kwargs.enable_thinking=false does: 71
+// roughly 70%. chat_template_kwargs.enable_thinking=false delivers it: 71
 // responses, 0 with reasoning, 20.7s -> 8.8s per call.
 //
 // Setting it here anyway would be a bad trade on a single-slot server, which is
@@ -264,11 +262,18 @@ func (c *LLMConnection) paramsFor(role string) map[string]any {
 // context depth. n=1, but it is the only direct measurement and it points the
 // conservative way.
 //
-// So it is a per-connection decision the user makes, not a default codehalter
-// imposes, because the answer depends on the slot count of the server in front
-// of it. res/settings.toml documents when to take it. On a server holding two
-// or more slots each rendering keeps its own KV cache and the switch is cheap;
-// on one slot it is the 83 minutes above.
+// codehalter takes the decode win a third way, which costs nothing at all: the
+// execute-role phases append an already-closed <think></think> for the model to
+// continue (withThinkingDisabled). That is a suffix, not a re-render, so both
+// roles keep asking for the same rendering and the 83 minutes never come due.
+// Probed against the same server on a 13978-token prompt: the kwargs change
+// came back cached=0, the append cached=13968, reasoning suppressed either way.
+//
+// The kwargs field stays a per-connection decision the user makes, not a
+// default codehalter imposes, because whether it is affordable depends on the
+// slot count of the server in front of it. res/settings.toml documents when to
+// take it. On a server holding two or more slots each rendering keeps its own
+// KV cache and the switch is cheap; on one slot it is the 83 minutes above.
 
 // endpoint joins the configured server base with an API path, e.g.
 // endpoint("/v1/models") → "http://host:8080/v1/models". The user configures
