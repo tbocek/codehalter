@@ -293,12 +293,71 @@ func (c *LLMConnection) parallelCap() int {
 	return 1
 }
 
-// loadSettings looks for settings.toml in this order:
-// 1. <cwd>/.codehalter/settings.toml (project-local, preferred)
-// 2. ~/.config/codehalter/settings.toml (global fallback)
-// Always creates .codehalter/ in the project if it doesn't exist. When
-// neither file exists, returns an empty Settings (with path "") and a nil
-// error so callers can prompt the user to create one without aborting the
+// settingsSource is one candidate settings.toml and its fate. Selection is
+// whole-file, never a merge: the first candidate that exists is Active and
+// every later one that exists is shadowed by it.
+type settingsSource struct {
+	Path   string
+	Scope  string // "project" | "global"
+	Exists bool
+	Active bool // the one loadSettings reads
+}
+
+// settingsSources lists the candidates in precedence order:
+//  1. <cwd>/.codehalter/settings.toml (project-local, preferred — per-project
+//     overrides win even when a machine-wide config exists)
+//  2. ~/.config/codehalter/settings.toml (global fallback, serving every project
+//     without a local file)
+//
+// loadSettings reads the Active one; /settings prints the whole list so the
+// user can see which file is in force and which it shadows. Both go through
+// here, so the order is defined once.
+func settingsSources(cwd string) []settingsSource {
+	out := []settingsSource{{Path: filepath.Join(cwd, sessionDir, "settings.toml"), Scope: "project"}}
+	if home, err := os.UserHomeDir(); err == nil {
+		out = append(out, settingsSource{Path: filepath.Join(home, ".config", "codehalter", "settings.toml"), Scope: "global"})
+	}
+	claimed := false
+	for i := range out {
+		if _, err := os.Stat(out[i].Path); err != nil {
+			continue
+		}
+		out[i].Exists = true
+		out[i].Active = !claimed
+		claimed = true
+	}
+	return out
+}
+
+// renderSettingsSources reports which settings.toml is in force and which
+// candidates it shadows. Read off disk each call rather than from the loaded
+// Settings: the question /settings answers is "which file am I reading", and a
+// path cached in memory cannot answer it if the file changed underneath.
+func renderSettingsSources(cwd string) string {
+	var b strings.Builder
+	b.WriteString("**Settings**\n\n")
+	found := false
+	for _, src := range settingsSources(cwd) {
+		switch {
+		case src.Active:
+			found = true
+			fmt.Fprintf(&b, "✅ in use: `%s` (%s)\n\n", src.Path, src.Scope)
+		case src.Exists:
+			fmt.Fprintf(&b, "❕ shadowed: `%s` (%s) — the file above wins, this one is never read.\n\n", src.Path, src.Scope)
+		default:
+			fmt.Fprintf(&b, "· absent: `%s` (%s)\n\n", src.Path, src.Scope)
+		}
+	}
+	if !found {
+		b.WriteString("🟡 No settings.toml at either path — codehalter cannot run a turn until one exists.\n\n")
+	}
+	return b.String()
+}
+
+// loadSettings decodes the highest-precedence settings.toml that exists (see
+// settingsSources). Always creates .codehalter/ in the project if it doesn't
+// exist. When neither file exists, returns an empty Settings (with path "") and
+// a nil error so callers can prompt the user to create one without aborting the
 // session.
 func loadSettings(cwd string) (Settings, error) {
 	// Ensure project .codehalter dir exists so scaffoldSettings can write a
@@ -310,24 +369,11 @@ func loadSettings(cwd string) (Settings, error) {
 		// its own error. Log so a genuine permission problem isn't silent.
 		slog.Warn("loadSettings: could not create project .codehalter dir", "dir", projectDir, "err", err)
 	}
-
-	// Project-local first — a project-specific settings.toml wins over the
-	// global file, so per-project overrides (a different server, a project
-	// model) are honoured even when a machine-wide config exists.
-	projectPath := filepath.Join(projectDir, "settings.toml")
-	if _, err := os.Stat(projectPath); err == nil {
-		return decodeSettings(projectPath)
-	}
-
-	// Global fallback — serves every project that has no local file, so we
-	// don't need to nag with the project-local prompt anymore.
-	if home, err := os.UserHomeDir(); err == nil {
-		globalPath := filepath.Join(home, ".config", "codehalter", "settings.toml")
-		if _, err := os.Stat(globalPath); err == nil {
-			return decodeSettings(globalPath)
+	for _, s := range settingsSources(cwd) {
+		if s.Active {
+			return decodeSettings(s.Path)
 		}
 	}
-
 	return Settings{}, nil
 }
 

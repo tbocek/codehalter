@@ -164,6 +164,33 @@ func handleClean(cwd string) (message string, handled bool) {
 	return fmt.Sprintf("✓ Cleaned %d session file(s) from .codehalter/", len(matched)), true
 }
 
+// handleSettings is a code-level slash command: /settings answers "which
+// settings.toml am I actually running, and which of my models work?".
+//
+// Both halves are things the user cannot otherwise see. The file is picked by
+// precedence and never merged, so a forgotten project-local copy silently
+// shadows the global one being edited; renderSettingsSources lists the
+// shadowed candidates for exactly that case. The model half re-probes every
+// [[llm]] instead of reprinting the cached result: ensureLLM only re-probes
+// when the settings hash changed, so a server that died (or came back)
+// mid-session would otherwise still show its state from session start. The
+// capabilities banner prints the same block once per session; this is the
+// on-demand version.
+//
+// The file list is said immediately and only the probe result returned,
+// because probing is the slow half (a llama.cpp router blocks the request
+// while it loads the model) and the path has no reason to wait behind it.
+func (a *agent) handleSettings(ctx context.Context, sid, cwd string) (message string, handled bool) {
+	if cwd == "" {
+		return "", false
+	}
+	a.say(ctx, sid, renderSettingsSources(cwd)+"Probing every configured `[[llm]]`")
+	stopBeat := a.heartbeat(ctx, sid)
+	a.probeAllLLMs(ctx)
+	stopBeat()
+	return "\n\n" + a.renderLLMStatus(), true
+}
+
 // splitMacro parses a slash command "/name args" into its name and args. name
 // is "" when userText is not a slash command.
 func splitMacro(userText string) (name, args string) {
@@ -182,15 +209,19 @@ func splitMacro(userText string) (name, args string) {
 // <name> is a known macro. handled=false → not a macro, run userText as-is.
 // handled=true + stopMsg → macro needs an arg it lacks; show stopMsg, run no
 // turn. Otherwise `rendered` replaces the user message.
-func expandMacro(cwd, userText string) (rendered, stopMsg string, handled bool) {
+func (a *agent) expandMacro(ctx context.Context, sid, cwd, userText string) (rendered, stopMsg string, handled bool) {
 	name, args := splitMacro(userText)
 	if name == "" {
 		return "", "", false
 	}
 	// Code-level slash commands run before template expansion.
-	if name == "clean" {
-		msg, handled := handleClean(cwd)
-		if handled {
+	switch name {
+	case "clean":
+		if msg, ok := handleClean(cwd); ok {
+			return "", msg, true
+		}
+	case "settings":
+		if msg, ok := a.handleSettings(ctx, sid, cwd); ok {
 			return "", msg, true
 		}
 	}
@@ -212,7 +243,10 @@ func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
 	names := templateNames(cwd)
 	cmds := make([]availableCommand, 0, len(names)+1)
 	// Code-level slash commands first.
-	cmds = append(cmds, availableCommand{Name: "clean", Description: "Delete session log files from .codehalter/"})
+	cmds = append(cmds,
+		availableCommand{Name: "clean", Description: "Delete session log files from .codehalter/"},
+		availableCommand{Name: "settings", Description: "Show which settings.toml is in use and re-probe every configured model"},
+	)
 	for _, n := range names {
 		cmds = append(cmds, availableCommand{Name: n, Description: "Run the " + n + " prompt template"})
 	}

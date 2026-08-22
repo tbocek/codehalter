@@ -133,10 +133,12 @@ func planRow(st subtask) string {
 // a single physical line, so two things in a subtask would wreck it: an
 // unescaped `|` (descriptions name exact commands, and a `grep x | wc -l` splits
 // the row into phantom columns) and a newline (it ends the table at that row).
-// Pipes are escaped and newlines become <br>, which Zed's markdown renders as a
-// real break. Keeping the shape is what lets the cell carry the whole
-// instruction: a real 27B description ran 1114 characters of shell pipelines
-// around a heredoc, unreadable if flattened onto one line but fine as lines.
+// Pipes are escaped and newlines become <br>. Keeping the shape is what lets the
+// cell carry the whole instruction: a real 27B description ran 1114 characters of
+// shell pipelines around a heredoc, unreadable if flattened onto one line but
+// fine as lines. Note that Zed does NOT render the <br> as a break: it prints
+// raw HTML as text, so the tag shows up literally and marks the break instead of
+// making it.
 func planCell(s string) string {
 	lines := strings.Split(strings.ReplaceAll(s, "|", `\|`), "\n")
 	kept := lines[:0]
@@ -148,11 +150,15 @@ func planCell(s string) string {
 		if ln == "" && (len(kept) == 0 || kept[len(kept)-1] == "") {
 			continue
 		}
-		// Leading whitespace has to survive as &nbsp; or the Go source a heredoc
-		// carries renders flat at column 0. Only the indent is protected: runs
-		// inside the line are alignment padding at worst and collapse harmlessly.
+		// Leading whitespace is re-emitted as plain spaces (a tab as four) so the
+		// Go source a heredoc carries doesn't render flat at column 0. Only the
+		// indent is rebuilt: runs inside the line are alignment padding at worst
+		// and collapse harmlessly. Plain spaces, not &nbsp;: Zed prints raw HTML
+		// as text, so the entity showed up literally and cost more than the indent
+		// it bought. Nothing here starts a line (the cell is one physical line),
+		// so a four-space run can't be read as an indented code block.
 		if ln != "" && indent != "" {
-			ln = strings.Repeat("&nbsp;", len(indent)+3*strings.Count(indent, "\t")) + ln
+			ln = strings.Repeat(" ", len(indent)+3*strings.Count(indent, "\t")) + ln
 		}
 		// A line ending in an odd number of backslashes is a shell continuation. It
 		// would escape the `<` of the <br> that follows and print the tag as text,

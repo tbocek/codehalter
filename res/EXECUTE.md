@@ -35,7 +35,8 @@ If this task WROTE or CHANGED code:
 - A `verify` recipe that only builds is INSUFFICIENT for code — add the test step yourself. New behavior with no test that runs it = task NOT done.
 
 ## Sustainability
-A `run_command` install you don't persist to `.devcontainer/Dockerfile` vanishes on rebuild. Install anything → pair with a Dockerfile edit in same loop, self-check install is in Dockerfile (planner usually puts this in verify; add if missing).
+A `run_command` install you don't persist to `.devcontainer/Dockerfile` vanishes on rebuild. Install a tool the project KEEPS needing (build/test/lint chain, runtime dep) → pair with a Dockerfile edit in same loop, self-check install is in Dockerfile (planner usually puts this in verify; add if missing).
+Installed only to test/probe/answer one question → do NOT touch the Dockerfile; the rebuild wiping it is the point. Say you left it unpersisted.
 
 ## Behavior
 - Read before editing. Know a file only from summary? Re-read first — may have changed.

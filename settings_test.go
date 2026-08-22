@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
@@ -166,5 +167,63 @@ func TestParamsForInventsNoChatTemplateKwargs(t *testing.T) {
 	}
 	if got := opted.paramsFor("execute")["temperature"]; got != 0.6 {
 		t.Errorf("temperature = %v, want 0.6", got)
+	}
+}
+
+// TestRenderSettingsSourcesMarksShadowed pins what /settings exists to show: a
+// project-local settings.toml silently shadowing the global one. Precedence
+// itself is pinned by TestLoadSettingsProjectLocalFirst; what matters here is
+// that the LOSING file is still named, because the failure this command exists
+// to diagnose is a user editing the global file while a forgotten local copy
+// is the one being read.
+func TestRenderSettingsSourcesMarksShadowed(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	globalPath := filepath.Join(home, ".config", "codehalter", "settings.toml")
+	if err := os.MkdirAll(filepath.Dir(globalPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(globalPath, []byte("[[llm]]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cwd := t.TempDir()
+	localPath := filepath.Join(cwd, sessionDir, "settings.toml")
+
+	// (a) global only: it is in use, and the missing local file is still listed
+	// so the user can see where to put an override.
+	got := renderSettingsSources(cwd)
+	if !strings.Contains(got, "✅ in use: `"+globalPath+"`") {
+		t.Errorf("global-only: %q does not mark the global file in use", got)
+	}
+	if !strings.Contains(got, "absent: `"+localPath+"`") {
+		t.Errorf("global-only: %q does not list the absent project path", got)
+	}
+
+	// (b) both exist: the project file wins and the global one is named as
+	// shadowed, not omitted.
+	if err := os.MkdirAll(filepath.Dir(localPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(localPath, []byte("[[llm]]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got = renderSettingsSources(cwd)
+	if !strings.Contains(got, "✅ in use: `"+localPath+"`") {
+		t.Errorf("both: %q does not mark the project file in use", got)
+	}
+	if !strings.Contains(got, "❕ shadowed: `"+globalPath+"`") {
+		t.Errorf("both: %q does not name the shadowed global file", got)
+	}
+
+	// (c) neither: say so outright rather than printing two absent paths and
+	// leaving the user to conclude it.
+	if err := os.Remove(localPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(globalPath); err != nil {
+		t.Fatal(err)
+	}
+	if got = renderSettingsSources(cwd); !strings.Contains(got, "No settings.toml at either path") {
+		t.Errorf("neither: %q does not say no settings file was found", got)
 	}
 }

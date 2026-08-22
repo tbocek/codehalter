@@ -198,7 +198,21 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// reads structurally as an answer; keeping the model off that is PLAN.md's job,
 	// not a brittle string match here.)
 	hasPlan := len(plan.Subtasks) > 0
-	hasAnswer := plan.answer != ""
+	// Prose alongside subtasks is a PREAMBLE, not an answer, and must not count as
+	// one: orchestrate surfaces answer only when there are no subtasks
+	// (prompt.go), and report_only=false says the planner means this plan to run,
+	// so there is nothing to choose between and nothing to ask. Measured over two
+	// sessions: 10 of 35 plan submissions carried a preamble ("The request is
+	// clear: delete the out/test build output and recompile the site."), every one
+	// of them report_only=false, and every one cost a corrective round trip (4-50s)
+	// plus a second plan table streamed over the first, to arrive at the plan
+	// already submitted. The nudge also lingers as a stored turn: a later planner
+	// round spent 1825 bytes of reasoning re-litigating one.
+	//
+	// report_only=true is the real fork and still nudges: those subtasks relay
+	// findings the message may already have delivered, so running them can
+	// re-derive an answer the user was just given.
+	hasAnswer := plan.answer != "" && (!hasPlan || plan.ReportOnly)
 	if plan.Clear && hasPlan == hasAnswer {
 		nudge := "You submitted neither a usable answer nor a plan — your message is empty or only promises to act (\"I'll…\"). Either write the COMPLETE answer now (report_only=true, no subtasks), OR submit subtasks that produce it. Never write \"I'll…\" / \"let me…\"."
 		if hasPlan {

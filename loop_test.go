@@ -347,6 +347,76 @@ func TestPlanRecoversFromMalformedSubmitPlanArguments(t *testing.T) {
 	}
 }
 
+// planPhaseAgent wires a mock LLM to a session and seeds a PLAN.md, the two
+// things runPlanPhase needs before it will run at all: no [[llm]] is an error
+// and an empty PLAN.md disables planning outright. The PLAN.md content is
+// irrelevant to these tests, only its presence gates the phase.
+func planPhaseAgent(t *testing.T, responses ...string) (*agent, *Session, *mockLLM) {
+	t.Helper()
+	mock := newMockLLM(t, responses...)
+	t.Cleanup(mock.Close)
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+	if err := os.MkdirAll(filepath.Join(s.Cwd, ".codehalter"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Cwd, ".codehalter", "PLAN.md"), []byte("plan things"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return a, s, mock
+}
+
+// TestPlanPreambleIsNotAnAnswer pins the detector's good path: prose written
+// alongside subtasks with report_only=false is a PREAMBLE, and preambles cost
+// nothing. orchestrate already drops that prose (it surfaces answer only when
+// there are no subtasks), so there is nothing to pick between and no reason to
+// spend a corrective round trip asking. Measured on two real sessions: 10 of 35
+// plan submissions looked exactly like this one, every one report_only=false,
+// every one nudged for a plan it had already submitted.
+func TestPlanPreambleIsNotAnAnswer(t *testing.T) {
+	args := `{"clear":true,"report_only":false,"subtasks":[{"description":"delete out/test and rebuild","verify":["go build ./..."]}]}`
+	a, s, mock := planPhaseAgent(t, sseContentThenToolCall(
+		"The request is clear: delete the out/test build output and recompile the site.",
+		"p1", submitPlanToolName, args))
+
+	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if got := mock.callCount(); got != 1 {
+		t.Errorf("a preamble cost %d LLM calls, want 1 (no corrective round trip)", got)
+	}
+	if plan == nil || len(plan.Subtasks) != 1 || plan.Subtasks[0].Description != "delete out/test and rebuild" {
+		t.Fatalf("plan = %+v, want the submitted subtask intact", plan)
+	}
+}
+
+// TestPlanReportOnlyProseStillNudges pins the other side: report_only=true IS
+// the real fork. Those subtasks only relay findings, so prose alongside them
+// may already have delivered the answer the subtasks would go re-derive. The
+// planner has to pick, and the corrective round is what makes it.
+func TestPlanReportOnlyProseStillNudges(t *testing.T) {
+	ambiguous := sseContentThenToolCall(
+		"The three helpers live in a.go, b.go and c.go.",
+		"p1", submitPlanToolName,
+		`{"clear":true,"report_only":true,"subtasks":[{"description":"list the helpers","verify":["ls"]}]}`)
+	picked := sseContentThenToolCall(
+		"The three helpers live in a.go, b.go and c.go.",
+		"p2", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[]}`)
+	a, s, mock := planPhaseAgent(t, ambiguous, picked)
+
+	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if got := mock.callCount(); got != 2 {
+		t.Errorf("an answer + report_only subtasks cost %d LLM calls, want 2 (the nudge)", got)
+	}
+	if plan == nil || len(plan.Subtasks) != 0 {
+		t.Fatalf("plan = %+v, want the corrected answer-only submission", plan)
+	}
+}
+
 // TestExecutePhaseTurnsReasoningOff pins how the execute role stops reasoning:
 // the connection carries the closed-<think> prefill, so the wire ends in an
 // assistant message the server is told to continue, and every earlier token is

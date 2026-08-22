@@ -133,7 +133,7 @@ func TestPlanCellKeepsLineStructureInsideOneRow(t *testing.T) {
 	}
 	// Leading indentation survives so heredoc'd source keeps its shape, while
 	// interior runs still collapse.
-	if got := planCell("func f() {\n\tif x {\n\t\treturn  y\n"); got != "func f() {<br>&nbsp;&nbsp;&nbsp;&nbsp;if x {<br>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;return y" {
+	if got := planCell("func f() {\n\tif x {\n\t\treturn  y\n"); got != "func f() {<br>    if x {<br>        return y" {
 		t.Errorf("indentation not preserved: %q", got)
 	}
 	// Multi-byte text passes through intact.

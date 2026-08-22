@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -28,8 +29,9 @@ func TestRenderMacro(t *testing.T) {
 
 func TestExpandMacroNonCommand(t *testing.T) {
 	dir := t.TempDir() // no on-disk templates → embed-only lookup
+	a, sess := newTestAgent(t)
 	for _, s := range []string{"hello world", "/nope-not-a-template here", "", "no slash here"} {
-		if _, _, handled := expandMacro(dir, s); handled {
+		if _, _, handled := a.expandMacro(context.Background(), sess.ID, dir, s); handled {
 			t.Errorf("expandMacro(%q) handled=true, want false", s)
 		}
 	}
@@ -91,10 +93,11 @@ func TestHandleCleanNoFiles(t *testing.T) {
 // fallback (empty temp cwd) so the shipped default is what's exercised.
 func TestExpandMacroGrillMe(t *testing.T) {
 	dir := t.TempDir()
-	if _, stopMsg, handled := expandMacro(dir, "/grill-me"); !handled || stopMsg == "" {
+	a, sess := newTestAgent(t)
+	if _, stopMsg, handled := a.expandMacro(context.Background(), sess.ID, dir, "/grill-me"); !handled || stopMsg == "" {
 		t.Errorf("/grill-me with no args: handled=%v stopMsg=%q (want handled + a stop message)", handled, stopMsg)
 	}
-	rendered, stopMsg, handled := expandMacro(dir, "/grill-me the auth design")
+	rendered, stopMsg, handled := a.expandMacro(context.Background(), sess.ID, dir, "/grill-me the auth design")
 	if !handled || stopMsg != "" || !strings.Contains(rendered, "the auth design") {
 		t.Errorf("/grill-me <args>: handled=%v stopMsg=%q rendered=%q", handled, stopMsg, rendered)
 	}
@@ -106,7 +109,8 @@ func TestExpandMacroGrillMe(t *testing.T) {
 // shipped default.
 func TestExpandMacroCommitRunsBare(t *testing.T) {
 	dir := t.TempDir()
-	rendered, stopMsg, handled := expandMacro(dir, "/commit")
+	a, sess := newTestAgent(t)
+	rendered, stopMsg, handled := a.expandMacro(context.Background(), sess.ID, dir, "/commit")
 	if !handled || stopMsg != "" || rendered == "" {
 		t.Fatalf("bare /commit should run: handled=%v stopMsg=%q renderedEmpty=%v", handled, stopMsg, rendered == "")
 	}
@@ -144,5 +148,21 @@ func TestSeedTemplatesRetiresRemovedMacros(t *testing.T) {
 	}
 	if err := seedTemplates(dir); err != nil {
 		t.Fatalf("second seedTemplates: %v", err)
+	}
+}
+
+// TestExpandMacroSettingsIsCodeLevel: /settings must be handled without any
+// TEMPLATE-settings.md on disk (it is code, not a template) and must come back
+// with the LLM half of the report. With no [[llm]] configured that is the
+// "add one" warning, which is exactly the state a user runs /settings in.
+func TestExpandMacroSettingsIsCodeLevel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no global settings.toml to find
+	a, sess := newTestAgent(t)
+	rendered, stopMsg, handled := a.expandMacro(context.Background(), sess.ID, sess.Cwd, "/settings")
+	if !handled || rendered != "" || stopMsg == "" {
+		t.Fatalf("/settings: handled=%v rendered=%q stopMsg=%q (want handled, nothing to run, a report)", handled, rendered, stopMsg)
+	}
+	if !strings.Contains(stopMsg, "no [[llm]] in settings.toml") {
+		t.Errorf("/settings report does not cover the models: %q", stopMsg)
 	}
 }

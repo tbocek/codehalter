@@ -680,7 +680,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	if sess != nil {
 		macroCwd = sess.Cwd
 	}
-	if rendered, stopMsg, handled := expandMacro(macroCwd, userText); handled {
+	if rendered, stopMsg, handled := a.expandMacro(ctx, req.SessionId, macroCwd, userText); handled {
 		if stopMsg != "" {
 			a.say(ctx, req.SessionId, stopMsg+"\n")
 			return PromptResponse{StopReason: "end_turn"}, nil
