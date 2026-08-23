@@ -222,7 +222,7 @@
       </div>
       <div class="pill"><span class="d"></span> For coding: an <b>IDE</b>, not a chat window</div>
       <h1>A holder for <span class="g">your code.</span></h1>
-      <p class="lede">codehalter is an ACP coding agent that connects <b>Zed, VS Code, or JetBrains</b> to any OpenAI-compatible model, built for and focused on <b>local LLMs</b>. It has no UI of its own: your editor is the front end, not a CLI. Plan → execute → verify → document, all through the ACP bridge.</p>
+      <p class="lede">codehalter is an ACP coding agent that connects <b>Zed, VS Code, or JetBrains</b> to any OpenAI-compatible model, built for and focused on <b>local LLMs</b>. Your editor is the front end, or run it standalone in a terminal with <code>--cli</code>. Plan → execute → verify → document, all through the ACP bridge.</p>
       <div class="cta">
         <div class="term">
           <span class="pr">$</span>
@@ -245,7 +245,7 @@
     <div class="wrap">
       <div class="stats">
         <div class="stat"><div class="num">~9k</div><div class="lbl">lines of Go (SLOC) · two dependencies · single static binary</div></div>
-        <div class="stat"><div class="num">90%+</div><div class="lbl">cache reuse on large sessions, prefix-cache consistency is a top design priority, so most of the KV cache stays warm</div></div>
+        <div class="stat"><div class="num">90%+</div><div class="lbl">cache reuse on large sessions, the conversation is <b>append-only</b>, so nothing already sent is ever rewritten and the KV cache is never busted</div></div>
         <div class="stat"><div class="num">sandboxed</div><div class="lbl">runs only inside a devcontainer, it scaffolds one on first run, so edits and commands never touch your host</div></div>
         <div class="stat"><div class="num">your call</div><div class="lbl">the agent is instructed never to commit or push on its own, it drafts the message; committing stays yours</div></div>
       </div>
@@ -291,9 +291,9 @@
         <h2>Your model. Your repo.<br>Your hardware.</h2>
         <p>No cloud round-trips, no vendor lock-in. Point codehalter at any OpenAI-compatible endpoint, Ollama, llama.cpp, vLLM, or a remote key, and keep the whole loop local.</p>
         <ul>
-          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> No UI of its own, your editor (Zed / VS Code / JetBrains) is the front end, not a CLI</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Your editor (Zed / VS Code / JetBrains) is the front end, or <code>--cli</code> for a terminal of its own</li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Any OpenAI-compatible model, local or remote</li>
-          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Prefix-cache-aware prompting keeps your KV cache warm</li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> Append-only prompting, nothing already sent gets rewritten, so the cache never busts</li>
           <li><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg> A single static Go binary, no runtime deps</li>
         </ul>
       </div>
@@ -335,8 +335,13 @@
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></div>
-          <h3>Prefix-cache discipline</h3>
-          <p>The rendered prompt stays byte- and position-stable turn over turn, so your server's KV cache stays ~90%+ warm. The prefix is <b>pre-warmed at session open</b> (first turn skips the prompt-processing wait), and even a single-slot server stays coherent: background work rides the conversation's own prefix. The only deliberate break is a new MCP server coming online.</p>
+          <h3>Append-only, so the cache never busts</h3>
+          <p>A turn only ever <b>appends</b>. Every message already sent is re-rendered byte-for-byte identical, at the same position, on every later turn, so the shared prefix only grows and your server's KV cache stays ~90%+ warm instead of being thrown away and reprocessed. That rule is enforced everywhere it would be easy to break: a screenshot replays the bytes it captured instead of re-rendering a page that may have changed, a truncated tool result replays the same truncation from the same stored inputs, and a phase that forbids a tool denies it at dispatch instead of quietly removing it from the tool list. The prefix is <b>pre-warmed at session open</b>, so the first turn skips the prompt-processing wait, and even a single-slot server stays coherent: background work rides the conversation's own prefix. Exactly two things rewrite history on purpose, compaction and a new MCP server coming online, and both are rare by design.</p>
+        </div>
+        <div class="fcard">
+          <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 17 6-6-6-6"/><path d="M12 19h8"/></svg></div>
+          <h3>Editor optional: <code>codehalter --cli</code></h3>
+          <p>The same agent, driven from a terminal instead of an editor. It is not a second code path: <code>--cli</code> starts the ACP client half in-process and talks to the agent over a real pipe, so every byte is the same protocol Zed sees, and a framing or capability bug shows up here instead of hiding behind a shortcut. The TUI is <b>inline</b>, no alternate screen and no repaint: the transcript scrolls like ordinary output while a live region at the bottom holds the streaming reply, the current plan, in-flight tool cards and the tail of whatever command is running. <code>Ctrl+C</code> interrupts the turn, not the process, so an interrupt costs you a tool call and not the conversation (press it twice to actually leave). <code>/new</code> and <code>/resume</code> switch sessions without restarting, and <code>-p "…"</code> runs one turn, prints it, and exits with a status a script can branch on, which puts the same agent in a git hook or a CI job with no editor anywhere. Redirect it to a file and the escapes disappear, leaving a plain readable log. Zero extra dependencies.</p>
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/><path d="M7 6.5h.01M7 17.5h.01"/></svg></div>

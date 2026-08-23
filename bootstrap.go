@@ -26,8 +26,15 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	dirInfo, statErr := os.Stat(dir)
 	hasDevcontainer := statErr == nil && dirInfo.IsDir()
 
-	const reopen = "Reopen the project in the container to continue. In Zed, press Ctrl-Alt-Shift-O and choose \"Connect Dev Container\"."
-	const restart = "Start a new Agent Thread (the + button at the top) to re-open the devcontainer setup menu."
+	// Both hints name a concrete next action, which differs by front end: an
+	// editor user reopens the window inside the container, a --cli user re-runs
+	// the binary through their container runtime.
+	reopen := "Reopen the project in the container to continue. In Zed, press Ctrl-Alt-Shift-O and choose \"Connect Dev Container\"."
+	restart := "Start a new Agent Thread (the + button at the top) to re-open the devcontainer setup menu."
+	if a.standalone {
+		reopen = "Re-run codehalter inside the container to continue, for example: devcontainer exec --workspace-folder . codehalter --cli"
+		restart = "Run codehalter --cli again to re-open the devcontainer setup menu."
+	}
 
 	if hasDevcontainer {
 		a.sendUpdateAndAbort(ctx, sid, "codehalter is running outside the .devcontainer. "+reopen)

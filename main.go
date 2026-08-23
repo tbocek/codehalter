@@ -144,6 +144,13 @@ type agent struct {
 	// Read under mu.
 	abortReason string
 
+	// standalone is true when our own terminal client is driving us (--cli,
+	// see cli.go) rather than an editor. It only picks the wording of the
+	// "you are not in a container" hints, which otherwise tell a terminal user
+	// to press a Zed keyboard shortcut. Written once by runCLI before the
+	// connection exists, so it needs no lock.
+	standalone bool
+
 	// subagentMeter folds the live status meter of each running subagent into
 	// its parent's in-progress phase row. Subagent sessions have no UI of their
 	// own (Zed only knows the parent sid), so their "↑sent ↓tokens… Ns" meter
@@ -220,6 +227,14 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "--setup" {
 		runSetup()
 		os.Exit(0)
+	}
+
+	// --cli flag: be our own ACP client and drive the agent from a terminal,
+	// instead of speaking the protocol over stdio to an editor. Same agent,
+	// same protocol; see cli.go. It sets up its own logging, because stderr is
+	// the user's screen here rather than an editor's log pane.
+	if len(os.Args) > 1 && os.Args[1] == "--cli" {
+		os.Exit(runCLI(os.Args[2:]))
 	}
 
 	// Global slog → stderr at debug (Zed captures it live); per-session detail
@@ -331,6 +346,13 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 	if err != nil {
 		slog.Debug("NewSession: newSession err", "err", err)
 		return NewSessionResponse{}, err
+	}
+	// newSession steps over the ids already on disk. A session that has not
+	// saved yet (no turn taken) exists only in a.sessions, and putSession would
+	// evict it without a word: ids are second-granular, so a client that opens a
+	// second session right away (the CLI's /new) lands there routinely.
+	for n, base := 2, s.ID; a.getSession(s.ID) != nil; n++ {
+		s = newSessionWithID(cwd, fmt.Sprintf("%s_%d", base, n))
 	}
 	// Hold the editor's MCP list for offerMCPImport, which runs in the bootstrap
 	// goroutine below: importing needs an elicitation, and session/new must

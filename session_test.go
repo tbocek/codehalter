@@ -502,6 +502,42 @@ func TestSessionRoundtrip(t *testing.T) {
 	}
 }
 
+// TestNewSessionKeepsTheOneBeforeIt pins the collision guard. Session ids have
+// second granularity, so opening a second session in the same second (the CLI's
+// /new does exactly that) used to hand back the id already on disk, and the
+// first save wiped the conversation it named.
+func TestNewSessionKeepsTheOneBeforeIt(t *testing.T) {
+	dir := t.TempDir()
+	first, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+	first.AddUser("keep me")
+	if err := first.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	second, err := newSession(dir)
+	if err != nil {
+		t.Fatalf("newSession (second): %v", err)
+	}
+	if second.ID == first.ID {
+		t.Fatalf("second session reused id %q", first.ID)
+	}
+	second.AddUser("and me")
+	if err := second.Save(); err != nil {
+		t.Fatalf("Save (second): %v", err)
+	}
+
+	loaded, err := loadSession(dir, first.ID)
+	if err != nil {
+		t.Fatalf("loadSession(%q): %v", first.ID, err)
+	}
+	if len(loaded.Messages) != 1 || loaded.Messages[0].Content != "keep me" {
+		t.Errorf("first session was overwritten: %+v", loaded.Messages)
+	}
+}
+
 // TestAppendToolUseCreatesAssistantMessage verifies that recording a tool use
 // when the last message is a user turn creates a new empty assistant message
 // to hold it (rather than attaching to the user).

@@ -760,9 +760,19 @@ func newSession(cwd string) (*Session, error) {
 		return nil, fmt.Errorf("creating session dir: %w", err)
 	}
 	now := time.Now()
-	id := now.Format("20060102_150405")
-	filename := fmt.Sprintf("session_%s.toml", id)
-	path := filepath.Join(cwd, sessionDir, filename)
+	// Second granularity collides when one session is opened in the same second
+	// as the last, which is exactly what the CLI's /new does. Reusing that id
+	// would overwrite the previous session's file, so take the next free name.
+	base := now.Format("20060102_150405")
+	id := base
+	var path string
+	for n := 2; ; n++ {
+		path = filepath.Join(cwd, sessionDir, fmt.Sprintf("session_%s.toml", id))
+		if _, err := os.Stat(path); err != nil {
+			break // free, or unreadable: the first save reports the real problem
+		}
+		id = fmt.Sprintf("%s_%d", base, n)
+	}
 	return &Session{
 		ID:        id,
 		Cwd:       cwd,

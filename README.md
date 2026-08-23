@@ -6,7 +6,7 @@ An [ACP](https://agentclientprotocol.com)-compatible AI coding agent that connec
 
 - **Small and auditable**: under 13k lines of code (≈9k SLOC; ~12k non-blank including its thorough comments), two small dependencies, one static binary.
 - **Local-LLM-first**: designed and tuned for small/medium models on your own [llama.cpp](https://github.com/ggml-org/llama.cpp) / Ollama / vLLM box, and works with hosted OpenAI-compatible APIs too.
-- **ACP-only, zero UI**: codehalter ships no interface of its own; it speaks the [Agent Client Protocol](https://agentclientprotocol.com) over stdio, so the editor is the UI. Native in [Zed](https://zed.dev); usable from JetBrains and VS Code through their ACP integrations.
+- **One protocol, two front ends**: codehalter speaks the [Agent Client Protocol](https://agentclientprotocol.com) over stdio, so the editor is the UI. Native in [Zed](https://zed.dev); usable from JetBrains and VS Code through their ACP integrations. No editor at hand? `codehalter --cli` runs the client half in-process over a real pipe and gives you an inline TUI in the terminal, same agent, same protocol, no extra dependencies.
 - **Prefix-cache consistency as a first principle**: the rendered prompt stays byte- and position-stable turn over turn, so the server's KV cache keeps ~90%+ warm. The *only* deliberate cache break is a new MCP server's tools coming online; skills added mid-session ride as user messages until the next compaction folds them into the cached system prompt. At session open codehalter **pre-warms** the cache with a background 1-token call, so your first turn skips the prompt-processing wait (`prewarm = false` to disable).
 - **Smart background compaction**: **after every turn**, a *separate* LLM slot condenses the whole turn into a structured note in the background while you read the reply, so the notes are ready before they're needed. A **large turn** is one user prompt and everything codehalter does to answer it; a **small turn** is a single model call plus its tool results (no user involved). Compaction is **purely reactive** — no token estimate. It's triggered by the server's context-overflow **400** and escalates: first keep the **unfinished small turn** plus the most recent **~10k tokens of completed small turns** (folding everything older into the summary); if that still overflows, keep only the **unfinished small turn**. Then retry. With ≥2 parallel LLM slots the summariser runs beside the foreground turn; on a **single slot** it appends its instruction to the conversation itself (a prefix-extension), reusing the warm cache instead of evicting it — it just serialises briefly with your next prompt, so `parallel = 1` works fully.
 - **Lightweight plan → execute → document loop**: each prompt is planned, executed with per-subtask self-verification, and documented only when the change is user-visible, no heavyweight agent framework.
@@ -43,6 +43,7 @@ An [ACP](https://agentclientprotocol.com)-compatible AI coding agent that connec
 - **Image support**: when the active LLM advertises vision, prompt images are passed through as OpenAI-style content blocks.
 - **Session persistence**: conversations are saved as TOML files under `.codehalter/` and can be resumed across editor restarts.
 - **History compression**: older turns are summarised to stay within token budgets. The unit of work is a **large turn** (one user-or-synthetic prompt plus every assistant step and tool call that answers it); within it, each model call plus its tool results is a **small turn**. After every large turn a background goroutine condenses the **whole turn** (not just the last reply) into a seven-section structured note (Goal / Constraints / Tasks / Progress / Decisions / Next Steps / Critical Context) on the `purpose = "summary"` slot. The notes accumulate one per completed large turn in a shadow buffer that is **persisted in the session TOML**, so they survive a restart. Compaction is **purely reactive — no token estimate at all**. It is driven by the server's context-overflow **400** and escalates in two steps. Step 1: keep the **unfinished small turn** plus the most recent **~10k tokens of completed small turns** verbatim, and fold everything older — the completed large turns (instant, from their ready shadow notes) plus a synchronous summary of the older completed small turns — into the rolling summary, rotating it into an archive file; retry. A small in-flight turn (under the budget) is kept whole. Step 2 (only if the retry still 400s — the unfinished small turn alone is huge): keep only the **unfinished small turn**, retry. Each step strictly shrinks the context, so it terminates: once only the unfinished small turn is left, the 400 surfaces as a normal failure. If the summariser's call fails, the slice still leaves a clipped raw note, so nothing is rotated out unsummarised. With ≥2 slots the summariser runs on its own slot; on a single slot (`parallel = 1`, one `[[llm]]` entry) it extends the foreground context as a prefix-extension — cache-safe, just briefly serialised with your next prompt.
+- **Standalone terminal client (`--cli`)**: the same agent driven from a terminal instead of an editor. `--cli` starts the ACP *client* half in-process and connects it to the agent over an `io.Pipe` pair, so the wire carries the identical JSON-RPC an editor would send, and there is no shortcut path that could drift from it. The TUI is **inline**: the transcript is append-only ordinary output (scrollback, selection and copy all keep working, no alternate screen) while a redrawn live region at the bottom holds the streaming reply, the current plan, in-flight tool cards and the tail of a running command. It advertises the `terminal` and `elicitation` capabilities (so `run_command` and `ask_user` work) and deliberately not `fs`, so the agent reads and writes the disk directly. `Ctrl+C` cancels the running turn rather than the process, `Ctrl+D` or `/quit` leaves, and logs are redirected to `.codehalter/cli.log` so they never fight the screen. Piped or redirected output carries no escape sequences, so it doubles as a plain transcript. See [Standalone CLI](#standalone-cli).
 - **Two modes**: *Interactive* (ask before setup steps and anything reaching outside the container) and *Autopilot* (auto-answer those prompts too, no interruption). Selectable per-session from the Zed mode picker. Work inside the container is never gated in either mode.
 - **Configurable LLM endpoints**: different roles (`thinking`, `execute`) can point at different models or servers.
 
@@ -215,6 +216,56 @@ Why these matter for codehalter specifically:
 The common advice is to skip it for single-user chat, where every prompt is unique and nothing hits the cache. codehalter is the opposite workload: it keeps the prompt byte-stable across turns, so prefix reuse is the norm (for example, restoring the foreground prefix after another request churned the slot). So enabling it is right here.
 
 64 GiB specifically is more than one user needs, but harmless. A single user's working set is a few states (the growing foreground context plus a couple of side ones), which stays well under 64 GiB, and because the value is only a ceiling it never costs RAM it is not using. On 128 GiB there is no downside to the high cap. If you want the headroom back, something in the low tens of GiB covers one user with margin. Keep it finite rather than `0`: there is an [open bug](https://github.com/ggml-org/llama.cpp/issues/22629) where the ceiling can be ineffective on Linux and OOM the server when caching image prompts, and a finite cap with free RAM (your 64 of 128 GiB) stays on the safe side of it.
+
+## Standalone CLI
+
+No editor required. `--cli` runs codehalter's own ACP client in the same process and drives the agent over a pipe, so what reaches the agent is byte-for-byte the protocol Zed would speak:
+
+```
+codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT]
+
+  --cli               run the standalone terminal client instead of an ACP server
+  --cwd DIR           project directory (default: current directory)
+  --resume [ID]       continue a stored session; without an ID, the most recent
+                      one for this directory
+  -p PROMPT           run one turn and exit, instead of opening a prompt. The
+                      exit status is 0 only when the turn finished normally,
+                      so a script can branch on it.
+```
+
+Like every other codehalter run this one is **devcontainer-first**: it refuses to start outside a container, so launch it through your container runtime, for example:
+
+```
+devcontainer exec --workspace-folder . codehalter --cli
+```
+
+The interface is an **inline** TUI, not a full-screen one. The transcript is plain append-only output, so your scrollback, mouse selection and copy behave exactly as they do for any other command, while a small live region at the bottom is redrawn in place with the streaming reply, the current plan, running tool cards and the last few lines of any command in flight. Redirect the output to a file and the escape sequences vanish, leaving a readable log.
+
+Client-side commands:
+
+| Command | Effect |
+|---------|--------|
+| `/help` | client commands, then the agent's own commands and `TEMPLATE-*.md` macros |
+| `/mode [name]` | show or switch the session mode (`Interactive` / `Autopilot`) |
+| `/sessions` | stored sessions for this directory, newest first |
+| `/new` | start a fresh session in this directory |
+| `/resume [id]` | switch to a stored session, or pick one from the list |
+| `/cwd` | project directory and current session id |
+| `/quit`, `/exit` | leave (same as `Ctrl+D`) |
+
+Anything else starting with `/` is handed to the agent, so `/commit`, `/clean`, `/settings`, `/grill-me` and your own macros work unchanged.
+
+`Ctrl+C` cancels the **turn**, not the process: the agent stops where it is and reports why, so the conversation survives an interrupt. While idle it says so instead of exiting; a second `Ctrl+C` within two seconds does leave, as does `Ctrl+D`. Permission cards and `ask_user` forms are rendered as numbered lists, with an empty line to dismiss. Diagnostics go to `.codehalter/cli.log` instead of the screen (`tail -f` it in another pane when you want to watch the protocol); the file is truncated on every run.
+
+**One turn, no prompt.** `-p` runs a single turn and exits, which is the form to reach for in a script, a git hook or CI:
+
+```
+devcontainer exec --workspace-folder . codehalter --cli -p "run the tests and fix what fails" || echo "turn did not finish"
+```
+
+It prints the same transcript, opens no prompt row, and exits `0` only when the turn ended normally. A cancellation, a refusal or a protocol error exits `1`, so the shell can branch on it. Questions still read from stdin, so run it with stdin closed (`< /dev/null`) for unattended use: every permission card and `ask_user` form then reads EOF and is cancelled, which in `Interactive` mode cancels the tool behind it. For a run that should actually get work done unattended, put the session in `Autopilot` first and `--resume` it.
+
+Terminal geometry is read with `stty size` at startup and at each prompt, keeping the binary dependency-free and platform-neutral, at the cost of not reacting to a resize mid-turn: the next prompt picks up the new width.
 
 ## Zed setup
 
