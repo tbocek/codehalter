@@ -126,6 +126,13 @@ type ToolUse struct {
 	// hit happened, not when the original call ran.
 	StartedAt  time.Time `toml:"started_at,omitempty"`
 	DurationMs int64     `toml:"duration_ms,omitempty"`
+	// ImageID is the content-addressed id of an image this call PRODUCED
+	// (screenshot). Replay rebuilds the multimodal parts from those STORED
+	// bytes instead of re-running the tool: unlike view_image, re-rendering is
+	// not pure — the page may have changed since — and different bytes in the
+	// middle of the prompt reprocess every message behind them. Empty for
+	// every other tool and for older sessions.
+	ImageID string `toml:"image_id,omitempty"`
 }
 
 // summariseTask is one queued background-summariser job: the messages of one

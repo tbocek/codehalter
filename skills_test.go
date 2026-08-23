@@ -135,6 +135,8 @@ func TestDeferredSkillTriggers(t *testing.T) {
 		{"src/app.ts", "SKILL-ts.md"},
 		{"web/index.jsx", "SKILL-js.md"},
 		{"lib/foo.cpp", "SKILL-c.md"},
+		{"design/layout.css", "SKILL-css.md"},
+		{"out/index.html", "SKILL-css.md"},
 		{"include/foo.h", "SKILL-c.md"},
 		{"src/Main.java", "SKILL-java.md"},
 		{"justfile", "SKILL-justfile.md"},

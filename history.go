@@ -470,16 +470,34 @@ func fallbackTurnNote(turn []Message) string {
 // The parts are reproducible because dispatchViewImage is pure given Cwd and
 // the stored arguments and the image store is content-addressed, so re-running
 // it yields the same bytes. Same rule the m.Images branch follows.
+//
+// A tool that PRODUCED an image (screenshot) is NOT pure that way: re-rendering
+// the page a turn later can yield different pixels, and the id is the only
+// thing that pins the bytes the model actually saw. So that case replays from
+// ImageID and never re-runs the tool.
 func (a *agent) replayToolOutput(sess *Session, tu ToolUse) any {
 	text := liveToolOutput(tu.ID, tu.Name, tu.Input, tu.Output)
-	if tu.Name != "view_image" || tu.Failed || !a.imagesSupported {
+	if tu.Failed || !a.imagesSupported {
+		return text
+	}
+	// Bytes gone (file deleted since the live call)? Nothing can make either
+	// replay identical, so fall back to the stored text rather than fail the
+	// turn: the same trade the file-missing branch of m.Images makes.
+	if tu.ImageID != "" {
+		data, mime, err := readImageFile(sess.Cwd, tu.ImageID)
+		if err != nil {
+			return text
+		}
+		// tu.Output, not `text`: the live call put the untruncated text in
+		// parts[0], so replaying the truncation hint here would change the
+		// wire bytes of a message the model already saw.
+		return imageParts(tu.Output, mime, data)
+	}
+	if tu.Name != "view_image" {
 		return text
 	}
 	_, parts, failed := dispatchViewImage(sess, tu.Input)
 	if failed {
-		// Bytes gone (file deleted since the live call). Nothing can make this
-		// replay identical, so fall back to the stored text rather than fail the
-		// turn: the same trade the file-missing branch of m.Images makes.
 		return text
 	}
 	return parts

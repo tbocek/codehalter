@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 )
@@ -78,14 +77,6 @@ func dispatchViewImage(sess *Session, rawArgs string) (string, []any, bool) {
 	if err != nil {
 		return fmt.Sprintf("view_image: image %q not found in the session image store. References to images live in Summary (and inline in live history). Check the id matches a `view_image id=…` hint exactly.", args.ID), nil, true
 	}
-	parts := []any{
-		map[string]any{"type": "text", "text": fmt.Sprintf("[Image %s re-delivered.]", args.ID)},
-		map[string]any{
-			"type": "image_url",
-			"image_url": map[string]string{
-				"url": fmt.Sprintf("data:%s;base64,%s", mime, base64.StdEncoding.EncodeToString(data)),
-			},
-		},
-	}
-	return fmt.Sprintf("[Image %s re-delivered.]", args.ID), parts, false
+	text := fmt.Sprintf("[Image %s re-delivered.]", args.ID)
+	return text, imageParts(text, mime, data), false
 }

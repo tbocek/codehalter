@@ -35,6 +35,9 @@ var skillBash string
 //go:embed res/SKILL-c.md
 var skillC string
 
+//go:embed res/SKILL-css.md
+var skillCSS string
+
 //go:embed res/SKILL-base.md
 var skillBase string
 
@@ -70,6 +73,7 @@ var defaultSkills = map[string]string{
 	"java": skillJava,
 	"bash": skillBash,
 	"c":    skillC,
+	"css":  skillCSS,
 }
 
 // osSkills maps an /etc/os-release ID (as returned by readOSInfo) to the
@@ -348,6 +352,7 @@ var shebangShell = regexp.MustCompile(`#![^\n]*\b(?:ba|da|z)?sh\b`)
 var deferredSkills = []deferredSkill{
 	{name: "SKILL-bash.md", match: suffixAny(".sh", ".bash"), matchRaw: shebangShell.MatchString},
 	{name: "SKILL-c.md", match: suffixAny(".c", ".h", ".cpp", ".cc", ".cxx", ".hpp")},
+	{name: "SKILL-css.md", match: suffixAny(".css", ".scss", ".sass", ".less", ".html", ".htm")},
 	{name: "SKILL-go.md", tools: []string{"go"}, match: suffixAny(".go")},
 	{name: "SKILL-java.md", tools: []string{"gradle"}, match: suffixAny(".java")},
 	{name: "SKILL-js.md", tools: []string{"npm"}, match: suffixAny(".js", ".jsx", ".mjs", ".cjs")},

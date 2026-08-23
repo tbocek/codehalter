@@ -377,19 +377,29 @@ func nextToolUseID() string {
 func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolUse, any) {
 	started := time.Now()
 
-	// view_image short-circuit: when the server supports images, deliver the
-	// bytes as multimodal tool content in the SAME turn (so the next llmStream
-	// call sees the image). The standard executeTool path returns text only.
+	// Image short-circuit: when the server supports images, deliver the bytes
+	// as multimodal tool content in the SAME turn (so the next llmStream call
+	// sees the image). The standard executeTool path returns text only. When
+	// it does NOT support images these fall through to executeTool, whose
+	// fallback says so instead of pretending bytes were delivered.
 	var result string
 	var failed bool
 	var multimodal any
-	if tc.Function.Name == "view_image" && a.imagesSupported {
+	var imageID string
+	switch {
+	case tc.Function.Name == "view_image" && a.imagesSupported:
 		text, parts, ferr := dispatchViewImage(a.getSession(sid), tc.Function.Arguments)
 		result, failed = text, ferr
 		if !ferr {
 			multimodal = parts
 		}
-	} else {
+	case tc.Function.Name == "screenshot" && a.imagesSupported:
+		text, parts, id, ferr := dispatchScreenshot(ctx, a, sid, tc.Function.Arguments)
+		result, failed = text, ferr
+		if !ferr {
+			multimodal, imageID = parts, id
+		}
+	default:
 		result, failed = a.executeTool(ctx, sid, tc)
 	}
 
@@ -403,6 +413,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		Failed:     failed,
 		StartedAt:  started,
 		DurationMs: time.Since(started).Milliseconds(),
+		ImageID:    imageID,
 	}
 	// Cache the full output (saved incrementally so it survives a crash) for view_output.
 	if sess := a.getSession(sid); sess != nil {

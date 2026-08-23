@@ -360,6 +360,10 @@ func detectStacks(cwd string) []string {
 		stacks = append(stacks, "js")
 	}
 
+	if hasFileWithExt(cwd, ".css", ".scss", ".sass", ".less", ".html", ".htm") {
+		stacks = append(stacks, "css")
+	}
+
 	for _, n := range []string{"pom.xml", "build.gradle", "build.gradle.kts"} {
 		if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
 			stacks = append(stacks, "java")
