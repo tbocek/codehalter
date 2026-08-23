@@ -5,6 +5,7 @@
 
 # prewarm = true    # warm the server's prefix cache at session open (default on)
 # skills = "inline" # put every language SKILL in the prompt up front (default "auto": defer until first touch)
+# update_check = false # never ask GitHub whether a newer release exists (default on, at most once a day)
 
 [[llm]]
 server = "http://localhost:8080"  # host root only, no path

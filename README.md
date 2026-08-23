@@ -43,7 +43,8 @@ An [ACP](https://agentclientprotocol.com)-compatible AI coding agent that connec
 - **Image support**: when the active LLM advertises vision, prompt images are passed through as OpenAI-style content blocks.
 - **Session persistence**: conversations are saved as TOML files under `.codehalter/` and can be resumed across editor restarts.
 - **History compression**: older turns are summarised to stay within token budgets. The unit of work is a **large turn** (one user-or-synthetic prompt plus every assistant step and tool call that answers it); within it, each model call plus its tool results is a **small turn**. After every large turn a background goroutine condenses the **whole turn** (not just the last reply) into a seven-section structured note (Goal / Constraints / Tasks / Progress / Decisions / Next Steps / Critical Context) on the `purpose = "summary"` slot. The notes accumulate one per completed large turn in a shadow buffer that is **persisted in the session TOML**, so they survive a restart. Compaction is **purely reactive — no token estimate at all**. It is driven by the server's context-overflow **400** and escalates in two steps. Step 1: keep the **unfinished small turn** plus the most recent **~10k tokens of completed small turns** verbatim, and fold everything older — the completed large turns (instant, from their ready shadow notes) plus a synchronous summary of the older completed small turns — into the rolling summary, rotating it into an archive file; retry. A small in-flight turn (under the budget) is kept whole. Step 2 (only if the retry still 400s — the unfinished small turn alone is huge): keep only the **unfinished small turn**, retry. Each step strictly shrinks the context, so it terminates: once only the unfinished small turn is left, the 400 surfaces as a normal failure. If the summariser's call fails, the slice still leaves a clipped raw note, so nothing is rotated out unsummarised. With ≥2 slots the summariser runs on its own slot; on a single slot (`parallel = 1`, one `[[llm]]` entry) it extends the foreground context as a prefix-extension — cache-safe, just briefly serialised with your next prompt.
-- **Standalone terminal client (`--cli`)**: the same agent driven from a terminal instead of an editor. `--cli` starts the ACP *client* half in-process and connects it to the agent over an `io.Pipe` pair, so the wire carries the identical JSON-RPC an editor would send, and there is no shortcut path that could drift from it. The TUI is **inline**: the transcript is append-only ordinary output (scrollback, selection and copy all keep working, no alternate screen) while a redrawn live region at the bottom holds the streaming reply, the current plan, in-flight tool cards and the tail of a running command. It advertises the `terminal` and `elicitation` capabilities (so `run_command` and `ask_user` work) and deliberately not `fs`, so the agent reads and writes the disk directly. `Ctrl+C` cancels the running turn rather than the process, `Ctrl+D` or `/quit` leaves, and logs are redirected to `.codehalter/cli.log` so they never fight the screen. Piped or redirected output carries no escape sequences, so it doubles as a plain transcript. See [Standalone CLI](#standalone-cli).
+- **Standalone terminal client (`--cli`)**: the same agent driven from a terminal instead of an editor. `--cli` starts the ACP *client* half in-process and connects it to the agent over an `io.Pipe` pair, so the wire carries the identical JSON-RPC an editor would send, and there is no shortcut path that could drift from it. The TUI is **inline**: the transcript is append-only ordinary output (scrollback, selection and copy all keep working, no alternate screen) while a redrawn live region at the bottom holds the streaming reply, the current plan, in-flight tool cards and the tail of a running command. It advertises the `terminal` and `elicitation` capabilities (so `run_command` and `ask_user` work) and deliberately not `fs`, so the agent reads and writes the disk directly. `Ctrl+C` cancels the running turn rather than the process, `Ctrl+D` or `/quit` leaves, and logs are redirected to `.codehalter/cli.log` so they never fight the screen. Piped or redirected output carries no escape sequences, so it doubles as a plain transcript. Started on the host in a project that has a `.devcontainer/devcontainer.json`, it also **starts that container itself**: the config is translated into a compose file on the fly (no devcontainer CLI, no new dependency), `docker` or `podman` `compose` brings it up, and the CLI re-runs itself inside with your terminal attached, printing which runtime it uses and which folder is mounted where. A key it cannot translate faithfully (`features`, lifecycle commands) is refused by name with the `devcontainer up` command to use instead, never silently dropped. See [Standalone CLI](#standalone-cli).
+- **Update check that covers the container too**: at most once a day, `codehalter --cli` asks the GitHub releases API whether a newer release exists and, if so, asks **you** before doing anything: yes downloads the binary for your platform, replaces the running one and restarts into it. The answer and the resolved tag then travel into the devcontainer, so the copy in there (baked into the image, otherwise stale until the next rebuild) updates itself in the same run without a second question or a second API call. A run with nobody watching (`-p`, redirected stdin) is told rather than asked; an editor session gets one line in the capabilities banner naming `codehalter --update`. A downloaded binary must run and report the release tag that was asked for before it is allowed to replace anything, so a truncated file or a wrong-architecture build cannot break the install. Off with `update_check = false` or `CODEHALTER_UPDATE=skip`. See [Updating](#updating).
 - **Two modes**: *Interactive* (ask before setup steps and anything reaching outside the container) and *Autopilot* (auto-answer those prompts too, no interruption). Selectable per-session from the Zed mode picker. Work inside the container is never gated in either mode.
 - **Configurable LLM endpoints**: different roles (`thinking`, `execute`) can point at different models or servers.
 
@@ -64,6 +65,31 @@ curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | b
 ```
 
 **Windows** — codehalter runs inside a Linux devcontainer, so install it under **WSL**: run `wsl --install` (once), open your WSL distro, and run the same Linux command above inside it. Native Windows isn't supported — the devcontainer's host-path bind mounts resolve `${localEnv:HOME}`, which WSL provides and native Windows does not.
+
+### Updating
+
+Releases are numbered `v1`, `v2`, ..., and an installed binary knows which one it is (`codehalter --version`; a build from source says `dev` and is left alone by everything below).
+
+`codehalter --cli` checks at most once a day whether a newer release exists, and asks before doing anything about it:
+
+```
+codehalter v42 is available (running v41). Update now? [Y/n]
+```
+
+Answer yes and it downloads the binary for your platform, replaces the one you are running, and restarts into it, so the session you asked for starts on the new version. There is nothing to reinstall and no package manager involved. **A run that nobody is watching is told rather than asked**: with `-p` or with stdin redirected it prints the same line, adds `Run codehalter --update to install it`, and carries on.
+
+**One answer covers the container too.** When the launcher starts a devcontainer for you, it hands the resolved release tag and your answer to the copy of codehalter inside it, so that one updates itself in the same run without asking a second question or spending a second API call. This matters because the container's binary was baked into the image and does not otherwise change until the image is rebuilt.
+
+The other ways in:
+
+| | |
+|---|---|
+| `codehalter --update` | check and install, no question asked. What the editor banner points at, since replacing the binary an editor is talking to belongs between sessions |
+| `codehalter --version` | the release tag this binary was built from |
+| `update_check = false` | in `settings.toml`: never contact GitHub about releases |
+| `CODEHALTER_UPDATE=skip` | the same for one run (CI); `=yes` updates without asking |
+
+The check is one unauthenticated call to the GitHub releases API, cached in `~/.cache/codehalter/update.json` for a day, so an unreachable network, a rate limit or an unwritable install directory each cost a line of output and nothing else: codehalter starts on the version you already have. A download is only allowed to replace your binary once it has been run and has reported the release tag that was asked for, so a truncated file, an error page or a wrong-architecture build never lands on top of a working install.
 
 ## Build
 
@@ -222,7 +248,7 @@ The common advice is to skip it for single-user chat, where every prompt is uniq
 No editor required. `--cli` runs codehalter's own ACP client in the same process and drives the agent over a pipe, so what reaches the agent is byte-for-byte the protocol Zed would speak:
 
 ```
-codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT]
+codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT] [--rebuild]
 
   --cli               run the standalone terminal client instead of an ACP server
   --cwd DIR           project directory (default: current directory)
@@ -231,13 +257,48 @@ codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT]
   -p PROMPT           run one turn and exit, instead of opening a prompt. The
                       exit status is 0 only when the turn finished normally,
                       so a script can branch on it.
+  --rebuild           rebuild the devcontainer image before starting it
+
+Other flags: --version prints the release tag, --update installs the newest
+release over this binary, --setup reconfigures the LLM connection.
 ```
 
-Like every other codehalter run this one is **devcontainer-first**: it refuses to start outside a container, so launch it through your container runtime, for example:
+Like every other codehalter run this one is **devcontainer-first**: it refuses to start outside a container. Starting that container is its own job, though.
+
+**The launcher.** Run `codehalter --cli` on the host in a project that has `.devcontainer/devcontainer.json` and it does not start the agent at all. It reads that file, translates it into a compose file, brings it up with `docker compose` (or `podman compose`), and re-runs itself inside the container with your terminal attached:
 
 ```
-devcontainer exec --workspace-folder . codehalter --cli
+$ codehalter --cli
+codehalter cli
+  no container here, so docker compose starts one: project myproject-1c881a, from Dockerfile
+  /home/you/src/myproject → /workspaces/myproject  (bind mount, read-write: edits inside are edits here)
+  building the image first, which takes a while; later runs reuse it
 ```
+
+Inside a container it skips all that and just starts, so the same command works in both places. `Ctrl+C` still belongs to the agent inside; the launcher ignores it and passes the child's exit status back, which keeps `-p` scriptable from the host.
+
+The container is left running when you leave, so the next `codehalter --cli` is one `compose exec` away, a tenth of a second rather than a start. Set `"shutdownAction": "stopContainer"` in the devcontainer file to have it stopped instead. Compose recreates the container by itself when the translated service changes, an image built from a `Dockerfile` is rebuilt when that `Dockerfile` changes, and `--rebuild` forces a rebuild.
+
+This is a launcher, not a devcontainer implementation. It reads the config from any of the three places the spec allows (`.devcontainer/devcontainer.json`, `.devcontainer.json`, or a single `.devcontainer/<name>/devcontainer.json`) and translates the keys that have a compose equivalent (`image`, `build`, `runArgs`, `containerEnv`, `remoteEnv`, `containerUser`, `remoteUser`, `mounts`, `workspaceFolder`, `workspaceMount`, `forwardPorts`, `overrideCommand`, `init`, `privileged`, `capAdd`, `securityOpt`, `shutdownAction`, and a `dockerComposeFile` project it hands through). It expands `${localEnv:NAME}`, `${localWorkspaceFolder}`, `${containerWorkspaceFolder}`, `${devcontainerId}` and their basename forms, plus `${containerEnv:NAME}` in `remoteEnv`, which is read out of the container once it is up. Forwarded ports are published on `127.0.0.1`, as the editors do. Editor-only keys are ignored **without** being expanded, so the `${workspaceFolder}` and `${env:HOME}` that live in `customizations.vscode.settings` are left alone. Anything else it refuses **by name**, rather than quietly starting a container that is not the one you asked for:
+
+```
+$ codehalter --cli
+.devcontainer/devcontainer.json uses features, postCreateCommand, which the built-in launcher does not implement
+
+Start it with the devcontainer CLI instead:
+  npm i -g @devcontainers/cli
+  devcontainer up   --workspace-folder /home/you/src/myproject
+  devcontainer exec --workspace-folder /home/you/src/myproject codehalter --cli
+```
+
+Four things differ from `devcontainer up` even for a config it accepts, and the first two print a `note:` line when they apply:
+
+- `updateRemoteUserUID` is not honoured: the container user keeps the uid baked into the image, so files written in the workspace can come back owned by someone else.
+- `userEnvProbe` is not honoured: commands run with the image's environment, not with one probed from a login shell.
+- `${devcontainerId}` is derived from the workspace path, so it does not match the id the devcontainer CLI computes for the same project.
+- `shutdownAction` defaults to leaving the container running, where the spec's default is to stop it. Write it down explicitly to get the other behaviour.
+
+None of this is required: `devcontainer up` yourself and run `devcontainer exec --workspace-folder . codehalter --cli`, and the launcher never runs.
 
 The interface is an **inline** TUI, not a full-screen one. The transcript is plain append-only output, so your scrollback, mouse selection and copy behave exactly as they do for any other command, while a small live region at the bottom is redrawn in place with the streaming reply, the current plan, running tool cards and the last few lines of any command in flight. Redirect the output to a file and the escape sequences vanish, leaving a readable log.
 
@@ -260,10 +321,12 @@ Anything else starting with `/` is handed to the agent, so `/commit`, `/clean`, 
 **One turn, no prompt.** `-p` runs a single turn and exits, which is the form to reach for in a script, a git hook or CI:
 
 ```
-devcontainer exec --workspace-folder . codehalter --cli -p "run the tests and fix what fails" || echo "turn did not finish"
+codehalter --cli -p "run the tests and fix what fails" || echo "turn did not finish"
 ```
 
 It prints the same transcript, opens no prompt row, and exits `0` only when the turn ended normally. A cancellation, a refusal or a protocol error exits `1`, so the shell can branch on it. Questions still read from stdin, so run it with stdin closed (`< /dev/null`) for unattended use: every permission card and `ask_user` form then reads EOF and is cancelled, which in `Interactive` mode cancels the tool behind it. For a run that should actually get work done unattended, put the session in `Autopilot` first and `--resume` it.
+
+At startup it also checks, at most once a day, whether a newer release exists, and offers to install it before anything else happens (see [Updating](#updating)). The answer travels into the container with the launcher, so one yes updates both.
 
 Terminal geometry is read with `stty size` at startup and at each prompt, keeping the binary dependency-free and platform-neutral, at the cost of not reacting to a resize mid-turn: the next prompt picks up the new width.
 
@@ -286,7 +349,7 @@ Open the agent panel (`Cmd+?` / `Ctrl+?`), click `+`, and select "Codehalter". P
 
 ## Sandboxing with a devcontainer
 
-Codehalter edits files and runs build/test commands. Running it inside a [devcontainer](https://containers.dev) sandboxes those actions to a throwaway environment, keeps the project's toolchain pinned, and means the same setup works on every machine. Zed launches ACP servers *inside* the container when you "Reopen in Container," so codehalter, Firefox, and the LLM endpoint must be reachable from there. The startup banner reports `Container: devcontainer` when this is wired up correctly.
+Codehalter edits files and runs build/test commands. Running it inside a [devcontainer](https://containers.dev) sandboxes those actions to a throwaway environment, keeps the project's toolchain pinned, and means the same setup works on every machine. Zed launches ACP servers *inside* the container when you "Reopen in Container," so codehalter, Firefox, and the LLM endpoint must be reachable from there. The startup banner reports `Container: devcontainer` when this is wired up correctly. From a terminal there is nothing to wire up: `codehalter --cli` starts the container itself (see [Standalone CLI](#standalone-cli)).
 
 **Codehalter scaffolds the devcontainer for you.** On the first session in a project without a `.devcontainer/` directory, it prompts for a base distro, **`Alpine / Arch / Debian / Fedora / Ubuntu`**, and writes the chosen `Dockerfile` + `devcontainer.json`:
 

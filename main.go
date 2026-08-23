@@ -223,6 +223,24 @@ type mcpState struct {
 // ---------------------------------------------------------------------------
 
 func main() {
+	// --version: the release tag this binary was built from. selfUpdate runs the
+	// binary it has just downloaded with this flag and compares the whole line
+	// before replacing anything, so the format is load-bearing rather than
+	// cosmetic (see versionLine).
+	if len(os.Args) > 1 && os.Args[1] == "--version" {
+		fmt.Println(versionLine(version))
+		os.Exit(0)
+	}
+
+	// --update: install the newest release over this binary and exit. The
+	// terminal path asks first (offerUpdate); this is the form for a run with
+	// nobody watching, and the one the capabilities banner points an editor
+	// user at, since replacing the binary an editor is currently talking to is
+	// something to do between sessions rather than during one.
+	if len(os.Args) > 1 && os.Args[1] == "--update" {
+		os.Exit(runUpdate())
+	}
+
 	// --setup flag: interactive LLM configuration, skips the ACP server.
 	if len(os.Args) > 1 && os.Args[1] == "--setup" {
 		runSetup()
@@ -299,11 +317,13 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 		Close *struct{} `json:"close,omitempty"`
 	}{List: &struct{}{}, Close: &struct{}{}}
 	// Static implementation block advertised in the initialize response —
-	// name and version don't change at runtime.
+	// name and version don't change at runtime. The version is the release tag
+	// this binary was built from ("dev" for a local build), so an editor
+	// reporting a protocol problem names the build that produced it.
 	res.AgentInfo = struct {
 		Name    string `json:"name,omitempty"`
 		Version string `json:"version,omitempty"`
-	}{"codehalter", "0.1.0"}
+	}{"codehalter", version}
 	res.AuthMethods = []AuthMethod{{
 		ID:          "terminal-setup",
 		Name:        "Terminal Setup",

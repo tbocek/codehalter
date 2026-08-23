@@ -28,11 +28,14 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 
 	// Both hints name a concrete next action, which differs by front end: an
 	// editor user reopens the window inside the container, a --cli user re-runs
-	// the binary through their container runtime.
+	// the binary. A standalone run only lands here when the launcher declined,
+	// which for an existing .devcontainer means no runtime with compose on PATH,
+	// so that hint names what to install rather than repeating the same command.
 	reopen := "Reopen the project in the container to continue. In Zed, press Ctrl-Alt-Shift-O and choose \"Connect Dev Container\"."
 	restart := "Start a new Agent Thread (the + button at the top) to re-open the devcontainer setup menu."
 	if a.standalone {
-		reopen = "Re-run codehalter inside the container to continue, for example: devcontainer exec --workspace-folder . codehalter --cli"
+		reopen = "codehalter --cli starts that container itself once docker or podman with the compose plugin is on PATH. " +
+			"Install one of those and run it again, or start the container yourself: devcontainer exec --workspace-folder . codehalter --cli"
 		restart = "Run codehalter --cli again to re-open the devcontainer setup menu."
 	}
 
@@ -129,7 +132,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	// Per-stack dev-tool installs are handled by the prepare phase on the
 	// next session (inside the container) — it asks the user, installs live,
 	// persists in this Dockerfile, and wires MCP. Nothing to seed here.
-	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json — the mounts you chose apply once you (re)start the container. " + reopen
+	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json, the mounts you chose apply once you (re)start the container. " + reopen
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
 	a.sendUpdateAndAbort(ctx, sid, note)
 	return false

@@ -914,6 +914,15 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	if a.settings.path != "" {
 		fmt.Fprintf(&b, "Using %s\n\n", a.settings.path)
 	}
+	// One line, once per session. This path cannot install the update itself:
+	// the editor is holding this binary's stdio, so replacing it under a live
+	// connection is something to do between sessions, and the line names the
+	// command that does it. The check answers from a day-old cache most of the
+	// time and says nothing at all when it cannot reach GitHub.
+	if tag := newerRelease(ctx, sess.Cwd); tag != "" {
+		fmt.Fprintf(&b, "🟡 Update: codehalter %s is available (running %s). Run `codehalter --update` in this container, "+
+			"or start `codehalter --cli` on the host, which offers to update the host and the container together.\n\n", tag, version)
+	}
 	b.WriteString(a.renderLLMStatus())
 
 	// Sandbox / browser / shell — these gate everything else, so they

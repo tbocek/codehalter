@@ -54,6 +54,13 @@ type Settings struct {
 	// diagnostics-capable MCP server is configured.
 	Diagnostics *bool `toml:"diagnostics,omitempty"`
 
+	// UpdateCheck controls the once-a-day "a newer release exists" check
+	// against the GitHub releases API (see version.go). nil means on. Set it to
+	// false for a machine that should never reach github.com on its own, or for
+	// an installation someone else keeps up to date; CODEHALTER_UPDATE=skip
+	// does the same for a single run.
+	UpdateCheck *bool `toml:"update_check,omitempty"`
+
 	path string
 }
 

@@ -67,12 +67,20 @@ const cliUsage = `usage: codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-
   -p PROMPT           run one turn and exit, instead of opening a prompt. The
                       exit status is 0 only when the turn finished normally,
                       so a script can branch on it.
+  --rebuild           rebuild the devcontainer image before starting it
+
+Run outside a container in a project that has .devcontainer/devcontainer.json,
+this starts that container with docker (or podman) compose and runs the CLI
+inside it. Inside a container it just starts.
+
+Other flags: --version prints the release tag, --update installs the newest
+release over this binary, --setup reconfigures the LLM connection.
 `
 
 func runCLI(argv []string) int {
 	cwd, _ := os.Getwd()
 	resumeID, prompt := "", ""
-	resume, oneshot := false, false
+	resume, oneshot, rebuild := false, false, false
 	for i := 0; i < len(argv); i++ {
 		switch argv[i] {
 		case "--cwd":
@@ -95,6 +103,8 @@ func runCLI(argv []string) int {
 			}
 			i++
 			prompt, oneshot = argv[i], true
+		case "--rebuild":
+			rebuild = true
 		case "--help", "-h":
 			fmt.Print(cliUsage)
 			return 0
@@ -109,6 +119,35 @@ func runCLI(argv []string) int {
 		return 2
 	}
 	cwd = abs
+
+	// Before anything is opened: an update installed here replaces this binary
+	// and re-executes, and there is no session, log or container yet to lose.
+	// A one-shot or a piped stdin is told, not asked, because there is nobody
+	// at the keyboard to answer. The decision (and the release tag) then travel
+	// into the container through the environment, so the copy in there does not
+	// repeat the question or the API call.
+	offerUpdate(context.Background(), cwd, stdinIsTTY() && !oneshot)
+
+	// On the host, with a devcontainer to work from, this process is only a
+	// launcher: it starts the container and runs the real CLI inside it, then
+	// reports that run's exit status. Everything below is the in-container
+	// path, which is also what a project with no devcontainer.json gets (the
+	// agent's own bootstrap then offers to scaffold one).
+	if containerKind() == "" {
+		var inner []string
+		if resume {
+			inner = append(inner, "--resume")
+			if resumeID != "" {
+				inner = append(inner, resumeID)
+			}
+		}
+		if oneshot {
+			inner = append(inner, "-p", prompt)
+		}
+		if code, launched := launchInDevcontainer(cwd, inner, rebuild); launched {
+			return code
+		}
+	}
 
 	// The agent logs at debug on every turn. On stderr that is a wall of text
 	// straight through the TUI, so both slog AND os.Stderr are redirected to a
