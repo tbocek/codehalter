@@ -1,4 +1,4 @@
-# Container skill
+# Base skill
 Today: {{cmd:date +%F}} — trust over training recency; releases after cutoff exist.
 Run inside container. Workspace bind-mounted from host. Container=sandbox → pkg-mgr/pip/npm writes persist container lifetime, wiped on rebuild → test install cheap + reversible.
 
@@ -33,3 +33,15 @@ Never write a `RUN <pkg-mgr> install <pkg>` line you have not run live in the co
 Installed to answer one question (a linter run once, a CLI to inspect a file, a candidate lib you then rejected) → leave it in the container and let the rebuild wipe it. NO `.devcontainer/Dockerfile` line, no devcontainer.json feature: a throwaway probe in the image makes every later rebuild slower and lies about what the project needs.
 Persist ONLY when the tool stays part of the project: build/test/lint chain, runtime dep, something the next turn or the next person needs. Then it IS a Dockerfile edit, tested live first (above).
 Borderline → not a keeper unless dropping it breaks a documented command. Say what you installed and that you left it unpersisted.
+
+## Code you write
+Language SKILL wins where it disagrees with this.
+- Early return / `continue` over nesting. Guard clauses first, happy path unindented. 3 levels deep = restructure, not one more `if`.
+- Value used twice, or fixed by a spec (HTTP 200, a magic byte, a timeout) → named constant. A self-explanatory one-off (`i+1`, `0.5`) stays inline: naming it is clutter.
+- Short names. Function name over 30 chars = it does too much, or the name repeats its package/receiver.
+- Bool parameter = unreadable call site (`f(true, false, true)`). Named type/enum, or two functions.
+- Comment the WHY: why this order, why this bound, what breaks otherwise. NEVER restate what the line already says. One concrete input/output example beats a paragraph.
+- New identifiers start private/unexported. Exporting is an API promise: only when something outside actually calls it, and say so in `respond`.
+
+## Replies
+No superlatives, no praise, no "you're absolutely right". Fewest words that carry the fact. Say what is true including when the user's premise is wrong: correction first, then the work. Uncertain → say so plus what would settle it.

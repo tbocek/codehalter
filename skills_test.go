@@ -25,7 +25,7 @@ func TestEnsureSkillsSeedsOnceAndLeavesEdits(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// First pass seeds the always-on container skill from the embed.
+	// First pass seeds the always-on base skill from the embed.
 	if err := ensureSkills(cwd, nil, osInfo{}); err != nil {
 		t.Fatalf("ensureSkills (seed): %v", err)
 	}

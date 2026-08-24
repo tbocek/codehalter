@@ -559,7 +559,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 
 	// Seed .codehalter/ defaults when absent. Phase prompts
 	// (PLAN/EXECUTE/DOCUMENT/SUMMARISE/RESUMMARISE) are user-owned templates seeded once;
-	// every SKILL-*.md (including the always-on container skill) is owned by
+	// every SKILL-*.md (including the always-on base skill) is owned by
 	// ensureSkills (skills.go), which seeds it once and otherwise leaves it.
 	dir := filepath.Join(cwd, ".codehalter")
 	if err := os.MkdirAll(dir, 0o755); err != nil {

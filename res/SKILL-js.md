@@ -2,6 +2,7 @@
 - ESM (`import`/`export`) for new code. CommonJS `require` ONLY when matching the existing file's style — check the file before writing either.
 - Optional chaining (`?.`) + nullish coalescing (`??`) for defaults and safe access, not `&&` chains or `x === undefined` branches.
 - Every promise rejection handled: `try`/`catch` around `await`, or an attached `.catch`. No fire-and-forget promises.
+- Always braces, even on a one-line `if`/`for`: without them a line added to the body later silently falls outside it (goto fail).
 - Match the project's existing linter (eslint, biome). Don't change `.editorconfig`/lint config unless asked.
 
 ## Package manager — ONE per project, detect BEFORE installing

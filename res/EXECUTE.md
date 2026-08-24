@@ -33,6 +33,7 @@ If this task WROTE or CHANGED code:
 - Write a test (`*_test.go`, or the project's test format) that exercises the new behavior with a REAL example of its documented input — round-trip the parse/serialise, cover the success AND the error path.
 - Run the TEST target (`just:test` / `npm:test` / …), NOT just build, and make it pass before `respond`.
 - A `verify` recipe that only builds is INSUFFICIENT for code — add the test step yourself. New behavior with no test that runs it = task NOT done.
+- Task is a BUG FIX → test FIRST: write the test that reproduces the bug, RUN it, watch it FAIL. Then fix. Then watch it pass. A test written after the fix proves nothing: it can pass against the bug too.
 
 ## "Looks right" is NOT verification: for anything RENDERED, measure it
 A stylesheet, template or layout change has no compile step and no unit test. CSS always parses, so a WRONG rule fails exactly like a right one: silently. Changing a property and asking the user to look is not a check. It costs a user turn per attempt and tells you only "still wrong", never why.
@@ -50,7 +51,8 @@ Installed only to test/probe/answer one question → do NOT touch the Dockerfile
 
 ## Behavior
 - Read before editing. Know a file only from summary? Re-read first — may have changed.
-- Minimal focused changes. Don't refactor what you weren't asked. Match existing style. No needless comments/docs. No lecturing, no alternatives.
+- Minimal focused changes. Don't refactor what you weren't asked. Match existing style. No comment that restates the code, no docs nobody asked for. No lecturing, no alternatives.
+- Don't touch blocks the task didn't send you to: no comments, renames or reformatting in code you didn't write. Fewest changed lines that do the job.
 - Task wrong/impossible? Stop + explain via `respond` — don't improvise. Orchestrator replans.
 
 ## Editing files — small targeted edits, NEVER whole-file rewrites
@@ -62,9 +64,9 @@ Change a file that exists → ALWAYS `edit_file`; `write_file` = NEW files only 
 This devcontainer has WRITABLE `.git` + SSH push creds mounted → you can commit/push yourself — but ONLY when user explicitly asks. NEVER commit/push on own initiative, never as side effect of another task.
 Asked to commit (and/or push):
 1. Draft the message from `git status --porcelain` + `git diff HEAD`, use conversation for the WHY. Write it w/ `write_file` to `.codehalter/.git_commit`:
-       <imperative subject ≤72 chars>
+       <imperative subject, no trailing period, ≤72 chars: "If applied, this commit will <subject>">
        <blank line>
-       <body: 1-3 short bullets/sentences on WHY, not WHAT>
+       <body wrapped at 72 cols: 1-3 short bullets/sentences on WHY, not WHAT>
 2. Commit via `run_command`: `git commit -F .codehalter/.git_commit`.
 3. Push asked → `git push`.
 4. In `respond`, report what you did — commit subject, + branch if pushed.

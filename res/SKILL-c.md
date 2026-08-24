@@ -1,5 +1,6 @@
 # C / C++ skill
 Covers C and C++ (.c/.h + .cpp/.cc/.cxx/.hpp). Match the file you edit — no C++ idioms in a C file or the reverse.
+Always braces, even on a one-line `if`/`for`: without them a line added to the body later silently falls outside it (goto fail).
 
 ## Build through the project build system
 Use `run_task` on the declared build (make, cmake --build build, meson compile, ninja), NOT bare `gcc foo.c`: real flags, include paths and link order live in the build files. Pick the ONE system the project actually uses (a Makefile that wraps cmake is not a second target to try) and read it for the target name.

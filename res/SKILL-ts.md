@@ -1,6 +1,7 @@
 # TypeScript skill
 - Strict null checks ON: `T | undefined` is NOT `T`. Use `!` ONLY when you can prove non-null.
 - Prefer named exports; ESM imports, not `require`, in new code.
+- Always braces, even on a one-line `if`/`for`: without them a line added to the body later silently falls outside it (goto fail).
 
 ## Package manager — ONE per project, detect BEFORE installing
 `package.json` `packageManager` field → lockfile (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, `bun.lockb`→bun, else npm) → an existing `node_modules/.pnpm` dir (→pnpm; the lockfile is often gitignored, so this is the real signal). Use that ONE for EVERYTHING (formatter, lsmcp, scripts). Never mix npm into a pnpm/yarn project, never `npm install` as a fallback. Get pnpm/yarn via `corepack enable`.
