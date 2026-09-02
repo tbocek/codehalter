@@ -38,6 +38,15 @@ import (
 // the write behind it. On timeout the write returns undecorated.
 const diagTimeout = 6 * time.Second
 
+// diagMaxStrikes is how many consecutive failed calls a diagnostics source gets
+// before codehalter stops asking it for the rest of the session. A server that
+// times out does not answer faster on the next write, and every write pays
+// diagTimeout to find that out again: one measured session spent 3.4 minutes
+// across 33 writes on a bridge that never answered once. Two rather than one, so
+// a single slow first call (a language server still loading its index) doesn't
+// cost the session its diagnostics.
+const diagMaxStrikes = 2
+
 // diagMaxBytes clips the diagnostics text appended to a tool result. A file
 // with a syntax error near the top can produce hundreds of cascading errors,
 // and pasting all of them costs more context than the edit itself. The first
@@ -89,8 +98,14 @@ func (a *agent) postWriteDiagnostics(ctx context.Context, sid, path, content str
 	var who, source, out string
 	// An MCP bridge that claims this file answers it, and its answer is final: a
 	// clean verdict from gopls about a .go file is not a reason to go looking for
-	// a second opinion. Everything it does not claim falls through to LSP.
-	if client, tool, ok := a.findDiagnosticsTool(path); ok {
+	// a second opinion. Everything it does not claim falls through to LSP — and
+	// so does a bridge that struck out (diagMaxStrikes), which is how a wedged
+	// lsmcp hands .ts files back to the LSP path instead of blocking them.
+	client, tool, mcpOK := a.findDiagnosticsTool(path)
+	if mcpOK && sess.diagSourceOff(client.name) {
+		mcpOK = false
+	}
+	if mcpOK {
 		args, ok := diagArgs(tool.InputSchema, path, rel, sess.Cwd)
 		if !ok {
 			// The server exposes a diagnostics tool whose schema has no argument we
@@ -108,13 +123,17 @@ func (a *agent) postWriteDiagnostics(ctx context.Context, sid, path, content str
 		switch {
 		case err != nil:
 			slog.Debug("diagnostics: call failed", "server", client.name, "tool", tool.Name, "path", path, "err", err)
+			a.reportDiagGaveUp(ctx, sid, sess, client.name)
 			return ""
 		case isErr:
 			// The server rejected the call — commonly "not a Go file" when gopls is
 			// asked about something outside its languages. Expected, not a fault.
 			slog.Debug("diagnostics: server reported an error", "server", client.name, "tool", tool.Name, "path", path, "out", truncate(body, 200))
+			// An answer, just a refusal. Not a strike.
+			sess.diagSourceOK(client.name)
 			return ""
 		}
+		sess.diagSourceOK(client.name)
 		if !diagHasFindings(body) {
 			return ""
 		}
@@ -123,8 +142,10 @@ func (a *agent) postWriteDiagnostics(ctx context.Context, sid, path, content str
 		body, err := c.diagnose(callCtx, path, content, langID)
 		if err != nil {
 			slog.Debug("diagnostics: lsp call failed", "server", c.name, "path", path, "err", err)
+			a.reportDiagGaveUp(ctx, sid, sess, c.name)
 			return ""
 		}
+		sess.diagSourceOK(c.name)
 		who, source, out = c.name, c.name+" (lsp)", body
 	}
 
@@ -134,6 +155,22 @@ func (a *agent) postWriteDiagnostics(ctx context.Context, sid, path, content str
 	a.logSession(sid, "DIAGNOSTICS", "%s on %s:\n%s", source, rel, out)
 	return fmt.Sprintf("\n\n[%s reports on %s — these are from the file you just wrote, fix them before moving on]\n%s",
 		who, rel, truncate(strings.TrimSpace(out), diagMaxBytes))
+}
+
+// reportDiagGaveUp records a failed diagnostics call and, on the failure that
+// crosses diagMaxStrikes, says once why diagnostics have gone quiet. Said to the
+// user rather than only logged: a feature that silently switches itself off is
+// precisely the thing nobody notices from the outside — the session that
+// motivated this spent 6s per write for two hours with nothing to show for it.
+func (a *agent) reportDiagGaveUp(ctx context.Context, sid string, sess *Session, name string) {
+	if !sess.diagSourceFailed(name) {
+		return
+	}
+	msg := fmt.Sprintf("🟡 Diagnostics from %s are off for the rest of this session: %d calls in a row failed or timed out, "+
+		"and every write pays up to %s waiting for it. Fix the server, then start a new session to re-enable.",
+		name, diagMaxStrikes, diagTimeout)
+	a.say(ctx, sid, msg+"\n")
+	a.logSession(sid, "DIAGNOSTICS", "%s", msg)
 }
 
 // diagnosticsEnabled reports the `diagnostics` settings key (default on).

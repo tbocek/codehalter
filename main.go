@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -87,6 +88,13 @@ type agent struct {
 	// probeAllLLMs; nil before the first prepare — a nil-map read is the zero
 	// probeResult, so renderLLMStatus stays safe.
 	connProbe map[string]probeResult
+
+	// summaryStrikes counts consecutive failures of the dedicated summariser
+	// connection (purpose = "summary"). At summaryMaxStrikes, connForBackgroundLLM
+	// stops routing there for the rest of the run and the notes generate on llm[0]
+	// instead. Atomic, not under a.mu: it is written from the summarise goroutine
+	// and read from the turn path.
+	summaryStrikes atomic.Int32
 
 	// ctkIgnored remembers which Server+Model has already been reported for
 	// accepting chat_template_kwargs and ignoring it, so the warning fires once

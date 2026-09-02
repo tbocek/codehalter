@@ -1244,6 +1244,13 @@ func (a *agent) connForSession(_ context.Context, sid string, role string) *LLMC
 	return a.settings.MainLLM(role)
 }
 
+// summaryMaxStrikes is how many consecutive failures the dedicated summariser
+// connection gets before background notes move to llm[0] for the rest of the
+// run. Each failure costs that turn's note (summariseCall falls back to a
+// clipped raw transcript), so the threshold is low: two, enough to ride out a
+// single timeout, not enough to spend a session degrading every note.
+const summaryMaxStrikes = 2
+
 // connForBackgroundLLM returns the connection to host background work (the
 // per-turn summariser). It walks the entries marked `purpose = "summary"` and
 // returns the first with free semaphore capacity, so marking several spreads
@@ -1269,6 +1276,20 @@ func (a *agent) connForBackgroundLLM() (*LLMConnection, bool) {
 	for i := 1; i < len(a.settings.LLM); i++ {
 		if !strings.EqualFold(a.settings.LLM[i].Purpose, purposeSummary) {
 			continue
+		}
+		// A summariser the probe couldn't reach, or one that has failed its way
+		// through summaryMaxStrikes, is not a summariser. Using it anyway costs
+		// the note outright — summariseCall's only fallback is a clipped raw
+		// transcript — and llm[0] is right there, one line down, where the note
+		// generates as a cheap prefix extension. Read of connProbe is unlocked,
+		// same as hasReachableLLM: it is written by the probe in the pre-turn
+		// prepare, never concurrently with a turn.
+		if p, ok := a.connProbe[a.settings.LLM[i].Server+"\x00"+a.settings.LLM[i].Model]; ok && !p.Reachable {
+			slog.Debug("background llm: summariser unreachable, using llm[0]", "server", a.settings.LLM[i].Server)
+			break
+		}
+		if a.summaryStrikes.Load() >= summaryMaxStrikes {
+			break
 		}
 		if i < len(a.connSems) && a.connSems[i] != nil &&
 			len(a.connSems[i]) < cap(a.connSems[i]) {

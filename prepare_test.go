@@ -643,3 +643,107 @@ func TestProbeToolBinsMatchesInlineProbe(t *testing.T) {
 		t.Errorf("formatters: got %+v, want %+v", gotFormatters, wantFormatters)
 	}
 }
+
+// TestFormatterConfigNeeds pins who gets offered a formatter config and, more
+// importantly, who does not: a Go project has nothing to pin (gofmt exposes no
+// style options), and a project that already declares its style is left alone
+// rather than asked about at the start of every session.
+func TestFormatterConfigNeeds(t *testing.T) {
+	// proj builds a project dir carrying a local prettier (so the "formatter is
+	// installed" gate passes without depending on the host PATH) plus whatever
+	// config files the case declares.
+	proj := func(t *testing.T, files ...string) string {
+		t.Helper()
+		dir := t.TempDir()
+		bin := filepath.Join(dir, "node_modules", ".bin")
+		if err := os.MkdirAll(bin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, "prettier"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range files {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("{}"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+
+	tests := []struct {
+		name   string
+		stacks []string
+		files  []string
+		want   []formatterConfigNeed
+	}{
+		{
+			name:   "js project with nothing pinning its style",
+			stacks: []string{"js"},
+			want:   []formatterConfigNeed{{"prettier", ".prettierrc"}},
+		},
+		{
+			name:   "ts and css are the same prettier, asked once",
+			stacks: []string{"ts", "css"},
+			want:   []formatterConfigNeed{{"prettier", ".prettierrc"}},
+		},
+		{
+			name:   "prettier config present",
+			stacks: []string{"ts"},
+			files:  []string{".prettierrc"},
+		},
+		{
+			// prettier reads .editorconfig, so the style IS pinned.
+			name:   "editorconfig counts as pinned",
+			stacks: []string{"js"},
+			files:  []string{".editorconfig"},
+		},
+		{
+			// The whole point of the exclusion list: gofmt has no options, so
+			// there is no config to write and nothing to disagree about.
+			name:   "go project is already pinned by gofmt",
+			stacks: []string{"go"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatterConfigNeeds(tc.stacks, proj(t, tc.files...))
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	// An uninstalled formatter is the install card's business and comes first,
+	// so nothing is offered here. Skipped on a machine with a global prettier,
+	// where the gate legitimately passes.
+	t.Run("formatter not installed", func(t *testing.T) {
+		dir := t.TempDir()
+		if prettierBin(dir) != "" {
+			t.Skip("prettier is on PATH here")
+		}
+		if got := formatterConfigNeeds([]string{"js"}, dir); got != nil {
+			t.Errorf("got %+v, want nothing offered for an uninstalled formatter", got)
+		}
+	})
+
+	t.Run("c project without clang-format config", func(t *testing.T) {
+		dir := t.TempDir()
+		got := formatterConfigNeeds([]string{"c"}, dir)
+		if !onPath("clang-format") {
+			if got != nil {
+				t.Errorf("got %+v with no clang-format installed, want nothing", got)
+			}
+			return
+		}
+		want := []formatterConfigNeed{{"clang-format", ".clang-format"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".clang-format"), []byte("BasedOnStyle: GNU\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := formatterConfigNeeds([]string{"c"}, dir); got != nil {
+			t.Errorf("got %+v with a .clang-format present, want nothing", got)
+		}
+	})
+}

@@ -50,6 +50,23 @@ const (
 
 	cardSetupClangd = "- No code-intelligence MCP (clangd = gopls analog for C/C++) configured. Set it up per SKILL-c.md.\n"
 
+	// cardFormatHeader is its own card rather than a bullet on cardSetupHeader:
+	// nothing here is installed and nothing belongs in the Dockerfile, and the
+	// work is judgement (read the code, infer the style it is already written in)
+	// rather than a package-manager command. Holes: the formatter list, then the
+	// config files to write.
+	cardFormatHeader = "This project has no formatter config (%s), so every tool that touches it formats by its own defaults.\n" +
+		"\n" +
+		"That is not cosmetic. codehalter formats what it writes, the editor may format on save, CI may check a third way, and when they disagree a file is rewritten between the moment the model reads it and its next edit — so the edit fails on text that was correct when it was read.\n" +
+		"\n" +
+		"PLAN ONLY → produce execute-phase steps that:\n" +
+		"1. MEASURE the style already in the repo. Do NOT impose defaults. Read several of the largest existing source files and count: indent width, tabs vs spaces, quote style, semicolons, trailing commas, the line width the code actually respects. State the numbers you measured.\n" +
+		"2. Write %s encoding exactly those numbers, so the formatter is a no-op on code that already matches the project.\n" +
+		"3. Prove it: run the formatter in check mode over the whole tree and report how many files it would still change. A large number means the config does not describe this codebase — go back to step 1 and fix the config. Do NOT reformat the repo to match a guess.\n" +
+		"4. Only once step 3 is small: format the whole tree and commit that as ONE commit containing formatting and nothing else. If `git status` is not clean, skip this step and say so — a formatting commit must not sweep up someone's work in progress.\n" +
+		"\n" +
+		"The matching language SKILL has the exact config file and flags. Change no behavior anywhere in this task.\n"
+
 	cardMCPParseError = "MCP config `.codehalter/mcp.toml` failed to parse: %s.\n" +
 		"\n" +
 		"Read file (header comments = schema), fix syntax, re-read to confirm parses. Do NOT start servers → codehalter reconciles next prompt.\n"
@@ -186,6 +203,46 @@ func detectFormatters(stacks []string, cwd string) []formatterNeed {
 func fileExists(cwd, name string) bool {
 	_, err := os.Stat(filepath.Join(cwd, name))
 	return err == nil
+}
+
+// formatterConfigNeed pairs a formatter that will run over this project with the
+// config file that would pin HOW it formats.
+type formatterConfigNeed struct {
+	bin, config string
+}
+
+// formatterConfigNeeds returns the formatters that will reformat this project's
+// files with nothing in the repo saying what its style is.
+//
+// gofmt, rustfmt and zig fmt are deliberately absent: they expose no style
+// options, so there is no config to write and no way for two tools to disagree
+// about their output — a Go project is already pinned by virtue of the language.
+// Only a formatter whose defaults are arbitrary relative to the code already in
+// the repo can drift from it, and that drift is expensive: an editor's
+// format-on-save reindenting a file after a write invalidates the exact text the
+// model just read, which costs failed edits and a repair cycle.
+//
+// The formatter has to be installed for this to be worth asking — a missing one
+// is the install card's business, and it comes first.
+func formatterConfigNeeds(stacks []string, cwd string) []formatterConfigNeed {
+	var needs []formatterConfigNeed
+	// .editorconfig counts as pinned for prettier, which reads it; clang-format
+	// does not, so it gets no such exemption below.
+	prettierUnpinned := prettierBin(cwd) != "" && !hasPrettierConfig(cwd) && !fileExists(cwd, ".editorconfig")
+	if prettierUnpinned && (slices.Contains(stacks, "ts") || slices.Contains(stacks, "js") || slices.Contains(stacks, "css")) {
+		needs = append(needs, formatterConfigNeed{"prettier", ".prettierrc"})
+	}
+	if slices.Contains(stacks, "c") && onPath("clang-format") && !fileExists(cwd, ".clang-format") {
+		needs = append(needs, formatterConfigNeed{"clang-format", ".clang-format"})
+	}
+	return needs
+}
+
+// formatConfigEnabled reports the `format_config` settings key (default on).
+func (a *agent) formatConfigEnabled() bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	return a.settings.FormatConfig == nil || *a.settings.FormatConfig
 }
 
 // hasPrettierConfig reports whether the project pins prettier — a dotfile, a
@@ -803,25 +860,44 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 	if slices.Contains(stacks, "c") && !mcpServerConfigured(sess.Cwd, "clangd") {
 		want("set up clangd (C/C++ code intelligence)", cardSetupClangd)
 	}
-	if len(steps) == 0 {
-		return nil
+	var probs []fixProblem
+	if len(steps) > 0 {
+		// Embed the OS we already detected so the LLM doesn't waste a tool call
+		// rediscovering it. The bootstrap step (ensureDevcontainer) only scaffolds
+		// containers based on one of the five supported distros, so osi.ID normally
+		// has a supported value here; the plain "Linux" fallback is for a container
+		// the user built themselves with no usable /etc/os-release.
+		distro := osi.Fields["PRETTY_NAME"]
+		if distro == "" && osi.ID != "" {
+			distro = strings.ToUpper(osi.ID[:1]) + osi.ID[1:]
+		}
+		if distro == "" {
+			distro = "Linux"
+		}
+		probs = append(probs, fixProblem{
+			desc:   "🟡 Container setup: " + strings.Join(titles, "; "),
+			prompt: fmt.Sprintf(cardSetupHeader, distro) + strings.Join(steps, ""),
+		})
 	}
-	// Embed the OS we already detected so the LLM doesn't waste a tool call
-	// rediscovering it. The bootstrap step (ensureDevcontainer) only scaffolds
-	// containers based on one of the five supported distros, so osi.ID normally
-	// has a supported value here; the plain "Linux" fallback is for a container
-	// the user built themselves with no usable /etc/os-release.
-	distro := osi.Fields["PRETTY_NAME"]
-	if distro == "" && osi.ID != "" {
-		distro = strings.ToUpper(osi.ID[:1]) + osi.ID[1:]
+
+	// Formatter config: at most once per session (see Session.formatCardShown),
+	// and never when the project opted out with format_config = false. A separate
+	// card from the container setup above, for the reasons on cardFormatHeader.
+	if !sess.formatCardShown && a.formatConfigEnabled() {
+		if needs := formatterConfigNeeds(stacks, sess.Cwd); len(needs) > 0 {
+			sess.formatCardShown = true
+			bins := make([]string, len(needs))
+			cfgs := make([]string, len(needs))
+			for i, n := range needs {
+				bins[i], cfgs[i] = n.bin, n.config
+			}
+			probs = append(probs, fixProblem{
+				desc:   "🟡 No formatter config (" + strings.Join(bins, ", ") + "): pin the style this code is already written in?",
+				prompt: fmt.Sprintf(cardFormatHeader, strings.Join(bins, ", "), strings.Join(cfgs, " + ")),
+			})
+		}
 	}
-	if distro == "" {
-		distro = "Linux"
-	}
-	return []fixProblem{{
-		desc:   "🟡 Container setup: " + strings.Join(titles, "; "),
-		prompt: fmt.Sprintf(cardSetupHeader, distro) + strings.Join(steps, ""),
-	}}
+	return probs
 }
 
 // ---------------------------------------------------------------------------

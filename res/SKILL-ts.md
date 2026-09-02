@@ -10,6 +10,15 @@ The base image has no node → install `nodejs npm` (OS pkg mgr) + persist FIRST
 ## Type-check + lint through the project's scripts
 Its package-manager run (`pnpm run`/`npm run`/`yarn`, matching the lockfile) of `typecheck`/`build`/`lint`, whatever `package.json` declares. Don't reach for `npx tsc --noEmit` or eslint directly when a script exists.
 
+## Formatter config — pin the style that is already there
+No `.prettierrc`/`.editorconfig` → prettier, your editor and CI each use their own defaults and fight over the file. Fix by MEASURING, never by imposing:
+- indent: `grep -h "^ *[^ ]" src/*.ts | sed "s/[^ ].*//" | awk "{print length}" | sort -n | uniq -c` → the smallest non-zero width that repeats is the indent. Tabs: `grep -lP "^\t" src/*.ts`.
+- quotes: count `'` vs `"` string delimiters. semicolons: does a line end in `;`? trailing commas: does a multi-line literal end `,\n)`? width: longest existing line, rounded.
+- Write `.prettierrc` with exactly those (`tabWidth`, `useTabs`, `singleQuote`, `semi`, `trailingComma`, `printWidth`).
+- Prove it: `prettier --list-different .` → few files = the config describes the code. Many = the config is wrong; fix it, do NOT reformat the repo to match a guess.
+- `.prettierignore` vendored/generated files (a copied upstream lib, `dist/`) BEFORE any `--write`.
+- Then `prettier --write .` as ONE commit, formatting only, and only on a clean tree.
+
 ## Type errors on every write — tsgo
 codehalter type-checks each `.ts`/`.tsx` it writes and appends the errors to that write's result: it speaks LSP to `tsgo` (the native TypeScript compiler) itself. There is NOTHING to wire — no MCP server, no `.codehalter/mcp.toml` entry, no `npx`, no restart.
 Two prerequisites, both the project's own:

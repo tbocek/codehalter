@@ -286,6 +286,14 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 		end = start + served - 1
 	}
 
+	// A window that begins at line 1 and ran out of file IS the whole file, so it
+	// can be compared against what we last wrote to that path (fsRead only checks
+	// unwindowed reads, and every read_file is windowed). This is the earliest
+	// point the model can be told a file was rewritten behind it.
+	if sess != nil && start == 1 && !more && byteNote == "" {
+		sess.checkExternalChange(path, content)
+	}
+
 	// Dedup on the ACTUAL served bytes, not a stat proxy: only flag a re-read as
 	// redundant when the content is byte-identical to what this same window
 	// served earlier this turn. A re-read that returns new bytes (an unsaved Zed
@@ -360,6 +368,9 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	out += "\n" + note
 	if dedupNote != "" {
 		out = dedupNote + "\n" + out
+	}
+	if sess != nil {
+		out += sess.takeDriftNote(path)
 	}
 
 	title := fmt.Sprintf("Reading: %s (%d-%d)", path, start, end)
@@ -589,6 +600,13 @@ func init() {
 		if rerr != nil {
 			slog.Debug("write_file: pre-edit read returned an error; treating as new file", "path", path, "err", rerr)
 		}
+		// Taken BEFORE the write: our own fsWrite resets the path's drift state,
+		// and the model still needs to know its remembered copy went stale — the
+		// content it just composed may have been written against it.
+		drift := ""
+		if sess := a.getSession(sid); sess != nil {
+			drift = sess.takeDriftNote(path)
+		}
 		newContent = a.formatGuarded(sid, path, oldContent, newContent)
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
@@ -602,7 +620,7 @@ func init() {
 		// answer into this result, so a broken write is visible now rather than at
 		// the next build. Returns "" when there's no server, nothing to report, or
 		// anything went wrong — the write already succeeded and must stay succeeded.
-		return "file written successfully" + a.postWriteDiagnostics(ctx, sid, path, newContent), false
+		return "file written successfully" + a.postWriteDiagnostics(ctx, sid, path, newContent) + drift, false
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -639,6 +657,15 @@ func init() {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error reading file: " + err.Error(), false
 		}
+		// Rides along on every outcome below. On a failed match it is the ANSWER:
+		// old_text was copied from a read that something else has since rewritten,
+		// and without this the model can only guess (one session spent minutes
+		// diffing against git to work out what had happened). Taken before the
+		// write, which resets the path's drift state.
+		drift := ""
+		if sess := a.getSession(sid); sess != nil {
+			drift = sess.takeDriftNote(path)
+		}
 
 		count := strings.Count(content, oldText)
 		var newContent string
@@ -646,7 +673,7 @@ func init() {
 		switch {
 		case count > 1:
 			a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("old_text matches %d times, must be unique", count))
-			return fmt.Sprintf("error: old_text matches %d places — it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count), true
+			return fmt.Sprintf("error: old_text matches %d places — it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count) + drift, true
 		case count == 1:
 			newContent = strings.Replace(content, oldText, newText, 1)
 		default:
@@ -660,7 +687,7 @@ func init() {
 				okNote = "file written successfully (old_text matched ignoring whitespace/indentation)"
 			case n > 1:
 				a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("old_text matches %d times ignoring whitespace, must be unique", n))
-				return fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n), true
+				return fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n) + drift, true
 			default:
 				a.FailToolCall(ctx, sid, tcId, "old_text not found in file")
 				if sess := a.getSession(sid); sess != nil {
@@ -676,9 +703,9 @@ func init() {
 				if line, snippet, found := nearMiss(content, oldText); found {
 					return fmt.Sprintf("error: old_text not found — the file has drifted from what you remember. The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
 						"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT call read_file first — the text above is the file's current content. Do NOT rewrite the whole file with write_file.",
-						path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap)), true
+						path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap)) + drift, true
 				}
-				return "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file.", true
+				return "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file." + drift, true
 			}
 		}
 
@@ -692,7 +719,7 @@ func init() {
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
 
 		// See write_file: diagnostics ride along on the successful edit's result.
-		return okNote + a.postWriteDiagnostics(ctx, sid, path, newContent), false
+		return okNote + a.postWriteDiagnostics(ctx, sid, path, newContent) + drift, false
 	}})
 }
 
@@ -707,25 +734,36 @@ func init() {
 // non-nil pointers to bound the response to a 1-indexed line window.
 func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit *int) (string, error) {
 	sess := a.getSession(sid)
-	if (sess != nil && sess.Depth > 0) || !a.clientCan("read") {
-		return directRead(path, line, limit)
+	content, err := func() (string, error) {
+		if (sess != nil && sess.Depth > 0) || !a.clientCan("read") {
+			return directRead(path, line, limit)
+		}
+		raw, err := a.conn.sendRequest(ctx, "fs/read_text_file", struct {
+			SessionId string `json:"sessionId"`
+			Path      string `json:"path"`
+			Line      *int   `json:"line,omitempty"`
+			Limit     *int   `json:"limit,omitempty"`
+		}{sid, path, line, limit})
+		if err != nil {
+			return "", err
+		}
+		var resp struct {
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			return "", err
+		}
+		return resp.Content, nil
+	}()
+	// Drift check on every WHOLE read, wherever it came from: a windowed read is
+	// a slice of the file and says nothing about whether the file as a whole
+	// still matches what we wrote. Detection lives here, at the one point every
+	// read passes through; the note it arms is delivered by whichever tool is
+	// returning this content (see takeDriftNote).
+	if err == nil && line == nil && limit == nil && sess != nil {
+		sess.checkExternalChange(path, content)
 	}
-	raw, err := a.conn.sendRequest(ctx, "fs/read_text_file", struct {
-		SessionId string `json:"sessionId"`
-		Path      string `json:"path"`
-		Line      *int   `json:"line,omitempty"`
-		Limit     *int   `json:"limit,omitempty"`
-	}{sid, path, line, limit})
-	if err != nil {
-		return "", err
-	}
-	var resp struct {
-		Content string `json:"content"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", err
-	}
-	return resp.Content, nil
+	return content, err
 }
 
 // fsWrite writes a text file. Same subagent and capability fallbacks as
@@ -736,7 +774,8 @@ func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit 
 // for every path through this function.
 func fsWrite(a *agent, ctx context.Context, sid string, path, content string) error {
 	direct := !a.clientCan("write")
-	if sess := a.getSession(sid); sess != nil {
+	sess := a.getSession(sid)
+	if sess != nil {
 		sess.readDedupMu.Lock()
 		for k := range sess.readDedup {
 			if strings.HasPrefix(k, path+"|") {
@@ -751,14 +790,22 @@ func fsWrite(a *agent, ctx context.Context, sid string, path, content string) er
 		sess.readCursorMu.Unlock()
 		direct = direct || sess.Depth > 0
 	}
+	var err error
 	if direct {
-		return os.WriteFile(path, []byte(content), 0644)
+		err = os.WriteFile(path, []byte(content), 0644)
+	} else {
+		_, err = a.conn.sendRequest(ctx, "fs/write_text_file", struct {
+			SessionId string `json:"sessionId"`
+			Path      string `json:"path"`
+			Content   string `json:"content"`
+		}{sid, path, content})
 	}
-	_, err := a.conn.sendRequest(ctx, "fs/write_text_file", struct {
-		SessionId string `json:"sessionId"`
-		Path      string `json:"path"`
-		Content   string `json:"content"`
-	}{sid, path, content})
+	// Remember exactly what we put there, so the next whole read of this path can
+	// tell "the model misremembers the file" from "something rewrote the file
+	// under us" (fsRead → checkExternalChange).
+	if err == nil && sess != nil {
+		sess.recordWrite(path, content)
+	}
 	return err
 }
 

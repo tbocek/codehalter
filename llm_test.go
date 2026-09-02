@@ -686,3 +686,55 @@ func TestLLMStreamSurfacesInStreamError(t *testing.T) {
 		})
 	}
 }
+
+// TestBackgroundSkipsDeadSummariser pins the two ways a dedicated summariser
+// stops being used: the startup probe could not reach it, or it has failed its
+// way through summaryMaxStrikes. Either way background work goes back to llm[0],
+// where a note still generates (and generates cheaply, as a prefix extension)
+// instead of every turn silently falling back to a raw transcript.
+func TestBackgroundSkipsDeadSummariser(t *testing.T) {
+	newAgent := func() *agent {
+		a := &agent{settings: Settings{LLM: []LLMConnection{
+			{Server: "u0", Model: "m0", Parallel: ptr(1)},
+			{Server: "sum", Model: "ms", Parallel: ptr(1), Purpose: "summary"},
+		}}}
+		a.buildConnSems()
+		return a
+	}
+	wantSummariser := func(t *testing.T, a *agent, why string) {
+		t.Helper()
+		if bg, onMain := a.connForBackgroundLLM(); bg == nil || bg.Server != "sum" || onMain {
+			t.Fatalf("%s: got %+v onMain=%v, want the summariser at sum", why, bg, onMain)
+		}
+	}
+	wantMain := func(t *testing.T, a *agent, why string) {
+		t.Helper()
+		if bg, onMain := a.connForBackgroundLLM(); bg == nil || bg.Server != "u0" || !onMain {
+			t.Fatalf("%s: got %+v onMain=%v, want llm[0] at u0 with onMain", why, bg, onMain)
+		}
+	}
+
+	// No probe result yet (nil map) is not evidence of a dead server.
+	wantSummariser(t, newAgent(), "unprobed")
+
+	a := newAgent()
+	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: true}}
+	wantSummariser(t, a, "probe says reachable")
+
+	a = newAgent()
+	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: false}}
+	wantMain(t, a, "probe says unreachable")
+
+	// A probe result for some OTHER endpoint must not take this one out.
+	a = newAgent()
+	a.connProbe = map[string]probeResult{"elsewhere\x00mx": {Reachable: false}}
+	wantSummariser(t, a, "unrelated unreachable endpoint")
+
+	a = newAgent()
+	a.summaryStrikes.Store(summaryMaxStrikes)
+	wantMain(t, a, "struck out")
+
+	a = newAgent()
+	a.summaryStrikes.Store(summaryMaxStrikes - 1)
+	wantSummariser(t, a, "one strike short")
+}

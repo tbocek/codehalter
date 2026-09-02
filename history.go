@@ -342,9 +342,31 @@ func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message
 // summariser can't answer with a tool call.
 func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, tools []map[string]any, turn []Message) string {
 	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, tools, nil, nil, nil)
+	// Whether this ran on a DEDICATED summariser, by endpoint rather than by
+	// Slot: connForBackgroundLLM stamps its llm[0] fallback with Slot 1 for the
+	// meter, so Slot alone would blame llm[0] for llm[0]'s own failures and take
+	// a healthy summariser out of rotation.
+	dedicated := false
+	a.cfgMu.RLock()
+	if len(a.settings.LLM) > 0 {
+		dedicated = conn.Server != a.settings.LLM[0].Server || conn.Model != a.settings.LLM[0].Model
+	}
+	a.cfgMu.RUnlock()
 	if err != nil || strings.TrimSpace(out) == "" {
-		slog.Debug("summarise: llm call failed — using raw fallback note", "sid", sess.ID, "err", err)
+		// Not Debug: every failure here silently swaps a structured note for a
+		// clipped transcript, which degrades every later compaction. One measured
+		// session lost 23 notes this way to an endpoint that was unreachable from
+		// inside the container, and the only trace was a Debug line nobody reads.
+		slog.Warn("summarise: llm call failed — using raw fallback note", "sid", sess.ID, "server", conn.Server, "err", err)
+		a.logSession(sess.ID, "SUMMARISE", "failed on %s (%s) — turn note fell back to a raw transcript: %v", conn.Server, conn.Model, err)
+		if dedicated {
+			// A dedicated summariser that keeps failing gets taken out of rotation
+			// by connForBackgroundLLM, which then generates notes on llm[0].
+			a.summaryStrikes.Add(1)
+		}
 		out = fallbackTurnNote(turn)
+	} else if dedicated {
+		a.summaryStrikes.Store(0)
 	}
 	return attachImageRefs(out, turn)
 }

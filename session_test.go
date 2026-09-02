@@ -620,3 +620,90 @@ func TestConcurrentSessionWritesAreRaceFree(t *testing.T) {
 		t.Errorf("user message count: got %d, want %d", userCount, want)
 	}
 }
+
+// TestExternalChangeDrift covers the detector that tells the model a file was
+// rewritten behind it. The failure it exists for: an editor's format-on-save
+// reindents a file after codehalter writes it, and the model's next edit_file
+// fails on old_text that was correct when it read it.
+func TestExternalChangeDrift(t *testing.T) {
+	s := &Session{}
+	const path = "/w/proj/src/app.js"
+
+	// A file we never wrote is not tracked: it changing is not drift.
+	s.checkExternalChange(path, "whatever")
+	if note := s.takeDriftNote(path); note != "" {
+		t.Errorf("untracked file produced a note: %q", note)
+	}
+
+	s.recordWrite(path, "let a = 1;\n")
+	s.checkExternalChange(path, "let a = 1;\n")
+	if note := s.takeDriftNote(path); note != "" {
+		t.Errorf("unchanged file produced a note: %q", note)
+	}
+
+	// Reindented behind us: exactly one note, delivered once.
+	s.checkExternalChange(path, "let  a  =  1;\n")
+	note := s.takeDriftNote(path)
+	if note == "" {
+		t.Fatal("a file rewritten behind us produced no note")
+	}
+	if again := s.takeDriftNote(path); again != "" {
+		t.Errorf("note delivered twice: %q", again)
+	}
+	// The hash advanced to what is on disk now, so the same content is no longer
+	// drift — only a NEW external change is.
+	s.checkExternalChange(path, "let  a  =  1;\n")
+	if n := s.takeDriftNote(path); n != "" {
+		t.Errorf("already-reported drift reported again: %q", n)
+	}
+	s.checkExternalChange(path, "let a = 2;\n")
+	if n := s.takeDriftNote(path); n == "" {
+		t.Error("a second, distinct external change produced no note")
+	}
+
+	// Our own write settles the question: whatever the other writer did, we have
+	// just replaced it, so there is nothing left to warn about.
+	s.recordWrite(path, "let a = 3;\n")
+	s.checkExternalChange(path, "let a = 4;\n")
+	s.recordWrite(path, "let a = 5;\n")
+	if n := s.takeDriftNote(path); n != "" {
+		t.Errorf("pending note survived our own write: %q", n)
+	}
+}
+
+// TestDiagSourceStrikes pins the back-off that keeps a wedged diagnostics server
+// from charging every write diagTimeout for an answer it never gives.
+func TestDiagSourceStrikes(t *testing.T) {
+	s := &Session{}
+	if s.diagSourceOff("lsmcp") {
+		t.Fatal("a source is off before it has failed")
+	}
+	for i := 1; i < diagMaxStrikes; i++ {
+		if s.diagSourceFailed("lsmcp") {
+			t.Fatalf("gave up after %d failures, want %d", i, diagMaxStrikes)
+		}
+		if s.diagSourceOff("lsmcp") {
+			t.Fatalf("source off after %d failures, want %d", i, diagMaxStrikes)
+		}
+	}
+	if !s.diagSourceFailed("lsmcp") {
+		t.Fatalf("failure %d did not switch the source off", diagMaxStrikes)
+	}
+	if !s.diagSourceOff("lsmcp") {
+		t.Error("source not reported off after the cutoff")
+	}
+	// Reported exactly once, so the user is told once and not per write.
+	if s.diagSourceFailed("lsmcp") {
+		t.Error("switching off was reported twice")
+	}
+	// An unrelated server is unaffected, and an answer clears the strikes.
+	if s.diagSourceOff("gopls") {
+		t.Error("a different source was taken down with it")
+	}
+	s2 := &Session{}
+	s2.diagSourceFailed("gopls")
+	s2.diagSourceOK("gopls")
+	if s2.diagSourceFailed("gopls") || s2.diagSourceOff("gopls") {
+		t.Error("a successful answer did not reset the strike count")
+	}
+}

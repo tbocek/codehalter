@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"os"
@@ -295,6 +296,24 @@ type Session struct {
 	// Same lifecycle as readDedup: reset at the top of Prompt(). In-memory only.
 	editFailedPathsMu sync.Mutex
 	editFailedPaths   map[string]bool
+	// wroteHash is the hash of the bytes codehalter last wrote to each path, and
+	// drifted marks the paths a later read found different. Together they detect
+	// a file being rewritten by something outside this session between our write
+	// and the model's next look at it — an editor's format-on-save is the usual
+	// cause, and the symptom is an edit_file whose old_text was copied from a
+	// read that is no longer true. Unlike the dedup maps this is NOT reset per
+	// turn: the drift it catches routinely spans turns. In-memory only.
+	wroteMu   sync.Mutex
+	wroteHash map[string]string
+	drifted   map[string]bool
+	// diagStrikes counts consecutive failed diagnostics calls per source, and
+	// diagOff is the set that has given up for this session. A language server
+	// that times out answers no faster on the next write, and the write pays
+	// diagTimeout every time: one measured session spent 3.4 minutes on 33
+	// writes for a server that never answered once. In-memory only.
+	diagMu      sync.Mutex
+	diagStrikes map[string]int
+	diagOff     map[string]bool
 	// One turn per session. turnMu is held across the whole turn; a new prompt
 	// cancelTurn()s the in-flight one then Lock()s here, so turns never overlap
 	// (overlap raced compaction → two divergent context snapshots). turnCancel is
@@ -360,6 +379,13 @@ type Session struct {
 	// one-line notices / fix cards instead of re-dumping the whole setup
 	// screen mid-conversation. Not persisted — a restart re-shows it once.
 	capabilitiesShown bool `toml:"-"`
+	// formatCardShown gates the formatter-config card to once per session. Every
+	// other fix card re-offers each turn until its condition goes away, which is
+	// right for "a tool is missing" but wrong here: a project can legitimately
+	// want no formatter config, and asking again after every single turn would
+	// be pure nagging. Declining costs one card per session; `format_config =
+	// false` in settings.toml silences it for good. Not persisted.
+	formatCardShown bool `toml:"-"`
 
 	// Per-turn stats for the "✅ Done" line: reset at Prompt start, summed
 	// during the turn, read at the end. turnStart is wall-clock; turnHumanWaitMs
@@ -863,6 +889,99 @@ func (s *Session) clearEditFailed(path string) bool {
 		return true
 	}
 	return false
+}
+
+// externalChangeNote is the one-line warning handed to the model when a file it
+// is about to work on was rewritten behind us. It names the likely cause because
+// the model cannot see the editor: without it, one measured session spent three
+// and a half minutes writing python to work out why its edits stopped matching.
+const externalChangeNote = "\n\n[NOTE: this file changed on disk after codehalter wrote it — something outside this session rewrote it, and an editor's format-on-save is the usual cause. Any old_text you remember from before that write may no longer match; copy it from THIS read.]"
+
+// recordWrite remembers the exact bytes codehalter just wrote to path, which is
+// what a later read is compared against. Any pending drift note for the path is
+// dropped: we have just overwritten whatever the other writer did, so warning
+// about it would send the model looking for a difference that is gone.
+func (s *Session) recordWrite(path, content string) {
+	sum := sha256.Sum256([]byte(content))
+	s.wroteMu.Lock()
+	if s.wroteHash == nil {
+		s.wroteHash = map[string]string{}
+	}
+	s.wroteHash[path] = string(sum[:])
+	delete(s.drifted, path)
+	s.wroteMu.Unlock()
+}
+
+// checkExternalChange compares a fresh full read against the bytes we last wrote
+// to that path and, on a mismatch, arms a one-time note for takeDriftNote. The
+// stored hash is advanced to the content just read, so each distinct drift is
+// reported once rather than on every read until the next write.
+//
+// Paths codehalter never wrote are not tracked: a file changing before we have
+// touched it is not drift, it is just the file.
+func (s *Session) checkExternalChange(path, content string) {
+	sum := sha256.Sum256([]byte(content))
+	s.wroteMu.Lock()
+	defer s.wroteMu.Unlock()
+	prev, ok := s.wroteHash[path]
+	if !ok || prev == string(sum[:]) {
+		return
+	}
+	s.wroteHash[path] = string(sum[:])
+	if s.drifted == nil {
+		s.drifted = map[string]bool{}
+	}
+	s.drifted[path] = true
+}
+
+// takeDriftNote returns the pending external-change note for path, or "" when
+// there is none, and clears it. Tools append it to their own result so the
+// warning arrives attached to the content it is about.
+func (s *Session) takeDriftNote(path string) string {
+	s.wroteMu.Lock()
+	defer s.wroteMu.Unlock()
+	if !s.drifted[path] {
+		return ""
+	}
+	delete(s.drifted, path)
+	return externalChangeNote
+}
+
+// diagSourceOff reports whether this diagnostics source has given up for the
+// session (see diagSourceFailed).
+func (s *Session) diagSourceOff(name string) bool {
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+	return s.diagOff[name]
+}
+
+// diagSourceFailed records a diagnostics call that timed out or errored, and
+// reports whether that was the failure which switched the source off. A server
+// rejecting the call (isErr) is NOT a failure: "not a Go file" is a correct
+// answer, and disabling gopls over it would be wrong.
+func (s *Session) diagSourceFailed(name string) bool {
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+	if s.diagStrikes == nil {
+		s.diagStrikes = map[string]int{}
+	}
+	s.diagStrikes[name]++
+	if s.diagStrikes[name] < diagMaxStrikes || s.diagOff[name] {
+		return false
+	}
+	if s.diagOff == nil {
+		s.diagOff = map[string]bool{}
+	}
+	s.diagOff[name] = true
+	return true
+}
+
+// diagSourceOK clears the strike count after an answer arrives, so a single slow
+// call in an otherwise healthy server never accumulates toward the cutoff.
+func (s *Session) diagSourceOK(name string) {
+	s.diagMu.Lock()
+	defer s.diagMu.Unlock()
+	delete(s.diagStrikes, name)
 }
 
 // readContentInContext reports whether the exact bytes `content` are still

@@ -54,6 +54,12 @@ type Settings struct {
 	// diagnostics-capable MCP server is configured.
 	Diagnostics *bool `toml:"diagnostics,omitempty"`
 
+	// FormatConfig controls the setup card that offers to pin a formatter config
+	// for a project that has none (see formatterConfigNeeds). nil means on. Set
+	// it to false for a project that deliberately keeps no formatter config, so
+	// the card stops being offered at the start of every session.
+	FormatConfig *bool `toml:"format_config,omitempty"`
+
 	// UpdateCheck controls the once-a-day "a newer release exists" check
 	// against the GitHub releases API (see version.go). nil means on. Set it to
 	// false for a machine that should never reach github.com on its own, or for
