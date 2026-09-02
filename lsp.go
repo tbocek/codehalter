@@ -58,7 +58,14 @@ var diagSkipExts = map[string]bool{
 // and returns the text to append to the write's tool result, or "" when there
 // is nothing to say. Never returns an error: a diagnostics failure must not
 // turn a successful write into a failed tool call.
-func (a *agent) postWriteDiagnostics(ctx context.Context, sid, path string) string {
+//
+// Two sources, in order. An MCP bridge (gopls' own `gopls mcp`, or any
+// third-party one) answers for the files it claims. Otherwise codehalter speaks
+// LSP to the language server itself (lsp_client.go) — the path that needs no
+// bridge, no mcp.toml entry and no setup turn. content is the text just
+// written, which the LSP path sends as the open document rather than re-reading
+// the path.
+func (a *agent) postWriteDiagnostics(ctx context.Context, sid, path, content string) string {
 	if !a.diagnosticsEnabled() {
 		return ""
 	}
@@ -69,50 +76,64 @@ func (a *agent) postWriteDiagnostics(ctx context.Context, sid, path string) stri
 	if sess == nil {
 		return ""
 	}
-
-	client, tool, ok := a.findDiagnosticsTool(path)
-	if !ok {
-		return ""
-	}
-
 	rel, err := filepath.Rel(sess.Cwd, path)
 	if err != nil {
 		rel = path
 	}
-	args, ok := diagArgs(tool.InputSchema, path, rel, sess.Cwd)
-	if !ok {
-		// The server exposes a diagnostics tool whose schema has no argument we
-		// recognise as "the file". Log it rather than dropping it: this is how a
-		// new language-server bridge with an unfamiliar schema surfaces.
-		slog.Debug("diagnostics: no usable path argument in tool schema", "server", client.name, "tool", tool.Name)
-		return ""
-	}
-	raw, err := json.Marshal(args)
-	if err != nil {
-		slog.Debug("diagnostics: marshalling args failed", "tool", tool.Name, "err", err)
-		return ""
-	}
 
 	callCtx, cancel := context.WithTimeout(ctx, diagTimeout)
 	defer cancel()
-	out, isErr, err := client.callTool(callCtx, tool.Name, raw)
-	switch {
-	case err != nil:
-		slog.Debug("diagnostics: call failed", "server", client.name, "tool", tool.Name, "path", path, "err", err)
-		return ""
-	case isErr:
-		// The server rejected the call — commonly "not a Go file" when gopls is
-		// asked about something outside its languages. Expected, not a fault.
-		slog.Debug("diagnostics: server reported an error", "server", client.name, "tool", tool.Name, "path", path, "out", truncate(out, 200))
-		return ""
+
+	// who names the server in the note the model reads; source carries the extra
+	// detail (which tool answered) into the session log. out is the report.
+	var who, source, out string
+	// An MCP bridge that claims this file answers it, and its answer is final: a
+	// clean verdict from gopls about a .go file is not a reason to go looking for
+	// a second opinion. Everything it does not claim falls through to LSP.
+	if client, tool, ok := a.findDiagnosticsTool(path); ok {
+		args, ok := diagArgs(tool.InputSchema, path, rel, sess.Cwd)
+		if !ok {
+			// The server exposes a diagnostics tool whose schema has no argument we
+			// recognise as "the file". Log it rather than dropping it: this is how a
+			// new language-server bridge with an unfamiliar schema surfaces.
+			slog.Debug("diagnostics: no usable path argument in tool schema", "server", client.name, "tool", tool.Name)
+			return ""
+		}
+		raw, err := json.Marshal(args)
+		if err != nil {
+			slog.Debug("diagnostics: marshalling args failed", "tool", tool.Name, "err", err)
+			return ""
+		}
+		body, isErr, err := client.callTool(callCtx, tool.Name, raw)
+		switch {
+		case err != nil:
+			slog.Debug("diagnostics: call failed", "server", client.name, "tool", tool.Name, "path", path, "err", err)
+			return ""
+		case isErr:
+			// The server rejected the call — commonly "not a Go file" when gopls is
+			// asked about something outside its languages. Expected, not a fault.
+			slog.Debug("diagnostics: server reported an error", "server", client.name, "tool", tool.Name, "path", path, "out", truncate(body, 200))
+			return ""
+		}
+		if !diagHasFindings(body) {
+			return ""
+		}
+		who, source, out = client.name, client.name+"__"+tool.Name, body
+	} else if c, langID := a.clientFor(ctx, sess.Cwd, path); c != nil {
+		body, err := c.diagnose(callCtx, path, content, langID)
+		if err != nil {
+			slog.Debug("diagnostics: lsp call failed", "server", c.name, "path", path, "err", err)
+			return ""
+		}
+		who, source, out = c.name, c.name+" (lsp)", body
 	}
 
-	if !diagHasFindings(out) {
+	if strings.TrimSpace(out) == "" {
 		return ""
 	}
-	a.logSession(sid, "DIAGNOSTICS", "%s__%s on %s:\n%s", client.name, tool.Name, rel, out)
+	a.logSession(sid, "DIAGNOSTICS", "%s on %s:\n%s", source, rel, out)
 	return fmt.Sprintf("\n\n[%s reports on %s — these are from the file you just wrote, fix them before moving on]\n%s",
-		client.name, rel, truncate(strings.TrimSpace(out), diagMaxBytes))
+		who, rel, truncate(strings.TrimSpace(out), diagMaxBytes))
 }
 
 // diagnosticsEnabled reports the `diagnostics` settings key (default on).

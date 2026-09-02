@@ -1,16 +1,10 @@
 # codehalter bootstrap assisted
-FROM quay.io/archlinux/archlinux:base-devel
+FROM alpine:3.24
 
-RUN pacman -Syu --noconfirm --needed \
-        ca-certificates \
-        curl \
-        git \
-        openssh \
-        go \
-        gopls \
-        just \
-        firefox \
-    && rm -rf /var/cache/pacman/pkg/*
+RUN apk update && apk add --no-cache \
+        ca-certificates curl git sudo openssh-client gcompat \
+        bash shadow \
+        firefox-esr
 
 RUN groupadd --gid 1000 dev \
     && useradd --uid 1000 --gid 1000 -m -s /bin/bash -G wheel dev \
@@ -19,11 +13,9 @@ RUN groupadd --gid 1000 dev \
 
 USER dev
 WORKDIR /home/dev
-
 # install.sh installs to ~/.local/bin as the non-root dev user; put it on PATH.
 ENV PATH="/home/dev/.local/bin:${PATH}"
+# ADD re-fetches the tags JSON every build (via ETag): a new codehalter release
+# changes it and busts the cache below; otherwise the install layer stays cached.
+ADD https://api.github.com/repos/tbocek/codehalter/tags /tmp/.codehalter-tags.json
 RUN curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash
-
-RUN git clone https://aur.archlinux.org/yay.git /tmp/yay \
-    && cd /tmp/yay && makepkg -si --noconfirm \
-    && cd / && rm -rf /tmp/yay

@@ -138,6 +138,12 @@ type agent struct {
 	// needs; its mutex guards the whole group (see mcpState).
 	mcp mcpState
 
+	// lsp owns the language servers codehalter speaks LSP to directly for
+	// post-write diagnostics (lsp_client.go). Separate from mcp: these are
+	// started on demand by a write, not reconciled from a config file, and they
+	// expose no tools to the model.
+	lsp lspState
+
 	// abortReason is set by the bootstrap goroutine when codehalter must not
 	// run in this environment (today: started outside a devcontainer). Empty
 	// means proceed; non-empty causes Prompt to refuse with this message.

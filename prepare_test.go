@@ -202,11 +202,12 @@ func TestDetectFormatters(t *testing.T) {
 	}
 }
 
-// TestMcpServerConfigured pins lsmcp detection: no file / commented entry read
+// TestMcpServerConfigured pins detection of a wired MCP server (clangd is the
+// remaining card that gates on one): no file / commented entry read
 // as not-configured (so the setup card fires), an active entry as configured.
 func TestMcpServerConfigured(t *testing.T) {
 	dir := t.TempDir()
-	if mcpServerConfigured(dir, "lsmcp") {
+	if mcpServerConfigured(dir, "clangd") {
 		t.Error("no mcp.toml should be not-configured")
 	}
 	cfgDir := filepath.Join(dir, sessionDir)
@@ -215,18 +216,18 @@ func TestMcpServerConfigured(t *testing.T) {
 	}
 	mcpPath := filepath.Join(cfgDir, "mcp.toml")
 
-	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"lsmcp\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"clangd\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if mcpServerConfigured(dir, "lsmcp") {
-		t.Error("commented lsmcp should be not-configured")
+	if mcpServerConfigured(dir, "clangd") {
+		t.Error("commented clangd should be not-configured")
 	}
 
-	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"lsmcp\"\ncommand = \"npx\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"clangd\"\ncommand = \"npx\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if !mcpServerConfigured(dir, "lsmcp") {
-		t.Error("active lsmcp should be configured")
+	if !mcpServerConfigured(dir, "clangd") {
+		t.Error("active clangd should be configured")
 	}
 }
 

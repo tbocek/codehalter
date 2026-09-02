@@ -181,15 +181,15 @@ func TestPostWriteDiagnosticsSkips(t *testing.T) {
 	}
 	ctx := t.Context()
 
-	if got := a.postWriteDiagnostics(ctx, s.ID, "/w/proj/README.md"); got != "" {
+	if got := a.postWriteDiagnostics(ctx, s.ID, "/w/proj/README.md", "# doc"); got != "" {
 		t.Errorf("markdown got diagnostics: %q", got)
 	}
-	if got := a.postWriteDiagnostics(ctx, "no-such-session", "/w/proj/main.go"); got != "" {
+	if got := a.postWriteDiagnostics(ctx, "no-such-session", "/w/proj/main.go", "package main"); got != "" {
 		t.Errorf("unknown session got diagnostics: %q", got)
 	}
 	off := false
 	a.settings.Diagnostics = &off
-	if got := a.postWriteDiagnostics(ctx, s.ID, "/w/proj/main.go"); got != "" {
+	if got := a.postWriteDiagnostics(ctx, s.ID, "/w/proj/main.go", "package main"); got != "" {
 		t.Errorf("diagnostics=false still ran: %q", got)
 	}
 }

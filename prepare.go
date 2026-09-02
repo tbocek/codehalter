@@ -41,7 +41,12 @@ const (
 
 	cardSetupGopls = "- No code-intelligence MCP (gopls) wired, so the model navigates with search_text/read_file instead of go_definition/go_references. Install gopls if it's missing, then wire it per SKILL-go.md (\"gopls as MCP server\").\n"
 
-	cardSetupLsmcp = "- No code-intelligence MCP (lsmcp = gopls analog for JS/TS) configured. Set it up per SKILL-ts.md.\n"
+	// No mcp.toml half to this one: codehalter drives tsgo over LSP itself
+	// (lsp_client.go), so the binary being present IS the whole capability. That
+	// is also what keeps the card from re-firing forever — the old lsmcp card was
+	// gated on an mcp.toml entry the install step didn't write, so an already
+	// installed bridge asked to be set up again on every session open.
+	cardSetupTsgo = "- No `tsgo` in this TypeScript project, so writes to .ts files come back with no type errors reported. Install it as a devDependency per SKILL-ts.md. Nothing to wire afterwards: codehalter speaks LSP to it directly.\n"
 
 	cardSetupClangd = "- No code-intelligence MCP (clangd = gopls analog for C/C++) configured. Set it up per SKILL-c.md.\n"
 
@@ -782,11 +787,16 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 	if slices.Contains(stacks, "go") && !mcpMentionsServer(sess.Cwd, "gopls") {
 		want("set up gopls (Go code intelligence)", cardSetupGopls)
 	}
-	// JS/TS code-intelligence MCP (lsmcp), the gopls analog for JS/TS. Offer setup
-	// when a TS/JS project hasn't wired it. (Uses mcpServerConfigured, so it
-	// re-offers until wired, unlike gopls which respects a commented-out decline.)
-	if (slices.Contains(stacks, "ts") || slices.Contains(stacks, "js")) && !mcpServerConfigured(sess.Cwd, "lsmcp") {
-		want("set up lsmcp (JS/TS code intelligence)", cardSetupLsmcp)
+	// TypeScript diagnostics come from tsgo, spoken to directly over LSP, so the
+	// only thing that can be missing is the binary — and lspServerFor answering
+	// "" for a .ts file in a project that HAS a tsconfig means exactly that.
+	// Plain JS is deliberately not offered anything: with no tsconfig there is no
+	// project to type-check against, and offering setup there is what put a
+	// seven-minute install turn in front of a JS-only repo's first prompt.
+	if slices.Contains(stacks, "ts") && fileExists(sess.Cwd, "tsconfig.json") {
+		if name, _, _ := lspServerFor(sess.Cwd, "probe.ts"); name == "" {
+			want("install tsgo (TypeScript diagnostics)", cardSetupTsgo)
+		}
 	}
 	// C/C++ code-intelligence MCP (clangd), the gopls analog for C. Same shape as
 	// the lsmcp bullet above.
