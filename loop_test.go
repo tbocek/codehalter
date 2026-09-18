@@ -532,7 +532,7 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 // to disk — before the second LLM turn produces the final text.
 func TestToolLoopRecordsToolUses(t *testing.T) {
 	// Isolate from the package-level registry so the synthetic `respond` tool
-	// (registered in tool_respond.go init) isn't in scope — its presence would
+	// (registered in tool_phase_end.go init) isn't in scope — its presence would
 	// flip the loop's empty-tool-call branch from "exit with allText" to a
 	// nudge, which is a different code path tested elsewhere.
 	withFreshToolRegistry(t)

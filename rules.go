@@ -180,4 +180,3 @@ func asStreamRule(err error) *streamRuleError {
 	}
 	return nil
 }
-
