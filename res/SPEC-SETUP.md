@@ -18,6 +18,12 @@ The spec is READ-ONLY: codehalter refuses edits under `{{spec_dir}}/`. Read it f
 4. Check git: build output (for example `target/`) must be ignored, and sources, manifests and tests under `{{out_dir}}/` must NOT be. Verify with `git check-ignore -v <path>` and fix `.gitignore` where it is wrong.
 5. Write one smoke test that passes.
 6. Architecture, because every item will be checked by a test: keep behaviour (state, rules, data formats, flow steps) in plain testable code, and keep the UI layer thin, only rendering state and forwarding user actions. Logic inside a UI callback cannot be tested and will never count as done.
+7. If the target is a desktop GUI, make its screens visible from inside this container. There is no host display here, and there never will be: everything runs in the container.
+   - Install a virtual display (`xvfb-run`), fonts and an icon theme. Without fonts and icons, screenshots come out with empty boxes where text and icons belong. Persist the installs in `.devcontainer/Dockerfile`.
+   - Render without a GPU: set `GSK_RENDERER=cairo` for GTK 4 (the default GL renderer needs a graphics driver the container does not have).
+   - Add a snapshot entry point to the app: `--snapshot <screen> --project <fixture dir> --out <file.png>` builds the window in that screen's state from a fixture project, waits for the first frame, renders the window with the toolkit's own API (GTK 4: a `gtk::WidgetPaintable` of the window, rendered with its renderer's `render_texture`, then `save_to_png`), and exits. Name the screens after the spec's image files (`03-window`, `05-cut`, ...), so each image in the spec has a reproducible counterpart.
+   - Add a `snapshot` recipe to the `justfile` that runs it under `xvfb-run -a` with `GSK_RENDERER=cairo` and writes to `{{out_dir}}/shots/<screen>.png`.
+   - Prove it: render one screen, even if it is still empty, and look at it with `screenshot path={{out_dir}}/shots/<screen>.png`.
 
 ## When this round counts as done
 
