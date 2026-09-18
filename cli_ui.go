@@ -121,6 +121,15 @@ type cliUI struct {
 	promptBroken bool
 }
 
+// stdoutStyled reports whether stdout takes ANSI styling: a terminal, not
+// TERM=dumb, and NO_COLOR unset. Shared by the CLI's UI and the launcher's
+// notice, which prints before any UI exists.
+func stdoutStyled() bool {
+	fi, err := os.Stdout.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0 &&
+		os.Getenv("TERM") != "dumb" && os.Getenv("NO_COLOR") == ""
+}
+
 func newCLIUI() *cliUI {
 	u := &cliUI{
 		out:   bufio.NewWriter(os.Stdout),
@@ -129,9 +138,7 @@ func newCLIUI() *cliUI {
 		cols:  80,
 		rows:  24,
 	}
-	fi, err := os.Stdout.Stat()
-	u.tty = err == nil && fi.Mode()&os.ModeCharDevice != 0 &&
-		os.Getenv("TERM") != "dumb" && os.Getenv("NO_COLOR") == ""
+	u.tty = stdoutStyled()
 	in, err := os.Stdin.Stat()
 	u.echoInput = err != nil || in.Mode()&os.ModeCharDevice == 0
 	u.refreshSize()
@@ -493,15 +500,6 @@ func (u *cliUI) flushRow() {
 	if len(u.pend) > 0 {
 		u.endRow()
 	}
-}
-
-// Flush ends the current paragraph. Used before printing anything that is not
-// streamed text, so a card or a prompt never lands in the middle of a sentence.
-func (u *cliUI) Flush() {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.flushRow()
-	u.drawLive()
 }
 
 // ---------------------------------------------------------------------------

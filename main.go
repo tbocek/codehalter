@@ -848,12 +848,6 @@ func (a *agent) heartbeat(ctx context.Context, sid string) func() {
 	}
 }
 
-// sayThought is say for the model's reasoning channel, which clients render
-// collapsed/dimmed rather than as an answer.
-func (a *agent) sayThought(ctx context.Context, sid, text string) {
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: text}})
-}
-
 // sendUpdateAndAbort marks the session as do-not-run and emits the reason to
 // chat. Prompt reads a.abortReason under mu and fails every turn until the
 // process is restarted (inside a container).

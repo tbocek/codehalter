@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -182,11 +181,3 @@ func asStreamRule(err error) *streamRuleError {
 	return nil
 }
 
-// ruleRetryMessage is what actually goes into the retry as a user turn. The
-// partial generation was discarded, so the model must be told that — otherwise
-// a model that had already written half an answer tends to continue from where
-// it thinks it left off.
-func ruleRetryMessage(e *streamRuleError) string {
-	return strings.TrimSpace(e.Reminder) +
-		"\n\nYour previous response was cut off at that point and DISCARDED — none of it was applied and it is not part of this conversation. Start the response over."
-}

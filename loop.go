@@ -435,7 +435,7 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 // connection as execute and feeds the documenter the full conversation via
 // buildLLMContext, so it reuses execute's warm KV prefix (a cache hit, not a
 // cold prefill) and sees the actual edits — not a digest. Only the summariser
-// and git-commit drafter run on the background LLM.
+// runs on the background LLM.
 // DOCUMENT.md self-skips when no documentation update is warranted.
 func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopResult) (toolLoopResult, error) {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
@@ -839,7 +839,11 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llmMessage) (stri
 				// the model repeating itself.
 				a.say(ctx, sid, "\n⟲ Response went off-format and was discarded; re-asking.\n")
 			}
-			messages = a.addCorrective(sid, messages, ruleRetryMessage(sr))
+			// The partial generation was discarded, so the model must be told
+			// that — otherwise a model that had already written half an answer
+			// tends to continue from where it thinks it left off.
+			messages = a.addCorrective(sid, messages, strings.TrimSpace(sr.Reminder)+
+				"\n\nYour previous response was cut off at that point and DISCARDED — none of it was applied and it is not part of this conversation. Start the response over.")
 			continue
 		}
 		// Cap ladder: the generation died AT the requested max_tokens cap with
@@ -940,10 +944,6 @@ type repetitionTracker struct {
 	bag  map[string]map[string]bool
 }
 
-func newRepetitionTracker() *repetitionTracker {
-	return &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
-}
-
 // sawAgain records this call's output and reports whether it made no progress.
 func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 	key := tc.Function.Name + "\x00" + tc.Function.Arguments
@@ -982,6 +982,13 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 // tool ran with nothing on screen saying which command it was, and no ACP
 // tool-call update carries it either.
 func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
+	// The file tools already put everything on screen themselves: their ACP
+	// card is titled with the path and carries the diff (or the error). The
+	// JSON would show the same old/new text a second time, escaped onto one
+	// line, directly above it.
+	if tc.Function.Name == "edit_file" || tc.Function.Name == "write_file" {
+		return
+	}
 	shown := tc.Function.Arguments
 	var pretty bytes.Buffer
 	if json.Indent(&pretty, []byte(shown), "", "  ") == nil {
@@ -1022,7 +1029,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			})
 		}
 		think, flushThink = throttledStream(func(chunk string) {
-			a.sayThought(ctx, sid, chunk)
+			// The reasoning channel, which clients render collapsed/dimmed
+			// rather than as an answer.
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: chunk}})
 		})
 		flushStream = func() {
 			if flushOn != nil { // nil when stream=false: no text channel to flush
@@ -1066,7 +1075,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	// sampler at stuckEscalateRounds, bail at stuckBailRounds — and any
 	// productive round resets the streak, so read-after-write and genuine fan-out
 	// are never punished.
-	repeats := newRepetitionTracker()
+	repeats := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
 	var stuckRounds int
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool

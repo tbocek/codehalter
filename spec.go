@@ -707,7 +707,8 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 		primaryText = idx.textNoNav(primary.doc, primary.start, primary.end)
 	case specDefTableRow:
 		primary = specSection{doc: it.Doc, start: it.Line, end: it.Line + 1}
-		primaryText = idx.tableRow(it.Doc, it.Line)
+		// The row under its table's header, so the cells keep their column names.
+		primaryText = idx.tableHeader(it.Doc, it.Line) + idx.docs[it.Doc].lines[it.Line]
 	default:
 		primary = idx.paragraphAt(it.Doc, it.Line)
 		primaryText = idx.text(primary.doc, primary.start, primary.end)
@@ -841,12 +842,6 @@ func (idx *specIndex) headingItemsIn(text, self string) int {
 		}
 	}
 	return n
-}
-
-// tableRow returns a table row with the table's header above it, so the cells
-// keep their column names.
-func (idx *specIndex) tableRow(doc, line int) string {
-	return idx.tableHeader(doc, line) + idx.docs[doc].lines[line]
 }
 
 // tableHeader returns the header and separator rows of the table containing

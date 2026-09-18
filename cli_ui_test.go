@@ -61,7 +61,7 @@ func TestStreamKeepsBlankLines(t *testing.T) {
 	}
 }
 
-// A partial row is held back so more of that sentence can still arrive; Flush
+// A partial row is held back so more of that sentence can still arrive; flushUI
 // is what commits it.
 func TestStreamHoldsPartialRow(t *testing.T) {
 	u, buf := uiFor(false, 40, 24)
@@ -69,7 +69,7 @@ func TestStreamHoldsPartialRow(t *testing.T) {
 	if buf.String() != "" {
 		t.Fatalf("partial row was committed early: %q", buf.String())
 	}
-	u.Flush()
+	flushUI(u)
 	if want := "half a sentence\n"; buf.String() != want {
 		t.Errorf("got %q, want %q", buf.String(), want)
 	}
@@ -81,7 +81,7 @@ func TestStreamStyleChangeFlushes(t *testing.T) {
 	u, buf := uiFor(false, 40, 24)
 	u.Stream("", "", "visible")
 	u.Stream(ansiDim, "  ", "thinking")
-	u.Flush()
+	flushUI(u)
 	if want := "visible\n  thinking\n"; buf.String() != want {
 		t.Errorf("got %q, want %q", buf.String(), want)
 	}
@@ -371,7 +371,7 @@ func TestSanitizeRemovesCursorMoves(t *testing.T) {
 func TestStreamStripsEscapes(t *testing.T) {
 	u, buf := uiFor(true, 80, 24)
 	u.Stream("", "", "before \x1b[10Aafter\n")
-	u.Flush()
+	flushUI(u)
 	// The ESC is gone, so what was a cursor move is now just text.
 	if strings.Contains(buf.String(), "\x1b[10A") {
 		t.Errorf("model escape reached the terminal: %q", buf.String())
@@ -397,4 +397,13 @@ func TestCardTitleIsSanitized(t *testing.T) {
 	if got := u.calls["t1"].title; got != "run [1;1Hls" {
 		t.Errorf("title = %q", got)
 	}
+}
+
+// flushUI ends the current paragraph the way every non-streamed print does
+// internally (flushRow under the lock), so a test can look at a held-back row.
+func flushUI(u *cliUI) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.flushRow()
+	u.drawLive()
 }

@@ -516,7 +516,8 @@ func (d *devcontainerConfig) composeFile() ([]byte, error) {
 		// A workspaceFolder outside the mount is the one misconfiguration that
 		// fails quietly: docker creates a missing working directory, so the
 		// container starts and the agent finds an empty project.
-		if target, _ := m["target"].(string); !within(d.WorkspaceFolder, target) {
+		target, _ := m["target"].(string)
+		if rel, err := filepath.Rel(target, d.WorkspaceFolder); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return nil, fmt.Errorf("workspaceMount puts the project at %s, but workspaceFolder says %s, "+
 				"so the container would start in an empty directory", target, d.WorkspaceFolder)
 		}
@@ -749,12 +750,6 @@ func parseMount(spec string) (map[string]any, error) {
 func strs(v any) []string {
 	s, _ := v.([]string)
 	return s
-}
-
-// within reports whether path is dir or something under it.
-func within(path, dir string) bool {
-	rel, err := filepath.Rel(dir, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func orElse(v, fallback string) string {
@@ -996,8 +991,7 @@ func resolveContainerEnv(remoteEnv map[string]string, read func() ([]byte, error
 // because everything the agent edits lands there.
 func notice(rt, project string, cfg *devcontainerConfig, building bool) {
 	bold, dim, reset := ansiBold, ansiDim, ansiReset
-	fi, err := os.Stdout.Stat()
-	if err != nil || fi.Mode()&os.ModeCharDevice == 0 || os.Getenv("TERM") == "dumb" || os.Getenv("NO_COLOR") != "" {
+	if !stdoutStyled() {
 		bold, dim, reset = "", "", ""
 	}
 	from := cfg.Image

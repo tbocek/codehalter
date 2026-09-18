@@ -89,11 +89,19 @@ func runSetup() {
 	if !result.ModelKnown {
 		// Try a simple HTTP check to distinguish network vs model issues
 		endpoint := conn.endpoint("/v1/models")
-		req, _ := http.NewRequest("GET", endpoint, nil)
+		// Bounded: this request had no context and no timeout at all, so a
+		// server that accepts the connection and never answers hung setup.
+		checkCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(checkCtx, "GET", endpoint, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Invalid server URL %q: %v\n", endpoint, err)
+			os.Exit(1)
+		}
 		if apiKey != "" {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
-		resp, httpErr := http.DefaultClient.Do(req)
+		resp, httpErr := metaHTTPClient.Do(req)
 		if httpErr != nil {
 			fmt.Fprintf(os.Stderr, "Connection failed: %v\n", httpErr)
 			os.Exit(1)

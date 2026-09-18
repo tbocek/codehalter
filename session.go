@@ -1223,13 +1223,6 @@ func (s *Session) keepWindowStart(maxCompletedTokens int) int {
 	return keep
 }
 
-// resetTurnStart is called right after rotate() trims the message prefix: the
-// kept window now begins at index 0, so the in-flight turn does too. rotate
-// runs with no concurrent writer (see its doc), so this needs no extra lock.
-func (s *Session) resetTurnStart() {
-	s.turnStartIdx = 0
-}
-
 // UpsertLastAssistant sets the content of the trailing assistant message,
 // or appends a new one if the last message is not already an assistant turn.
 func (s *Session) UpsertLastAssistant(content string) {

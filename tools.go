@@ -348,10 +348,6 @@ func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (strin
 
 var toolCallCounter atomic.Uint64
 
-func nextToolCallID() string {
-	return fmt.Sprintf("tc_%d", toolCallCounter.Add(1))
-}
-
 // toolUseCounter assigns each recorded ToolUse a stable per-process handle so
 // view_output can address it later without re-running the original tool.
 // Process-global rather than session-scoped — search is already scoped to one
@@ -493,7 +489,7 @@ func TerminalContent(terminalId string) ToolCallContent {
 }
 
 func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []ToolCallLocation) string {
-	id := nextToolCallID()
+	id := fmt.Sprintf("tc_%d", toolCallCounter.Add(1))
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call",
 		ToolCallId: id,

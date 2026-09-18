@@ -203,26 +203,6 @@ func TestBuildDevcontainerJSON(t *testing.T) {
 	}
 }
 
-func TestHasGitFolder(t *testing.T) {
-	dir := t.TempDir()
-	if hasGitFolder(dir) {
-		t.Errorf("no .git → false")
-	}
-	if err := os.Mkdir(filepath.Join(dir, ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if !hasGitFolder(dir) {
-		t.Errorf(".git dir → true")
-	}
-	d2 := t.TempDir()
-	if err := os.WriteFile(filepath.Join(d2, ".git"), []byte("gitdir: ../x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if hasGitFolder(d2) {
-		t.Errorf(".git FILE (worktree link) must not count")
-	}
-}
-
 func TestHostSSHAgentAvailable(t *testing.T) {
 	t.Setenv("SSH_AUTH_SOCK", "")
 	if hostSSHAgentAvailable() {

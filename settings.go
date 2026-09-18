@@ -555,17 +555,6 @@ func (s *Settings) SubagentPinOrder() []PinSlot {
 	return out
 }
 
-// settingsLooksPlaceholder reports whether the loaded settings still hold the
-// skeleton's placeholder values. Lets renderLLMStatus print a clear "edit your
-// settings.toml" warning instead of a generic "unreachable" or "model not
-// loaded" one when the user hasn't filled them in yet.
-func settingsLooksPlaceholder(s Settings) bool {
-	if len(s.LLM) == 0 {
-		return false
-	}
-	return s.LLM[0].Model == "your-model-id"
-}
-
 // allConnections enumerates every distinct LLMConnection across the [[llm]]
 // list. Used by probeAllLLMs for the prepare-phase probe and by slash.go for
 // the /status summary. Returns clones safe to mutate.

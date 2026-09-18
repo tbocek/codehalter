@@ -35,25 +35,6 @@ type backgroundJob struct {
 	terminalId string
 }
 
-// bgScript wraps the model's command so the job keeps the two handles the model
-// already knows how to use: a log file it reads with `run_command: cat …` and a
-// pid it stops with `run_command: kill …`. Neither is available from an ACP
-// terminal — the client owns the process and only ever tells us a terminal id —
-// so the shell inside the terminal produces them instead.
-//
-// This works because the client's terminal and codehalter share a filesystem
-// (Zed's dev-container flow runs both inside the container), which is the same
-// assumption run_command makes when the model cats a file a command just wrote.
-//
-// `cmd &` then `$!` rather than `$$` + exec: for a simple command bash execs it
-// directly into the backgrounded child, so `$!` is the real process, and for a
-// compound one (`cd x && npm run dev`) it's the subshell — the same pid the
-// old exec.Command path recorded. `wait` keeps the shell alive so the terminal
-// exits when the job does, which is what the grace check reads.
-func bgScript(cmdStr, logPath, pidPath string) string {
-	return fmt.Sprintf("exec > %s 2>&1\n%s &\necho $! > %s\nwait $!", logPath, cmdStr, pidPath)
-}
-
 // nextBgID reserves the next sequential job id (used to name the log file before
 // the job is registered).
 func (a *agent) nextBgID() int {
@@ -152,7 +133,23 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.pid", id))
 	job := &backgroundJob{id: id, sid: sid, cmdStr: cmdStr, logPath: logPath, pidPath: pidPath}
 
-	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", bgScript(cmdStr, logPath, pidPath)}, sess.Cwd)
+	// bgScript wraps the model's command so the job keeps the two handles the model
+	// already knows how to use: a log file it reads with `run_command: cat …` and a
+	// pid it stops with `run_command: kill …`. Neither is available from an ACP
+	// terminal — the client owns the process and only ever tells us a terminal id —
+	// so the shell inside the terminal produces them instead.
+	//
+	// This works because the client's terminal and codehalter share a filesystem
+	// (Zed's dev-container flow runs both inside the container), which is the same
+	// assumption run_command makes when the model cats a file a command just wrote.
+	//
+	// `cmd &` then `$!` rather than `$$` + exec: for a simple command bash execs it
+	// directly into the backgrounded child, so `$!` is the real process, and for a
+	// compound one (`cd x && npm run dev`) it's the subshell — the same pid the
+	// old exec.Command path recorded. `wait` keeps the shell alive so the terminal
+	// exits when the job does, which is what the grace check reads.
+	script := fmt.Sprintf("exec > %s 2>&1\n%s &\necho $! > %s\nwait $!", logPath, cmdStr, pidPath)
+	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", script}, sess.Cwd)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return "error starting terminal: " + err.Error(), false

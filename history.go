@@ -105,7 +105,10 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 		a.say(ctx, sess.ID, "⚠ Compaction failed: "+err.Error()+"\n\n")
 		return false
 	}
-	sess.resetTurnStart()
+	// rotate() trimmed the message prefix: the kept window now begins at index
+	// 0, so the in-flight turn does too. rotate runs with no concurrent writer
+	// (see its doc), so this needs no lock.
+	sess.turnStartIdx = 0
 	// The fold rewrote the front of the context, so the next call legitimately
 	// re-reads almost everything. Drop the comparison point rather than report
 	// that as a cache fault.

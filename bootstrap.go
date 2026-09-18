@@ -77,7 +77,9 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	// source), so only ask when the source is present and only add what the user
 	// accepts. The chosen mounts apply when the user reopens in the container.
 	gitWritable, gitconfig := false, false
-	if hasGitFolder(cwd) {
+	// A .git DIRECTORY (a normal clone). A .git FILE (worktree/submodule link)
+	// doesn't count: the bind mount targets a dir.
+	if info, err := os.Stat(filepath.Join(cwd, ".git")); err == nil && info.IsDir() {
 		yes, gtc, gerr := a.askYesNoWithCard(ctx, sid, "Mount your repo's .git (writable) and ~/.gitconfig (when present) into the container, so git uses your real history and identity for commit/push?", "think", "Yes, mount", "No")
 		if gerr != nil {
 			a.FailToolCall(ctx, sid, gtc, gerr.Error())
@@ -199,13 +201,6 @@ func (a *agent) ensureTerminals(ctx context.Context, sid string) bool {
 		"builds, tests, and every run_command are unavailable. Use a client with ACP terminal support (Zed does), "+
 		"then start a new Agent Thread.")
 	return false
-}
-
-// hasGitFolder reports whether cwd has a .git directory (a normal clone). A .git
-// FILE (worktree/submodule link) doesn't count — the bind mount targets a dir.
-func hasGitFolder(cwd string) bool {
-	info, err := os.Stat(filepath.Join(cwd, ".git"))
-	return err == nil && info.IsDir()
 }
 
 // hostSSHAgentAvailable reports whether a host SSH agent is reachable: SSH_AUTH_SOCK

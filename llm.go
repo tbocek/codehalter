@@ -40,6 +40,22 @@ var llmHTTPClient = &http.Client{
 	},
 }
 
+// metaHTTPClient serves the short metadata requests: the LLM probes, the setup
+// check, the update check and download. Same dial and handshake bounds as
+// llmHTTPClient, so a dead route fails in seconds. No ResponseHeaderTimeout on
+// purpose: a llama.cpp router answers /props?model= only once the model is
+// loaded, which takes minutes, and the probe's own context bounds that wait.
+var metaHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
+
 // LLM message types for the OpenAI API.
 
 type llmMessage struct {
@@ -1113,7 +1129,7 @@ func probeGetJSON(ctx context.Context, conn *LLMConnection, path, who string, v 
 	if conn.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := metaHTTPClient.Do(req)
 	if err != nil {
 		slog.Info(who+": request failed", "url", url, "err", err)
 		return false

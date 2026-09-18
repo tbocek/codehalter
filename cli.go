@@ -277,10 +277,9 @@ type cliClient struct {
 	// so "no turn is running" is not enough to make the loop safe on its own.
 	askMu sync.Mutex
 
-	termMu   sync.Mutex
-	terms    map[string]*cliTerminal
-	termSeq  int
-	released bool
+	termMu  sync.Mutex
+	terms   map[string]*cliTerminal
+	termSeq int
 }
 
 func (c *cliClient) sessionID() string {

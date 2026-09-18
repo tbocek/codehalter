@@ -206,7 +206,9 @@ func (a *agent) findDiagnosticsTool(path string) (*MCPClient, mcpTool, bool) {
 			if !strings.Contains(strings.ToLower(t.Name), "diagnostic") {
 				continue
 			}
-			if want, ok := diagToolLangExt[langPrefix(t.Name)]; ok {
+			// The token before the first underscore: "go_diagnostics" → "go".
+			prefix, _, _ := strings.Cut(strings.ToLower(t.Name), "_")
+			if want, ok := diagToolLangExt[prefix]; ok {
 				// Language-specific tool: exact match wins immediately.
 				if want[ext] {
 					return c, t, true
@@ -222,15 +224,6 @@ func (a *agent) findDiagnosticsTool(path string) (*MCPClient, mcpTool, bool) {
 		return generic, genericTool, true
 	}
 	return nil, mcpTool{}, false
-}
-
-// langPrefix returns the token before the first underscore, lowercased —
-// "go_diagnostics" → "go". Used only to look up diagToolLangExt.
-func langPrefix(name string) string {
-	if i := strings.Index(name, "_"); i > 0 {
-		return strings.ToLower(name[:i])
-	}
-	return ""
 }
 
 // diagToolLangExt maps a language-specific diagnostics-tool prefix to the

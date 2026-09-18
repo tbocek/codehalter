@@ -153,10 +153,4 @@ func TestAsStreamRuleUnwraps(t *testing.T) {
 	if got := asStreamRule(errors.New("unrelated")); got != nil {
 		t.Errorf("asStreamRule(unrelated) = %v, want nil", got)
 	}
-	if !strings.Contains(ruleRetryMessage(base), "fix it") {
-		t.Error("retry message dropped the reminder")
-	}
-	if !strings.Contains(ruleRetryMessage(base), "DISCARDED") {
-		t.Error("retry message must tell the model the partial was thrown away")
-	}
 }

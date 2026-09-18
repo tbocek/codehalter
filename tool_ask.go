@@ -222,10 +222,6 @@ var unknownSessionBackoffs = []time.Duration{
 	128 * time.Millisecond,
 }
 
-func isUnknownSessionErr(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "unknown session")
-}
-
 func (a *AgentSideConnection) doPermissionRequest(ctx context.Context, r permissionRequest) (string, error) {
 	// Every interactive card blocks here waiting on the user; record that span
 	// so the turn's "✅ Done" line can exclude it from active time. (Auto-answer
@@ -248,7 +244,7 @@ func (a *AgentSideConnection) doPermissionRequest(ctx context.Context, r permiss
 	var err error
 	for attempt := 0; attempt <= len(unknownSessionBackoffs); attempt++ {
 		raw, err = a.sendRequest(ctx, "session/request_permission", r)
-		if err == nil || !isUnknownSessionErr(err) || attempt == len(unknownSessionBackoffs) {
+		if err == nil || !strings.Contains(err.Error(), "unknown session") || attempt == len(unknownSessionBackoffs) {
 			break
 		}
 		select {

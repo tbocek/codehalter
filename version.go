@@ -137,7 +137,7 @@ func latestRelease(ctx context.Context) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := metaHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -236,7 +236,7 @@ func selfUpdate(ctx context.Context, tag string) (string, error) {
 		tmp.Close()
 		return "", err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := metaHTTPClient.Do(req)
 	if err != nil {
 		tmp.Close()
 		return "", err

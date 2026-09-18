@@ -420,16 +420,6 @@ func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptRes
 	return PromptResponse{}, err
 }
 
-// stopReasonFor reports `cancelled` if the prompt's context was cancelled
-// (user hit Cancel in the client), else `end_turn`. ACP clients use the
-// stop reason to distinguish a clean turn from a user-initiated abort.
-func stopReasonFor(ctx context.Context) string {
-	if ctx.Err() != nil {
-		return "cancelled"
-	}
-	return "end_turn"
-}
-
 // sessionTitleMax is how many runes of the opening message become the thread
 // name. Long enough to keep a real sentence, short enough not to be elided by
 // the client's own thread list.
@@ -772,7 +762,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	slog.Debug("Prompt: draining pre-turn fix cards (post-turn)", "sid", req.SessionId, "fixes", len(pendingFixes))
 	a.drainFixes(ctx, req.SessionId, pendingFixes)
 
-	return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
+	// A turn whose ctx was cancelled along the way still returns normally here:
+	// the stop reason is how the client tells a clean turn from an abort.
+	if ctx.Err() != nil {
+		return PromptResponse{StopReason: "cancelled"}, nil
+	}
+	return PromptResponse{StopReason: "end_turn"}, nil
 }
 
 // runTurn drives one full turn through the single shared path: reset the

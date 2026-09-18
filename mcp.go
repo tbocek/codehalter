@@ -1283,7 +1283,11 @@ func (a *agent) askMCPImport(ctx context.Context, sid string, fresh []acpMCPServ
 	}
 	options := make([]map[string]any, 0, len(fresh))
 	for _, s := range fresh {
-		options = append(options, map[string]any{"const": s.Name, "title": s.Name + " — " + mcpSummary(s)})
+		summary := "stdio " + strings.TrimSpace(s.Command+" "+strings.Join(s.Args, " "))
+		if s.URL != "" {
+			summary = "http " + s.URL
+		}
+		options = append(options, map[string]any{"const": s.Name, "title": s.Name + " — " + summary})
 	}
 	raw, err := a.conn.sendRequest(ctx, "elicitation/create", map[string]any{
 		"sessionId": sid,
@@ -1342,15 +1346,6 @@ func mcpNameInFile(raw, name string) bool {
 		}
 	}
 	return false
-}
-
-// mcpSummary is the one-line "what is this" shown next to a server's name in
-// the form.
-func mcpSummary(s acpMCPServer) string {
-	if s.URL != "" {
-		return "http " + s.URL
-	}
-	return "stdio " + strings.TrimSpace(s.Command+" "+strings.Join(s.Args, " "))
 }
 
 // mcpTOMLEntry renders one server as a [[server]] block, optionally with every

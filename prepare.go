@@ -391,21 +391,24 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
 		return a.hasReachableLLM() && a.mainSlotTokens >= minSlotTokens
 	}
 	forceRetry := false
-	for attempt := 0; ; attempt++ {
-		if loaded, err := loadSettings(sess.Cwd); err == nil {
-			a.cfgMu.Lock()
+	// reload swaps in the settings on disk and reports whether a settings file
+	// exists at all. A file that fails to parse keeps the previous settings.
+	reload := func() bool {
+		loaded, err := loadSettings(sess.Cwd)
+		a.cfgMu.Lock()
+		defer a.cfgMu.Unlock()
+		if err == nil {
 			a.settings = loaded
 			a.buildConnSems()
-			a.cfgMu.Unlock()
+		} else {
+			slog.Warn("ensureLLM: keeping previous settings, reload failed", "err", err)
 		}
-		if a.settings.path == "" {
+		return a.settings.path != ""
+	}
+	for attempt := 0; ; attempt++ {
+		if !reload() {
 			a.scaffoldSettings(ctx, sess.Cwd, sid)
-			if loaded, err := loadSettings(sess.Cwd); err == nil {
-				a.cfgMu.Lock()
-				a.settings = loaded
-				a.buildConnSems()
-				a.cfgMu.Unlock()
-			}
+			reload()
 		}
 		currentHash := hashSettingsFiles(sess.Cwd)
 		if !forceRetry && currentHash != "" && currentHash == sess.llmHash && ready() {
@@ -613,7 +616,9 @@ func (a *agent) renderLLMStatus() string {
 		b.WriteString("🟡 LLM: no [[llm]] in settings.toml — codehalter cannot run until you add one.\n\n")
 		return b.String()
 	}
-	if settingsLooksPlaceholder(a.settings) {
+	// Still the skeleton's placeholder: say "edit your settings.toml" rather than
+	// a generic "unreachable" or "model not loaded".
+	if len(a.settings.LLM) > 0 && a.settings.LLM[0].Model == "your-model-id" {
 		fmt.Fprintf(&b, "🟡 LLM: %s still has the placeholder model \"your-model-id\". Edit it with your real url and model, then click Retry below.\n\n", a.settings.path)
 		return b.String()
 	}
