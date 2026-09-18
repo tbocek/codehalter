@@ -246,6 +246,7 @@ func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
 	cmds = append(cmds,
 		availableCommand{Name: "clean", Description: "Delete session log files from .codehalter/"},
 		availableCommand{Name: "settings", Description: "Show which settings.toml is in use and re-probe every configured model"},
+		availableCommand{Name: "spec", Description: "Implement a spec item by item until every requirement has a passing test: /spec <spec-dir> <out-dir> [technology]; /spec resumes; /spec status"},
 	)
 	for _, n := range names {
 		cmds = append(cmds, availableCommand{Name: n, Description: "Run the " + n + " prompt template"})

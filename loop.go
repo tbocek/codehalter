@@ -263,6 +263,16 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		}
 		a.say(ctx, sid, question)
 
+		// Inside a /spec loop under autopilot nobody is there to answer, and
+		// taking the first option would let the model settle an open point of the
+		// spec by itself. Park the question instead: the loop blocks the item
+		// with it and moves on (spec_loop.go).
+		if sess != nil && sess.specFence() != "" && a.isAutopilot() {
+			appendAssistantNote(sess, "Question parked for the user by the spec loop: "+question)
+			sess.saveOrLog()
+			return nil, toolUses, &specQuestionError{Question: question, Choices: plan.Choices}
+		}
+
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
 		choice, err := a.askChoiceAuto(ctx, sid, tcId, question, plan.Choices)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})

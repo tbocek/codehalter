@@ -29,6 +29,12 @@ var defaultSummariseMD string
 //go:embed res/RESUMMARISE.md
 var defaultResummariseMD string
 
+//go:embed res/SPEC.md
+var defaultSpecMD string
+
+//go:embed res/SPEC-SETUP.md
+var defaultSpecSetupMD string
+
 //go:embed res/Dockerfile.devcontainer.alpine
 var defaultDevcontainerDockerfileAlpine string
 
@@ -585,6 +591,8 @@ func (a *agent) initSession(cwd string, s *Session) error {
 		{"DOCUMENT.md", defaultDocumentMD},
 		{"SUMMARISE.md", defaultSummariseMD},
 		{"RESUMMARISE.md", defaultResummariseMD},
+		{"SPEC.md", defaultSpecMD},
+		{"SPEC-SETUP.md", defaultSpecSetupMD},
 	} {
 		path := filepath.Join(dir, f.name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {

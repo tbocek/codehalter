@@ -680,6 +680,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	if sess != nil {
 		macroCwd = sess.Cwd
 	}
+	// /spec runs a loop of whole turns rather than one: it owns the rest of this
+	// Prompt (spec_loop.go).
+	if name, args := splitMacro(userText); name == "spec" && sess != nil {
+		return a.runSpec(ctx, req.SessionId, sess, args, pendingFixes)
+	}
 	if rendered, stopMsg, handled := a.expandMacro(ctx, req.SessionId, macroCwd, userText); handled {
 		if stopMsg != "" {
 			a.say(ctx, req.SessionId, stopMsg+"\n")

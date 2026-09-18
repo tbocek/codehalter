@@ -588,6 +588,9 @@ func init() {
 		if err != nil {
 			return "error: " + err.Error(), false
 		}
+		if refusal := a.specFenceRefusal(sid, path); refusal != "" {
+			return refusal, true
+		}
 		newContent := args.str("content")
 		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
@@ -646,6 +649,9 @@ func init() {
 		path, err := a.resolvePath(sid, args.str("path"))
 		if err != nil {
 			return "error: " + err.Error(), false
+		}
+		if refusal := a.specFenceRefusal(sid, path); refusal != "" {
+			return refusal, true
 		}
 		oldText := args.str("old_text")
 		newText := args.str("new_text")

@@ -314,6 +314,10 @@ type Session struct {
 	diagMu      sync.Mutex
 	diagStrikes map[string]int
 	diagOff     map[string]bool
+	// specFenceDir is the spec directory a running /spec loop has made
+	// read-only for the file tools (spec_loop.go); "" when no loop runs.
+	specMu       sync.Mutex
+	specFenceDir string
 	// One turn per session. turnMu is held across the whole turn; a new prompt
 	// cancelTurn()s the in-flight one then Lock()s here, so turns never overlap
 	// (overlap raced compaction → two divergent context snapshots). turnCancel is
