@@ -585,7 +585,7 @@ func TestLLMStreamSurfacesInStreamError(t *testing.T) {
 
 // TestBackgroundSkipsDeadSummariser pins the two ways a dedicated summariser
 // stops being used: the startup probe could not reach it, or it has failed its
-// way through summaryMaxStrikes. Either way background work goes back to llm[0],
+// way through summaryMaxStrikes (until summaryCooldown has passed). Either way background work goes back to llm[0],
 // where a note still generates (and generates cheaply, as a prefix extension)
 // instead of every turn silently falling back to a raw transcript.
 func TestBackgroundSkipsDeadSummariser(t *testing.T) {
@@ -628,7 +628,14 @@ func TestBackgroundSkipsDeadSummariser(t *testing.T) {
 
 	a = newAgent()
 	a.summaryStrikes.Store(summaryMaxStrikes)
+	a.summaryStruckAt.Store(time.Now().UnixNano())
 	wantMain(t, a, "struck out")
+
+	// Struck out is not forever: after the cooldown it gets another call.
+	a = newAgent()
+	a.summaryStrikes.Store(summaryMaxStrikes)
+	a.summaryStruckAt.Store(time.Now().Add(-summaryCooldown - time.Second).UnixNano())
+	wantSummariser(t, a, "cooldown over")
 
 	a = newAgent()
 	a.summaryStrikes.Store(summaryMaxStrikes - 1)

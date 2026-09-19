@@ -454,7 +454,7 @@ const NoThinkPrefillContent = "<think>\n\n</think>\n\n"
 // same connSem. The original conn is untouched.
 //
 // This is how codehalter turns reasoning off for the "execute" role: the
-// executor and the documenter both call it, and so does the
+// executor and the documenter both call it, so do the summariser and the
 // tool loop's <think>-stall retry. The alternative levers both cost more than
 // they save. Qwen's /no_think text switch is unreliable (237 of 388 execute
 // responses carrying it reasoned anyway, over one 11.6h session), and

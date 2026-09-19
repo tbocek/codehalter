@@ -196,7 +196,8 @@ func (a *agent) scheduleSummaryFold(sess *Session, summary string) {
 		// thing that ever waits on it is a compaction that is nowhere near.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		out, _, _, err := a.llmStream(ctx, sess.ID, conn, []llm.Message{{
+		// Reasoning off, like the per-turn notes (see summariseCall).
+		out, _, _, err := a.llmStream(ctx, sess.ID, conn.WithThinkingDisabled(), []llm.Message{{
 			Role: "user", Content: prompt + "\n\n" + clipBytes(summary, maxLLMInputBytes),
 		}}, nil, nil, nil, nil)
 		out = strings.TrimSpace(out)
@@ -344,8 +345,13 @@ func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message
 // foreground's KV cache, and the next user turn then re-evaluates cold too.
 // The callers pair the tools with tool_choice="none" on the conn so the
 // summariser can't answer with a tool call.
+//
+// Reasoning is off. A note restates what the turn already says, and a thinking
+// model reasoned 5 to 20 KB before writing one: past the two-minute deadline on
+// a 27B, which cost the note and struck the summariser out. The closed think
+// block is a suffix, so the prefix-extension call still reuses the cache.
 func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *llm.Conn, msgs []llm.Message, tools []map[string]any, turn []Message) string {
-	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, tools, nil, nil, nil)
+	out, _, _, err := a.llmStream(ctx, sess.ID, conn.WithThinkingDisabled(), msgs, tools, nil, nil, nil)
 	// Whether this ran on a DEDICATED summariser, by endpoint rather than by
 	// Slot: connForBackgroundLLM stamps its llm[0] fallback with Slot 1 for the
 	// meter, so Slot alone would blame llm[0] for llm[0]'s own failures and take
@@ -367,6 +373,7 @@ func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *llm.Conn
 			// A dedicated summariser that keeps failing gets taken out of rotation
 			// by connForBackgroundLLM, which then generates notes on llm[0].
 			a.summaryStrikes.Add(1)
+			a.summaryStruckAt.Store(time.Now().UnixNano())
 		}
 		out = fallbackTurnNote(turn)
 	} else if dedicated {

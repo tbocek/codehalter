@@ -100,11 +100,13 @@ type agent struct {
 	connProbe map[string]llm.ProbeResult
 
 	// summaryStrikes counts consecutive failures of the dedicated summariser
-	// connection (purpose = "summary"). At summaryMaxStrikes, connForBackgroundLLM
-	// stops routing there for the rest of the run and the notes generate on llm[0]
-	// instead. Atomic, not under a.mu: it is written from the summarise goroutine
-	// and read from the turn path.
-	summaryStrikes atomic.Int32
+	// connection (purpose = "summary"), and summaryStruckAt is when the latest
+	// one happened (unix nanos). At summaryMaxStrikes, connForBackgroundLLM
+	// routes the notes to llm[0] until summaryCooldown has passed since that
+	// strike. Atomic, not under a.mu: written from the summarise goroutine, read
+	// from the turn path.
+	summaryStrikes  atomic.Int32
+	summaryStruckAt atomic.Int64
 
 	// ctkIgnored remembers which Server+Model has already been reported for
 	// accepting chat_template_kwargs and ignoring it, so the warning fires once

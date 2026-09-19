@@ -810,10 +810,17 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 			t.Errorf("summariser request missing %q; got:\n%s", want, wire)
 		}
 	}
-	last, _ := msgs[len(msgs)-1].(map[string]any)
+	// Reasoning off: the closed think block follows the instruction, and the
+	// server continues it. A note written after 20 KB of reasoning missed the
+	// deadline on a 27B.
+	prefill, _ := msgs[len(msgs)-1].(map[string]any)
+	if prefill["role"] != "assistant" || prefill["content"] != llm.NoThinkPrefillContent || req["continue_final_message"] != true {
+		t.Errorf("summariser should run with reasoning off (closed think block, continued), got last=%v continue=%v", prefill, req["continue_final_message"])
+	}
+	last, _ := msgs[len(msgs)-2].(map[string]any)
 	instr, _ := last["content"].(string)
 	if last["role"] != "user" || !strings.Contains(instr, "SUMMARISE PROMPT") {
-		t.Errorf("final message should be the SUMMARISE instruction, got role=%v content:\n%s", last["role"], instr)
+		t.Errorf("the SUMMARISE instruction should precede the prefill, got role=%v content:\n%s", last["role"], instr)
 	}
 	if !strings.Contains(instr, "please do the thing") {
 		t.Errorf("instruction should anchor the turn's opening user message, got:\n%s", instr)
@@ -1194,9 +1201,10 @@ func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// One pasted message, then the closed think block that turns reasoning off.
 	msgs, _ := mock.request(0)["messages"].([]any)
-	if len(msgs) != 1 {
-		t.Fatalf("paste mode should send one message, got %d", len(msgs))
+	if len(msgs) != 2 {
+		t.Fatalf("paste mode should send the paste plus the prefill, got %d messages", len(msgs))
 	}
 	m, _ := msgs[0].(map[string]any)
 	paste, _ := m["content"].(string)

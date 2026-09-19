@@ -501,11 +501,18 @@ func (a *agent) connForSession(_ context.Context, _ string, role string) *llm.Co
 }
 
 // summaryMaxStrikes is how many consecutive failures the dedicated summariser
-// connection gets before background notes move to llm[0] for the rest of the
-// run. Each failure costs that turn's note (summariseCall falls back to a
-// clipped raw transcript), so the threshold is low: two, enough to ride out a
-// single timeout, not enough to spend a session degrading every note.
+// connection gets before background notes move to llm[0] for summaryCooldown.
+// Each failure costs that turn's note (summariseCall falls back to a clipped
+// raw transcript), so the threshold is low: two, enough to ride out a single
+// timeout, not enough to spend a session degrading every note.
 const summaryMaxStrikes = 2
+
+// summaryCooldown is how long a struck-out summariser stays out of rotation
+// before it gets another call. It used to be the rest of the run, which retired
+// a summariser for 16 hours after two timeouts while the server was up the
+// whole time. A call that fails again renews the cooldown, so a server that
+// really is down costs one note per cooldown.
+const summaryCooldown = 10 * time.Minute
 
 // connForBackgroundLLM returns the connection to host background work (the
 // per-turn summariser). It walks the entries marked `purpose = "summary"` and
@@ -544,7 +551,8 @@ func (a *agent) connForBackgroundLLM() (*llm.Conn, bool) {
 			slog.Debug("background llm: summariser unreachable, using llm[0]", "server", a.settings.LLM[i].Server)
 			break
 		}
-		if a.summaryStrikes.Load() >= summaryMaxStrikes {
+		if a.summaryStrikes.Load() >= summaryMaxStrikes &&
+			time.Since(time.Unix(0, a.summaryStruckAt.Load())) < summaryCooldown {
 			break
 		}
 		if i < len(a.connSems) && a.connSems[i] != nil &&
