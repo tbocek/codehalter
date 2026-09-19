@@ -90,128 +90,6 @@ func TestEnsureSkillsPrunesVariantDir(t *testing.T) {
 	}
 }
 
-// TestArgTokens: string values inside JSON args split on whitespace and shed
-// shell punctuation, so paths surface from both structured fields and
-// run_command strings; non-JSON input degrades to a raw split. Exercises the
-// collectArgStrings → argTokens pair the way discloseSkills composes them.
-func TestArgTokens(t *testing.T) {
-	cases := []struct {
-		args string
-		want string // one token that must be present
-	}{
-		{`{"path":"cmd/main.go"}`, "cmd/main.go"},
-		{`{"command":"cat cmd/main.go && ls"}`, "cmd/main.go"},
-		{`{"command":"grep -r foo 'src/app.ts';"}`, "src/app.ts"},
-		{`{"nested":{"files":["a/b.c","d.h"]}}`, "a/b.c"},
-		{`not json at all Makefile here`, "Makefile"},
-	}
-	for _, c := range cases {
-		toks := argTokens(collectArgStrings(c.args))
-		found := false
-		for _, tok := range toks {
-			if tok == c.want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			t.Errorf("argTokens(collectArgStrings(%q)) = %v, want it to contain %q", c.args, toks, c.want)
-		}
-	}
-}
-
-// TestDeferredSkillTriggers walks the trigger table: each stack's touch signal
-// (path token or runner tool name) must map to exactly the expected skill.
-func TestDeferredSkillTriggers(t *testing.T) {
-	byName := map[string]deferredSkill{}
-	for _, d := range deferredSkills {
-		byName[d.name] = d
-	}
-	tokenCases := []struct {
-		tok  string
-		want string
-	}{
-		{"design/layout.css", "SKILL-layout.md"},
-		{"out/index.html", "SKILL-layout.md"},
-		{"justfile", "SKILL-justfile.md"},
-		{"sub/dir/Makefile", "SKILL-makefile.md"},
-		{"rules.mk", "SKILL-makefile.md"},
-	}
-	for _, c := range tokenCases {
-		var hits []string
-		for _, d := range deferredSkills {
-			if d.match != nil && d.match(c.tok) {
-				hits = append(hits, d.name)
-			}
-		}
-		if len(hits) != 1 || hits[0] != c.want {
-			t.Errorf("token %q matched %v, want exactly [%s]", c.tok, hits, c.want)
-		}
-	}
-	// Runner tool names imply their stack without any path token.
-	for tool, want := range map[string]string{
-		"just": "SKILL-justfile.md", "make": "SKILL-makefile.md",
-	} {
-		d, ok := byName[want]
-		if !ok {
-			t.Fatalf("skill %s missing from deferredSkills", want)
-		}
-		found := false
-		for _, tn := range d.tools {
-			if tn == tool {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("tool %q should trigger %s (tools: %v)", tool, want, d.tools)
-		}
-	}
-	// Source files of any language trigger nothing: there are no language skills.
-	for _, tok := range []string{"cmd/main.go", "src/app.ts", "src/lib.rs", "install.sh"} {
-		for _, d := range deferredSkills {
-			if d.match != nil && d.match(tok) {
-				t.Errorf("token %q triggered %s", tok, d.name)
-			}
-		}
-	}
-	// Never-deferred skills must stay off the table: they have no touch signal.
-	for _, name := range []string{"SKILL-base.md", "SKILL-arch.md"} {
-		if isDeferredSkill(name) {
-			t.Errorf("%s must not be deferred", name)
-		}
-	}
-}
-
-// TestLoadSkillsSkip: the skip filter drops exactly the named files while the
-// rest keep loading — the mechanism skills="auto" uses to withhold untouched
-// language skills from the system prompt.
-func TestLoadSkillsSkip(t *testing.T) {
-	cwd := t.TempDir()
-	dir := filepath.Join(cwd, ".codehalter")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for name, body := range map[string]string{
-		"SKILL-base.md": "base body",
-		"SKILL-go.md":   "go body",
-	} {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	all := loadSkills(cwd, nil)
-	if !strings.Contains(all, "base body") || !strings.Contains(all, "go body") {
-		t.Fatalf("nil skip should load everything, got %q", all)
-	}
-	filtered := loadSkills(cwd, func(name string) bool { return name == "SKILL-go.md" })
-	if strings.Contains(filtered, "go body") {
-		t.Errorf("SKILL-go.md should have been skipped, got %q", filtered)
-	}
-	if !strings.Contains(filtered, "base body") {
-		t.Errorf("SKILL-base.md should still load, got %q", filtered)
-	}
-}
-
 // TestExpandCmdPlaceholders pins the seed-time {{cmd:...}} templating: stdout
 // is spliced in trimmed, several placeholders on one line all expand, a
 // failing command leaves its placeholder verbatim (visible in the seeded file
@@ -261,7 +139,7 @@ func TestSkillCmdExpandsAtLoad(t *testing.T) {
 	if body := readSkillBody(dir, "SKILL-alpine.md"); !strings.Contains(body, "Base: Alpine Test, apk-tools 9.9.") {
 		t.Errorf("readSkillBody should expand:\n%s", body)
 	}
-	if all := loadSkills(dir, nil); !strings.Contains(all, "Base: Alpine Test, apk-tools 9.9.") {
+	if all := loadSkills(dir); !strings.Contains(all, "Base: Alpine Test, apk-tools 9.9.") {
 		t.Errorf("loadSkills should expand:\n%s", all)
 	}
 }
@@ -288,9 +166,9 @@ func TestLoadSkillsDeterministic(t *testing.T) {
 		}
 	}
 
-	first := loadSkills(dir, nil)
+	first := loadSkills(dir)
 	for i := 0; i < 5; i++ {
-		got := loadSkills(dir, nil)
+		got := loadSkills(dir)
 		if got != first {
 			t.Errorf("loadSkills run %d differs from run 0:\n  run 0: %q\n  run %d: %q", i, first, i, got)
 		}

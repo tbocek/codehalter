@@ -7,7 +7,7 @@ import (
 )
 
 // The terminal tools: the one call that ends a phase. submit_plan ends PLANNING,
-// respond ends execute and subagent runs. Neither has a side effect: what its
+// respond ends execute runs. Neither has a side effect: what its
 // Execute returns is handed up by the tool loop as the phase's result.
 
 // submitPlanToolName is the terminal tool for the PLANNING phase — the planner's
@@ -88,8 +88,8 @@ func init() {
 // (https://github.com/antoinezambelli/forge): exposing a `respond(message)`
 // tool keeps small local models inside the tool-calling grammar they're best
 // at, so the "should I emit prose or another tool call?" decision — which
-// 8B-class models reliably get wrong — never has to be made. The execute and
-// subagent phases include it; plan/verify/document exclude it (they emit
+// 8B-class models reliably get wrong — never has to be made. The execute
+// phase includes it; plan/verify/document exclude it (they emit
 // structured JSON or are one-shot text).
 const respondToolName = "respond"
 

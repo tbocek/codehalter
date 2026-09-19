@@ -52,7 +52,7 @@ func viewImageExecuteFallback(ctx context.Context, a *agent, sid string, rawArgs
 	}
 	// imagesSupported and we reached the fallback? The dispatcher should have
 	// intercepted. Surface that so the bug isn't silent.
-	return "view_image: internal — dispatch missed the intercept. Try again, or use view_output on a prior screenshotting tool if this persists.", true
+	return "view_image: internal — dispatch missed the intercept. Try again.", true
 }
 
 // dispatchViewImage parses view_image arguments, reads the file from the

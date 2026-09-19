@@ -80,7 +80,7 @@ type Message struct {
 	// ToolUse. Zero on user turns.
 	DurationMs int64 `toml:"duration_ms,omitempty"`
 	// Phase tags which pipeline stage produced this message: "plan",
-	// "execute", "verify", "document", or "subagent". Empty on user turns
+	// "execute", "verify" or "document". Empty on user turns
 	// and on legacy entries from before this field existed.
 	Phase string `toml:"phase,omitempty"`
 	// PromptTokens is the server-reported prompt_tokens of the call that produced
@@ -101,11 +101,8 @@ type ImageData struct {
 }
 
 type ToolUse struct {
-	// ID is a per-session stable handle ("tu_<n>") generated when the tool
-	// loop records the call. Surfaced in head/tail truncation hints so the
-	// model can call `view_output id=tu_N` to retrieve any portion of the
-	// full result without re-running the original tool. Empty for ToolUses
-	// loaded from older session files; view_output treats those as not found.
+	// ID is a per-process handle ("tu_<n>") generated when the tool loop
+	// records the call. Empty for ToolUses loaded from older session files.
 	ID string `toml:"id,omitempty"`
 	// CallID is the tool_call id the MODEL emitted (OpenAI linkage between the
 	// assistant's tool call and its result). It's what the live wire used, so we
@@ -157,8 +154,6 @@ type Session struct {
 	ID        string    `toml:"id"`
 	Cwd       string    `toml:"cwd"`
 	CreatedAt time.Time `toml:"created_at"`
-	Depth     int       `toml:"depth,omitempty"`
-	ParentID  string    `toml:"parent_id,omitempty"`
 	Summary   string    `toml:"summary,omitempty"`
 	// FoldedSummary is a shorter rewrite of Summary, produced in the background
 	// after a compaction (scheduleSummaryFold) and consumed as the BASE of the
@@ -212,15 +207,6 @@ type Session struct {
 	// must still render in full. Under phaseMu for the same reason as the fields
 	// above, it is written from the SSE read loop.
 	planTableShown bool
-	// launchedSubagents caches results of completed launch_subagent tasks,
-	// keyed by a hash of (instructions, context). When the model re-asks for
-	// an identical subagent (within or across launch_subagent tool calls in
-	// the same session), we return the prior result instead of running it
-	// again — small models forget what they already launched. Not persisted
-	// across process restarts: re-running after a restart re-launches, which
-	// is the safer default than feeding back a possibly-stale cached result.
-	launchedSubagentsMu sync.Mutex
-	launchedSubagents   map[string]string
 	// webBodies caches the full raw page text from web_read / web_read_raw,
 	// keyed by URL. When the LLM-visible result is truncated, the model can
 	// re-call with offset/limit to view a specific range — we slice from the
@@ -241,9 +227,9 @@ type Session struct {
 	// runs synchronously per session so contention is rare; the lock mainly
 	// exists for the background summariser path (which reads Messages while
 	// the foreground turn may be appending) and for the encoder invariant
-	// inside saveLocked. The phaseMu and launchedSubagentsMu fields above
-	// intentionally have their own locks — they don't touch persisted state
-	// and must not block on mu.
+	// inside saveLocked. The phaseMu field above
+	// intentionally has its own lock — it doesn't touch persisted state and
+	// must not block on mu.
 	mu sync.Mutex
 	// turnStartIdx is the index into Messages where the current top-level turn
 	// begins (set by markTurnStart at runTurn entry, after the human/card prompt
@@ -306,6 +292,11 @@ type Session struct {
 	wroteMu   sync.Mutex
 	wroteHash map[string]string
 	drifted   map[string]bool
+	// bgNotes queues the results of finished run_background jobs until a quiet
+	// point (see deliverBgNotesWhenIdle / flushBgNotes). In-memory only: the job
+	// died with the process that would have reported it.
+	bgNotesMu sync.Mutex
+	bgNotes   []bgNote
 	// specFenceDir is the spec directory a running /spec loop has made
 	// read-only for the file tools (spec_loop.go); "" when no loop runs.
 	specMu       sync.Mutex
@@ -327,28 +318,6 @@ type Session struct {
 	// as a user message (NOT folded into the prompt — that would bust the KV
 	// prefix cache) until the next compaction re-renders the prompt. Runtime-only.
 	promptSkills []string
-	// DisclosedSkills is the set of deferred SKILL-*.md filenames already
-	// injected into this session under skills="auto" (see discloseSkills). The
-	// system-prompt renderer keeps a deferred skill out of the prefix until it
-	// appears here. Persisted so a resumed session's rebuilt prompt still
-	// carries the skills its history already relies on.
-	DisclosedSkills []string `toml:"disclosed_skills,omitempty"`
-	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
-	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
-	// of role — cache-coherence trumps per-role sampler matching, the conn
-	// stays warm across the subagent's whole run instead of bouncing on every
-	// plan/execute switch. -1 means no pin (main session, tests).
-	// Breadth-first assigned at creation by launch_subagent: the first
-	// subagent in a batch pins to LLM[0], the rest fan out across LLM[1+]
-	// up to each conn's parallel cap.
-	PinnedLLMIdx int `toml:"pinned_llm_idx,omitempty"`
-	// DisplayLabel is the short human-readable name the runner uses when it
-	// surfaces this session's activity to its parent ("subagent 1",
-	// "subagent 2", …). Not persisted — purely a UI breadcrumb so the
-	// parent's chat can show what each subagent is doing tool-call by
-	// tool-call. Set by launch_subagent at creation; empty on main sessions
-	// (we don't forward main-session updates anywhere).
-	DisplayLabel string `toml:"-"`
 	// llmHash is hex sha256 of the concatenated global + project
 	// settings.toml contents at the time of the last successful LLM probe.
 	// ensureLLM short-circuits the probe when the current hash matches AND
@@ -666,27 +635,6 @@ func (s *Session) turnStats() turnReport {
 	}
 }
 
-// recallSubagent returns a prior result for the given task hash if one exists.
-func (s *Session) recallSubagent(hash string) (string, bool) {
-	s.launchedSubagentsMu.Lock()
-	defer s.launchedSubagentsMu.Unlock()
-	if s.launchedSubagents == nil {
-		return "", false
-	}
-	r, ok := s.launchedSubagents[hash]
-	return r, ok
-}
-
-// rememberSubagent caches the result of a successful subagent run.
-func (s *Session) rememberSubagent(hash, result string) {
-	s.launchedSubagentsMu.Lock()
-	defer s.launchedSubagentsMu.Unlock()
-	if s.launchedSubagents == nil {
-		s.launchedSubagents = make(map[string]string)
-	}
-	s.launchedSubagents[hash] = result
-}
-
 // recallWebBody returns a cached page body if the URL was fetched earlier in
 // this session. Lets range-style web_read calls slice from cache without
 // re-issuing the HTTP request.
@@ -803,32 +751,6 @@ func newSession(cwd string) (*Session, error) {
 	}, nil
 }
 
-func newSubagentSession(cwd string, parentID string, index, depth, pinnedLLMIdx int) *Session {
-	// Belt-and-suspenders: the parent session already created this dir. If it
-	// fails here the first saveLocked will surface it, but don't let the mkdir
-	// itself vanish.
-	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0755); err != nil {
-		slog.Warn("newSubagentSession: mkdir failed", "cwd", cwd, "err", err)
-	}
-	// Nanosecond suffix so sequential launch_subagent calls from the same
-	// parent don't collide on id (each call re-starts index at 0).
-	now := time.Now()
-	id := fmt.Sprintf("sub_%s_%d_%d", parentID, now.UnixNano(), index)
-	filename := fmt.Sprintf("session_%s.toml", id)
-	path := filepath.Join(cwd, sessionDir, filename)
-	s := &Session{
-		ID:           id,
-		Cwd:          cwd,
-		Depth:        depth,
-		ParentID:     parentID,
-		CreatedAt:    now,
-		filePath:     path,
-		PinnedLLMIdx: pinnedLLMIdx,
-	}
-	s.saveOrLog()
-	return s
-}
-
 func (s *Session) AddUser(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -943,6 +865,32 @@ func (s *Session) takeDriftNote(path string) string {
 	return externalChangeNote
 }
 
+// bgNote is one finished background job: a line for the user and the full
+// note (exit code, log path, log tail) for the model.
+type bgNote struct {
+	line, full string
+}
+
+func (s *Session) addBgNote(n bgNote) {
+	s.bgNotesMu.Lock()
+	s.bgNotes = append(s.bgNotes, n)
+	s.bgNotesMu.Unlock()
+}
+
+func (s *Session) hasBgNotes() bool {
+	s.bgNotesMu.Lock()
+	defer s.bgNotesMu.Unlock()
+	return len(s.bgNotes) > 0
+}
+
+func (s *Session) takeBgNotes() []bgNote {
+	s.bgNotesMu.Lock()
+	defer s.bgNotesMu.Unlock()
+	notes := s.bgNotes
+	s.bgNotes = nil
+	return notes
+}
+
 // readContentInContext reports whether the exact bytes `content` are still
 // present in the live message window as a prior read_file/continue_read result
 // the model can scroll back to. Compaction trims s.Messages, so an archived read
@@ -967,26 +915,6 @@ func (s *Session) readContentInContext(content string) bool {
 		}
 	}
 	return false
-}
-
-// FindToolUseOutput scans every message's tool uses for one matching id and
-// returns its Output. Used by view_output to re-serve the full output of any
-// prior tool call without re-running it. Returns "" when no match (older
-// session files that predate ToolUse.ID, or a hallucinated id).
-func (s *Session) FindToolUseOutput(id string) string {
-	if id == "" {
-		return ""
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.Messages {
-		for _, tu := range s.Messages[i].ToolUses {
-			if tu.ID == id {
-				return tu.Output
-			}
-		}
-	}
-	return ""
 }
 
 // enqueueSummarise appends a task to the summariser queue and starts the
@@ -1263,8 +1191,6 @@ func (s *Session) rotate(keep []Message, summary string) (string, error) {
 		ID:           archiveID,
 		Cwd:          s.Cwd,
 		CreatedAt:    s.CreatedAt,
-		Depth:        s.Depth,
-		ParentID:     s.ParentID,
 		Summary:      s.Summary,
 		SystemPrompt: s.SystemPrompt,
 		Messages:     s.Messages,
@@ -1317,8 +1243,8 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 		if !strings.HasPrefix(e.Name(), "session_") || !strings.HasSuffix(e.Name(), ".toml") {
 			continue
 		}
-		// Skip subagent and post-rotation archive sessions — both live on
-		// disk for inspection but should not clutter the picker.
+		// Skip post-rotation archives (and subagent sessions an older
+		// codehalter left behind): on disk for inspection, not for the picker.
 		if strings.HasPrefix(e.Name(), "session_sub_") ||
 			strings.HasPrefix(e.Name(), "session_archive_") {
 			continue

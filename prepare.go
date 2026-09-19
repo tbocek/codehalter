@@ -323,7 +323,7 @@ const minSlotTokens = 32 * 1024
 // outside the file).
 //
 // There is no Abort: codehalter cannot function without an LLM. In auto-
-// answer modes (autopilot, subagents) we cap retries at 3 to avoid
+// answer mode (autopilot) we cap retries at 3 to avoid
 // spinning forever — those callers handle "no LLM" gracefully via
 // connForSession.
 func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
@@ -498,7 +498,7 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	})
 	// Record reachability and auto-detect the slot count: when an [[llm]] left
 	// `parallel` unset, adopt llama.cpp's reported total_slots (-np) so connSems,
-	// the summariser's separate-slot gate, and subagent pinning all
+	// and the summariser's separate-slot gate both
 	// see real server capacity without the user declaring it. An explicit
 	// `parallel` always wins. Re-detected each probe — ensureLLM reloads settings
 	// (resetting Parallel to the file value) right before calling us.
@@ -729,13 +729,6 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 	} else if sp != sess.SystemPrompt {
 		for _, name := range skillFiles(sess.Cwd) {
 			if slices.Contains(sess.promptSkills, name) {
-				continue
-			}
-			// skills="auto": a deferred skill seeded mid-session is NOT injected
-			// here — discloseSkills puts it on the wire the first time a tool
-			// call touches its stack. (Once disclosed it's in promptSkills, so
-			// the Contains above already skips it.)
-			if a.skillsAuto() && isDeferredSkill(name) {
 				continue
 			}
 			if body := readSkillBody(sess.Cwd, name); body != "" {

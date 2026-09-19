@@ -327,7 +327,7 @@ const noThinkPrefillContent = "<think>\n\n</think>\n\n"
 // same connSem. The original conn is untouched.
 //
 // This is how codehalter turns reasoning off for the "execute" role: the
-// executor, the documenter and a leaf subagent all call it, and so does the
+// executor and the documenter both call it, and so does the
 // tool loop's <think>-stall retry. The alternative levers both cost more than
 // they save. Qwen's /no_think text switch is unreliable (237 of 388 execute
 // responses carrying it reasoned anyway, over one 11.6h session), and
@@ -859,8 +859,8 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 
 	// Per-conn concurrency gate: cap in-flight calls to this conn at its
 	// configured `parallel`. The token is held only for this call (released on
-	// return), not a subagent's lifetime — so between calls the conn frees up,
-	// and pool size 1 serialises without deadlocking nested subagents; the wait
+	// return), so between calls the conn frees up and a background call (the
+	// summariser) can take its turn on a pool of size 1; the wait
 	// shows as "(queued…)". Find the conn's semaphore index by matching
 	// server+model; -1 (test mocks / probes not in settings.LLM) means "no gate,
 	// dispatch directly".
@@ -1238,25 +1238,13 @@ func (a *agent) probeViaProps(ctx context.Context, conn *LLMConnection, path str
 	return r, true
 }
 
-// connForSession resolves the connection for the session and role. The main
-// session always uses LLM[0] — its KV cache owns the parent's conversation
-// prefix. Subagent sessions carry a PinnedLLMIdx assigned at launch by
-// launch_subagent; every call from that session routes back to the same
-// entry so the conn's prefix cache stays warm across plan/execute switches.
-// Concurrency is enforced by per-conn semaphores in llmStream; this picker
-// just resolves the routing target.
-func (a *agent) connForSession(_ context.Context, sid string, role string) *LLMConnection {
-	// Resolve the session under a.mu (getSession) BEFORE taking cfgMu, so cfgMu
-	// stays a strict leaf. Then read settings under RLock; ConnAt/MainLLM return
-	// value copies, safe to use after the lock is released.
-	sess := a.getSession(sid)
+// connForSession resolves the connection for the role. Every session runs on
+// LLM[0], whose KV cache owns the conversation prefix. Concurrency is enforced
+// by per-conn semaphores in llmStream; MainLLM returns a value copy, safe to use
+// after the lock is released.
+func (a *agent) connForSession(_ context.Context, _ string, role string) *LLMConnection {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
-	if sess != nil && sess.Depth > 0 && sess.PinnedLLMIdx >= 0 {
-		if c := a.settings.ConnAt(sess.PinnedLLMIdx, role); c != nil {
-			return c
-		}
-	}
 	return a.settings.MainLLM(role)
 }
 

@@ -105,12 +105,12 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// arguments are the structured plan. Keeping respond out forces the planner
 	// onto submit_plan instead of escaping into execute's exit and emitting a
 	// free-text answer with no plan attached.
-	// Read-only planning, enforced at dispatch: edit_file/write_file/launch_subagent
-	// are denied (planner edits leak into history; launch_subagent fans them to a
-	// leaf worker). `sed -i` is unblockable here — PLAN.md forbids it in prose.
+	// Read-only planning, enforced at dispatch: edit_file/write_file are denied
+	// (planner edits leak into history). `sed -i` is unblockable here — PLAN.md
+	// forbids it in prose.
 	// Terminals: submit_plan (the plan) or respond (a direct answer, no work).
 	policy := phasePolicy{
-		deny:      map[string]bool{"write_file": true, "edit_file": true, "launch_subagent": true},
+		deny:      map[string]bool{"write_file": true, "edit_file": true},
 		terminals: map[string]bool{submitPlanToolName: true, respondToolName: true},
 	}
 
@@ -561,8 +561,8 @@ func throttledStream(emit func(string)) (sink func(string), flush func()) {
 // concluding the loop is stuck and bouncing it to a replan — where
 // web_search/web_read and a fresh decomposition are available, unlike this
 // web-blind execute loop. maxToolLoopIterations stays above it as the absolute
-// runaway backstop (and still solely governs the plan/subagent loops, which
-// pass no cap). Small fail budget + larger maxReplans deliberately shifts work
+// runaway backstop (and still solely governs the plan loop, which
+// passes no cap). Small fail budget + larger maxReplans deliberately shifts work
 // from one web-blind loop toward more web-capable replan rounds.
 const executeFailCap = 8
 
@@ -615,7 +615,7 @@ type toolLoopResult struct {
 // repeat. When stream is true the model's text/reasoning tokens are forwarded to
 // the UI live (execute / document phases); the planner's internal JSON pass
 // passes false so its tokens stay silent. The phase tag ("plan"/"execute"/
-// "document"/"subagent") and cumulative llmStream wall-clock are stamped onto
+// "document") and cumulative llmStream wall-clock are stamped onto
 // the trailing assistant message via MarkLastAssistantTiming, so session.toml
 // records who ran the turn and how much time was generation vs tool execution.
 //
@@ -632,9 +632,8 @@ type toolLoopResult struct {
 // that lands in the session but not the snapshot (the b/c re-read bug).
 // corrective carries a caller's retry turn (a nudge, a "call submit_plan"
 // retry). It is STORED before the rebuild instead of appended after it, for the
-// reason addCorrective gives. Every phase uses this; only the subagent — which
-// seeds from its PARENT's session for cache warmth — calls runToolLoopSeeded
-// directly.
+// reason addCorrective gives. Every phase uses this; runToolLoopSeeded is the
+// loop itself, taking the context explicitly.
 func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, policy phasePolicy, phase string, stream bool, failSoftCap int, corrective ...string) (toolLoopResult, error) {
 	var messages []llmMessage
 	if sess := a.getSession(sid); sess != nil {
@@ -682,8 +681,7 @@ func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []
 }
 
 // startToolMeter shows "(running run_command go build ./...… 12s)" for as long
-// as a tool runs, so a slow tool or a subagent's tool call reads as busy rather
-// than frozen. For a subagent session setStatus folds it into the parent's row.
+// as a tool runs, so a slow tool reads as busy rather than frozen.
 //
 // The tool name alone doesn't answer the question the row raises: "run_command"
 // sitting at 77s says something is slow but not WHAT, and the arguments are only
@@ -909,7 +907,7 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llmMessage) (stri
 			break
 		}
 		s := a.getSession(sid)
-		if s == nil || s.Depth != 0 {
+		if s == nil {
 			break
 		}
 		// Advance through fold steps until one frees something.
@@ -988,11 +986,10 @@ func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 	// diff, submit_plan streams as a table and respond's message is the reply.
 	// The JSON would repeat that, escaped onto one line, directly above it. It
 	// is kept only where nothing else shows the arguments: an MCP tool's card
-	// carries just its name, launch_subagent's just a count, and these few open
-	// no card at all.
+	// carries just its name, and these few open no card at all.
 	switch name := tc.Function.Name; {
-	case strings.Contains(name, "__"), name == "launch_subagent",
-		name == "view_output", name == "view_image", name == "session_insights":
+	case strings.Contains(name, "__"),
+		name == "view_image", name == "session_insights":
 	default:
 		return
 	}
@@ -1015,10 +1012,10 @@ func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 	a.say(ctx, sid, fmt.Sprintf("\n**%s**\n%sjson\n%s\n%s\n", tc.Function.Name, fence, shown, fence))
 }
 
-// runToolLoopSeeded runs the agentic loop with an EXPLICIT initial context. Only
-// the subagent uses it (it seeds from the parent's context, not its own session);
-// single-use, so the stale-snapshot risk runToolLoop removes doesn't apply. The
-// failSoftCap / loop-exit semantics in the doc above apply here too.
+// runToolLoopSeeded runs the agentic loop with an EXPLICIT initial context.
+// runToolLoop is its one production caller (tests drive it directly with a
+// hand-built context). The failSoftCap / loop-exit semantics in the doc above
+// apply here too.
 func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
 	// `stream` gates the TEXT channel only. Reasoning always streams when there
 	// is a session to stream to: it is the sole live signal during a long call,
@@ -1184,13 +1181,6 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		roundStuck := len(calls) > 0
 
 		for _, tc := range calls {
-			// Subagent sessions don't surface their own UI (Zed doesn't know
-			// their sid), so forward a one-liner to the parent before each
-			// tool call. Gives the user a live feed of what each subagent is
-			// up to instead of just "Starting…" → 5 minutes → "Done".
-			if sess := a.getSession(sid); sess != nil && sess.ParentID != "" && sess.DisplayLabel != "" {
-				a.say(ctx, sess.ParentID, fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80)))
-			}
 			// Terminal tools are skipped because their payload is already
 			// rendered: submit_plan as the streamed table, respond as the turn's
 			// own text.
@@ -1200,19 +1190,11 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 
 			// Live status while the tool runs (the tool-side counterpart of the LLM
 			// meter in llmStream): "(running web_search… 12s)" ticks so a long tool or a
-			// subagent's tool call shows liveness instead of a frozen row.
-			// launch_subagent is excluded: its subagents fold their OWN meters into
-			// this same parent row (setSubagentStatus), so a ticker here would fight
-			// them; a one-time marker holds until they take over.
-			var stopMeter func()
-			if tc.Function.Name == "launch_subagent" {
-				a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
-			} else {
-				stopMeter = a.startToolMeter(ctx, sid, tc)
-			}
+			// tool shows liveness instead of a frozen row.
+			stopMeter := a.startToolMeter(ctx, sid, tc)
 
 			// runToolCall (tools.go) executes the tool, caches its full output
-			// for view_output, and hands back the model-visible content (the
+			// in the session, and hands back the model-visible content (the
 			// output truncated past truncateThreshold, or inline image parts).
 			// A tool the phase policy forbids is rejected here WITHOUT executing —
 			// the rejection is recorded so the model sees why and corrects.
@@ -1250,15 +1232,6 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				Content:    content,
 				ToolCallID: tc.ID,
 			})
-		}
-
-		// skills="auto": if this batch touched a stack whose deferred SKILL
-		// isn't in context yet, put it on the wire now — appended after the
-		// batch's tool results, so the cached prefix is untouched — and let
-		// discloseSkills persist it for rebuilds and the next compaction's
-		// prompt re-render.
-		for _, body := range a.discloseSkills(sid, calls) {
-			messages = append(messages, llmMessage{Role: "user", Content: body})
 		}
 
 		// Terminal tool called: stream the message to the UI as one chunk

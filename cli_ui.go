@@ -55,7 +55,7 @@ const (
 	// under its card. Enough to see a build moving, short enough that three
 	// concurrent commands still fit.
 	cliTermTail = 3
-	// cliMaxCards caps the in-flight card list so a fan-out of subagent tools
+	// cliMaxCards caps the in-flight card list so a burst of tool calls
 	// can't push the status line off the screen.
 	cliMaxCards = 6
 	// cliDiffLines caps each side of a rendered diff hunk.

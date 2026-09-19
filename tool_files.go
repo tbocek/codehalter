@@ -726,17 +726,15 @@ func init() {
 
 // fsRead reads a text file. For top-level sessions known to the ACP client
 // (Zed), the call goes over the wire so the editor can render diffs and
-// honour unsaved buffer state. Subagent sessions were never announced to
-// Zed (newSubagentSession just mints an id locally), so an ACP read would
-// hit -32603 Internal error — we fall back to direct disk I/O for them.
-// A client that did not advertise fs.readTextFile takes the same fallback:
-// ACP forbids sending it a method it never claimed to implement.
+// honour unsaved buffer state. A client that did not advertise
+// fs.readTextFile gets direct disk I/O instead: ACP forbids sending it a
+// method it never claimed to implement.
 // line/limit are optional: pass nil for both to read the whole file, or
 // non-nil pointers to bound the response to a 1-indexed line window.
 func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit *int) (string, error) {
 	sess := a.getSession(sid)
 	content, err := func() (string, error) {
-		if (sess != nil && sess.Depth > 0) || !a.clientCan("read") {
+		if !a.clientCan("read") {
 			return directRead(path, line, limit)
 		}
 		raw, err := a.conn.sendRequest(ctx, "fs/read_text_file", struct {
@@ -767,9 +765,8 @@ func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit 
 	return content, err
 }
 
-// fsWrite writes a text file. Same subagent and capability fallbacks as
-// fsRead — Zed has no record of a sub_* session id, so ACP writes are dead
-// and we go straight to disk. Any cached read-dedup entries for this path
+// fsWrite writes a text file, with the same capability fallback as fsRead.
+// Any cached read-dedup entries for this path
 // are dropped here because the file just changed — a subsequent read_file
 // must run. That invalidation happens before either fallback, so it holds
 // for every path through this function.
@@ -789,7 +786,6 @@ func fsWrite(a *agent, ctx context.Context, sid string, path, content string) er
 		sess.readCursorMu.Lock()
 		delete(sess.readCursor, path)
 		sess.readCursorMu.Unlock()
-		direct = direct || sess.Depth > 0
 	}
 	var err error
 	if direct {
@@ -810,7 +806,7 @@ func fsWrite(a *agent, ctx context.Context, sid string, path, content string) er
 	return err
 }
 
-// directRead is the subagent-path equivalent of an ACP fs/read_text_file:
+// directRead is the disk equivalent of an ACP fs/read_text_file:
 // reads the file from disk and applies the 1-indexed line/limit window so
 // the returned slice matches the shape the ACP path would have produced.
 // SplitAfter keeps trailing newlines on each line so the join is lossless.

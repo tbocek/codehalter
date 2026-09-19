@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -271,14 +270,6 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 	if sess == nil {
 		return
 	}
-	// Subagents own no phase row (Zed only knows the parent sid), so fold their
-	// live meter into the PARENT's in-progress row instead of letting sendUpdate
-	// drop it. Intercept before the phaseActive gate below: an execute-mode
-	// subagent runs no phase of its own, yet its parent is mid-"Working".
-	if sess.ParentID != "" {
-		a.setSubagentStatus(ctx, sess.ParentID, sid, sess.DisplayLabel, suffix)
-		return
-	}
 	sess.phaseMu.Lock()
 	active := sess.phaseActive
 	phase := sess.phaseCurrent
@@ -320,61 +311,6 @@ func (a *agent) startStatusMeter(ctx context.Context, sid string, render func() 
 		}
 	}()
 	return func() { close(done); <-stopped }
-}
-
-// setSubagentStatus records (suffix non-empty) or clears (suffix empty) one
-// subagent's live meter under its parent, then re-renders the parent's
-// in-progress row as a compact " (labelA …metersA · labelB …metersB)" join of
-// every active subagent. This is what surfaces a subagent's ↑sent / ↓tokens /
-// elapsed in Zed's "Current: Working (…)" status — N parallel subagents each
-// keep their own fragment instead of clobbering a single row. Called from
-// concurrent subagent goroutines, so the map is mutex-guarded; the parent
-// sendUpdate it ends in already runs concurrently today (loop.go breadcrumbs).
-// Returns the rendered aggregate (the suffix handed to the parent's setStatus)
-// so the folding is observable in tests, mirroring phaseEntries' compute-and-
-// return shape; production callers ignore it.
-func (a *agent) setSubagentStatus(ctx context.Context, parentSid, subSid, label, suffix string) string {
-	if label == "" {
-		label = "sub"
-	}
-	a.subagentMeterMu.Lock()
-	if a.subagentMeter == nil {
-		a.subagentMeter = map[string]map[string]string{}
-	}
-	subs := a.subagentMeter[parentSid]
-	if subs == nil {
-		subs = map[string]string{}
-		a.subagentMeter[parentSid] = subs
-	}
-	// suffix is the meter fragment " (llm[0] ↑12kb ↓1.2k…)" / " (running read_file…)".
-	// Strip its outer " ( … )" framing (and the redundant "llm[slot] " prefix the
-	// meter adds — the label already names the slot) so the join reads cleanly.
-	if inner := strings.Trim(strings.TrimSpace(suffix), "()"); inner == "" {
-		delete(subs, subSid)
-	} else {
-		if rest, ok := strings.CutPrefix(inner, "llm["); ok {
-			if i := strings.IndexByte(rest, ']'); i >= 0 {
-				inner = strings.TrimPrefix(rest[i+1:], " ")
-			}
-		}
-		subs[subSid] = label + " " + inner
-	}
-	parts := make([]string, 0, len(subs))
-	for _, v := range subs {
-		parts = append(parts, v)
-	}
-	if len(subs) == 0 {
-		delete(a.subagentMeter, parentSid)
-	}
-	a.subagentMeterMu.Unlock()
-
-	sort.Strings(parts) // stable order so the row doesn't reshuffle each tick
-	agg := ""
-	if len(parts) > 0 {
-		agg = " (" + strings.Join(parts, " · ") + ")"
-	}
-	a.setStatus(ctx, parentSid, agg)
-	return agg
 }
 
 // finalizePlan marks every phase up to and including the currently-active one
@@ -491,6 +427,16 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	}
 	defer cancel()
 	defer a.finalizePlan(req.SessionId)
+	// Background jobs that finished while this turn ran are reported when it is
+	// over, on every exit path (a /spec loop and a cancelled turn included),
+	// never in the middle of it. Deferred after the turnMu unlock above was, so it
+	// runs first: still inside the turn's lock. Background ctx: the turn's own may
+	// already be cancelled.
+	defer func() {
+		if sess := a.getSession(req.SessionId); sess != nil {
+			a.flushBgNotes(context.Background(), sess)
+		}
+	}()
 
 	// Abort wins over pending-question. Once ensureDevcontainer has decided
 	// the session can't proceed (set abortReason), the pending UI prompt is
@@ -1103,9 +1049,7 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	}
 
 	var b strings.Builder
-	// skills="auto" withholds untouched deferred skills from the prefix; the
-	// skip closure is nil in inline mode, which loads everything.
-	if skills := loadSkills(sess.Cwd, a.deferredSkillSkip(sess)); skills != "" {
+	if skills := loadSkills(sess.Cwd); skills != "" {
 		b.WriteString(skills)
 	}
 	fmt.Fprintf(&b, "Project directory: %s\n", sess.Cwd)

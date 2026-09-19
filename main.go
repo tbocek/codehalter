@@ -165,15 +165,6 @@ type agent struct {
 	// connection exists, so it needs no lock.
 	standalone bool
 
-	// subagentMeter folds the live status meter of each running subagent into
-	// its parent's in-progress phase row. Subagent sessions have no UI of their
-	// own (Zed only knows the parent sid), so their "↑sent ↓tokens… Ns" meter
-	// would otherwise be dropped. Keyed parentSid -> subSid -> latest meter
-	// fragment; setSubagentStatus re-renders the parent row as a compact join of
-	// every active subagent. Guarded by subagentMeterMu (concurrent subagents).
-	subagentMeterMu sync.Mutex
-	subagentMeter   map[string]map[string]string
-
 	// bgJobs tracks run_background jobs (long-lived processes the model starts:
 	// dev servers, watchers) so shutdownBackground can release their terminals on
 	// exit — which kills them — instead of orphaning them with a held port. Keyed
@@ -351,8 +342,7 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 // clientCan reports whether the editor advertised a capability in its
 // initialize request: "read", "write", "elicitation" or "terminal". A client
 // that didn't claim a method must never be sent it, so a false here means we
-// fall back — fsRead/fsWrite do the I/O themselves (the same path subagent
-// sessions already take) and asks go out as session/request_permission. The
+// fall back — fsRead/fsWrite do the I/O themselves and asks go out as session/request_permission. The
 // exception is "terminal", which has no fallback: ensureTerminals refuses the
 // session outright. Zed advertises all four, which is why the missing fs gate
 // went unnoticed.
@@ -641,7 +631,6 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	a.cfgMu.Unlock()
 	a.discoverRunners(cwd)
 	a.discoverSandbox()
-	a.registerSubagentTool()
 	return nil
 }
 
@@ -768,15 +757,6 @@ func (a *agent) setMainSlotTokens(n int) { a.mu.Lock(); a.mainSlotTokens = n; a.
 
 func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 	if a.conn == nil {
-		return
-	}
-	// Zed only knows the parent session id; SessionUpdate for a "sub_*"
-	// sid produces a "Received session notification for unknown session"
-	// warning on every emit. Subagent activity is intentionally not
-	// surfaced to the parent UI (only the final tool result is), so drop
-	// the notification entirely here. The per-session TOML log still
-	// captures the subagent's full message history.
-	if strings.HasPrefix(sid, "sub_") {
 		return
 	}
 	if err := a.conn.SessionUpdate(ctx, sid, u); err != nil {

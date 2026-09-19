@@ -181,21 +181,6 @@ func UnregisterToolsByPrefix(prefix string) int {
 	return removed
 }
 
-// hasToolPrefix reports whether any registered tool starts with the prefix.
-// Used by the MCP reconciler to detect leftover registrations.
-func hasToolPrefix(prefix string) bool {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
 // llmAllToolDefinitions returns EVERY registered tool, sorted by name. Phases no
 // longer prune this — restriction is enforced at dispatch via phasePolicy — so
 // the rendered `tools` block is byte-identical across plan/execute/document and
@@ -314,7 +299,7 @@ func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (strin
 
 	// Find the tool under the lock and capture just its Execute closure, so the
 	// call runs WITHOUT the lock held: Execute may take seconds (bash commands,
-	// LLM subagents) and must not block concurrent registration. Capturing the
+	// web reads) and must not block concurrent registration. Capturing the
 	// func value (not a slice index) keeps it callable even if the registry is
 	// rebuilt afterward. On a miss the scan collects the names to report.
 	registryMu.Lock()
@@ -348,12 +333,9 @@ func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (strin
 
 var toolCallCounter atomic.Uint64
 
-// toolUseCounter assigns each recorded ToolUse a stable per-process handle so
-// view_output can address it later without re-running the original tool.
-// Process-global rather than session-scoped — search is already scoped to one
-// session, and a single counter is simpler than tracking last-seen IDs per
-// session across restarts (where the counter resets but historical IDs in
-// session TOML survive — view_output handles "id not found" cleanly).
+// toolUseCounter assigns each recorded ToolUse a per-process handle. It names
+// the call in session.toml and is the wire id of last resort for a model that
+// sends no tool_call id of its own (see ToolUse.CallID).
 var toolUseCounter atomic.Uint64
 
 func nextToolUseID() string {
@@ -361,11 +343,10 @@ func nextToolUseID() string {
 }
 
 // runToolCall executes one tool call and returns (a) the ToolUse recording its
-// FULL output and (b) the model-visible content. The full output is cached here
-// (in the session, saved to disk) so view_output can re-serve any portion
-// without re-running the tool; the message stream only ever carries the
-// model-visible copy. That copy is the output shrunk past truncateThreshold with
-// a view_output hint — or, for view_image, the inline multimodal parts. The
+// FULL output and (b) the model-visible content. The full output is recorded in
+// the session (saved to disk, for the summariser and for you); the message
+// stream only ever carries the model-visible copy. That copy is the output
+// shrunk past truncateThreshold with a "to see more" hint — or, for view_image, the inline multimodal parts. The
 // caller appends the returned ToolUse to its result set and the content to the
 // message stream. Truncation lives here, not in individual tools, so every tool
 // returns its complete output and this one place decides "small → whole, big →
@@ -411,7 +392,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		DurationMs: time.Since(started).Milliseconds(),
 		ImageID:    imageID,
 	}
-	// Cache the full output (saved incrementally so it survives a crash) for view_output.
+	// Record the full output, saved incrementally so it survives a crash.
 	if sess := a.getSession(sid); sess != nil {
 		sess.AppendToolUse(tu)
 		sess.saveOrLog()
@@ -420,7 +401,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	if multimodal != nil {
 		return tu, multimodal
 	}
-	return tu, liveToolOutput(useID, tc.Function.Name, tc.Function.Arguments, result)
+	return tu, liveToolOutput(tc.Function.Name, tc.Function.Arguments, result)
 }
 
 // denyToolCall rejects a policy-forbidden tool WITHOUT executing it: a failed
@@ -559,7 +540,7 @@ const (
 // through THIS same function, so a replay is byte-identical to the live wire
 // (cache-warm) — re-sending a cached full read is free, whereas clipping it would
 // change the bytes and force a reprocess. n_ctx is bounded by compaction instead.
-func liveToolOutput(useID, toolName, args, content string) string {
+func liveToolOutput(toolName, args, content string) string {
 	switch toolName {
 	case "read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw":
 		if len(content) <= liveExemptCap {
@@ -573,63 +554,54 @@ func liveToolOutput(useID, toolName, args, content string) string {
 			cut = liveExemptCap
 		}
 		return fmt.Sprintf("%s\n\n[... %d of %d chars omitted (oversized output capped at %d KB). %s]",
-			content[:cut], len(content)-cut, len(content), liveExemptCap/1024, truncationHint(useID, toolName, args))
+			content[:cut], len(content)-cut, len(content), liveExemptCap/1024, truncationHint(toolName, args))
 	}
-	return truncateForLLM(useID, toolName, args, content)
+	return truncateForLLM(toolName, args, content)
 }
 
 // truncateForLLM returns content unchanged if short; otherwise emits a
 // head/tail-shaped slice with a per-tool "to see more" hint in the middle.
-// useID is the ToolUse handle the caller just assigned — embedded in the hint
-// so the model can `view_output id=useID mode=grep pattern=…` to retrieve any
-// portion of the original without re-running the underlying tool. toolName +
-// args let the hint name the exact alternate follow-up call (e.g. read_file
+// toolName + args let the hint name the exact alternate follow-up call (e.g. read_file
 // path+line, web_read url+offset) so the model doesn't have to reconstruct what
 // it just asked about. Applied by liveToolOutput to the non-exempt tools (live
 // and on history re-render alike).
-func truncateForLLM(useID, toolName, args, content string) string {
+func truncateForLLM(toolName, args, content string) string {
 	if len(content) <= truncateThreshold {
 		return content
 	}
 	omitted := len(content) - truncateHeadChars - truncateTailChars
 	head := content[:truncateHeadChars]
 	tail := content[len(content)-truncateTailChars:]
-	hint := truncationHint(useID, toolName, args)
+	hint := truncationHint(toolName, args)
 	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", head, omitted, len(content), hint, tail)
 }
 
-// truncationHint returns the per-tool "to see more" pointer. Every hint
-// includes a `view_output id=<useID>` path that retrieves any portion of the
-// FULL cached output without re-running the underlying tool — critical for
-// `run_task` / `run_command` where re-running is slow or non-idempotent.
-// Tools with cheap, idempotent re-invocation paths (read_file with a different
-// line range, web_read with offset/limit) also keep that alternate hint
-// because slicing on the caller's terms is sometimes more useful than
-// grepping. parseArgs is best-effort — when args don't contain a useful key
-// the alternate-call suggestion is dropped and only view_output remains.
-func truncationHint(useID, toolName, args string) string {
+// truncationHint returns the per-tool "to see more" pointer: how to get at
+// the part that was cut. There is deliberately no tool that re-serves a cached
+// full output: it was called after about 7% of truncations, and every hint paid
+// ~300 bytes of history to advertise it. Narrowing the call is what the model
+// does anyway, so the hint says how. parseArgs is best-effort; without a useful
+// key the hint falls back to the generic wording.
+func truncationHint(toolName, args string) string {
 	a := parseArgs(args)
-	viewOut := fmt.Sprintf("call view_output id=%q mode=grep pattern=<regex> (or mode=head / mode=tail with lines=<n>) to retrieve the cached full output without re-running this tool", useID)
 	switch toolName {
 	case "web_read", "web_read_raw":
-		u := a["url"]
-		if u == "" {
-			return "To see more: " + viewOut + ", OR call this tool again with offset=<n> limit=<m> — the full body is cached server-side, so no re-fetch."
+		if u := a["url"]; u != "" {
+			return fmt.Sprintf("To see more: call %s again with url=%q offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched.", toolName, u)
 		}
-		return fmt.Sprintf("To see more: %s, OR call %s again with url=%q offset=<n> limit=<m> — the full body is cached server-side, so no re-fetch.", viewOut, toolName, u)
+		return "To see more: call this tool again with offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched."
 	case "run_command", "run_task":
-		return "To see more: " + viewOut + ". Do NOT re-run the command just to see more output — view_output reads the cached result."
+		return "To see more: re-run it with the output narrowed (`| grep <pattern>`, `| tail -n <n>`, `| head -n <n>`), or redirect it to a file and read_file that. If re-running is slow or has side effects, redirect to a file the FIRST time."
 	case "list_files":
-		path := a["path"]
-		if path == "" {
-			return "To see more: " + viewOut + ", OR call list_files on a deeper subdirectory."
+		if path := a["path"]; path != "" {
+			return fmt.Sprintf("To see more: call list_files on a subdirectory of %q.", path)
 		}
-		return fmt.Sprintf("To see more: %s, OR call list_files on a subdirectory of %q.", viewOut, path)
+		return "To see more: call list_files on a deeper subdirectory."
 	case "search_text":
-		return "To see more: " + viewOut + ", OR re-run search_text with a more specific pattern or narrower path."
+		return "To see more: re-run search_text with a more specific pattern or a narrower path."
 	case "web_search":
-		return "To see more: " + viewOut + ", OR refine the query (fewer, more specific terms) and search again — then web_read the most promising result for its full text."
+		return "To see more: refine the query (fewer, more specific terms) and search again, then web_read the most promising result."
 	default:
-		return "To see more: " + viewOut + "."
+		return "To see more: call the tool again with narrower arguments."
 	}
 }

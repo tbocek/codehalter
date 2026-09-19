@@ -21,7 +21,7 @@ func fnvHash(s string) uint64 {
 
 // parallel runs fn for each index [0, n) with up to `cap` concurrent
 // goroutines. Callers pass an explicit upper bound matched to the work-list
-// (e.g. launch_subagent's SubagentPinOrder length, probeAllLLMs's len(conns))
+// (e.g. probeAllLLMs's len(conns))
 // so excess work queues instead of contending for slots.
 func parallel(n, cap int, fn func(i int)) {
 	if cap > n {

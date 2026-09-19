@@ -244,7 +244,7 @@
   <section class="section" style="padding:56px 0;">
     <div class="wrap">
       <div class="stats">
-        <div class="stat"><div class="num">~9k</div><div class="lbl">lines of Go (SLOC) · two dependencies · single static binary</div></div>
+        <div class="stat"><div class="num">~16k</div><div class="lbl">lines of Go (SLOC) · two dependencies · single static binary</div></div>
         <div class="stat"><div class="num">90%+</div><div class="lbl">cache reuse on large sessions, the conversation is <b>append-only</b>, so nothing already sent is ever rewritten and the KV cache is never busted</div></div>
         <div class="stat"><div class="num">sandboxed</div><div class="lbl">runs only inside a devcontainer, it scaffolds one on first run, so edits and commands never touch your host</div></div>
         <div class="stat"><div class="num">your call</div><div class="lbl">the agent is instructed never to commit or push on its own, it drafts the message; committing stays yours</div></div>
@@ -345,8 +345,8 @@
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/><path d="M7 6.5h.01M7 17.5h.01"/></svg></div>
-          <h3>Code intelligence, every language</h3>
-          <p>Real go-to-definition, find-references and symbol search, not just for Go. gopls is wired in out of the box; TypeScript, C/C++ (clangd), Rust, Python, … bridge their LSP to MCP via lsmcp. Bring any other MCP server via <code>mcp.toml</code>. <i>(non-Go bridges experimental)</i></p>
+          <h3>Spec loop: <code>/spec</code></h3>
+          <p><code>/spec spec/ rust/ use gtk4-rs libadwaita</code> implements a specification item by item until every requirement has a passing test. The bookkeeping is code, not model memory: requirement ids and sections are read from the spec, an item is done only when a test names it and the suite passes, each round sees just its slice of the spec, and every finished item is one commit. Cancel any time, <code>/spec</code> resumes. Bring any MCP server via <code>mcp.toml</code>.</p>
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10 21 3"/><path d="M3 21l7-7"/></svg></div>
@@ -361,7 +361,7 @@
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></div>
           <h3>Sets up new projects</h3>
-          <p>Point it at a fresh repo and it onboards the whole thing: scaffolds the devcontainer, detects the stack, seeds skills, and offers one-click <b>fix cards</b> to install what's missing, gopls/node/clang, an LSP bridge, a broken <code>mcp.toml</code>, doing it for you when you accept.</p>
+          <p>Point it at a fresh repo and it onboards the whole thing: scaffolds the devcontainer, detects the stack, seeds skills, and offers one-click <b>fix cards</b> to install what's missing (go, node, clang, a task runner, a formatter), pin a formatter config that matches the code's existing style, or repair a broken <code>mcp.toml</code>, doing it for you when you accept.</p>
         </div>
       </div>
     </div>

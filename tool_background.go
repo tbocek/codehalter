@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -33,6 +34,7 @@ type backgroundJob struct {
 	logPath    string
 	pidPath    string
 	terminalId string
+	started    time.Time
 }
 
 // nextBgID reserves the next sequential job id (used to name the log file before
@@ -131,7 +133,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	id := a.nextBgID()
 	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.log", id))
 	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.pid", id))
-	job := &backgroundJob{id: id, sid: sid, cmdStr: cmdStr, logPath: logPath, pidPath: pidPath}
+	job := &backgroundJob{id: id, sid: sid, cmdStr: cmdStr, logPath: logPath, pidPath: pidPath, started: time.Now()}
 
 	// bgScript wraps the model's command so the job keeps the two handles the model
 	// already knows how to use: a log file it reads with `run_command: cat …` and a
@@ -214,8 +216,9 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 		// which would signal the whole process group.
 		stop = "its pid was not recorded, so it can only be stopped by ending the session"
 	}
-	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls. Read its output with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
+	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, end the turn with `respond` saying the job is running. Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
 		id, job.pid, logPath, stop, tail)
+	go a.watchBgJob(job)
 	// Retitle only: the card is holding the live terminal, and text content here
 	// would replace it with a static snapshot taken at second one of a dev server.
 	a.sendUpdate(ctx, sid, toolCallUpdate{
@@ -225,4 +228,105 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 		Status:     "completed",
 	})
 	return result, false
+}
+
+// bgNoteTailCap bounds the log tail carried in a job's finish note. Smaller than
+// bgLogTailCap: the note lands in the conversation for good, and the full log
+// stays on disk for the model to read.
+const bgNoteTailCap = 3 * 1024
+
+// bgWakeRetry is how often a finished job re-checks for a quiet moment while a
+// turn is running.
+const bgWakeRetry = 2 * time.Second
+
+// watchBgJob waits for a running job to exit and hands its result to the
+// session. This is what lets a long experiment run while the chat stays usable:
+// the model ends its turn instead of polling, and the result comes back on its
+// own. The terminal is released once the job is gone (nothing left to show live
+// that the log doesn't have) and the log file is kept for the model to read.
+func (a *agent) watchBgJob(job *backgroundJob) {
+	exit, err := a.terminalWaitForExit(context.Background(), job.sid, job.terminalId)
+	// Shutdown reaps every job and drops the table: a job that "exits" because
+	// we killed it on the way out has nothing to report and nobody to report to.
+	a.bgMu.Lock()
+	_, tracked := a.bgJobs[job.id]
+	delete(a.bgJobs, job.id)
+	a.bgMu.Unlock()
+	if !tracked {
+		return
+	}
+	a.terminalRelease(job.sid, job.terminalId)
+	_ = os.Remove(job.pidPath)
+	sess := a.getSession(job.sid)
+	if sess == nil {
+		return
+	}
+	outcome := fmt.Sprintf("exited with code %d", exit.code())
+	if err != nil {
+		outcome = "was lost (" + err.Error() + ")"
+	}
+	took := humanDuration(time.Since(job.started).Milliseconds())
+	sess.addBgNote(bgNote{
+		line: fmt.Sprintf("background job %d `%s` %s after %s", job.id, truncate(job.cmdStr, 80), outcome, took),
+		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` %s after %s. Full log: %s. Last output:]\n\n%s",
+			job.id, job.cmdStr, outcome, took, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
+	})
+	a.deliverBgNotesWhenIdle(sess)
+}
+
+// deliverBgNotesWhenIdle reports finished jobs at the next quiet point and
+// never interrupts a turn. Idle (turnMu free): codehalter runs a turn of its own
+// so the model looks at the result and tells the user. A turn is running: the
+// notes stay queued and Prompt delivers them when that turn ends
+// (flushBgNotes); this loop only exists to catch the window where the turn has
+// passed its flush but not yet released the lock.
+func (a *agent) deliverBgNotesWhenIdle(sess *Session) {
+	for sess.hasBgNotes() {
+		if !sess.turnMu.TryLock() {
+			time.Sleep(bgWakeRetry)
+			continue
+		}
+		notes := sess.takeBgNotes()
+		if len(notes) == 0 {
+			sess.turnMu.Unlock()
+			return
+		}
+		// The same turn bookkeeping a typed Prompt does, so a prompt the user
+		// sends now supersedes this turn exactly as it would any other.
+		ctx, cancel := context.WithCancel(context.Background())
+		sess.adoptTurn()
+		sess.beginTurn(cancel)
+		var full []string
+		for _, n := range notes {
+			a.say(ctx, sess.ID, "\n🔔 "+n.line+"\n\n")
+			full = append(full, n.full)
+		}
+		sess.AddUser(strings.Join(full, "\n\n") + "\n\nLook at the result and tell the user what it means for the work in progress. Do not start new work the user did not ask for.")
+		sess.saveOrLog()
+		if err := a.runTurn(ctx, sess.ID); err != nil && !isCancelled(err) {
+			slog.Warn("background job report turn failed", "sid", sess.ID, "err", err)
+			a.say(context.Background(), sess.ID, "⚠ Could not report on the finished background job: "+err.Error()+"\n")
+		}
+		cancel()
+		sess.turnMu.Unlock()
+		return
+	}
+}
+
+// flushBgNotes is the mid-conversation half: called by Prompt when its turn has
+// ended. Each finished job gets one line on screen, and its full note is stored
+// as a message so the model sees it at the start of the next turn. No turn is
+// started here: the user is reading an answer they asked for.
+func (a *agent) flushBgNotes(ctx context.Context, sess *Session) {
+	notes := sess.takeBgNotes()
+	if len(notes) == 0 {
+		return
+	}
+	var full []string
+	for _, n := range notes {
+		a.say(ctx, sess.ID, "\n🔔 "+n.line+". The log is at hand; ask about it whenever you like.\n")
+		full = append(full, n.full)
+	}
+	sess.AddUser(strings.Join(full, "\n\n"))
+	sess.saveOrLog()
 }

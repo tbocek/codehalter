@@ -382,7 +382,7 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 		t.Errorf("tool message [0] wrong: %+v", msgs[2])
 	}
 	// Long output runs through truncateForLLM — the wire copy is shorter than
-	// the stored Output and carries the view_output hint.
+	// the stored Output and carries the "to see more" hint.
 	tool2Content := contentString(t, msgs[3])
 	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "tu_2" {
 		t.Errorf("tool message [1] Role/ID wrong: %+v", msgs[3])
@@ -390,8 +390,8 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 	if len(tool2Content) >= len(long) {
 		t.Errorf("long tool output not truncated: wire len %d >= stored len %d", len(tool2Content), len(long))
 	}
-	if !strings.Contains(tool2Content, "view_output id=\"tu_2\"") {
-		t.Errorf("truncated tool message missing view_output hint: %q", tool2Content)
+	if !strings.Contains(tool2Content, "To see more:") {
+		t.Errorf("truncated tool message missing the hint: %q", tool2Content)
 	}
 
 	if msgs[4].Role != "user" || contentString(t, msgs[4]) != "thanks" {
@@ -831,7 +831,7 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 // TestBuildContextUsesModelCallID pins the cache fix: a rebuilt context must use
 // the MODEL's tool_call id (CallID) on the wire — both the assistant tool call
 // and its tool result — so replaying from history is byte-identical to what was
-// sent live. The internal useID stays only as the view_output handle.
+// sent live. The internal useID is only the fallback for a model that sends none.
 func TestBuildContextUsesModelCallID(t *testing.T) {
 	a := &agent{}
 	s := &Session{}
@@ -1165,19 +1165,22 @@ func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
-	// Depth > 0 takes the paste branch: a subagent's history is not what this
-	// conn holds, so prefix extension would not line up.
-	s.Depth = 1
 	s.Summary = "Goal: port xdocc to the new API\nConstraint: never touch vendor/"
 	s.AddUser("keep going")
 	s.markTurnStart()
 	s.AddAssistant("kept going")
 
 	a := &agent{
-		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		sessions: map[string]*Session{s.ID: s},
+		// A dedicated summariser takes the paste branch: the conversation is not
+		// in that conn's cache, so prefix extension would not line up.
+		settings: Settings{LLM: []LLMConnection{
+			{Server: mock.ts.URL, Model: "m"},
+			{Server: mock.ts.URL, Model: "s", Purpose: purposeSummary},
+		}},
 		mainSlotTokens: 90_000,
 	}
+	a.buildConnSems()
 	a.backgroundSummarise(s)
 
 	deadline := time.Now().Add(2 * time.Second)
@@ -1216,7 +1219,6 @@ func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
-	s2.Depth = 1
 	s2.AddUser("first turn")
 	s2.markTurnStart()
 	s2.AddAssistant("done")

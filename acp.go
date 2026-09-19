@@ -68,8 +68,7 @@ type AuthMethod struct {
 // fs/write_text_file to a client that advertised them. Zed does, which is why
 // this went unnoticed, but a client that doesn't (and there are several ACP
 // clients now) would have failed every read_file with an RPC error. See
-// fsRead/fsWrite, which fall back to the disk path the subagent sessions
-// already use.
+// fsRead/fsWrite, which fall back to plain disk I/O.
 type ClientCapabilities struct {
 	Fs struct {
 		ReadTextFile  bool `json:"readTextFile"`

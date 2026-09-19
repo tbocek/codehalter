@@ -149,17 +149,17 @@ func TestLiveToolOutput(t *testing.T) {
 	big := strings.Repeat("x", truncateThreshold*3)
 
 	for _, tool := range []string{"read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw"} {
-		if got := liveToolOutput("tu_1", tool, "{}", big); got != big {
+		if got := liveToolOutput(tool, "{}", big); got != big {
 			t.Errorf("liveToolOutput(%s) clipped a size-managing tool (len %d, want %d)", tool, len(got), len(big))
 		}
 	}
-	if got := liveToolOutput("tu_1", "run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
+	if got := liveToolOutput("run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
 		t.Errorf("liveToolOutput(run_command) should clip a non-exempt tool")
 	}
-	if got := truncateForLLM("tu_1", "run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
+	if got := truncateForLLM("run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
 		t.Errorf("truncateForLLM must clip a long non-exempt output")
 	}
-	if got := truncateForLLM("tu_1", "run_command", "{}", "small"); got != "small" {
+	if got := truncateForLLM("run_command", "{}", "small"); got != "small" {
 		t.Errorf("short content should pass through, got %q", got)
 	}
 }
@@ -172,7 +172,7 @@ func TestLiveExemptCap(t *testing.T) {
 	line := strings.Repeat("a", 80) + "\n"
 	huge := strings.Repeat(line, liveExemptCap/len(line)+50) // comfortably over the cap
 
-	got := liveToolOutput("tu_1", "search_text", "{}", huge)
+	got := liveToolOutput("search_text", "{}", huge)
 	if got == huge {
 		t.Fatal("oversized search_text output should be capped, not passed whole")
 	}
@@ -189,10 +189,10 @@ func TestLiveExemptCap(t *testing.T) {
 }
 
 // TestWebSearchRefineHint pins that web_search overflow steers the model to
-// refine the query (not just view_output) — the "ask to refine" half of the
+// refine the query — the "ask to refine" half of the
 // truncation contract.
 func TestWebSearchRefineHint(t *testing.T) {
-	hint := truncationHint("tu_1", "web_search", `{"query":"x"}`)
+	hint := truncationHint("web_search", `{"query":"x"}`)
 	if !strings.Contains(hint, "refine the query") {
 		t.Errorf("web_search hint should suggest refining the query, got %q", hint)
 	}

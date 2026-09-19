@@ -139,3 +139,63 @@ func TestRunBackgroundRequiresCommand(t *testing.T) {
 		t.Fatalf("expected command-required error, got: %s (failed=%v)", res, failed)
 	}
 }
+
+// lastUserMessage returns the newest user message in the session, "" if none.
+func lastUserMessage(s *Session) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].Role == "user" {
+			return s.Messages[i].Content
+		}
+	}
+	return ""
+}
+
+// TestBackgroundJobReportsWhenTurnEnds pins the no-interrupt rule: a job that
+// finishes while a turn is running changes nothing until that turn is over.
+// Then the result is stored for the model (exit code, log path, last output)
+// without any turn being started.
+func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	old := bgJobGrace
+	bgJobGrace = 50 * time.Millisecond
+	defer func() { bgJobGrace = old }()
+
+	h.sess.turnMu.Lock() // a turn is running
+	res, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 0.3; echo experiment-done; exit 4"}`)
+	if failed || !strings.Contains(res, "do NOT poll") {
+		t.Fatalf("launch = (%q, failed=%v), want a running job that tells the model not to poll", res, failed)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !h.sess.hasBgNotes() {
+		if time.Now().After(deadline) {
+			t.Fatal("the finished job never queued a note")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := lastUserMessage(h.sess); got != "" {
+		t.Fatalf("a message reached the session while the turn was still running: %q", got)
+	}
+
+	h.agent.flushBgNotes(context.Background(), h.sess) // what Prompt does as the turn ends
+	h.sess.turnMu.Unlock()
+
+	got := lastUserMessage(h.sess)
+	for _, want := range []string{"background job", "exited with code 4", "experiment-done", "codehalter, not the user"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("stored note lacks %q: %q", want, got)
+		}
+	}
+	if h.sess.hasBgNotes() {
+		t.Error("note still queued after the flush")
+	}
+	h.agent.bgMu.Lock()
+	left := len(h.agent.bgJobs)
+	h.agent.bgMu.Unlock()
+	if left != 0 {
+		t.Errorf("finished job still tracked: %d", left)
+	}
+}

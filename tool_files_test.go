@@ -27,7 +27,6 @@ func writeLines(t *testing.T, path string, n int) {
 // markers, and the cursor advancing then clearing at end of file.
 func TestServeReadChunksAndCursor(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1 // force directRead (disk) instead of the ACP wire
 	path := filepath.Join(s.Cwd, "big.txt")
 	writeLines(t, path, 350)
 	ctx := context.Background()
@@ -74,7 +73,6 @@ func TestServeReadChunksAndCursor(t *testing.T) {
 // is partial.
 func TestServeReadCompleteBoundary(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1
 	ctx := context.Background()
 
 	exact := filepath.Join(s.Cwd, "exact.txt")
@@ -103,7 +101,6 @@ func TestServeReadCompleteBoundary(t *testing.T) {
 // unchanged marker runToolLoop scans for.
 func TestServeReadDedupOnUnchangedReread(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1
 	ctx := context.Background()
 	path := filepath.Join(s.Cwd, "f.txt")
 	writeLines(t, path, 10)
@@ -124,7 +121,6 @@ func TestServeReadDedupOnUnchangedReread(t *testing.T) {
 // keeps this from being a false redundant-fetch.)
 func TestServeReadFreshBytesNotFlagged(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1
 	ctx := context.Background()
 	path := filepath.Join(s.Cwd, "f.txt")
 	writeLines(t, path, 10)
@@ -145,7 +141,6 @@ func TestServeReadFreshBytesNotFlagged(t *testing.T) {
 // test seeds s.Messages to simulate the prior read being in context.
 func TestServeReadRefusesWhenInContext(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1
 	ctx := context.Background()
 	path := filepath.Join(s.Cwd, "f.txt")
 	writeLines(t, path, 10)
@@ -184,7 +179,6 @@ func TestServeReadRefusesWhenInContext(t *testing.T) {
 // The string forms stay accepted, since small models often quote everything.
 func TestReadFileHonoursNumericLineAndLimit(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1 // direct disk I/O instead of the ACP wire
 	ctx := context.Background()
 	path := filepath.Join(s.Cwd, "big.txt")
 	writeLines(t, path, 350)
@@ -227,7 +221,6 @@ func TestReadFileHonoursNumericLineAndLimit(t *testing.T) {
 // file. A successful edit stays failed=false.
 func TestEditFileMissFailsAndSteers(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1 // direct disk I/O instead of the ACP wire
 	ctx := context.Background()
 	path := filepath.Join(s.Cwd, "f.go")
 	if err := os.WriteFile(path, []byte("package main\n\nfunc A() {}\n"), 0o644); err != nil {
@@ -346,7 +339,6 @@ func TestNearMiss(t *testing.T) {
 // the model NOT to re-read — that saved round-trip is the whole point.
 func TestEditFileMissQuotesNearbyRegion(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1 // direct disk I/O instead of the ACP wire
 	ctx := context.Background()
 	path := filepath.Join(s.Cwd, "g.go")
 	body := "package main\n\nfunc load(p string) error {\n\tf, err := os.Open(p)\n\tif err != nil {\n\t\treturn err\n\t}\n\treturn nil\n}\n"

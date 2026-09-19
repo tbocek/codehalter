@@ -27,7 +27,7 @@ type Settings struct {
 	// dispatch to. LLM[0] is the "main" connection: the foreground session
 	// always runs on it, its KV cache holds the parent's history, and
 	// background work (summariser) avoids it to keep that cache warm. LLM[1+]
-	// are extras — used to fan out subagents in parallel. Each entry's
+	// are extras: one may host the summariser (purpose = "summary"). Each entry's
 	// Parallel field caps how many concurrent requests it accepts.
 	LLM []LLMConnection `toml:"llm"`
 
@@ -37,14 +37,6 @@ type Settings struct {
 	// delta. Only useful on backends with prefix caching (llama.cpp); elsewhere
 	// it wastes one tiny request. nil means on.
 	Prewarm *bool `toml:"prewarm,omitempty"`
-
-	// Skills selects how SKILL-*.md files reach the model. "auto" (default,
-	// also the value for "") keeps only the always-relevant skills in the
-	// system prompt (container/OS/bash) and injects each language/build skill
-	// the first time a tool call touches a matching file — shorter prefix,
-	// skill arrives on first use. "inline" concatenates every skill into the
-	// system prompt up front.
-	Skills string `toml:"skills,omitempty"`
 
 	// FormatConfig controls the setup card that offers to pin a formatter config
 	// for a project that has none (see formatterConfigNeeds). nil means on. Set
@@ -74,9 +66,8 @@ type Settings struct {
 //
 // Parallel is the per-conn concurrent-call cap. Each in-flight llmStream
 // acquires one of N tokens from this conn's semaphore; excess calls block
-// until a token is released. Holds *per LLM call*, not per subagent — between
-// calls (during local tool dispatch) the conn is free for another caller, so
-// nested subagents on the same conn just queue. Optional for llama.cpp:
+// until a token is released. Held *per LLM call*: between calls (during local
+// tool dispatch) the conn is free for another caller. Optional for llama.cpp:
 // probeAllLLMs auto-fills it from /props total_slots (-np) when left at 0. Set
 // it explicitly only for backends that don't report slots (vLLM, OpenAI, …) or
 // to cap concurrency below the server's capacity; 0 with no detection means 1.
@@ -92,16 +83,13 @@ type LLMConnection struct {
 	Tag    string `toml:"tag,omitempty"`
 	// Purpose designates which non-foreground work routes to this entry.
 	// "summary" sends the per-turn summariser here instead of LLM[0].
-	// Empty means no designated background work — the entry is still a
-	// subagent fan-out target, which is what most extras are.
+	// Empty means no designated background work.
 	//
 	// Named explicitly rather than inferred as "the first free entry after
-	// LLM[0]", because those are different jobs. Once there are two extras the
-	// inferred rule sends the summariser to whichever happens to be idle: a
-	// small fast model on one turn, a slow reasoning model the next, and it
-	// quietly consumes a slot meant for subagent fan-out. Naming the entry makes
-	// the routing stable and lets the summariser live on a machine picked for
-	// it. Marking LLM[0] is allowed and simply means "summarise on the main
+	// LLM[0]": with two extras the inferred rule sends the summariser to
+	// whichever happens to be idle, a small fast model on one turn, a slow
+	// reasoning model the next. Naming the entry makes the routing stable and
+	// lets the summariser live on a machine picked for it. Marking LLM[0] is allowed and simply means "summarise on the main
 	// conn", which is also what no marking at all yields.
 	Purpose string `toml:"purpose,omitempty"`
 
@@ -452,14 +440,15 @@ func decodeSettings(path string) (Settings, error) {
 		// skill_variant selected a per-model pruned skill set; those were folded
 		// into the single .codehalter/SKILL-*.md set. Named here so an existing
 		// config does not get told it has a typo.
+		if key.String() == "skills" {
+			slog.Warn("skills is no longer supported (ignored — every SKILL-*.md is always in the system prompt now; delete the line)", "file", path)
+			continue
+		}
 		if k := key.String(); strings.HasSuffix(k, "skill_variant") {
 			slog.Warn("skill_variant is no longer supported (ignored — there is one skill set now, .codehalter/SKILL-*.md; delete the line)", "key", k, "file", path)
 			continue
 		}
 		slog.Warn("unknown settings key (ignored — check for a typo)", "key", key.String(), "file", path)
-	}
-	if s.Skills != "" && s.Skills != "inline" && s.Skills != "auto" {
-		slog.Warn("unknown skills value (falling back to \"auto\")", "value", s.Skills, "file", path)
 	}
 	// A typo'd purpose is silent otherwise: the entry just never receives the
 	// summariser and the work stays on LLM[0], which looks like the flag not
@@ -473,21 +462,13 @@ func decodeSettings(path string) (Settings, error) {
 	return s, nil
 }
 
-// prewarmEnabled / skillsAuto read the two behavior flags under cfgMu.
+// prewarmEnabled reads the prewarm flag under cfgMu.
 // Settings hot-reload each turn (prepare), so an edit takes effect on the
 // next turn without a restart.
 func (a *agent) prewarmEnabled() bool {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
 	return a.settings.Prewarm == nil || *a.settings.Prewarm
-}
-
-func (a *agent) skillsAuto() bool {
-	a.cfgMu.RLock()
-	defer a.cfgMu.RUnlock()
-	// "auto" is the default: "" and unknown values (warned at load) land here
-	// too; only an explicit "inline" opts out of first-touch deferral.
-	return a.settings.Skills != "inline"
 }
 
 // MainLLM returns the foreground connection (LLM[0]) with role-resolved
@@ -498,7 +479,7 @@ func (s *Settings) MainLLM(role string) *LLMConnection {
 }
 
 // ConnAt returns LLM[idx] with role-resolved ExtraBody, or nil when idx is
-// out of range. Used by connForSession to resolve pinned subagent sessions.
+// out of range.
 func (s *Settings) ConnAt(idx int, role string) *LLMConnection {
 	if idx < 0 || idx >= len(s.LLM) {
 		return nil
@@ -508,43 +489,6 @@ func (s *Settings) ConnAt(idx int, role string) *LLMConnection {
 	c.Tag = role
 	c.Slot = idx
 	return &c
-}
-
-// PinSlot pairs a conn index with the slot-within-conn occupied by a subagent
-// task. For caps [1, 3] the breadth-first interleave yields
-// [{0,0}, {1,0}, {1,1}, {1,2}] — the Slot field disambiguates multiple
-// subagents pinned to the same conn so display labels can show conn/slot.
-type PinSlot struct {
-	Conn int
-	Slot int
-}
-
-// SubagentPinOrder returns the breadth-first slot interleave used to assign
-// pinned conn indices to subagent tasks. Caps total = sum of every LLM
-// entry's parallelCap. For caps [1, 3] the returned slice is
-// [{0,0}, {1,0}, {1,1}, {1,2}] — task 0 pins to LLM[0] slot 0, tasks 1..3
-// to LLM[1] slots 0..2. Tasks beyond the slice length wrap (k % len), so
-// the same per-conn cap still applies once they reach the conn's semaphore
-// at dispatch time.
-func (s *Settings) SubagentPinOrder() []PinSlot {
-	if len(s.LLM) == 0 {
-		return nil
-	}
-	maxCap := 0
-	for i := range s.LLM {
-		if c := s.LLM[i].parallelCap(); c > maxCap {
-			maxCap = c
-		}
-	}
-	var out []PinSlot
-	for slot := range maxCap {
-		for i := range s.LLM {
-			if slot < s.LLM[i].parallelCap() {
-				out = append(out, PinSlot{Conn: i, Slot: slot})
-			}
-		}
-	}
-	return out
 }
 
 // allConnections enumerates every distinct LLMConnection across the [[llm]]

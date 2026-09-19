@@ -8,22 +8,14 @@ import (
 	"time"
 )
 
-// shouldAutoAnswer reports whether prompts must be auto-answered: either
-// global autopilot mode is on, or the session is a subagent (Depth > 0). Zed
-// doesn't know subagent session ids, so any permission request sent for one
-// would hang forever — auto-answering keeps the subagent moving.
-func (a *agent) shouldAutoAnswer(sid string) (bool, string) {
-	if a.isAutopilot() {
-		return true, "autopilot"
-	}
-	if sess := a.getSession(sid); sess != nil && sess.Depth > 0 {
-		return true, "subagent"
-	}
-	return false, ""
+// shouldAutoAnswer reports whether prompts must be auto-answered (autopilot
+// mode), and the label to show in front of the automatic answer.
+func (a *agent) shouldAutoAnswer(_ string) (bool, string) {
+	return a.isAutopilot(), "autopilot"
 }
 
-// askChoiceAuto asks the user in interactive mode; in autopilot or from a
-// subagent it returns choices[0] (or "abort" if empty).
+// askChoiceAuto asks the user in interactive mode; in autopilot it returns
+// choices[0] (or "abort" if empty).
 func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId, question string, choices []string) (string, error) {
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
 		if len(choices) == 0 {
@@ -36,7 +28,7 @@ func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId, question st
 }
 
 // askFormAuto is askChoiceAuto for the options-plus-free-text form. Under
-// autopilot or in a subagent nobody is there to type, so a free-text-only ask
+// autopilot nobody is there to type, so a free-text-only ask
 // has no answer to give: it returns "" and the caller tells the model to decide
 // for itself rather than inventing a reply on the user's behalf.
 func (a *agent) askFormAuto(ctx context.Context, sid string, tcId, question string, options []string, allowText bool) (string, error) {

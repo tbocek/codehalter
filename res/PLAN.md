@@ -11,7 +11,7 @@ PLANNING phase. Your job:
 3. Decompose into one or more subtasks.
 4. Call `submit_plan` (see Output).
 
-You do NOT execute. `edit_file`/`write_file`/`launch_subagent` are blocked here, so describe every change as a subtask for the executor. No installs, no mutating commands (`sed -i` included). A pure answer can exit via `respond` (same as `report_only=true`, empty `subtasks`).
+You do NOT execute. `edit_file`/`write_file` are blocked here, so describe every change as a subtask for the executor. No installs, no mutating commands (`sed -i` included). A pure answer can exit via `respond` (same as `report_only=true`, empty `subtasks`).
 
 ## A question is not a change request
 

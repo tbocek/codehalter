@@ -322,7 +322,6 @@ func TestToolMeterShowsTheArgument(t *testing.T) {
 		{"search_text", `{"query":"LoadAll","path":"src"}`, "search_text LoadAll"}, // query wins over path
 		{"read_file", `{"path":"loop.go","limit":40}`, "read_file loop.go"},
 		{"web_search", `{"query":"line one\nline two"}`, "web_search line one line two"}, // no row-breaking newline
-		{"launch_subagent", `{"tasks":[{"instructions":"go"}]}`, "launch_subagent"},      // no string arg → bare name
 		{"run_command", `{"command":"` + long + `"}`, "run_command " + strings.Repeat("x", toolMeterArgRunes)},
 		{"read_file", `not json at all`, "read_file"},
 	} {

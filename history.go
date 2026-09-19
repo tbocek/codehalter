@@ -285,9 +285,8 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	// already holds this conversation, so send the conversation itself plus a
 	// small instruction instead of re-pasting the turn — the server reuses the
 	// whole cached prefix and evaluates only the instruction. This is what
-	// makes a single-slot (parallel = 1) server viable. Depth guard: a
-	// subagent's history lives on its pinned conn, not necessarily here.
-	if onMain && sess.Depth == 0 {
+	// makes a single-slot (parallel = 1) server viable.
+	if onMain {
 		task.Msgs = a.appendSummariseMsgs(sess, prompt, turn)
 	}
 	sess.enqueueSummarise(task, func(t summariseTask) {
@@ -398,7 +397,7 @@ func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConn
 			if len(m.ToolUses) > 0 {
 				turnBuf.WriteString("\n<tool_calls>\n")
 				for _, tu := range m.ToolUses {
-					fmt.Fprintf(&turnBuf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncateForLLM(tu.ID, tu.Name, tu.Input, tu.Output))
+					fmt.Fprintf(&turnBuf, "- %s(%s) → %s\n", tu.Name, tu.Input, truncateForLLM(tu.Name, tu.Input, tu.Output))
 				}
 				turnBuf.WriteString("</tool_calls>")
 			}
@@ -501,7 +500,7 @@ func fallbackTurnNote(turn []Message) string {
 // thing that pins the bytes the model actually saw. So that case replays from
 // ImageID and never re-runs the tool.
 func (a *agent) replayToolOutput(sess *Session, tu ToolUse) any {
-	text := liveToolOutput(tu.ID, tu.Name, tu.Input, tu.Output)
+	text := liveToolOutput(tu.Name, tu.Input, tu.Output)
 	if tu.Failed || !a.imagesSupported {
 		return text
 	}
@@ -546,8 +545,7 @@ func wireCallID(tu ToolUse) string {
 
 func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 	// Snapshot under the lock: the background summariser (foldHistory/rotate
-	// reassigns s.Messages) and a parallel subagent's buildLLMContext(parent) can
-	// mutate the session while this ranges it. Copy the slice header + the prompt
+	// reassigns s.Messages) can mutate the session while this ranges it. Copy the slice header + the prompt
 	// strings, then build from the copy unlocked.
 	sess.mu.Lock()
 	systemPrompt, summary := sess.SystemPrompt, sess.Summary

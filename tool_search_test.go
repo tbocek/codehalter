@@ -139,7 +139,6 @@ func TestSearchInFileMatchers(t *testing.T) {
 // tool loop scans for, while a search with a different scope is NOT flagged.
 func TestSearchTextDedupOnRepeat(t *testing.T) {
 	a, s := newTestAgent(t)
-	s.Depth = 1
 	ctx := context.Background()
 	if err := os.WriteFile(filepath.Join(s.Cwd, "f.go"), []byte("package main\n// needle here\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)

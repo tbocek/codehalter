@@ -432,17 +432,22 @@ func init() {
 
 	RegisterTool(Tool{Def: webReadDef(
 		"web_read",
-		"Open a URL in Firefox and return a concise summary of the page content. Use this for unstructured information (what does the page say about X). The user will review the page before the summary is returned.",
+		"Open a URL in Firefox and get an ANSWER from the page: a separate reader sees ONLY the page and your `question`, and returns what the page says about it. Much cheaper for your context than the raw text. Use this for \"what does this page say about X\". The user will review the page before the answer is returned.",
+		true,
 	), Execute: makeWebRead(true)})
 
 	RegisterTool(Tool{Def: webReadDef(
 		"web_read_raw",
 		"Open a URL in Firefox and return the raw extracted text (truncated). Use this when summarization would lose precision: finding a specific download URL on the page, exact version numbers, code snippets, or any string that must be preserved verbatim. The user will review the page before the text is returned.",
+		false,
 	), Execute: makeWebRead(false)})
 }
 
-func webReadDef(name, description string) map[string]any {
-	return map[string]any{
+// webReadDef builds the schema shared by web_read and web_read_raw. withQuestion
+// adds web_read's required `question`: the reader that answers it is a separate
+// LLM call with no view of this conversation, so the question has to stand alone.
+func webReadDef(name, description string, withQuestion bool) map[string]any {
+	def := map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        name,
@@ -467,6 +472,15 @@ func webReadDef(name, description string) map[string]any {
 			},
 		},
 	}
+	if withQuestion {
+		params := def["function"].(map[string]any)["parameters"].(map[string]any)
+		params["required"] = []string{"url", "question"}
+		params["properties"].(map[string]any)["question"] = map[string]any{
+			"type":        "string",
+			"description": "What you want to know from this page, as a STANDALONE question. The reader sees only the page and this text, nothing of our conversation: name the product, version, platform and what exactly you need (\"Which gtk4-rs crate version supports GTK 4.14, and what cargo feature enables it?\"), not \"what about the version?\".",
+		}
+	}
+	return def
 }
 
 const (
@@ -497,6 +511,16 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 		// Any supplied `limit` means the model wants a slice, even one we then
 		// clamp — presence is the signal, not the value.
 		rangeRequest := offset > 0 || args.has("limit")
+		// web_read's answer depends on the question, so the result cache is keyed
+		// on both: the same page asked something else is a different result.
+		question := strings.TrimSpace(args.str("question"))
+		if summarize && question == "" && !rangeRequest {
+			return "error: question is required: say what you want to know from the page, as a standalone question (the reader sees only the page and the question). For the raw text use web_read_raw.", true
+		}
+		resultKey := targetURL
+		if summarize {
+			resultKey += "\x00" + question
+		}
 
 		// Range request hits the cache first — no second HTTP round-trip when
 		// the page was fetched earlier in this session. Cache miss falls
@@ -522,7 +546,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 			// summarize is another LLM round-trip). Identical bytes are also nice
 			// to the prefix cache if the second call shows up in the same prompt.
 			if sess := a.getSession(sid); sess != nil {
-				if cached, ok := sess.recallWebResult(targetURL, summarize); ok {
+				if cached, ok := sess.recallWebResult(resultKey, summarize); ok {
 					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
 					a.CompleteToolCallTitled(ctx, sid, tcId,
 						"Web Read (cached): "+targetURL,
@@ -533,9 +557,29 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 			}
 		}
 
+		// A new question about a page already fetched this session: answer from
+		// the cached body. The Firefox launch and page load are the slow part
+		// (30-60s) and the page has not changed.
+		if summarize && !rangeRequest {
+			if sess := a.getSession(sid); sess != nil {
+				if body, ok := sess.recallWebBody(targetURL); ok {
+					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL+" — "+question, "search", nil)
+					out := a.summarizePage(ctx, sid, question, targetURL, body)
+					a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read (cached): "+targetURL+" — "+question,
+						[]ToolCallContent{TextContent(fmt.Sprintf("answered from the cached page (%d chars, no re-fetch)", len(body)))})
+					sess.rememberWebResult(resultKey, summarize, out)
+					return out, false
+				}
+			}
+		}
+
 		a.logSession(sid, "WEB", "open URL: %s", targetURL)
 
-		tcId := a.StartToolCall(ctx, sid, "Web Read: "+targetURL, "search", nil)
+		title := "Web Read: " + targetURL
+		if question != "" {
+			title += " — " + question
+		}
+		tcId := a.StartToolCall(ctx, sid, title, "search", nil)
 
 		port := nextBrowserPort()
 		browser, err := StartBrowser(ctx, port, targetURL)
@@ -585,7 +629,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 		}
 		var out string
 		if summarize {
-			out = a.summarizePage(ctx, sid, "content of "+targetURL, targetURL, text)
+			out = a.summarizePage(ctx, sid, question, targetURL, text)
 		} else {
 			out = text
 			if len(out) > maxRawPageChars {
@@ -593,7 +637,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 			}
 		}
 		if sess := a.getSession(sid); sess != nil {
-			sess.rememberWebResult(targetURL, summarize, out)
+			sess.rememberWebResult(resultKey, summarize, out)
 		}
 		return out, false
 	}
@@ -627,21 +671,23 @@ func sliceWebBody(body string, offset, limit int) string {
 	return clipUTF8(body[offset:], limit)
 }
 
-// summarizePage uses the execute LLM to extract only the relevant information
-// from a web page. sid scopes the per-session debug log. Routes via the
-// session's pin: main → LLM[0], subagent → its pinned LLM[i] entry.
-func (a *agent) summarizePage(ctx context.Context, sid string, query, url, pageText string) string {
-	conn := a.connForSession(ctx, sid, "execute")
-
-	// Truncate input to avoid overwhelming the LLM.
-	const maxInput = 8000
-	if len(pageText) > maxInput {
-		pageText = clipUTF8(pageText, maxInput)
+// summarizePage answers one standalone question from a web page. It is a
+// self-contained call (the page and the question, nothing of the conversation),
+// so it runs on the background connection: a dedicated summariser when one is
+// configured, else llm[0]. The foreground context then carries the answer
+// instead of the page. sid scopes the per-session debug log.
+func (a *agent) summarizePage(ctx context.Context, sid string, question, url, pageText string) string {
+	conn, _ := a.connForBackgroundLLM()
+	if conn == nil {
+		return clipUTF8(pageText, 2000) + "\n... (truncated; no LLM available to answer from the page)"
 	}
+	// Head of the page only: the reader's context is not the foreground's, but a
+	// documentation page with its sidebar can still run to megabytes.
+	pageText = clipUTF8(pageText, maxLLMInputBytes)
 
 	prompt := fmt.Sprintf(
-		"The user searched for: %q\n\nExtract ONLY the information relevant to this search from the following web page. Be concise and factual. Include specific versions, dates, and facts. Skip navigation, menus, ads, and unrelated content. Max 300 words.\n\nURL: %s\n\n%s",
-		query, url, pageText,
+		"Answer this question using ONLY the web page below:\n\n%s\n\nBe concise and factual. Quote exact versions, names, commands, URLs and dates as the page gives them. If the page does not answer the question, say so in one line and say what the page IS about; do not answer from your own knowledge. Skip navigation, menus and ads. Max 300 words.\n\nURL: %s\n\n%s",
+		question, url, pageText,
 	)
 
 	messages := []llmMessage{{Role: "user", Content: prompt}}

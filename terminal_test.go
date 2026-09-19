@@ -149,30 +149,3 @@ func TestTerminalCmdCancelReportsPartialOutput(t *testing.T) {
 		t.Errorf("out = %q, want the output produced before the cancel", out)
 	}
 }
-
-// TestClientSessionIDResolvesSubagents pins that a subagent's commands are
-// addressed to the session the client actually knows. A "sub_*" id was minted
-// locally and never announced, so a terminal request naming one is rejected the
-// same way fs/read_text_file is.
-func TestClientSessionIDResolvesSubagents(t *testing.T) {
-	a, root := newTestAgent(t)
-	child := newSubagentSession(root.Cwd, root.ID, 0, 1, 0)
-	grandchild := newSubagentSession(root.Cwd, child.ID, 0, 2, 0)
-	a.sessions[child.ID] = child
-	a.sessions[grandchild.ID] = grandchild
-
-	for _, tc := range []struct {
-		name string
-		sid  string
-	}{
-		{"top-level session is its own client session", root.ID},
-		{"subagent resolves to its parent", child.ID},
-		{"depth-2 subagent resolves all the way up", grandchild.ID},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := a.clientSessionID(tc.sid); got != root.ID {
-				t.Errorf("clientSessionID(%q) = %q, want %q", tc.sid, got, root.ID)
-			}
-		})
-	}
-}

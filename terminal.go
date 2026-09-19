@@ -59,22 +59,6 @@ func (e terminalExit) code() int {
 	return -1
 }
 
-// clientSessionID maps a session id to one the client actually knows. Subagent
-// sessions are minted locally as "sub_<parent>_…" and never announced, so a
-// terminal request naming one is rejected exactly as fs/read_text_file is;
-// their commands run on the parent's session instead. The loop (rather than a
-// single hop) is for depth-2 subagents, whose parent is itself a sub_ session.
-func (a *agent) clientSessionID(sid string) string {
-	for i := 0; i < maxSubagentDepth+1; i++ {
-		sess := a.getSession(sid)
-		if sess == nil || sess.ParentID == "" {
-			return sid
-		}
-		sid = sess.ParentID
-	}
-	return sid
-}
-
 // terminalCreate starts command+args in a client terminal and returns its id.
 // terminal/create takes an argv, not a shell line, so a caller with a shell
 // line passes ("bash", []string{"-c", line}) — that's what keeps pipes,
@@ -84,7 +68,7 @@ func (a *agent) terminalCreate(ctx context.Context, sid, command string, args []
 		args = []string{}
 	}
 	raw, err := a.conn.sendRequest(ctx, "terminal/create", map[string]any{
-		"sessionId":       a.clientSessionID(sid),
+		"sessionId":       sid,
 		"command":         command,
 		"args":            args,
 		"cwd":             cwd,
@@ -108,7 +92,7 @@ func (a *agent) terminalCreate(ctx context.Context, sid, command string, args []
 // terminalOutput fetches everything the terminal has produced so far. exit is
 // nil while the command is still running.
 func (a *agent) terminalOutput(ctx context.Context, sid, tid string) (out string, truncated bool, exit *terminalExit, err error) {
-	raw, err := a.conn.sendRequest(ctx, "terminal/output", map[string]any{"sessionId": a.clientSessionID(sid), "terminalId": tid})
+	raw, err := a.conn.sendRequest(ctx, "terminal/output", map[string]any{"sessionId": sid, "terminalId": tid})
 	if err != nil {
 		return "", false, nil, err
 	}
@@ -125,7 +109,7 @@ func (a *agent) terminalOutput(ctx context.Context, sid, tid string) (out string
 
 // terminalWaitForExit blocks until the command finishes.
 func (a *agent) terminalWaitForExit(ctx context.Context, sid, tid string) (terminalExit, error) {
-	raw, err := a.conn.sendRequest(ctx, "terminal/wait_for_exit", map[string]any{"sessionId": a.clientSessionID(sid), "terminalId": tid})
+	raw, err := a.conn.sendRequest(ctx, "terminal/wait_for_exit", map[string]any{"sessionId": sid, "terminalId": tid})
 	if err != nil {
 		return terminalExit{}, err
 	}
@@ -139,7 +123,7 @@ func (a *agent) terminalWaitForExit(ctx context.Context, sid, tid string) (termi
 // terminalKill kills the command but keeps the terminal id valid, so output
 // produced before the kill can still be read.
 func (a *agent) terminalKill(ctx context.Context, sid, tid string) error {
-	_, err := a.conn.sendRequest(ctx, "terminal/kill", map[string]any{"sessionId": a.clientSessionID(sid), "terminalId": tid})
+	_, err := a.conn.sendRequest(ctx, "terminal/kill", map[string]any{"sessionId": sid, "terminalId": tid})
 	return err
 }
 
@@ -153,7 +137,7 @@ func (a *agent) terminalRelease(sid, tid string) {
 	// context, so reusing it would skip the kill exactly when it matters most.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := a.conn.sendRequest(ctx, "terminal/release", map[string]any{"sessionId": a.clientSessionID(sid), "terminalId": tid}); err != nil {
+	if _, err := a.conn.sendRequest(ctx, "terminal/release", map[string]any{"sessionId": sid, "terminalId": tid}); err != nil {
 		slog.Debug("terminal/release failed", "terminal", tid, "err", err)
 	}
 }
