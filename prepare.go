@@ -32,7 +32,7 @@ const (
 	// that provides the language server the wiring bullet then points at.
 	cardSetupHeader = "Container setup needed in this %s devcontainer.\n" +
 		"\n" +
-		"PLAN ONLY → produce execute-phase steps covering every item below, then PERSIST every install in `.devcontainer/Dockerfile`. Follow SKILL-base.md (install order + install/persist loop) and the matching language SKILL for which pkg mgr.\n" +
+		"PLAN ONLY → produce execute-phase steps covering every item below, then PERSIST every install in `.devcontainer/Dockerfile`. Follow SKILL-base.md (install order + install/persist loop).\n" +
 		"\n"
 
 	cardInstallTools = "- Missing dev tools: %s. Install each, verify each runs.\n"
@@ -52,7 +52,7 @@ const (
 		"3. Prove it: run the formatter in check mode over the whole tree and report how many files it would still change. A large number means the config does not describe this codebase — go back to step 1 and fix the config. Do NOT reformat the repo to match a guess.\n" +
 		"4. Only once step 3 is small: format the whole tree and commit that as ONE commit containing formatting and nothing else. If `git status` is not clean, skip this step and say so — a formatting commit must not sweep up someone's work in progress.\n" +
 		"\n" +
-		"The matching language SKILL has the exact config file and flags. Change no behavior anywhere in this task.\n"
+		"SKILL-base.md (\"Formatter config\") has the exact config files and flags. Change no behavior anywhere in this task.\n"
 
 	cardMCPParseError = "MCP config `.codehalter/mcp.toml` failed to parse: %s.\n" +
 		"\n" +

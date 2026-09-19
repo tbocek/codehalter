@@ -131,19 +131,11 @@ func TestDeferredSkillTriggers(t *testing.T) {
 		tok  string
 		want string
 	}{
-		{"cmd/main.go", "SKILL-go.md"},
-		{"src/app.ts", "SKILL-ts.md"},
-		{"web/index.jsx", "SKILL-js.md"},
-		{"lib/foo.cpp", "SKILL-c.md"},
-		{"design/layout.css", "SKILL-css.md"},
-		{"out/index.html", "SKILL-css.md"},
-		{"include/foo.h", "SKILL-c.md"},
-		{"src/Main.java", "SKILL-java.md"},
+		{"design/layout.css", "SKILL-layout.md"},
+		{"out/index.html", "SKILL-layout.md"},
 		{"justfile", "SKILL-justfile.md"},
 		{"sub/dir/Makefile", "SKILL-makefile.md"},
 		{"rules.mk", "SKILL-makefile.md"},
-		{"install.sh", "SKILL-bash.md"},
-		{"scripts/run.bash", "SKILL-bash.md"},
 	}
 	for _, c := range tokenCases {
 		var hits []string
@@ -158,8 +150,7 @@ func TestDeferredSkillTriggers(t *testing.T) {
 	}
 	// Runner tool names imply their stack without any path token.
 	for tool, want := range map[string]string{
-		"go": "SKILL-go.md", "just": "SKILL-justfile.md",
-		"make": "SKILL-makefile.md", "npm": "SKILL-js.md", "gradle": "SKILL-java.md",
+		"just": "SKILL-justfile.md", "make": "SKILL-makefile.md",
 	} {
 		d, ok := byName[want]
 		if !ok {
@@ -175,52 +166,19 @@ func TestDeferredSkillTriggers(t *testing.T) {
 			t.Errorf("tool %q should trigger %s (tools: %v)", tool, want, d.tools)
 		}
 	}
+	// Source files of any language trigger nothing: there are no language skills.
+	for _, tok := range []string{"cmd/main.go", "src/app.ts", "src/lib.rs", "install.sh"} {
+		for _, d := range deferredSkills {
+			if d.match != nil && d.match(tok) {
+				t.Errorf("token %q triggered %s", tok, d.name)
+			}
+		}
+	}
 	// Never-deferred skills must stay off the table: they have no touch signal.
-	for _, name := range []string{"SKILL-base.md", "SKILL-arch.md", "SKILL-rust.md"} {
+	for _, name := range []string{"SKILL-base.md", "SKILL-arch.md"} {
 		if isDeferredSkill(name) {
 			t.Errorf("%s must not be deferred", name)
 		}
-	}
-}
-
-// TestShebangShell pins the extensionless-script signal: a shell shebang in a
-// whole argument string (a write_file content, say) triggers the bash skill,
-// the same classification `file`(1) would make, while other interpreters and
-// mid-word "sh" don't.
-func TestShebangShell(t *testing.T) {
-	hits := []string{
-		"#!/usr/bin/env bash\nset -euo pipefail\n",
-		"#!/bin/sh\necho hi\n",
-		"#!/bin/dash\n",
-		"#!/usr/bin/zsh\n",
-		"leading text\n#!/bin/bash\n", // shebang not at byte 0 still counts
-	}
-	misses := []string{
-		"#!/usr/bin/env python3\nprint()\n",
-		"#!/usr/bin/fish\n", // "sh" mid-word must not match
-		"echo no shebang here",
-		"",
-	}
-	for _, s := range hits {
-		if !shebangShell.MatchString(s) {
-			t.Errorf("shebangShell should match %q", s)
-		}
-	}
-	for _, s := range misses {
-		if shebangShell.MatchString(s) {
-			t.Errorf("shebangShell should NOT match %q", s)
-		}
-	}
-	// End-to-end through the raw extractor: an extensionless script write.
-	raws := collectArgStrings(`{"path":"install","content":"#!/usr/bin/env bash\nset -euo pipefail\n"}`)
-	found := false
-	for _, r := range raws {
-		if shebangShell.MatchString(r) {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("shebang inside write_file content should be caught via collectArgStrings")
 	}
 }
 

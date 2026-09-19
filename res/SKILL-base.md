@@ -16,9 +16,9 @@ Repo you don't already know (first turn here, or the request names files/command
 ## "command not found"
 Pkg-mgr commands depend on the base image → SKILL-<os>.md (alpine/arch/debian/fedora/ubuntu), else /etc/os-release.
 - NO retry of the same cmd unchanged.
-- Absent from distro repos, or repo version too old (fast movers: Go, gopls, LSPs) → web_search upstream docs/releases BEFORE claiming unavailable.
+- Absent from distro repos, or repo version too old (fast movers: Go, Rust, Node) → web_search upstream docs/releases BEFORE claiming unavailable.
 
-## Install order (any missing tool, incl. gopls, ruff, prettier…)
+## Install order (any missing tool, incl. ruff, prettier, just…)
 1) distro pkg mgr 2) upstream site 3) language installer 4) community repos (AUR, COPR, PPA, backports). Next option only when the previous has no package, or too old.
 - "Not in repos" = claim, not fact. Prove with the pkg-mgr exact-name query (SKILL-<os>.md). Never grep search output: listings print `name-version`, so `grep "^name "` matches 0 lines = false absence. "Too old" → quote the version the repo offers.
 - Vendor repo when upstream docs offer one → custom-repo recipe in SKILL-<os>.md. Repo installs keep updating → prefer over a one-off binary.
@@ -34,8 +34,31 @@ Installed to answer one question (a linter run once, a CLI to inspect a file, a 
 Persist ONLY when the tool stays part of the project: build/test/lint chain, runtime dep, something the next turn or the next person needs. Then it IS a Dockerfile edit, tested live first (above).
 Borderline → not a keeper unless dropping it breaks a documented command. Say what you installed and that you left it unpersisted.
 
+## Toolchains
+- Toolchain probe (`go version`, `node --version`, `cargo --version`, `which X`) answered once → do NOT re-run it with a different cwd, redirect or wrapper. Same binary, same answer. Exception: a nested manifest that pins its own toolchain (`go.mod` `toolchain` line, `rust-toolchain.toml`, `.nvmrc`): read the pin instead of re-probing.
+- Project wants a newer toolchain than installed:
+  - PATCH gap, same minor (go.mod wants 1.26.6, have 1.26.3) → lower the project's directive to the installed version, drop any `toolchain` line. Do NOT install a newer one or let it auto-fetch: a patch adds no language or stdlib API.
+  - MINOR gap (wants 1.26.x, have 1.25.x) → do NOT lower it; the code may use what the newer minor added. Raise the toolchain, in this order: 1) bump the base image `FROM` tag 2) distro package 3) upstream tarball. Unobtainable → stop, report.
+- JS/TS: ONE package manager per project, detected BEFORE installing anything: `package.json` `packageManager` field → lockfile (`pnpm-lock.yaml`→pnpm, `yarn.lock`→yarn, `bun.lockb`→bun, else npm) → an existing `node_modules/.pnpm` dir (→pnpm; the lockfile is often gitignored). Use that one for everything, never mix npm into a pnpm/yarn project. pnpm/yarn via `corepack enable`. pnpm in a devcontainer drops `.pnpm-store` in the repo (the store can't hardlink across the bind mount) → gitignore `.pnpm-store` + `node_modules`.
+- Build, test, type-check and lint through what the project declares (task runner recipe, `package.json` script), not the bare tool: the real flags live there.
+- Tools that rewrite files across the repo (`go mod tidy`, `gofmt -w`, `go generate`, `cargo fmt`, `prettier --write`) are MUTATING → EXECUTE phase only. Their read-only twins (`go vet`, `gofmt -d`, `cargo fmt --check`, `prettier --check`) are fine while planning.
+
+## "failed on line N" is not a diagnosis
+A script, just recipe or make target bailing with `failed on line N exit code 1` is the WRAPPER's error; the real cause was printed by a sub-process a few lines earlier in the output.
+1. Find line N → that's the failing command. Re-run just that command via run_command, isolated → its clean error without the wrapper's footer.
+2. It invokes another shell script → re-run `bash -x that.sh ARGS`: the last `+` line before the error is the inner line that broke.
+3. Fix the INNER command's error, not the wrapper's line number.
+
+## Formatter config — pin the style that is already there
+No formatter config in the repo (`.prettierrc`/`.editorconfig`, `.clang-format`) → the formatter, the editor's format-on-save and CI each apply their own defaults and fight over the file; an editor reindenting after a write breaks the next edit. gofmt / rustfmt / zig fmt have no style options: nothing to pin. For the others, fix by MEASURING, never by imposing defaults:
+- Read several of the largest existing source files: indent width, tabs vs spaces, quote style, semicolons, trailing commas, brace placement, pointer binding (`char *p` vs `char* p`), the line width the code respects. State the numbers.
+- Write the config with exactly those. prettier → `.prettierrc` (`tabWidth`, `useTabs`, `singleQuote`, `semi`, `trailingComma`, `printWidth`). clang-format → start from the closest named base (`clang-format --style=GNU --dump-config > .clang-format`, or LLVM/Google/WebKit), then correct `IndentWidth`, `UseTab`, `BreakBeforeBraces`, `PointerAlignment`, `ColumnLimit`.
+- Prove it in check mode over the tree (`prettier --list-different .`, `clang-format --dry-run -Werror $(git ls-files "*.c" "*.h")`): few files = the config describes the code. Many = the config is wrong; fix the config, do NOT reformat the repo to match a guess.
+- Ignore vendored/generated files (`.prettierignore`: a copied upstream lib, `dist/`) BEFORE any write.
+- Then format the tree as ONE commit, formatting only, and only on a clean tree.
+
 ## Code you write
-Language SKILL wins where it disagrees with this.
+The project's existing style wins where it disagrees with this.
 - Early return / `continue` over nesting. Guard clauses first, happy path unindented. 3 levels deep = restructure, not one more `if`.
 - Value used twice, or fixed by a spec (HTTP 200, a magic byte, a timeout) → named constant. A self-explanatory one-off (`i+1`, `0.5`) stays inline: naming it is clutter.
 - Short names. Function name over 30 chars = it does too much, or the name repeats its package/receiver.

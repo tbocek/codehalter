@@ -17,26 +17,8 @@ import (
 	"time"
 )
 
-//go:embed res/SKILL-go.md
-var skillGo string
-
-//go:embed res/SKILL-ts.md
-var skillTS string
-
-//go:embed res/SKILL-js.md
-var skillJS string
-
-//go:embed res/SKILL-java.md
-var skillJava string
-
-//go:embed res/SKILL-bash.md
-var skillBash string
-
-//go:embed res/SKILL-c.md
-var skillC string
-
-//go:embed res/SKILL-css.md
-var skillCSS string
+//go:embed res/SKILL-layout.md
+var skillLayout string
 
 //go:embed res/SKILL-base.md
 var skillBase string
@@ -61,20 +43,6 @@ var skillFedora string
 
 //go:embed res/SKILL-ubuntu.md
 var skillUbuntu string
-
-// defaultSkills maps a per-stack key (language stack from detectStacks)
-// to the embedded skill body. The container / per-OS / per-runner skills
-// live in their own seed paths inside ensureSkills, not here, because
-// they're not driven by detectStacks.
-var defaultSkills = map[string]string{
-	"go":   skillGo,
-	"ts":   skillTS,
-	"js":   skillJS,
-	"java": skillJava,
-	"bash": skillBash,
-	"c":    skillC,
-	"css":  skillCSS,
-}
 
 // osSkills maps an /etc/os-release ID (as returned by readOSInfo) to the
 // embedded skill body. Only IDs we have a SKILL-<id>.md for are present;
@@ -151,12 +119,14 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 	if err := seed("SKILL-base.md", skillBase); err != nil {
 		return err
 	}
-	// Per-stack skills (driven by files in the tree).
-	for _, stack := range stacks {
-		if body, ok := defaultSkills[stack]; ok {
-			if err := seed("SKILL-"+stack+".md", body); err != nil {
-				return err
-			}
+	// There are no per-language skills: a capable model knows its languages, and
+	// what it cannot know (this container, the distro, the task runner, how to
+	// check a rendered page) is what the skills below cover. The layout skill is
+	// the one driven by the tree: it teaches the screenshot/measure loop, which
+	// only matters where there are stylesheets or HTML templates.
+	if slices.Contains(stacks, "css") {
+		if err := seed("SKILL-layout.md", skillLayout); err != nil {
+			return err
 		}
 	}
 	// Per-runner skills.
@@ -285,7 +255,7 @@ func skillFiles(cwd string) []string {
 // removed mid-session takes effect on the next turn while an unchanged set
 // keeps the cache prefix stable. skip (nil = keep all) excludes individual
 // files — skills="auto" passes deferredSkillSkip to withhold untouched
-// language skills from the prefix.
+// deferred skills (layout, justfile, makefile) from the prefix.
 func loadSkills(cwd string, skip func(name string) bool) string {
 	var b strings.Builder
 	for _, n := range skillFiles(cwd) {
@@ -327,40 +297,24 @@ func listSkills(cwd string) []string {
 
 // deferredSkill describes one SKILL file that skills="auto" withholds from the
 // system prompt until the session actually touches its stack. A skill is
-// triggered by tool NAME (the per-runner tools imply their stack), by a token
-// matcher run over the whitespace-split string arguments of every tool call —
-// file paths in edit/read calls, filenames inside run_command strings — or by
-// matchRaw over each WHOLE string argument (line structure intact), which is
-// how shell scripts without a .sh extension are caught: the shebang inside a
-// write_file/edit_file content argument classifies the file the same way
-// `file`(1) would, without exec'ing anything. Skills not listed here — the
-// container base, the OS skills, and anything the user drops in manually —
-// always stay inline: there is no reliable touch signal to defer them on.
+// triggered by tool NAME (the per-runner tools imply their stack), or by a token
+// matcher run over the whitespace-split string arguments of every tool call:
+// file paths in edit/read calls, filenames inside run_command strings. Skills
+// not listed here (the container base, the OS skills, and anything the user
+// drops in manually) always stay inline: there is no reliable touch signal to defer them on.
 type deferredSkill struct {
-	name     string
-	tools    []string
-	match    func(tok string) bool
-	matchRaw func(s string) bool
+	name  string
+	tools []string
+	match func(tok string) bool
 }
-
-// shebangShell matches a #! interpreter line naming a shell (sh, bash, dash,
-// zsh — not fish, whose "sh" is mid-word). Appears in write_file/edit_file
-// content the moment the model authors a script, extension or not.
-var shebangShell = regexp.MustCompile(`#![^\n]*\b(?:ba|da|z)?sh\b`)
 
 // Slice, not map: disclosure order inside one batch stays deterministic.
 var deferredSkills = []deferredSkill{
-	{name: "SKILL-bash.md", match: suffixAny(".sh", ".bash"), matchRaw: shebangShell.MatchString},
-	{name: "SKILL-c.md", match: suffixAny(".c", ".h", ".cpp", ".cc", ".cxx", ".hpp")},
-	{name: "SKILL-css.md", match: suffixAny(".css", ".scss", ".sass", ".less", ".html", ".htm")},
-	{name: "SKILL-go.md", tools: []string{"go"}, match: suffixAny(".go")},
-	{name: "SKILL-java.md", tools: []string{"gradle"}, match: suffixAny(".java")},
-	{name: "SKILL-js.md", tools: []string{"npm"}, match: suffixAny(".js", ".jsx", ".mjs", ".cjs")},
+	{name: "SKILL-layout.md", match: suffixAny(".css", ".scss", ".sass", ".less", ".html", ".htm")},
 	{name: "SKILL-justfile.md", tools: []string{"just"}, match: baseAny("justfile", "Justfile", ".justfile")},
 	{name: "SKILL-makefile.md", tools: []string{"make"}, match: func(tok string) bool {
 		return strings.HasSuffix(tok, ".mk") || baseAny("Makefile", "makefile", "GNUmakefile")(tok)
 	}},
-	{name: "SKILL-ts.md", match: suffixAny(".ts", ".tsx")},
 }
 
 func suffixAny(exts ...string) func(string) bool {
@@ -385,7 +339,7 @@ func isDeferredSkill(name string) bool {
 }
 
 // collectArgStrings returns every string value in a tool call's JSON
-// arguments, intact (line structure preserved, for matchRaw). Non-JSON
+// arguments. Non-JSON
 // arguments degrade to the raw string as one value.
 func collectArgStrings(rawArgs string) []string {
 	var v any
@@ -471,12 +425,9 @@ func (a *agent) discloseSkills(sid string, calls []toolCall) []string {
 
 	var names []string
 	var tokens []string
-	var raws []string
 	for _, tc := range calls {
 		names = append(names, tc.Function.Name)
-		rs := collectArgStrings(tc.Function.Arguments)
-		raws = append(raws, rs...)
-		tokens = append(tokens, argTokens(rs)...)
+		tokens = append(tokens, argTokens(collectArgStrings(tc.Function.Arguments))...)
 	}
 
 	var out []string
@@ -487,9 +438,6 @@ func (a *agent) discloseSkills(sid string, calls []toolCall) []string {
 		hit := slices.ContainsFunc(names, func(n string) bool { return slices.Contains(d.tools, n) })
 		if !hit && d.match != nil {
 			hit = slices.ContainsFunc(tokens, d.match)
-		}
-		if !hit && d.matchRaw != nil {
-			hit = slices.ContainsFunc(raws, d.matchRaw)
 		}
 		if !hit {
 			continue

@@ -38,7 +38,7 @@ If this task WROTE or CHANGED code:
 ## "Looks right" is NOT verification: for anything RENDERED, measure it
 A stylesheet, template or layout change has no compile step and no unit test. CSS always parses, so a WRONG rule fails exactly like a right one: silently. Changing a property and asking the user to look is not a check. It costs a user turn per attempt and tells you only "still wrong", never why.
 If this task changed how something RENDERS (CSS, HTML/template, generated document, chart, terminal output):
-- Turn the complaint into a NUMBER taken from the rendered artifact BEFORE editing anything. "The gap is too big" is a pixel count you can print (SKILL-css.md has the recipe). With no number first you cannot tell a fix from a coincidence.
+- Turn the complaint into a NUMBER taken from the rendered artifact BEFORE editing anything. "The gap is too big" is a pixel count you can print (SKILL-layout.md has the recipe). With no number first you cannot tell a fix from a coincidence.
 - Change ONE rule, take the SAME number again, report both ("16.0 -> 1.9"), never "should be better now".
 - Number unchanged after the edit? Your DIAGNOSIS was wrong, not your value. Revert that edit before trying another. Do NOT stack a second guess on the first.
 - Measure the artifact the user actually sees (the BUILT output file), not the source template it was generated from.
