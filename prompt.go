@@ -125,7 +125,7 @@ func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
 	}
 	s := string(data)
 	if len(s) > maxLLMInputBytes {
-		s = s[:maxLLMInputBytes] + "\n[... truncated ...]"
+		s = clipUTF8(s, maxLLMInputBytes) + "\n[... truncated ...]"
 	}
 	return s, base, true
 }

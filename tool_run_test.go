@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // TestBoundedOutput pins the head+tail capture: small streams come back verbatim,
@@ -43,6 +44,19 @@ func TestBoundedOutput(t *testing.T) {
 	}
 	if !strings.Contains(got, "bytes omitted") {
 		t.Errorf("ring: missing elision marker: %q", got)
+	}
+}
+
+// TestBoundedOutputKeepsUTF8 pins that eliding the middle never splits a
+// character at either cut: the output is stored in the session file, where one
+// invalid byte made the whole session unloadable.
+func TestBoundedOutputKeepsUTF8(t *testing.T) {
+	for shift := 0; shift < 3; shift++ {
+		b := newBoundedOutput(16)
+		b.Write([]byte(strings.Repeat("x", shift) + strings.Repeat("→", 20)))
+		if out := b.String(); !utf8.ValidString(out) {
+			t.Errorf("shift %d: invalid UTF-8: %q", shift, out)
+		}
 	}
 }
 

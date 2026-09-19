@@ -596,7 +596,7 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 	out, err := c.CombinedOutput()
 	tail := string(out)
 	if len(tail) > specTestTailBytes {
-		tail = "…" + tail[len(tail)-specTestTailBytes:]
+		tail = "…" + tailUTF8(tail, specTestTailBytes)
 	}
 	took := humanDuration(time.Since(start).Milliseconds())
 	if err != nil {

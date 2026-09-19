@@ -534,8 +534,8 @@ func truncateForLLM(toolName, args, content string) string {
 		return content
 	}
 	omitted := len(content) - truncateHeadChars - truncateTailChars
-	head := content[:truncateHeadChars]
-	tail := content[len(content)-truncateTailChars:]
+	head := clipUTF8(content, truncateHeadChars)
+	tail := tailUTF8(content, truncateTailChars)
 	hint := truncationHint(toolName, args)
 	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", head, omitted, len(content), hint, tail)
 }

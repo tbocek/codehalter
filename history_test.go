@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tbocek/codehalter/llm"
 )
@@ -1237,5 +1238,20 @@ func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 	m, _ = msgs[0].(map[string]any)
 	if paste, _ := m["content"].(string); strings.Contains(paste, "already_recorded") {
 		t.Errorf("empty Summary should add no block; got:\n%s", paste)
+	}
+}
+
+// TestFallbackTurnNoteIsValidUTF8 pins the note that made a session
+// unloadable: a respond call whose input had a two-byte character exactly at
+// the 100-byte cut. The note went into Shadow, compaction folded it into
+// Summary, and the TOML decoder refused the whole file over that one byte.
+func TestFallbackTurnNoteIsValidUTF8(t *testing.T) {
+	// fallbackTurnNote keeps the first 100 bytes of a tool input; ± (0xC2 0xB1,
+	// the same lead byte as the real file) starts at byte 99.
+	prefix := `{"message":"`
+	input := prefix + strings.Repeat("a", 99-len(prefix)) + "±" + strings.Repeat("x", 400) + `"}`
+	turn := []Message{{Role: "assistant", ToolUses: []ToolUse{{Name: "respond", Input: input}}}}
+	if note := fallbackTurnNote(turn); !utf8.ValidString(note) {
+		t.Errorf("note is not valid UTF-8: %q", note)
 	}
 }

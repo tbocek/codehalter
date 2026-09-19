@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tbocek/codehalter/llm"
 )
@@ -629,5 +631,38 @@ func TestExternalChangeDrift(t *testing.T) {
 	s.recordWrite(path, "let a = 5;\n")
 	if n := s.takeDriftNote(path); n != "" {
 		t.Errorf("pending note survived our own write: %q", n)
+	}
+}
+
+// TestLoadSessionRepairsInvalidUTF8 pins that one invalid byte in a session
+// file no longer makes it unloadable, and that the repair keeps what the model
+// sees: the repaired text marshals to the same JSON as the broken original,
+// which is what was sent before the restart.
+func TestLoadSessionRepairsInvalidUTF8(t *testing.T) {
+	dir := t.TempDir()
+	s, err := newSession(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broken := "the session clock of \xe2\x86\n[... 390 bytes truncated ...]"
+	s.Summary = broken
+	s.AddUser("go on")
+	if err := s.Save(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadSession(dir, s.ID)
+	if err != nil {
+		t.Fatalf("loadSession: %v", err)
+	}
+	if !utf8.ValidString(got.Summary) {
+		t.Errorf("Summary still invalid: %q", got.Summary)
+	}
+	was, _ := json.Marshal(broken)
+	now, _ := json.Marshal(got.Summary)
+	if string(was) != string(now) {
+		t.Errorf("wire bytes changed: before %s, after %s", was, now)
+	}
+	if len(got.Messages) != 1 || got.Messages[0].Content != "go on" {
+		t.Errorf("messages not restored: %+v", got.Messages)
 	}
 }

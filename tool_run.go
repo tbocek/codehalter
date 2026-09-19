@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/tbocek/codehalter/acp"
@@ -136,8 +137,11 @@ func (b *boundedOutput) String() string {
 		overlap := b.headCap + b.tailCap - b.total // bytes head and tail share
 		return string(b.head) + string(tail[overlap:])
 	default:
+		// Both cuts are byte offsets and may split a character; drop the halves,
+		// which would otherwise be invalid UTF-8 in the session file.
 		omitted := b.total - b.headCap - b.tailCap
-		return string(b.head) + fmt.Sprintf("\n[... %d bytes omitted ...]\n", omitted) + string(tail)
+		head := strings.ToValidUTF8(string(b.head), "")
+		return head + fmt.Sprintf("\n[... %d bytes omitted ...]\n", omitted) + strings.ToValidUTF8(string(tail), "")
 	}
 }
 

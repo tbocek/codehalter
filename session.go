@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 
@@ -596,8 +598,32 @@ func loadSession(cwd string, id string) (*Session, error) {
 	filename := fmt.Sprintf("session_%s.toml", id)
 	path := filepath.Join(cwd, sessionDir, filename)
 
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	// TOML refuses invalid UTF-8 outright, so one bad byte made the whole
+	// session unloadable: a string cut through a multibyte character before
+	// every cut snapped to rune boundaries (tailUTF8), or a command's raw output.
+	// Each bad byte becomes U+FFFD, which is exactly what the model already saw:
+	// Go's JSON encoder sends every invalid byte as \ufffd, so the repaired
+	// session renders to the same wire bytes and keeps its cached prefix.
+	if !utf8.Valid(data) {
+		slog.Warn("session file has invalid UTF-8, replacing it with U+FFFD", "path", path)
+		var fixed bytes.Buffer
+		for len(data) > 0 {
+			r, n := utf8.DecodeRune(data)
+			if r == utf8.RuneError && n == 1 {
+				fixed.WriteString("\uFFFD")
+			} else {
+				fixed.Write(data[:n])
+			}
+			data = data[n:]
+		}
+		data = fixed.Bytes()
+	}
 	var s Session
-	if _, err := toml.DecodeFile(path, &s); err != nil {
+	if _, err := toml.Decode(string(data), &s); err != nil {
 		return nil, err
 	}
 	s.ID = id

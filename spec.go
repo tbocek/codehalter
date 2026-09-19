@@ -718,7 +718,7 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 	if len(primaryText) > specPrimaryCap {
 		cut := strings.LastIndexByte(primaryText[:specPrimaryCap], '\n')
 		if cut <= 0 {
-			cut = specPrimaryCap
+			cut = len(clipUTF8(primaryText, specPrimaryCap))
 		}
 		resume := primary.start + strings.Count(primaryText[:cut], "\n") + 2
 		primaryText = primaryText[:cut] + fmt.Sprintf("\n[... section continues: read_file %s line=%d]", path(primary.doc), resume)

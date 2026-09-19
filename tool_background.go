@@ -96,7 +96,7 @@ func readLogTail(path string, max int) string {
 		return ""
 	}
 	if len(data) > max {
-		return "[... earlier output truncated ...]\n" + string(data[len(data)-max:])
+		return "[... earlier output truncated ...]\n" + tailUTF8(string(data), max)
 	}
 	return string(data)
 }

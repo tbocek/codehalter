@@ -644,18 +644,6 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 	}
 }
 
-// clipUTF8 truncates s to at most n bytes, snapped back to a rune boundary so a
-// multibyte character straddling the cut isn't split into a � replacement.
-func clipUTF8(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n]
-}
-
 // sliceWebBody returns up to `limit` bytes of `body` starting at `offset`,
 // clamping both ends so out-of-range arguments produce a sensible empty/last
 // slice instead of a panic. The model can pass offset past the end (e.g. when
@@ -696,7 +684,7 @@ func (a *agent) summarizePage(ctx context.Context, sid string, question, url, pa
 	if err != nil {
 		const maxLen = 2000
 		if len(pageText) > maxLen {
-			return pageText[:maxLen] + "\n... (truncated)"
+			return clipUTF8(pageText, maxLen) + "\n... (truncated)"
 		}
 		return pageText
 	}

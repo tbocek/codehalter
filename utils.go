@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // fnvHash returns the 64-bit FNV-1a hash of s — a cheap, deterministic identity
@@ -212,13 +213,42 @@ func usableCwd(reqCwd string) (string, bool, error) {
 	return fallback, true, nil
 }
 
-// truncate shortens s to maxLen runes-ish (bytes) with an ellipsis suffix when
-// it overflows; shorter strings pass through unchanged.
+// truncate shortens s to at most maxLen bytes with an ellipsis suffix when it
+// overflows; shorter strings pass through unchanged.
 func truncate(s string, maxLen int) string {
 	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+		return clipUTF8(s, maxLen) + "..."
 	}
 	return s
+}
+
+// clipUTF8 truncates s to at most n bytes, snapped back to a rune boundary so a
+// multibyte character straddling the cut isn't split into a � replacement.
+func clipUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// tailUTF8 is clipUTF8 from the other end: the last at most n bytes of s,
+// starting on a rune boundary.
+//
+// Every cut of text that can end up in the session file goes through one of
+// these two. A cut through a multibyte character leaves invalid UTF-8, and one
+// such byte in a Summary made a whole session unloadable (see loadSession).
+func tailUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	i := len(s) - n
+	for i < len(s) && !utf8.RuneStart(s[i]) {
+		i++
+	}
+	return s[i:]
 }
 
 // maxLLMInputBytes caps the bytes of any single text payload handed to an LLM
@@ -238,5 +268,5 @@ func clipBytes(s string, max int) string {
 		return s
 	}
 	half := max / 2
-	return s[:half] + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + s[len(s)-half:]
+	return clipUTF8(s, half) + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + tailUTF8(s, half)
 }
