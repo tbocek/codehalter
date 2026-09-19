@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 // binarySniffLen is how many leading bytes we sniff for a NUL to classify a file
@@ -260,7 +262,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	}
 	if looksBinary([]byte(content)) {
 		msg := fmt.Sprintf("%s is a binary file (NUL bytes) — not shown. Reading it as text would corrupt the context. Use a shell tool to inspect its bytes if you must.", path)
-		a.CompleteToolCallTitled(ctx, sid, tcId, "Read (binary, skipped): "+path, []ToolCallContent{TextContent(msg)})
+		a.CompleteToolCallTitled(ctx, sid, tcId, "Read (binary, skipped): "+path, []acp.ToolCallContent{acp.TextContent(msg)})
 		return msg, false
 	}
 
@@ -303,30 +305,23 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	// clears a path's entries on write, so a post-edit re-read starts fresh.
 	var dedupNote string
 	if sess != nil {
-		sum := fnvHash(content)
-		sess.readDedupMu.Lock()
-		if prev, ok := sess.readDedup[dedupKey]; ok && prev.hash == sum {
+		if sess.repeatedResult(dedupKey, fnvHash(content)) {
 			dedupNote = fmt.Sprintf("[note: %s — you read %s from line %d earlier this turn and it has NOT changed. Re-reading the same window makes no progress; for MORE of the file call continue_read path=%q.]", readUnchangedMarker, path, start, path)
 		}
-		if sess.readDedup == nil {
-			sess.readDedup = map[string]readDedupEntry{}
-		}
-		sess.readDedup[dedupKey] = readDedupEntry{hash: sum}
-		sess.readDedupMu.Unlock()
 	}
 
 	// Advance the cursor while the file continues; clear it at EOF.
 	if sess != nil {
-		sess.readCursorMu.Lock()
-		if sess.readCursor == nil {
-			sess.readCursor = map[string]int{}
+		sess.turnMu.Lock()
+		if sess.turn.readCursor == nil {
+			sess.turn.readCursor = map[string]int{}
 		}
 		if more {
-			sess.readCursor[path] = end + 1
+			sess.turn.readCursor[path] = end + 1
 		} else {
-			delete(sess.readCursor, path)
+			delete(sess.turn.readCursor, path)
 		}
-		sess.readCursorMu.Unlock()
+		sess.turnMu.Unlock()
 	}
 
 	var note string
@@ -357,7 +352,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 		}
 		refusal := fmt.Sprintf("This file is already in the context — %s. You read %s lines %d-%d earlier this turn and it has not changed; re-read refused.%s",
 			readUnchangedMarker, path, start, end, ptr)
-		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Read (already in context): %s (%d-%d)", path, start, end), []ToolCallContent{TextContent(refusal)})
+		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Read (already in context): %s (%d-%d)", path, start, end), []acp.ToolCallContent{acp.TextContent(refusal)})
 		return refusal, false
 	}
 
@@ -382,16 +377,8 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	} else {
 		title += " (complete)"
 	}
-	a.CompleteToolCallTitled(ctx, sid, tcId, title, []ToolCallContent{TextContent(out)})
+	a.CompleteToolCallTitled(ctx, sid, tcId, title, []acp.ToolCallContent{acp.TextContent(out)})
 	return out, false
-}
-
-// readDedupEntry holds the fnv hash of the bytes a read_file/continue_read
-// window last served. A later read of the same window whose content hashes
-// identically is a true literal repeat — the model already has those exact
-// bytes in its tool-call history.
-type readDedupEntry struct {
-	hash uint64
 }
 
 // readUnchangedMarker is a stable phrase the dedup note carries when a read is a
@@ -434,8 +421,8 @@ func listProjectFiles(root string) []string {
 	return files
 }
 
-func init() {
-	RegisterTool(Tool{Def: map[string]any{
+var fileTools = []Tool{
+	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "list_files",
@@ -466,11 +453,11 @@ func init() {
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 			return fmt.Sprintf("error: no such directory: %s", dir), false
 		}
-		tcId := a.StartToolCall(ctx, sid, "Listing: "+dir, "search", []ToolCallLocation{{Path: dir}})
+		tcId := a.StartToolCall(ctx, sid, "Listing: "+dir, "search", []acp.ToolCallLocation{{Path: dir}})
 		files := listProjectFiles(dir)
 		a.CompleteToolCallTitled(ctx, sid, tcId,
 			fmt.Sprintf("Listing: %s (%d files)", dir, len(files)),
-			[]ToolCallContent{TextContent(fmt.Sprintf("%d files", len(files)))})
+			[]acp.ToolCallContent{acp.TextContent(fmt.Sprintf("%d files", len(files)))})
 		if len(files) == 0 {
 			return "(directory is empty: " + dir + ")", false
 		}
@@ -479,21 +466,13 @@ func init() {
 		// Mirrors read_file's readUnchangedMarker so the repetition ladder
 		// counts it and the model knows to reuse the listing it already has.
 		dedupKey := "list_files|" + dir
-		h := fnvHash(listing)
-		sess.readDedupMu.Lock()
-		if sess.readDedup == nil {
-			sess.readDedup = map[string]readDedupEntry{}
-		}
-		_, seen := sess.readDedup[dedupKey]
-		sess.readDedup[dedupKey] = readDedupEntry{hash: h}
-		sess.readDedupMu.Unlock()
-		if seen {
+		if sess.repeatedResult(dedupKey, fnvHash(listing)) {
 			return fmt.Sprintf("[note: %s — you already listed %s this turn and the contents are UNCHANGED. Reuse the listing you already have.]\n%s", readUnchangedMarker, dir, listing), false
 		}
 		return listing, false
-	}})
+	}},
 
-	RegisterTool(Tool{Def: map[string]any{
+	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
@@ -530,11 +509,11 @@ func init() {
 		if haveLine {
 			title = fmt.Sprintf("Reading: %s:%d", path, line)
 		}
-		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, title, "read", []acp.ToolCallLocation{{Path: path}})
 		return a.serveRead(ctx, sid, path, start, maxLines, tcId)
-	}})
+	}},
 
-	RegisterTool(Tool{Def: map[string]any{
+	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "continue_read",
@@ -555,17 +534,17 @@ func init() {
 		}
 		start := 1
 		if sess := a.getSession(sid); sess != nil {
-			sess.readCursorMu.Lock()
-			if c, ok := sess.readCursor[path]; ok {
+			sess.turnMu.Lock()
+			if c, ok := sess.turn.readCursor[path]; ok {
 				start = c
 			}
-			sess.readCursorMu.Unlock()
+			sess.turnMu.Unlock()
 		}
-		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Continuing: %s:%d", path, start), "read", []ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Continuing: %s:%d", path, start), "read", []acp.ToolCallLocation{{Path: path}})
 		return a.serveRead(ctx, sid, path, start, readChunkLines, tcId)
-	}})
+	}},
 
-	RegisterTool(Tool{Def: map[string]any{
+	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "write_file",
@@ -592,7 +571,7 @@ func init() {
 			return refusal, true
 		}
 		newContent := args.str("content")
-		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []acp.ToolCallLocation{{Path: path}})
 
 		// Pre-edit read for the diff card + formatGuarded's dry run. A missing file
 		// (the common new-file case) and a read fault both surface as an error here,
@@ -617,12 +596,12 @@ func init() {
 			return "error writing file: " + err.Error(), false
 		}
 
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &oldContent, newContent)})
+		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.DiffContent(path, &oldContent, newContent)})
 
 		return "file written successfully" + drift, false
-	}})
+	}},
 
-	RegisterTool(Tool{Def: map[string]any{
+	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "edit_file",
@@ -652,7 +631,7 @@ func init() {
 		oldText := args.str("old_text")
 		newText := args.str("new_text")
 
-		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []acp.ToolCallLocation{{Path: path}})
 
 		content, err := fsRead(a, ctx, sid, path, nil, nil)
 		if err != nil {
@@ -718,10 +697,10 @@ func init() {
 			return "error writing file: " + err.Error(), false
 		}
 
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
+		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.DiffContent(path, &content, newContent)})
 
 		return okNote + drift, false
-	}})
+	}},
 }
 
 // fsRead reads a text file. For top-level sessions known to the ACP client
@@ -737,7 +716,7 @@ func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit 
 		if !a.clientCan("read") {
 			return directRead(path, line, limit)
 		}
-		raw, err := a.conn.sendRequest(ctx, "fs/read_text_file", struct {
+		raw, err := a.conn.SendRequest(ctx, "fs/read_text_file", struct {
 			SessionId string `json:"sessionId"`
 			Path      string `json:"path"`
 			Line      *int   `json:"line,omitempty"`
@@ -774,24 +753,22 @@ func fsWrite(a *agent, ctx context.Context, sid string, path, content string) er
 	direct := !a.clientCan("write")
 	sess := a.getSession(sid)
 	if sess != nil {
-		sess.readDedupMu.Lock()
-		for k := range sess.readDedup {
+		// The file changed: drop its read windows and any continue_read cursor,
+		// so the next read runs and starts fresh rather than from a stale line.
+		sess.turnMu.Lock()
+		for k := range sess.turn.seen {
 			if strings.HasPrefix(k, path+"|") {
-				delete(sess.readDedup, k)
+				delete(sess.turn.seen, k)
 			}
 		}
-		sess.readDedupMu.Unlock()
-		// The file changed — drop any continue_read cursor so the next read
-		// starts fresh rather than continuing from a now-stale line.
-		sess.readCursorMu.Lock()
-		delete(sess.readCursor, path)
-		sess.readCursorMu.Unlock()
+		delete(sess.turn.readCursor, path)
+		sess.turnMu.Unlock()
 	}
 	var err error
 	if direct {
 		err = os.WriteFile(path, []byte(content), 0644)
 	} else {
-		_, err = a.conn.sendRequest(ctx, "fs/write_text_file", struct {
+		_, err = a.conn.SendRequest(ctx, "fs/write_text_file", struct {
 			SessionId string `json:"sessionId"`
 			Path      string `json:"path"`
 			Content   string `json:"content"`

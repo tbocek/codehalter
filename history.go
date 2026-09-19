@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/tbocek/codehalter/llm"
 )
 
 // compactTriggerPct is the up-front input guard, NOT a compaction trigger.
@@ -194,7 +196,7 @@ func (a *agent) scheduleSummaryFold(sess *Session, summary string) {
 		// thing that ever waits on it is a compaction that is nowhere near.
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
-		out, _, _, err := a.llmStream(ctx, sess.ID, conn, []llmMessage{{
+		out, _, _, err := a.llmStream(ctx, sess.ID, conn, []llm.Message{{
 			Role: "user", Content: prompt + "\n\n" + clipBytes(summary, maxLLMInputBytes),
 		}}, nil, nil, nil, nil)
 		out = strings.TrimSpace(out)
@@ -297,7 +299,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 			// Prefix-extension: same tools array as the foreground turn (see
 			// summariseCall — required for the rendered prompt to share the
 			// foreground's prefix), tool_choice=none so the answer is the note.
-			note = a.summariseCall(ctx, sess, t.Conn.withToolChoiceNone(), t.Msgs, llmAllToolDefinitions(), t.Turn)
+			note = a.summariseCall(ctx, sess, t.Conn.WithToolChoiceNone(), t.Msgs, a.tools.defs(), t.Turn)
 		} else {
 			note = a.summariseSlice(ctx, sess, t.Conn, t.Prompt, t.Turn)
 		}
@@ -316,7 +318,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 // anchor quote pins WHICH span is "the final turn": a turn can contain
 // synthetic inner user messages (subtask prompts, skill disclosures), so
 // "everything after the last user message" would be wrong.
-func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message) []llmMessage {
+func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message) []llm.Message {
 	msgs := a.buildLLMContext(sess)
 	instr := prompt + "\n\nThe exchange to summarise is the FINAL turn of the conversation above — nothing before it."
 	for _, m := range turn {
@@ -325,7 +327,7 @@ func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message
 			break
 		}
 	}
-	return append(msgs, llmMessage{Role: "user", Content: instr})
+	return append(msgs, llm.Message{Role: "user", Content: instr})
 }
 
 // summariseCall is the shared execution core of both note modes: one LLM call
@@ -342,7 +344,7 @@ func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message
 // foreground's KV cache, and the next user turn then re-evaluates cold too.
 // The callers pair the tools with tool_choice="none" on the conn so the
 // summariser can't answer with a tool call.
-func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, tools []map[string]any, turn []Message) string {
+func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *llm.Conn, msgs []llm.Message, tools []map[string]any, turn []Message) string {
 	out, _, _, err := a.llmStream(ctx, sess.ID, conn, msgs, tools, nil, nil, nil)
 	// Whether this ran on a DEDICATED summariser, by endpoint rather than by
 	// Slot: connForBackgroundLLM stamps its llm[0] fallback with Slot 1 for the
@@ -380,7 +382,7 @@ func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConne
 // keeps working after compaction. Both the per-turn background summariser (whole
 // large turn) and the in-flight overflow recovery (the completed small turns of
 // the in-flight large turn, see foldHistory) go through here.
-func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConnection, prompt string, turn []Message) string {
+func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *llm.Conn, prompt string, turn []Message) string {
 	var turnBuf strings.Builder
 	for _, m := range turn {
 		switch m.Role {
@@ -435,7 +437,7 @@ func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConn
 			"Do NOT repeat any of it: summarise ONLY the exchange below."
 	}
 	full := prompt + "\n" + clipBytes(turnBuf.String(), maxLLMInputBytes)
-	return a.summariseCall(ctx, sess, conn, []llmMessage{{Role: "user", Content: full}}, nil, turn)
+	return a.summariseCall(ctx, sess, conn, []llm.Message{{Role: "user", Content: full}}, nil, turn)
 }
 
 // attachImageRefs appends the deterministic image-reference block to a note so
@@ -528,7 +530,7 @@ func (a *agent) replayToolOutput(sess *Session, tu ToolUse) any {
 }
 
 // buildLLMContext renders SystemPrompt + Summary + stored Messages as the
-// wire-shape llmMessage slice. Tool calls use OpenAI protocol — assistant
+// wire-shape llm.Message slice. Tool calls use OpenAI protocol — assistant
 // with ToolCalls, then one Role:"tool" per call with ToolCallID = tu.ID.
 // Every stored image is inlined as image_url every turn so wire bytes for a
 // given message stay byte-identical until compaction rotates it out; after
@@ -543,7 +545,7 @@ func wireCallID(tu ToolUse) string {
 	return tu.ID
 }
 
-func (a *agent) buildLLMContext(sess *Session) []llmMessage {
+func (a *agent) buildLLMContext(sess *Session) []llm.Message {
 	// Snapshot under the lock: the background summariser (foldHistory/rotate
 	// reassigns s.Messages) can mutate the session while this ranges it. Copy the slice header + the prompt
 	// strings, then build from the copy unlocked.
@@ -552,17 +554,17 @@ func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 	msgs := append([]Message(nil), sess.Messages...)
 	sess.mu.Unlock()
 
-	var messages []llmMessage
+	var messages []llm.Message
 
 	if systemPrompt != "" {
-		messages = append(messages, llmMessage{
+		messages = append(messages, llm.Message{
 			Role:    "user",
 			Content: systemPrompt,
 		})
 	}
 
 	if summary != "" {
-		messages = append(messages, llmMessage{
+		messages = append(messages, llm.Message{
 			Role:    "user",
 			Content: "[Earlier conversation summary — most recent messages below take priority]\n\n" + summary,
 		})
@@ -606,17 +608,17 @@ func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 			}
 		}
 
-		var toolCalls []toolCall
+		var toolCalls []llm.ToolCall
 		for _, tu := range m.ToolUses {
-			tc := toolCall{ID: wireCallID(tu), Type: "function"}
+			tc := llm.ToolCall{ID: wireCallID(tu), Type: "function"}
 			tc.Function.Name = tu.Name
 			tc.Function.Arguments = tu.Input
 			toolCalls = append(toolCalls, tc)
 		}
 
-		messages = append(messages, llmMessage{Role: m.Role, Content: content, ToolCalls: toolCalls})
+		messages = append(messages, llm.Message{Role: m.Role, Content: content, ToolCalls: toolCalls})
 		for _, tu := range m.ToolUses {
-			messages = append(messages, llmMessage{
+			messages = append(messages, llm.Message{
 				Role:       "tool",
 				Content:    a.replayToolOutput(sess, tu),
 				ToolCallID: wireCallID(tu),

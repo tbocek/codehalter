@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 // discoverRunners checks for known task runners in the project and registers
@@ -52,7 +54,7 @@ func (a *agent) discoverRunners(cwd string) {
 	a.runners = runners
 	a.mu.Unlock()
 
-	RegisterTool(Tool{Def: map[string]any{
+	a.tools.add(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_task",
@@ -125,16 +127,16 @@ func (a *agent) discoverRunners(cwd string) {
 		if runErr != nil {
 			banner := fmt.Sprintf("❌ TASK FAILED: %s (%s)\n", task, runErr.Error())
 			result := banner + "\n" + out + "\n" + banner
-			a.sendUpdate(ctx, sid, toolCallUpdate{
+			a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
 				Kind:       "tool_call_update",
 				ToolCallId: tcId,
 				Title:      "Running: " + task + " (" + runErr.Error() + ") ❌",
 				Status:     "failed",
-				Content:    []ToolCallContent{TextContent(result)},
+				Content:    []acp.ToolCallContent{acp.TextContent(result)},
 			})
 			return result, true
 		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(out)})
+		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent(out)})
 		return out, false
 	}})
 }

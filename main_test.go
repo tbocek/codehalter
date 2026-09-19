@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/tbocek/codehalter/acp"
+	"github.com/tbocek/codehalter/llm"
 )
 
 // ptr returns a pointer to v, for struct literals with *int/*bool fields
@@ -48,6 +51,29 @@ func newTestAgent(t *testing.T) (*agent, *Session) {
 	return &agent{sessions: map[string]*Session{s.ID: s}}, s
 }
 
+// pipePair returns two os.Pipe halves wired so writes on agentW arrive on
+// peerR, and writes on peerW arrive on agentR. Kernel-buffered, so small
+// writes don't deadlock the writer when no reader is yet waiting.
+func pipePair(t *testing.T) (agentW *os.File, agentR *os.File, peerW *os.File, peerR *os.File) {
+	t.Helper()
+	var err error
+	agentR, peerW, err = os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerR, agentW, err = os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		agentW.Close()
+		agentR.Close()
+		peerW.Close()
+		peerR.Close()
+	})
+	return
+}
+
 // elicitingAgent wires an agent to a pipe-backed connection and advertises
 // form elicitation, so a caller that prefers elicitation (Ask*, the MCP import)
 // takes the elicitation/create path. Returns the peer end for the test to read
@@ -56,7 +82,7 @@ func elicitingAgent(t *testing.T) (*agent, *Session, *bufio.Reader, *os.File) {
 	t.Helper()
 	a, s := newTestAgent(t)
 	agentW, agentR, peerW, peerR := pipePair(t)
-	a.conn = NewAgentSideConnection(a, agentW, agentR)
+	a.conn = acp.NewAgentSideConnection(a, agentW, agentR)
 	a.clientCaps.Elicitation = &struct {
 		Form *struct{} `json:"form"`
 		URL  *struct{} `json:"url"`
@@ -111,7 +137,7 @@ func newTerminalHarness(t *testing.T) *terminalHarness {
 	t.Helper()
 	a, s := newTestAgent(t)
 	agentW, agentR, peerW, peerR := pipePair(t)
-	a.conn = NewAgentSideConnection(a, agentW, agentR)
+	a.conn = acp.NewAgentSideConnection(a, agentW, agentR)
 	a.clientCaps.Terminal = true
 	h := &terminalHarness{agent: a, sess: s, terms: map[string]*fakeTerminal{}}
 	t.Cleanup(h.killAll)
@@ -375,13 +401,11 @@ func (h *terminalHarness) waitFor(cond func() bool) bool {
 	return false
 }
 
-// withFreshToolRegistry saves and restores the package-global registeredTools
-// around a test body, so registering fake tools doesn't leak into other tests.
-func withFreshToolRegistry(t *testing.T) {
-	t.Helper()
-	saved := registeredTools
-	registeredTools = nil
-	t.Cleanup(func() { registeredTools = saved })
+// withTools gives a exactly the tools ts, for tests that must not depend on the
+// real ones.
+func withTools(a *agent, ts ...Tool) {
+	a.tools.tools = map[string]Tool{}
+	a.tools.add(ts...)
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +461,8 @@ func newMockLLM(t *testing.T, responses ...string) *mockLLM {
 
 func (m *mockLLM) Close() { m.ts.Close() }
 
-func (m *mockLLM) conn(name string) *LLMConnection {
-	return &LLMConnection{Tag: name, Server: m.ts.URL, Model: "test-model"}
+func (m *mockLLM) conn(name string) *llm.Conn {
+	return &llm.Conn{Tag: name, Server: m.ts.URL, Model: "test-model"}
 }
 
 func (m *mockLLM) callCount() int { return int(m.idx.Load()) }

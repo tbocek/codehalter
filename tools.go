@@ -5,14 +5,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/tbocek/codehalter/acp"
+	"github.com/tbocek/codehalter/llm"
 )
 
 // ---------------------------------------------------------------------------
@@ -137,77 +142,95 @@ func denyHint(phase string) string {
 	}
 }
 
-// registryMu guards registeredTools. Most writes happen at init() (single
-// goroutine), but the MCP reconciler mutates the registry mid-session — both
-// on startup (parallel server bring-up) and at every turn boundary
-// (diff-and-apply after mcp.toml changed). Reconciles are ordered against
-// turns, never inside one, but they run on their own goroutine and ACP can
-// deliver SessionUpdate to other sessions concurrently, so the lock is
-// mandatory.
-var (
-	registryMu      sync.Mutex
-	registeredTools []Tool
-)
-
-func RegisterTool(t Tool) {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	registeredTools = append(registeredTools, t)
+// builtinTools is every tool codehalter provides in any project. Discovery adds
+// the project's own (run_command and run_background inside a container,
+// run_task when there is a task runner) and MCP adds its servers' tools, both
+// at runtime into the agent's toolRegistry.
+func builtinTools() []Tool {
+	return slices.Concat(fileTools, webTools, []Tool{
+		searchTextTool, askUserTool, submitPlanTool, respondTool,
+		insightsTool, screenshotTool, viewImageTool,
+	})
 }
 
-// UnregisterToolsByPrefix removes every tool whose function name starts with
-// the given prefix. Used by the MCP reconciler to drop a server's tools when
-// it shuts down or its config changes. Returns the number removed.
-func UnregisterToolsByPrefix(prefix string) int {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	kept := registeredTools[:0]
-	removed := 0
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
+// toolName is the function name a tool is offered and called under.
+func toolName(t Tool) string {
+	fn, _ := t.Def["function"].(map[string]any)
+	name, _ := fn["name"].(string)
+	return name
+}
+
+// toolRegistry is the agent's tool set, keyed by name. Adding a name that is
+// already there replaces it, so discovery running again for the next session
+// cannot offer a tool twice. The zero value holds the built-ins (seedLocked),
+// which is what a test fixture's zero agent starts with too.
+//
+// Most adds happen before any turn, but the MCP reconciler adds and removes
+// tools on its own goroutine while ACP may run other sessions' turns, so the
+// lock is needed.
+type toolRegistry struct {
+	mu    sync.Mutex
+	tools map[string]Tool
+}
+
+// seedLocked gives a registry that was never used the built-ins. Caller holds mu.
+func (r *toolRegistry) seedLocked() {
+	if r.tools != nil {
+		return
+	}
+	r.tools = make(map[string]Tool)
+	for _, t := range builtinTools() {
+		r.tools[toolName(t)] = t
+	}
+}
+
+func (r *toolRegistry) add(ts ...Tool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seedLocked()
+	for _, t := range ts {
+		r.tools[toolName(t)] = t
+	}
+}
+
+// removePrefix drops every tool whose name starts with prefix; the MCP
+// reconciler uses it when a server stops or its config changes.
+func (r *toolRegistry) removePrefix(prefix string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seedLocked()
+	for name := range r.tools {
 		if strings.HasPrefix(name, prefix) {
-			removed++
-			continue
+			delete(r.tools, name)
 		}
-		kept = append(kept, t)
 	}
-	// Zero the tail so closed-over goroutines (e.g. an in-flight tools/call)
-	// don't keep the old Execute closure alive through this slice.
-	for i := len(kept); i < len(registeredTools); i++ {
-		registeredTools[i] = Tool{}
-	}
-	registeredTools = kept
-	return removed
 }
 
-// llmAllToolDefinitions returns EVERY registered tool, sorted by name. Phases no
-// longer prune this — restriction is enforced at dispatch via phasePolicy — so
-// the rendered `tools` block is byte-identical across plan/execute/document and
-// the KV-cache prefix is never invalidated by a phase change (only an MCP
-// reconcile, which re-registers tools, alters it).
-func llmAllToolDefinitions() []map[string]any {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	type named struct {
-		name string
-		def  map[string]any
+// lookup returns the named tool, or ok=false and every tool's name, sorted.
+func (r *toolRegistry) lookup(name string) (t Tool, ok bool, names []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seedLocked()
+	if t, ok = r.tools[name]; !ok {
+		names = slices.Sorted(maps.Keys(r.tools))
 	}
-	var got []named
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		got = append(got, named{name, t.Def})
-	}
-	// Sort by tool name so the rendered `tools` block is byte-identical
-	// turn-over-turn regardless of registration order. The MCP reconciler
-	// re-adds server tools in a non-deterministic order; without this, that
-	// reorders the tool list every reconcile, changing the prompt prefix and
-	// busting the LLM's KV cache (full reprocess) — same rule as message bytes.
-	sort.Slice(got, func(i, j int) bool { return got[i].name < got[j].name })
-	defs := make([]map[string]any, len(got))
-	for i, g := range got {
-		defs[i] = g.def
+	return t, ok, names
+}
+
+// defs returns EVERY tool's definition, sorted by name. Phases do not prune
+// this (phasePolicy restricts calls at dispatch instead), and the order does not
+// depend on when a tool was added (the MCP reconciler re-adds a server's tools
+// in no particular order), so the rendered `tools` block is byte-identical
+// across phases and turns. Only a change to the set itself alters it; anything
+// else would change the prompt prefix and bust the server's KV cache.
+func (r *toolRegistry) defs() []map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seedLocked()
+	names := slices.Sorted(maps.Keys(r.tools))
+	defs := make([]map[string]any, len(names))
+	for i, n := range names {
+		defs[i] = r.tools[n].Def
 	}
 	return defs
 }
@@ -294,35 +317,17 @@ func (a toolArgs) has(key string) bool {
 	return ok
 }
 
-func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (string, bool) {
+func (a *agent) executeTool(ctx context.Context, sid string, tc llm.ToolCall) (string, bool) {
 	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 
-	// Find the tool under the lock and capture just its Execute closure, so the
-	// call runs WITHOUT the lock held: Execute may take seconds (bash commands,
-	// web reads) and must not block concurrent registration. Capturing the
-	// func value (not a slice index) keeps it callable even if the registry is
-	// rebuilt afterward. On a miss the scan collects the names to report.
-	registryMu.Lock()
-	var run func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
-	var names []string
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		if name == tc.Function.Name {
-			run = t.Execute
-			break
-		}
-		if name != "" {
-			names = append(names, name)
-		}
+	// Run outside the registry lock: a tool may take seconds (a build, a web
+	// read) and must not block the MCP reconciler.
+	t, ok, names := a.tools.lookup(tc.Function.Name)
+	if ok {
+		return t.Execute(ctx, a, sid, tc.Function.Arguments)
 	}
-	registryMu.Unlock()
-
-	if run != nil {
-		return run(ctx, a, sid, tc.Function.Arguments)
-	}
-	// Listed names go back to the model as the tool result, so it can
-	// self-correct on the next turn instead of looping on the same hallucination.
+	// The names go back to the model as the tool result, so it can self-correct
+	// on the next turn instead of looping on the same hallucination.
 	return fmt.Sprintf("unknown tool %q. Use only the tools provided to you; available tools: %s",
 		tc.Function.Name, strings.Join(names, ", ")), false
 }
@@ -351,7 +356,7 @@ func nextToolUseID() string {
 // message stream. Truncation lives here, not in individual tools, so every tool
 // returns its complete output and this one place decides "small → whole, big →
 // truncate + cache the rest".
-func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolUse, any) {
+func (a *agent) runToolCall(ctx context.Context, sid string, tc llm.ToolCall) (ToolUse, any) {
 	started := time.Now()
 
 	// Image short-circuit: when the server supports images, deliver the bytes
@@ -408,7 +413,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 // tool card + a recorded rejection so the model corrects. Failed is for the
 // record only — the caller doesn't feed it to the fail cap (the repetition
 // ladder catches genuine spamming).
-func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall) (ToolUse, string) {
+func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc llm.ToolCall) (ToolUse, string) {
 	msg := fmt.Sprintf("error: %s is not available during the %s phase — %s", tc.Function.Name, phase, denyHint(phase))
 	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
 	a.FailToolCall(ctx, sid, tcId, msg)
@@ -428,63 +433,22 @@ func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall
 	return tu, msg
 }
 
-type toolCallUpdate struct {
-	Kind       string             `json:"sessionUpdate"`
-	ToolCallId string             `json:"toolCallId"`
-	Title      string             `json:"title,omitempty"`
-	ToolKind   string             `json:"kind,omitempty"`
-	Status     string             `json:"status,omitempty"`
-	Content    []ToolCallContent  `json:"content,omitempty"`
-	Locations  []ToolCallLocation `json:"locations,omitempty"`
-}
-
-type ToolCallContent struct {
-	Type       string        `json:"type"`
-	Content    *ContentBlock `json:"content,omitempty"`
-	Path       string        `json:"path,omitempty"`
-	OldText    *string       `json:"oldText,omitempty"`
-	NewText    string        `json:"newText,omitempty"`
-	TerminalId string        `json:"terminalId,omitempty"`
-}
-
-type ToolCallLocation struct {
-	Path string `json:"path"`
-	Line *int   `json:"line,omitempty"`
-}
-
-func TextContent(text string) ToolCallContent {
-	b := ContentBlock{Type: "text", Text: text}
-	return ToolCallContent{Type: "content", Content: &b}
-}
-
-func DiffContent(path string, oldText *string, newText string) ToolCallContent {
-	return ToolCallContent{Type: "diff", Path: path, OldText: oldText, NewText: newText}
-}
-
-// TerminalContent embeds a terminal created with terminal/create into a tool
-// call, so the client renders its output live instead of us relaying it as
-// message chunks. Must be sent before terminal/release; the client keeps
-// showing the output afterwards.
-func TerminalContent(terminalId string) ToolCallContent {
-	return ToolCallContent{Type: "terminal", TerminalId: terminalId}
-}
-
-func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []ToolCallLocation) string {
+func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []acp.ToolCallLocation) string {
 	id := fmt.Sprintf("tc_%d", toolCallCounter.Add(1))
-	a.sendUpdate(ctx, sid, toolCallUpdate{
+	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
 		Kind:       "tool_call",
 		ToolCallId: id,
 		Title:      title,
 		ToolKind:   kind,
 		Status:     "in_progress",
-		Content:    []ToolCallContent{},
+		Content:    []acp.ToolCallContent{},
 		Locations:  locations,
 	})
 	return id
 }
 
-func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, content []ToolCallContent) {
-	a.sendUpdate(ctx, sid, toolCallUpdate{
+func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, content []acp.ToolCallContent) {
+	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
 		Status:     "completed",
@@ -496,8 +460,8 @@ func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, con
 // tool-call's title. Use this to surface a result preview in the panel
 // without requiring the user to expand the disclosure (e.g. change
 // "go_symbols: Foo" → "go_symbols: Foo → router.go:27 (+1)").
-func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, title string, content []ToolCallContent) {
-	a.sendUpdate(ctx, sid, toolCallUpdate{
+func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, title string, content []acp.ToolCallContent) {
+	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
 		Title:      title,
@@ -507,11 +471,11 @@ func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, titl
 }
 
 func (a *agent) FailToolCall(ctx context.Context, sid string, id, errMsg string) {
-	a.sendUpdate(ctx, sid, toolCallUpdate{
+	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
 		Status:     "failed",
-		Content:    []ToolCallContent{TextContent("❌ " + errMsg)},
+		Content:    []acp.ToolCallContent{acp.TextContent("❌ " + errMsg)},
 	})
 }
 

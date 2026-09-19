@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 // ---------------------------------------------------------------------------
@@ -67,7 +69,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	case "Ubuntu":
 		dockerfile = defaultDevcontainerDockerfileUbuntu
 	default:
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
+		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("Skipped")})
 		a.sendUpdateAndAbort(ctx, sid, "Devcontainer setup cancelled. "+restart)
 		return false
 	}
@@ -97,7 +99,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 					done += " (no ~/.gitconfig recorded on the host, so it isn't mounted)."
 				}
 			}
-			a.CompleteToolCall(ctx, sid, gtc, []ToolCallContent{TextContent(done)})
+			a.CompleteToolCall(ctx, sid, gtc, []acp.ToolCallContent{acp.TextContent(done)})
 		}
 	}
 	sshAgent := false
@@ -111,7 +113,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 			if yes {
 				done = "Will forward the host SSH agent."
 			}
-			a.CompleteToolCall(ctx, sid, stc, []ToolCallContent{TextContent(done)})
+			a.CompleteToolCall(ctx, sid, stc, []acp.ToolCallContent{acp.TextContent(done)})
 		}
 	}
 
@@ -135,7 +137,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	// next session (inside the container) — it asks the user, installs live,
 	// persists in this Dockerfile, and wires MCP. Nothing to seed here.
 	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json, the mounts you chose apply once you (re)start the container. " + reopen
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
+	a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent(note)})
 	a.sendUpdateAndAbort(ctx, sid, note)
 	return false
 }
@@ -307,7 +309,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	case labels[1]:
 		entry, note = "# .codehalter/ is intentionally tracked", "Marked .codehalter/ as tracked in .gitignore"
 	default:
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Cancelled")})
+		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("Cancelled")})
 		return
 	}
 
@@ -337,7 +339,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 			return
 		}
 	}
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
+	a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent(note)})
 	a.say(ctx, sid, note+"\n")
 }
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
@@ -13,52 +12,10 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/tbocek/codehalter/acp"
+	"github.com/tbocek/codehalter/llm"
 )
-
-// beginTurn registers the in-flight turn's cancel.
-func (s *Session) beginTurn(c context.CancelFunc) {
-	s.turnCancelMu.Lock()
-	s.turnCancel = c
-	s.turnCancelMu.Unlock()
-}
-
-// cancelTurn cancels the in-flight turn's ctx (Cancel button, or a new prompt
-// superseding it). The caller does NOT wait for the turn to finish.
-func (s *Session) cancelTurn() {
-	s.turnCancelMu.Lock()
-	c := s.turnCancel
-	s.turnCancelMu.Unlock()
-	if c != nil {
-		c()
-	}
-}
-
-// markSuperseding flags that a freshly-arrived prompt is about to cancel and
-// replace the in-flight turn, so that turn's cancel handler stays silent (the
-// new turn speaks for itself) instead of reporting an editor abort. Pairs with
-// adoptTurn, which clears the flag once the new turn has taken over.
-func (s *Session) markSuperseding() {
-	s.turnCancelMu.Lock()
-	s.superseding = true
-	s.turnCancelMu.Unlock()
-}
-
-// adoptTurn clears the supersede flag once the new prompt has acquired turnMu
-// and become the active turn (the superseded turn has fully unwound by then).
-func (s *Session) adoptTurn() {
-	s.turnCancelMu.Lock()
-	s.superseding = false
-	s.turnCancelMu.Unlock()
-}
-
-// superseded reports whether a newly-arrived prompt flagged the in-flight turn
-// for replacement (markSuperseding). A superseded turn's cancel handler stays
-// silent; a plain editor abort / client-side timeout surfaces its reason.
-func (s *Session) superseded() bool {
-	s.turnCancelMu.Lock()
-	defer s.turnCancelMu.Unlock()
-	return s.superseding
-}
 
 const sessionDir = ".codehalter"
 
@@ -138,7 +95,7 @@ type ToolUse struct {
 // at enqueue time so the runner doesn't have to reach back into the agent.
 type summariseTask struct {
 	Turn []Message
-	Conn *LLMConnection
+	Conn *llm.Conn
 	// Prompt is the SUMMARISE.md body for the paste-mode render (unused in
 	// prefix-extension mode, where it is already baked into Msgs).
 	Prompt string
@@ -147,7 +104,7 @@ type summariseTask struct {
 	// instruction (see appendSummariseMsgs). Frozen at ENQUEUE time so a
 	// queued task still summarises exactly its own turn even when the next
 	// turn has already started by the time the worker runs it.
-	Msgs []llmMessage
+	Msgs []llm.Message
 }
 
 type Session struct {
@@ -189,7 +146,7 @@ type Session struct {
 	// mcpOffer holds the editor's own MCP server list, as it arrived on
 	// session/new. Not persisted: it's the client's configuration, re-sent on
 	// every connect, and offerMCPImport consumes it once at bootstrap.
-	mcpOffer []acpMCPServer
+	mcpOffer []acp.MCPServer
 	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
 	// phaseActive=true means a phase entry is showing as in_progress and
 	// must be marked completed before Prompt returns; phaseCurrent is the
@@ -207,20 +164,6 @@ type Session struct {
 	// must still render in full. Under phaseMu for the same reason as the fields
 	// above, it is written from the SSE read loop.
 	planTableShown bool
-	// webBodies caches the full raw page text from web_read / web_read_raw,
-	// keyed by URL. When the LLM-visible result is truncated, the model can
-	// re-call with offset/limit to view a specific range — we slice from the
-	// cache instead of issuing another HTTP fetch, so paging through a long
-	// document is free after the first read. In-memory only; lost on restart.
-	webBodiesMu sync.Mutex
-	webBodies   map[string]string
-	// webResults caches the final rendered output (summary or raw-truncated)
-	// keyed by URL+mode. A literal-repeat web_read on the same URL skips both
-	// the HTTP fetch AND the re-summarize, and the model receives the exact
-	// same string — friendly to the LLM prefix cache. Range requests bypass
-	// this and go through webBodies/sliceWebBody.
-	webResultsMu sync.Mutex
-	webResults   map[string]string
 	// mu serialises the Save() encoder write against concurrent mutators —
 	// AddUser/AddAssistant/etc. acquire it before touching persisted fields
 	// so a Save() landing in parallel doesn't observe a torn slice. Prompt
@@ -253,66 +196,17 @@ type Session struct {
 	summariseRunning bool
 	summariseUndone  int
 	summariseCond    *sync.Cond
-	// readDedup remembers read_file outcomes for the current Prompt() turn
-	// so a literal-repeat read (same path+line+limit, file unchanged) is
-	// rejected instead of re-running. Reset at the top of Prompt(); busted
-	// for a specific path whenever edit_file / write_file writes through
-	// fsWrite. In-memory only.
-	readDedupMu sync.Mutex
-	readDedup   map[string]readDedupEntry
-	// searchDedup remembers search_text outcomes for the current Prompt() turn
-	// so a literal-repeat search (same query+path+flags, same results) is flagged
-	// with a note instead of silently re-running. Keyed by the full args, value
-	// is the fnv hash of the result. Same lifecycle as readDedup: reset at the
-	// top of Prompt(). In-memory only.
-	searchDedupMu sync.Mutex
-	searchDedup   map[string]uint64
-	// readCursor remembers, per file path, the next 1-based line continue_read
-	// should serve — set when read_file (or continue_read) returns a partial
-	// chunk, cleared when a chunk reaches EOF. Lets continue_read page forward
-	// with no line math. Same lifecycle as readDedup: reset each Prompt() turn,
-	// busted for a path on write. In-memory only.
-	readCursorMu sync.Mutex
-	readCursor   map[string]int
-	// editFailedPaths is the set of paths where edit_file returned "not found"
-	// this turn. A failed edit signals that the model's remembered content is
-	// stale or inexact, so the next read_file on that path must bypass the
-	// readContentInContext guard — the model genuinely needs a fresh look to
-	// get the exact old_text for a retry. Cleared when the path is re-read.
-	// Same lifecycle as readDedup: reset at the top of Prompt(). In-memory only.
-	editFailedPathsMu sync.Mutex
-	editFailedPaths   map[string]bool
-	// wroteHash is the hash of the bytes codehalter last wrote to each path, and
-	// drifted marks the paths a later read found different. Together they detect
-	// a file being rewritten by something outside this session between our write
-	// and the model's next look at it — an editor's format-on-save is the usual
-	// cause, and the symptom is an edit_file whose old_text was copied from a
-	// read that is no longer true. Unlike the dedup maps this is NOT reset per
-	// turn: the drift it catches routinely spans turns. In-memory only.
-	wroteMu   sync.Mutex
-	wroteHash map[string]string
-	drifted   map[string]bool
-	// bgNotes queues the results of finished run_background jobs until a quiet
-	// point (see deliverBgNotesWhenIdle / flushBgNotes). In-memory only: the job
-	// died with the process that would have reported it.
-	bgNotesMu sync.Mutex
-	bgNotes   []bgNote
-	// specFenceDir is the spec directory a running /spec loop has made
-	// read-only for the file tools (spec_loop.go); "" when no loop runs.
-	specMu       sync.Mutex
-	specFenceDir string
-	// One turn per session. turnMu is held across the whole turn; a new prompt
-	// cancelTurn()s the in-flight one then Lock()s here, so turns never overlap
-	// (overlap raced compaction → two divergent context snapshots). turnCancel is
-	// the in-flight turn's ctx cancel, fired by the Cancel button or a superseding
-	// prompt; guarded by turnCancelMu. superseding (same mutex) is set by a
-	// newly-arrived prompt right before it cancels the in-flight turn, so that
-	// turn's cancel handler can tell a supersede (stay silent) from a plain
-	// editor abort / client-side timeout (surface the reason).
-	turnMu       sync.Mutex
-	turnCancelMu sync.Mutex
-	turnCancel   context.CancelFunc
-	superseding  bool
+	// ctl is the turn gate: one turn at a time, and how a newer one replaces
+	// it (turn.go).
+	ctl turnControl
+	// turn is the current turn's scratch state (turnState) and lineage the
+	// prefix-cache comparison point that outlives it (cacheLineage). Both are
+	// guarded by turnMu, a leaf lock: nothing is called while holding it.
+	turnMu  sync.Mutex
+	turn    turnState
+	lineage cacheLineage
+	// rt is what the session keeps in memory across turns (sessionRuntime).
+	rt sessionRuntime
 	// promptSkills is the set of SKILL-*.md filenames folded into the current
 	// SystemPrompt. A skill seeded on disk AFTER the prompt was built is injected
 	// as a user message (NOT folded into the prompt — that would bust the KV
@@ -351,90 +245,105 @@ type Session struct {
 	// be pure nagging. Declining costs one card per session; `format_config =
 	// false` in settings.toml silences it for good. Not persisted.
 	formatCardShown bool `toml:"-"`
-
-	// Per-turn stats for the "✅ Done" line: reset at Prompt start, summed
-	// during the turn, read at the end. turnStart is wall-clock; turnHumanWaitMs
-	// is time blocked on user-input cards (doPermissionRequest) so it can be
-	// subtracted out; turn*Tokens sum every llmStream call's reported usage.
-	// Guarded by turnStatsMu — background goroutines (summariser, git-commit)
-	// add tokens concurrently with the foreground turn.
-	turnStatsMu          sync.Mutex
-	turnStart            time.Time
-	turnHumanWaitMs      int64
-	turnCompletionTokens int
-	// turnWastedCompletion is decode the harness threw away: a <think> stall, a
-	// stream-rule abort, a cap retry. It is already inside turnCompletionTokens,
-	// so without a name of its own it reads as productive output. It is usually
-	// the largest single cost in a bad turn: one measured stall burned 8192
-	// tokens, which at that server's 37.7 tok/s is 3.6 min, against 57 s for the
-	// prefix loss the same event caused.
-	turnWastedCompletion int
-	// turnEvaluatedPrompt is the sent-but-not-cached prompt total (Σ of each call's
-	// prompt_tokens − cached_tokens) — the real prompt work, shown on the Done line.
-	// We deliberately do NOT sum the gross prompt_tokens (which re-counts the cached
-	// prefix every call). When no backend reports a cache split, haveServerCache is
-	// false and the line falls back to turnLastPrompt (final context size).
-	turnEvaluatedPrompt int
-	turnLastPrompt      int // most recent call's prompt size
-	haveServerCache     bool
-	turnPromptMs        int64 // eval time (server prompt_ms, else TTFT)
-	turnGenMs           int64 // generation time
-	// Prefix-cache rewind detector, fed by the tool loop's calls only (see
-	// noteCacheLineage). cacheRewinds counts the calls that had to re-read
-	// prompt the previous call already sent; cacheRewound sums those tokens.
-	//
-	// cachePrevPrompt deliberately does NOT reset per turn (resetTurnStats
-	// leaves it alone): the comparison point is a property of the conversation,
-	// not of the turn. Zeroing it at every turn start exempted the FIRST call of
-	// every turn from the check, which is the one place message-list mutations
-	// actually land (compaction, a summariser fold, a tool result that replays
-	// differently than it was sent). An 11.6h session logged zero CACHE lines
-	// with a 30466-token rewind sitting in it, at exactly such a boundary.
-	cachePrevPrompt int
-	// cachePrevRender is the previous call's renderKey: the template-affecting
-	// params it was sent with. Kept next to cachePrevPrompt, and dropped by the
-	// same two callers, because it answers the question the token counts raise
-	// but cannot settle: a rewind means the prompt was re-rendered, and this
-	// says whether WE asked for that (a role switch across differing
-	// chat_template_kwargs) or the server did it on its own.
-	//
-	// Not persisted, like the rest of the lineage: a restart re-prefills anyway,
-	// so there is no cache to reason about across process boundaries.
-	cachePrevRender string
-	// cachePrevAt is when the previous call landed. A rewind cannot say why on
-	// token counts alone, and the gap separates the two causes better than
-	// anything else in the record: on the 11.6h session that motivated this
-	// detector, every stable-rendering rewind sat behind an idle gap (2h06 and
-	// 13min), while the calls seconds apart never lost a prefix. Servers reclaim
-	// idle slots, and no line of settings.toml prevents that.
-	cachePrevAt  time.Time
-	cacheRewinds int
-	cacheRewound int
-	// cacheRewindsRender is the subset of cacheRewinds where the two calls
-	// carried different template params. Split out because the fix differs: for
-	// those the user has one line of settings.toml to change, for the rest the
-	// cause is elsewhere entirely.
-	cacheRewindsRender int
 }
 
-// resetTurnStats starts a fresh per-turn measurement window at start.
-func (s *Session) resetTurnStats(start time.Time) {
-	s.turnStatsMu.Lock()
-	s.turnStart = start
-	s.turnHumanWaitMs = 0
-	s.turnCompletionTokens = 0
-	s.turnWastedCompletion = 0
-	s.turnEvaluatedPrompt = 0
-	s.turnLastPrompt = 0
-	s.haveServerCache = false
-	s.turnPromptMs = 0
-	s.turnGenMs = 0
-	// cachePrevPrompt survives on purpose — see its declaration. The counters
-	// below are per-turn reporting and do reset.
-	s.cacheRewinds = 0
-	s.cacheRewound = 0
-	s.cacheRewindsRender = 0
-	s.turnStatsMu.Unlock()
+// turnState is what one turn accumulates and the next must not see. runTurn
+// gives every turn a fresh one (startTurn), so none of it needs reset code of
+// its own; the zero value is ready and the maps are made on first write.
+// Background goroutines (summariser, git commit) add their tokens to whichever
+// turn is current. In-memory only.
+type turnState struct {
+	// seen maps each read_file window, list_files directory and search_text
+	// query to the fnv hash of what it returned, so a literal repeat with an
+	// unchanged result gets a note instead of silently re-running (repeatedRead).
+	// fsWrite drops a path's entries, so a post-edit re-read starts fresh.
+	seen map[string]uint64
+	// readCursor is, per path, the next 1-based line continue_read serves: set
+	// when read_file (or continue_read) returns a partial chunk, cleared at EOF
+	// and on a write. Lets continue_read page forward with no line math.
+	readCursor map[string]int
+	// editFailed holds the paths where edit_file returned "not found". A failed
+	// edit means the model's remembered content is stale or inexact, so the next
+	// read_file on that path bypasses the readContentInContext guard: the model
+	// needs a fresh look to get the exact old_text for a retry. Cleared when the
+	// path is re-read.
+	editFailed map[string]bool
+
+	// start and humanWaitMs give the turn's active time for the "✅ Done" line:
+	// wall clock since start minus the time blocked on user-input cards
+	// (doPermissionRequest). stats sums every llmStream call's usage; turnStats
+	// fills in its activeMs when it reads it.
+	start       time.Time
+	humanWaitMs int64
+	stats       turnReport
+}
+
+// cacheLineage is the previous tool-loop call, which noteCacheLineage compares
+// the next call's cache split against.
+//
+// It deliberately does NOT reset per turn: the comparison point is a property
+// of the conversation, not of the turn. Zeroing it at every turn start exempted
+// the FIRST call of every turn from the check, which is the one place
+// message-list mutations actually land (compaction, a summariser fold, a tool
+// result that replays differently than it was sent). An 11.6h session logged
+// zero CACHE lines with a 30466-token rewind sitting in it, at exactly such a
+// boundary. Not persisted: a restart re-prefills anyway, so there is no cache
+// to reason about across process boundaries.
+type cacheLineage struct {
+	prompt int // its prompt_tokens
+	// render is its llm.RenderKey: the template-affecting params it was sent with.
+	// It answers the question the token counts raise but cannot settle: a
+	// rewind means the prompt was re-rendered, and this says whether WE asked
+	// for that (a role switch across differing chat_template_kwargs) or the
+	// server did it on its own.
+	render string
+	// at is when it landed. A rewind cannot say why on token counts alone, and
+	// the gap separates the two causes better than anything else in the record:
+	// on the 11.6h session that motivated this detector, every stable-rendering
+	// rewind sat behind an idle gap (2h06 and 13min), while the calls seconds
+	// apart never lost a prefix. Servers reclaim idle slots, and no line of
+	// settings.toml prevents that.
+	at time.Time
+}
+
+// sessionRuntime is what a session keeps across turns but never persists: this
+// process's view of the pages it fetched, the files it wrote, the background
+// jobs that finished and the /spec loop it runs. A restart legitimately forgets
+// all of it. One leaf mutex for the lot.
+type sessionRuntime struct {
+	mu sync.Mutex
+	// webBodies caches the full page text from web_read, keyed by URL, so a
+	// range re-call (offset/limit) slices from memory instead of re-fetching.
+	webBodies map[string]string
+	// webResults caches the rendered output keyed by URL+mode, so a literal
+	// repeat skips both the fetch and the re-summarise and the model receives
+	// the exact same string (friendly to the prefix cache). Range requests
+	// bypass it and go through webBodies.
+	webResults map[string]string
+	// wroteHash is the hash of the bytes codehalter last wrote to each path, and
+	// drifted marks the paths a later read found different. Together they detect
+	// a file being rewritten by something outside this session between our write
+	// and the model's next look at it: an editor's format-on-save is the usual
+	// cause, and the symptom is an edit_file whose old_text was copied from a
+	// read that is no longer true. Not per turn: that drift routinely spans turns.
+	wroteHash map[string]string
+	drifted   map[string]bool
+	// bgNotes queues the results of finished run_background jobs until a quiet
+	// point (see deliverBgNotesWhenIdle / flushBgNotes). The job died with the
+	// process that would have reported it.
+	bgNotes []bgNote
+	// specFenceDir is the spec directory a running /spec loop has made
+	// read-only for the file tools (spec_loop.go); "" when no loop runs.
+	specFenceDir string
+}
+
+// startTurn gives the session a fresh turnState: nothing one turn saw (dedup,
+// cursors, failed edits, stats) leaks into the next. The cache lineage is kept
+// on purpose, see cacheLineage.
+func (s *Session) startTurn(start time.Time) {
+	s.turnMu.Lock()
+	s.turn = turnState{start: start}
+	s.turnMu.Unlock()
 }
 
 // addTurnTokens folds one call's usage into the turn: it sums completion and the
@@ -443,16 +352,17 @@ func (s *Session) resetTurnStats(start time.Time) {
 // the backend reported no cache split (then haveServerCache stays false). prompt
 // is the full prompt size, used only for the context-size fallback — never summed.
 func (s *Session) addTurnTokens(prompt, completion, evaluated int) {
-	s.turnStatsMu.Lock()
-	s.turnCompletionTokens += completion
+	s.turnMu.Lock()
+	st := &s.turn.stats
+	st.completion += completion
 	if prompt > 0 {
-		s.turnLastPrompt = prompt
+		st.lastPrompt = prompt
 	}
 	if evaluated >= 0 {
-		s.turnEvaluatedPrompt += evaluated
-		s.haveServerCache = true
+		st.evaluatedPrompt += evaluated
+		st.haveServerCache = true
 	}
-	s.turnStatsMu.Unlock()
+	s.turnMu.Unlock()
 }
 
 // cacheRewindSlack is how far below the previous call's prompt this call's
@@ -488,13 +398,13 @@ const wastedCompletionFloor = 256
 // a rendering change, a rewritten message, and a server-side eviction alike.
 type cacheRewind struct {
 	tokens        int           // prompt the previous call had already sent, re-read now
-	prevRender    string        // the previous call's renderKey
+	prevRender    string        // the previous call's llm.RenderKey
 	renderChanged bool          // ... and this call asked for a different one
 	idle          time.Duration // wall gap since the previous call (0 if unknown)
 }
 
 // noteCacheLineage folds one tool-loop call's cache split into the turn's
-// rewind detector and describes what it found. render is this call's renderKey
+// rewind detector and describes what it found. render is this call's llm.RenderKey
 // and now is its wall time; both are recorded for the next call to compare
 // against, whether or not this one rewound.
 //
@@ -506,22 +416,22 @@ type cacheRewind struct {
 // something rewriting the middle of the prompt (a tool result that replayed
 // differently than it was sent, or a template that repositions content).
 //
-// Only the tool loop feeds this (LLMConnection.cacheLineage), because only the
+// Only the tool loop feeds this (llm.Conn.CacheLineage), because only the
 // tool loop guarantees the premise: each call's message list is the previous
 // call's plus an append, so the server should serve the whole previous prompt
 // from cache and evaluate just the new tail. The premise holds ACROSS turn
 // boundaries too (the next turn's first call is the same list plus one user
-// message), which is why the comparison point outlives resetTurnStats: the one
+// message), which is why the comparison point outlives the turn: the one
 // place where it genuinely does not hold drops it by hand (resetCacheLineage,
 // called by compaction).
 //
 // cached < 0 means the backend reported no cache split; then there is nothing
 // to compare and the lineage restarts at this call.
 func (s *Session) noteCacheLineage(prompt, cached int, render string, now time.Time) cacheRewind {
-	s.turnStatsMu.Lock()
-	defer s.turnStatsMu.Unlock()
-	prev, prevRender, prevAt := s.cachePrevPrompt, s.cachePrevRender, s.cachePrevAt
-	s.cachePrevPrompt, s.cachePrevRender, s.cachePrevAt = prompt, render, now
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	prev, prevRender, prevAt := s.lineage.prompt, s.lineage.render, s.lineage.at
+	s.lineage = cacheLineage{prompt: prompt, render: render, at: now}
 	out := cacheRewind{prevRender: prevRender}
 	if !prevAt.IsZero() && now.After(prevAt) {
 		out.idle = now.Sub(prevAt)
@@ -542,22 +452,22 @@ func (s *Session) noteCacheLineage(prompt, cached int, render string, now time.T
 	if rewound <= cacheRewindSlack {
 		return out
 	}
-	s.cacheRewinds++
-	s.cacheRewound += rewound
+	s.turn.stats.cacheRewinds++
+	s.turn.stats.cacheRewound += rewound
 	out.tokens = rewound
 	if prevRender != render {
-		s.cacheRewindsRender++
+		s.turn.stats.cacheRewindsRender++
 		out.renderChanged = true
 	}
 	return out
 }
 
 // addWastedCompletion records completion tokens that were generated and then
-// discarded. See turnWastedCompletion.
+// discarded. See turnReport.wastedCompletion.
 func (s *Session) addWastedCompletion(n int) {
-	s.turnStatsMu.Lock()
-	s.turnWastedCompletion += n
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	s.turn.stats.wastedCompletion += n
+	s.turnMu.Unlock()
 }
 
 // resetCacheLineage drops the comparison point so the next call can't be read
@@ -565,86 +475,77 @@ func (s *Session) addWastedCompletion(n int) {
 // the prefix away by design, and reporting that as a fault would be crying
 // wolf at the one moment the user was already told what happened.
 func (s *Session) resetCacheLineage() {
-	s.turnStatsMu.Lock()
-	s.cachePrevPrompt = 0
-	s.cachePrevRender = ""
-	s.cachePrevAt = time.Time{}
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	s.lineage = cacheLineage{}
+	s.turnMu.Unlock()
 }
 
 // addTurnTiming sums one call's eval/gen times.
 func (s *Session) addTurnTiming(promptMs, genMs int64) {
-	s.turnStatsMu.Lock()
-	s.turnPromptMs += promptMs
-	s.turnGenMs += genMs
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	s.turn.stats.promptMs += promptMs
+	s.turn.stats.genMs += genMs
+	s.turnMu.Unlock()
 }
 
 // addHumanWait records time spent blocked on a user-input card so it can be
 // excluded from the turn's active time.
 func (s *Session) addHumanWait(d time.Duration) {
-	s.turnStatsMu.Lock()
-	s.turnHumanWaitMs += d.Milliseconds()
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	s.turn.humanWaitMs += d.Milliseconds()
+	s.turnMu.Unlock()
 }
 
-// turnStats returns the active wall-clock for the current turn (elapsed minus
-// time spent waiting on the user) and the summed token usage. activeMs is 0
-// before the first resetTurnStats.
-// turnReport is the end-of-turn accounting for the "✅ Done" line.
+// turnReport is the end-of-turn accounting for the "✅ Done" line, summed over
+// every llmStream call of the turn.
 type turnReport struct {
-	activeMs        int64
-	completion      int  // Σ completion_tokens
-	evaluatedPrompt int  // Σ sent-but-not-cached prompt tokens (the real prompt work)
-	lastPrompt      int  // final context size (last call's prompt_tokens)
-	haveServerCache bool // a backend reported the cache split
-	promptMs        int64
-	genMs           int64
-	cacheRewinds    int // calls that re-read prompt the previous call had sent
-	cacheRewound    int // Σ of those re-read tokens
-	// cacheRewindsRender is how many of cacheRewinds we caused ourselves by
+	activeMs   int64 // wall clock minus time waiting on the user; set by turnStats
+	completion int   // Σ completion_tokens
+	// evaluatedPrompt is Σ of each call's prompt_tokens − cached_tokens: the
+	// real prompt work. The gross prompt_tokens are deliberately NOT summed (that
+	// re-counts the cached prefix every call). When no backend reports a cache
+	// split, haveServerCache stays false and the line falls back to lastPrompt.
+	evaluatedPrompt int
+	lastPrompt      int   // final context size (last call's prompt_tokens)
+	haveServerCache bool  // a backend reported the cache split
+	promptMs        int64 // eval time (server prompt_ms, else TTFT)
+	genMs           int64 // generation time
+	// cacheRewinds counts the tool-loop calls that had to re-read prompt the
+	// previous call already sent (noteCacheLineage); cacheRewound sums those
+	// tokens; cacheRewindsRender is how many of them we caused ourselves by
 	// changing the template params between the two calls.
+	cacheRewinds       int
+	cacheRewound       int
 	cacheRewindsRender int
-	// wastedCompletion is the part of completion that was generated and then
-	// discarded.
+	// wastedCompletion is decode the harness threw away: a <think> stall, a
+	// stream-rule abort, a cap retry. It is already inside completion, so
+	// without a name of its own it reads as productive output. It is usually the
+	// largest single cost in a bad turn: one measured stall burned 8192 tokens,
+	// which at that server's 37.7 tok/s is 3.6 min, against 57 s for the prefix
+	// loss the same event caused.
 	wastedCompletion int
 }
 
+// turnStats returns the current turn's report. activeMs is 0 before the first
+// startTurn.
 func (s *Session) turnStats() turnReport {
-	s.turnStatsMu.Lock()
-	defer s.turnStatsMu.Unlock()
-	if s.turnStart.IsZero() {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.turn.start.IsZero() {
 		return turnReport{}
 	}
-	activeMs := time.Since(s.turnStart).Milliseconds() - s.turnHumanWaitMs
-	if activeMs < 0 {
-		activeMs = 0
-	}
-	return turnReport{
-		activeMs:           activeMs,
-		completion:         s.turnCompletionTokens,
-		evaluatedPrompt:    s.turnEvaluatedPrompt,
-		lastPrompt:         s.turnLastPrompt,
-		haveServerCache:    s.haveServerCache,
-		promptMs:           s.turnPromptMs,
-		genMs:              s.turnGenMs,
-		cacheRewinds:       s.cacheRewinds,
-		cacheRewound:       s.cacheRewound,
-		cacheRewindsRender: s.cacheRewindsRender,
-		wastedCompletion:   s.turnWastedCompletion,
-	}
+	r := s.turn.stats
+	r.activeMs = max(time.Since(s.turn.start).Milliseconds()-s.turn.humanWaitMs, 0)
+	return r
 }
 
 // recallWebBody returns a cached page body if the URL was fetched earlier in
 // this session. Lets range-style web_read calls slice from cache without
 // re-issuing the HTTP request.
 func (s *Session) recallWebBody(url string) (string, bool) {
-	s.webBodiesMu.Lock()
-	defer s.webBodiesMu.Unlock()
-	if s.webBodies == nil {
-		return "", false
-	}
-	b, ok := s.webBodies[url]
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	b, ok := s.rt.webBodies[url]
 	return b, ok
 }
 
@@ -653,12 +554,12 @@ func (s *Session) recallWebBody(url string) (string, bool) {
 // the model wants — if it asked for a fresh fetch it should see fresh content
 // on subsequent range views.
 func (s *Session) rememberWebBody(url, body string) {
-	s.webBodiesMu.Lock()
-	defer s.webBodiesMu.Unlock()
-	if s.webBodies == nil {
-		s.webBodies = make(map[string]string)
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	if s.rt.webBodies == nil {
+		s.rt.webBodies = make(map[string]string)
 	}
-	s.webBodies[url] = body
+	s.rt.webBodies[url] = body
 }
 
 // webResultKey distinguishes summarized vs. raw output for the same URL so
@@ -674,24 +575,21 @@ func webResultKey(url string, summarize bool) string {
 // for the same URL+mode. Lets the second call on a duplicate URL skip fetch
 // and re-summarize entirely.
 func (s *Session) recallWebResult(url string, summarize bool) (string, bool) {
-	s.webResultsMu.Lock()
-	defer s.webResultsMu.Unlock()
-	if s.webResults == nil {
-		return "", false
-	}
-	r, ok := s.webResults[webResultKey(url, summarize)]
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	r, ok := s.rt.webResults[webResultKey(url, summarize)]
 	return r, ok
 }
 
 // rememberWebResult stores the final rendered output for a URL+mode so a
 // duplicate call returns the byte-identical string without redoing any work.
 func (s *Session) rememberWebResult(url string, summarize bool, out string) {
-	s.webResultsMu.Lock()
-	defer s.webResultsMu.Unlock()
-	if s.webResults == nil {
-		s.webResults = make(map[string]string)
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	if s.rt.webResults == nil {
+		s.rt.webResults = make(map[string]string)
 	}
-	s.webResults[webResultKey(url, summarize)] = out
+	s.rt.webResults[webResultKey(url, summarize)] = out
 }
 
 func loadSession(cwd string, id string) (*Session, error) {
@@ -789,21 +687,21 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 // markEditFailed records that edit_file failed with "not found" for path,
 // allowing the next read_file on that path to bypass readContentInContext.
 func (s *Session) markEditFailed(path string) {
-	s.editFailedPathsMu.Lock()
-	if s.editFailedPaths == nil {
-		s.editFailedPaths = map[string]bool{}
+	s.turnMu.Lock()
+	if s.turn.editFailed == nil {
+		s.turn.editFailed = map[string]bool{}
 	}
-	s.editFailedPaths[path] = true
-	s.editFailedPathsMu.Unlock()
+	s.turn.editFailed[path] = true
+	s.turnMu.Unlock()
 }
 
 // clearEditFailed clears the edit-failed flag for path and returns whether
 // it was set. Called by serveRead so the bypass fires exactly once per failure.
 func (s *Session) clearEditFailed(path string) bool {
-	s.editFailedPathsMu.Lock()
-	defer s.editFailedPathsMu.Unlock()
-	if s.editFailedPaths[path] {
-		delete(s.editFailedPaths, path)
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.turn.editFailed[path] {
+		delete(s.turn.editFailed, path)
 		return true
 	}
 	return false
@@ -821,13 +719,13 @@ const externalChangeNote = "\n\n[NOTE: this file changed on disk after codehalte
 // about it would send the model looking for a difference that is gone.
 func (s *Session) recordWrite(path, content string) {
 	sum := sha256.Sum256([]byte(content))
-	s.wroteMu.Lock()
-	if s.wroteHash == nil {
-		s.wroteHash = map[string]string{}
+	s.rt.mu.Lock()
+	if s.rt.wroteHash == nil {
+		s.rt.wroteHash = map[string]string{}
 	}
-	s.wroteHash[path] = string(sum[:])
-	delete(s.drifted, path)
-	s.wroteMu.Unlock()
+	s.rt.wroteHash[path] = string(sum[:])
+	delete(s.rt.drifted, path)
+	s.rt.mu.Unlock()
 }
 
 // checkExternalChange compares a fresh full read against the bytes we last wrote
@@ -839,29 +737,29 @@ func (s *Session) recordWrite(path, content string) {
 // touched it is not drift, it is just the file.
 func (s *Session) checkExternalChange(path, content string) {
 	sum := sha256.Sum256([]byte(content))
-	s.wroteMu.Lock()
-	defer s.wroteMu.Unlock()
-	prev, ok := s.wroteHash[path]
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	prev, ok := s.rt.wroteHash[path]
 	if !ok || prev == string(sum[:]) {
 		return
 	}
-	s.wroteHash[path] = string(sum[:])
-	if s.drifted == nil {
-		s.drifted = map[string]bool{}
+	s.rt.wroteHash[path] = string(sum[:])
+	if s.rt.drifted == nil {
+		s.rt.drifted = map[string]bool{}
 	}
-	s.drifted[path] = true
+	s.rt.drifted[path] = true
 }
 
 // takeDriftNote returns the pending external-change note for path, or "" when
 // there is none, and clears it. Tools append it to their own result so the
 // warning arrives attached to the content it is about.
 func (s *Session) takeDriftNote(path string) string {
-	s.wroteMu.Lock()
-	defer s.wroteMu.Unlock()
-	if !s.drifted[path] {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	if !s.rt.drifted[path] {
 		return ""
 	}
-	delete(s.drifted, path)
+	delete(s.rt.drifted, path)
 	return externalChangeNote
 }
 
@@ -872,23 +770,38 @@ type bgNote struct {
 }
 
 func (s *Session) addBgNote(n bgNote) {
-	s.bgNotesMu.Lock()
-	s.bgNotes = append(s.bgNotes, n)
-	s.bgNotesMu.Unlock()
+	s.rt.mu.Lock()
+	s.rt.bgNotes = append(s.rt.bgNotes, n)
+	s.rt.mu.Unlock()
 }
 
 func (s *Session) hasBgNotes() bool {
-	s.bgNotesMu.Lock()
-	defer s.bgNotesMu.Unlock()
-	return len(s.bgNotes) > 0
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	return len(s.rt.bgNotes) > 0
 }
 
 func (s *Session) takeBgNotes() []bgNote {
-	s.bgNotesMu.Lock()
-	defer s.bgNotesMu.Unlock()
-	notes := s.bgNotes
-	s.bgNotes = nil
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	notes := s.rt.bgNotes
+	s.rt.bgNotes = nil
 	return notes
+}
+
+// repeatedResult records that the tool call named by key returned a result
+// hashing to sum, and reports whether the same call already returned exactly
+// that earlier this turn. read_file, list_files and search_text use it to flag
+// a literal repeat with readUnchangedMarker instead of silently re-running.
+func (s *Session) repeatedResult(key string, sum uint64) bool {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	prev, ok := s.turn.seen[key]
+	if s.turn.seen == nil {
+		s.turn.seen = map[string]uint64{}
+	}
+	s.turn.seen[key] = sum
+	return ok && prev == sum
 }
 
 // readContentInContext reports whether the exact bytes `content` are still
@@ -1040,9 +953,9 @@ func (s *Session) lastAssistantIndex() int {
 // context size at that call), so keepWindowStart can size the 400-recovery keep
 // window by REAL tokens. No-op when the backend reports no usage.
 func (s *Session) recordLastPromptTokens() {
-	s.turnStatsMu.Lock()
-	pt := s.turnLastPrompt
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	pt := s.turn.stats.lastPrompt
+	s.turnMu.Unlock()
 	if pt <= 0 {
 		return
 	}
@@ -1228,7 +1141,7 @@ func (s *Session) saveLocked() error {
 	return f.Close()
 }
 
-func listSessions(cwd string) ([]SessionInfo, error) {
+func listSessions(cwd string) ([]acp.SessionInfo, error) {
 	dir := filepath.Join(cwd, sessionDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1238,7 +1151,7 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 		return nil, err
 	}
 
-	var sessions []SessionInfo
+	var sessions []acp.SessionInfo
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), "session_") || !strings.HasSuffix(e.Name(), ".toml") {
 			continue
@@ -1256,7 +1169,7 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 		id := strings.TrimPrefix(e.Name(), "session_")
 		id = strings.TrimSuffix(id, ".toml")
 
-		sessions = append(sessions, SessionInfo{
+		sessions = append(sessions, acp.SessionInfo{
 			SessionId: id,
 			Cwd:       cwd,
 			UpdatedAt: info.ModTime().Format(time.RFC3339),
@@ -1268,11 +1181,4 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 	})
 
 	return sessions, nil
-}
-
-// SessionInfo is returned by session/list.
-type SessionInfo struct {
-	SessionId string `json:"sessionId"`
-	Cwd       string `json:"cwd"`
-	UpdatedAt string `json:"updatedAt,omitempty"`
 }

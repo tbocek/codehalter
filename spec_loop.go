@@ -10,6 +10,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 // /spec drives the implementation of a specification as a loop of rounds, one
@@ -49,16 +51,16 @@ func (e *specQuestionError) Error() string { return "the planner needs an answer
 // setSpecFence marks dir (absolute) read-only for write_file/edit_file while a
 // spec loop runs in this session; "" lifts it.
 func (s *Session) setSpecFence(dir string) {
-	s.specMu.Lock()
-	s.specFenceDir = dir
-	s.specMu.Unlock()
+	s.rt.mu.Lock()
+	s.rt.specFenceDir = dir
+	s.rt.mu.Unlock()
 }
 
 // specFence returns the fenced spec dir, or "" when no loop is running.
 func (s *Session) specFence() string {
-	s.specMu.Lock()
-	defer s.specMu.Unlock()
-	return s.specFenceDir
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	return s.rt.specFenceDir
 }
 
 // specFenceRefusal is the tool-level guard on the spec: while a loop runs, the
@@ -231,8 +233,8 @@ func specModuleNames(idx *specIndex) []string {
 }
 
 // runSpec is the /spec command: status, or setup/resume followed by the loop.
-func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args string, pendingFixes []fixProblem) (PromptResponse, error) {
-	end := PromptResponse{StopReason: "end_turn"}
+func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args string, pendingFixes []fixProblem) (acp.PromptResponse, error) {
+	end := acp.PromptResponse{StopReason: "end_turn"}
 	say := func(s string) { a.say(ctx, sid, s) }
 
 	cmd, specArg, outArg, target, err := parseSpecArgs(args)
@@ -332,7 +334,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return end, nil
 		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(map[bool]string{true: "Starting", false: "Stopped"}[ok])})
+		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent(map[bool]string{true: "Starting", false: "Stopped"}[ok])})
 		if !ok {
 			return end, nil
 		}
@@ -350,7 +352,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	reasons := map[string]string{} // why the last round on an item did not count, for its retry
 	consecutive, round := 0, 0
 	fixes := pendingFixes
-	stopped := func(err error) (PromptResponse, error) {
+	stopped := func(err error) (acp.PromptResponse, error) {
 		if serr := saveSpecConfig(sess.Cwd, cfg); serr != nil {
 			a.say(context.Background(), sid, "⚠ /spec: "+serr.Error()+"\n")
 		}
@@ -361,7 +363,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		if !sess.superseded() {
 			a.say(context.Background(), sid, msg)
 		}
-		return PromptResponse{StopReason: "cancelled"}, nil
+		return acp.PromptResponse{StopReason: "cancelled"}, nil
 	}
 
 	for {
@@ -404,10 +406,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		round++
 		prompt, head := a.specRoundPrompt(sid, cfg, idx, item, setup, covered, testCmd(), reasons[item], question, answer)
 		say(fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
-		sess.AddUser(prompt)
-		sess.saveOrLog()
-
-		turnErr := a.runTurn(ctx, sid)
+		turnErr := a.runPromptTurn(ctx, sess, prompt)
 		if isCancelled(turnErr) {
 			return stopped(turnErr)
 		}

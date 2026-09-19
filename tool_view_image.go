@@ -15,35 +15,33 @@ import (
 // — that delivers the bytes within the current turn so the next llmStream
 // call sees the image as fresh context (NOT "next turn").
 
-func init() {
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": "view_image",
-				"description": "Re-fetch a previously-attached image into the current context. " +
-					"Pass the `id` (img_<hex>) surfaced in a `[Image img_… — call view_image id=… to view]` reference. " +
-					"References appear in Summary after compaction has rotated the original user turn out, OR alongside any image still in live history when image bytes failed to read from disk. " +
-					"Only call this when you actually need to look at the image — every retrieval re-injects the full bytes into the prompt.",
-				"parameters": map[string]any{
-					"type":     "object",
-					"required": []string{"id"},
-					"properties": map[string]any{
-						"id": map[string]any{
-							"type":        "string",
-							"description": "The image id from a view_image reference, e.g. `img_a1b2c3d4e5f60718`.",
-						},
+var viewImageTool = Tool{
+	Def: map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name": "view_image",
+			"description": "Re-fetch a previously-attached image into the current context. " +
+				"Pass the `id` (img_<hex>) surfaced in a `[Image img_… — call view_image id=… to view]` reference. " +
+				"References appear in Summary after compaction has rotated the original user turn out, OR alongside any image still in live history when image bytes failed to read from disk. " +
+				"Only call this when you actually need to look at the image — every retrieval re-injects the full bytes into the prompt.",
+			"parameters": map[string]any{
+				"type":     "object",
+				"required": []string{"id"},
+				"properties": map[string]any{
+					"id": map[string]any{
+						"type":        "string",
+						"description": "The image id from a view_image reference, e.g. `img_a1b2c3d4e5f60718`.",
 					},
 				},
 			},
 		},
-		// Execute is the fallback path: if a server is configured to disable
-		// the in-loop multimodal intercept (e.g. the LLM doesn't support image
-		// inputs), this returns a plain-text error rather than silently
-		// pretending the bytes were delivered. Real success goes through
-		// dispatchViewImage and never reaches here.
-		Execute: viewImageExecuteFallback,
-	})
+	},
+	// Execute is the fallback path: if a server is configured to disable
+	// the in-loop multimodal intercept (e.g. the LLM doesn't support image
+	// inputs), this returns a plain-text error rather than silently
+	// pretending the bytes were delivered. Real success goes through
+	// dispatchViewImage and never reaches here.
+	Execute: viewImageExecuteFallback,
 }
 
 func viewImageExecuteFallback(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {

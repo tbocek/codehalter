@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 // discoverSandbox registers `run_command` whenever we're inside a container.
@@ -23,7 +25,7 @@ func (a *agent) discoverSandbox() {
 		return
 	}
 
-	RegisterTool(Tool{Def: map[string]any{
+	a.tools.add(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name": "run_command",
@@ -43,7 +45,7 @@ func (a *agent) discoverSandbox() {
 		},
 	}, Execute: runCmdExecute})
 
-	RegisterTool(Tool{Def: map[string]any{
+	a.tools.add(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_background",
@@ -176,7 +178,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	// release. Sending text content here would replace that live view with a
 	// static copy, so retitle only: a nil Content is omitted from the update, and
 	// an absent field leaves the existing content alone.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
+	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: tcId,
 		Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),

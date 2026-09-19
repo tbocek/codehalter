@@ -1,4 +1,4 @@
-package main
+package launcher
 
 import (
 	"encoding/json"
@@ -12,11 +12,17 @@ import (
 
 // scaffoldWorkspace writes the devcontainer.json codehalter itself scaffolds
 // (with every optional mount switched on, which is the widest config it ever
-// produces) into a temp workspace, plus every file those mounts bind. HOME and
-// SSH_AUTH_SOCK point at the temp tree so ${localEnv:...} resolves to something
-// that exists: composeFile refuses a bind whose source is missing.
+// produces) into a temp workspace, plus every file those mounts bind. testdata
+// holds that file; TestScaffoldIsLauncherFixture in the main package keeps it
+// current. HOME and SSH_AUTH_SOCK point at the temp tree so ${localEnv:...}
+// resolves to something that exists: composeFile refuses a bind whose source
+// is missing.
 func scaffoldWorkspace(t *testing.T) string {
 	t.Helper()
+	scaffold, err := os.ReadFile(filepath.Join("testdata", "devcontainer.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	root := t.TempDir()
 	ws := filepath.Join(root, "myproject")
 	home := filepath.Join(root, "home")
@@ -31,7 +37,7 @@ func scaffoldWorkspace(t *testing.T) string {
 	}
 	sock := filepath.Join(home, "agent.sock")
 	for _, f := range []struct{ path, body string }{
-		{filepath.Join(ws, ".devcontainer", "devcontainer.json"), buildDevcontainerJSON(true, true, true)},
+		{filepath.Join(ws, ".devcontainer", "devcontainer.json"), string(scaffold)},
 		{filepath.Join(ws, ".devcontainer", "Dockerfile"), "FROM alpine\n"},
 		{filepath.Join(home, ".gitconfig"), "[user]\n"},
 		{sock, ""},

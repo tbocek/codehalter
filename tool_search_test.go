@@ -8,6 +8,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/tbocek/codehalter/llm"
 )
 
 // TestFormatMatchBlock pins the search-result rendering: file:line header, the
@@ -144,7 +146,7 @@ func TestSearchTextDedupOnRepeat(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	var tc toolCall
+	var tc llm.ToolCall
 	tc.Function.Name = "search_text"
 	tc.Function.Arguments = `{"query":"needle"}`
 
@@ -156,7 +158,7 @@ func TestSearchTextDedupOnRepeat(t *testing.T) {
 	}
 
 	// Same query, different path → different dedup key → NOT a repeat.
-	var scoped toolCall
+	var scoped llm.ToolCall
 	scoped.Function.Name = "search_text"
 	scoped.Function.Arguments = `{"query":"needle","path":"."}`
 	if out, _ := a.executeTool(ctx, s.ID, scoped); strings.Contains(out, readUnchangedMarker) {

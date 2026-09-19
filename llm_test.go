@@ -13,6 +13,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tbocek/codehalter/llm"
 )
 
 func TestTrimJSON(t *testing.T) {
@@ -50,7 +52,7 @@ func TestTrimJSON(t *testing.T) {
 // must NOT quietly absorb the summariser.
 func TestBackgroundSlotLabel(t *testing.T) {
 	// Single entry, parallel=2 → foreground llm[0], background llm[1] (same conn).
-	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2)}}}}
+	a := &agent{settings: Settings{LLM: []llm.Conn{{Server: "u", Model: "m", Parallel: ptr(2)}}}}
 	a.buildConnSems()
 	if fg := a.settings.MainLLM("execute"); fg == nil || fg.Slot != 0 {
 		t.Fatalf("MainLLM.Slot = %v, want 0", fg)
@@ -61,7 +63,7 @@ func TestBackgroundSlotLabel(t *testing.T) {
 	}
 
 	// Single entry, parallel=1 → no second slot to label; background stays llm[0].
-	a1 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(1)}}}}
+	a1 := &agent{settings: Settings{LLM: []llm.Conn{{Server: "u", Model: "m", Parallel: ptr(1)}}}}
 	a1.buildConnSems()
 	if bg, onMain := a1.connForBackgroundLLM(); bg == nil || bg.Slot != 0 || !onMain {
 		t.Fatalf("single-slot connForBackgroundLLM = %+v onMain=%v, want Slot 0, onMain", bg, onMain)
@@ -69,7 +71,7 @@ func TestBackgroundSlotLabel(t *testing.T) {
 
 	// Two entries, neither designated → the extra is a fan-out target only, so
 	// background stays on llm[0] where it can extend the foreground prefix.
-	a2 := &agent{settings: Settings{LLM: []LLMConnection{
+	a2 := &agent{settings: Settings{LLM: []llm.Conn{
 		{Server: "u0", Model: "m0", Parallel: ptr(1)},
 		{Server: "u1", Model: "m1", Parallel: ptr(1)},
 	}}}
@@ -79,7 +81,7 @@ func TestBackgroundSlotLabel(t *testing.T) {
 	}
 
 	// Third entry designated → background routes there, past the undesignated one.
-	a3 := &agent{settings: Settings{LLM: []LLMConnection{
+	a3 := &agent{settings: Settings{LLM: []llm.Conn{
 		{Server: "u0", Model: "m0", Parallel: ptr(1)},
 		{Server: "u1", Model: "m1", Parallel: ptr(1)},
 		{Server: "u2", Model: "m2", Parallel: ptr(1), Purpose: "summary"},
@@ -96,7 +98,7 @@ func TestBackgroundSlotLabel(t *testing.T) {
 	}
 
 	// purpose on llm[0] is the same as no purpose: the fallback already lands there.
-	a4 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2), Purpose: "summary"}}}}
+	a4 := &agent{settings: Settings{LLM: []llm.Conn{{Server: "u", Model: "m", Parallel: ptr(2), Purpose: "summary"}}}}
 	a4.buildConnSems()
 	if bg, onMain := a4.connForBackgroundLLM(); bg == nil || bg.Slot != 1 || !onMain {
 		t.Fatalf("purpose on llm[0] = %+v onMain=%v, want Slot 1 onMain", bg, onMain)
@@ -108,7 +110,7 @@ func TestBackgroundSlotLabel(t *testing.T) {
 // llmStream (which captured the old channel at acquire) would release into a new
 // empty channel and block forever. A real cap change DOES rebuild.
 func TestBuildConnSemsIdempotent(t *testing.T) {
-	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "s", Model: "m"}}}}
+	a := &agent{settings: Settings{LLM: []llm.Conn{{Server: "s", Model: "m"}}}}
 	a.buildConnSems()
 	first := a.connSems[0]
 
@@ -136,7 +138,7 @@ func TestCfgConcurrentReloadAndRead(t *testing.T) {
 	a, s := newTestAgent(t)
 	reload := func(p int) {
 		a.cfgMu.Lock()
-		a.settings = Settings{LLM: []LLMConnection{
+		a.settings = Settings{LLM: []llm.Conn{
 			{Server: "http://a", Model: "m0", Parallel: ptr(p)},
 			{Server: "http://b", Model: "m1", Parallel: ptr(1)},
 		}}
@@ -182,25 +184,6 @@ func TestCfgConcurrentReloadAndRead(t *testing.T) {
 	wg.Wait()
 }
 
-func TestIsContextFull(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"400 reject", &llmHTTPError{Status: 400}, true},
-		{"context ceiling", fmt.Errorf("ceiling: %w", errContextCeiling), true},
-		{"500 error", &llmHTTPError{Status: 500}, false},
-		{"plain error", errors.New("boom"), false},
-		{"nil", nil, false},
-	}
-	for _, c := range cases {
-		if got := isContextFull(c.err); got != c.want {
-			t.Errorf("%s: isContextFull=%v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
 // TestFinishLengthClassification pins the finish=length split: truncation BELOW
 // the cap is the n_ctx ceiling (fold + retry); reasoning-only AT the cap is a
 // <think> stall (thinking-off retry); content AT the cap is a genuine, not-
@@ -211,7 +194,7 @@ func TestFinishLengthClassification(t *testing.T) {
 		mock := newMockLLM(t, sse)
 		defer mock.Close()
 		a, s := newTestAgent(t)
-		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+		a.settings = Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}}}
 		a.mainSlotTokens = 85248
 		conn := a.connForSession(context.Background(), s.ID, "thinking")
 		if conn == nil {
@@ -219,34 +202,34 @@ func TestFinishLengthClassification(t *testing.T) {
 		}
 		// sid="" disables session logging; the finish=length classification works
 		// off the locally-parsed usage tokens regardless.
-		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil)
+		_, _, _, err := a.llmStream(context.Background(), "", conn, []llm.Message{{Role: "user", Content: "go"}}, nil, nil, nil, nil)
 		return err
 	}
 
 	// Reasoning truncated BELOW the cap → n_ctx ceiling (recover by folding).
-	if err := run(sseTruncated("thinking", 82393, 2854)); err == nil || !isContextFull(err) || isStuckThinking(err) {
+	if err := run(sseTruncated("thinking", 82393, 2854)); err == nil || !llm.IsContextFull(err) || llm.IsStuckThinking(err) {
 		t.Errorf("below-cap truncation should be a context ceiling, got: %v", err)
 	}
 	// completion_tokens omitted (0) but prompt+max_tokens overruns n_ctx (85248)
 	// → still the ceiling, detected from prompt size, not the missing completion.
-	if err := run(sseTruncated("thinking", 80000, 0)); err == nil || !isContextFull(err) {
+	if err := run(sseTruncated("thinking", 80000, 0)); err == nil || !llm.IsContextFull(err) {
 		t.Errorf("no-room truncation with unreported completion should be a ceiling, got: %v", err)
 	}
 	// Reasoning-only AT the cap → stuck in <think> (recover by a thinking-off retry).
-	if err := run(sseTruncated("thinking", 1000, defaultMaxTokens)); err == nil || !isStuckThinking(err) || isContextFull(err) {
+	if err := run(sseTruncated("thinking", 1000, llm.DefaultMaxTokens)); err == nil || !llm.IsStuckThinking(err) || llm.IsContextFull(err) {
 		t.Errorf("reasoning-only cap should be a stuck-thinking stall, got: %v", err)
 	}
 	// Message CONTENT at the cap → a typed cap hit carrying the request's
 	// max_tokens, so the tool loop's cap ladder (be-concise nudge, then a
 	// doubled cap) can recover it.
-	err := run(sseTruncatedContent("verbose output", 1000, defaultMaxTokens))
-	if err == nil || isStuckThinking(err) || isContextFull(err) {
+	err := run(sseTruncatedContent("verbose output", 1000, llm.DefaultMaxTokens))
+	if err == nil || llm.IsStuckThinking(err) || llm.IsContextFull(err) {
 		t.Errorf("content at the cap should be a cap hit, got: %v", err)
 	}
-	if ce := asCapHit(err); ce == nil {
-		t.Errorf("content at the cap should classify as capHitError, got: %v", err)
-	} else if ce.Cap != defaultMaxTokens {
-		t.Errorf("capHitError.Cap = %d, want %d", ce.Cap, defaultMaxTokens)
+	if ce := llm.AsCapHit(err); ce == nil {
+		t.Errorf("content at the cap should classify as llm.CapHitError, got: %v", err)
+	} else if ce.Cap != llm.DefaultMaxTokens {
+		t.Errorf("llm.CapHitError.Cap = %d, want %d", ce.Cap, llm.DefaultMaxTokens)
 	}
 }
 
@@ -264,7 +247,7 @@ func TestReasoningArrivesUnderEitherSpelling(t *testing.T) {
 	for _, field := range []string{"reasoning_content", "reasoning"} {
 		mock := newMockLLM(t, sse(field))
 		a, s := newTestAgent(t)
-		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+		a.settings = Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}}}
 		conn := a.connForSession(context.Background(), s.ID, "thinking")
 		if conn == nil {
 			mock.Close()
@@ -272,7 +255,7 @@ func TestReasoningArrivesUnderEitherSpelling(t *testing.T) {
 		}
 		var streamed strings.Builder
 		_, _, reasoning, err := a.llmStream(context.Background(), "", conn,
-			[]llmMessage{{Role: "user", Content: "go"}}, nil, nil,
+			[]llm.Message{{Role: "user", Content: "go"}}, nil, nil,
 			func(s string) { streamed.WriteString(s) }, nil)
 		mock.Close()
 		if err != nil {
@@ -315,71 +298,6 @@ func TestIsTransientStreamError(t *testing.T) {
 	}
 }
 
-// TestThinkingOn pins the guard deciding whether a <think> stall is recoverable:
-// thinking counts as ON unless the request already suppressed it, so the retry
-// can't loop. Two ways it can be suppressed: the user's own
-// chat_template_kwargs.enable_thinking=false, or codehalter's own retry
-// continuing a prefilled closed <think></think> (continue_final_message).
-func TestThinkingOn(t *testing.T) {
-	cases := []struct {
-		name string
-		body map[string]any
-		want bool
-	}{
-		{"no kwargs", map[string]any{}, true},
-		{"empty kwargs", map[string]any{"chat_template_kwargs": map[string]any{}}, true},
-		{"enabled", map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": true}}, true},
-		{"disabled", map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}, false},
-		{"prefill continued", map[string]any{"continue_final_message": true}, false},
-		{"prefill, kwargs say on", map[string]any{
-			"continue_final_message": true,
-			"chat_template_kwargs":   map[string]any{"preserve_thinking": true},
-		}, false},
-	}
-	for _, c := range cases {
-		if got := thinkingOn(c.body); got != c.want {
-			t.Errorf("%s: thinkingOn=%v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
-// TestWithThinkingDisabled pins the retry conn copy: it arms the prefill and
-// leaves ExtraBody alone, so the two calls still render the same way. Routing
-// fields survive and the original is untouched.
-//
-// ExtraBody is what renderKey fingerprints. If the retry wrote
-// chat_template_kwargs (as it once did), the server would re-render the whole
-// conversation and hand back cached=0; the append leaves every earlier token in
-// place. Measured against ai.jos.li on the same 13,972-token prompt: kwargs
-// cached=0, prefill cached=13,968 of 13,978, reasoning suppressed either way.
-func TestWithThinkingDisabled(t *testing.T) {
-	orig := &LLMConnection{Server: "s", Model: "m", Slot: 2, ExtraBody: map[string]any{
-		"temperature":          0.7,
-		"chat_template_kwargs": map[string]any{"preserve_thinking": true},
-	}}
-	off := orig.withThinkingDisabled()
-
-	if off.Server != "s" || off.Model != "m" || off.Slot != 2 {
-		t.Errorf("routing fields changed: %+v", off)
-	}
-	if !off.noThinkPrefill {
-		t.Error("withThinkingDisabled did not arm the prefill")
-	}
-	if renderKey(off.ExtraBody) != renderKey(orig.ExtraBody) {
-		t.Errorf("the retry changed the rendering: %s vs %s",
-			renderKey(off.ExtraBody), renderKey(orig.ExtraBody))
-	}
-	if _, set := off.ExtraBody["chat_template_kwargs"].(map[string]any)["enable_thinking"]; set {
-		t.Errorf("the retry still writes enable_thinking: %+v", off.ExtraBody)
-	}
-	if off.ExtraBody["temperature"] != 0.7 {
-		t.Errorf("sibling params dropped: %+v", off.ExtraBody)
-	}
-	if orig.noThinkPrefill {
-		t.Error("withThinkingDisabled mutated the original conn")
-	}
-}
-
 // TestPrefillIsAppendedNotRendered pins what goes on the wire for the stall
 // retry: the closed think block arrives as a trailing assistant message the
 // server is told to continue, the earlier messages are untouched (that is the
@@ -390,8 +308,8 @@ func TestPrefillIsAppendedNotRendered(t *testing.T) {
 	defer mock.Close()
 	a, sess := newTestAgent(t)
 
-	conn := mock.conn("test").withThinkingDisabled()
-	msgs := []llmMessage{{Role: "user", Content: "hi"}}
+	conn := mock.conn("test").WithThinkingDisabled()
+	msgs := []llm.Message{{Role: "user", Content: "hi"}}
 	if _, _, _, err := a.llmStream(context.Background(), sess.ID, conn, msgs, nil, nil, nil, nil); err != nil {
 		t.Fatalf("llmStream: %v", err)
 	}
@@ -415,30 +333,8 @@ func TestPrefillIsAppendedNotRendered(t *testing.T) {
 		t.Errorf("the original message changed: %v", first)
 	}
 	last, _ := sent[1].(map[string]any)
-	if last["role"] != "assistant" || last["content"] != noThinkPrefillContent {
-		t.Errorf("prefill: got %v, want an assistant %q", last, noThinkPrefillContent)
-	}
-}
-
-// TestWithMaxTokens pins the prewarm conn copy: max_tokens is forced in a
-// copied ExtraBody (overriding the role default, since llmStream copies
-// ExtraBody into the request first), sibling params and routing fields
-// survive, and the original conn keeps its own cap.
-func TestWithMaxTokens(t *testing.T) {
-	orig := &LLMConnection{Server: "s", Model: "m", Slot: 1, ExtraBody: map[string]any{
-		"max_tokens":  8192,
-		"temperature": 0.7,
-	}}
-	capped := orig.withMaxTokens(1)
-
-	if capped.Server != "s" || capped.Model != "m" || capped.Slot != 1 {
-		t.Errorf("routing fields changed: %+v", capped)
-	}
-	if capped.ExtraBody["max_tokens"] != 1 || capped.ExtraBody["temperature"] != 0.7 {
-		t.Errorf("ExtraBody: got %+v, want max_tokens=1 + temperature kept", capped.ExtraBody)
-	}
-	if orig.ExtraBody["max_tokens"] != 8192 {
-		t.Error("withMaxTokens mutated the original conn")
+	if last["role"] != "assistant" || last["content"] != llm.NoThinkPrefillContent {
+		t.Errorf("prefill: got %v, want an assistant %q", last, llm.NoThinkPrefillContent)
 	}
 }
 
@@ -453,16 +349,16 @@ func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
 		mock := newMockLLM(t, sseText("here you go\n<tool_call>{\"name\":\"read_file\"}"))
 		defer mock.Close()
 		a, s := newTestAgent(t)
-		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+		a.settings = Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}}}
 		a.streamRules = compileStreamRules(defaultStreamRules)
 		conn := a.connForSession(context.Background(), s.ID, "execute")
 		if conn == nil {
 			t.Fatal("connForSession returned nil")
 		}
 		if arm {
-			conn = conn.forToolLoop()
+			conn = conn.ForToolLoop()
 		}
-		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, llmAllToolDefinitions(), nil, nil, nil)
+		_, _, _, err := a.llmStream(context.Background(), "", conn, []llm.Message{{Role: "user", Content: "go"}}, a.tools.defs(), nil, nil, nil)
 		return err
 	}
 
@@ -491,7 +387,7 @@ func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
 // (LoadOrStore), since it is a property of the deployment, not of the call.
 //
 // Only a user who wrote enable_thinking=false into a params table gets this;
-// codehalter never sets it itself (paramsFor), so an unconfigured connection
+// codehalter never sets it itself (llm.Conn.ParamsFor), so an unconfigured connection
 // has nothing to be disappointed about.
 func TestWarnsWhenServerIgnoresThinkingOff(t *testing.T) {
 	reasoned, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
@@ -504,14 +400,14 @@ func TestWarnsWhenServerIgnoresThinkingOff(t *testing.T) {
 		mock := newMockLLM(t, body)
 		defer mock.Close()
 		a, s := newTestAgent(t)
-		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m",
+		a.settings = Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m",
 			ParamsExecute: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}}}}
 		conn := a.connForSession(context.Background(), s.ID, role)
 		if conn == nil {
 			t.Fatalf("connForSession(%s) returned nil", role)
 		}
 		if _, _, _, err := a.llmStream(context.Background(), s.ID, conn,
-			[]llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil); err != nil {
+			[]llm.Message{{Role: "user", Content: "go"}}, nil, nil, nil, nil); err != nil {
 			t.Fatalf("llmStream(%s): %v", role, err)
 		}
 		_, seen := a.ctkIgnored.Load(conn.Server + "\x00" + conn.Model)
@@ -544,14 +440,14 @@ func TestRejectedChatTemplateKwargsNamesTheSetting(t *testing.T) {
 	defer ts.Close()
 
 	a, s := newTestAgent(t)
-	a.settings = Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "gpt-x",
+	a.settings = Settings{LLM: []llm.Conn{{Server: ts.URL, Model: "gpt-x",
 		ParamsExecute: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}}}}
 	conn := a.connForSession(context.Background(), s.ID, "execute")
 	if conn == nil {
 		t.Fatal("connForSession returned nil")
 	}
 	_, _, _, err := a.llmStream(context.Background(), s.ID, conn,
-		[]llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil)
+		[]llm.Message{{Role: "user", Content: "go"}}, nil, nil, nil, nil)
 	if err == nil {
 		t.Fatal("a 400 should be an error")
 	}
@@ -614,7 +510,7 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 		context.Background(),
 		"", // unscoped: no session log
 		mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "hi"}},
+		[]llm.Message{{Role: "user", Content: "hi"}},
 		nil,
 		func(tok string) { collected.WriteString(tok) },
 		nil,
@@ -672,7 +568,7 @@ func TestLLMStreamSurfacesInStreamError(t *testing.T) {
 			a := &agent{}
 			_, _, _, err := a.llmStream(
 				context.Background(), "", mock.conn("execute"),
-				[]llmMessage{{Role: "user", Content: "hi"}}, nil, nil, nil, nil,
+				[]llm.Message{{Role: "user", Content: "hi"}}, nil, nil, nil, nil,
 			)
 			if err == nil {
 				t.Fatal("llmStream: got nil error, want the in-stream error surfaced")
@@ -694,7 +590,7 @@ func TestLLMStreamSurfacesInStreamError(t *testing.T) {
 // instead of every turn silently falling back to a raw transcript.
 func TestBackgroundSkipsDeadSummariser(t *testing.T) {
 	newAgent := func() *agent {
-		a := &agent{settings: Settings{LLM: []LLMConnection{
+		a := &agent{settings: Settings{LLM: []llm.Conn{
 			{Server: "u0", Model: "m0", Parallel: ptr(1)},
 			{Server: "sum", Model: "ms", Parallel: ptr(1), Purpose: "summary"},
 		}}}
@@ -718,16 +614,16 @@ func TestBackgroundSkipsDeadSummariser(t *testing.T) {
 	wantSummariser(t, newAgent(), "unprobed")
 
 	a := newAgent()
-	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: true}}
+	a.connProbe = map[string]llm.ProbeResult{"sum\x00ms": {Reachable: true}}
 	wantSummariser(t, a, "probe says reachable")
 
 	a = newAgent()
-	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: false}}
+	a.connProbe = map[string]llm.ProbeResult{"sum\x00ms": {Reachable: false}}
 	wantMain(t, a, "probe says unreachable")
 
 	// A probe result for some OTHER endpoint must not take this one out.
 	a = newAgent()
-	a.connProbe = map[string]probeResult{"elsewhere\x00mx": {Reachable: false}}
+	a.connProbe = map[string]llm.ProbeResult{"elsewhere\x00mx": {Reachable: false}}
 	wantSummariser(t, a, "unrelated unreachable endpoint")
 
 	a = newAgent()

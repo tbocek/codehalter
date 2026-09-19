@@ -285,3 +285,23 @@ func TestEnsureSettingsGitignored(t *testing.T) {
 		t.Errorf("must append on a fresh line:\n%q", string(data3))
 	}
 }
+
+// TestScaffoldIsLauncherFixture keeps the launcher's tests honest: they run on
+// launcher/testdata/devcontainer.json, which must be exactly what codehalter
+// scaffolds with every optional mount on. On a mismatch after changing the
+// scaffold, write buildDevcontainerJSON(true, true, true) to that file.
+func TestScaffoldIsLauncherFixture(t *testing.T) {
+	fixture := filepath.Join("launcher", "testdata", "devcontainer.json")
+	if os.Getenv("CODEHALTER_WRITE_FIXTURE") != "" {
+		if err := os.WriteFile(fixture, []byte(buildDevcontainerJSON(true, true, true)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(fixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != buildDevcontainerJSON(true, true, true) {
+		t.Errorf("%s is not what codehalter scaffolds; rerun with CODEHALTER_WRITE_FIXTURE=1", fixture)
+	}
+}

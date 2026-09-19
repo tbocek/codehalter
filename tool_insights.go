@@ -265,28 +265,26 @@ func (d sessionDigest) render(b *strings.Builder) {
 
 const insightsReplyCap = 12000 // keep the digest small-model friendly
 
-func init() {
-	RegisterTool(Tool{Def: map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name":        "session_insights",
-			"description": "Mechanically analyze codehalter session logs (.codehalter/session_*.log) and return a compact failure digest: repeated identical tool calls (loops), failing tool calls with their first error line, RECOVER events, transport errors, build-vs-test balance, replan mentions. Use this INSTEAD of reading or grepping raw session logs — logs are usually far larger than the context window. Read a raw log only to zoom into one specific spot the digest points at.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"sessions": map[string]any{
-						"type":        "integer",
-						"description": "How many of the most recent session logs to analyze (default 3, max 10).",
-					},
-					"file": map[string]any{
-						"type":        "string",
-						"description": "Analyze one specific log by filename (e.g. session_abc123.log) instead of the most recent ones.",
-					},
+var insightsTool = Tool{Def: map[string]any{
+	"type": "function",
+	"function": map[string]any{
+		"name":        "session_insights",
+		"description": "Mechanically analyze codehalter session logs (.codehalter/session_*.log) and return a compact failure digest: repeated identical tool calls (loops), failing tool calls with their first error line, RECOVER events, transport errors, build-vs-test balance, replan mentions. Use this INSTEAD of reading or grepping raw session logs — logs are usually far larger than the context window. Read a raw log only to zoom into one specific spot the digest points at.",
+		"parameters": map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"sessions": map[string]any{
+					"type":        "integer",
+					"description": "How many of the most recent session logs to analyze (default 3, max 10).",
+				},
+				"file": map[string]any{
+					"type":        "string",
+					"description": "Analyze one specific log by filename (e.g. session_abc123.log) instead of the most recent ones.",
 				},
 			},
 		},
-	}, Execute: insightsExecute})
-}
+	},
+}, Execute: insightsExecute}
 
 func insightsExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	sess := a.getSession(sid)

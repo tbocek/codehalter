@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 // bgJobGrace is how long run_background waits after launch before returning, to
@@ -164,11 +166,11 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	// The terminal is NOT released here: release kills the process, and this job
 	// is meant to outlive the tool call. It stays embedded in the card, so the
 	// user watches the dev server's output live for as long as it runs.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
+	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: tcId,
 		Status:     "in_progress",
-		Content:    []ToolCallContent{TerminalContent(tid)},
+		Content:    []acp.ToolCallContent{acp.TerminalContent(tid)},
 	})
 
 	// Grace window: catch an immediate exit (failed bind, bad command) before
@@ -204,7 +206,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 		a.terminalRelease(sid, tid)
 		a.forgetBgJob(job)
 		result := fmt.Sprintf("background job %d exited immediately (exit %d) — it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", id, exit.code(), tail)
-		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, exit.code()), []ToolCallContent{TextContent(result)})
+		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, exit.code()), []acp.ToolCallContent{acp.TextContent(result)})
 		return result, false
 	}
 
@@ -221,7 +223,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	go a.watchBgJob(job)
 	// Retitle only: the card is holding the live terminal, and text content here
 	// would replace it with a static snapshot taken at second one of a dev server.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
+	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: tcId,
 		Title:      fmt.Sprintf("Background: %s (pid %d)", cmdStr, job.pid),
@@ -275,40 +277,36 @@ func (a *agent) watchBgJob(job *backgroundJob) {
 }
 
 // deliverBgNotesWhenIdle reports finished jobs at the next quiet point and
-// never interrupts a turn. Idle (turnMu free): codehalter runs a turn of its own
+// never interrupts a turn. Idle: codehalter runs a turn of its own
 // so the model looks at the result and tells the user. A turn is running: the
 // notes stay queued and Prompt delivers them when that turn ends
 // (flushBgNotes); this loop only exists to catch the window where the turn has
 // passed its flush but not yet released the lock.
 func (a *agent) deliverBgNotesWhenIdle(sess *Session) {
 	for sess.hasBgNotes() {
-		if !sess.turnMu.TryLock() {
+		// Never interrupts: a prompt the user sends while this runs replaces it,
+		// as it would any other turn.
+		ctx, release, ok := a.holdTurn(context.Background(), sess, false)
+		if !ok {
 			time.Sleep(bgWakeRetry)
 			continue
 		}
 		notes := sess.takeBgNotes()
 		if len(notes) == 0 {
-			sess.turnMu.Unlock()
+			release()
 			return
 		}
-		// The same turn bookkeeping a typed Prompt does, so a prompt the user
-		// sends now supersedes this turn exactly as it would any other.
-		ctx, cancel := context.WithCancel(context.Background())
-		sess.adoptTurn()
-		sess.beginTurn(cancel)
 		var full []string
 		for _, n := range notes {
 			a.say(ctx, sess.ID, "\n🔔 "+n.line+"\n\n")
 			full = append(full, n.full)
 		}
-		sess.AddUser(strings.Join(full, "\n\n") + "\n\nLook at the result and tell the user what it means for the work in progress. Do not start new work the user did not ask for.")
-		sess.saveOrLog()
-		if err := a.runTurn(ctx, sess.ID); err != nil && !isCancelled(err) {
+		prompt := strings.Join(full, "\n\n") + "\n\nLook at the result and tell the user what it means for the work in progress. Do not start new work the user did not ask for."
+		if err := a.runPromptTurn(ctx, sess, prompt); err != nil && !isCancelled(err) {
 			slog.Warn("background job report turn failed", "sid", sess.ID, "err", err)
 			a.say(context.Background(), sess.ID, "⚠ Could not report on the finished background job: "+err.Error()+"\n")
 		}
-		cancel()
-		sess.turnMu.Unlock()
+		release()
 		return
 	}
 }

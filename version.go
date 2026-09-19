@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/tbocek/codehalter/llm"
 )
 
 // ---------------------------------------------------------------------------
@@ -110,6 +112,15 @@ func releaseNum(tag string) int {
 // spend that budget on a version number that changes a few times a month.
 func updateCachePath() string { return filepath.Join(cacheDir(), "update.json") }
 
+// cacheDir is codehalter's per-user cache: the update check's answer, and the
+// compose files the launcher generates.
+func cacheDir() string {
+	if d, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(d, "codehalter")
+	}
+	return filepath.Join(os.TempDir(), "codehalter")
+}
+
 type updateCache struct {
 	Tag     string    `json:"tag"`
 	Checked time.Time `json:"checked"`
@@ -137,7 +148,7 @@ func latestRelease(ctx context.Context) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := metaHTTPClient.Do(req)
+	resp, err := llm.MetaHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -236,7 +247,7 @@ func selfUpdate(ctx context.Context, tag string) (string, error) {
 		tmp.Close()
 		return "", err
 	}
-	resp, err := metaHTTPClient.Do(req)
+	resp, err := llm.MetaHTTPClient.Do(req)
 	if err != nil {
 		tmp.Close()
 		return "", err

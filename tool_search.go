@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 const (
@@ -17,145 +19,136 @@ const (
 	searchContextLines = 2 // lines of context shown on each side of a match
 )
 
-func init() {
-	RegisterTool(Tool{Def: map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name":        "search_text",
-			"description": fmt.Sprintf("Search for text or a regex across all files in the project. Returns up to %d matches, each as `file:line` plus the matched line and %d lines of context on each side (the match line marked with `>`) — so you can often act on a hit without opening the file. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive. Line-oriented by default; set multiline=true so a regex can match across newlines.", maxSearchResults, searchContextLines),
-			"parameters": map[string]any{
-				"type":     "object",
-				"required": []string{"query"},
-				"properties": map[string]any{
-					"query":     map[string]any{"type": "string", "description": "Text to search for. Literal substring by default; Go RE2 regex when regex=true."},
-					"path":      map[string]any{"type": "string", "description": "Subdirectory to search in (relative to project root, empty for all)"},
-					"regex":     map[string]any{"type": "boolean", "description": "If true, interpret query as a Go RE2 regular expression. Default: false (literal substring)."},
-					"multiline": map[string]any{"type": "boolean", "description": "If true, match against the whole file at once so patterns can span newlines (e.g. `foo\\nbar`). Implies regex=true. Default: false (line-by-line)."},
-				},
+var searchTextTool = Tool{Def: map[string]any{
+	"type": "function",
+	"function": map[string]any{
+		"name":        "search_text",
+		"description": fmt.Sprintf("Search for text or a regex across all files in the project. Returns up to %d matches, each as `file:line` plus the matched line and %d lines of context on each side (the match line marked with `>`) — so you can often act on a hit without opening the file. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive. Line-oriented by default; set multiline=true so a regex can match across newlines.", maxSearchResults, searchContextLines),
+		"parameters": map[string]any{
+			"type":     "object",
+			"required": []string{"query"},
+			"properties": map[string]any{
+				"query":     map[string]any{"type": "string", "description": "Text to search for. Literal substring by default; Go RE2 regex when regex=true."},
+				"path":      map[string]any{"type": "string", "description": "Subdirectory to search in (relative to project root, empty for all)"},
+				"regex":     map[string]any{"type": "boolean", "description": "If true, interpret query as a Go RE2 regular expression. Default: false (literal substring)."},
+				"multiline": map[string]any{"type": "boolean", "description": "If true, match against the whole file at once so patterns can span newlines (e.g. `foo\\nbar`). Implies regex=true. Default: false (line-by-line)."},
 			},
 		},
-	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-		args := parseArgs(rawArgs)
-		sess := a.getSession(sid)
-		if sess == nil {
-			return "error: no session", false
-		}
-		query := args.str("query")
-		if query == "" {
-			return "error: query is empty", false
-		}
-		multiline := args.flag("multiline")
-		useRegex := multiline || args.flag("regex")
+	},
+}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+	args := parseArgs(rawArgs)
+	sess := a.getSession(sid)
+	if sess == nil {
+		return "error: no session", false
+	}
+	query := args.str("query")
+	if query == "" {
+		return "error: query is empty", false
+	}
+	multiline := args.flag("multiline")
+	useRegex := multiline || args.flag("regex")
 
-		var re *regexp.Regexp
-		matcher := func(s string) bool { return strings.Contains(s, query) }
-		if useRegex {
-			compiled, err := regexp.Compile(query)
-			if err != nil {
-				return "error: invalid regex: " + err.Error(), false
-			}
-			re = compiled
-			matcher = re.MatchString
+	var re *regexp.Regexp
+	matcher := func(s string) bool { return strings.Contains(s, query) }
+	if useRegex {
+		compiled, err := regexp.Compile(query)
+		if err != nil {
+			return "error: invalid regex: " + err.Error(), false
 		}
+		re = compiled
+		matcher = re.MatchString
+	}
 
-		root := sess.Cwd
-		dir := root
-		subdir := args.str("path")
-		if subdir != "" {
-			resolved, err := a.resolvePath(sid, subdir)
-			if err != nil {
-				return "error: " + err.Error(), false
-			}
-			dir = resolved
+	root := sess.Cwd
+	dir := root
+	subdir := args.str("path")
+	if subdir != "" {
+		resolved, err := a.resolvePath(sid, subdir)
+		if err != nil {
+			return "error: " + err.Error(), false
 		}
+		dir = resolved
+	}
 
-		// label carries the path so two searches with the same query but different
-		// scopes (e.g. `res` vs the whole repo) read distinctly in the UI — a "0
-		// matches in res" then "17 matches" is otherwise indistinguishable.
-		label := query
-		if subdir != "" {
-			label += " in " + subdir
-		}
-		tcId := a.StartToolCall(ctx, sid, "Searching: "+label, "search", nil)
+	// label carries the path so two searches with the same query but different
+	// scopes (e.g. `res` vs the whole repo) read distinctly in the UI — a "0
+	// matches in res" then "17 matches" is otherwise indistinguishable.
+	label := query
+	if subdir != "" {
+		label += " in " + subdir
+	}
+	tcId := a.StartToolCall(ctx, sid, "Searching: "+label, "search", nil)
 
-		var results []string
-		dirCounts := map[string]int{} // matches per path bucket, for the cap-hit hint
-		files := listProjectFiles(dir)
-		for _, relPath := range files {
-			if len(results) >= maxSearchResults {
-				break
-			}
-			absPath := filepath.Join(dir, relPath)
-			var matches []int
-			if multiline {
-				matches = searchInFileMultiline(absPath, re, maxSearchResults-len(results))
-			} else {
-				matches = searchInFile(absPath, matcher, maxSearchResults-len(results))
-			}
-			if len(matches) == 0 {
-				continue
-			}
-			dirCounts[searchBucket(relPath)] += len(matches)
-			// Read the file once to pull the lines around each hit.
-			var lines []string
-			if data, err := os.ReadFile(absPath); err == nil {
-				lines = strings.Split(string(data), "\n")
-				if n := len(lines); n > 0 && lines[n-1] == "" {
-					lines = lines[:n-1]
-				}
-			}
-			for _, lineNum := range matches {
-				results = append(results, formatMatchBlock(relPath, lines, lineNum, searchContextLines))
+	var results []string
+	dirCounts := map[string]int{} // matches per path bucket, for the cap-hit hint
+	files := listProjectFiles(dir)
+	for _, relPath := range files {
+		if len(results) >= maxSearchResults {
+			break
+		}
+		absPath := filepath.Join(dir, relPath)
+		var matches []int
+		if multiline {
+			matches = searchInFileMultiline(absPath, re, maxSearchResults-len(results))
+		} else {
+			matches = searchInFile(absPath, matcher, maxSearchResults-len(results))
+		}
+		if len(matches) == 0 {
+			continue
+		}
+		dirCounts[searchBucket(relPath)] += len(matches)
+		// Read the file once to pull the lines around each hit.
+		var lines []string
+		if data, err := os.ReadFile(absPath); err == nil {
+			lines = strings.Split(string(data), "\n")
+			if n := len(lines); n > 0 && lines[n-1] == "" {
+				lines = lines[:n-1]
 			}
 		}
+		for _, lineNum := range matches {
+			results = append(results, formatMatchBlock(relPath, lines, lineNum, searchContextLines))
+		}
+	}
 
-		out := "no matches found"
-		summary := "no matches"
-		if len(results) > 0 {
-			summary = fmt.Sprintf("%d matches", len(results))
-			out = strings.Join(results, "\n")
-			if len(results) >= maxSearchResults {
-				summary += ", limit reached"
-				// Hit the cap: more matches exist than shown, and the file-walk
-				// order may have spent the whole budget on one noisy tree (e.g.
-				// gitignored build/bench logs). Point the model at where the shown
-				// matches cluster so it can re-scope with `path` or ignore that
-				// tree itself, instead of re-running the same flooded search.
-				if hot := topBuckets(dirCounts, 5); hot != "" {
-					out = fmt.Sprintf("[note: hit the %d-match cap — more matches exist than shown, so this result is partial. The matches shown cluster under: %s. Re-run with a narrower `path`, or ignore those paths.]\n\n%s", maxSearchResults, hot, out)
-				}
+	out := "no matches found"
+	summary := "no matches"
+	if len(results) > 0 {
+		summary = fmt.Sprintf("%d matches", len(results))
+		out = strings.Join(results, "\n")
+		if len(results) >= maxSearchResults {
+			summary += ", limit reached"
+			// Hit the cap: more matches exist than shown, and the file-walk
+			// order may have spent the whole budget on one noisy tree (e.g.
+			// gitignored build/bench logs). Point the model at where the shown
+			// matches cluster so it can re-scope with `path` or ignore that
+			// tree itself, instead of re-running the same flooded search.
+			if hot := topBuckets(dirCounts, 5); hot != "" {
+				out = fmt.Sprintf("[note: hit the %d-match cap — more matches exist than shown, so this result is partial. The matches shown cluster under: %s. Re-run with a narrower `path`, or ignore those paths.]\n\n%s", maxSearchResults, hot, out)
 			}
 		}
+	}
 
-		// Literal-repeat dedup: the same query+path+flags returning the same
-		// results this turn gets a note so the model reuses the earlier result
-		// instead of re-running. Mirrors read_file's readUnchangedMarker dedup;
-		// loop.go scans the output for the marker to also count it as a stuck
-		// round (the prepended note changes the bytes, so callOutHash misses it).
-		dedupKey := query + "\x00" + subdir + "\x00" + fmt.Sprintf("%t%t", useRegex, multiline)
-		sum := fnvHash(out)
-		var dedupNote string
-		sess.searchDedupMu.Lock()
-		if prev, ok := sess.searchDedup[dedupKey]; ok && prev == sum {
-			dedupNote = fmt.Sprintf("[note: %s — you already ran this exact search (%s) earlier this turn and the results are UNCHANGED. Re-searching makes no progress; reuse the earlier result.]", readUnchangedMarker, label)
-		}
-		if sess.searchDedup == nil {
-			sess.searchDedup = map[string]uint64{}
-		}
-		sess.searchDedup[dedupKey] = sum
-		sess.searchDedupMu.Unlock()
+	// Literal-repeat dedup: the same query+path+flags returning the same
+	// results this turn gets a note so the model reuses the earlier result
+	// instead of re-running. Mirrors read_file's readUnchangedMarker dedup;
+	// loop.go scans the output for the marker to also count it as a stuck
+	// round (the prepended note changes the bytes, so callOutHash misses it).
+	dedupKey := query + "\x00" + subdir + "\x00" + fmt.Sprintf("%t%t", useRegex, multiline)
+	var dedupNote string
+	if sess.repeatedResult(dedupKey, fnvHash(out)) {
+		dedupNote = fmt.Sprintf("[note: %s — you already ran this exact search (%s) earlier this turn and the results are UNCHANGED. Re-searching makes no progress; reuse the earlier result.]", readUnchangedMarker, label)
+	}
 
-		title := "Searching: " + label + " (" + summary + ")"
-		if dedupNote != "" {
-			title += " (repeat)"
-		}
-		a.CompleteToolCallTitled(ctx, sid, tcId, title, []ToolCallContent{TextContent(summary)})
-		if dedupNote != "" {
-			out = dedupNote + "\n" + out
-		}
-		return out, false
-	}})
-}
+	title := "Searching: " + label + " (" + summary + ")"
+	if dedupNote != "" {
+		title += " (repeat)"
+	}
+	a.CompleteToolCallTitled(ctx, sid, tcId, title, []acp.ToolCallContent{acp.TextContent(summary)})
+	if dedupNote != "" {
+		out = dedupNote + "\n" + out
+	}
+	return out, false
+}}
 
 // formatMatchBlock renders one search hit as `file:matchLine` followed by the
 // matched line and up to ctx lines of context on each side, line-numbered, the

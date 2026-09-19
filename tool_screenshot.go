@@ -18,6 +18,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 // screenshot renders a file from the workspace with headless Firefox and hands
@@ -59,45 +61,43 @@ var (
 	bodyCloseRe = regexp.MustCompile(`(?i)</body>`)
 )
 
-func init() {
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": "screenshot",
-				"description": "Render a local HTML/SVG/image file with headless Firefox and look at the result. " +
-					"Use it to CHECK a rendering you changed (CSS, template, generated page) instead of asking the user whether it looks right. " +
-					"Point `path` at the BUILT file the user sees, not the source template it was generated from. " +
-					"`selector` puts one element at the top of the shot: that is how you inspect a block of a long page without pushing a huge image into the prompt. " +
-					"A screenshot tells you WHETHER something is off, not by how much: for a distance, measure it as a number instead.",
-				"parameters": map[string]any{
-					"type":     "object",
-					"required": []string{"path"},
-					"properties": map[string]any{
-						"path": map[string]any{
-							"type":        "string",
-							"description": "Project-relative path of the file to render, e.g. `out/index.html`. Must be inside the project; there is no URL mode.",
-						},
-						"selector": map[string]any{
-							"type":        "string",
-							"description": "Optional CSS selector. Its first match is scrolled to the top of the shot, and the reply says whether it matched and where it sits.",
-						},
-						"width": map[string]any{
-							"type":        "integer",
-							"description": fmt.Sprintf("Viewport width in px. Default %d, max %d.", screenshotDefaultWidth, screenshotMaxWidth),
-						},
-						"height": map[string]any{
-							"type":        "integer",
-							"description": fmt.Sprintf("Viewport height in px. Default %d, max %d. A taller shot captures more of the page and costs more; prefer `selector`.", screenshotDefaultHeight, screenshotMaxHeight),
-						},
+var screenshotTool = Tool{
+	Def: map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name": "screenshot",
+			"description": "Render a local HTML/SVG/image file with headless Firefox and look at the result. " +
+				"Use it to CHECK a rendering you changed (CSS, template, generated page) instead of asking the user whether it looks right. " +
+				"Point `path` at the BUILT file the user sees, not the source template it was generated from. " +
+				"`selector` puts one element at the top of the shot: that is how you inspect a block of a long page without pushing a huge image into the prompt. " +
+				"A screenshot tells you WHETHER something is off, not by how much: for a distance, measure it as a number instead.",
+			"parameters": map[string]any{
+				"type":     "object",
+				"required": []string{"path"},
+				"properties": map[string]any{
+					"path": map[string]any{
+						"type":        "string",
+						"description": "Project-relative path of the file to render, e.g. `out/index.html`. Must be inside the project; there is no URL mode.",
+					},
+					"selector": map[string]any{
+						"type":        "string",
+						"description": "Optional CSS selector. Its first match is scrolled to the top of the shot, and the reply says whether it matched and where it sits.",
+					},
+					"width": map[string]any{
+						"type":        "integer",
+						"description": fmt.Sprintf("Viewport width in px. Default %d, max %d.", screenshotDefaultWidth, screenshotMaxWidth),
+					},
+					"height": map[string]any{
+						"type":        "integer",
+						"description": fmt.Sprintf("Viewport height in px. Default %d, max %d. A taller shot captures more of the page and costs more; prefer `selector`.", screenshotDefaultHeight, screenshotMaxHeight),
 					},
 				},
 			},
 		},
-		// Execute is the fallback path, same shape as view_image's: real
-		// success goes through dispatchScreenshot and never reaches here.
-		Execute: screenshotExecuteFallback,
-	})
+	},
+	// Execute is the fallback path, same shape as view_image's: real
+	// success goes through dispatchScreenshot and never reaches here.
+	Execute: screenshotExecuteFallback,
 }
 
 // screenshotExecuteFallback runs when the dispatcher declined to intercept,
@@ -143,7 +143,7 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 	selector := strings.TrimSpace(args.str("selector"))
 
 	title := fmt.Sprintf("Screenshot: %s (%dx%d)", rel, width, height)
-	tcID := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: rel}})
+	tcID := a.StartToolCall(ctx, sid, title, "read", []acp.ToolCallLocation{{Path: rel}})
 
 	png, note, err := renderPage(ctx, bin, abs, selector, width, height)
 	if err != nil {
@@ -161,7 +161,7 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 		return msg, nil, "", true
 	}
 	text := fmt.Sprintf("[Screenshot of %s (%dx%d) attached as %s.%s]", rel, width, height, id, note)
-	a.CompleteToolCall(ctx, sid, tcID, []ToolCallContent{TextContent(fmt.Sprintf("%s, %d KiB%s", id, len(png)/1024, note))})
+	a.CompleteToolCall(ctx, sid, tcID, []acp.ToolCallContent{acp.TextContent(fmt.Sprintf("%s, %d KiB%s", id, len(png)/1024, note))})
 	return text, imageParts(text, "image/png", png), id, false
 }
 

@@ -264,16 +264,14 @@ func TestResolvePath(t *testing.T) {
 }
 
 // TestAllToolDefinitions pins the cache invariant that replaced per-phase
-// pruning: llmAllToolDefinitions returns EVERY registered tool, sorted by name
+// pruning: toolRegistry.defs returns EVERY tool, sorted by name
 // (NOT registration order), so the rendered `tools` block is byte-identical
 // across phases and turns. (Registered out of order on purpose.)
 func TestAllToolDefinitions(t *testing.T) {
-	withFreshToolRegistry(t)
-	RegisterTool(Tool{Def: toolDef("read")})
-	RegisterTool(Tool{Def: toolDef("write")})
-	RegisterTool(Tool{Def: toolDef("other")})
+	a := &agent{}
+	withTools(a, Tool{Def: toolDef("read")}, Tool{Def: toolDef("write")}, Tool{Def: toolDef("other")})
 
-	if got, want := toolNames(llmAllToolDefinitions()), []string{"other", "read", "write"}; !slices.Equal(got, want) {
+	if got, want := toolNames(a.tools.defs()), []string{"other", "read", "write"}; !slices.Equal(got, want) {
 		t.Errorf("got %v, want %v (all tools, sorted)", got, want)
 	}
 }

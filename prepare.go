@@ -12,6 +12,9 @@ import (
 	"slices"
 	"sort"
 	"strings"
+
+	"github.com/tbocek/codehalter/acp"
+	"github.com/tbocek/codehalter/llm"
 )
 
 // Fix-card prompts — the message dispatched to the executor when the user
@@ -381,7 +384,7 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
 			probed := "GET /v1/models and GET /props"
 			if len(a.settings.LLM) > 0 {
 				c := &a.settings.LLM[0]
-				probed = "GET " + c.endpoint("/v1/models") + " and GET " + c.endpoint("/props")
+				probed = "GET " + c.Endpoint("/v1/models") + " and GET " + c.Endpoint("/props")
 			}
 			where := a.settings.path
 			if where == "" {
@@ -396,7 +399,7 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return
 		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Retrying LLM probe")})
+		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("Retrying LLM probe")})
 		forceRetry = true
 	}
 }
@@ -485,16 +488,16 @@ func (a *agent) hasReachableLLM() bool {
 // state changes.
 func (a *agent) probeAllLLMs(ctx context.Context) {
 	conns := a.settings.allConnections()
-	a.connProbe = make(map[string]probeResult, len(conns))
+	a.connProbe = make(map[string]llm.ProbeResult, len(conns))
 	a.setMainSlotTokens(0)
 	if len(conns) == 0 {
 		a.imagesSupported = false
 		return
 	}
-	results := make([]probeResult, len(conns))
+	results := make([]llm.ProbeResult, len(conns))
 	parallel(len(conns), len(conns), func(i int) {
 		c := conns[i]
-		results[i] = a.probeLLM(ctx, &c)
+		results[i] = llm.Probe(ctx, &c)
 	})
 	// Record reachability and auto-detect the slot count: when an [[llm]] left
 	// `parallel` unset, adopt llama.cpp's reported total_slots (-np) so connSems,
@@ -523,7 +526,7 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// per-slot n_ctx (no division, robust to the total ÷ -np split); else divide
 	// a known total — an explicit context_size (the total the user declared) or
 	// /v1/models' -c launch arg — by the slot count.
-	slots := a.settings.LLM[0].parallelCap()
+	slots := a.settings.LLM[0].ParallelCap()
 	switch {
 	case conns[0].ContextSize != nil && *conns[0].ContextSize > 0:
 		a.setMainSlotTokens(*conns[0].ContextSize / slots)
@@ -578,7 +581,7 @@ func (a *agent) renderLLMStatus() string {
 		// Reachable, but /v1/models answered without listing the configured id.
 		// The connection works yet requests for this model often come back empty
 		// (the gateway routes an unknown/unloaded name to nothing, returning a
-		// clean 200 with no content). Previously swallowed — probeLLM logged
+		// clean 200 with no content). Previously swallowed — llm.Probe logged
 		// loaded=false and moved on, so the banner showed a bare ✅ and the user
 		// only discovered the problem when the first turn failed to parse.
 		if pr := a.connProbe[c.Server+"\x00"+c.Model]; pr.ModelKnown && !pr.ModelLoaded {
@@ -592,7 +595,7 @@ func (a *agent) renderLLMStatus() string {
 			}
 			continue
 		}
-		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.Server, c.parallelCap())
+		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.Server, c.ParallelCap())
 		// The one settings mistake that costs real time and shows no symptom.
 		// Everything that is not a sampler is an argument to the server's chat
 		// template, so two roles that disagree there ask for two different
@@ -603,7 +606,7 @@ func (a *agent) renderLLMStatus() string {
 		// detector already reports this, but only after the tokens are spent,
 		// and the counts alone do not say which key caused it. Say it here,
 		// before the first call, and name the two renderings.
-		if think, exec := renderKey(c.paramsFor("thinking")), renderKey(c.paramsFor("execute")); think != exec {
+		if think, exec := llm.RenderKey(c.ParamsFor("thinking")), llm.RenderKey(c.ParamsFor("execute")); think != exec {
 			// "(none)" rather than an empty string: no template params at all is
 			// the good configuration and should not read like missing data.
 			show := func(k string) string {
@@ -640,7 +643,7 @@ func (a *agent) renderLLMStatus() string {
 		fmt.Fprintf(&b, "🟡 Context window: only %d tokens/slot — codehalter requires at least %d. Raise `context_size` in settings.toml, increase your server's launch flag (`-c N` / `--max-model-len N`), or reduce `parallel`.\n\n", a.mainSlotTokens, minSlotTokens)
 	default:
 		inputCap := a.mainSlotTokens * compactTriggerPct / 100
-		if pc := conns[0].parallelCap(); pc > 1 {
+		if pc := conns[0].ParallelCap(); pc > 1 {
 			fmt.Fprintf(&b, "✅ Context window: %d tokens/slot (n_ctx %d ÷ %d slots, max prompt %d)\n\n", a.mainSlotTokens, a.mainSlotTokens*pc, pc, inputCap)
 		} else {
 			fmt.Fprintf(&b, "✅ Context window: %d tokens (max prompt %d)\n\n", a.mainSlotTokens, inputCap)
@@ -1017,20 +1020,18 @@ func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 		return
 	}
 	if !ok {
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped — fix it manually when convenient")})
+		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("Skipped — fix it manually when convenient")})
 		return
 	}
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Dispatching: " + p.prompt)})
+	a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("Dispatching: " + p.prompt)})
 	sess := a.getSession(sid)
 	if sess == nil {
 		return
 	}
-	sess.AddUser(p.prompt)
-	sess.saveOrLog()
-	// The accepted fix is its own turn — run it through the same path as a typed
-	// Prompt (runTurn) so it gets the "✅ Done" stats line, git-commit, and
-	// compaction. This used to call orchestrate directly and skip all three.
-	if err := a.runTurn(ctx, sid); err != nil {
+	// The accepted fix is its own turn, inside the turn the caller holds, run
+	// through the same path as a typed prompt so it gets the "✅ Done" stats
+	// line and compaction.
+	if err := a.runPromptTurn(ctx, sess, p.prompt); err != nil {
 		// A cancelled fix dispatch is routine (user stopped it); a real failure
 		// is not — surface it at Warn so a fix that silently never ran is
 		// visible in the log rather than buried at Debug.

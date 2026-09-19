@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tbocek/codehalter/llm"
 )
 
 // TestTurnServerCache pins the server-driven accounting: with the evaluated
@@ -14,7 +16,7 @@ import (
 // total is no longer tracked.
 func TestTurnServerCache(t *testing.T) {
 	s := &Session{}
-	s.resetTurnStats(time.Now())
+	s.startTurn(time.Now())
 	s.addTurnTokens(1000, 50, 1000) // cold: 1000 evaluated (uncached)
 	s.addTurnTokens(1100, 40, 100)  // 100 evaluated, the rest served from cache
 	r := s.turnStats()
@@ -27,7 +29,7 @@ func TestTurnServerCache(t *testing.T) {
 
 	// No server cache info → no claim, keep the final context size.
 	s2 := &Session{}
-	s2.resetTurnStats(time.Now())
+	s2.startTurn(time.Now())
 	s2.addTurnTokens(5000, 30, -1)
 	s2.addTurnTokens(5200, 20, -1)
 	r2 := s2.turnStats()
@@ -47,7 +49,7 @@ func TestTurnServerCache(t *testing.T) {
 func TestCacheLineage(t *testing.T) {
 	at := lineageClock()
 	s := &Session{}
-	s.resetTurnStats(time.Now())
+	s.startTurn(time.Now())
 
 	// Real trace of the fixed run: cached is always prompt(n-1) - 4.
 	healthy := [][2]int{{11307, 5348}, {11483, 11303}, {11666, 11479}, {12732, 11662}}
@@ -64,7 +66,7 @@ func TestCacheLineage(t *testing.T) {
 	// tail behind it. 65 is the same fault with nothing behind the boundary:
 	// under the slack, deliberately not reported.
 	s2 := &Session{}
-	s2.resetTurnStats(time.Now())
+	s2.startTurn(time.Now())
 	s2.noteCacheLineage(15346, 5348, "", at()) // first call: no comparison point
 	broken := [][3]int{{15346, 8475, 6871}, {17000, 7002, 8344}, {17100, 17035, 0}}
 	for _, c := range broken {
@@ -80,7 +82,7 @@ func TestCacheLineage(t *testing.T) {
 	// A backend that reports no cache split (cached = -1) can't be judged, and
 	// must not make the NEXT call look like a rewind either.
 	s3 := &Session{}
-	s3.resetTurnStats(time.Now())
+	s3.startTurn(time.Now())
 	s3.noteCacheLineage(9000, -1, "", at())
 	if n := s3.noteCacheLineage(9100, -1, "", at()).tokens; n != 0 {
 		t.Errorf("no cache info: got %d, want 0", n)
@@ -96,13 +98,13 @@ func TestCacheLineage(t *testing.T) {
 	// 115135-token fault that never happened. The genuine loss three hours later
 	// (72033 -> 71997, a 36-token shrink from the thinking-off flip) still counts.
 	s5 := &Session{}
-	s5.resetTurnStats(time.Now())
+	s5.startTurn(time.Now())
 	s5.noteCacheLineage(115135, 115000, "", at())
 	if n := s5.noteCacheLineage(5970, 0, "", at()).tokens; n != 0 {
 		t.Errorf("context reset reported as a %d-token rewind", n)
 	}
 	s6 := &Session{}
-	s6.resetTurnStats(time.Now())
+	s6.startTurn(time.Now())
 	s6.noteCacheLineage(72033, 71900, "", at())
 	if n := s6.noteCacheLineage(71997, 0, "", at()).tokens; n != 72033 {
 		t.Errorf("genuine loss after a 36-token shrink: got %d, want 72033", n)
@@ -110,7 +112,7 @@ func TestCacheLineage(t *testing.T) {
 
 	// Compaction rewrites the front of the context on purpose.
 	s4 := &Session{}
-	s4.resetTurnStats(time.Now())
+	s4.startTurn(time.Now())
 	s4.noteCacheLineage(30000, 29996, "", at())
 	s4.resetCacheLineage()
 	if n := s4.noteCacheLineage(12000, 0, "", at()).tokens; n != 0 {
@@ -119,7 +121,7 @@ func TestCacheLineage(t *testing.T) {
 }
 
 // TestCacheLineageSpansTurns pins the blind spot that made every rewind above
-// invisible in practice: resetTurnStats used to zero the comparison point, so
+// invisible in practice: the turn reset used to zero the comparison point, so
 // the FIRST call of every turn was exempt — and a turn boundary is the one place
 // the message list actually gets mutated (compaction, a summariser fold, a tool
 // result that replays differently than it was sent). One 11.6h session logged
@@ -129,10 +131,10 @@ func TestCacheLineage(t *testing.T) {
 func TestCacheLineageSpansTurns(t *testing.T) {
 	at := lineageClock()
 	s := &Session{}
-	s.resetTurnStats(time.Now())
+	s.startTurn(time.Now())
 	s.noteCacheLineage(51594, 51590, "", at()) // last call of turn 1
 
-	s.resetTurnStats(time.Now()) // turn 2 begins
+	s.startTurn(time.Now()) // turn 2 begins
 	// First call of turn 2: an image dropped out of the middle of the prompt, so
 	// the server could only reuse the part in front of it.
 	if n := s.noteCacheLineage(51163, 21128, "", at()).tokens; n != 51594-21128 {
@@ -144,7 +146,7 @@ func TestCacheLineageSpansTurns(t *testing.T) {
 
 	// The per-turn counters DO reset, so turn 3 starts its report clean while
 	// keeping the comparison point.
-	s.resetTurnStats(time.Now())
+	s.startTurn(time.Now())
 	if r := s.turnStats(); r.cacheRewinds != 0 || r.cacheRewound != 0 {
 		t.Errorf("turn 3: rewinds=%d rewound=%d, want 0 and 0", r.cacheRewinds, r.cacheRewound)
 	}
@@ -179,47 +181,6 @@ func TestUpsertLastAssistant(t *testing.T) {
 	}
 	if s.Messages[2].Role != "assistant" || s.Messages[2].Content != "answer" {
 		t.Errorf("tail: got %+v", s.Messages[2])
-	}
-}
-
-// TestSessionTurnControl pins the turn-cancel handle: beginTurn registers the
-// in-flight cancel, cancelTurn fires it (Cancel button OR a new prompt
-// superseding). The caller never waits, so a wedged turn can't block the next.
-func TestSessionTurnControl(t *testing.T) {
-	s := &Session{}
-	cancelled := false
-	s.beginTurn(func() { cancelled = true })
-	s.cancelTurn()
-	if !cancelled {
-		t.Error("cancelTurn should fire the registered cancel")
-	}
-
-	// A new turn overwrites the cancel; cancelTurn now fires the NEW one only.
-	first, second := false, false
-	s.beginTurn(func() { first = true })
-	s.beginTurn(func() { second = true })
-	s.cancelTurn()
-	if first || !second {
-		t.Errorf("cancelTurn should fire only the latest turn: first=%v second=%v", first, second)
-	}
-}
-
-// TestSessionSupersedeFlag pins the supersede flag that lets a cancelled turn
-// tell an editor abort (surface the reason) from a new-prompt supersede (stay
-// silent). markSuperseding sets it, superseded reads it, adoptTurn clears it
-// once the replacement turn has taken over.
-func TestSessionSupersedeFlag(t *testing.T) {
-	s := &Session{}
-	if s.superseded() {
-		t.Error("fresh session should not be flagged superseded")
-	}
-	s.markSuperseding()
-	if !s.superseded() {
-		t.Error("markSuperseding should set the flag")
-	}
-	s.adoptTurn()
-	if s.superseded() {
-		t.Error("adoptTurn should clear the flag")
 	}
 }
 
@@ -294,7 +255,7 @@ func TestKeepWindowStart(t *testing.T) {
 
 // TestCacheLineageNamesTheRenderChange pins the attribution half of the rewind
 // detector. The token counts alone say the prompt was re-rendered; they cannot
-// say who did it. Recording the renderKey of each call answers that, and the
+// say who did it. Recording the llm.RenderKey of each call answers that, and the
 // two answers have nothing in common: a rendering that changed is one line of
 // settings.toml, a rendering that held is compaction, a tool result that
 // replayed differently, or a server-side eviction.
@@ -305,7 +266,7 @@ func TestKeepWindowStart(t *testing.T) {
 // more. 99582 tokens for one setting, and nothing in the log said so.
 //
 // codehalter no longer causes this: the retry appends a closed <think></think>
-// instead (see withThinkingDisabled). The detector stays because a settings.toml
+// instead (see llm.Conn.WithThinkingDisabled). The detector stays because a settings.toml
 // whose two roles disagree on chat_template_kwargs reproduces it exactly, and
 // the numbers below are what that costs.
 func TestCacheLineageNamesTheRenderChange(t *testing.T) {
@@ -315,7 +276,7 @@ func TestCacheLineageNamesTheRenderChange(t *testing.T) {
 		exec  = `{"chat_template_kwargs":{"enable_thinking":false}}`
 	)
 	s := &Session{}
-	s.resetTurnStats(time.Now())
+	s.startTurn(time.Now())
 	s.noteCacheLineage(71997, 71000, think, at())
 
 	// Same conversation, different rendering asked for: the server had nothing
@@ -345,7 +306,7 @@ func TestCacheLineageNamesTheRenderChange(t *testing.T) {
 	// A rewind with the rendering unchanged is a different fault and must not be
 	// blamed on the settings.
 	s2 := &Session{}
-	s2.resetTurnStats(time.Now())
+	s2.startTurn(time.Now())
 	s2.noteCacheLineage(51594, 51590, think, at())
 	if rw := s2.noteCacheLineage(51163, 21128, think, at()); rw.tokens == 0 || rw.renderChanged {
 		t.Errorf("rewind with a stable rendering: got n=%d changed=%v, want a rewind and false", rw.tokens, rw.renderChanged)
@@ -373,7 +334,7 @@ func TestCacheLineageNamesTheRenderChange(t *testing.T) {
 func TestCacheLineageTimesTheGap(t *testing.T) {
 	base := time.Date(2026, 8, 21, 22, 0, 0, 0, time.UTC)
 	s := &Session{}
-	s.resetTurnStats(base)
+	s.startTurn(base)
 
 	// First call of a lineage: there is no previous call to be idle since, and
 	// reporting the process uptime here would read as a two-hour stall.
@@ -412,7 +373,7 @@ func TestCacheLineageTimesTheGap(t *testing.T) {
 // tok/s, against 57s for the prefix loss the same event caused.
 func TestTurnStatsNamesDiscardedDecode(t *testing.T) {
 	s := &Session{}
-	s.resetTurnStats(time.Now())
+	s.startTurn(time.Now())
 	s.addTurnTokens(11000, 8192, 900) // the stalled call, generated then dropped
 	s.addWastedCompletion(8192)
 	s.addTurnTokens(11400, 400, 300) // the retry that produced the answer
@@ -427,9 +388,9 @@ func TestTurnStatsNamesDiscardedDecode(t *testing.T) {
 
 	// Per turn, like every other figure on the Done line: a stall in the turn
 	// before this one is not this turn's cost.
-	s.resetTurnStats(time.Now())
+	s.startTurn(time.Now())
 	if r := s.turnStats(); r.wastedCompletion != 0 {
-		t.Errorf("after resetTurnStats: wastedCompletion=%d, want 0", r.wastedCompletion)
+		t.Errorf("after startTurn: wastedCompletion=%d, want 0", r.wastedCompletion)
 	}
 }
 
@@ -439,8 +400,8 @@ func TestTurnStatsNamesDiscardedDecode(t *testing.T) {
 // including fields nobody has thought of yet (Qwen3.8 reads a top-level
 // reasoning_effort, for instance).
 func TestRenderKeyIgnoresSamplers(t *testing.T) {
-	plan := renderKey(map[string]any{"temperature": 1.0, "top_p": 0.95, "max_tokens": 8000})
-	exec := renderKey(map[string]any{"temperature": 0.6, "top_p": 0.8, "max_tokens": 4000})
+	plan := llm.RenderKey(map[string]any{"temperature": 1.0, "top_p": 0.95, "max_tokens": 8000})
+	exec := llm.RenderKey(map[string]any{"temperature": 0.6, "top_p": 0.8, "max_tokens": 4000})
 	if plan != "" || exec != "" {
 		t.Errorf("samplers entered the key: thinking=%q execute=%q", plan, exec)
 	}
@@ -448,15 +409,15 @@ func TestRenderKeyIgnoresSamplers(t *testing.T) {
 	// Same kwargs, written in a different order, must fingerprint identically:
 	// Go map iteration is randomised, and a key that flapped would report a
 	// rewind on every other call.
-	a := renderKey(map[string]any{"temperature": 1.0, "chat_template_kwargs": map[string]any{"preserve_thinking": true, "enable_thinking": true}})
-	b := renderKey(map[string]any{"temperature": 0.6, "chat_template_kwargs": map[string]any{"enable_thinking": true, "preserve_thinking": true}})
+	a := llm.RenderKey(map[string]any{"temperature": 1.0, "chat_template_kwargs": map[string]any{"preserve_thinking": true, "enable_thinking": true}})
+	b := llm.RenderKey(map[string]any{"temperature": 0.6, "chat_template_kwargs": map[string]any{"enable_thinking": true, "preserve_thinking": true}})
 	if a != b || a == "" {
 		t.Errorf("kwargs key is not canonical: %q vs %q", a, b)
 	}
 
 	// An unknown non-sampler counts: assuming it is harmless is how the
 	// expensive kind of rewind goes unnoticed.
-	if k := renderKey(map[string]any{"reasoning_effort": "low"}); k == "" {
+	if k := llm.RenderKey(map[string]any{"reasoning_effort": "low"}); k == "" {
 		t.Error("reasoning_effort was dropped from the key")
 	}
 }

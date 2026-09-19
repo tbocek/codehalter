@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/tbocek/codehalter/llm"
 )
 
 // TestScreenshotRejectsBadPaths: the two ways a path argument can be wrong
@@ -310,7 +312,7 @@ func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tc := toolCall{}
+	tc := llm.ToolCall{}
 	tc.Function.Name = "screenshot"
 	tc.Function.Arguments = `{"path":"page.html"}`
 	text, failed := a.executeTool(context.Background(), s.ID, tc)

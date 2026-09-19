@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tbocek/codehalter/llm"
 )
 
 // TestCompressHistoryRecordsSummary is the headline history test: once the
@@ -50,7 +52,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
+			LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -198,7 +200,7 @@ func TestFoldHistoryNoopWhenNothingToFold(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
+			LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -245,7 +247,7 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
+			LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -268,9 +270,9 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 	}
 }
 
-// contentString asserts that an llmMessage carries a string payload and
+// contentString asserts that an llm.Message carries a string payload and
 // returns it; it fails the test if the content was something else.
-func contentString(t *testing.T, m llmMessage) string {
+func contentString(t *testing.T, m llm.Message) string {
 	t.Helper()
 	s, ok := m.Content.(string)
 	if !ok {
@@ -592,7 +594,7 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
+			LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -655,7 +657,7 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 		settings: Settings{
-			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
+			LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}},
 		},
 		mainSlotTokens: 90_000,
 	}
@@ -726,7 +728,7 @@ func TestCompressHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
 
 	a := &agent{
 		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		settings:       Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}}},
 		mainSlotTokens: 90_000,
 	}
 
@@ -779,7 +781,7 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 
 	a := &agent{
 		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		settings:       Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}}},
 		mainSlotTokens: 90_000,
 	}
 	a.backgroundSummarise(s)
@@ -895,14 +897,14 @@ func TestSummarisePrefixIdentity(t *testing.T) {
 	}
 	a := &agent{
 		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		settings:       Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}}},
 		mainSlotTokens: 90_000,
 	}
 
 	s.AddUser("do the thing")
 	s.markTurnStart()
 	fgMsgs := a.buildLLMContext(s)
-	if _, _, _, err := a.llmStream(context.Background(), s.ID, a.settings.ConnAt(0, "execute"), fgMsgs, llmAllToolDefinitions(), nil, nil, nil); err != nil {
+	if _, _, _, err := a.llmStream(context.Background(), s.ID, a.settings.ConnAt(0, "execute"), fgMsgs, a.tools.defs(), nil, nil, nil); err != nil {
 		t.Fatalf("foreground call: %v", err)
 	}
 	s.AddAssistant("did it")
@@ -1056,7 +1058,7 @@ func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
 	s.Summary = big
 	a := &agent{
 		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		settings:       Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}}},
 		mainSlotTokens: 90_000,
 	}
 
@@ -1132,7 +1134,7 @@ func TestSummaryFoldKeepsSummaryOnFailure(t *testing.T) {
 	s2.Summary = big
 	a2 := &agent{
 		sessions:       map[string]*Session{s2.ID: s2},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
+		settings:       Settings{LLM: []llm.Conn{{Server: mock.ts.URL, Model: "m"}}},
 		mainSlotTokens: 90_000,
 	}
 	a2.scheduleSummaryFold(s2, big)
@@ -1174,7 +1176,7 @@ func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 		sessions: map[string]*Session{s.ID: s},
 		// A dedicated summariser takes the paste branch: the conversation is not
 		// in that conn's cache, so prefix extension would not line up.
-		settings: Settings{LLM: []LLMConnection{
+		settings: Settings{LLM: []llm.Conn{
 			{Server: mock.ts.URL, Model: "m"},
 			{Server: mock.ts.URL, Model: "s", Purpose: purposeSummary},
 		}},

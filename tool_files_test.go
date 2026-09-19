@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/tbocek/codehalter/llm"
 )
 
 // writeLines writes n newline-terminated lines ("L1\n".."Ln\n") to path.
@@ -44,27 +46,27 @@ func TestServeReadChunksAndCursor(t *testing.T) {
 	if !strings.Contains(out, "the file continues") {
 		t.Errorf("chunk 1 should be marked partial:\n%s", out)
 	}
-	if got := s.readCursor[path]; got != 151 {
+	if got := s.turn.readCursor[path]; got != 151 {
 		t.Errorf("cursor after chunk 1 = %d, want 151", got)
 	}
 
-	out, _ = a.serveRead(ctx, s.ID, path, s.readCursor[path], readChunkLines, "tc2")
+	out, _ = a.serveRead(ctx, s.ID, path, s.turn.readCursor[path], readChunkLines, "tc2")
 	if !strings.Contains(out, "L151\n") || !strings.Contains(out, "L300\n") {
 		t.Errorf("chunk 2 should be lines 151-300:\n%s", out)
 	}
-	if got := s.readCursor[path]; got != 301 {
+	if got := s.turn.readCursor[path]; got != 301 {
 		t.Errorf("cursor after chunk 2 = %d, want 301", got)
 	}
 
-	out, _ = a.serveRead(ctx, s.ID, path, s.readCursor[path], readChunkLines, "tc3")
+	out, _ = a.serveRead(ctx, s.ID, path, s.turn.readCursor[path], readChunkLines, "tc3")
 	if !strings.Contains(out, "L350\n") {
 		t.Errorf("final chunk missing last line:\n%s", out)
 	}
 	if !strings.Contains(out, "end of file") {
 		t.Errorf("final chunk should be marked complete:\n%s", out)
 	}
-	if _, ok := s.readCursor[path]; ok {
-		t.Errorf("cursor should be cleared at EOF, still %d", s.readCursor[path])
+	if _, ok := s.turn.readCursor[path]; ok {
+		t.Errorf("cursor should be cleared at EOF, still %d", s.turn.readCursor[path])
 	}
 }
 
@@ -81,7 +83,7 @@ func TestServeReadCompleteBoundary(t *testing.T) {
 	if !strings.Contains(out, "end of file") {
 		t.Errorf("exactly readChunkLines should be complete:\n%s", out)
 	}
-	if _, ok := s.readCursor[exact]; ok {
+	if _, ok := s.turn.readCursor[exact]; ok {
 		t.Errorf("no cursor expected for a complete read")
 	}
 
@@ -91,7 +93,7 @@ func TestServeReadCompleteBoundary(t *testing.T) {
 	if !strings.Contains(out, "the file continues") {
 		t.Errorf("readChunkLines+1 should be partial:\n%s", out)
 	}
-	if got := s.readCursor[over]; got != readChunkLines+1 {
+	if got := s.turn.readCursor[over]; got != readChunkLines+1 {
 		t.Errorf("cursor = %d, want %d", got, readChunkLines+1)
 	}
 }
@@ -185,7 +187,7 @@ func TestReadFileHonoursNumericLineAndLimit(t *testing.T) {
 
 	read := func(t *testing.T, rawArgs string) string {
 		t.Helper()
-		var tc toolCall
+		var tc llm.ToolCall
 		tc.Function.Name = "read_file"
 		tc.Function.Arguments = rawArgs
 		out, failed := a.executeTool(ctx, s.ID, tc)
@@ -227,7 +229,7 @@ func TestEditFileMissFailsAndSteers(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	var miss toolCall
+	var miss llm.ToolCall
 	miss.Function.Name = "edit_file"
 	miss.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func ZZZ() {}","new_text":"x"}`, path)
 	out, failed := a.executeTool(ctx, s.ID, miss)
@@ -240,7 +242,7 @@ func TestEditFileMissFailsAndSteers(t *testing.T) {
 		}
 	}
 
-	var hit toolCall
+	var hit llm.ToolCall
 	hit.Function.Name = "edit_file"
 	hit.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func A() {}","new_text":"func A() { return }"}`, path)
 	if _, failed := a.executeTool(ctx, s.ID, hit); failed {
@@ -346,7 +348,7 @@ func TestEditFileMissQuotesNearbyRegion(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	var miss toolCall
+	var miss llm.ToolCall
 	miss.Function.Name = "edit_file"
 	miss.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func load(path string) error {\n\tf, err := os.Open(path)\n\tif err != nil {","new_text":"x"}`, path)
 	out, failed := a.executeTool(ctx, s.ID, miss)

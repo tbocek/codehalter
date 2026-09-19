@@ -7,6 +7,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tbocek/codehalter/acp"
+	"github.com/tbocek/codehalter/llm"
 )
 
 // elicitationRequest is the wire shape of an elicitation/create as a test reads
@@ -72,7 +75,7 @@ func TestAskUsesElicitationWhenAdvertised(t *testing.T) {
 	}
 	res := make(chan result, 1)
 	go func() {
-		choice, err := a.conn.AskChoice(context.Background(), s.ID, "tc1", "Mount your .git?", []string{"Yes, mount", "No"})
+		choice, err := a.askChoice(context.Background(), s.ID, "tc1", "Mount your .git?", []string{"Yes, mount", "No"})
 		res <- result{choice, err}
 	}()
 
@@ -101,7 +104,7 @@ func TestAskUsesElicitationWhenAdvertised(t *testing.T) {
 		t.Errorf("last option = %+v, want the abort option", prop.OneOf[2])
 	}
 
-	reply := jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+	reply := acp.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 		"action":  "accept",
 		"content": map[string]string{elicitChoiceKey: "Yes, mount"},
 	}}
@@ -133,7 +136,7 @@ func TestAskUserOptionsPlusFreeText(t *testing.T) {
 
 	res := make(chan string, 1)
 	go func() {
-		var tc toolCall
+		var tc llm.ToolCall
 		tc.Function.Name = "ask_user"
 		tc.Function.Arguments = `{"question":"Which port?","options":["8080","3000"],"allow_text":true}`
 		out, _ := a.executeTool(context.Background(), s.ID, tc)
@@ -157,7 +160,7 @@ func TestAskUserOptionsPlusFreeText(t *testing.T) {
 	}
 
 	// Answer BOTH: the typed text must win.
-	reply := jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
+	reply := acp.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 		"action":  "accept",
 		"content": map[string]any{elicitChoiceKey: "8080", elicitTextKey: " 9999 "},
 	}}
@@ -184,7 +187,7 @@ func TestAskUserTextOnlyIsRequired(t *testing.T) {
 
 	res := make(chan string, 1)
 	go func() {
-		var tc toolCall
+		var tc llm.ToolCall
 		tc.Function.Name = "ask_user"
 		tc.Function.Arguments = `{"question":"What should I name it?"}`
 		out, _ := a.executeTool(context.Background(), s.ID, tc)
@@ -201,7 +204,7 @@ func TestAskUserTextOnlyIsRequired(t *testing.T) {
 
 	// Dismissing a text box is routine, so it must read as "no answer" rather
 	// than failing the tool call.
-	b, _ := json.Marshal(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"action": "cancel"}})
+	b, _ := json.Marshal(acp.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"action": "cancel"}})
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +227,7 @@ func TestAskUserFreeTextNeedsElicitation(t *testing.T) {
 	a, s, _, _ := elicitingAgent(t)
 	a.clientCaps.Elicitation = nil // client without form support
 
-	var tc toolCall
+	var tc llm.ToolCall
 	tc.Function.Name = "ask_user"
 	tc.Function.Arguments = `{"question":"What should I name it?"}`
 	out, _ := a.executeTool(context.Background(), s.ID, tc)
@@ -240,7 +243,7 @@ func TestAskUserLegacyYesNoLabels(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.mode = "Autopilot" // auto-answer picks options[0], no editor conn needed
 
-	var tc toolCall
+	var tc llm.ToolCall
 	tc.Function.Name = "ask_user"
 	tc.Function.Arguments = `{"question":"Deploy?","yes_label":"Ship it","no_label":"Hold"}`
 	out, _ := a.executeTool(context.Background(), s.ID, tc)
@@ -272,10 +275,10 @@ func TestElicitationActionsMapToOutcomes(t *testing.T) {
 			}
 			res := make(chan result, 1)
 			go func() {
-				choice, err := a.conn.doElicitation(context.Background(), permissionRequest{
+				choice, err := a.doElicitation(context.Background(), acp.PermissionRequest{
 					SessionId: s.ID,
 					Message:   "pick",
-					Options: []permissionOption{
+					Options: []acp.PermissionOption{
 						{OptionId: "yes", Name: "Yes"},
 						{OptionId: "no", Name: "No"},
 					},
@@ -293,7 +296,7 @@ func TestElicitationActionsMapToOutcomes(t *testing.T) {
 			if err := json.Unmarshal([]byte(line), &req); err != nil {
 				t.Fatalf("parse: %v", err)
 			}
-			b, _ := json.Marshal(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"action": tc.action}})
+			b, _ := json.Marshal(acp.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"action": tc.action}})
 			if _, err := peerW.Write(append(b, '\n')); err != nil {
 				t.Fatal(err)
 			}

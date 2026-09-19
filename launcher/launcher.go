@@ -1,4 +1,6 @@
-package main
+// Package launcher starts the standalone CLI inside the project's devcontainer
+// (see Run and the notes below).
+package launcher
 
 import (
 	"bytes"
@@ -799,12 +801,28 @@ func containerTool() string {
 	return ""
 }
 
-// launchInDevcontainer runs the CLI inside the project's devcontainer and
-// reports whether it handled the run at all. Not handled means the caller
-// carries on in this process: no devcontainer.json to work from, or no
-// container runtime to work with, and in both cases the agent's own bootstrap
-// gives the better message.
-func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, bool) {
+// Options is what Run needs from the CLI that calls it.
+type Options struct {
+	Workspace string   // the project directory on the host
+	Inner     []string // arguments for the codehalter --cli inside the container
+	Rebuild   bool     // rebuild the image even when nothing changed
+	// Interactive is set when stdin is a terminal; the exec then gets one too.
+	Interactive bool
+	// Styled is set when stdout takes ANSI styling, for the notice.
+	Styled bool
+	// Forward names the host environment variables handed on to the
+	// codehalter inside: the update decisions the host already made.
+	Forward []string
+	// CacheDir holds the generated compose files, one directory per project.
+	CacheDir string
+}
+
+// Run runs the CLI inside the project's devcontainer and reports whether it
+// handled the run at all. Not handled means the caller carries on in this
+// process: no devcontainer.json to work from, or no container runtime to work
+// with, and in both cases the agent's own bootstrap gives the better message.
+func Run(o Options) (int, bool) {
+	workspace, inner, rebuild := o.Workspace, o.Inner, o.Rebuild
 	cfg, err := loadDevcontainerConfig(workspace)
 	switch {
 	case err == os.ErrNotExist:
@@ -831,7 +849,7 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 			fmt.Fprintf(os.Stderr, "%s: %v\n", cfg.path, err)
 			return 1, true
 		}
-		dir := filepath.Join(cacheDir(), "launcher", project)
+		dir := filepath.Join(o.CacheDir, "launcher", project)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			fmt.Fprintf(os.Stderr, "creating %s: %v\n", dir, err)
 			return 1, true
@@ -849,7 +867,7 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 		rebuild = rebuild || stampChanged(filepath.Join(dir, "stamp"), body, cfg)
 	}
 
-	notice(rt, project, cfg, rebuild)
+	notice(rt, project, cfg, rebuild, o.Styled)
 	compose := func(args ...string) *exec.Cmd {
 		full := []string{"compose", "-p", project}
 		for _, f := range files {
@@ -888,7 +906,7 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 	}
 
 	args := []string{"exec", "-w", cfg.WorkspaceFolder}
-	if !stdinIsTTY() {
+	if !o.Interactive {
 		args = append(args, "-T")
 	}
 	if cfg.RemoteUser != "" {
@@ -901,7 +919,7 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 	// What the host already worked out about updates: the resolved release tag
 	// and the answer the user gave to the question about it. Without these the
 	// copy inside the container spends its own API call and asks again.
-	for _, k := range []string{envLatest, envUpdate} {
+	for _, k := range o.Forward {
 		if v := os.Getenv(k); v != "" {
 			args = append(args, "-e", k+"="+v)
 		}
@@ -989,9 +1007,9 @@ func resolveContainerEnv(remoteEnv map[string]string, read func() ([]byte, error
 // runtime, that compose is driving it, and above all which host directory is
 // about to be mounted where. The mount is the part worth being sure about,
 // because everything the agent edits lands there.
-func notice(rt, project string, cfg *devcontainerConfig, building bool) {
-	bold, dim, reset := ansiBold, ansiDim, ansiReset
-	if !stdoutStyled() {
+func notice(rt, project string, cfg *devcontainerConfig, building, styled bool) {
+	bold, dim, reset := "\x1b[1m", "\x1b[2m", "\x1b[0m"
+	if !styled {
 		bold, dim, reset = "", "", ""
 	}
 	from := cfg.Image
@@ -1044,11 +1062,4 @@ func stampChanged(path string, compose []byte, cfg *devcontainerConfig) bool {
 		slog.Debug("launcher: cannot write stamp", "err", err)
 	}
 	return err != nil || string(got) != want
-}
-
-func cacheDir() string {
-	if d, err := os.UserCacheDir(); err == nil {
-		return filepath.Join(d, "codehalter")
-	}
-	return filepath.Join(os.TempDir(), "codehalter")
 }

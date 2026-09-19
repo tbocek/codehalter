@@ -152,3 +152,25 @@ func TestEmptyProjectFlag(t *testing.T) {
 		t.Error("expected emptyProject=false when source files are present")
 	}
 }
+
+// TestDiscoverRunnersTwiceOffersOneRunTask pins that discovery is safe to run
+// again: every session setup runs it, and when it only ever appended, the
+// second thread in one editor process offered run_task twice.
+func TestDiscoverRunnersTwiceOffersOneRunTask(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Makefile"), []byte("build:\n\tgo build\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	a := &agent{}
+	a.discoverRunners(dir)
+	a.discoverRunners(dir)
+	n := 0
+	for _, d := range a.tools.defs() {
+		if toolName(Tool{Def: d}) == "run_task" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("run_task offered %d times, want 1", n)
+	}
+}

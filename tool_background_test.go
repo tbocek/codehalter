@@ -163,7 +163,7 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	bgJobGrace = 50 * time.Millisecond
 	defer func() { bgJobGrace = old }()
 
-	h.sess.turnMu.Lock() // a turn is running
+	h.sess.ctl.held.Lock() // a turn is running
 	res, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 0.3; echo experiment-done; exit 4"}`)
 	if failed || !strings.Contains(res, "do NOT poll") {
 		t.Fatalf("launch = (%q, failed=%v), want a running job that tells the model not to poll", res, failed)
@@ -181,7 +181,7 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	}
 
 	h.agent.flushBgNotes(context.Background(), h.sess) // what Prompt does as the turn ends
-	h.sess.turnMu.Unlock()
+	h.sess.ctl.held.Unlock()
 
 	got := lastUserMessage(h.sess)
 	for _, want := range []string{"background job", "exited with code 4", "experiment-done", "codehalter, not the user"} {

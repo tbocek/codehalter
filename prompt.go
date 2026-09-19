@@ -15,6 +15,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/tbocek/codehalter/acp"
 )
 
 // This file owns the prompt orchestrator. Prompt() is the ACP entry point.
@@ -223,11 +225,11 @@ var phaseNames = []string{"Planning", "Working", "Documenting"}
 // surface transient lifecycle markers like " (thinking…)" or " (running
 // read_file…)"). Document (phase 2) only appears once it actually starts,
 // so a no-doc run ends with two rows.
-func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
+func phaseEntries(phase int, done bool, suffix string) []acp.PlanEntry {
 	if phase < 0 || phase >= len(phaseNames) {
 		return nil
 	}
-	entries := make([]PlanEntry, 0, phase+1)
+	entries := make([]acp.PlanEntry, 0, phase+1)
 	for i := 0; i <= phase; i++ {
 		status := "completed"
 		content := phaseNames[i]
@@ -235,7 +237,7 @@ func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
 			status = "in_progress"
 			content += suffix
 		}
-		entries = append(entries, PlanEntry{Content: content, Priority: "medium", Status: status})
+		entries = append(entries, acp.PlanEntry{Content: content, Priority: "medium", Status: status})
 	}
 	return entries
 }
@@ -255,7 +257,7 @@ func (a *agent) sendPhase(ctx context.Context, sid string, phase int, done bool)
 		sess.phaseActive = !done
 		sess.phaseMu.Unlock()
 	}
-	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
+	a.sendUpdate(ctx, sid, acp.PlanUpdate{Kind: "plan", Entries: entries})
 }
 
 // setStatus re-emits the full multi-row plan with `suffix` appended to
@@ -281,7 +283,7 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 	if entries == nil {
 		return
 	}
-	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
+	a.sendUpdate(ctx, sid, acp.PlanUpdate{Kind: "plan", Entries: entries})
 }
 
 // startStatusMeter refreshes the active phase row once a second with whatever
@@ -335,7 +337,7 @@ func (a *agent) finalizePlan(sid string) {
 		return
 	}
 	// Background ctx so the finalize fires even when the request ctx is cancelled.
-	a.sendUpdate(context.Background(), sid, planUpdate{Kind: "plan", Entries: entries})
+	a.sendUpdate(context.Background(), sid, acp.PlanUpdate{Kind: "plan", Entries: entries})
 }
 
 // failPrompt records a fatal error in the session and returns it so the ACP
@@ -344,7 +346,7 @@ func (a *agent) finalizePlan(sid string) {
 // (LLM auth / out-of-credits / runPlanPhase crash). Pass any tool uses
 // captured before the failure so they're preserved in history. Recoverable
 // warnings should keep using sendUpdate with a "⚠ ..." chunk.
-func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptResponse, error) {
+func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (acp.PromptResponse, error) {
 	if sess := a.getSession(sid); sess != nil {
 		if len(toolUses) > 0 {
 			sess.AddAssistantWithTools("❌ "+err.Error(), toolUses)
@@ -353,7 +355,7 @@ func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptRes
 		}
 		sess.saveOrLog()
 	}
-	return PromptResponse{}, err
+	return acp.PromptResponse{}, err
 }
 
 // sessionTitleMax is how many runes of the opening message become the thread
@@ -396,47 +398,27 @@ func (a *agent) setSessionTitle(ctx context.Context, sess *Session, raw string) 
 		return
 	}
 	sess.Title = title
-	a.sendUpdate(ctx, sess.ID, sessionInfoUpdate{
+	a.sendUpdate(ctx, sess.ID, acp.SessionInfoUpdate{
 		Kind:      "session_info_update",
 		Title:     title,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
-func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
+func (a *agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptResponse, error) {
 	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
 
-	// One turn per session. A new prompt supersedes the in-flight turn: cancel it
-	// (stops its LLM call), then WAIT on turnMu for it to fully unwind before
-	// starting — so two turns never run with divergent context snapshots. That
-	// overlap was the bug: one turn compacted the session while the other kept
-	// re-sending its pre-compaction snapshot, re-bloating the context and
-	// double-compacting. The deadlock that made us drop this lock is fixed
-	// (connSems capture + the ctx bail-out in orchestrate below), so the wait is
-	// short: the old turn sees its cancelled ctx and returns within one step.
+	// A typed prompt replaces the turn in flight and waits for it to unwind
+	// (holdTurn, turn.go). release runs on every exit path below.
 	if sess := a.getSession(req.SessionId); sess != nil {
-		sess.markSuperseding() // tell the in-flight turn this is a replacement, not an abort
-		sess.cancelTurn()
-		sess.turnMu.Lock()
-		sess.adoptTurn() // we're now the active turn; the superseded one has unwound
-		defer sess.turnMu.Unlock()
+		var release func()
+		ctx, release, _ = a.holdTurn(ctx, sess, true)
+		defer release()
+	} else {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	if sess := a.getSession(req.SessionId); sess != nil {
-		sess.beginTurn(cancel)
-	}
-	defer cancel()
-	defer a.finalizePlan(req.SessionId)
-	// Background jobs that finished while this turn ran are reported when it is
-	// over, on every exit path (a /spec loop and a cancelled turn included),
-	// never in the middle of it. Deferred after the turnMu unlock above was, so it
-	// runs first: still inside the turn's lock. Background ctx: the turn's own may
-	// already be cancelled.
-	defer func() {
-		if sess := a.getSession(req.SessionId); sess != nil {
-			a.flushBgNotes(context.Background(), sess)
-		}
-	}()
 
 	// Abort wins over pending-question. Once ensureDevcontainer has decided
 	// the session can't proceed (set abortReason), the pending UI prompt is
@@ -492,26 +474,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	var pendingFixes []fixProblem
 	if sess != nil {
 		pendingFixes = a.prepareChecks(ctx, sess, req.SessionId)
-	}
-
-	// Clear per-turn read-dedup. Dedup is scoped to a single Prompt() turn
-	// so that across-turn re-reads (after a user reply, edits made outside
-	// our process, etc.) still go through.
-	if sess != nil {
-		sess.readDedupMu.Lock()
-		sess.readDedup = nil
-		sess.readDedupMu.Unlock()
-		sess.searchDedupMu.Lock()
-		sess.searchDedup = nil
-		sess.searchDedupMu.Unlock()
-		sess.readCursorMu.Lock()
-		sess.readCursor = nil
-		sess.readCursorMu.Unlock()
-		sess.editFailedPathsMu.Lock()
-		sess.editFailedPaths = nil
-		sess.editFailedPathsMu.Unlock()
-	} else {
-		slog.Debug("Prompt: pre-turn getSession NIL", "sid", req.SessionId, "knownSessions", len(a.sessions))
 	}
 
 	// Extract user text and images from prompt blocks. Image bytes are
@@ -624,7 +586,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	if rendered, stopMsg, handled := a.expandMacro(ctx, req.SessionId, macroCwd, userText); handled {
 		if stopMsg != "" {
 			a.say(ctx, req.SessionId, stopMsg+"\n")
-			return PromptResponse{StopReason: "end_turn"}, nil
+			return acp.PromptResponse{StopReason: "end_turn"}, nil
 		}
 		userText = rendered
 	}
@@ -695,7 +657,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			if msg != "" {
 				a.say(context.Background(), req.SessionId, msg)
 			}
-			return PromptResponse{StopReason: "cancelled"}, nil
+			return acp.PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, nil)
 	}
@@ -711,9 +673,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// A turn whose ctx was cancelled along the way still returns normally here:
 	// the stop reason is how the client tells a clean turn from an abort.
 	if ctx.Err() != nil {
-		return PromptResponse{StopReason: "cancelled"}, nil
+		return acp.PromptResponse{StopReason: "cancelled"}, nil
 	}
-	return PromptResponse{StopReason: "end_turn"}, nil
+	return acp.PromptResponse{StopReason: "end_turn"}, nil
 }
 
 // runTurn drives one full turn through the single shared path: reset the
@@ -737,7 +699,10 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 
 	sess := a.getSession(sid)
 	if sess != nil {
-		sess.resetTurnStats(time.Now())
+		// Each turn starts with fresh scratch state: read/search dedup and paging
+		// cursors are per turn, so a re-read after a user reply or an outside edit
+		// still goes through.
+		sess.startTurn(time.Now())
 		// Anchor the in-flight turn at the prompt just appended by the caller
 		// (Prompt / proposeFix), so the 400-recovery's first fold (foldHistory at
 		// turnStartIndex) keeps this whole turn — human prompt plus the synthetic
@@ -776,7 +741,7 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		// that omits usage leaves lastPrompt 0, or n_ctx isn't probed yet), so no
 		// data means no update rather than a misleading empty ring.
 		if size := a.getMainSlotTokens(); size > 0 && r.lastPrompt > 0 {
-			a.sendUpdate(ctx, sid, usageUpdate{Kind: "usage_update", Used: r.lastPrompt, Size: size})
+			a.sendUpdate(ctx, sid, acp.UsageUpdate{Kind: "usage_update", Used: r.lastPrompt, Size: size})
 		}
 		// \n\n keeps the stats on their own markdown line. With the server cache
 		// split, headline the work done (evaluated + gen) plus sent/cached%;
@@ -899,8 +864,8 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	upserts := 0
 
 	for {
-		// Bail the instant the turn is superseded/cancelled, so turnMu is released
-		// promptly (the new prompt is waiting on it) instead of starting another
+		// Bail the instant the turn is superseded/cancelled, so the turn is released
+		// promptly (a new prompt waits on it in holdTurn) instead of starting another
 		// plan/execute phase on a turn that's already been told to stop.
 		if err := ctx.Err(); err != nil {
 			return lastResult, err
