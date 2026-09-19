@@ -46,14 +46,6 @@ type Settings struct {
 	// system prompt up front.
 	Skills string `toml:"skills,omitempty"`
 
-	// Diagnostics controls whether a successful write_file / edit_file asks a
-	// wired language server about the file and appends its findings to the tool
-	// result (see postWriteDiagnostics). nil means on. Turn it off for a project
-	// whose language server is slow to answer or noisy enough that the findings
-	// cost more context than the round-trips they save; it has no effect when no
-	// diagnostics-capable MCP server is configured.
-	Diagnostics *bool `toml:"diagnostics,omitempty"`
-
 	// FormatConfig controls the setup card that offers to pin a formatter config
 	// for a project that has none (see formatterConfigNeeds). nil means on. Set
 	// it to false for a project that deliberately keeps no formatter config, so

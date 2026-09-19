@@ -64,53 +64,29 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 }
 
 // TestCheckEnvSetupIsOneCard pins the one-card, one-turn rule. Every accepted
-// card dispatches a full plan/execute/document cycle (~14 LLM calls), so a Go
-// project needing both a toolchain install and gopls wiring must produce a
-// SINGLE fixProblem carrying both bullets, not one card per problem. Declining
-// gopls (a commented-out entry) drops just that bullet.
+// card dispatches a full plan/execute/document cycle, so every missing dev tool
+// is folded into a SINGLE fixProblem, with one PLAN ONLY directive.
 func TestCheckEnvSetupIsOneCard(t *testing.T) {
 	a, s := newTestAgent(t)
 	// Empty PATH so every probed binary reads as missing regardless of the
 	// developer's machine.
 	t.Setenv("PATH", "")
-	if err := os.WriteFile(filepath.Join(s.Cwd, "go.mod"), []byte("module x\n\ngo 1.24\n"), 0o644); err != nil {
-		t.Fatal(err)
+	for name, body := range map[string]string{"go.mod": "module x\n\ngo 1.24\n", "justfile": "test:\n\tgo test ./...\n"} {
+		if err := os.WriteFile(filepath.Join(s.Cwd, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	cfgDir := filepath.Join(s.Cwd, sessionDir)
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	// go.mod makes `go` a missing runner AND makes gopls wiring wanted: two
-	// problems, one card, and the prompt has to carry both.
 	problems := a.checkEnv(s, s.ID)
 	if len(problems) != 1 {
 		t.Fatalf("setup must be one card (one turn), got %d: %+v", len(problems), problems)
 	}
-	if !strings.Contains(problems[0].prompt, "Missing dev tools:") {
-		t.Errorf("prompt lost the install bullet: %q", problems[0].prompt)
+	for _, want := range []string{"Missing dev tools:", "go (", "just ("} {
+		if !strings.Contains(problems[0].prompt, want) {
+			t.Errorf("prompt lacks %q: %q", want, problems[0].prompt)
+		}
 	}
-	if !strings.Contains(problems[0].prompt, "gopls") {
-		t.Errorf("prompt lost the gopls bullet: %q", problems[0].prompt)
-	}
-	// One PLAN ONLY directive, not one per bullet — that repetition was the sign
-	// of prompts being concatenated rather than merged.
 	if n := strings.Count(problems[0].prompt, "PLAN ONLY"); n != 1 {
 		t.Errorf("want exactly 1 PLAN ONLY directive, got %d: %q", n, problems[0].prompt)
-	}
-
-	// Declined (commented out) → the gopls bullet goes away, the install bullet
-	// stays, and gopls does not resurface as a "missing dev tool" either.
-	mcp := "# [[server]]\n# name = \"gopls\"\n# command = \"gopls\"\n"
-	if err := os.WriteFile(filepath.Join(cfgDir, "mcp.toml"), []byte(mcp), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	problems = a.checkEnv(s, s.ID)
-	if len(problems) != 1 {
-		t.Fatalf("still one card after declining gopls, got %d: %+v", len(problems), problems)
-	}
-	if strings.Contains(problems[0].prompt, "gopls") {
-		t.Errorf("a commented-out gopls should silence every gopls mention: %q", problems[0].prompt)
 	}
 }
 
@@ -199,80 +175,6 @@ func TestDetectFormatters(t *testing.T) {
 
 	if n := detectFormatters(nil, t.TempDir()); len(n) != 0 {
 		t.Errorf("empty project should need no formatters, got %v", n)
-	}
-}
-
-// TestMcpServerConfigured pins detection of a wired MCP server (clangd is the
-// remaining card that gates on one): no file / commented entry read
-// as not-configured (so the setup card fires), an active entry as configured.
-func TestMcpServerConfigured(t *testing.T) {
-	dir := t.TempDir()
-	if mcpServerConfigured(dir, "clangd") {
-		t.Error("no mcp.toml should be not-configured")
-	}
-	cfgDir := filepath.Join(dir, sessionDir)
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	mcpPath := filepath.Join(cfgDir, "mcp.toml")
-
-	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"clangd\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if mcpServerConfigured(dir, "clangd") {
-		t.Error("commented clangd should be not-configured")
-	}
-
-	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"clangd\"\ncommand = \"npx\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !mcpServerConfigured(dir, "clangd") {
-		t.Error("active clangd should be configured")
-	}
-}
-
-// TestMcpMentionsServer pins the comment-AWARE check that gates the gopls card:
-// unlike mcpServerConfigured, a commented-out entry counts as "mentioned" (the
-// user was already offered it and declined), so the card stops nagging. This is
-// the exact distinction the gopls offer relies on — and why the seed mcp.toml
-// must name no server.
-func TestMcpMentionsServer(t *testing.T) {
-	dir := t.TempDir()
-	if mcpMentionsServer(dir, "gopls") {
-		t.Error("no mcp.toml should leave gopls not-mentioned")
-	}
-	cfgDir := filepath.Join(dir, sessionDir)
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	mcpPath := filepath.Join(cfgDir, "mcp.toml")
-
-	// The crux: a commented-out gopls is NOT active (no card would mean "wired")
-	// but IS mentioned, so the offer card must NOT re-fire.
-	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"gopls\"\n# command = \"gopls\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if mcpServerConfigured(dir, "gopls") {
-		t.Error("commented gopls should NOT be configured")
-	}
-	if !mcpMentionsServer(dir, "gopls") {
-		t.Error("commented gopls SHOULD be mentioned (already offered → don't nag)")
-	}
-
-	// A project mentioning a different server but not gopls → gopls still offered.
-	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"fs\"\ncommand = \"npx\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if mcpMentionsServer(dir, "gopls") {
-		t.Error("a non-gopls mcp.toml should leave gopls not-mentioned")
-	}
-
-	// Active gopls → both mentioned and configured.
-	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"gopls\"\ncommand = \"gopls\"\nargs = [\"mcp\"]\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !mcpMentionsServer(dir, "gopls") || !mcpServerConfigured(dir, "gopls") {
-		t.Error("active gopls should be both mentioned and configured")
 	}
 }
 

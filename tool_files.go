@@ -619,11 +619,7 @@ func init() {
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &oldContent, newContent)})
 
-		// Ask a wired language server about the file we just wrote and fold the
-		// answer into this result, so a broken write is visible now rather than at
-		// the next build. Returns "" when there's no server, nothing to report, or
-		// anything went wrong — the write already succeeded and must stay succeeded.
-		return "file written successfully" + a.postWriteDiagnostics(ctx, sid, path, newContent) + drift, false
+		return "file written successfully" + drift, false
 	}})
 
 	RegisterTool(Tool{Def: map[string]any{
@@ -724,8 +720,7 @@ func init() {
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
 
-		// See write_file: diagnostics ride along on the successful edit's result.
-		return okNote + a.postWriteDiagnostics(ctx, sid, path, newContent) + drift, false
+		return okNote + drift, false
 	}})
 }
 

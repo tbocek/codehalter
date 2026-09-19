@@ -12,8 +12,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-
-	"github.com/BurntSushi/toml"
 )
 
 // Fix-card prompts — the message dispatched to the executor when the user
@@ -38,17 +36,6 @@ const (
 		"\n"
 
 	cardInstallTools = "- Missing dev tools: %s. Install each, verify each runs.\n"
-
-	cardSetupGopls = "- No code-intelligence MCP (gopls) wired, so the model navigates with search_text/read_file instead of go_definition/go_references. Install gopls if it's missing, then wire it per SKILL-go.md (\"gopls as MCP server\").\n"
-
-	// No mcp.toml half to this one: codehalter drives tsgo over LSP itself
-	// (lsp_client.go), so the binary being present IS the whole capability. That
-	// is also what keeps the card from re-firing forever — the old lsmcp card was
-	// gated on an mcp.toml entry the install step didn't write, so an already
-	// installed bridge asked to be set up again on every session open.
-	cardSetupTsgo = "- No `tsgo` in this TypeScript project, so writes to .ts files come back with no type errors reported. Install it as a devDependency per SKILL-ts.md. Nothing to wire afterwards: codehalter speaks LSP to it directly.\n"
-
-	cardSetupClangd = "- No code-intelligence MCP (clangd = gopls analog for C/C++) configured. Set it up per SKILL-c.md.\n"
 
 	// cardFormatHeader is its own card rather than a bullet on cardSetupHeader:
 	// nothing here is installed and nothing belongs in the Dockerfile, and the
@@ -88,16 +75,6 @@ type fixProblem struct {
 	desc   string
 	prompt string
 }
-
-// A stack's dev tooling is NOT probed as a PATH binary. It used to be, via a
-// stackProbeBinary("go") == "gopls" table whose only entry was that one — so the
-// install card and the gopls setup card both owned the same binary, and because
-// the setup card was gated on gopls already being present, the two could never
-// fire in the same batch: install this turn, wire the next. That is the "asked
-// about gopls twice" bug. Every stack now works the way JS/TS and C already did:
-// one code-intelligence card per stack (checkEnv, below) owns install AND wiring
-// in a single turn. The install card is left to cover runners and formatters,
-// which have no card of their own.
 
 // detectRunnerConfigs returns runner-kind names purely from config-file
 // presence in cwd, regardless of whether the runner binary is installed.
@@ -268,41 +245,6 @@ func hasPrettierConfig(cwd string) bool {
 func pyprojectHasTable(cwd, prefix string) bool {
 	data, err := os.ReadFile(filepath.Join(cwd, "pyproject.toml"))
 	return err == nil && strings.Contains(string(data), prefix)
-}
-
-// mcpServerConfigured reports whether .codehalter/mcp.toml has an ACTIVE
-// [[server]] with the given name. Missing/unparseable file → false; commented
-// entries don't decode, so they read as not-configured — exactly what the
-// setup card wants.
-func mcpServerConfigured(cwd, name string) bool {
-	var f struct {
-		Server []MCPServerConfig `toml:"server"`
-	}
-	if _, err := toml.DecodeFile(filepath.Join(cwd, sessionDir, "mcp.toml"), &f); err != nil {
-		return false
-	}
-	for _, s := range f.Server {
-		if s.Name == name {
-			return true
-		}
-	}
-	return false
-}
-
-// mcpMentionsServer reports whether mcp.toml references a [[server]] with this
-// name in ANY form — ACTIVE or COMMENTED-OUT. Unlike mcpServerConfigured (which
-// decodes, so it only sees active entries), this is a raw-text check: a commented
-// `# name = "gopls"` still matches. The setup card uses this to decide whether to
-// OFFER wiring: an active entry means it's already wired, a commented one means
-// the user was already offered it and declined — either way, don't nag. This is
-// why the seed mcp.toml ships NO named-server example: a name here would read as
-// "already offered" on every fresh project and the card would never fire.
-func mcpMentionsServer(cwd, name string) bool {
-	data, err := os.ReadFile(filepath.Join(cwd, sessionDir, "mcp.toml"))
-	if err != nil {
-		return false
-	}
-	return strings.Contains(string(data), `"`+name+`"`)
 }
 
 // ---------------------------------------------------------------------------
@@ -745,10 +687,7 @@ func (a *agent) probeToolBins(sess *Session) (runners, formatters []toolPresence
 // environment (container, firefox, run_command, runner-config and formatter
 // binaries on PATH), and reports what is missing. All missing binaries are collapsed into ONE fixProblem so
 // the user sees a single "Install fix? make, just" card instead of one card per
-// tool. Each stack's language server is deliberately NOT in that card: its own
-// code-intelligence card installs and wires it in one turn, and having both own
-// the same binary is what made gopls get asked about twice. Strictly silent —
-// emits no chat output of its own. Bash and devcontainer are filtered out of
+// tool. Strictly silent — emits no chat output of its own. Bash and devcontainer are filtered out of
 // knownStacks because they're meta-tooling, not stacks.
 func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 	var stacks []string
@@ -807,7 +746,7 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 		}
 	}
 
-	// Build the "gopls (go stack), make (Makefile), …" detail as we find each
+	// Build the "just (just runner), prettier (ts stack formatter), …" detail as we find each
 	// missing probe binary — one consolidated fixProblem covers them all.
 	var detail strings.Builder
 	note := func(bin, reason string) {
@@ -830,43 +769,8 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 		}
 	}
 
-	// Everything below folds into ONE card, one accepted turn. Each `want` adds a
-	// short phrase to the card title and a bullet to the single prompt.
-	var titles, steps []string
-	want := func(title, step string) {
-		titles = append(titles, title)
-		steps = append(steps, step)
-	}
-	if detail.Len() > 0 {
-		want("install "+detail.String(), fmt.Sprintf(cardInstallTools, detail.String()))
-	}
-	// Go code-intelligence MCP (gopls). Wanted whenever a Go project has no gopls
-	// [[server]] in mcp.toml, installed or not: the bullet installs it first when
-	// missing, then wires it. mcpMentionsServer (not mcpServerConfigured): a
-	// commented-out entry counts as "already offered and declined", so we don't
-	// nag — which is also why the seed mcp.toml ships no gopls example. The
-	// lsmcp/clangd bullets below mirror this for JS/TS and C.
-	if slices.Contains(stacks, "go") && !mcpMentionsServer(sess.Cwd, "gopls") {
-		want("set up gopls (Go code intelligence)", cardSetupGopls)
-	}
-	// TypeScript diagnostics come from tsgo, spoken to directly over LSP, so the
-	// only thing that can be missing is the binary — and lspServerFor answering
-	// "" for a .ts file in a project that HAS a tsconfig means exactly that.
-	// Plain JS is deliberately not offered anything: with no tsconfig there is no
-	// project to type-check against, and offering setup there is what put a
-	// seven-minute install turn in front of a JS-only repo's first prompt.
-	if slices.Contains(stacks, "ts") && fileExists(sess.Cwd, "tsconfig.json") {
-		if name, _, _ := lspServerFor(sess.Cwd, "probe.ts"); name == "" {
-			want("install tsgo (TypeScript diagnostics)", cardSetupTsgo)
-		}
-	}
-	// C/C++ code-intelligence MCP (clangd), the gopls analog for C. Same shape as
-	// the lsmcp bullet above.
-	if slices.Contains(stacks, "c") && !mcpServerConfigured(sess.Cwd, "clangd") {
-		want("set up clangd (C/C++ code intelligence)", cardSetupClangd)
-	}
 	var probs []fixProblem
-	if len(steps) > 0 {
+	if detail.Len() > 0 {
 		// Embed the OS we already detected so the LLM doesn't waste a tool call
 		// rediscovering it. The bootstrap step (ensureDevcontainer) only scaffolds
 		// containers based on one of the five supported distros, so osi.ID normally
@@ -880,8 +784,8 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 			distro = "Linux"
 		}
 		probs = append(probs, fixProblem{
-			desc:   "🟡 Container setup: " + strings.Join(titles, "; "),
-			prompt: fmt.Sprintf(cardSetupHeader, distro) + strings.Join(steps, ""),
+			desc:   "🟡 Container setup: install " + detail.String(),
+			prompt: fmt.Sprintf(cardSetupHeader, distro) + fmt.Sprintf(cardInstallTools, detail.String()),
 		})
 	}
 
@@ -917,7 +821,7 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 // last pass is what catches an mcp.toml edited by hand while no turn was
 // running — nothing watches the file, so this stat is how such an edit is seen.
 func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) []fixProblem {
-	// Starting a stdio MCP child (gopls, lsmcp, …) can take seconds before it
+	// Starting a stdio MCP child can take seconds before it
 	// answers the handshake, and neither the wait nor reconcile says anything
 	// until it is done.
 	stopBeat := a.heartbeat(ctx, sid)
@@ -929,7 +833,7 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) []fixPr
 	ownNotes, ownFixes := renderMCPChanges(changes)
 	// Benign starts/stops/restarts get a one-line notice, NOT a re-dump of the
 	// whole capabilities banner — that full re-emit on a routine server start
-	// (e.g. gopls coming up the turn after it was added) was pure noise. Said
+	// (a server coming up the turn after it was added) was pure noise. Said
 	// here, from inside the turn, including the ones a background flush parked.
 	for _, n := range append(notes, ownNotes...) {
 		a.say(ctx, sid, n+"\n")

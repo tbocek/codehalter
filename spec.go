@@ -691,7 +691,9 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 	seenRel := map[string]bool{}
 	var b strings.Builder
 	add := func(header, body string) {
-		b.WriteString("--- " + header + " ---\n")
+		b.WriteString("--- ")
+		b.WriteString(header)
+		b.WriteString(" ---\n")
 		b.WriteString(strings.TrimRight(body, "\n"))
 		b.WriteString("\n\n")
 		used += len(header) + len(body) + 10

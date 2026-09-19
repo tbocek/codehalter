@@ -152,12 +152,6 @@ type agent struct {
 	// needs; its mutex guards the whole group (see mcpState).
 	mcp mcpState
 
-	// lsp owns the language servers codehalter speaks LSP to directly for
-	// post-write diagnostics (lsp_client.go). Separate from mcp: these are
-	// started on demand by a write, not reconciled from a config file, and they
-	// expose no tools to the model.
-	lsp lspState
-
 	// abortReason is set by the bootstrap goroutine when codehalter must not
 	// run in this environment (today: started outside a devcontainer). Empty
 	// means proceed; non-empty causes Prompt to refuse with this message.
@@ -229,7 +223,7 @@ type mcpState struct {
 	// starting turn can wait one out (mcpState.wait).
 	flushDone chan struct{}
 	// flushNotes / flushFixes hold what a background flush produced: one-line
-	// notices ("gopls started") and cards (a parse error, a server that would
+	// notices ("<server> started") and cards (a parse error, a server that would
 	// not start). A flush runs BETWEEN turns, and anything said there lands
 	// outside any prompt — a card has no turn to dispatch from, and a notice is
 	// at the mercy of whether the client renders out-of-turn updates. So both
@@ -610,12 +604,8 @@ func (a *agent) initSession(cwd string, s *Session) error {
 		return err
 	}
 	// mcp.toml — only seeded on first run with the minimal placeholder (a header
-	// and ONE generic commented example, no per-stack servers). Per-stack MCP
-	// wiring (e.g. gopls for Go) is the prepare phase's job: checkEnv offers a
-	// setup card, and accepting it appends the matching [[server]] entry. The
-	// placeholder deliberately names no server so that "is gopls mentioned?"
-	// (mcpMentionsServer) reads as not-yet-offered on a fresh project. Once this
-	// file exists we never touch it again — the user owns it.
+	// and ONE generic commented example). Once this file exists we never touch
+	// it again — the user owns it.
 	mcpPath := filepath.Join(dir, "mcp.toml")
 	if _, err := os.Stat(mcpPath); os.IsNotExist(err) {
 		if err := os.WriteFile(mcpPath, []byte(defaultMCPToml), 0o644); err != nil {

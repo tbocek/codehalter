@@ -180,7 +180,8 @@ func specIgnoredProbes(ctx context.Context, cwd, outRel string, idx *specIndex) 
 	}
 	var in strings.Builder
 	for _, p := range probes {
-		in.WriteString(filepath.ToSlash(filepath.Join(outRel, p)) + "\n")
+		in.WriteString(filepath.ToSlash(filepath.Join(outRel, p)))
+		in.WriteByte('\n')
 	}
 	// One call for every probe. -v names the rule; --stdin reads the paths.
 	c := exec.CommandContext(ctx, "git", "-C", cwd, "check-ignore", "-v", "--stdin")

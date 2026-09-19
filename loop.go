@@ -982,11 +982,18 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 // tool ran with nothing on screen saying which command it was, and no ACP
 // tool-call update carries it either.
 func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
-	// The file tools already put everything on screen themselves: their ACP
-	// card is titled with the path and carries the diff (or the error). The
-	// JSON would show the same old/new text a second time, escaped onto one
-	// line, directly above it.
-	if tc.Function.Name == "edit_file" || tc.Function.Name == "write_file" {
+	// Most tools already put their arguments on screen themselves: the ACP card
+	// they open is titled with them ("Run: <command>", "Reading: <path> (1-150)",
+	// "Searching: <query> in <dir>", "Web Read: <url>"), the file tools add the
+	// diff, submit_plan streams as a table and respond's message is the reply.
+	// The JSON would repeat that, escaped onto one line, directly above it. It
+	// is kept only where nothing else shows the arguments: an MCP tool's card
+	// carries just its name, launch_subagent's just a count, and these few open
+	// no card at all.
+	switch name := tc.Function.Name; {
+	case strings.Contains(name, "__"), name == "launch_subagent",
+		name == "view_output", name == "view_image", name == "session_insights":
+	default:
 		return
 	}
 	shown := tc.Function.Arguments

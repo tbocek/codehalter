@@ -170,11 +170,10 @@ type MCPClient struct {
 	// MCP-Protocol-Version header, which legacy servers expect only on
 	// post-initialize requests.
 	initialized bool
-	// tools is what this server advertised at tools/list, retained so codehalter
-	// can call one of them on its own initiative rather than only when the model
-	// asks — see postWriteDiagnostics, which needs both the tool's name and its
-	// input schema to build a call. Written once by reconcileMCP BEFORE the
-	// client is published into a.mcp.clients, so readers never race the write.
+	// tools is what this server advertised at tools/list, retained so callTool
+	// can look up a tool's x-mcp-header parameters. Written once by reconcileMCP
+	// BEFORE the client is published into a.mcp.clients, so readers never race
+	// the write.
 	tools []mcpTool
 }
 
@@ -1536,10 +1535,9 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 		// Mcp-Param-* mirrors) before the list is retained or registered.
 		tools = newClient.vetTools(tools)
 
-		// Retain the advertised tool list on the client before publishing it, so
-		// agent-initiated calls (postWriteDiagnostics) can look up a tool's schema
-		// without a second tools/list. Set here, pre-publication, so it is written
-		// while no other goroutine can reach the client.
+		// Retain the advertised tool list on the client before publishing it (see
+		// MCPClient.tools). Set here, pre-publication, so it is written while no
+		// other goroutine can reach the client.
 		newClient.tools = tools
 
 		// New client is ready. Atomically swap: unregister old tools, register

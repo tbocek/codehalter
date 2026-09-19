@@ -306,14 +306,6 @@ type Session struct {
 	wroteMu   sync.Mutex
 	wroteHash map[string]string
 	drifted   map[string]bool
-	// diagStrikes counts consecutive failed diagnostics calls per source, and
-	// diagOff is the set that has given up for this session. A language server
-	// that times out answers no faster on the next write, and the write pays
-	// diagTimeout every time: one measured session spent 3.4 minutes on 33
-	// writes for a server that never answered once. In-memory only.
-	diagMu      sync.Mutex
-	diagStrikes map[string]int
-	diagOff     map[string]bool
 	// specFenceDir is the spec directory a running /spec loop has made
 	// read-only for the file tools (spec_loop.go); "" when no loop runs.
 	specMu       sync.Mutex
@@ -949,43 +941,6 @@ func (s *Session) takeDriftNote(path string) string {
 	}
 	delete(s.drifted, path)
 	return externalChangeNote
-}
-
-// diagSourceOff reports whether this diagnostics source has given up for the
-// session (see diagSourceFailed).
-func (s *Session) diagSourceOff(name string) bool {
-	s.diagMu.Lock()
-	defer s.diagMu.Unlock()
-	return s.diagOff[name]
-}
-
-// diagSourceFailed records a diagnostics call that timed out or errored, and
-// reports whether that was the failure which switched the source off. A server
-// rejecting the call (isErr) is NOT a failure: "not a Go file" is a correct
-// answer, and disabling gopls over it would be wrong.
-func (s *Session) diagSourceFailed(name string) bool {
-	s.diagMu.Lock()
-	defer s.diagMu.Unlock()
-	if s.diagStrikes == nil {
-		s.diagStrikes = map[string]int{}
-	}
-	s.diagStrikes[name]++
-	if s.diagStrikes[name] < diagMaxStrikes || s.diagOff[name] {
-		return false
-	}
-	if s.diagOff == nil {
-		s.diagOff = map[string]bool{}
-	}
-	s.diagOff[name] = true
-	return true
-}
-
-// diagSourceOK clears the strike count after an answer arrives, so a single slow
-// call in an otherwise healthy server never accumulates toward the cutoff.
-func (s *Session) diagSourceOK(name string) {
-	s.diagMu.Lock()
-	defer s.diagMu.Unlock()
-	delete(s.diagStrikes, name)
 }
 
 // readContentInContext reports whether the exact bytes `content` are still
