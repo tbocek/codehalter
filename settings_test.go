@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -225,5 +226,45 @@ func TestRenderSettingsSourcesMarksShadowed(t *testing.T) {
 	}
 	if got = renderSettingsSources(cwd); !strings.Contains(got, "No settings.toml at either path") {
 		t.Errorf("neither: %q does not say no settings file was found", got)
+	}
+}
+
+// TestRenderKeyIgnoresToolChoice pins that tool_choice is a sampler, not a
+// rendering: llama.cpp turns it into a grammar and leaves every prompt token
+// alone (measured over 14 summariser calls that set it to "none": prompt=250679
+// cached=250178). If renderKey counted it, a plan→execute switch that differs
+// only in tool_choice would be reported as a rendering change and the rewind
+// detector would blame settings.toml for a cache loss that never happened.
+func TestRenderKeyIgnoresToolChoice(t *testing.T) {
+	base := map[string]any{"temperature": 0.7}
+	required := map[string]any{"temperature": 0.7, "tool_choice": "required"}
+	none := map[string]any{"temperature": 0.7, "tool_choice": "none"}
+	if renderKey(base) != renderKey(required) || renderKey(required) != renderKey(none) {
+		t.Errorf("tool_choice must not change the render fingerprint: %q vs %q vs %q",
+			renderKey(base), renderKey(required), renderKey(none))
+	}
+	// A field that DOES reach the chat template still must.
+	if renderKey(base) == renderKey(map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}) {
+		t.Error("chat_template_kwargs must still change the fingerprint")
+	}
+}
+
+// TestKeepWarmInterval pins how the setting is read: absent means the default,
+// the off words mean off, and an unparsable value falls back rather than
+// silently disabling the refresh.
+func TestKeepWarmInterval(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"":       keepWarmEvery,
+		"90s":    90 * time.Second,
+		"5m":     5 * time.Minute,
+		"off":    0,
+		"0":      0,
+		"no":     0,
+		"banana": keepWarmEvery,
+	} {
+		a := &agent{settings: Settings{KeepWarm: raw}}
+		if got := a.keepWarmInterval(); got != want {
+			t.Errorf("keep_warm=%q -> %v, want %v", raw, got, want)
+		}
 	}
 }

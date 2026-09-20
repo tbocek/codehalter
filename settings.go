@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -37,6 +38,16 @@ type Settings struct {
 	// delta. Only useful on backends with prefix caching (llama.cpp); elsewhere
 	// it wastes one tiny request. nil means on.
 	Prewarm *bool `toml:"prewarm,omitempty"`
+
+	// KeepWarm is how long a conversation's prefix may sit unused in the
+	// server's KV cache before codehalter refreshes it with the same 1-token
+	// call Prewarm uses. A local server reclaims or unloads an idle slot, and
+	// the next turn then re-reads the whole prompt: one measured session lost a
+	// 174k-token prefix after a 2m59s gap while a test ran, roughly six minutes
+	// of prompt processing at that server's rate. Empty means the default
+	// (keepWarmEvery); "off" or "0" disables it, which is what a metered or
+	// hosted endpoint wants since it caches on its own and bills per request.
+	KeepWarm string `toml:"keep_warm,omitempty"`
 
 	// FormatConfig controls the setup card that offers to pin a formatter config
 	// for a project that has none (see formatterConfigNeeds). nil means on. Set
@@ -172,6 +183,13 @@ var samplerParams = map[string]bool{
 	"frequency_penalty": true, "max_tokens": true, "min_p": true,
 	"n": true, "presence_penalty": true, "repeat_penalty": true,
 	"seed": true, "stop": true, "temperature": true, "top_k": true, "top_p": true,
+	// tool_choice constrains generation with a grammar; the prompt is rendered
+	// the same either way. Measured on llama.cpp over 14 summariser calls that
+	// set it to "none": prompt=250679 cached=250178, prompt=217887 cached=217256,
+	// so the prefix survived whole. Listing it here keeps a phase switch that
+	// differs only in tool_choice from being REPORTED as a rendering change by
+	// the rewind detector (noteCacheLineage), which would be a false accusation.
+	"tool_choice": true,
 }
 
 // renderKey fingerprints the params that reach the server's chat template:
@@ -469,6 +487,35 @@ func (a *agent) prewarmEnabled() bool {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
 	return a.settings.Prewarm == nil || *a.settings.Prewarm
+}
+
+// keepWarmEvery is the default gap between keep-alive calls: short enough to
+// sit under an idle-slot reclaim, long enough that an untouched session is not
+// generating traffic every few seconds.
+const keepWarmEvery = 3 * time.Minute
+
+// keepWarmFor bounds how long codehalter keeps refreshing after the last real
+// call. Past this the session is not idle, it is over: a machine left running
+// overnight should not hold a GPU slot until morning.
+const keepWarmFor = 30 * time.Minute
+
+// keepWarmInterval resolves the configured gap, or 0 when keep-alive is off.
+func (a *agent) keepWarmInterval() time.Duration {
+	a.cfgMu.RLock()
+	raw := strings.TrimSpace(a.settings.KeepWarm)
+	a.cfgMu.RUnlock()
+	switch strings.ToLower(raw) {
+	case "":
+		return keepWarmEvery
+	case "off", "false", "no", "0":
+		return 0
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		slog.Warn("settings: keep_warm is not a duration, using the default", "value", raw, "default", keepWarmEvery)
+		return keepWarmEvery
+	}
+	return d
 }
 
 // MainLLM returns the foreground connection (LLM[0]) with role-resolved

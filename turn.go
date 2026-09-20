@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"log/slog"
+	"strings"
 	"sync"
 )
 
@@ -28,10 +30,26 @@ import (
 // or a prompt that replaces it), and superseding tells that turn's cancel
 // handler it is being replaced rather than aborted, so it stays quiet.
 type turnControl struct {
-	held        sync.Mutex
-	mu          sync.Mutex
-	cancel      context.CancelFunc
+	held    sync.Mutex
+	mu      sync.Mutex
+	cancel  context.CancelFunc
+	running bool
+	// warmStop ends the keep-alive that runs between turns (keepWarm): a turn
+	// taking the gate stops it, and the turn's release starts a new one.
+	warmStop func()
+	// superseding is set while a turn is being replaced rather than aborted.
+	// Only the fix cards at session open replace a turn now: a prompt the user
+	// types while one runs steers it instead (see Session.addSteer).
 	superseding bool
+}
+
+// turnRunning reports whether a turn holds the gate right now. A prompt typed
+// then is steering, not a replacement, so Prompt queues it instead of waiting
+// for the gate.
+func (s *Session) turnRunning() bool {
+	s.ctl.mu.Lock()
+	defer s.ctl.mu.Unlock()
+	return s.ctl.running
 }
 
 // cancelTurn stops the turn in flight, if any. The caller does not wait for it
@@ -84,14 +102,51 @@ func (a *agent) holdTurn(parent context.Context, sess *Session, wait bool) (ctx 
 	sess.ctl.mu.Lock()
 	sess.ctl.superseding = false // the replaced turn has unwound; this one is not being replaced
 	sess.ctl.cancel = cancel
+	sess.ctl.running = true
+	if sess.ctl.warmStop != nil {
+		sess.ctl.warmStop() // this turn calls the model itself from here on
+		sess.ctl.warmStop = nil
+	}
 	sess.ctl.mu.Unlock()
 	release = func() {
 		a.finalizePlan(sess.ID)
 		a.flushBgNotes(context.Background(), sess)
+		// Between turns the conversation's prefix sits unused in the server's
+		// KV cache, where an idle slot is reclaimed and the next turn pays to
+		// re-read the whole prompt. Refresh it until the next turn starts, or
+		// until keepWarmFor says the session is over rather than idle.
+		warmConn := a.connForSession(context.Background(), sess.ID, "execute")
+		stop := a.keepWarm(sess, warmConn, func() []llmMessage { return a.buildLLMContext(sess) })
+		sess.ctl.mu.Lock()
+		sess.ctl.running = false
+		sess.ctl.warmStop = stop
+		sess.ctl.mu.Unlock()
 		cancel()
 		sess.ctl.held.Unlock()
 	}
 	return ctx, release, true
+}
+
+// maxSteerTurns bounds drainSteer: each turn it runs can leave more queued
+// behind it, and a user typing during those is steering THAT turn, not asking
+// for another. Three is enough for the race this covers (typed as the last
+// round ended) without turning a fast typist into an unbounded chain.
+const maxSteerTurns = 3
+
+// drainSteer runs what the user typed too late for any round to pick up. The
+// turn is over by then, so it becomes a turn of its own rather than being
+// dropped or silently stored where nothing would answer it.
+func (a *agent) drainSteer(ctx context.Context, sess *Session) {
+	for range maxSteerTurns {
+		queued := sess.takeSteer()
+		if len(queued) == 0 {
+			return
+		}
+		if err := a.runPromptTurn(ctx, sess, strings.Join(queued, "\n\n")); err != nil {
+			slog.Debug("drainSteer: the follow-up turn failed", "sid", sess.ID, "err", err)
+			return
+		}
+	}
 }
 
 // runPromptTurn stores text as a user message and runs one full turn on it,

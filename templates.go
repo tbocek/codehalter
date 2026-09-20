@@ -35,8 +35,16 @@ type availableCommandsUpdate struct {
 // to zero valid commands client-side (Zed shows "Available commands: none" and
 // rejects the slash), which is exactly what an earlier []string version did.
 type availableCommand struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	Name        string        `json:"name"`
+	Description string        `json:"description"`
+	Input       *commandInput `json:"input,omitempty"`
+}
+
+// commandInput is the optional placeholder the client shows after the command
+// name while the user has typed no arguments yet. Set only for the commands
+// that take arguments, so the menu says which those are.
+type commandInput struct {
+	Hint string `json:"hint"`
 }
 
 // isTemplateFile reports whether a filename is a TEMPLATE-<name>.md and returns
@@ -233,6 +241,22 @@ func (a *agent) expandMacro(ctx context.Context, sid, cwd, userText string) (ren
 	return r, msg, true
 }
 
+// templateSummary is a template's first line of prose, which is what its author
+// wrote the command to do. Markdown heading marks are stripped and the line is
+// clipped, since the client shows it inline in the slash menu. A template that
+// opens with something unusable (only a heading mark, or nothing) falls back to
+// naming itself.
+func templateSummary(name, body string) string {
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(line), "#"))
+		if line == "" || line == templatePlaceholder {
+			continue
+		}
+		return clipUTF8(line, 120)
+	}
+	return "Run the " + name + " prompt template"
+}
+
 // sendAvailableCommands advertises the macro commands to the editor's slash
 // menu. Re-sent every turn (from prepare) so the menu stays live.
 func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
@@ -246,10 +270,21 @@ func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
 	cmds = append(cmds,
 		availableCommand{Name: "clean", Description: "Delete session log files from .codehalter/"},
 		availableCommand{Name: "settings", Description: "Show which settings.toml is in use and re-probe every configured model"},
-		availableCommand{Name: "spec", Description: "Implement a spec item by item until every requirement has a passing test: /spec <spec-dir> <out-dir> [technology]; /spec resumes; /spec status"},
+		availableCommand{
+			Name:        "spec",
+			Description: "Implement a spec item by item until every requirement has a passing test. No arguments resumes; `status` reports the ledger",
+			Input:       &commandInput{Hint: "<spec-dir> <out-dir> [technology] | status"},
+		},
 	)
 	for _, n := range names {
-		cmds = append(cmds, availableCommand{Name: n, Description: "Run the " + n + " prompt template"})
+		body, _ := loadTemplate(cwd, n)
+		cmd := availableCommand{Name: n, Description: templateSummary(n, body)}
+		// A {{}} template is the one shape that REQUIRES args (renderMacro
+		// refuses without them), so it is the one that gets a hint.
+		if strings.Contains(body, templatePlaceholder) {
+			cmd.Input = &commandInput{Hint: "<your text>"}
+		}
+		cmds = append(cmds, cmd)
 	}
 	a.sendUpdate(ctx, sid, availableCommandsUpdate{Kind: "available_commands_update", Commands: cmds})
 }

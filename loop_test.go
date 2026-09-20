@@ -504,6 +504,12 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	if _, set := body["chat_template_kwargs"]; set {
 		t.Errorf("execute re-rendered the prompt instead of appending: %v", body["chat_template_kwargs"])
 	}
+	// This phase ends only on a terminal tool, so prose is always a slip: the
+	// server is told to answer with a tool call rather than being nudged into
+	// one afterwards. A grammar, not a re-render, so the prefix is untouched.
+	if body["tool_choice"] != "required" {
+		t.Errorf("execute call tool_choice = %v, want required", body["tool_choice"])
+	}
 	sent, _ := body["messages"].([]any)
 	if len(sent) == 0 {
 		t.Fatal("no messages on the wire")
@@ -1129,5 +1135,111 @@ func TestToolLoopNudgesReasonedButEmpty(t *testing.T) {
 	}
 	if res.Text != "here is the answer" {
 		t.Errorf("res.Text: got %q, want the post-nudge answer", res.Text)
+	}
+}
+
+// TestNoToolCallNudgesEscalate pins the ladder for a model that answers in
+// prose in a phase that only ends on a terminal tool: three re-asks whose
+// wording escalates, then the text exit so it cannot spin forever. One polite
+// nudge used to be the whole budget, and the weaker models answered in prose
+// again on the next round, ending the turn with the work unfinished.
+func TestNoToolCallNudgesEscalate(t *testing.T) {
+	mock := newMockLLM(t,
+		sseText("I will now do the thing"),
+		sseText("I am doing the thing"),
+		sseText("still prose"),
+		sseText("final prose"),
+	)
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}},
+		phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if mock.callCount() != noCallNudges+1 {
+		t.Fatalf("LLM calls: got %d, want %d (one per nudge plus the accepted text exit)", mock.callCount(), noCallNudges+1)
+	}
+
+	// Each re-ask carries its own wording, and the last one is the imperative.
+	var nudges []string
+	for i := 1; i < mock.callCount(); i++ {
+		msgs, _ := mock.request(i)["messages"].([]any)
+		last, _ := msgs[len(msgs)-1].(map[string]any)
+		nudges = append(nudges, last["content"].(string))
+	}
+	for _, want := range []string{"no tool call", "Prose again", "STOP. You MUST call"} {
+		found := false
+		for _, n := range nudges {
+			found = found || strings.Contains(n, want)
+		}
+		if !found {
+			t.Errorf("no nudge contained %q; got %q", want, nudges)
+		}
+	}
+	if nudges[0] == nudges[1] || nudges[1] == nudges[2] {
+		t.Errorf("the wording must change with each re-ask, got %q", nudges)
+	}
+	if res.RespondCalled {
+		t.Error("the model never called respond; the loop must not report one")
+	}
+	if !strings.Contains(res.Text, "final prose") {
+		t.Errorf("the accepted text exit should carry the prose, got %q", res.Text)
+	}
+}
+
+// TestSteeringLandsBetweenRounds pins what a prompt typed mid-turn does: it is
+// queued, the running turn picks it up before its next model call, and it
+// arrives as an ordinary user message (an append, so the prefix cache holds).
+// Before this, typing cancelled the turn in flight and started a new one, which
+// during a long /spec round threw away the whole round.
+func TestSteeringLandsBetweenRounds(t *testing.T) {
+	a, s := newTestAgent(t)
+	// The user types while the tool runs, which is when they actually do.
+	testTools := []Tool{{
+		Def: map[string]any{"type": "function", "function": map[string]any{
+			"name": "probe", "description": "x", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, raw string) (string, bool) {
+			s.addSteer("also update the README")
+			return "probed", false
+		},
+	}}
+	mock := newMockLLM(t,
+		sseToolCall("c1", "probe", `{}`),
+		sseToolCall("c2", respondToolName, `{"message":"done"}`),
+	)
+	defer mock.Close()
+	withTools(a, append(testTools, respondTool)...)
+
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}},
+		phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if !res.RespondCalled {
+		t.Fatalf("the loop did not finish: %+v", res)
+	}
+	if mock.callCount() != 2 {
+		t.Fatalf("LLM calls: got %d, want 2", mock.callCount())
+	}
+
+	msgs, _ := mock.request(1)["messages"].([]any)
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	if last["role"] != "user" || last["content"] != "also update the README" {
+		t.Errorf("the steer should be the last message of the next round, got %v", last)
+	}
+	// It is part of the conversation, not a one-off: the session keeps it.
+	found := false
+	for _, m := range s.Messages {
+		found = found || (m.Role == "user" && m.Content == "also update the README")
+	}
+	if !found {
+		t.Error("the steer was not stored in the session")
+	}
+	if q := s.takeSteer(); len(q) != 0 {
+		t.Errorf("the queue should be empty after it was picked up, got %v", q)
 	}
 }

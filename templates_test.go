@@ -166,3 +166,21 @@ func TestExpandMacroSettingsIsCodeLevel(t *testing.T) {
 		t.Errorf("/settings report does not cover the models: %q", stopMsg)
 	}
 }
+
+// TestAvailableCommandsDescribeThemselves pins what the editor's slash menu
+// shows: a template's own first line (a heading counts, without its marks)
+// rather than a generic label.
+func TestAvailableCommandsDescribeThemselves(t *testing.T) {
+	if got := templateSummary("commit", "Commit my changes (do NOT push).\nMore text.\n"); got != "Commit my changes (do NOT push)." {
+		t.Errorf("summary should be the first line, got %q", got)
+	}
+	if got := templateSummary("commit", "# Commit helper\n\nbody\n"); got != "Commit helper" {
+		t.Errorf("a heading should lose its marks and serve as the description, got %q", got)
+	}
+	if got := templateSummary("empty", "#\n\n"); got != "Run the empty prompt template" {
+		t.Errorf("an unusable body should fall back, got %q", got)
+	}
+	if got := templateSummary("args", "{{}}\nDo the thing.\n"); got != "Do the thing." {
+		t.Errorf("the placeholder is not a description, got %q", got)
+	}
+}

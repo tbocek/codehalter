@@ -428,28 +428,18 @@ var webTools = []Tool{
 		return formatted, false
 	}},
 
-	{Def: webReadDef(
-		"web_read",
-		"Open a URL in Firefox and get an ANSWER from the page: a separate reader sees ONLY the page and your `question`, and returns what the page says about it. Much cheaper for your context than the raw text. Use this for \"what does this page say about X\". The user will review the page before the answer is returned.",
-		true,
-	), Execute: makeWebRead(true)},
-
-	{Def: webReadDef(
-		"web_read_raw",
-		"Open a URL in Firefox and return the raw extracted text (truncated). Use this when summarization would lose precision: finding a specific download URL on the page, exact version numbers, code snippets, or any string that must be preserved verbatim. The user will review the page before the text is returned.",
-		false,
-	), Execute: makeWebRead(false)},
+	{Def: webReadDef(), Execute: webReadExecute},
 }
 
-// webReadDef builds the schema shared by web_read and web_read_raw. withQuestion
-// adds web_read's required `question`: the reader that answers it is a separate
-// LLM call with no view of this conversation, so the question has to stand alone.
-func webReadDef(name, description string, withQuestion bool) map[string]any {
+// webReadDef builds web_read's schema. `question` is what picks the mode, so it
+// is described as the normal way to call the tool and omitting it as the
+// exception: the answer costs a fraction of the raw text in context.
+func webReadDef() map[string]any {
 	def := map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name":        name,
-			"description": description,
+			"name":        "web_read",
+			"description": "Open a URL in Firefox and get an ANSWER from the page: a separate reader sees ONLY the page and your `question`, and returns what the page says about it. Much cheaper for your context than the raw text. Use this for \"what does this page say about X\". OMIT `question` to get the raw extracted text instead (truncated), which you want only when an answer would lose precision: a download URL, an exact version number, a code snippet, any string that must survive verbatim. The user will review the page before the result is returned.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"url"},
@@ -470,19 +460,16 @@ func webReadDef(name, description string, withQuestion bool) map[string]any {
 			},
 		},
 	}
-	if withQuestion {
-		params := def["function"].(map[string]any)["parameters"].(map[string]any)
-		params["required"] = []string{"url", "question"}
-		params["properties"].(map[string]any)["question"] = map[string]any{
-			"type":        "string",
-			"description": "What you want to know from this page, as a STANDALONE question. The reader sees only the page and this text, nothing of our conversation: name the product, version, platform and what exactly you need (\"Which gtk4-rs crate version supports GTK 4.14, and what cargo feature enables it?\"), not \"what about the version?\".",
-		}
+	params := def["function"].(map[string]any)["parameters"].(map[string]any)
+	params["properties"].(map[string]any)["question"] = map[string]any{
+		"type":        "string",
+		"description": "What you want to know from this page, as a STANDALONE question. The reader sees only the page and this text, nothing of our conversation: name the product, version, platform and what exactly you need (\"Which gtk4-rs crate version supports GTK 4.14, and what cargo feature enables it?\"), not \"what about the version?\". Omit it to get the raw page text instead.",
 	}
 	return def
 }
 
 const (
-	// maxRawPageChars caps the bytes returned by web_read_raw on the FIRST
+	// maxRawPageChars caps the bytes a question-less web_read returns on the FIRST
 	// fetch (before truncateForLLM further compresses for the model). Full
 	// body is still cached so range reads can dip past this.
 	maxRawPageChars = 30000
@@ -491,154 +478,157 @@ const (
 	maxWebRangeChars = 8000
 )
 
-func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (string, bool) {
-	return func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-		args := parseArgs(rawArgs)
-		targetURL := args.str("url")
-		if targetURL == "" {
-			return "error: url is required", false
-		}
-		offset, _ := args.num("offset")
-		if offset < 0 {
-			offset = 0
-		}
-		limit, _ := args.num("limit")
-		if limit <= 0 || limit > maxWebRangeChars {
-			limit = maxWebRangeChars
-		}
-		// Any supplied `limit` means the model wants a slice, even one we then
-		// clamp — presence is the signal, not the value.
-		rangeRequest := offset > 0 || args.has("limit")
-		// web_read's answer depends on the question, so the result cache is keyed
-		// on both: the same page asked something else is a different result.
-		question := strings.TrimSpace(args.str("question"))
-		if summarize && question == "" && !rangeRequest {
-			return "error: question is required: say what you want to know from the page, as a standalone question (the reader sees only the page and the question). For the raw text use web_read_raw.", true
-		}
-		resultKey := targetURL
-		if summarize {
-			resultKey += "\x00" + question
-		}
-
-		// Range request hits the cache first — no second HTTP round-trip when
-		// the page was fetched earlier in this session. Cache miss falls
-		// through to the regular fetch path so the model can still get a slice
-		// (it just costs the fetch the first time).
-		if rangeRequest {
-			if sess := a.getSession(sid); sess != nil {
-				if body, ok := sess.recallWebBody(targetURL); ok {
-					slice := sliceWebBody(body, offset, limit)
-					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
-					a.CompleteToolCallTitled(ctx, sid, tcId,
-						fmt.Sprintf("Web Read (cached): %s [%d:%d of %d]", targetURL, offset, offset+len(slice), len(body)),
-						[]ToolCallContent{TextContent(fmt.Sprintf("returned %d chars from cache (offset %d, body %d)", len(slice), offset, len(body)))})
-					a.logSession(sid, "WEB", "range from cache: url=%s offset=%d limit=%d returned=%d body=%d", targetURL, offset, limit, len(slice), len(body))
-					return slice, false
-				}
-			}
-		} else {
-			// No-range repeat on the same URL+mode: return the previously-rendered
-			// output verbatim. Small models often re-ask for the same URL within
-			// one phase (or across plan→execute); skipping the fetch + summarize
-			// here saves the dominant cost (Firefox launch + page load is 30-60s,
-			// summarize is another LLM round-trip). Identical bytes are also nice
-			// to the prefix cache if the second call shows up in the same prompt.
-			if sess := a.getSession(sid); sess != nil {
-				if cached, ok := sess.recallWebResult(resultKey, summarize); ok {
-					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
-					a.CompleteToolCallTitled(ctx, sid, tcId,
-						"Web Read (cached): "+targetURL,
-						[]ToolCallContent{TextContent(fmt.Sprintf("returned cached result (%d chars, no re-fetch)", len(cached)))})
-					a.logSession(sid, "WEB", "result from cache: url=%s summarize=%v returned=%d", targetURL, summarize, len(cached))
-					return cached, false
-				}
-			}
-		}
-
-		// A new question about a page already fetched this session: answer from
-		// the cached body. The Firefox launch and page load are the slow part
-		// (30-60s) and the page has not changed.
-		if summarize && !rangeRequest {
-			if sess := a.getSession(sid); sess != nil {
-				if body, ok := sess.recallWebBody(targetURL); ok {
-					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL+" — "+question, "search", nil)
-					out := a.summarizePage(ctx, sid, question, targetURL, body)
-					a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read (cached): "+targetURL+" — "+question,
-						[]ToolCallContent{TextContent(fmt.Sprintf("answered from the cached page (%d chars, no re-fetch)", len(body)))})
-					sess.rememberWebResult(resultKey, summarize, out)
-					return out, false
-				}
-			}
-		}
-
-		a.logSession(sid, "WEB", "open URL: %s", targetURL)
-
-		title := "Web Read: " + targetURL
-		if question != "" {
-			title += " — " + question
-		}
-		tcId := a.StartToolCall(ctx, sid, title, "search", nil)
-
-		port := nextBrowserPort()
-		browser, err := StartBrowser(ctx, port, targetURL)
-		if err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error starting browser: " + err.Error(), false
-		}
-		defer browser.Close()
-		tabID := browser.initialTab
-
-		text, err := browser.PageText(ctx, tabID)
-		if err != nil {
-			a.logSession(sid, "WEB", "page text error: %s", err.Error())
-			a.FailToolCall(ctx, sid, tcId, "page text error: "+err.Error())
-			return "error getting page text: " + err.Error(), false
-		}
-
-		// Cache the full extracted text BEFORE summarization / raw truncation.
-		// Later offset/limit calls slice from this — they should be able to
-		// reach past the raw 30k cap or the summary's compression.
-		if sess := a.getSession(sid); sess != nil {
-			sess.rememberWebBody(targetURL, text)
-		}
-
-		// Binary success/failure marker after the URL: ✅ when the body looks
-		// like real content, ❌ when pageIssue flags a load failure, bot wall,
-		// or content too thin to use. The card itself is still marked
-		// completed (not failed) because the model can decide to retry with
-		// web_read_raw or fall back to web_search; we don't want Zed to bury
-		// the result in a red-collapsed card.
-		icon, msg := "✅", "Page loaded"
-		if issue := pageIssue(text); issue != "" {
-			icon, msg = "❌", issue
-		}
-		a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read: "+targetURL+" "+icon,
-			[]ToolCallContent{TextContent(icon + " " + msg)})
-
-		a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))
-
-		// A range request that fell through (cache miss) returns a slice of
-		// the freshly-fetched body — honor offset/limit even on the first
-		// call so the model gets exactly what it asked for. Range slices are
-		// NOT memoized in webResults (offset/limit vary), but the underlying
-		// body is in webBodies so the next range call is still free.
-		if rangeRequest {
-			return sliceWebBody(text, offset, limit), false
-		}
-		var out string
-		if summarize {
-			out = a.summarizePage(ctx, sid, question, targetURL, text)
-		} else {
-			out = text
-			if len(out) > maxRawPageChars {
-				out = clipUTF8(out, maxRawPageChars) + "\n... (truncated)"
-			}
-		}
-		if sess := a.getSession(sid); sess != nil {
-			sess.rememberWebResult(resultKey, summarize, out)
-		}
-		return out, false
+// webReadExecute serves both modes of web_read: with a `question` the page is
+// read by a separate LLM call that answers it, without one the raw text comes
+// back truncated. One tool rather than two because the choice between them is a
+// choice small models get wrong, and the argument they already have to write
+// says which one they meant.
+func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+	args := parseArgs(rawArgs)
+	targetURL := args.str("url")
+	if targetURL == "" {
+		return "error: url is required", false
 	}
+	offset, _ := args.num("offset")
+	if offset < 0 {
+		offset = 0
+	}
+	limit, _ := args.num("limit")
+	if limit <= 0 || limit > maxWebRangeChars {
+		limit = maxWebRangeChars
+	}
+	// Any supplied `limit` means the model wants a slice, even one we then
+	// clamp — presence is the signal, not the value.
+	rangeRequest := offset > 0 || args.has("limit")
+	// web_read's answer depends on the question, so the result cache is keyed
+	// on both: the same page asked something else is a different result.
+	question := strings.TrimSpace(args.str("question"))
+	// The question is what picks the mode: with one, a separate reader
+	// answers it; without one, the raw text comes back.
+	summarize := question != ""
+	resultKey := targetURL
+	if summarize {
+		resultKey += "\x00" + question
+	}
+
+	// Range request hits the cache first — no second HTTP round-trip when
+	// the page was fetched earlier in this session. Cache miss falls
+	// through to the regular fetch path so the model can still get a slice
+	// (it just costs the fetch the first time).
+	if rangeRequest {
+		if sess := a.getSession(sid); sess != nil {
+			if body, ok := sess.recallWebBody(targetURL); ok {
+				slice := sliceWebBody(body, offset, limit)
+				tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
+				a.CompleteToolCallTitled(ctx, sid, tcId,
+					fmt.Sprintf("Web Read (cached): %s [%d:%d of %d]", targetURL, offset, offset+len(slice), len(body)),
+					[]ToolCallContent{TextContent(fmt.Sprintf("returned %d chars from cache (offset %d, body %d)", len(slice), offset, len(body)))})
+				a.logSession(sid, "WEB", "range from cache: url=%s offset=%d limit=%d returned=%d body=%d", targetURL, offset, limit, len(slice), len(body))
+				return slice, false
+			}
+		}
+	} else {
+		// No-range repeat on the same URL+mode: return the previously-rendered
+		// output verbatim. Small models often re-ask for the same URL within
+		// one phase (or across plan→execute); skipping the fetch + summarize
+		// here saves the dominant cost (Firefox launch + page load is 30-60s,
+		// summarize is another LLM round-trip). Identical bytes are also nice
+		// to the prefix cache if the second call shows up in the same prompt.
+		if sess := a.getSession(sid); sess != nil {
+			if cached, ok := sess.recallWebResult(resultKey, summarize); ok {
+				tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
+				a.CompleteToolCallTitled(ctx, sid, tcId,
+					"Web Read (cached): "+targetURL,
+					[]ToolCallContent{TextContent(fmt.Sprintf("returned cached result (%d chars, no re-fetch)", len(cached)))})
+				a.logSession(sid, "WEB", "result from cache: url=%s summarize=%v returned=%d", targetURL, summarize, len(cached))
+				return cached, false
+			}
+		}
+	}
+
+	// A new question about a page already fetched this session: answer from
+	// the cached body. The Firefox launch and page load are the slow part
+	// (30-60s) and the page has not changed.
+	if summarize && !rangeRequest {
+		if sess := a.getSession(sid); sess != nil {
+			if body, ok := sess.recallWebBody(targetURL); ok {
+				tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL+" — "+question, "search", nil)
+				out := a.summarizePage(ctx, sid, question, targetURL, body)
+				a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read (cached): "+targetURL+" — "+question,
+					[]ToolCallContent{TextContent(fmt.Sprintf("answered from the cached page (%d chars, no re-fetch)", len(body)))})
+				sess.rememberWebResult(resultKey, summarize, out)
+				return out, false
+			}
+		}
+	}
+
+	a.logSession(sid, "WEB", "open URL: %s", targetURL)
+
+	title := "Web Read: " + targetURL
+	if question != "" {
+		title += " — " + question
+	}
+	tcId := a.StartToolCall(ctx, sid, title, "search", nil)
+
+	port := nextBrowserPort()
+	browser, err := StartBrowser(ctx, port, targetURL)
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		return "error starting browser: " + err.Error(), false
+	}
+	defer browser.Close()
+	tabID := browser.initialTab
+
+	text, err := browser.PageText(ctx, tabID)
+	if err != nil {
+		a.logSession(sid, "WEB", "page text error: %s", err.Error())
+		a.FailToolCall(ctx, sid, tcId, "page text error: "+err.Error())
+		return "error getting page text: " + err.Error(), false
+	}
+
+	// Cache the full extracted text BEFORE summarization / raw truncation.
+	// Later offset/limit calls slice from this — they should be able to
+	// reach past the raw 30k cap or the summary's compression.
+	if sess := a.getSession(sid); sess != nil {
+		sess.rememberWebBody(targetURL, text)
+	}
+
+	// Binary success/failure marker after the URL: ✅ when the body looks
+	// like real content, ❌ when pageIssue flags a load failure, bot wall,
+	// or content too thin to use. The card itself is still marked
+	// completed (not failed) because the model can decide to retry without
+	// a question or fall back to web_search; we don't want Zed to bury
+	// the result in a red-collapsed card.
+	icon, msg := "✅", "Page loaded"
+	if issue := pageIssue(text); issue != "" {
+		icon, msg = "❌", issue
+	}
+	a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read: "+targetURL+" "+icon,
+		[]ToolCallContent{TextContent(icon + " " + msg)})
+
+	a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))
+
+	// A range request that fell through (cache miss) returns a slice of
+	// the freshly-fetched body — honor offset/limit even on the first
+	// call so the model gets exactly what it asked for. Range slices are
+	// NOT memoized in webResults (offset/limit vary), but the underlying
+	// body is in webBodies so the next range call is still free.
+	if rangeRequest {
+		return sliceWebBody(text, offset, limit), false
+	}
+	var out string
+	if summarize {
+		out = a.summarizePage(ctx, sid, question, targetURL, text)
+	} else {
+		out = text
+		if len(out) > maxRawPageChars {
+			out = clipUTF8(out, maxRawPageChars) + "\n... (truncated)"
+		}
+	}
+	if sess := a.getSession(sid); sess != nil {
+		sess.rememberWebResult(resultKey, summarize, out)
+	}
+	return out, false
 }
 
 // sliceWebBody returns up to `limit` bytes of `body` starting at `offset`,

@@ -148,7 +148,7 @@ func TestArgsTypedAccessors(t *testing.T) {
 func TestLiveToolOutput(t *testing.T) {
 	big := strings.Repeat("x", truncateThreshold*3)
 
-	for _, tool := range []string{"read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw"} {
+	for _, tool := range []string{"read_file", "continue_read", "search_text", "web_search", "web_read"} {
 		if got := liveToolOutput(tool, "{}", big); got != big {
 			t.Errorf("liveToolOutput(%s) clipped a size-managing tool (len %d, want %d)", tool, len(got), len(big))
 		}

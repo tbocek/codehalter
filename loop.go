@@ -361,7 +361,9 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// Reasoning off for the whole subtask: withThinkingDisabled appends a closed
 	// <think></think> for the model to continue, which suppresses it without
 	// changing a single earlier token (see llm.go).
-	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
+	// ... and every round must be a tool call: this phase ends only on a
+	// terminal tool, so prose is always a slip (withToolChoiceRequired).
+	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled().withToolChoiceRequired()
 	res, err := a.runToolLoop(ctx, sid, conn, policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
 	// session, stored verbatim by the loop — no post-hoc patch.
@@ -577,6 +579,15 @@ const (
 	stuckEscalateRounds = 3
 	stuckBailRounds     = 5
 )
+
+// noCallNudges is how many times a phase with a terminal tool re-asks a model
+// that answered in prose instead of calling one. The wording escalates with
+// each: a reminder, then an instruction, then one imperative line naming the
+// only tools that end the turn. Three because a single polite nudge left the
+// weaker models answering in prose again on the next round, and the text exit
+// below then ended the turn with the work unfinished; past three the model is
+// not going to call it and spinning costs more than taking the prose.
+const noCallNudges = 3
 
 // toolLoopResult is what an agentic tool loop (runToolLoop) returns.
 type toolLoopResult struct {
@@ -1083,10 +1094,10 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	var stuckRounds int
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
-	// respondNudged: with a terminal tool (hasTerminal), an empty tool-call list
-	// gets one nudge to call it; a second empty list falls through to the legacy
-	// text exit so a model that refuses the terminal can't spin forever.
-	var respondNudged bool
+	// noCallNudged counts the empty tool-call lists this loop has re-asked (see
+	// noCallNudges); once the budget is spent the next one falls through to the
+	// text exit, so a model that refuses the terminal can't spin forever.
+	var noCallNudged int
 	// failedRounds counts iterations whose tool batch produced a failure; the
 	// failSoftCap check below bounces the loop once it accumulates too many.
 	var failedRounds int
@@ -1099,6 +1110,18 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			stampTiming()
 			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
 		}
+		// What the user typed while this turn was running, taken between rounds
+		// and handed over as a plain user message: an append, so the prefix
+		// cache is untouched and the model reads it as part of the conversation
+		// rather than as a system correction.
+		if sess := a.getSession(sid); sess != nil {
+			if queued := sess.takeSteer(); len(queued) > 0 {
+				joined := strings.Join(queued, "\n\n")
+				messages = a.addCorrective(sid, messages, joined)
+				a.say(ctx, sid, "\n↪ picked up: "+firstLine(joined)+"\n")
+			}
+		}
+
 		streamStart := time.Now()
 		if res.StartedAt.IsZero() {
 			res.StartedAt = streamStart
@@ -1128,26 +1151,35 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		}
 
 		if len(calls) == 0 {
-			// No tool call. Nudge ONCE (respondNudged) before accepting the text
-			// exit, for either model slip:
+			// No tool call. Re-ask, in escalating wording (noCallNudges), before
+			// accepting the text exit, for either model slip:
 			//   (a) reasoned a lot but emitted EMPTY content — the answer is stuck
 			//       in the never-shown reasoning channel ("calculated a lot, then
 			//       nothing"); tell it to write the answer as plain text.
 			//   (b) terminal mode: it dropped out of tool-calling without finishing.
 			reasonedButSilent := text == "" && len(reasoning) > reasoningNudgeBytes
-			if !respondNudged && (reasonedButSilent || hasTerminal) {
-				respondNudged = true
+			if noCallNudged < noCallNudges && (reasonedButSilent || hasTerminal) {
+				noCallNudged++
 				var nudge string
-				if reasonedButSilent {
+				switch {
+				case reasonedButSilent:
 					nudge = "You produced a lot of reasoning but no visible output — your reasoning/thinking is NEVER shown to the user. Write your result now as plain text; this message is what they read."
 					if hasTerminal {
 						nudge += fmt.Sprintf(" If you're done, put it in %s.", termList)
 					}
-				} else {
+				case noCallNudged == 1:
 					nudge = fmt.Sprintf("Your last response was plain text with no tool call. "+
 						"This turn ends only when you call a terminal tool (%s), or "+
 						"another tool if you still have work to do. Do not reply in "+
 						"prose — call a tool.", termList)
+				case noCallNudged == 2:
+					// Shorter and imperative: the first wording did not land, and a
+					// longer explanation of the same thing reads as more prose to
+					// answer in kind.
+					nudge = fmt.Sprintf("Prose again. Nothing you write outside a tool call counts. "+
+						"Call %s now if the work is done, or the tool that does the next step.", termList)
+				default:
+					nudge = fmt.Sprintf("STOP. You MUST call one of: %s. Emit the tool call and nothing else.", termList)
 				}
 				// The assistant turn above is already in the session (AddAssistant at
 				// the top of this iteration); only the nudge needs storing.
@@ -1179,6 +1211,17 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		// already produced this loop — i.e. the round made no progress (see the
 		// repetition ladder below). A single new/productive call clears it.
 		roundStuck := len(calls) > 0
+
+		// Nothing calls the model while this batch runs, and a build or a test
+		// suite is exactly the gap in which a server reclaims the slot holding
+		// this conversation. Refresh it meanwhile: the messages so far are a
+		// prefix of the next round's request, so the refresh keeps precisely
+		// what that round will ask for.
+		stopWarm := func() {}
+		if sess := a.getSession(sid); sess != nil {
+			sent := messages
+			stopWarm = a.keepWarm(sess, caller.conn, func() []llmMessage { return sent })
+		}
 
 		for _, tc := range calls {
 			// Terminal tools are skipped because their payload is already
@@ -1233,6 +1276,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				ToolCallID: tc.ID,
 			})
 		}
+		stopWarm() // the model is about to be called again; the slot is busy from here
 
 		// Terminal tool called: stream the message to the UI as one chunk
 		// (the model emitted it as tool arguments, which never went through

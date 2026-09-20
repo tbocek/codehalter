@@ -4,6 +4,11 @@
 # Top-level keys must stay ABOVE the [[llm]] tables.
 
 # prewarm = true    # warm the server's prefix cache at session open (default on)
+# keep_warm = "3m"  # while the session is idle, and while a long tool runs, re-send
+                    # the conversation as a 1-token call so the server does not reclaim
+                    # the slot holding its prefix. "off" for a hosted endpoint, which
+                    # caches on its own and bills per request. Default 3m, stops 30min
+                    # after the last real call.
 # update_check = false # never ask GitHub whether a newer release exists (default on, at most once a day)
 # format_config = false # stop offering to pin a formatter config for a project that deliberately has none (default on, asked once per session)
 

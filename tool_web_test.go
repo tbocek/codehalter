@@ -19,24 +19,21 @@ func TestSliceWebBodyRunes(t *testing.T) {
 	}
 }
 
-// TestWebReadNeedsStandaloneQuestion pins web_read's contract: its reader is a
-// separate LLM call that sees only the page and the question, so a call without
-// one is refused before any browser starts, and only web_read (not the raw
-// variant) requires it.
-func TestWebReadNeedsStandaloneQuestion(t *testing.T) {
-	a, s := newTestAgent(t)
-	out, failed := makeWebRead(true)(t.Context(), a, s.ID, `{"url":"https://example.com"}`)
-	if !failed || !strings.Contains(out, "question is required") {
-		t.Errorf("web_read without a question = (%q, failed=%v), want a refusal", out, failed)
+// TestWebReadQuestionPicksTheMode pins the one-tool contract: `question` is
+// optional and is what chooses between an answered read and the raw text, and
+// the schema still spells out that the reader sees only the page and that
+// question (it is a separate LLM call with no view of the conversation).
+func TestWebReadQuestionPicksTheMode(t *testing.T) {
+	def := webReadDef()["function"].(map[string]any)
+	params := def["parameters"].(map[string]any)
+	if got := params["required"].([]string); len(got) != 1 || got[0] != "url" {
+		t.Errorf("web_read required = %v, want url only: the question is what picks the mode", got)
 	}
-
-	required := func(def map[string]any) []string {
-		return def["function"].(map[string]any)["parameters"].(map[string]any)["required"].([]string)
+	q, ok := params["properties"].(map[string]any)["question"].(map[string]any)
+	if !ok || !strings.Contains(q["description"].(string), "STANDALONE") {
+		t.Errorf("web_read must still ask for a standalone question, got %v", q)
 	}
-	if got := required(webReadDef("web_read", "d", true)); len(got) != 2 || got[1] != "question" {
-		t.Errorf("web_read required = %v, want url and question", got)
-	}
-	if got := required(webReadDef("web_read_raw", "d", false)); len(got) != 1 {
-		t.Errorf("web_read_raw required = %v, want url only", got)
+	if !strings.Contains(def["description"].(string), "OMIT `question`") {
+		t.Errorf("the description must say how to get raw text, got %q", def["description"])
 	}
 }

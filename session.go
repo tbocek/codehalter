@@ -327,6 +327,11 @@ type sessionRuntime struct {
 	// read that is no longer true. Not per turn: that drift routinely spans turns.
 	wroteHash map[string]string
 	drifted   map[string]bool
+	// steer holds what the user typed while a turn was running. The running
+	// turn drains it between rounds (runToolLoop) and feeds it to the model as
+	// a user message, so a mid-turn "also do X" is an append to the
+	// conversation rather than a cancelled turn and a fresh one.
+	steer []string
 	// bgNotes queues the results of finished run_background jobs until a quiet
 	// point (see deliverBgNotesWhenIdle / flushBgNotes). The job died with the
 	// process that would have reported it.
@@ -548,7 +553,7 @@ func (s *Session) recallWebBody(url string) (string, bool) {
 	return b, ok
 }
 
-// rememberWebBody stores the full raw page text from a web_read / web_read_raw
+// rememberWebBody stores the full raw page text from a web_read
 // fetch. Overwrites on re-fetch so a refresh updates the cache; this is what
 // the model wants — if it asked for a fresh fetch it should see fresh content
 // on subsequent range views.
@@ -562,7 +567,7 @@ func (s *Session) rememberWebBody(url, body string) {
 }
 
 // webResultKey distinguishes summarized vs. raw output for the same URL so
-// web_read and web_read_raw don't collide in the result cache.
+// an answered web_read and a raw one don't collide in the result cache.
 func webResultKey(url string, summarize bool) string {
 	if summarize {
 		return url + "\x00summary"
@@ -570,7 +575,7 @@ func webResultKey(url string, summarize bool) string {
 	return url + "\x00raw"
 }
 
-// recallWebResult returns a previously-rendered web_read / web_read_raw output
+// recallWebResult returns a previously-rendered web_read output
 // for the same URL+mode. Lets the second call on a duplicate URL skip fetch
 // and re-summarize entirely.
 func (s *Session) recallWebResult(url string, summarize bool) (string, bool) {
@@ -790,6 +795,22 @@ func (s *Session) takeDriftNote(path string) string {
 // note (exit code, log path, log tail) for the model.
 type bgNote struct {
 	line, full string
+}
+
+// addSteer queues a prompt typed while a turn was running.
+func (s *Session) addSteer(text string) {
+	s.rt.mu.Lock()
+	s.rt.steer = append(s.rt.steer, text)
+	s.rt.mu.Unlock()
+}
+
+// takeSteer returns and clears the queue.
+func (s *Session) takeSteer() []string {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	queued := s.rt.steer
+	s.rt.steer = nil
+	return queued
 }
 
 func (s *Session) addBgNote(n bgNote) {

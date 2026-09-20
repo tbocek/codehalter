@@ -389,6 +389,26 @@ func (c *LLMConnection) withToolChoiceNone() *LLMConnection {
 	return &cp
 }
 
+// withToolChoiceRequired returns a shallow copy of the connection whose next
+// call must answer with a tool call. llama.cpp turns this into a grammar over
+// the tool-call format, so no prompt token changes and the prefix cache is
+// untouched (see samplerParams).
+//
+// Used by the execute phase, where the turn ends only on a terminal tool and
+// prose is therefore always a mistake: the loop otherwise spends a round trip
+// per nudge (noCallNudges) asking for a tool call it can simply require. Not
+// used where prose is a legitimate answer (the document phase), and not on the
+// planner, whose reasoning runs before the tool call and whose own corrective
+// retry already covers the prose slip.
+func (c *LLMConnection) withToolChoiceRequired() *LLMConnection {
+	cp := *c
+	eb := make(map[string]any, len(c.ExtraBody)+1)
+	maps.Copy(eb, c.ExtraBody)
+	eb["tool_choice"] = "required"
+	cp.ExtraBody = eb
+	return &cp
+}
+
 // prewarm pays the prompt-processing cost of the session's prefix (system
 // prompt + summary + history + tool schemas) before the user's first message,
 // so turn one only pays for its own delta. One synchronous 1-token call built
@@ -400,6 +420,55 @@ func (c *LLMConnection) withToolChoiceNone() *LLMConnection {
 // call skips session logging and turn stats. Errors are swallowed by design:
 // an unreachable server or a cache-less backend just makes this a no-op, and
 // the real turn will surface any genuine problem.
+// keepWarm refreshes the server's cached prefix for this conversation while
+// nothing else is calling it, and returns the function that stops doing so.
+//
+// The call is prewarm's: one token, the same renderers, so the request is a
+// byte-prefix of whatever comes next and the refresh costs the server a lookup
+// rather than a prefill. next() is called per tick instead of once, so the
+// refreshed prefix is the current one even if the conversation moved on.
+//
+// Two things make a prefix go cold, and this covers both: a slot reclaimed
+// while the user is away, and a slot reclaimed while a long tool runs, which is
+// the case actually measured (a 174k-token prompt re-read after a 2m59s gap
+// during a test run).
+func (a *agent) keepWarm(sess *Session, conn *LLMConnection, next func() []llmMessage) (stop func()) {
+	every := a.keepWarmInterval()
+	if sess == nil || conn == nil || every <= 0 {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	warm := conn.withMaxTokens(1)
+	warm.noTurnStats = true // a refresh is not the turn's work; see noTurnStats
+	go func() {
+		tick := time.NewTicker(every)
+		defer tick.Stop()
+		giveUp := time.After(keepWarmFor)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-giveUp:
+				return
+			case <-tick.C:
+				messages := next()
+				if len(messages) == 0 {
+					continue
+				}
+				start := time.Now()
+				callCtx, callCancel := context.WithTimeout(ctx, 5*time.Minute)
+				_, _, _, err := a.llmStream(callCtx, sess.ID, warm, messages, a.tools.defs(), nil, nil, nil)
+				callCancel()
+				a.logSession(sess.ID, "WARM", "kept the prefix warm in %s err=%v", time.Since(start).Round(time.Millisecond), err)
+				if err != nil && ctx.Err() == nil {
+					slog.Debug("keepWarm: refresh failed", "sid", sess.ID, "err", err)
+				}
+			}
+		}
+	}()
+	return cancel
+}
+
 func (a *agent) prewarm(sess *Session) {
 	if sess == nil || !a.prewarmEnabled() {
 		return

@@ -406,6 +406,36 @@ func (a *agent) setSessionTitle(ctx context.Context, sess *Session, raw string) 
 func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
 	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
 
+	// Typing while a turn runs STEERS it: the text is queued and the running
+	// turn picks it up between tool rounds (runToolLoop), so "also update the
+	// README" costs a round rather than the whole turn. Interrupting is the
+	// editor's stop button, which cancels the turn's context.
+	//
+	// Only the plain text blocks are queued. An attachment mid-turn would have
+	// to be resolved against a conversation that is still moving, and the model
+	// is about to be handed a message either way; the reply says what was left
+	// out so nothing disappears silently.
+	if sess := a.getSession(req.SessionId); sess != nil && sess.turnRunning() {
+		var text string
+		attachments := 0
+		for _, block := range req.Content {
+			if block.Type == "text" {
+				text += block.Text
+			} else {
+				attachments++
+			}
+		}
+		if strings.TrimSpace(text) != "" {
+			sess.addSteer(text)
+			note := "↪ Queued for the turn in flight, it lands at its next step. Stop the turn to interrupt it instead.\n"
+			if attachments > 0 {
+				note = fmt.Sprintf("↪ Queued your message for the turn in flight (%d attachment(s) left out, send them once it finishes). Stop the turn to interrupt it instead.\n", attachments)
+			}
+			a.say(ctx, req.SessionId, note)
+			return PromptResponse{StopReason: "end_turn"}, nil
+		}
+	}
+
 	// A typed prompt replaces the turn in flight and waits for it to unwind
 	// (holdTurn, turn.go). release runs on every exit path below.
 	if sess := a.getSession(req.SessionId); sess != nil {
@@ -658,6 +688,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, nil)
+	}
+
+	// Anything typed in the last seconds of the turn, after its final round had
+	// already asked the model, is nobody's yet: run it as its own turn.
+	if sess := a.getSession(req.SessionId); sess != nil {
+		a.drainSteer(ctx, sess)
 	}
 
 	// Offer any fix cards the pre-turn checks detected, now that the user's

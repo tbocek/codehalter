@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/BurntSushi/toml"
@@ -95,6 +98,25 @@ type specConfig struct {
 	Skip     []string       `toml:"skip,omitempty"`
 	Attempts map[string]int `toml:"attempts,omitempty"`
 	Blocked  []specBlock    `toml:"blocked,omitempty"`
+	// Items is what the loop finished: id -> what the spec said at the time.
+	// Coverage answers "is there a passing test for this?" and is recomputed
+	// from the code every round; this answers "is that test still about what
+	// the spec says NOW?", which nothing in the code can know.
+	Items map[string]specLedger `toml:"items,omitempty"`
+}
+
+// specLedger is one finished item, recorded when its test passed and its commit
+// landed. Hash is over the item's own spec text (specItemText), so a later run
+// can tell that the section was edited since. Title carries renames: a section
+// moved to another file keeps its heading, and matching on it means the item is
+// not reported as one removal plus one new item.
+type specLedger struct {
+	Hash      string    `toml:"hash"`
+	Title     string    `toml:"title,omitempty"`
+	File      string    `toml:"file,omitempty"` // spec file, relative to spec_dir
+	CoveredBy string    `toml:"covered_by,omitempty"`
+	Commit    string    `toml:"commit,omitempty"`
+	At        time.Time `toml:"at,omitempty"`
 }
 
 // specBlock is an item the loop gave up on, with the reason and, when the
@@ -126,10 +148,14 @@ func loadSpecConfig(cwd string) (*specConfig, error) {
 
 func saveSpecConfig(cwd string, cfg *specConfig) error {
 	var buf bytes.Buffer
-	buf.WriteString("# /spec loop state. spec_dir, out_dir and target come from the /spec command.\n" +
+	buf.WriteString("# /spec loop state. spec_dir, out_dir and target come from the /spec command,\n" +
+		"# or from the questions the first /spec asked.\n" +
 		"# To answer a blocked item, fill its `answer` and run /spec again.\n" +
 		"# accept_open_markers = true starts the loop despite open REVIEW/TBD markers.\n" +
-		"# test_cmd overrides the detected test command (run from out_dir).\n\n")
+		"# test_cmd overrides the detected test command (run from out_dir).\n" +
+		"# [items] is what the loop finished, with the spec text it was built from:\n" +
+		"# editing that section makes the next run redo the item, deleting it makes\n" +
+		"# the next run offer to delete the code. Delete an entry to forget an item.\n\n")
 	if err := toml.NewEncoder(&buf).Encode(cfg); err != nil {
 		return err
 	}
@@ -1106,6 +1132,323 @@ func detectSpecTestCmd(outAbs string) string {
 // nextSpecItem returns the first item in ledger order that is neither covered
 // nor blocked. A blocked item the user has answered is eligible again; its
 // answer comes back so the round can carry it.
+// specItemText is the spec text an item IS: the section it heads, or the single
+// line that defines it (a table row, an id on a line of its own). Deliberately
+// not the round prompt's slice, which pulls in linked sections and would make
+// an edit anywhere in the spec look like a change to this item.
+func specItemText(idx *specIndex, id string) string {
+	it := idx.items[id]
+	if it == nil {
+		return ""
+	}
+	if s, ok := idx.sectionAt(it.Doc, it.Line); ok && s.start == it.Line {
+		return idx.text(it.Doc, s.start, s.end)
+	}
+	d := idx.docs[it.Doc]
+	if it.Line >= 0 && it.Line < len(d.lines) {
+		return d.lines[it.Line]
+	}
+	return ""
+}
+
+// specItemHash fingerprints that text with whitespace normalised away, so
+// reflowing a paragraph or reindenting a list does not re-open a finished item.
+// Wording changes do, because nothing cheap can tell a reworded sentence from a
+// changed requirement.
+func specItemHash(idx *specIndex, id string) string {
+	text := specItemText(idx, id)
+	if text == "" {
+		return ""
+	}
+	// Every run of whitespace becomes one space, line breaks included: a
+	// paragraph rewrapped at a different width is the same requirement.
+	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(text), " ")))
+	return hex.EncodeToString(sum[:8])
+}
+
+// specDelta is what a run found when it compared the spec against the ledger.
+// Changed items are re-opened (the spec is the master, so code follows it);
+// Removed ones are offered for deletion; Renamed and Adopted are reported and
+// already applied to the config by specReconcile.
+type specDelta struct {
+	Changed []string // finished once, and the spec text has moved since
+	Removed []string // finished once, and the section is gone from the spec
+	Renamed []string // "old → new", the ledger entry travelled with it
+	Adopted int      // covered items that predate the ledger
+}
+
+func (d specDelta) empty() bool {
+	return len(d.Changed) == 0 && len(d.Removed) == 0 && len(d.Renamed) == 0
+}
+
+// specReconcile compares the spec, the ledger and the code, and MUTATES cfg:
+// renames carry their entry to the new id, and items that are covered but have
+// no entry (work that predates the ledger, or a spec set up before this
+// existed) are adopted at their current text so they are not all reported as
+// changed on the next run.
+//
+// Items whose test file is gone need no case of their own: coverage is
+// recomputed from the code every round, so they are simply uncovered again and
+// the normal queue picks them up.
+func specReconcile(cfg *specConfig, idx *specIndex, covered map[string]string) specDelta {
+	var d specDelta
+	if cfg.Items == nil {
+		cfg.Items = map[string]specLedger{}
+	}
+	hashes := make(map[string]string, len(idx.order))
+	for _, id := range idx.order {
+		hashes[id] = specItemHash(idx, id)
+	}
+	// Gone from the spec, by id. Some are renames, resolved below.
+	var gone []string
+	for id := range cfg.Items {
+		if _, live := idx.items[id]; !live {
+			gone = append(gone, id)
+		}
+	}
+	sort.Strings(gone)
+	for _, old := range gone {
+		led := cfg.Items[old]
+		match := ""
+		for _, id := range idx.order {
+			if _, known := cfg.Items[id]; known {
+				continue // already tracked under its own id
+			}
+			if hashes[id] == led.Hash || (led.Title != "" && strings.EqualFold(idx.items[id].Title, led.Title)) {
+				match = id
+				break
+			}
+		}
+		if match == "" {
+			d.Removed = append(d.Removed, old)
+			continue
+		}
+		led.Hash = hashes[match]
+		led.Title = idx.items[match].Title
+		led.File = idx.docs[idx.items[match].Doc].rel
+		cfg.Items[match] = led
+		delete(cfg.Items, old)
+		d.Renamed = append(d.Renamed, old+" → "+match)
+	}
+	for _, id := range idx.order {
+		led, known := cfg.Items[id]
+		switch {
+		case !known && covered[id] != "":
+			cfg.Items[id] = specLedger{Hash: hashes[id], Title: idx.items[id].Title,
+				File: idx.docs[idx.items[id].Doc].rel, CoveredBy: covered[id]}
+			d.Adopted++
+		case known && led.Hash != hashes[id]:
+			d.Changed = append(d.Changed, id)
+		}
+	}
+	return d
+}
+
+// specDirCandidates ranks the directories that could hold the specification:
+// by name first (a directory called spec is a spec), then by how much markdown
+// is in it, then by depth. Two levels deep is enough for docs/spec, and the
+// project root counts when the markdown lives there.
+func specDirCandidates(cwd string) []string {
+	nameScore := map[string]int{"spec": 3, "specs": 3, "requirements": 3, "design": 2, "doc": 2, "docs": 2}
+	type cand struct {
+		rel   string
+		score int
+		mds   int
+		depth int
+	}
+	var out []cand
+	consider := func(rel string, depth int) {
+		entries, err := os.ReadDir(filepath.Join(cwd, rel))
+		if err != nil {
+			return
+		}
+		mds := 0
+		for _, e := range entries {
+			if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".md") {
+				mds++
+			}
+		}
+		if mds < 2 {
+			return
+		}
+		out = append(out, cand{rel: rel, score: nameScore[strings.ToLower(filepath.Base(rel))], mds: mds, depth: depth})
+	}
+	consider(".", 0)
+	top, err := os.ReadDir(cwd)
+	if err != nil {
+		return nil
+	}
+	for _, e := range top {
+		if !e.IsDir() || specSkipDirs[e.Name()] || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		consider(e.Name(), 1)
+		sub, err := os.ReadDir(filepath.Join(cwd, e.Name()))
+		if err != nil {
+			continue
+		}
+		for _, s := range sub {
+			if s.IsDir() && !specSkipDirs[s.Name()] && !strings.HasPrefix(s.Name(), ".") {
+				consider(filepath.ToSlash(filepath.Join(e.Name(), s.Name())), 2)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].score != out[j].score {
+			return out[i].score > out[j].score
+		}
+		if out[i].mds != out[j].mds {
+			return out[i].mds > out[j].mds
+		}
+		if out[i].depth != out[j].depth {
+			return out[i].depth < out[j].depth
+		}
+		return out[i].rel < out[j].rel
+	})
+	rels := make([]string, 0, len(out))
+	for _, c := range out {
+		// A directory inside one already offered is part of that spec, not a
+		// rival to it: naivepost's spec/ holds prompts/ and inventory/.
+		nested := false
+		for _, kept := range rels {
+			if kept != "." && strings.HasPrefix(c.rel, kept+"/") {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			rels = append(rels, c.rel)
+		}
+	}
+	return rels
+}
+
+// specEntryPage is the page a reader would open first: the README or index,
+// else the first file in sort order (specs are routinely numbered, so that is
+// 00-… when the author numbered them). Returns its path relative to specDir.
+func specEntryPage(specAbs string) (rel, content string) {
+	entries, err := os.ReadDir(specAbs)
+	if err != nil {
+		return "", ""
+	}
+	var mds []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".md") {
+			mds = append(mds, e.Name())
+		}
+	}
+	if len(mds) == 0 {
+		return "", ""
+	}
+	sort.Strings(mds)
+	pick := mds[0]
+	for _, name := range mds {
+		if l := strings.ToLower(name); l == "readme.md" || l == "index.md" {
+			pick = name
+			break
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(specAbs, pick))
+	if err != nil {
+		return "", ""
+	}
+	return pick, string(data)
+}
+
+// specTargetGuess is the fallback when no model is available or it has nothing
+// to say: the stack a spec names in its own words, and a directory to put it
+// in. Ordered, because a spec that says "rust" and "gtk4-rs" is a GTK project
+// and one that only says "rust" is not.
+var specTargetGuess = []struct {
+	keywords []string
+	outDir   string
+	target   string
+}{
+	{[]string{"gtk4-rs", "gtk 4", "gtk4", "libadwaita"}, "rust", "rust with gtk4-rs and libadwaita"},
+	{[]string{"tauri"}, "src-tauri", "rust with tauri"},
+	{[]string{"cargo", "rust"}, "rust", "rust"},
+	{[]string{"go.mod", "golang", "goroutine"}, "go", "go"},
+	{[]string{"react", "typescript", "tsx"}, "web", "typescript with react"},
+	{[]string{"fastapi", "django", "python"}, "py", "python"},
+}
+
+// specGuessTarget reads the entry page for the stack it asks for.
+func specGuessTarget(entry string) (outDir, target string) {
+	low := strings.ToLower(entry)
+	for _, g := range specTargetGuess {
+		for _, k := range g.keywords {
+			if strings.Contains(low, k) {
+				return g.outDir, g.target
+			}
+		}
+	}
+	return "", ""
+}
+
+// specSectionFromText pulls one item's text out of an old copy of its spec
+// file: the section whose heading slug matches the id, or the line carrying the
+// id when the item was never a section. Used on a file recovered from git,
+// which is why it parses rather than reusing the live index.
+func specSectionFromText(content, id string) string {
+	slug := id
+	if i := strings.LastIndex(id, "#"); i >= 0 {
+		slug = id[i+1:]
+	}
+	lines := strings.Split(content, "\n")
+	heading := func(l string) (level int, title string) {
+		t := strings.TrimSpace(l)
+		if !strings.HasPrefix(t, "#") {
+			return 0, ""
+		}
+		level = len(t) - len(strings.TrimLeft(t, "#"))
+		return level, strings.TrimSpace(t[level:])
+	}
+	start, level := -1, 0
+	for i, l := range lines {
+		if h, title := heading(l); h > 0 && githubSlug(title) == slug {
+			start, level = i, h
+			break
+		}
+	}
+	if start < 0 {
+		for _, l := range lines {
+			if containsID(l, id) {
+				return strings.TrimSpace(l)
+			}
+		}
+		return ""
+	}
+	for i := start + 1; i < len(lines); i++ {
+		if h, _ := heading(lines[i]); h > 0 && h <= level {
+			return strings.Join(lines[start:i], "\n")
+		}
+	}
+	return strings.Join(lines[start:], "\n")
+}
+
+// renderSpecDelta is the one-block report a run prints before it starts working.
+func renderSpecDelta(d specDelta) string {
+	if d.empty() {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("**/spec changes since the last run**\n\n")
+	if len(d.Changed) > 0 {
+		fmt.Fprintf(&b, "- %d item(s) changed in the spec and will be redone: %s\n", len(d.Changed), strings.Join(d.Changed, ", "))
+	}
+	if len(d.Removed) > 0 {
+		fmt.Fprintf(&b, "- %d item(s) are gone from the spec: %s\n", len(d.Removed), strings.Join(d.Removed, ", "))
+	}
+	if len(d.Renamed) > 0 {
+		fmt.Fprintf(&b, "- %d item(s) moved or were retitled, their record travelled with them: %s\n", len(d.Renamed), strings.Join(d.Renamed, ", "))
+	}
+	if d.Adopted > 0 {
+		fmt.Fprintf(&b, "- %d item(s) already covered were recorded at their current text\n", d.Adopted)
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
 func nextSpecItem(idx *specIndex, covered map[string]string, cfg *specConfig) (id, answer string) {
 	for _, it := range idx.order {
 		if _, ok := covered[it]; ok {

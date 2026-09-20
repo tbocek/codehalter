@@ -35,6 +35,9 @@ var defaultSpecMD string
 //go:embed res/SPEC-SETUP.md
 var defaultSpecSetupMD string
 
+//go:embed res/SPEC-REMOVE.md
+var defaultSpecRemoveMD string
+
 //go:embed res/Dockerfile.devcontainer.alpine
 var defaultDevcontainerDockerfileAlpine string
 
@@ -555,8 +558,19 @@ func (a *agent) putSession(s *Session) {
 
 func (a *agent) deleteSession(id string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	sess := a.sessions[id]
 	delete(a.sessions, id)
+	a.mu.Unlock()
+	// A closed session has no next turn to keep a prefix warm for.
+	if sess != nil {
+		sess.ctl.mu.Lock()
+		stop := sess.ctl.warmStop
+		sess.ctl.warmStop = nil
+		sess.ctl.mu.Unlock()
+		if stop != nil {
+			stop()
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +596,7 @@ func (a *agent) initSession(cwd string, s *Session) error {
 		{"RESUMMARISE.md", defaultResummariseMD},
 		{"SPEC.md", defaultSpecMD},
 		{"SPEC-SETUP.md", defaultSpecSetupMD},
+		{"SPEC-REMOVE.md", defaultSpecRemoveMD},
 	} {
 		path := filepath.Join(dir, f.name)
 		if _, err := os.Stat(path); os.IsNotExist(err) {

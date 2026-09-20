@@ -30,7 +30,7 @@ func TestSpecDecide(t *testing.T) {
 	if _, block, _ := specDecide(cfg, "F0.3", specRoundResult{Question: "keep or drop?"}); !block {
 		t.Error("a planner question did not block the item")
 	}
-	_, _, reason = specDecide(&specConfig{}, specSetupID, specRoundResult{Setup: true, TestsPass: true})
+	_, _, reason = specDecide(&specConfig{}, specSetupID, specRoundResult{Mode: specModeSetup, TestsPass: true})
 	if !strings.Contains(reason, "no test source") {
 		t.Errorf("setup without tests: reason %q", reason)
 	}
@@ -91,7 +91,7 @@ func TestSpecRoundPrompt(t *testing.T) {
 	}
 	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs libadwaita"}
 
-	prompt, head := a.specRoundPrompt(s.ID, cfg, idx, "F0.1", false, map[string]string{"§01-files#1-layout": "tests/x.rs"}, "just test", "no test names f0_1", "", "")
+	prompt, head := a.specRoundPrompt(s.ID, cfg, idx, "F0.1", specModeItem, map[string]string{"§01-files#1-layout": "tests/x.rs"}, "just test", "no test names f0_1", "", "", "")
 	for _, want := range []string{"**F0.1**", "`f0_1`", "just test", "use gtk4-rs libadwaita", "rust/", "S1 Switch.",
 		"did not count", "no test names f0_1", "spec/00-principles.md", "1 of"} {
 		if !strings.Contains(prompt, want) {
@@ -105,12 +105,12 @@ func TestSpecRoundPrompt(t *testing.T) {
 		t.Errorf("heading = %q", head)
 	}
 
-	setup, _ := a.specRoundPrompt(s.ID, cfg, idx, specSetupID, true, nil, "", "", "", "")
+	setup, _ := a.specRoundPrompt(s.ID, cfg, idx, specSetupID, specModeSetup, nil, "", "", "", "", "")
 	if strings.Contains(setup, "{{") || !strings.Contains(setup, "use gtk4-rs libadwaita") || !strings.Contains(setup, "`rust/`") {
 		t.Errorf("setup prompt:\n%s", setup)
 	}
 
-	answered, _ := a.specRoundPrompt(s.ID, cfg, idx, "F0.2", false, nil, "just test", "", "keep or drop?", "keep it")
+	answered, _ := a.specRoundPrompt(s.ID, cfg, idx, "F0.2", specModeItem, nil, "just test", "", "keep or drop?", "keep it", "")
 	if !strings.Contains(answered, "keep or drop?") || !strings.Contains(answered, "keep it") {
 		t.Errorf("answered prompt lacks the question and answer:\n%s", answered)
 	}
@@ -162,5 +162,35 @@ func TestSpecIgnoredProbes(t *testing.T) {
 	os.WriteFile(gi, []byte("/cut/\n/*.json\n/test*\n/out/\n"), 0o644)
 	if got := specIgnoredProbes(t.Context(), cwd, "rust", idx); len(got) != 0 {
 		t.Errorf("anchored rules still reported: %v", got)
+	}
+}
+
+// TestSpecDecideChangeAndRemove pins the two round kinds whose done rule is not
+// "a test names it and the suite passes".
+//
+// A changed item is still covered by the test written for the OLD spec text, so
+// coverage alone would declare it done before the model touched anything: the
+// commit is the evidence. A removal is the inverse: it is done when no test
+// names the item any more.
+func TestSpecDecideChangeAndRemove(t *testing.T) {
+	cfg := &specConfig{}
+	done, _, reason := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true})
+	if done || !strings.Contains(reason, "no code did") {
+		t.Errorf("a change round that wrote nothing: done=%v reason=%q", done, reason)
+	}
+	if done, _, _ := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true, Committed: true}); !done {
+		t.Error("a change round that committed should be done")
+	}
+
+	done, _, reason = specDecide(cfg, "F0.2", specRoundResult{Mode: specModeRemove, TestsPass: true, Covered: true, Committed: true})
+	if done || !strings.Contains(reason, "still names") {
+		t.Errorf("a removal with the test still in place: done=%v reason=%q", done, reason)
+	}
+	if done, _, _ := specDecide(cfg, "F0.2", specRoundResult{Mode: specModeRemove, TestsPass: true, Committed: true}); !done {
+		t.Error("a removal whose test is gone and whose suite passes should be done")
+	}
+	// The suite must still pass: deleting an item cannot take the build with it.
+	if done, _, reason := specDecide(cfg, "F0.3", specRoundResult{Mode: specModeRemove, TestTail: "3 failed"}); done || !strings.Contains(reason, "did not pass") {
+		t.Errorf("a removal that broke the suite: done=%v reason=%q", done, reason)
 	}
 }

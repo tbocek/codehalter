@@ -537,14 +537,14 @@ const (
 
 // liveToolOutput is the model-visible content for a tool call. The content-
 // retrieval tools (read_file/continue_read/search_text + web_search/web_read/
-// web_read_raw) pass through whole (up to the line-aware liveExemptCap); every
+// web_read) pass through whole (up to the line-aware liveExemptCap); every
 // other tool gets the 1.5 KB head/tail cap. history.go re-renders stored outputs
 // through THIS same function, so a replay is byte-identical to the live wire
 // (cache-warm) — re-sending a cached full read is free, whereas clipping it would
 // change the bytes and force a reprocess. n_ctx is bounded by compaction instead.
 func liveToolOutput(toolName, args, content string) string {
 	switch toolName {
-	case "read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw":
+	case "read_file", "continue_read", "search_text", "web_search", "web_read":
 		if len(content) <= liveExemptCap {
 			return content
 		}
@@ -587,7 +587,7 @@ func truncateForLLM(toolName, args, content string) string {
 func truncationHint(toolName, args string) string {
 	a := parseArgs(args)
 	switch toolName {
-	case "web_read", "web_read_raw":
+	case "web_read":
 		if u := a["url"]; u != "" {
 			return fmt.Sprintf("To see more: call %s again with url=%q offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched.", toolName, u)
 		}

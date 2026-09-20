@@ -291,3 +291,174 @@ func TestSpecConfigRoundTrip(t *testing.T) {
 		t.Errorf("round trip:\n got %+v\nwant %+v", out, in)
 	}
 }
+
+// TestSpecItemHashIgnoresFormatting pins what counts as a spec change: the
+// words, not the layout. Reflowing a paragraph or reindenting a list must not
+// re-open a finished item, while rewording it must.
+func TestSpecItemHashIgnoresFormatting(t *testing.T) {
+	root := writeSpecFixture(t)
+	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "§01-files#1-layout"
+	before := specItemHash(idx, id)
+	if before == "" {
+		t.Fatalf("no hash for %s; items: %v", id, idx.order)
+	}
+
+	path := filepath.Join(root, "01-files.md")
+	body, _ := os.ReadFile(path)
+	reflowed := strings.Replace(string(body), "The project folder.", "  The project\n  folder.  ", 1)
+	if err := os.WriteFile(path, []byte(reflowed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx2, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := specItemHash(idx2, id); got != before {
+		t.Errorf("reformatting changed the hash: %s -> %s", before, got)
+	}
+
+	reworded := strings.Replace(string(body), "The project folder.", "The project folder, now with a lock file.", 1)
+	if err := os.WriteFile(path, []byte(reworded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx3, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := specItemHash(idx3, id); got == before {
+		t.Error("rewording the section left the hash unchanged")
+	}
+}
+
+// TestSpecReconcile pins the four cases a later run has to tell apart, and that
+// the config comes back describing the spec as it is NOW: a rename carries its
+// record to the new id, and covered work that predates the ledger is adopted
+// rather than reported as changed.
+func TestSpecReconcile(t *testing.T) {
+	root := writeSpecFixture(t)
+	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		unchanged = "§01-files#1-layout"
+		edited    = "§01-files#2-cutjson"
+	)
+	cfg := &specConfig{Items: map[string]specLedger{
+		unchanged: {Hash: specItemHash(idx, unchanged), Title: idx.items[unchanged].Title},
+		edited:    {Hash: "stale", Title: idx.items[edited].Title},
+		// Gone from the spec entirely.
+		"§99-old#1-dropped": {Hash: "whatever", Title: "1. Dropped"},
+		// Same heading, different file: a section that moved.
+		"§98-moved#1-screen": {Hash: "moved", Title: idx.items["§03-shell#1-screen"].Title},
+	}}
+	// An item covered by a test but absent from the ledger: work that predates
+	// it, which must be adopted rather than reported as changed forever.
+	adoptable := ""
+	for _, id := range idx.order {
+		if _, known := cfg.Items[id]; !known && id != "§03-shell#1-screen" {
+			adoptable = id
+			break
+		}
+	}
+	if adoptable == "" {
+		t.Fatalf("fixture has no spare item; order: %v", idx.order)
+	}
+	covered := map[string]string{adoptable: "tests/flows.rs"}
+
+	d := specReconcile(cfg, idx, covered)
+	if want := []string{edited}; !reflect.DeepEqual(d.Changed, want) {
+		t.Errorf("Changed = %v, want %v", d.Changed, want)
+	}
+	if want := []string{"§99-old#1-dropped"}; !reflect.DeepEqual(d.Removed, want) {
+		t.Errorf("Removed = %v, want %v", d.Removed, want)
+	}
+	if len(d.Renamed) != 1 || !strings.Contains(d.Renamed[0], "§03-shell#1-screen") {
+		t.Errorf("Renamed = %v, want the moved section", d.Renamed)
+	}
+	if _, ok := cfg.Items["§98-moved#1-screen"]; ok {
+		t.Error("the old id must not stay in the ledger after a rename")
+	}
+	if led, ok := cfg.Items["§03-shell#1-screen"]; !ok || led.Hash != specItemHash(idx, "§03-shell#1-screen") {
+		t.Errorf("the renamed item must be recorded at its new text, got %+v", led)
+	}
+	if d.Adopted != 1 || cfg.Items[adoptable].CoveredBy != "tests/flows.rs" {
+		t.Errorf("covered work predating the ledger should be adopted, got %d and %+v", d.Adopted, cfg.Items[adoptable])
+	}
+	// A second pass adopts nothing new and finds no further renames: the item
+	// still to redo and the one still to delete keep being reported, because
+	// nothing has acted on them yet.
+	d2 := specReconcile(cfg, idx, covered)
+	if d2.Adopted != 0 || len(d2.Renamed) != 0 {
+		t.Errorf("a second pass must be quiet about renames and adoptions, got %+v", d2)
+	}
+	if !reflect.DeepEqual(d2.Changed, d.Changed) || !reflect.DeepEqual(d2.Removed, d.Removed) {
+		t.Errorf("unacted work must still be reported: %+v then %+v", d, d2)
+	}
+}
+
+// TestSpecSetupDetection pins the first-run guesses: which directory holds the
+// spec, which page a reader opens first, and what stack that page asks for.
+func TestSpecSetupDetection(t *testing.T) {
+	root := t.TempDir()
+	for path, body := range map[string]string{
+		"notes/a.md":     "# a",
+		"notes/b.md":     "# b",
+		"spec/README.md": "# The spec\n\nA desktop editor. The rewrite targets Rust with gtk4-rs and libadwaita.\n",
+		"spec/01.md":     "# 01",
+		"spec/02.md":     "# 02",
+		"target/x.md":    "# ignored build output",
+		"target/y.md":    "# ignored build output",
+	} {
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cands := specDirCandidates(root)
+	if len(cands) == 0 || cands[0] != "spec" {
+		t.Errorf("candidates = %v, want spec first (it is named like a spec)", cands)
+	}
+	for _, c := range cands {
+		if c == "target" {
+			t.Error("build output must not be offered as a spec directory")
+		}
+		if strings.HasPrefix(c, "spec/") {
+			t.Errorf("%q is part of the spec already offered, not a rival to it", c)
+		}
+	}
+	rel, entry := specEntryPage(filepath.Join(root, "spec"))
+	if rel != "README.md" || !strings.Contains(entry, "desktop editor") {
+		t.Errorf("entry page = %q (%d bytes), want README.md", rel, len(entry))
+	}
+	out, target := specGuessTarget(entry)
+	if out != "rust" || !strings.Contains(target, "gtk4-rs") {
+		t.Errorf("guess = %q / %q, want rust and gtk4-rs", out, target)
+	}
+	if out, target := specGuessTarget("# a spec with no stack in it\n"); out != "" || target != "" {
+		t.Errorf("a page naming no stack must guess nothing, got %q / %q", out, target)
+	}
+}
+
+// TestSpecSectionFromText pins recovering a deleted item's text from an old
+// copy of its file: the section stops at the next heading of its level or above.
+func TestSpecSectionFromText(t *testing.T) {
+	doc := "# 01 Files\n\n## 1. Layout\n\nThe folder.\n\n### 1.1 Detail\n\nMore.\n\n## 2. cut.json\n\nThe format.\n"
+	got := specSectionFromText(doc, "§01-files#1-layout")
+	if !strings.Contains(got, "The folder.") || !strings.Contains(got, "1.1 Detail") {
+		t.Errorf("section should carry its subsections, got %q", got)
+	}
+	if strings.Contains(got, "cut.json") {
+		t.Errorf("section must stop at the next heading of its level, got %q", got)
+	}
+	if got := specSectionFromText(doc, "§01-files#nope"); got != "" {
+		t.Errorf("an unknown slug should find nothing, got %q", got)
+	}
+}

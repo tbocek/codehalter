@@ -746,3 +746,67 @@ func TestBackgroundSkipsDeadSummariser(t *testing.T) {
 	a.summaryStrikes.Store(summaryMaxStrikes - 1)
 	wantSummariser(t, a, "one strike short")
 }
+
+// TestKeepWarmRefreshesUntilStopped pins the keep-alive: while nothing else is
+// calling the model it re-sends the conversation as a 1-token request, so the
+// server's cached prefix stays alive, and stopping it ends that immediately.
+// The measured failure it prevents is a 174k-token prompt re-read after a
+// 2m59s gap while a test ran.
+func TestKeepWarmRefreshesUntilStopped(t *testing.T) {
+	mock := newMockLLM(t, sseText("."), sseText("."), sseText("."), sseText("."))
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}, KeepWarm: "20ms"}
+	msgs := []llmMessage{{Role: "user", Content: "the conversation so far"}}
+
+	stop := a.keepWarm(s, mock.conn("execute"), func() []llmMessage { return msgs })
+	deadline := time.Now().Add(2 * time.Second)
+	for mock.callCount() == 0 {
+		if time.Now().After(deadline) {
+			stop()
+			t.Fatal("keepWarm never refreshed the prefix")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stop()
+
+	// One token, and the conversation itself: a refresh that asked for more, or
+	// that sent something else, would cost generation or seed a different prefix.
+	body := mock.request(0)
+	if body["max_tokens"] != float64(1) {
+		t.Errorf("refresh max_tokens = %v, want 1", body["max_tokens"])
+	}
+	sent, _ := body["messages"].([]any)
+	if len(sent) != 1 {
+		t.Fatalf("refresh sent %d messages, want the conversation", len(sent))
+	}
+	if m, _ := sent[0].(map[string]any); m["content"] != "the conversation so far" {
+		t.Errorf("refresh sent %v, want the conversation", m)
+	}
+
+	settled := mock.callCount()
+	time.Sleep(80 * time.Millisecond)
+	if got := mock.callCount(); got != settled {
+		t.Errorf("stop() did not end the refreshes: %d -> %d", settled, got)
+	}
+	// A refresh is not the turn's work, so it must not land in the turn stats.
+	if r := s.turnStats(); r.completion != 0 || r.evaluatedPrompt != 0 {
+		t.Errorf("a refresh was counted against the turn: %+v", r)
+	}
+}
+
+// TestKeepWarmOff pins that the setting really disables it: a hosted endpoint
+// caches on its own and bills per request.
+func TestKeepWarmOff(t *testing.T) {
+	mock := newMockLLM(t, sseText("."))
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}, KeepWarm: "off"}
+	stop := a.keepWarm(s, mock.conn("execute"), func() []llmMessage { return []llmMessage{{Role: "user", Content: "x"}} })
+	defer stop()
+	time.Sleep(60 * time.Millisecond)
+	if mock.callCount() != 0 {
+		t.Errorf("keep_warm=off still called the model %d time(s)", mock.callCount())
+	}
+}
