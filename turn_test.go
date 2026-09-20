@@ -7,17 +7,21 @@ import (
 	"time"
 )
 
-// TestHoldTurnSupersedes pins what a typed prompt does to a turn in flight: it
-// cancels it, flags it as replaced (so its cancel handler stays quiet), waits
-// for it to release, and only then runs.
-func TestHoldTurnSupersedes(t *testing.T) {
+// TestHoldTurnWaitsItsTurn pins that nothing replaces a running turn any more:
+// a second holder waits for the gate, and the turn in flight is NOT cancelled.
+// Typing steers a turn (addSteer) and the stop button cancels it; holdTurn
+// itself only serialises, so two turns never send divergent snapshots.
+func TestHoldTurnWaitsItsTurn(t *testing.T) {
 	a, s := newTestAgent(t)
-	oldCtx, oldRelease, ok := a.holdTurn(context.Background(), s, true)
+	firstCtx, firstRelease, ok := a.holdTurn(context.Background(), s, true)
 	if !ok {
 		t.Fatal("first holdTurn refused")
 	}
+	if !s.turnRunning() {
+		t.Error("turnRunning should report the held turn")
+	}
 
-	got := make(chan error, 1) // the new turn's ctx.Err(), read before it releases
+	got := make(chan error, 1) // the second turn's ctx.Err(), read before it releases
 	go func() {
 		ctx, release, _ := a.holdTurn(context.Background(), s, true)
 		got <- ctx.Err()
@@ -25,29 +29,21 @@ func TestHoldTurnSupersedes(t *testing.T) {
 	}()
 
 	select {
-	case <-oldCtx.Done():
-	case <-time.After(2 * time.Second):
-		t.Fatal("the turn in flight was not cancelled")
-	}
-	if !s.superseded() {
-		t.Error("the replaced turn does not know it is being replaced")
-	}
-	select {
 	case <-got:
-		t.Fatal("the new turn ran before the old one released")
+		t.Fatal("the second turn ran while the first still held the gate")
 	case <-time.After(50 * time.Millisecond):
 	}
-	oldRelease()
+	if firstCtx.Err() != nil {
+		t.Error("waiting for the gate cancelled the turn in flight")
+	}
+	firstRelease()
 	select {
 	case err := <-got:
 		if err != nil {
-			t.Error("the new turn started with a cancelled ctx")
+			t.Error("the second turn started with a cancelled ctx")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("the new turn never ran")
-	}
-	if s.superseded() {
-		t.Error("superseded still set after the new turn took over")
+		t.Fatal("the second turn never ran")
 	}
 }
 

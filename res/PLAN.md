@@ -63,12 +63,12 @@ Project work: prefer probes — `list_files` / `search_text` / `read_file`.
 
 Each runs as one bounded tool loop (≤10 LLM turns): the executor reads, edits, installs, and self-verifies before declaring done.
 
-ONE subtask for narrow requests (single edit, lookup, install). MULTIPLE when work splits along independently-verifiable concerns ("1. Install gopls. 2. Wire it into mcp.toml. 3. Verify both via run_task"). Prefer fewer — each costs a planner roundtrip on failure.
+ONE subtask for narrow requests (single edit, lookup, install). MULTIPLE when work splits along independently-verifiable concerns ("1. Install gopls. 2. Wire it into mcp.toml. 3. Verify both via run_command"). Prefer fewer — each costs a planner roundtrip on failure.
 
 Each subtask:
 - `description` — self-contained. Name files, functions, exact commands. Concrete beats abstract: "Install gopls via dnf, then add `gopls` to .devcontainer/Dockerfile" beats "set up gopls".
 - `verify` — concrete checks the executor MUST run before success, each a tool call in plain English. Examples:
-  - `["Run just:verify via run_task"]` — pick the most comprehensive verify-class target (`verify`, `ci`, `check`, `test`).
+  - `["Run `just verify` via run_command"]` — pick the most comprehensive verify-class target (`verify`, `ci`, `check`, `test`).
   - `["Run gopls --version via run_command", "Confirm gopls is in .devcontainer/Dockerfile via search_text"]` — install-then-persist.
   - `[]` — ONLY pure-lookup subtasks that edit nothing.
 

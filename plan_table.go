@@ -66,17 +66,11 @@ func repairJSON(s string) string {
 }
 
 // planTable renders submit_plan's streaming arguments as a markdown table that
-// only ever grows. The chat transcript is append-only, so a row can never be
-// rewritten: a row is therefore emitted only once its subtask object has CLOSED
-// in the JSON. Holding the tail back matters even when its description looks
-// finished, because `verify` follows `description` in field order and may still
-// be filling in.
-//
-// It carries no title. Whether the planner produced a plan, findings or a
-// replan depends on report_only, which the schema emits AFTER subtasks, so at
-// the moment the first row is ready the correct heading isn't known yet. A
-// wrong label is worse than none, so renderPlan prints the heading by itself
-// once the table has streamed.
+// only grows: the transcript is append-only, so a row is emitted only once its
+// subtask object has CLOSED in the JSON (`verify` follows `description` and may
+// still be filling in). It carries no title: whether this is a plan, findings
+// or a replan depends on report_only, which the schema emits AFTER subtasks,
+// and a wrong label is worse than none. renderPlan prints the heading later.
 type planTable struct {
 	buf     strings.Builder
 	emitted int
@@ -111,17 +105,11 @@ func (p *planTable) feed(delta string, say func(string)) {
 	}
 }
 
-// planTableHead opens the table, and planRow renders one subtask. Both the
-// streamed table and renderPlan go through them so a subtask looks the same
-// however it reached the screen.
-//
-// The leading blank line is structural: a table has to start its own block, and
-// without it a row arriving straight after a line of agent text is swallowed as
-// a lazy continuation of that paragraph.
-//
-// There is no number column. Zed gives every column an equal share of the pane
-// whatever it holds, so one would cost a third of the width to show a single
-// digit, and the planner numbers its own subtasks ("1) Add the helper...").
+// planTableHead opens the table and planRow renders one subtask; the streamed
+// table and renderPlan share them, so a subtask looks the same either way. The
+// leading blank line is structural: without it a row after agent text is
+// swallowed as a continuation of that paragraph. No number column: Zed gives
+// every column an equal share, and the planner numbers its own subtasks.
 const planTableHead = "\n\n| Subtask | Verify |\n|---|---|\n"
 
 func planRow(st subtask) string {
@@ -129,15 +117,11 @@ func planRow(st subtask) string {
 		planCell(st.Description), planCell(strings.Join(st.Verify, "\n")))
 }
 
-// planCell makes arbitrary text safe inside a markdown table cell. A pipe row is
-// a single physical line, so two things in a subtask would wreck it: an
-// unescaped `|` (descriptions name exact commands, and a `grep x | wc -l` splits
-// the row into phantom columns) and a newline (it ends the table at that row).
-// Pipes are escaped and newlines become <br>. Keeping the shape is what lets the
-// cell carry the whole instruction: a real 27B description ran 1114 characters of
-// shell pipelines around a heredoc, unreadable if flattened onto one line but
-// fine as lines. Note that Zed does NOT render the <br> as a break: it prints
-// raw HTML as text, so the tag shows up literally and marks the break instead of
+// planCell makes arbitrary text safe in a table cell. A row is one physical
+// line, so an unescaped `|` (descriptions quote commands like `grep x | wc -l`)
+// splits it into phantom columns and a newline ends the table. Pipes are
+// escaped and newlines become <br>, which keeps a long multi-line instruction
+// readable. Zed prints the <br> literally, so it marks the break rather than
 // making it.
 func planCell(s string) string {
 	lines := strings.Split(strings.ReplaceAll(s, "|", `\|`), "\n")

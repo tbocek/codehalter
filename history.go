@@ -18,18 +18,12 @@ import (
 // runToolLoopSeeded. No chars/4 estimate anywhere.
 const compactTriggerPct = 80
 
-// foldHistory folds Messages[:keepFrom] into the rolling Summary and keeps
-// Messages[keepFrom:] verbatim, returning true when it folded anything. The
-// recovery loop in runToolLoopSeeded calls this on a context-overflow 400 and
-// escalates keepFrom: first keepWindowStart (keep the unfinished small turn plus
-// the most recent ~keepSmallTurnTokens of completed small turns, fold everything
-// older), then lastAssistantIndex (keep ONLY the unfinished small turn) if that
-// still overflows. The server's 400 between the steps decides whether the cheaper
-// step was enough.
-//
-// Messages[:turnStartIdx] are completed LARGE turns, already noted in Shadow.
-// Messages[turnStartIdx:keepFrom] is the in-flight slice being folded; it has no
-// note yet, so it is summarised synchronously here. Reuses rotate's epilogue.
+// foldHistory folds Messages[:keepFrom] into the rolling Summary and keeps the
+// rest verbatim, reporting whether it folded anything. The 400-recovery loop
+// calls it with an escalating keepFrom: keepWindowStart first, then
+// lastAssistantIndex (only the unfinished small turn) if that still overflows;
+// the server's next 400 decides. Completed large turns are already noted in
+// Shadow; the in-flight slice has no note yet and is summarised here.
 func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bool {
 	// Drain pending background notes for the completed LARGE turns first, so
 	// rotating them out doesn't lose their summary.
@@ -133,50 +127,25 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 	return true
 }
 
-// maxSummaryBytes bounds the rolling Summary. Crossing it makes a compaction
-// queue a background rewrite of the summary into a summary of itself, which the
-// NEXT compaction uses as its base instead of the concatenation.
-//
-// A bound is needed because Summary is otherwise append-only: foldHistory
-// concatenates the previous one verbatim with the new notes, so it only ever
-// grows. Measured on one 11.6h session: 0 -> 3801 -> 6521 tokens over two
-// compactions, with the very first note of the session still byte-identical at
-// the front, next to three near-duplicate notes about the same task and two
-// "[automatic summary unavailable]" raw excerpts that were 19% of the whole
-// thing on their own.
-//
-// It is not just prefix size. Summary sits in front of every request for the
-// rest of the session, so it is resident in the KV cache for every token the
-// model generates, and decode slows as that cache grows (fitted on the same
-// session: 59 tok/s at 7k context, 34 at 100k). 6521 resident tokens cost ~6.5
-// minutes of pure decode across that session, and the cost compounds because
-// nothing ever removes a note.
-//
-// 16 KiB is roughly 4k tokens: about the size of the system prompt, which is
-// the other permanently-resident block and a reasonable ceiling for "everything
-// that happened before what is still in context".
+// maxSummaryBytes bounds the rolling Summary: crossing it queues a background
+// rewrite that the NEXT compaction uses as its base. Summary is otherwise
+// append-only (measured: 0 -> 3801 -> 6521 tokens over two compactions, with
+// near-duplicate notes and raw excerpts riding along). It matters beyond
+// prefix size: Summary is resident in the KV cache for every generated token,
+// and decode slows as the cache grows (59 tok/s at 7k context, 34 at 100k).
+// 16 KiB is about 4k tokens, the size of the system prompt.
 const maxSummaryBytes = 16 * 1024
 
-// scheduleSummaryFold queues the summary-of-summaries rewrite to run AFTER the
-// compaction that produced `summary` has returned. Nothing in that turn needs
-// the shorter text: it is consumed as the BASE of the NEXT compaction, a whole
-// context-fill away. Doing it inline would put a second LLM call, over 16 KB of
-// prose, in front of a user already waiting out a compaction they did not ask
-// for, to save bytes nothing reads until much later.
+// scheduleSummaryFold queues the summary rewrite to run AFTER the compaction
+// that produced `summary` has returned: nothing needs the shorter text until
+// the next compaction, and inline it would put a second LLM call in front of a
+// user already waiting one out.
 //
-// The result lands in FoldedSummary and never in Summary. Summary is the front
-// of every request, so swapping shorter text in mid-session re-renders the
-// whole prompt behind it: it would buy a few thousand resident tokens and pay a
-// full re-prefill for them. foldHistory has already thrown the prefix away by
-// the time it reads FoldedSummary (resetCacheLineage, a few lines up), so
-// consuming it exactly there is the one place it is free.
-//
-// On the summariser queue rather than a bare goroutine, for three things that
-// queue already gives: foldHistory's waitSummarise joins it, so the next
-// compaction can never read a half-written fold; the single worker keeps the
-// fold from racing a per-turn note for the same background slot, where two
-// concurrent calls on one KV slot make each other re-prefill; and it is the
-// same kind of work, on the same connection, as the notes it queues behind.
+// The result lands in FoldedSummary, never in Summary, because swapping the
+// front of every request mid-session costs a full re-prefill (see
+// FoldedSummary). It rides the summariser queue rather than a bare goroutine:
+// waitSummarise then joins it, so a compaction never reads a half-written
+// fold, and the single worker keeps it off the slot a per-turn note is using.
 func (a *agent) scheduleSummaryFold(sess *Session, summary string) {
 	if len(summary) <= maxSummaryBytes {
 		return
@@ -248,15 +217,11 @@ func keepImageRefs(old, folded string) string {
 	return strings.TrimRight(folded, "\n") + "\n\nAttached images:\n" + strings.Join(missing, "\n")
 }
 
-// backgroundSummarise enqueues exactly one structured-note task for the
-// just-completed turn — every message from turnStart to the end, which spans
-// the human prompt plus any synthetic subtask/doc prompts and all assistant
-// tool calls. Fired once per turn at the boundary (runTurn epilogue), never
-// mid-turn, so the Shadow buffer holds one note per completed turn. A single
-// worker drains the queue sequentially. context.Background() so user
-// cancellation of the next prompt doesn't kill an in-flight note. On LLM
-// failure it stores a clipped raw fallback rather than nothing, so a completed
-// turn always contributes one entry and compaction never rotates it out unnoted.
+// backgroundSummarise enqueues one structured-note task for the turn that
+// just completed: everything from turnStart on. It fires once per turn, at the
+// boundary, so Shadow holds one note per completed turn. context.Background(),
+// so cancelling the next prompt does not kill a note in flight. On LLM failure
+// a clipped raw fallback is stored, so no turn rotates out unnoted.
 func (a *agent) backgroundSummarise(sess *Session) {
 	if sess == nil {
 		return
@@ -298,7 +263,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 			// Prefix-extension: same tools array as the foreground turn (see
 			// summariseCall — required for the rendered prompt to share the
 			// foreground's prefix), tool_choice=none so the answer is the note.
-			note = a.summariseCall(ctx, sess, t.Conn.withToolChoiceNone(), t.Msgs, a.tools.defs(), t.Turn)
+			note = a.summariseCall(ctx, sess, t.Conn.withToolChoice("none"), t.Msgs, a.tools.defs(), t.Turn)
 		} else {
 			note = a.summariseSlice(ctx, sess, t.Conn, t.Prompt, t.Turn)
 		}
@@ -329,24 +294,17 @@ func (a *agent) appendSummariseMsgs(sess *Session, prompt string, turn []Message
 	return append(msgs, llmMessage{Role: "user", Content: instr})
 }
 
-// summariseCall is the shared execution core of both note modes: one LLM call
-// over the prepared messages, the raw-transcript fallback when it fails or
-// returns empty, and the image-reference block. Message construction is the
-// only thing that differs between prefix-extension (appendSummariseMsgs) and
-// transcript paste (summariseSlice), so it stays with the callers.
+// summariseCall is the core both note modes share: one LLM call, the raw
+// fallback when it fails or comes back empty, and the image-reference block.
 //
-// tools MUST be the foreground's full tool array in prefix-extension mode and
-// nil in paste mode. The chat template renders the tools array into the HEAD
-// of the prompt, so a prefix-extension call without it produces a rendered
-// prompt that diverges from the foreground's at the very first token — the
-// call re-evaluates the whole context cold AND (on a single slot) evicts the
-// foreground's KV cache, and the next user turn then re-evaluates cold too.
-// The callers pair the tools with tool_choice="none" on the conn so the
-// summariser can't answer with a tool call.
+// tools MUST be the foreground's full array in prefix-extension mode and nil
+// in paste mode. The template renders tools into the HEAD of the prompt, so a
+// prefix-extension call without them diverges at the first token: it
+// re-evaluates cold and, on one slot, evicts the foreground's cache. The
+// callers add tool_choice="none" so the answer is the note, not a call.
 //
-// Reasoning is off. A note restates what the turn already says, and a thinking
-// model reasoned 5 to 20 KB before writing one: past the two-minute deadline on
-// a 27B, which cost the note and struck the summariser out. The closed think
+// Reasoning is off: a note restates the turn, and a thinking model reasoned
+// 5 to 20 KB first, past the two-minute deadline on a 27B. The closed think
 // block is a suffix, so the prefix-extension call still reuses the cache.
 func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConnection, msgs []llmMessage, tools []map[string]any, turn []Message) string {
 	out, _, _, err := a.llmStream(ctx, sess.ID, conn.withThinkingDisabled(), msgs, tools, nil, nil, nil)
@@ -410,28 +368,16 @@ func (a *agent) summariseSlice(ctx context.Context, sess *Session, conn *LLMConn
 			}
 		}
 	}
-	// Cap the whole rendered slice so a long (many-iteration) turn can't blow the
-	// background slot's context. clipBytes keeps the slice's head (the request +
-	// early work) and tail (recent work + outcome), which is what a terse note
-	// needs; without it a 100-iteration turn would 400 and degrade to the raw
-	// fallback note.
-	// Hand the paste the rolling Summary as background. Prefix-extension mode
-	// gets this for free (appendSummariseMsgs builds the real wire context, and
-	// buildLLMContext renders Summary in front of the messages), but a paste sees
-	// nothing except the turn slice — so the first note written after a
-	// compaction comes from something with no idea what the session had already
-	// established. It restates the goal and the constraints that are sitting
-	// three inches above it in the very Summary it is about to be appended to.
-	// The two paste callers are exactly the two where that bites: the synchronous
-	// in-flight fold inside foldHistory (which runs AT a compaction) and a
-	// per-turn note routed to a separate purpose = "summary" connection.
+	// Cap the rendered slice so a long turn cannot overflow the background slot;
+	// clipBytes keeps the head (the request) and the tail (the outcome), which is
+	// what a terse note needs.
 	//
-	// Framed read-only on purpose. foldHistory concatenates the resulting note
-	// AFTER this same Summary, so anything copied out of it is stored twice and
-	// then twice as likely to survive the next boundSummary fold.
-	//
-	// Clipped to maxSummaryBytes: the fold caller gets here BECAUSE the
-	// foreground context overflowed, and the background slot must not follow it.
+	// The paste also gets the rolling Summary as background. Prefix-extension
+	// mode has it for free, but a paste sees only the turn, so the first note
+	// after a compaction restated goals sitting right above it. Framed read-only,
+	// since foldHistory concatenates the note AFTER this same Summary and
+	// anything copied out would be stored twice. Clipped to maxSummaryBytes: the
+	// fold caller is here BECAUSE the foreground overflowed.
 	sess.mu.Lock()
 	prior := strings.TrimSpace(sess.Summary)
 	sess.mu.Unlock()
@@ -485,27 +431,17 @@ func fallbackTurnNote(turn []Message) string {
 	return clipBytes(b.String(), 2400)
 }
 
-// replayToolOutput re-renders one stored tool result exactly as the live call
-// put it on the wire, which is what keeps a rebuilt prompt byte-identical to
-// the one the server already has cached.
+// replayToolOutput re-renders a stored tool result exactly as the live call
+// put it on the wire, which keeps a rebuilt prompt byte-identical to the one
+// the server has cached. For most tools that is liveToolOutput's text, NOT a
+// tighter clip: a cached re-send is free, clipping changes the bytes.
 //
-// For every tool but view_image that is liveToolOutput's text (NOT a tighter
-// history clip: a cached re-send is free, whereas clipping changes the bytes
-// and forces a reprocess; n_ctx is bounded by compaction, not by clipping
-// here). view_image is the exception. runToolCall puts []any{text, image_url}
-// on the wire and stores only the text half in tu.Output, so replaying
-// tu.Output alone silently DROPS an image out of the MIDDLE of the prompt and
-// every message behind it shifts. Measured once on a real session: 431 prompt
-// tokens saved against 30035 re-evaluated, a 70:1 losing trade.
-//
-// The parts are reproducible because dispatchViewImage is pure given Cwd and
-// the stored arguments and the image store is content-addressed, so re-running
-// it yields the same bytes. Same rule the m.Images branch follows.
-//
-// A tool that PRODUCED an image (screenshot) is NOT pure that way: re-rendering
-// the page a turn later can yield different pixels, and the id is the only
-// thing that pins the bytes the model actually saw. So that case replays from
-// ImageID and never re-runs the tool.
+// view_image is the exception. The wire carried []any{text, image_url} but
+// only the text is stored, so replaying it alone drops an image out of the
+// MIDDLE of the prompt (measured: 431 tokens saved, 30035 re-evaluated). The
+// parts are reproducible, since dispatchViewImage is pure and the store is
+// content-addressed. A tool that PRODUCED an image (screenshot) is not pure,
+// so it replays from ImageID and never re-runs.
 func (a *agent) replayToolOutput(sess *Session, tu ToolUse) any {
 	text := liveToolOutput(tu.Name, tu.Input, tu.Output)
 	if tu.Failed || !a.imagesSupported {
@@ -534,15 +470,9 @@ func (a *agent) replayToolOutput(sess *Session, tu ToolUse) any {
 	return parts
 }
 
-// buildLLMContext renders SystemPrompt + Summary + stored Messages as the
-// wire-shape llmMessage slice. Tool calls use OpenAI protocol — assistant
-// with ToolCalls, then one Role:"tool" per call with ToolCallID = tu.ID.
-// Every stored image is inlined as image_url every turn so wire bytes for a
-// given message stay byte-identical until compaction rotates it out; after
-// compaction the reference lives in Summary and view_image fetches on demand.
-// wireCallID is the tool_call id to put on the wire for a ToolUse: the model's
-// own id (what the live request used) so a rebuild from history is byte-identical.
-// Falls back to the internal useID for older sessions / models that sent no id.
+// wireCallID is the tool_call id to put on the wire: the model's own, so a
+// rebuild from history is byte-identical to the live request. Falls back to
+// the internal id for sessions and models that sent none.
 func wireCallID(tu ToolUse) string {
 	if tu.CallID != "" {
 		return tu.CallID
@@ -550,6 +480,11 @@ func wireCallID(tu ToolUse) string {
 	return tu.ID
 }
 
+// buildLLMContext renders SystemPrompt, Summary and the stored messages as the
+// wire's message list: OpenAI tool protocol, one Role:"tool" message per call.
+// Stored images are inlined every turn, so a message's wire bytes stay
+// identical until compaction rotates it out; after that the reference lives in
+// Summary and view_image fetches on demand.
 func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 	// Snapshot under the lock: the background summariser (foldHistory/rotate
 	// reassigns s.Messages) can mutate the session while this ranges it. Copy the slice header + the prompt

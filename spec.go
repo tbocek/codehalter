@@ -106,7 +106,7 @@ type specConfig struct {
 }
 
 // specLedger is one finished item, recorded when its test passed and its commit
-// landed. Hash is over the item's own spec text (specItemText), so a later run
+// landed. Hash is over the item's own spec text (specItemHash), so a later run
 // can tell that the section was edited since. Title carries renames: a section
 // moved to another file keeps its heading, and matching on it means the item is
 // not reported as one removal plus one new item.
@@ -205,13 +205,6 @@ func (c *specConfig) context(idx *specIndex) []string {
 		return c.Context
 	}
 	return defaultSpecContext(idx)
-}
-
-func (c *specConfig) maxBlocked() int {
-	if c.MaxBlocked > 0 {
-		return c.MaxBlocked
-	}
-	return defaultSpecMaxBlocked
 }
 
 func (c *specConfig) block(id string) *specBlock {
@@ -1129,34 +1122,25 @@ func detectSpecTestCmd(outAbs string) string {
 // Picking the next item and reporting
 // ---------------------------------------------------------------------------
 
-// nextSpecItem returns the first item in ledger order that is neither covered
-// nor blocked. A blocked item the user has answered is eligible again; its
-// answer comes back so the round can carry it.
-// specItemText is the spec text an item IS: the section it heads, or the single
-// line that defines it (a table row, an id on a line of its own). Deliberately
-// not the round prompt's slice, which pulls in linked sections and would make
-// an edit anywhere in the spec look like a change to this item.
-func specItemText(idx *specIndex, id string) string {
-	it := idx.items[id]
-	if it == nil {
-		return ""
-	}
-	if s, ok := idx.sectionAt(it.Doc, it.Line); ok && s.start == it.Line {
-		return idx.text(it.Doc, s.start, s.end)
-	}
-	d := idx.docs[it.Doc]
-	if it.Line >= 0 && it.Line < len(d.lines) {
-		return d.lines[it.Line]
-	}
-	return ""
-}
-
-// specItemHash fingerprints that text with whitespace normalised away, so
+// specItemHash fingerprints an item's own spec text with whitespace normalised away, so
 // reflowing a paragraph or reindenting a list does not re-open a finished item.
 // Wording changes do, because nothing cheap can tell a reworded sentence from a
 // changed requirement.
 func specItemHash(idx *specIndex, id string) string {
-	text := specItemText(idx, id)
+	it := idx.items[id]
+	if it == nil {
+		return ""
+	}
+	// The text an item IS: the section it heads, or the single line that
+	// defines it (a table row, an id on its own line). Not the round prompt's
+	// slice, which pulls in linked sections and would make an edit anywhere in
+	// the spec look like a change to this item.
+	text := ""
+	if sec, ok := idx.sectionAt(it.Doc, it.Line); ok && sec.start == it.Line {
+		text = idx.text(it.Doc, sec.start, sec.end)
+	} else if lines := idx.docs[it.Doc].lines; it.Line >= 0 && it.Line < len(lines) {
+		text = lines[it.Line]
+	}
 	if text == "" {
 		return ""
 	}
@@ -1175,10 +1159,6 @@ type specDelta struct {
 	Removed []string // finished once, and the section is gone from the spec
 	Renamed []string // "old → new", the ledger entry travelled with it
 	Adopted int      // covered items that predate the ledger
-}
-
-func (d specDelta) empty() bool {
-	return len(d.Changed) == 0 && len(d.Removed) == 0 && len(d.Renamed) == 0
 }
 
 // specReconcile compares the spec, the ledger and the code, and MUTATES cfg:
@@ -1428,7 +1408,8 @@ func specSectionFromText(content, id string) string {
 
 // renderSpecDelta is the one-block report a run prints before it starts working.
 func renderSpecDelta(d specDelta) string {
-	if d.empty() {
+	// Adoptions alone are bookkeeping, not news.
+	if len(d.Changed) == 0 && len(d.Removed) == 0 && len(d.Renamed) == 0 {
 		return ""
 	}
 	var b strings.Builder

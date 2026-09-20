@@ -79,12 +79,9 @@ func seedTemplates(cwd string) error {
 		if _, ok := isTemplateFile(n); !ok {
 			continue
 		}
-		path := filepath.Join(cwd, ".codehalter", n)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			data, _ := templateFS.ReadFile("res/" + n)
-			if err := os.WriteFile(path, data, 0o644); err != nil {
-				return fmt.Errorf("seeding %s: %w", path, err)
-			}
+		data, _ := templateFS.ReadFile("res/" + n)
+		if err := seedFile(filepath.Join(cwd, ".codehalter"), n, string(data)); err != nil {
+			return err
 		}
 	}
 	return nil

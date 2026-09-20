@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -65,28 +64,128 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 
 // TestCheckEnvSetupIsOneCard pins the one-card, one-turn rule. Every accepted
 // card dispatches a full plan/execute/document cycle, so every missing dev tool
-// is folded into a SINGLE fixProblem, with one PLAN ONLY directive.
+// is folded into a SINGLE fixProblem, with one PLAN ONLY directive. Two stacks
+// wanting two different formatters is the case that would otherwise be two
+// cards; a runner config (the justfile here) is deliberately not probed at all.
 func TestCheckEnvSetupIsOneCard(t *testing.T) {
 	a, s := newTestAgent(t)
 	// Empty PATH so every probed binary reads as missing regardless of the
 	// developer's machine.
 	t.Setenv("PATH", "")
-	for name, body := range map[string]string{"go.mod": "module x\n\ngo 1.24\n", "justfile": "test:\n\tgo test ./...\n"} {
+	for name, body := range map[string]string{
+		"tsconfig.json": "{}\n",
+		"main.c":        "int main(void){return 0;}\n",
+		"justfile":      "test:\n\tgo test ./...\n",
+	} {
 		if err := os.WriteFile(filepath.Join(s.Cwd, name), []byte(body), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	problems := a.checkEnv(s, s.ID)
-	if len(problems) != 1 {
-		t.Fatalf("setup must be one card (one turn), got %d: %+v", len(problems), problems)
-	}
-	for _, want := range []string{"Missing dev tools:", "go (", "just ("} {
-		if !strings.Contains(problems[0].prompt, want) {
-			t.Errorf("prompt lacks %q: %q", want, problems[0].prompt)
+	setup := firstCard(t, a.checkEnv(s, s.ID), "Missing dev tools:")
+	for _, want := range []string{"prettier (", "clang-format ("} {
+		if !strings.Contains(setup.prompt, want) {
+			t.Errorf("prompt lacks %q: %q", want, setup.prompt)
 		}
 	}
-	if n := strings.Count(problems[0].prompt, "PLAN ONLY"); n != 1 {
-		t.Errorf("want exactly 1 PLAN ONLY directive, got %d: %q", n, problems[0].prompt)
+	if strings.Contains(setup.prompt, "just") {
+		t.Errorf("a runner binary was probed: %q", setup.prompt)
+	}
+	if n := strings.Count(setup.prompt, "PLAN ONLY"); n != 1 {
+		t.Errorf("want exactly 1 PLAN ONLY directive, got %d: %q", n, setup.prompt)
+	}
+}
+
+// firstCard returns the one problem whose prompt carries want, failing when
+// none or several do. checkEnv answers with several unrelated cards in one
+// pass, and a test that indexed [0] would break whenever their order changed.
+func firstCard(t *testing.T, probs []fixProblem, want string) fixProblem {
+	t.Helper()
+	var found []fixProblem
+	for _, p := range probs {
+		if strings.Contains(p.prompt, want) {
+			found = append(found, p)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one card mentioning %q, got %d of %+v", want, len(found), probs)
+	}
+	return found[0]
+}
+
+// TestCheckEnvOneTimeCards pins that the two cards asking for work a project
+// only ever needs once are offered once per PROJECT, not once per session: the
+// mark lands in .codehalter/checks.done, so a second agent opening the same
+// directory (a restart, the ordinary case) stays quiet. Before that file
+// existed, declining meant being asked again at every session start.
+func TestCheckEnvOneTimeCards(t *testing.T) {
+	a, s := newTestAgent(t)
+	// A ts project with a local prettier and no config: formatterConfigNeeds
+	// wants a .prettierrc, and there is no AGENT.md either.
+	bin := filepath.Join(s.Cwd, "node_modules", ".bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, body := range map[string]string{
+		filepath.Join(s.Cwd, "tsconfig.json"): "{}\n",
+		filepath.Join(bin, "prettier"):        "#!/bin/sh\n",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(s.Cwd, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// One file to read: .git and node_modules are skipped by the walk. The
+	// formatter card fires, the AGENT.md card does not. A directory that is
+	// merely non-pristine has nothing for the card's "read the tree" step.
+	probs := a.checkEnv(s, s.ID)
+	firstCard(t, probs, "no formatter config")
+	for _, p := range probs {
+		if strings.Contains(p.prompt, "AGENT.md") {
+			t.Fatalf("asked for an AGENT.md with one file to read: %q", p.desc)
+		}
+	}
+
+	// Content is what flips it, and it is re-checked live, so a project that
+	// grows during the session is asked then rather than at the next one.
+	for _, n := range []string{"a.ts", "b.ts", "c.ts", "d.ts", "README.md"} {
+		if err := os.WriteFile(filepath.Join(s.Cwd, n), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	probs = a.checkEnv(s, s.ID)
+	agents := firstCard(t, probs, "AGENT.md")
+	if !strings.Contains(agents.prompt, "ask_user") {
+		t.Errorf("the AGENT.md card must confirm the facts with the user: %q", agents.prompt)
+	}
+
+	// Same session, and after a restart: neither comes back.
+	for _, again := range []func() []fixProblem{
+		func() []fixProblem { return a.checkEnv(s, s.ID) },
+		func() []fixProblem {
+			b, s2 := newTestAgent(t)
+			s2.Cwd = s.Cwd
+			return b.checkEnv(s2, s2.ID)
+		},
+	} {
+		for _, p := range again() {
+			if strings.Contains(p.prompt, "no formatter config") || strings.Contains(p.prompt, "AGENT.md") {
+				t.Errorf("a one-time card was offered twice: %q", p.desc)
+			}
+		}
+	}
+
+	// A project that ships AGENT.md is never asked in the first place.
+	c, s3 := newTestAgent(t)
+	if err := os.WriteFile(filepath.Join(s3.Cwd, "AGENT.md"), []byte("# x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range c.checkEnv(s3, s3.ID) {
+		if strings.Contains(p.prompt, "AGENT.md") {
+			t.Errorf("asked for an AGENT.md that exists: %q", p.desc)
+		}
 	}
 }
 
@@ -507,45 +606,6 @@ func TestScaffoldSettings(t *testing.T) {
 	}
 }
 
-// TestProbeToolBinsMatchesInlineProbe pins that probeToolBins computes exactly the
-// per-binary presence the three reporters (envSnapshot / checkEnv /
-// notifyCapabilities) used to compute inline, so collapsing them into one helper
-// changed no behavior. It independently re-implements the original inline loops
-// and compares; both sides read the same PATH/cwd, so the result is deterministic
-// regardless of which dev tools happen to be installed.
-func TestProbeToolBinsMatchesInlineProbe(t *testing.T) {
-	a, s := newTestAgent(t)
-	s.knownStacks = []string{"go", "rust"}
-	s.knownRunners = []string{"make", "go", "bogus"} // make→make, go→go; bogus→"" (skipped)
-
-	gotRunners, gotFormatters := a.probeToolBins(s)
-
-	// Independent re-implementation of the pre-refactor inline probe loops.
-	var wantRunners, wantFormatters []toolPresence
-	for _, k := range s.knownRunners {
-		if bin := runnerProbeBinary(k); bin != "" {
-			_, err := exec.LookPath(bin)
-			wantRunners = append(wantRunners, toolPresence{bin: bin, label: k, present: err == nil})
-		}
-	}
-	for _, f := range detectFormatters(s.knownStacks, s.Cwd) {
-		present := false
-		if f.bin == "prettier" {
-			present = prettierBin(s.Cwd) != ""
-		} else if _, err := exec.LookPath(f.bin); err == nil {
-			present = true
-		}
-		wantFormatters = append(wantFormatters, toolPresence{bin: f.bin, label: f.reason, present: present})
-	}
-
-	if !reflect.DeepEqual(gotRunners, wantRunners) {
-		t.Errorf("runners: got %+v, want %+v", gotRunners, wantRunners)
-	}
-	if !reflect.DeepEqual(gotFormatters, wantFormatters) {
-		t.Errorf("formatters: got %+v, want %+v", gotFormatters, wantFormatters)
-	}
-}
-
 // TestFormatterConfigNeeds pins who gets offered a formatter config and, more
 // importantly, who does not: a Go project has nothing to pin (gofmt exposes no
 // style options), and a project that already declares its style is left alone
@@ -648,4 +708,35 @@ func TestFormatterConfigNeeds(t *testing.T) {
 			t.Errorf("got %+v with a .clang-format present, want nothing", got)
 		}
 	})
+}
+
+// TestEmptyProject covers the deferred-bootstrap path: a fresh directory
+// reads as empty, so initSession sets the flag whose hint asks the user what
+// language and runner to use. A populated one must not, and nothing is
+// scaffolded either way.
+func TestEmptyProject(t *testing.T) {
+	dir := t.TempDir()
+	if !isEmptyProject(dir) {
+		t.Fatal("expected fresh tempdir to be empty")
+	}
+
+	if _, err := newSession(dir); err != nil { // creates .codehalter/, no sources
+		t.Fatalf("newSession: %v", err)
+	}
+	if !isEmptyProject(dir) {
+		t.Error("expected dir with only .codehalter/ to still count as empty")
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "Makefile")); err == nil {
+		t.Error("bootstrap must be deferred — no Makefile should be written")
+	}
+
+	// Non-empty project: isEmptyProject=false and flag stays off.
+	populated := t.TempDir()
+	if err := os.WriteFile(filepath.Join(populated, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if isEmptyProject(populated) {
+		t.Error("expected dir with main.go to not be empty")
+	}
 }

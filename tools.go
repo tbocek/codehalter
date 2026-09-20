@@ -89,15 +89,12 @@ func realInside(p, cwd string) bool {
 
 type Tool struct {
 	Def map[string]any
-	// Execute returns the tool's output and a `failed` flag. `failed` is the
-	// authoritative signal that the underlying operation reported a hard
-	// failure (e.g. run_task observed a non-zero exit). It's surfaced as
-	// ToolUse.Failed so the subtask orchestrator can override an LLM
-	// "success=true" when codehalter itself saw the call fail. Most handlers
-	// return (output, false); run_task and similar truth-bearing tools set
-	// failed=true on a non-zero exit. edit_file/write_file also set it on a usage
-	// error to feed the loop's fail cap — but runExecutePhase's verdict excludes
-	// file-mutation tools, so a recovered edit doesn't condemn the subtask.
+	// Execute returns the tool's output and a `failed` flag: the authoritative
+	// signal that the operation itself failed (run_command saw a non-zero exit).
+	// It becomes ToolUse.Failed, which lets the orchestrator override a model's
+	// "success". edit_file/write_file set it on a usage error too, to feed the
+	// fail cap, but the subtask verdict excludes file-mutation tools, so a
+	// recovered edit does not condemn the subtask.
 	Execute func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
 }
 
@@ -112,10 +109,6 @@ type phasePolicy struct {
 	terminals map[string]bool
 }
 
-func (p phasePolicy) isDenied(name string) bool   { return p.deny[name] }
-func (p phasePolicy) isTerminal(name string) bool { return p.terminals[name] }
-func (p phasePolicy) hasTerminal() bool           { return len(p.terminals) > 0 }
-
 // terminalList renders the phase's terminal tools for a model-facing nudge,
 // e.g. "`respond` or `submit_plan`". Sorted for a stable message.
 func terminalList(p phasePolicy) string {
@@ -125,29 +118,6 @@ func terminalList(p phasePolicy) string {
 	}
 	sort.Strings(names)
 	return strings.Join(names, " or ")
-}
-
-// denyHint tells the model what to do instead of a forbidden tool, per phase.
-func denyHint(phase string) string {
-	switch phase {
-	case "plan":
-		return "planning is read-only; describe this change as a subtask in submit_plan and the executor will make it."
-	case "document":
-		return "the documentation phase only wraps up — write the note and stop, don't re-plan."
-	default:
-		return "it isn't allowed here; continue without it."
-	}
-}
-
-// builtinTools is every tool codehalter provides in any project. Discovery adds
-// the project's own (run_command and run_background inside a container,
-// run_task when there is a task runner) and MCP adds its servers' tools, both
-// at runtime into the agent's toolRegistry.
-func builtinTools() []Tool {
-	return slices.Concat(fileTools, webTools, []Tool{
-		searchTextTool, askUserTool, submitPlanTool, respondTool,
-		insightsTool, screenshotTool, viewImageTool,
-	})
 }
 
 // toolName is the function name a tool is offered and called under.
@@ -176,7 +146,14 @@ func (r *toolRegistry) seedLocked() {
 		return
 	}
 	r.tools = make(map[string]Tool)
-	for _, t := range builtinTools() {
+	// Every tool codehalter provides in any project. Discovery adds the
+	// project's own (run_command and run_background inside a container) and
+	// MCP adds its servers', both at runtime through add.
+	builtin := slices.Concat(fileTools, webTools, []Tool{
+		searchTextTool, askUserTool, submitPlanTool, respondTool,
+		insightsTool, screenshotTool, viewImageTool,
+	})
+	for _, t := range builtin {
 		r.tools[toolName(t)] = t
 	}
 }
@@ -232,17 +209,11 @@ func (r *toolRegistry) defs() []map[string]any {
 	return defs
 }
 
-// toolArgs is one decoded tool-call argument object.
-//
-// It decodes into map[string]any, NOT map[string]string, because our own tool
-// schemas declare non-string types: read_file's `line`/`limit` are integers,
-// search_text's `regex`/`multiline` are booleans, web_read's `offset`/`limit`
-// are integers. A model that obeys the schema sends `{"line": 42}` — a JSON
-// number — and decoding that into map[string]string fails the whole object with
-// a type error while leaving the offending key set to "". The tool then read
-// from line 1 and reported success, with the only trace a debug log. Keeping the
-// values as `any` and coercing per-key at the point of use is what makes the
-// schema and the decoder agree.
+// toolArgs is one decoded tool-call argument object. It is map[string]any, NOT
+// map[string]string, because the schemas declare integers and booleans: a
+// model that obeys them sends `{"line": 42}`, and decoding that into strings
+// fails the whole object while leaving the key "". The tool then read from
+// line 1 and reported success. Values are coerced per key at the point of use.
 type toolArgs map[string]any
 
 // parseArgs decodes a tool call's raw JSON arguments. A malformed payload
@@ -344,15 +315,12 @@ func nextToolUseID() string {
 	return fmt.Sprintf("tu_%d", toolUseCounter.Add(1))
 }
 
-// runToolCall executes one tool call and returns (a) the ToolUse recording its
-// FULL output and (b) the model-visible content. The full output is recorded in
-// the session (saved to disk, for the summariser and for you); the message
-// stream only ever carries the model-visible copy. That copy is the output
-// shrunk past truncateThreshold with a "to see more" hint — or, for view_image, the inline multimodal parts. The
-// caller appends the returned ToolUse to its result set and the content to the
-// message stream. Truncation lives here, not in individual tools, so every tool
-// returns its complete output and this one place decides "small → whole, big →
-// truncate + cache the rest".
+// runToolCall executes one tool call and returns the ToolUse recording its FULL
+// output, plus the model-visible content: the output shrunk past
+// truncateThreshold with a "to see more" hint, or view_image's multimodal
+// parts. The full output goes to the session; the wire carries only the
+// visible copy. Truncation lives here, so every tool returns everything and
+// one place decides what the model sees.
 func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolUse, any) {
 	started := time.Now()
 
@@ -411,7 +379,15 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 // record only — the caller doesn't feed it to the fail cap (the repetition
 // ladder catches genuine spamming).
 func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall) (ToolUse, string) {
-	msg := fmt.Sprintf("error: %s is not available during the %s phase — %s", tc.Function.Name, phase, denyHint(phase))
+	// Say what to do instead: a bare refusal gets the same call again.
+	hint := "it isn't allowed here; continue without it."
+	switch phase {
+	case "plan":
+		hint = "planning is read-only; describe this change as a subtask in submit_plan and the executor will make it."
+	case "document":
+		hint = "the documentation phase only wraps up — write the note and stop, don't re-plan."
+	}
+	msg := fmt.Sprintf("error: %s is not available during the %s phase — %s", tc.Function.Name, phase, hint)
 	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
 	a.FailToolCall(ctx, sid, tcId, msg)
 	tu := ToolUse{
@@ -592,7 +568,7 @@ func truncationHint(toolName, args string) string {
 			return fmt.Sprintf("To see more: call %s again with url=%q offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched.", toolName, u)
 		}
 		return "To see more: call this tool again with offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched."
-	case "run_command", "run_task":
+	case "run_command":
 		return "To see more: re-run it with the output narrowed (`| grep <pattern>`, `| tail -n <n>`, `| head -n <n>`), or redirect it to a file and read_file that. If re-running is slow or has side effects, redirect to a file the FIRST time."
 	case "list_files":
 		if path := a["path"]; path != "" {

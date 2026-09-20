@@ -10,31 +10,19 @@ import (
 )
 
 // ACP terminals are how codehalter runs commands: the client starts the process
-// and owns it, and we drive it by id. There is no in-process exec path — a
-// client that doesn't advertise clientCapabilities.terminal is refused at
-// bootstrap (see ensureTerminals), rather than silently falling back to running
-// processes ourselves.
+// and owns it, and we drive it by id. There is no in-process exec path; a
+// client without clientCapabilities.terminal is refused at bootstrap.
 //
-// Handing the process to the client is not a sandbox escape. bootstrap.go
-// directs the user to Zed's "Connect Dev Container", where Zed's remote server
-// runs INSIDE the container and spawns codehalter there, so a terminal it
-// creates is in the same container as everything else we do. run_background
-// relies on the stronger form of that: the client's terminal and codehalter see
-// the same filesystem, so a log file written by a terminal is readable here.
+// This is not a sandbox escape: Zed's remote server runs INSIDE the container
+// and spawns codehalter there, so its terminals share our container and
+// filesystem (run_background relies on reading a terminal's log file here).
 //
-// Two things differ from running the process ourselves:
-//
-//   - We never see a pid, so there is no process group to own and no way to ask
-//     whether a command left a child behind (`npm run dev &`). That case is out
-//     of run_command's contract: it runs commands that exit on their own, and a
-//     never-exits process belongs in run_background. run_command finishes
-//     regardless, and the deferred terminal/release kills whatever the terminal
-//     still holds. The steer to run_background lives in the tool description.
-//   - The idle watchdog is a poll, not a stream. terminal/wait_for_exit blocks
-//     and there is no output stream to watch, so silence is detected by
-//     re-reading terminal/output on a timer and timestamping the last change.
-//     Kill latency is bounded by the poll interval, not by the timeout. See
-//     runTerminalCmd.
+// Two things differ from running the process ourselves. We never see a pid, so
+// a child a command leaves behind (`npm run dev &`) is out of run_command's
+// contract: never-exiting processes belong in run_background, and the deferred
+// terminal/release kills whatever remains. And the idle watchdog is a poll:
+// there is no output stream, so silence is detected by re-reading
+// terminal/output on a timer, and kill latency is bounded by that interval.
 
 // terminalOutputLimit is the byte cap we ask the client to enforce. The client
 // truncates from the FRONT (it keeps the tail), which loses the head of a long

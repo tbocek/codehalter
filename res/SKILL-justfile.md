@@ -1,20 +1,16 @@
 # Justfile skill
-Project has `justfile` (or `Justfile`/`.justfile`). Use declared recipes via `run_task`, NOT raw `just`.
+Project has `justfile` (or `Justfile`/`.justfile`): recipes run as `just <recipe>` through `run_command`.
 
-## Probe available recipes
-- `just --list` → every public recipe + docstring. Use first.
+## Probe
+- `just --list` → every public recipe with its docstring. Use before guessing a name.
 - `just --show <recipe>` → print a recipe body without running it.
-- `just --evaluate` → dump every variable's resolved value.
-run_task already enumerated recipes this turn → reuse, don't re-parse.
 
-## Editing
-- **Recipes are NOT incremental.** `just` has no dependency tracking and no output-freshness check: it ALWAYS runs the body, every time. Skipping "because the output is up to date" does not exist — don't claim it, and don't rely on it.
-- Consistent indentation (spaces OR tabs, not both — `just` refuses mixed).
-- `{{var}}` is evaluated by just BEFORE the shell sees the line; `$var` is shell expansion after. Confusing the two → recipes that "work in the shell" but fail under `just`.
-- Recipe lines each run in their own shell (`sh -cu` by default; override with a shebang or `set shell := ["bash", "-cu"]`).
+## What just does NOT do
+- **Recipes are not incremental.** No dependency tracking, no output-freshness check: the body ALWAYS runs. "Skipping, the output is up to date" does not exist here. Don't claim it, don't rely on it.
+- Mixed indentation is refused: spaces OR tabs inside a recipe, never both.
+- `{{var}}` is just's own substitution, applied BEFORE the shell sees the line; `$var` is shell expansion after. Confusing the two gives recipes that work pasted into a shell and fail under `just`.
+- Each recipe line runs in its own shell (`sh -cu`; override with a shebang or `set shell := ["bash", "-cu"]`), so a `cd` on one line is gone by the next.
 
-## When proposing a new recipe
-1. Name it compatibly with the build/test/lint/format classifier (the codehalter task router groups by these keywords).
-2. Add a leading docstring comment — that's what `just --list` shows.
-3. Declare prerequisites as recipe dependencies, NOT inline `just <other>` calls (the latter spawns a new `just` process).
-4. Depends on a tool not in the base image → surface that; `apt install` inside a recipe hides install latency.
+## Writing a recipe
+- Lead with a `#` comment: that is what `just --list` shows.
+- Declare prerequisites as recipe dependencies, not as inline `just <other>` calls: the latter spawns a second `just`.

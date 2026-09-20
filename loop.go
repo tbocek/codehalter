@@ -4,22 +4,19 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 )
 
-// This file owns the plan + per-subtask machinery. The orchestrator
-// (prompt.go) drives the larger plan → subtasks → replan cycle and the
-// once-at-end document phase.
-//
-// The plan phase produces a list of subtasks; each subtask carries its
-// own verify recipe. Every subtask runs as ONE tool-calling loop where
-// the executor can read, edit, install, and self-verify before declaring
-// done via `respond`. No separate verify-phase LLM call — the executor
-// runs the recipe itself. The loop's only ceiling is the hard
-// maxToolLoopIterations backstop in this file.
+// This file owns the plan phase and the per-subtask loop; the orchestrator
+// (prompt.go) drives plan → subtasks → replan and the closing document phase.
+// Each subtask carries its own verify recipe and runs as ONE tool loop in which
+// the executor reads, edits, installs and verifies before calling `respond`.
+// There is no separate verify call, and the only ceiling is
+// maxToolLoopIterations.
 
 // ---------------------------------------------------------------------------
 // Plan phase
@@ -53,26 +50,16 @@ type planResult struct {
 	answer string
 }
 
-// runPlanPhase appends PLAN.md (plus an optional replanContext on retries) as a
-// fresh user message, runs the planning LLM, persists the JSON response as the
-// trailing assistant turn, parses the plan, and resolves any clarification
-// round-trip. It does NOT ask "Execute this plan?" — the orchestrator owns the
-// single confirmation per plan / per replan so the user sees the full subtask
-// list before deciding.
+// runPlanPhase runs the planner and returns its plan, resolving any
+// clarification round trip. It does not ask "Execute this plan?": the
+// orchestrator owns that, so the user sees the whole subtask list first.
 //
-// Returns (nil, nil, err) when no LLM is configured. Returns (nil, ...) when
-// there's no PLAN.md, the tool loop fails, or the response can't be parsed even
-// after one corrective retry — callers treat any of those as "no plan, proceed
-// without one". errUserCancelled fires when the user aborts on a clarification
-// prompt.
-//
-// replanContext is "" on the first planning pass; on a replan the orchestrator
-// supplies a short note (e.g. "REPLAN: prior attempt failed — see history.
-// Same failure surfaced N times — try a structurally different approach.")
-// The actual failure detail is already in history on the preceding executor
-// response, so we don't repeat it here.
+// A nil plan means "proceed without one": no PLAN.md, the loop failed, or the
+// reply would not parse even after a corrective retry. errUserCancelled means
+// the user aborted a clarification. replanContext is "" on the first pass; on a
+// replan it is a short note, the failure detail being in history already.
 func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
-	thinking := a.connForSession(ctx, sid, "thinking")
+	thinking := a.connFor("thinking")
 	if thinking == nil {
 		return nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
 	}
@@ -101,26 +88,19 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		sess.phaseMu.Unlock()
 	}
 
-	// Exclude respond: planning has its OWN terminal tool, submit_plan, whose
-	// arguments are the structured plan. Keeping respond out forces the planner
-	// onto submit_plan instead of escaping into execute's exit and emitting a
-	// free-text answer with no plan attached.
-	// Read-only planning, enforced at dispatch: edit_file/write_file are denied
-	// (planner edits leak into history). `sed -i` is unblockable here — PLAN.md
-	// forbids it in prose.
-	// Terminals: submit_plan (the plan) or respond (a direct answer, no work).
+	// Planning is read-only, enforced at dispatch: edit_file/write_file are
+	// denied, since planner edits leak into history (`sed -i` cannot be blocked
+	// here; PLAN.md forbids it in prose). Terminals: submit_plan, whose
+	// arguments ARE the plan, or respond for a direct answer with no work.
 	policy := phasePolicy{
 		deny:      map[string]bool{"write_file": true, "edit_file": true},
 		terminals: map[string]bool{submitPlanToolName: true, respondToolName: true},
 	}
 
-	// Run the tool loop (stream=false: planning output is machinery, not shown
-	// live — orchestrate renders the subtask list or surfaces a direct answer).
-	// The planner ends by calling submit_plan, whose arguments ARE the plan, so
-	// planRes.Text is clean JSON and planRes.Content is any user-facing answer
-	// prose — already separated. A model that skips the tool and emits the plan
-	// as free text falls through to the legacy parse + one corrective retry.
-	// Merged ToolUses keep full visibility either way.
+	// stream=false: planning output is machinery, and orchestrate renders the
+	// result. The planner ends on submit_plan, so planRes.Text is clean JSON and
+	// planRes.Content any answer prose. A model that emits the plan as free text
+	// instead falls through to the parse below and one corrective retry.
 	var plan planResult
 	planRes, err := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0)
 	if err != nil {
@@ -136,11 +116,9 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	}
 	parseErr := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
 	if parseErr != nil {
-		// Two different failures land here and they need different correctives:
-		// the planner answered in prose without ever calling submit_plan, or it
-		// called it with arguments that aren't valid JSON. The second used to skip
-		// this retry outright (the condition also demanded !RespondCalled), so one
-		// malformed argument list failed the whole turn with nothing said.
+		// Two failures land here and need different correctives: the planner
+		// answered in prose without calling submit_plan, or it called it with
+		// arguments that are not valid JSON. Both get the retry.
 		corrective := "Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."
 		wrong := "the planner replied in prose instead of calling submit_plan"
 		if planRes.RespondCalled {
@@ -190,28 +168,17 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		plan.answer = strings.TrimSpace(strings.Replace(planRes.Text, trimJSON(planRes.Text), "", 1))
 	}
 
-	// Clean-signal enforcement: the planner must submit EITHER a final answer (a
-	// message, no subtasks) OR a plan (subtasks) — never both, never neither.
-	// PLAN.md spells this out; here we catch the structural violations and nudge
-	// ONCE to pick a lane, then re-parse — orchestrate then surfaces the answer or
-	// runs the subtasks. (A "message" that's really a promise — "I'll summarize" —
-	// reads structurally as an answer; keeping the model off that is PLAN.md's job,
-	// not a brittle string match here.)
+	// The planner must submit EITHER an answer (a message, no subtasks) OR a
+	// plan, never both and never neither. Structural violations get ONE nudge to
+	// pick a lane, then a re-parse. A "message" that is really a promise ("I'll
+	// summarize") reads as an answer here; keeping the model off that is
+	// PLAN.md's job, not a brittle string match.
 	hasPlan := len(plan.Subtasks) > 0
-	// Prose alongside subtasks is a PREAMBLE, not an answer, and must not count as
-	// one: orchestrate surfaces answer only when there are no subtasks
-	// (prompt.go), and report_only=false says the planner means this plan to run,
-	// so there is nothing to choose between and nothing to ask. Measured over two
-	// sessions: 10 of 35 plan submissions carried a preamble ("The request is
-	// clear: delete the out/test build output and recompile the site."), every one
-	// of them report_only=false, and every one cost a corrective round trip (4-50s)
-	// plus a second plan table streamed over the first, to arrive at the plan
-	// already submitted. The nudge also lingers as a stored turn: a later planner
-	// round spent 1825 bytes of reasoning re-litigating one.
-	//
-	// report_only=true is the real fork and still nudges: those subtasks relay
-	// findings the message may already have delivered, so running them can
-	// re-derive an answer the user was just given.
+	// Prose alongside subtasks is a PREAMBLE, not an answer: report_only=false
+	// says the plan is meant to run, so there is nothing to choose between.
+	// Nudging on it cost a round trip (4-50s) on 10 of 35 measured submissions, to
+	// arrive at the plan already submitted. report_only=true is the real fork and
+	// still nudges: those subtasks relay findings the message may already carry.
 	hasAnswer := plan.answer != "" && (!hasPlan || plan.ReportOnly)
 	if plan.Clear && hasPlan == hasAnswer {
 		nudge := "You submitted neither a usable answer nor a plan — your message is empty or only promises to act (\"I'll…\"). Either write the COMPLETE answer now (report_only=true, no subtasks), OR submit subtasks that produce it. Never write \"I'll…\" / \"let me…\"."
@@ -277,11 +244,10 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		choice, err := a.askChoiceAuto(ctx, sid, tcId, question, plan.Choices)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
-		// err = the card's ctx was cancelled (the editor aborted this turn to send
-		// a new prompt) — NOT a stop the user made; surface the real cause so the
-		// notice doesn't say "you stopped it". choice=="abort" IS an explicit stop.
+		// err = the card's ctx was cancelled (the turn was stopped while the card
+		// was open); choice=="abort" is the user answering the card with a stop.
 		if err != nil {
-			appendAssistantNote(sess, "Clarification cancelled (superseded).")
+			appendAssistantNote(sess, "Clarification cancelled.")
 			if sess != nil {
 				sess.saveOrLog()
 			}
@@ -362,8 +328,8 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// <think></think> for the model to continue, which suppresses it without
 	// changing a single earlier token (see llm.go).
 	// ... and every round must be a tool call: this phase ends only on a
-	// terminal tool, so prose is always a slip (withToolChoiceRequired).
-	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled().withToolChoiceRequired()
+	// terminal tool, so prose is always a slip (withToolChoice).
+	conn := a.connFor("execute").withThinkingDisabled().withToolChoice("required")
 	res, err := a.runToolLoop(ctx, sid, conn, policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
 	// session, stored verbatim by the loop — no post-hoc patch.
@@ -388,15 +354,11 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		out.Reason = "executor exited without calling respond"
 		return out
 	}
-	// Exit-code authority, last state only: typed Failed flags override
-	// whatever the model claimed in its respond message — small models
-	// routinely declare success while a command exited non-zero, so we trust
-	// the tool stream. But we honour only the LAST invocation of each distinct
-	// call (same tool name + same arguments): a verify command that failed, got
-	// fixed, and then re-ran green leaves an early Failed=true in the history
-	// that must NOT condemn the subtask. Keying on name+input means re-running
-	// the exact same command updates its verdict, while a different command
-	// keeps its own.
+	// Exit-code authority, last state only. Failed flags override the model's
+	// own verdict, since small models declare success over a non-zero exit. But
+	// only the LAST run of each distinct call (name + arguments) counts: a verify
+	// command that failed, got fixed and re-ran green must not condemn the
+	// subtask.
 	type callKey struct{ name, input string }
 	lastFailed := map[callKey]bool{}
 	var order []callKey
@@ -409,14 +371,11 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	}
 	var failedNames []string
 	for _, k := range order {
-		// Only run_task/run_command exit codes are authoritative build verdicts.
-		// Several other tools set Failed to feed the loop's fail cap but are NOT
-		// verdicts: edit_file/write_file on a usage error (a recovered edit is a
-		// later edit with a different key, and an unrecovered one is caught by the
-		// verify recipe when the file won't build), view_image on a benign missing
-		// image. Condemning the subtask on those triggers spurious replans, so use
-		// a positive allowlist.
-		if lastFailed[k] && (k.name == "run_task" || k.name == "run_command") {
+		// Only run_command exit codes are verdicts. Other tools set Failed to feed
+		// the fail cap without being one (an edit_file usage error is recovered by
+		// a later edit or caught by the verify recipe; view_image on a missing
+		// image is benign), and condemning the subtask on those replans for nothing.
+		if lastFailed[k] && k.name == "run_command" {
 			failedNames = append(failedNames, k.name)
 		}
 	}
@@ -432,12 +391,9 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 // Document phase (runs once at end of a successful prompt)
 // ---------------------------------------------------------------------------
 
-// runDocumentPhase runs after every subtask in the prompt has succeeded. It is
-// part of the FOREGROUND turn (plan → execute → document): it runs on the same
-// connection as execute and feeds the documenter the full conversation via
-// buildLLMContext, so it reuses execute's warm KV prefix (a cache hit, not a
-// cold prefill) and sees the actual edits — not a digest. Only the summariser
-// runs on the background LLM.
+// runDocumentPhase runs once every subtask has succeeded. It is part of the
+// FOREGROUND turn: same connection as execute and the full conversation, so it
+// reuses execute's warm prefix and sees the actual edits rather than a digest.
 // DOCUMENT.md self-skips when no documentation update is warranted.
 func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopResult) (toolLoopResult, error) {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
@@ -455,7 +411,7 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// the background LLM. Run it on the SAME connection as execute so it reuses
 	// execute's warm KV prefix instead of cold-prefilling a separate slot.
 	// Reasoning off, like the executor it follows (see withThinkingDisabled).
-	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
+	conn := a.connFor("execute").withThinkingDisabled()
 	if conn == nil {
 		return exec, nil
 	}
@@ -555,38 +511,28 @@ func throttledStream(emit func(string)) (sink func(string), flush func()) {
 	return sink, send
 }
 
-// executeFailCap is the per-subtask budget of FAILED rounds (iterations whose
-// tool batch produced a failure). Successful work is uncounted, so a long but
-// productive subtask runs unhindered; only one that keeps hitting failures it
-// can't clear burns the budget. A healthy verify-fix cycle costs 1-2 failures
-// (red build → fix → green), so this leaves room for a few bumps before
-// concluding the loop is stuck and bouncing it to a replan — where
-// web_search/web_read and a fresh decomposition are available, unlike this
-// web-blind execute loop. maxToolLoopIterations stays above it as the absolute
-// runaway backstop (and still solely governs the plan loop, which
-// passes no cap). Small fail budget + larger maxReplans deliberately shifts work
-// from one web-blind loop toward more web-capable replan rounds.
+// executeFailCap is the per-subtask budget of FAILED rounds. Successful work
+// is uncounted, so a long productive subtask runs freely and only one that
+// keeps failing burns the budget. A healthy fix cycle costs 1-2 (red, fix,
+// green); past this the loop is stuck and bounces to a replan, where web tools
+// and a fresh decomposition are available. Small here, generous maxReplans.
 const executeFailCap = 8
 
-// stuckEscalateRounds / stuckBailRounds drive runToolLoop's repetition ladder.
-// A "stuck round" is an iteration whose every tool call reproduced output it
-// already produced this loop (an unchanged re-read, a re-run command with
-// identical output, a repeated failing call). Consecutive stuck rounds first
-// warm the sampler (switch execute→thinking — same server/model, so the prefix
-// cache stays warm), then bail. Escalate strictly below bail so the warmer
-// sampler always gets a turn before we give up.
+// stuckEscalateRounds / stuckBailRounds drive the repetition ladder. A stuck
+// round is one whose every tool call reproduced output it already produced.
+// Consecutive stuck rounds first warm the sampler (execute→thinking, same
+// server, so the prefix stays warm), then bail. Escalate strictly below bail,
+// so the warmer sampler always gets a turn.
 const (
 	stuckEscalateRounds = 3
 	stuckBailRounds     = 5
 )
 
-// noCallNudges is how many times a phase with a terminal tool re-asks a model
-// that answered in prose instead of calling one. The wording escalates with
-// each: a reminder, then an instruction, then one imperative line naming the
-// only tools that end the turn. Three because a single polite nudge left the
-// weaker models answering in prose again on the next round, and the text exit
-// below then ended the turn with the work unfinished; past three the model is
-// not going to call it and spinning costs more than taking the prose.
+// noCallNudges is how many times a phase that ends on a terminal tool re-asks
+// a model that answered in prose, with escalating wording: a reminder, an
+// instruction, then one imperative line naming the tools. One polite nudge
+// left weaker models answering in prose again; past three the model will not
+// call it, and spinning costs more than taking the prose.
 const noCallNudges = 3
 
 // toolLoopResult is what an agentic tool loop (runToolLoop) returns.
@@ -622,29 +568,16 @@ type toolLoopResult struct {
 	DurationMs int64
 }
 
-// runToolLoop is the core agentic tool loop: send to LLM, execute tool calls,
-// repeat. When stream is true the model's text/reasoning tokens are forwarded to
-// the UI live (execute / document phases); the planner's internal JSON pass
-// passes false so its tokens stay silent. The phase tag ("plan"/"execute"/
-// "document") and cumulative llmStream wall-clock are stamped onto
-// the trailing assistant message via MarkLastAssistantTiming, so session.toml
-// records who ran the turn and how much time was generation vs tool execution.
+// runToolLoop is the agentic loop every phase uses: call the model, run its
+// tool calls, repeat. stream forwards tokens to the UI (execute, document) or
+// keeps them silent (the planner's JSON pass). failSoftCap > 0 ends the loop
+// after that many FAILED rounds with RespondCalled=false, so the subtask
+// bounces to a replan; 0 leaves only maxToolLoopIterations.
 //
-// failSoftCap is an optional soft ceiling on FAILED rounds — iterations whose
-// tool batch produced at least one failed tool. When > 0 and that count is
-// reached without the terminal tool firing, returns (res, nil) with
-// RespondCalled=false instead of erroring, so a subtask runner bounces to a
-// replan. Counting failures (not total iterations) lets a long-but-productive
-// subtask run freely while a stuck one — one that keeps hitting red builds/tests
-// this web-blind loop can't resolve — exits early. 0 means only the
-// maxToolLoopIterations backstop applies.
-// runToolLoop builds the LLM context FRESH from the session each call — never
-// from a caller-held snapshot, which goes stale the instant the loop does work
-// that lands in the session but not the snapshot (the b/c re-read bug).
-// corrective carries a caller's retry turn (a nudge, a "call submit_plan"
-// retry). It is STORED before the rebuild instead of appended after it, for the
-// reason addCorrective gives. Every phase uses this; runToolLoopSeeded is the
-// loop itself, taking the context explicitly.
+// The context is built FRESH from the session each call, never from a caller's
+// snapshot, which is stale the moment the loop stores anything. corrective is a
+// caller's retry turn, STORED before the rebuild (see addCorrective).
+// runToolLoopSeeded is the loop itself, taking the context explicitly.
 func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, policy phasePolicy, phase string, stream bool, failSoftCap int, corrective ...string) (toolLoopResult, error) {
 	var messages []llmMessage
 	if sess := a.getSession(sid); sess != nil {
@@ -665,24 +598,14 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection
 	return a.runToolLoopSeeded(ctx, sid, conn, messages, policy, phase, stream, failSoftCap)
 }
 
-// addCorrective puts a corrective turn on the wire AND stores it in the session.
-// Both, always.
+// addCorrective puts a corrective turn on the wire AND stores it. One rule, no
+// exceptions: what goes on the wire is what is stored.
 //
-// A wire-only turn reads as free: it is appended after everything else, so it
-// looks like a pure suffix on a warm prefix. That holds only while it is the
-// last message. runToolLoop rebuilds the context from the session on every
-// entry, and a turn the session never saw is gone from that rebuild — from the
-// MIDDLE of history, shifting every message after it. The server then re-renders
-// from that point. Measured on one plan-phase retry: the no-tool-call nudge
-// vanished at index 8 of 23 and the server re-evaluated 9998 of 15346 tokens,
-// 19s, the single most expensive event in that turn.
-//
-// One rule, no exceptions: what goes on the wire is what is stored.
-//
-// Storing has two visible consequences, both accepted. The turn stays in context
-// for the rest of the session (a few hundred bytes), and session/load replays it
-// to the client as a user message — which the phase prompts (AddUser at
-// runExecutePhase / runDocumentPhase) and the skill disclosures already do.
+// A wire-only turn looks like a free suffix, but runToolLoop rebuilds the
+// context from the session on every entry, and an unstored turn then vanishes
+// from the MIDDLE of history, shifting everything after it. Measured: a nudge
+// that vanished at index 8 of 23 re-evaluated 9998 of 15346 tokens, 19s. The
+// accepted cost is a few hundred bytes of context, replayed on session/load.
 func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []llmMessage {
 	if sess := a.getSession(sid); sess != nil {
 		sess.AddUser(text)
@@ -691,13 +614,10 @@ func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []
 	return append(messages, llmMessage{Role: "user", Content: text})
 }
 
-// startToolMeter shows "(running run_command go build ./...… 12s)" for as long
-// as a tool runs, so a slow tool reads as busy rather than frozen.
-//
-// The tool name alone doesn't answer the question the row raises: "run_command"
-// sitting at 77s says something is slow but not WHAT, and the arguments are only
-// in the transcript above, scrolled away behind whatever streamed since. So the
-// one argument that identifies the call rides along.
+// startToolMeter shows "(running run_command go build ./...… 12s)" while a
+// tool runs, so a slow tool reads as busy rather than frozen. The identifying
+// argument rides along: "run_command" at 77s says something is slow but not
+// WHAT, and the arguments have scrolled away by then.
 func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (stop func()) {
 	label := tc.Function.Name
 	// Tried in priority order: a tool can carry several of these (search_text has
@@ -706,7 +626,7 @@ func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (st
 	// break the row apart, and the cut is on runes so it can't split one in half.
 	var args map[string]any
 	if json.Unmarshal([]byte(tc.Function.Arguments), &args) == nil {
-		for _, key := range []string{"command", "task", "query", "path", "id"} {
+		for _, key := range []string{"command", "query", "path", "id"} {
 			v, _ := args[key].(string)
 			if v = strings.Join(strings.Fields(v), " "); v == "" {
 				continue
@@ -753,16 +673,12 @@ type toolLoopCaller struct {
 	stalled bool
 }
 
-// round makes one LLM call and runs the whole recovery ladder around it: the
-// stuck-<think> swap, the stream-rule re-ask, the two max_tokens cap rungs, the
-// transient-drop retries, and the context-full history fold. It returns the
-// model's text, tool calls and reasoning, plus the message slice — which the
-// ladder rewrites as it goes, since a corrective turn or a fold changes the
-// context the next attempt is made against.
-//
-// It is its own function because the ladder is a self-contained state machine
-// over a single call, with five independent retry latches; inline, it buried
-// the loop's actual shape (call → run tools → repeat) 150 lines deep.
+// round makes one LLM call with the whole recovery ladder around it: the
+// stuck-<think> swap, the stream-rule re-ask, the two max_tokens rungs, the
+// transient-drop retries and the context-full fold. It returns the messages
+// too, since a corrective turn or a fold rewrites them. Its own function
+// because the ladder is a state machine over one call with five independent
+// latches, which inline buried the loop's shape (call, run tools, repeat).
 func (c *toolLoopCaller) round(ctx context.Context, messages []llmMessage) (string, []toolCall, string, []llmMessage, error) {
 	a, sid := c.a, c.sid
 	var text, reasoning string
@@ -807,33 +723,21 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llmMessage) (stri
 		// must answer directly, and latch it for the rest of the run so it can't
 		// re-burn the budget next round. Any phase/depth — swaps the conn, no
 		// history fold needed.
-		if isStuckThinking(err) && !thinkingRetried {
+		if errors.Is(err, errStuckThinking) && !thinkingRetried {
 			thinkingRetried = true
 			c.stalled = true
-			// withThinkingDisabled appends a closed <think></think> for the
-			// model to continue instead of re-rendering the prompt, so the
-			// prefix cache survives both the retry and the return to normal at
-			// the end of this loop. No cache-lineage reset is needed: the next
-			// call extends the previous tokens like any other.
-			//
-			// This used to change chat_template_kwargs, and one real session
-			// paid for it: 71997 tokens re-evaluated at cached=0 entering the
-			// thinking-off window, then 27585 more leaving it, for a 99614-token
-			// context. Probed against the same server afterwards, the append
-			// keeps 13968 of 13978 tokens where the kwargs change kept none.
+			// withThinkingDisabled appends a closed <think></think> rather than
+			// re-rendering, so the prefix cache survives the retry and the return to
+			// normal, and no cache-lineage reset is needed. The kwargs route cost
+			// one session 99614 tokens re-evaluated across the two switches.
 			callConn = callConn.withThinkingDisabled()
 			a.logSession(sid, "RECOVER", "model stuck in <think>: continuing a closed <think></think> for the rest of this tool loop")
 			continue
 		}
-		// A stream rule fired: llmStream abandoned the generation the moment the
-		// content matched, so there is no partial to salvage. Re-ask with the
-		// rule's reminder added as a user turn — the same shape as the cap nudge
-		// below, and stored for the same reason (addCorrective): a suffix is only
-		// cache-cheap while it stays the last message.
-		//
-		// Capped, because a model that ignores the reminder twice is not going to
-		// be talked out of it on the third try; better to let the bad reply
-		// through and end up in the replan machinery than to spin here.
+		// A stream rule fired and the generation was abandoned, so there is no
+		// partial to salvage. Re-ask with the rule's reminder as a stored user turn
+		// (addCorrective). Capped: a model that ignores the reminder twice will not
+		// be talked out of it, and the replan machinery beats spinning here.
 		if sr := asStreamRule(err); sr != nil {
 			if ruleRetries >= maxStreamRuleRetries {
 				a.logSession(sid, "RECOVER", "stream rule %q fired %d times — giving up on the nudge, letting the turn fail", sr.Rule, ruleRetries+1)
@@ -855,14 +759,11 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llmMessage) (stri
 				"\n\nYour previous response was cut off at that point and DISCARDED — none of it was applied and it is not part of this conversation. Start the response over.")
 			continue
 		}
-		// Cap ladder: the generation died AT the requested max_tokens cap with
-		// content or tool calls in flight. The partial is discarded (truncated
-		// tool-call JSON can't be resumed through the chat API). Rung 1: retry
-		// with a be-concise nudge — cheapest, and it keeps the output small,
-		// which is what packs concurrent calls into the KV pool. Rung 2: the
-		// output is genuinely too big for the cap, retry once on a doubled cap
-		// (sampler-side param, so the prefix cache survives). A third hit
-		// surfaces as a normal failure into the replan machinery.
+		// Cap ladder: the generation died AT the max_tokens cap. The partial is
+		// discarded (truncated tool-call JSON cannot be resumed). Rung 1: retry with
+		// a be-concise nudge, the cheapest. Rung 2: retry once on a doubled cap, a
+		// sampler-side change, so the prefix survives. A third hit is an ordinary
+		// failure for the replan machinery.
 		if ce := asCapHit(err); ce != nil {
 			if !capNudged {
 				capNudged = true
@@ -969,11 +870,11 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 	}
 	rt.hash[key] = h
 	rt.bag[key] = bag
-	// A SUCCESSFUL run_task/run_command re-run with identical output is a
+	// A SUCCESSFUL run_command re-run with identical output is a
 	// legitimate re-verify after an edit (re-running just:build / just:test to
 	// confirm a change held), NOT spinning — don't count it as no-progress. A
 	// FAILED re-run still counts: the model IS stuck on a red build/test.
-	if repeated && !tu.Failed && (tc.Function.Name == "run_task" || tc.Function.Name == "run_command") {
+	if repeated && !tu.Failed && tc.Function.Name == "run_command" {
 		repeated = false
 	}
 	// read_file/continue_read/search_text also honour the content-dedup marker —
@@ -991,13 +892,10 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 // tool ran with nothing on screen saying which command it was, and no ACP
 // tool-call update carries it either.
 func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
-	// Most tools already put their arguments on screen themselves: the ACP card
-	// they open is titled with them ("Run: <command>", "Reading: <path> (1-150)",
-	// "Searching: <query> in <dir>", "Web Read: <url>"), the file tools add the
-	// diff, submit_plan streams as a table and respond's message is the reply.
-	// The JSON would repeat that, escaped onto one line, directly above it. It
-	// is kept only where nothing else shows the arguments: an MCP tool's card
-	// carries just its name, and these few open no card at all.
+	// Most tools already show their arguments: the card is titled with them
+	// ("Run: <command>", "Reading: <path>"), file tools add the diff, submit_plan
+	// streams a table. The JSON would repeat that, escaped onto one line. It is
+	// kept only where nothing else shows them: MCP tools and the card-less few.
 	switch name := tc.Function.Name; {
 	case strings.Contains(name, "__"),
 		name == "view_image", name == "session_insights":
@@ -1061,7 +959,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	// superset now). When the phase has any terminal, the empty-tool-calls branch
 	// below stops meaning "model finished" and starts meaning "model dropped out
 	// of tool-calling grammar" — see the nudge + fallback there.
-	hasTerminal := policy.hasTerminal()
+	hasTerminal := len(policy.terminals) > 0
 	termList := terminalList(policy)
 
 	var res toolLoopResult
@@ -1227,7 +1125,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			// Terminal tools are skipped because their payload is already
 			// rendered: submit_plan as the streamed table, respond as the turn's
 			// own text.
-			if !policy.isTerminal(tc.Function.Name) {
+			if !policy.terminals[tc.Function.Name] {
 				a.announceToolCall(ctx, sid, tc)
 			}
 
@@ -1243,7 +1141,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			// the rejection is recorded so the model sees why and corrects.
 			var tu ToolUse
 			var content any
-			denied := policy.isDenied(tc.Function.Name)
+			denied := policy.deny[tc.Function.Name]
 			switch {
 			case denied:
 				var msg string
@@ -1265,7 +1163,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if !repeats.sawAgain(tc, tu) {
 				roundStuck = false
 			}
-			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled {
+			if hasTerminal && policy.terminals[tc.Function.Name] && !terminalCalled {
 				terminalCalled = true
 				terminalName = tc.Function.Name
 				terminalMessage = tu.Output
@@ -1347,17 +1245,12 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n"+
 				"3. If you are stuck or the task is infeasible, say so and stop.")
 		// Mid-ladder recovery: warm the sampler once before the bail. Same
-		// server/model, so it routes to the same slot gate.
-		//
-		// Same server/model, and samplers don't enter the KV cache key, so the
-		// prefix cache survives — but only while the two roles differ in SAMPLERS
-		// alone. A role whose params carry chat_template_kwargs renders the prompt
-		// differently, which would make this swap a re-prefill at the worst
-		// possible moment: deep into a long execute context. res/settings.toml
-		// costs that trade; this is one of the places that pays for it.
-		// Skip when already on "thinking" (plan phase) — a no-op swap.
+		// server and model, and samplers do not enter the KV cache key, so the
+		// prefix survives, provided the two roles differ in samplers alone (a
+		// role carrying chat_template_kwargs would re-prefill here, deep into a
+		// long context; see res/settings.toml). Skipped when already "thinking".
 		if stuckRounds >= stuckEscalateRounds && !escalated && caller.conn != nil && caller.conn.Tag != "thinking" {
-			if thinkConn := a.connForSession(ctx, sid, "thinking"); thinkConn != nil {
+			if thinkConn := a.connFor("thinking"); thinkConn != nil {
 				caller.conn = thinkConn
 				escalated = true
 				if sid != "" {

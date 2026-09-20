@@ -401,12 +401,10 @@ func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, pa
 
 	select {
 	case <-ctx.Done():
-		// Tell the client to drop it. This is the half that matters for
-		// codehalter: session/request_permission and elicitation/create block on
-		// a human, so cancelling the turn while a dialog is open used to leave
-		// that dialog on screen forever, still expecting an answer we will never
-		// read. Best-effort — a client that ignores $/cancel_request is no worse
-		// off than before.
+		// Tell the client to drop it. Permission and elicitation requests block
+		// on a human, so without this a dialog open when the turn is cancelled
+		// stays on screen forever, expecting an answer nobody will read.
+		// Best-effort: a client may ignore $/cancel_request.
 		if err := a.writeMessage(jsonrpcRequest{
 			JSONRPC: "2.0",
 			Method:  "$/cancel_request",

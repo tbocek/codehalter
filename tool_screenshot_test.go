@@ -212,7 +212,7 @@ func TestBeaconRoundTrip(t *testing.T) {
 // flags still work and that the selector shift lands. Skipped where Firefox
 // isn't installed (CI, a slim container) rather than failing the suite.
 func TestScreenshotEndToEnd(t *testing.T) {
-	if _, err := firefoxPath(); err != nil {
+	if _, err := findFirefox(); err != nil {
 		t.Skipf("no firefox: %v", err)
 	}
 	if testing.Short() {

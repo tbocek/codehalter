@@ -23,38 +23,21 @@ import (
 // ---------------------------------------------------------------------------
 // Standalone CLI client.
 //
-// codehalter is an ACP agent, so it normally sits behind an editor that speaks
-// the client half of the protocol. --cli supplies that half itself: it starts
-// the same agent in-process, wires the two halves together with a pair of
-// pipes, and drives it from a terminal. Nothing about the agent is special-
-// cased for it. It goes through initialize / session/new / session/prompt and
-// answers session/request_permission, elicitation/create and terminal/* exactly
-// as Zed does, which is the point: if the CLI works, the protocol works.
+// codehalter is an ACP agent and normally sits behind an editor. --cli supplies
+// the client half itself: the same agent in-process, joined to it by a pair of
+// pipes, driven from a terminal. Nothing in the agent is special-cased for it.
+// The pipes look redundant in one process, and they are the point: every byte
+// is real ACP on a real wire, so a framing, ordering or capability bug shows up
+// here instead of hiding behind an in-process shortcut.
 //
-// The pipes look redundant when both ends are in one process, and a direct call
-// would be faster. They are what keeps this honest. Every byte the agent emits
-// is real ACP on a real wire, so a bug in framing, ordering or capability
-// gating shows up here rather than being papered over by an in-process
-// shortcut, and pointing the client at a codehalter SUBPROCESS later is a
-// change of two lines (the io.Pipe pair becomes cmd.StdinPipe/StdoutPipe).
+// Two capabilities are required: terminal (ensureTerminals aborts a session
+// without it, and the agent has no exec fallback, so the CLI implements real
+// terminals over os/exec) and elicitation.form (ask_user's free text has no
+// permission-dialog equivalent). fs is NOT advertised: it exists to serve
+// unsaved editor buffers, and the CLI has none.
 //
-// Two capabilities are not optional here:
-//
-//   - terminal, because ensureTerminals aborts any session whose client didn't
-//     advertise it. There is no in-process exec fallback in the agent, by
-//     design, so the CLI implements real terminals over os/exec.
-//   - elicitation.form, because ask_user's free-text form has no
-//     session/request_permission equivalent (buttons can't carry a typed
-//     answer) and fails with errNoFreeText without it.
-//
-// fs is deliberately NOT advertised. fs/read_text_file exists so an editor can
-// serve unsaved buffer contents; the CLI has no buffers, and the agent's own
-// fallback reads the same file off the same disk. Diffs still arrive as
-// ToolCallContent, because the agent computes those itself either way.
-//
-// Like every other way of running codehalter, this must run INSIDE the
-// devcontainer (ensureDevcontainer aborts otherwise), which also means the
-// terminals below spawn processes in the container, matching Zed exactly.
+// Like every way of running codehalter, this runs INSIDE the devcontainer, so
+// the terminals below spawn processes in the container, exactly as under Zed.
 // ---------------------------------------------------------------------------
 
 // cliUsage is printed for --help and for a flag we don't know.

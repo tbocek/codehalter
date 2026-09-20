@@ -122,19 +122,6 @@ func isModernRPCError(err error) bool {
 	return rpc.Code == mcpErrHeaderMismatch || rpc.Code == mcpErrMissingCapability || rpc.Code == mcpErrUnsupportedVersion
 }
 
-// modernMeta is the _meta block every modern-era request carries: protocol
-// version (mirrored into the MCP-Protocol-Version header on HTTP), client
-// identity, and capabilities. Capabilities stay empty on purpose — codehalter
-// doesn't service sampling/elicitation/roots, so servers must not solicit
-// MRTR input from us.
-func modernMeta() map[string]any {
-	return map[string]any{
-		"io.modelcontextprotocol/protocolVersion":    mcpModernVersion,
-		"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "codehalter", "version": "0.1.0"},
-		"io.modelcontextprotocol/clientCapabilities": map[string]any{},
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Transport abstraction
 // ---------------------------------------------------------------------------
@@ -306,7 +293,13 @@ func (c *MCPClient) send(ctx context.Context, method string, params map[string]a
 		// _meta (and, on HTTP, mirrored headers) instead of a session.
 		p := make(map[string]any, len(params)+1)
 		maps.Copy(p, params)
-		p["_meta"] = modernMeta()
+		// Capabilities stay empty on purpose: codehalter services no sampling,
+		// elicitation or roots, so a server must not solicit input from it.
+		p["_meta"] = map[string]any{
+			"io.modelcontextprotocol/protocolVersion":    mcpModernVersion,
+			"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "codehalter", "version": "0.1.0"},
+			"io.modelcontextprotocol/clientCapabilities": map[string]any{},
+		}
 		params = p
 		headers["MCP-Protocol-Version"] = mcpModernVersion
 		headers["Mcp-Method"] = method
@@ -1203,17 +1196,12 @@ func mcpConfigPath(cwd string) string { return filepath.Join(cwd, sessionDir, "m
 // the response content.
 const elicitMCPKey = "servers"
 
-// offerMCPImport asks which of the editor's own MCP servers to adopt, and
-// writes the answer into .codehalter/mcp.toml. session/new (and session/load)
-// carry the list the user configured in Zed; codehalter used to drop it on the
-// floor, because MCP here is file-driven, so those servers were simply
-// invisible with no hint that they existed.
-//
-// Every offered server is written either way: chosen ones as live entries, the
-// rest commented out. That is what makes this a one-time question. The next
-// session finds the name already in the file and stays quiet, and the user
-// enables one later by deleting a '#', which is the enable/disable convention
-// the file already documents (see MCPServerConfig).
+// offerMCPImport asks which of the editor's own MCP servers to adopt and writes
+// the answer into .codehalter/mcp.toml. MCP here is file-driven, so without
+// this the servers configured in Zed (sent on session/new) stay invisible.
+// Every offered server is written either way, chosen ones live and the rest
+// commented out, which makes it a one-time question: the next session finds
+// the name in the file, and enabling one later is deleting a '#'.
 func (a *agent) offerMCPImport(ctx context.Context, cwd, sid string) {
 	sess := a.getSession(sid)
 	if sess == nil || len(sess.mcpOffer) == 0 {

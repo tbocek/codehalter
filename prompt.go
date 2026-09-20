@@ -17,22 +17,12 @@ import (
 	"unicode/utf8"
 )
 
-// This file owns the prompt orchestrator. Prompt() is the ACP entry point.
-// The pipeline per turn is:
-//
-//   1. Plan once (read-only, decomposes into subtasks each with a verify
-//      recipe). User confirms (skipped in autopilot).
-//   2. For each subtask, run a single bounded tool-calling loop where the
-//      executor self-verifies before calling respond.
-//   3. If any subtask fails, re-plan with the failure context — up to
-//      maxReplans times. User confirms each replan (skipped in autopilot).
-//      Jaccard similarity over failure reasons escalates the replan note
-//      ("same problem N times — try a structurally different approach").
-//   4. Once every subtask in the current plan succeeds, fire the document
-//      phase exactly once.
-//
-// The phase UI helpers (sendPhase, setStatus, finalizePlan) and the
-// request-level error shaper (failPrompt, stopReasonFor) live here.
+// This file owns the prompt orchestrator; Prompt() is the ACP entry point. Per
+// turn: plan once (read-only, subtasks each with a verify recipe), run each
+// subtask as one bounded tool loop that self-verifies before `respond`, replan
+// on failure up to maxReplans times (Jaccard similarity over failure reasons
+// escalates the note when the same problem recurs), then document once. The
+// phase UI helpers and the request-level error shaper live here too.
 
 // maxReplans caps the number of planner retries per Prompt. The planner has
 // the conversation history (showing what's been tried and what failed) plus the
@@ -54,36 +44,6 @@ const maxUpserts = 20
 // "cancelled" when this sentinel reaches the top level.
 var errUserCancelled = errors.New("user cancelled")
 
-// resourcePath returns the local filesystem path an ACP resource URI points
-// at: a file:// URI collapses to its percent-decoded path with any fragment
-// (e.g. an editor line range "#L801-836") stripped, so the model can pass it
-// straight to read_file. Non-file or unparseable URIs are returned verbatim.
-func resourcePath(uri string) string {
-	if uri == "" {
-		return ""
-	}
-	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
-		return u.Path
-	}
-	return strings.TrimPrefix(uri, "file://")
-}
-
-// resourceLabel is resourcePath plus the URI fragment in parentheses when
-// present — used as a human-readable header for an attached snippet so the
-// model sees which file (and line range) the context came from.
-func resourceLabel(uri string) string {
-	if uri == "" {
-		return "attachment"
-	}
-	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
-		if u.Fragment != "" {
-			return u.Path + " (" + u.Fragment + ")"
-		}
-		return u.Path
-	}
-	return strings.TrimPrefix(uri, "file://")
-}
-
 // readLinkedResource reads the file a resource_link / embedded-resource URI
 // points at and returns it as an inline snippet plus a display label, honouring
 // a #L<start>-<end> line-range fragment. ok is false (caller falls back to just
@@ -94,7 +54,8 @@ func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
 	if cwd == "" || uri == "" {
 		return "", "", false
 	}
-	path, start, end := parseResourceURI(uri)
+	path, frag := parseResourceURI(uri)
+	start, end := parseLineRange(frag)
 	if path == "" {
 		return "", "", false
 	}
@@ -102,8 +63,10 @@ func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
 	if !filepath.IsAbs(clean) {
 		clean = filepath.Join(cwd, clean)
 	}
-	root := filepath.Clean(cwd)
-	if clean != root && !strings.HasPrefix(clean, root+string(filepath.Separator)) {
+	// realInside, not a prefix test: a symlink living in the project but
+	// pointing out of it passes a prefix test and would be inlined (see
+	// resolvePath, which refuses the same path for the file tools).
+	if !realInside(clean, cwd) {
 		return "", "", false
 	}
 	data, err := os.ReadFile(clean)
@@ -128,25 +91,19 @@ func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
 	return s, base, true
 }
 
-// parseResourceURI splits a resource URI into its local path and an optional
-// line range from the fragment (file:///x/llm.go#L810-845 → "/x/llm.go", 810,
-// 845). Non-file or unparseable URIs return an empty path.
-func parseResourceURI(uri string) (path string, start, end int) {
-	if uri == "" {
-		return "", 0, 0
-	}
-	var frag string
+// parseResourceURI splits an ACP resource URI into the local path it points at
+// (percent-decoded) and its fragment, which editors use for a line range
+// (file:///x/llm.go#L810-845 → "/x/llm.go", "L810-845"). A URI that is not a
+// file URI comes back as its own path, so the caller can still name it.
+func parseResourceURI(uri string) (path, frag string) {
 	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
-		path = u.Path
-		frag = u.Fragment
-	} else {
-		path = strings.TrimPrefix(uri, "file://")
-		if i := strings.IndexByte(path, '#'); i >= 0 {
-			frag, path = path[i+1:], path[:i]
-		}
+		return u.Path, u.Fragment
 	}
-	start, end = parseLineRange(frag)
-	return path, start, end
+	path = strings.TrimPrefix(uri, "file://")
+	if i := strings.IndexByte(path, '#'); i >= 0 {
+		path, frag = path[:i], path[i+1:]
+	}
+	return path, frag
 }
 
 // parseLineRange pulls a 1- or 2-number line range out of a URI fragment,
@@ -179,6 +136,92 @@ func parseLineRange(frag string) (int, int) {
 	default:
 		return nums[0], nums[1]
 	}
+}
+
+// promptContent turns a prompt's content blocks into the user's text and the
+// images attached to it. Attached files and selections are inlined into the
+// text, so a reference like "why do we need this?" has its referent. Image
+// bytes are content-addressed (sha256[:8]) and written under
+// .codehalter/images, so the wire's base64 never lands in session.toml and a
+// re-pasted screenshot skips the write; what stays on the message is {id, mime}.
+func promptContent(cwd string, blocks []ContentBlock) (text string, images []ImageData) {
+	for _, block := range blocks {
+		slog.Debug("prompt: content block", "type", block.Type, "uri", block.URI, "hasResource", block.Resource != nil)
+		switch block.Type {
+		case "text":
+			text += block.Text
+		case "image":
+			bytes, err := base64.StdEncoding.DecodeString(block.Data)
+			if err != nil {
+				slog.Warn("prompt: skipping image with undecodable base64", "err", err)
+				continue
+			}
+			// Content-addressed id ("img_<sha256[:8] hex>") — same bytes →
+			// same id → same file path, so a re-pasted screenshot doesn't
+			// re-write the store.
+			h := sha256.Sum256(bytes)
+			id := "img_" + hex.EncodeToString(h[:8])
+			if cwd != "" {
+				if err := writeImageFile(cwd, id, block.MimeType, bytes); err != nil {
+					slog.Warn("prompt: writing image file failed", "id", id, "err", err)
+					continue
+				}
+			}
+			images = append(images, ImageData{ID: id, MimeType: block.MimeType})
+		case "resource":
+			// Embedded resource: an editor selection / file excerpt attached via
+			// Zed's "@ include context". The snippet text lives inline; without
+			// this case it was silently dropped and the model saw only the bare
+			// prompt, so a reference like "why do we need this?" had no referent.
+			if block.Resource == nil {
+				slog.Debug("prompt: resource block with no embedded resource")
+				continue
+			}
+			label, frag := parseResourceURI(block.Resource.URI)
+			switch {
+			case label == "":
+				label = "attachment"
+			case frag != "":
+				label += " (" + frag + ")"
+			}
+			switch {
+			case block.Resource.Text != "":
+				text += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, block.Resource.Text)
+			case block.Resource.Blob != "":
+				// Binary embedded resource (rare from editors — images arrive as
+				// "image" blocks). Note it rather than inlining opaque bytes.
+				text += fmt.Sprintf("\n\n[Attached binary resource %s (%s) — not inlined]\n", label, block.Resource.MimeType)
+			default:
+				// No inline text/blob but a URI — same fallback as resource_link:
+				// read the linked file so the reference still resolves.
+				if snippet, l, ok := readLinkedResource(cwd, block.Resource.URI); ok {
+					text += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", l, snippet)
+				} else {
+					slog.Debug("prompt: empty embedded resource", "uri", block.Resource.URI)
+				}
+			}
+		case "resource_link":
+			// A pointer to a file (no inline content). Pull the linked file in —
+			// honouring a #L<start>-<end> line range — so a bare reference like
+			// "why do we need this?" resolves immediately instead of forcing the
+			// model to read_file and risk a read-loop hunting for the snippet.
+			// Falls back to noting the path when the file is outside the
+			// workspace or unreadable.
+			if snippet, label, ok := readLinkedResource(cwd, block.URI); ok {
+				text += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, snippet)
+			} else {
+				name := block.Name
+				path, _ := parseResourceURI(block.URI)
+				if name == "" {
+					name = path
+				}
+				text += fmt.Sprintf("\n\n[Referenced file: %s (%s)]\n", name, path)
+			}
+		default:
+			slog.Debug("prompt: ignoring unsupported content block", "type", block.Type)
+		}
+	}
+	return text, images
 }
 
 // isCancelled returns true for both the deliberate-cancel sentinel and a
@@ -411,25 +454,16 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// README" costs a round rather than the whole turn. Interrupting is the
 	// editor's stop button, which cancels the turn's context.
 	//
-	// Only the plain text blocks are queued. An attachment mid-turn would have
-	// to be resolved against a conversation that is still moving, and the model
-	// is about to be handed a message either way; the reply says what was left
-	// out so nothing disappears silently.
+	// Attached files and selections travel with it, inlined as text. Images do
+	// not: the queue hands the model a text message, and the reply says so
+	// rather than dropping them silently.
 	if sess := a.getSession(req.SessionId); sess != nil && sess.turnRunning() {
-		var text string
-		attachments := 0
-		for _, block := range req.Content {
-			if block.Type == "text" {
-				text += block.Text
-			} else {
-				attachments++
-			}
-		}
+		text, images := promptContent(sess.Cwd, req.Content)
 		if strings.TrimSpace(text) != "" {
 			sess.addSteer(text)
 			note := "↪ Queued for the turn in flight, it lands at its next step. Stop the turn to interrupt it instead.\n"
-			if attachments > 0 {
-				note = fmt.Sprintf("↪ Queued your message for the turn in flight (%d attachment(s) left out, send them once it finishes). Stop the turn to interrupt it instead.\n", attachments)
+			if len(images) > 0 {
+				note = fmt.Sprintf("↪ Queued your message for the turn in flight (%d image(s) left out, send them once it finishes). Stop the turn to interrupt it instead.\n", len(images))
 			}
 			a.say(ctx, req.SessionId, note)
 			return PromptResponse{StopReason: "end_turn"}, nil
@@ -504,91 +538,11 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		pendingFixes = a.prepareChecks(ctx, sess, req.SessionId)
 	}
 
-	// Extract user text and images from prompt blocks. Image bytes are
-	// content-addressed (sha256[:8]) and written under .codehalter/images so
-	// the ACP wire-side base64 doesn't get persisted in session.toml; what
-	// stays on Message.Images is just {id, mime}. Re-pasting the same
-	// screenshot collides on id and skips the write.
-	var userText string
-	var images []ImageData
-	for _, block := range req.Content {
-		slog.Debug("prompt: content block", "type", block.Type, "uri", block.URI, "hasResource", block.Resource != nil)
-		switch block.Type {
-		case "text":
-			userText += block.Text
-		case "image":
-			bytes, err := base64.StdEncoding.DecodeString(block.Data)
-			if err != nil {
-				slog.Warn("prompt: skipping image with undecodable base64", "err", err)
-				continue
-			}
-			// Content-addressed id ("img_<sha256[:8] hex>") — same bytes →
-			// same id → same file path, so a re-pasted screenshot doesn't
-			// re-write the store.
-			h := sha256.Sum256(bytes)
-			id := "img_" + hex.EncodeToString(h[:8])
-			if sess != nil {
-				if err := writeImageFile(sess.Cwd, id, block.MimeType, bytes); err != nil {
-					slog.Warn("prompt: writing image file failed", "id", id, "err", err)
-					continue
-				}
-			}
-			images = append(images, ImageData{ID: id, MimeType: block.MimeType})
-		case "resource":
-			// Embedded resource: an editor selection / file excerpt attached via
-			// Zed's "@ include context". The snippet text lives inline; without
-			// this case it was silently dropped and the model saw only the bare
-			// prompt, so a reference like "why do we need this?" had no referent.
-			if block.Resource == nil {
-				slog.Debug("prompt: resource block with no embedded resource")
-				continue
-			}
-			label := resourceLabel(block.Resource.URI)
-			switch {
-			case block.Resource.Text != "":
-				userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, block.Resource.Text)
-			case block.Resource.Blob != "":
-				// Binary embedded resource (rare from editors — images arrive as
-				// "image" blocks). Note it rather than inlining opaque bytes.
-				userText += fmt.Sprintf("\n\n[Attached binary resource %s (%s) — not inlined]\n", label, block.Resource.MimeType)
-			default:
-				// No inline text/blob but a URI — same fallback as resource_link:
-				// read the linked file so the reference still resolves.
-				cwd := ""
-				if sess != nil {
-					cwd = sess.Cwd
-				}
-				if snippet, l, ok := readLinkedResource(cwd, block.Resource.URI); ok {
-					userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", l, snippet)
-				} else {
-					slog.Debug("prompt: empty embedded resource", "uri", block.Resource.URI)
-				}
-			}
-		case "resource_link":
-			// A pointer to a file (no inline content). Pull the linked file in —
-			// honouring a #L<start>-<end> line range — so a bare reference like
-			// "why do we need this?" resolves immediately instead of forcing the
-			// model to read_file and risk a read-loop hunting for the snippet.
-			// Falls back to noting the path when the file is outside the
-			// workspace or unreadable.
-			cwd := ""
-			if sess != nil {
-				cwd = sess.Cwd
-			}
-			if snippet, label, ok := readLinkedResource(cwd, block.URI); ok {
-				userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, snippet)
-			} else {
-				name := block.Name
-				path := resourcePath(block.URI)
-				if name == "" {
-					name = path
-				}
-				userText += fmt.Sprintf("\n\n[Referenced file: %s (%s)]\n", name, path)
-			}
-		default:
-			slog.Debug("prompt: ignoring unsupported content block", "type", block.Type)
-		}
+	cwd := ""
+	if sess != nil {
+		cwd = sess.Cwd
 	}
+	userText, images := promptContent(cwd, req.Content)
 
 	// Name the thread from its opening request. Done here, BEFORE macro
 	// expansion, so a slash command titles as the command rather than as the
@@ -623,13 +577,8 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// it's a one-shot nudge — once the project has files, we want the
 	// summariser to drop it naturally rather than re-injecting it forever.
 	stored := userText
-	if isFirstMessage {
-		a.mu.Lock()
-		empty := a.emptyProject
-		a.mu.Unlock()
-		if empty {
-			stored = emptyProjectHint + "\n---\n" + userText
-		}
+	if isFirstMessage && a.projectIsEmpty() {
+		stored = emptyProjectHint + "\n---\n" + userText
 	}
 	if sess != nil {
 		if len(images) > 0 {
@@ -658,33 +607,16 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	if err := a.runTurn(ctx, req.SessionId); err != nil {
 		if isCancelled(err) {
-			// Never silent: log the cancellation and tell the user why. Covers
-			// the in-app Abort/Cancel button AND the editor aborting the turn
-			// (e.g. a client-side request-deadline timeout while the LLM was
-			// busy) — the latter used to vanish with no trace at all. Background
-			// ctx for the notice since the request ctx is already cancelled.
+			// Never silent: an aborted turn says why, whether the user stopped it
+			// or the editor did (a client-side request timeout while the LLM was
+			// busy). Background ctx: the request's own is already cancelled.
 			reason := cancelReason(err)
 			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "reason", reason, "err", err)
-			// Only the explicit in-app Abort is "you stopped it". An external cancel
-			// (the editor aborting to send your next message) is NOT a stop you made,
-			// so don't blame you — and when a plan is held, say that instead. A new
-			// prompt that superseded this turn will speak for itself.
-			sess := a.getSession(req.SessionId)
-			msg := ""
-			switch {
-			case errors.Is(err, errUserCancelled):
+			msg := "⏹ Turn cancelled — " + reason + ".\n"
+			if errors.Is(err, errUserCancelled) {
 				msg = "⏹ Stopped.\n"
-			case sess == nil || !sess.superseded():
-				// Editor aborted the request (Cancel button, or a client-side
-				// request timeout while the LLM was busy) with nothing taking
-				// over — surface it so an aborted turn never dies without a
-				// trace in the UI. A supersede stays silent: the new turn speaks
-				// for itself.
-				msg = "⏹ Turn cancelled — " + cancelReason(err) + ".\n"
 			}
-			if msg != "" {
-				a.say(context.Background(), req.SessionId, msg)
-			}
+			a.say(context.Background(), req.SessionId, msg)
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, nil)
@@ -716,10 +648,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 // per-turn stats window, run the orchestrator, and on a clean result fire the
 // epilogue — the "✅ Done" stats line and history compaction. Both entry
 // points use it — a typed user Prompt and an
-// accepted proposeFix "install fix?" card — so a fix-dispatched turn behaves
-// identically to a typed one (they used to diverge: the fix path skipped stats
-// AND compaction). The caller owns error presentation (Prompt surfaces it over
-// ACP, proposeFix logs it).
+// accepted proposeFix "install fix?" card — so a fix-dispatched turn gets the
+// same stats line and compaction as a typed one. The caller owns error
+// presentation (Prompt surfaces it over ACP, proposeFix logs it).
 func (a *agent) runTurn(ctx context.Context, sid string) error {
 	// MCP config this turn writes is applied at the BOUNDARY, never inside the
 	// turn: registering tools rewrites the `tools` array, which the chat template
@@ -898,9 +829,8 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	upserts := 0
 
 	for {
-		// Bail the instant the turn is superseded/cancelled, so the turn is released
-		// promptly (a new prompt waits on it in holdTurn) instead of starting another
-		// plan/execute phase on a turn that's already been told to stop.
+		// Bail the instant the turn is cancelled, instead of starting another
+		// plan/execute phase on a turn that has been told to stop.
 		if err := ctx.Err(); err != nil {
 			return lastResult, err
 		}
@@ -1057,7 +987,7 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	// every turn alongside the SKILL files. Stable across the session, so no
 	// mid-session cache churn.
 	if name, content := loadAgentsFile(sess.Cwd); content != "" {
-		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation.\n\n%s\n", name, content)
+		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation. They are meant to hold across sessions, so when your work makes one of them wrong (the stack, the layout, how the project is built, run or tested), update %s in the same task: a line left stale here is believed by every session after this one.\n\n%s\n", name, name, content)
 	}
 	// Project-first investigation guidance — a user-editable prompt seeded to
 

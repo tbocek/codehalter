@@ -21,11 +21,11 @@ var skillLayout string
 //go:embed res/SKILL-base.md
 var skillBase string
 
-//go:embed res/SKILL-makefile.md
-var skillMakefile string
-
 //go:embed res/SKILL-justfile.md
 var skillJustfile string
+
+// retiredSkills names skills codehalter used to seed and has since dropped.
+var retiredSkills = []string{"SKILL-makefile.md"}
 
 //go:embed res/SKILL-alpine.md
 var skillAlpine string
@@ -53,6 +53,48 @@ var osSkills = map[string]string{
 	"ubuntu": skillUbuntu,
 }
 
+// seedFile writes a default into .codehalter/ once: a file that exists, whether
+// codehalter's copy or the user's edit, is left alone, and deleting it re-seeds.
+// The publish is atomic (temp + rename), so a concurrent reader never sees a
+// half-written file and two sessions seeding the same project at once simply
+// overwrite each other with identical bytes.
+func seedFile(dir, name, body string) error {
+	if body == "" {
+		return nil
+	}
+	path := filepath.Join(dir, name)
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return nil // already seeded (or stat failed otherwise) — leave it
+	}
+	// First seed of a fresh project creates .codehalter/ itself.
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("seeding %s: %w", path, err)
+	}
+	// Atomic publish (temp + rename): a concurrent reader (loadSkills) never sees
+	// a half-written seed, and two same-cwd sessions seeding at once just overwrite
+	// with identical bytes instead of racing a partial file. The ".seed-*" temp
+	// name can't match the "SKILL-*.md" load glob.
+	f, err := os.CreateTemp(filepath.Dir(path), ".seed-*")
+	if err != nil {
+		return fmt.Errorf("seeding %s: %w", path, err)
+	}
+	tmp := f.Name()
+	if _, err := f.Write([]byte(body)); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return fmt.Errorf("seeding %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("seeding %s: %w", path, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("seeding %s: %w", path, err)
+	}
+	return nil
+}
+
 // ensureSkills seeds .codehalter/SKILL-*.md from the embeds based on what is
 // PRESENT in the project tree (justfile / Makefile / language stacks) and in
 // the container (/etc/os-release ID), NOT on what tooling is installed on PATH.
@@ -68,42 +110,6 @@ var osSkills = map[string]string{
 // otherwise keep getting concatenated into every system prompt.
 func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 	dir := filepath.Join(cwd, ".codehalter")
-	seed := func(name, body string) error {
-		if body == "" {
-			return nil
-		}
-		path := filepath.Join(dir, name)
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			return nil // already seeded (or stat failed otherwise) — leave it
-		}
-		// First seed of a fresh project creates .codehalter/ itself.
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("seeding %s: %w", path, err)
-		}
-		// Atomic publish (temp + rename): a concurrent reader (loadSkills) never sees
-		// a half-written seed, and two same-cwd sessions seeding at once just overwrite
-		// with identical bytes instead of racing a partial file. The ".seed-*" temp
-		// name can't match the "SKILL-*.md" load glob.
-		f, err := os.CreateTemp(filepath.Dir(path), ".seed-*")
-		if err != nil {
-			return fmt.Errorf("seeding %s: %w", path, err)
-		}
-		tmp := f.Name()
-		if _, err := f.Write([]byte(body)); err != nil {
-			f.Close()
-			os.Remove(tmp)
-			return fmt.Errorf("seeding %s: %w", path, err)
-		}
-		if err := f.Close(); err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("seeding %s: %w", path, err)
-		}
-		if err := os.Rename(tmp, path); err != nil {
-			os.Remove(tmp)
-			return fmt.Errorf("seeding %s: %w", path, err)
-		}
-		return nil
-	}
 	exists := func(names ...string) bool {
 		for _, n := range names {
 			if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
@@ -114,7 +120,7 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 	}
 
 	// Always-on container skill.
-	if err := seed("SKILL-base.md", skillBase); err != nil {
+	if err := seedFile(dir, "SKILL-base.md", skillBase); err != nil {
 		return err
 	}
 	// There are no per-language skills: a capable model knows its languages, and
@@ -123,19 +129,25 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 	// the one driven by the tree: it teaches the screenshot/measure loop, which
 	// only matters where there are stylesheets or HTML templates.
 	if slices.Contains(stacks, "css") {
-		if err := seed("SKILL-layout.md", skillLayout); err != nil {
+		if err := seedFile(dir, "SKILL-layout.md", skillLayout); err != nil {
 			return err
 		}
 	}
-	// Per-runner skills.
+	// The only per-runner skill. There is no Makefile one: everything it said
+	// about `make` (.PHONY, tab indentation, `:=` vs `=`, a subshell per recipe
+	// line) is knowledge any model already has, whereas `just` is young enough
+	// that its recipes-are-never-incremental rule has to be spelled out.
 	if exists("justfile", "Justfile", ".justfile") {
-		if err := seed("SKILL-justfile.md", skillJustfile); err != nil {
+		if err := seedFile(dir, "SKILL-justfile.md", skillJustfile); err != nil {
 			return err
 		}
 	}
-	if exists("Makefile", "makefile", "GNUmakefile") {
-		if err := seed("SKILL-makefile.md", skillMakefile); err != nil {
-			return err
+	// Seeding only ever adds, so a project set up before a skill was dropped
+	// keeps its copy and loadSkills keeps concatenating it into every system
+	// prompt. Sweeping the filenames is what actually retires them.
+	for _, name := range retiredSkills {
+		if err := os.Remove(filepath.Join(dir, name)); err != nil && !os.IsNotExist(err) {
+			slog.Warn("removing a retired skill", "name", name, "err", err)
 		}
 	}
 	// Migration: earlier versions seeded per-model pruned skill sets into
@@ -170,7 +182,7 @@ func ensureSkills(cwd string, stacks []string, osi osInfo) error {
 		// values come through the same load-time {{cmd:...}} expansion
 		// (sourcing /etc/os-release) as every other skill.
 		if body, ok := osSkills[osi.ID]; ok {
-			if err := seed("SKILL-"+osi.ID+".md", body); err != nil {
+			if err := seedFile(dir, "SKILL-"+osi.ID+".md", body); err != nil {
 				return err
 			}
 		}
@@ -269,17 +281,4 @@ func loadSkills(cwd string) string {
 		}
 	}
 	return b.String()
-}
-
-// listSkills returns the bare names (no "SKILL-" prefix, no ".md" suffix) of
-// every SKILL-*.md in .codehalter/, sorted. notifyCapabilities shows these so
-// the user sees which skill bodies got concatenated into the system prompt this
-// turn — implicitly revealing what was pruned (anything missing from the list).
-func listSkills(cwd string) []string {
-	files := skillFiles(cwd)
-	names := make([]string, len(files))
-	for i, n := range files {
-		names[i] = strings.TrimSuffix(strings.TrimPrefix(n, "SKILL-"), ".md")
-	}
-	return names
 }

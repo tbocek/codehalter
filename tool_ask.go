@@ -8,23 +8,59 @@ import (
 	"time"
 )
 
-// shouldAutoAnswer reports whether prompts must be auto-answered (autopilot
-// mode), and the label to show in front of the automatic answer.
-func (a *agent) shouldAutoAnswer(_ string) (bool, string) {
-	return a.isAutopilot(), "autopilot"
+// autoAnswer is what autopilot does with a question: take the offered answer
+// and say so in the transcript. It reports false in interactive mode, where
+// the caller goes on to ask.
+func (a *agent) autoAnswer(ctx context.Context, sid, answer string) bool {
+	if !a.isAutopilot() {
+		return false
+	}
+	a.say(ctx, sid, "[autopilot] "+answer+"\n\n")
+	return true
 }
 
-// askChoiceAuto asks the user in interactive mode; in autopilot it returns
-// choices[0] (or "abort" if empty).
+// askChoiceAuto asks the user to pick one of choices on an existing tool card;
+// autopilot takes the first (or "abort" when there is none).
 func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId, question string, choices []string) (string, error) {
-	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		if len(choices) == 0 {
-			return "abort", nil
-		}
-		a.say(ctx, sid, "["+reason+"] "+choices[0]+"\n\n")
+	if len(choices) == 0 && a.isAutopilot() {
+		return "abort", nil
+	}
+	if len(choices) > 0 && a.autoAnswer(ctx, sid, choices[0]) {
 		return choices[0], nil
 	}
 	return a.askChoice(ctx, sid, tcId, question, choices)
+}
+
+// askCard opens a tool card AND asks its question in one flow, returning the
+// chosen option id and the card for the caller to Complete or Fail. The
+// request carries the card's title and kind, so a client that dropped the
+// tool_call update (the session-registration race) can still show the card
+// from the request alone. Autopilot takes the first option; an error reads as
+// "abort".
+func (a *agent) askCard(ctx context.Context, sid, title, kind string, options []permissionOption) (choice, tcId string, err error) {
+	tcId = a.StartToolCall(ctx, sid, title, kind, nil)
+	if len(options) > 0 && a.autoAnswer(ctx, sid, options[0].Name) {
+		return options[0].OptionId, tcId, nil
+	}
+	choice, err = a.doPermissionRequest(ctx, permissionRequest{
+		SessionId: sid,
+		ToolCall:  permissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
+		Message:   title,
+		Options:   options,
+	})
+	if err != nil {
+		return "abort", tcId, err
+	}
+	return choice, tcId, nil
+}
+
+// askYesNoWithCard is askCard with two buttons.
+func (a *agent) askYesNoWithCard(ctx context.Context, sid, title, kind, yesLabel, noLabel string) (bool, string, error) {
+	choice, tcId, err := a.askCard(ctx, sid, title, kind, []permissionOption{
+		{OptionId: "yes", Name: yesLabel, Kind: "allow_once"},
+		{OptionId: "no", Name: noLabel, Kind: "reject_once"},
+	})
+	return choice == "yes", tcId, err
 }
 
 // askChoice shows N green choices + a red Abort and returns the chosen option.
@@ -61,13 +97,11 @@ func choiceOptions(choices []string) []permissionOption {
 // answer to give: it returns "" and the caller tells the model to decide for
 // itself rather than inventing a reply on the user's behalf.
 func (a *agent) askFormAuto(ctx context.Context, sid string, tcId, question string, options []string, allowText bool) (string, error) {
-	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		answer, note := "", "no answer available"
-		if len(options) > 0 {
-			answer, note = options[0], options[0]
-		}
-		a.say(ctx, sid, "["+reason+"] "+note+"\n\n")
-		return answer, nil
+	if len(options) > 0 && a.autoAnswer(ctx, sid, options[0]) {
+		return options[0], nil
+	}
+	if a.autoAnswer(ctx, sid, "no answer available") {
+		return "", nil
 	}
 	if !allowText || !a.clientCan("elicitation") {
 		if len(options) == 0 {
@@ -142,79 +176,6 @@ func (a *agent) askFormAuto(ctx context.Context, sid string, tcId, question stri
 		return s, nil
 	}
 	return "", errPermissionCancelled
-}
-
-// askChoiceWithCard opens a tool card AND asks for permission in a single
-// flow, returning the new tcId so the caller can Complete/Fail it. The
-// request_permission payload carries the card title/kind, so if the prior
-// tool_call SessionUpdate was dropped (the session-registration race), Zed
-// can still register the card from the permission request alone.
-//
-// Use this in the bootstrap phase (ensureDevcontainer, ensureGitignore); the
-// execute-phase tools open a card first and only sometimes ask for permission,
-// so they keep the split API.
-func (a *agent) askChoiceWithCard(ctx context.Context, sid, title, kind string, choices []string) (string, string, error) {
-	tcId := a.StartToolCall(ctx, sid, title, kind, nil)
-	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		if len(choices) == 0 {
-			return "abort", tcId, nil
-		}
-		a.say(ctx, sid, "["+reason+"] "+choices[0]+"\n\n")
-		return choices[0], tcId, nil
-	}
-	choice, err := a.doPermissionRequest(ctx, permissionRequest{
-		SessionId: sid,
-		ToolCall:  permissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
-		Message:   title,
-		Options:   choiceOptions(choices),
-	})
-	if err != nil {
-		return "abort", tcId, err
-	}
-	return choice, tcId, nil
-}
-
-// askYesNoWithCard is askChoiceWithCard's two-button cousin.
-func (a *agent) askYesNoWithCard(ctx context.Context, sid, title, kind, yesLabel, noLabel string) (bool, string, error) {
-	tcId := a.StartToolCall(ctx, sid, title, kind, nil)
-	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		a.say(ctx, sid, "["+reason+"] "+yesLabel+"\n\n")
-		return true, tcId, nil
-	}
-	choice, err := a.doPermissionRequest(ctx, permissionRequest{
-		SessionId: sid,
-		ToolCall:  permissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
-		Message:   title,
-		Options: []permissionOption{
-			{OptionId: "yes", Name: yesLabel, Kind: "allow_once"},
-			{OptionId: "no", Name: noLabel, Kind: "reject_once"},
-		},
-	})
-	if err != nil {
-		return false, tcId, err
-	}
-	return choice == "yes", tcId, nil
-}
-
-// askAcknowledgeWithCard is a single-button card — the user clicks `label` to
-// acknowledge, no decline path. Used by the Prepare phase's LLM-unreachable
-// Retry loop: codehalter can't proceed without an LLM, so the only useful
-// option is "I've edited the file, try again". In auto-answer modes the card
-// completes immediately (callers cap retries themselves). Returns the tcId so
-// the caller can Complete/Fail it after acting on the acknowledgement.
-func (a *agent) askAcknowledgeWithCard(ctx context.Context, sid, title, kind, label string) (string, error) {
-	tcId := a.StartToolCall(ctx, sid, title, kind, nil)
-	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		a.say(ctx, sid, "["+reason+"] "+label+"\n\n")
-		return tcId, nil
-	}
-	_, err := a.doPermissionRequest(ctx, permissionRequest{
-		SessionId: sid,
-		ToolCall:  permissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
-		Message:   title,
-		Options:   []permissionOption{{OptionId: "ack", Name: label, Kind: "allow_once"}},
-	})
-	return tcId, err
 }
 
 var askUserTool = Tool{Def: map[string]any{

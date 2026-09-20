@@ -128,12 +128,12 @@ func TestBuildConnSemsIdempotent(t *testing.T) {
 
 // TestCfgConcurrentReloadAndRead exercises the cfgMu guard: a foreground "prepare"
 // reassigns a.settings + rebuilds a.connSems while background goroutines resolve
-// connections through connForBackgroundLLM / connForSession (as the summariser and
+// connections through connForBackgroundLLM / connFor (as the summariser and
 // git-commit drafter do). Before cfgMu these raced the settings struct and the
 // connSems slice header; the test is meaningful under -race, where an
 // unsynchronised access on either side reports a failure.
 func TestCfgConcurrentReloadAndRead(t *testing.T) {
-	a, s := newTestAgent(t)
+	a, _ := newTestAgent(t)
 	reload := func(p int) {
 		a.cfgMu.Lock()
 		a.settings = Settings{LLM: []LLMConnection{
@@ -171,7 +171,7 @@ func TestCfgConcurrentReloadAndRead(t *testing.T) {
 					return
 				default:
 					_, _ = a.connForBackgroundLLM()
-					_ = a.connForSession(context.Background(), s.ID, "execute")
+					_ = a.connFor("execute")
 				}
 			}
 		}()
@@ -210,12 +210,12 @@ func TestFinishLengthClassification(t *testing.T) {
 		t.Helper()
 		mock := newMockLLM(t, sse)
 		defer mock.Close()
-		a, s := newTestAgent(t)
+		a, _ := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
 		a.mainSlotTokens = 85248
-		conn := a.connForSession(context.Background(), s.ID, "thinking")
+		conn := a.connFor("thinking")
 		if conn == nil {
-			t.Fatalf("connForSession returned nil")
+			t.Fatalf("connFor returned nil")
 		}
 		// sid="" disables session logging; the finish=length classification works
 		// off the locally-parsed usage tokens regardless.
@@ -224,7 +224,7 @@ func TestFinishLengthClassification(t *testing.T) {
 	}
 
 	// Reasoning truncated BELOW the cap → n_ctx ceiling (recover by folding).
-	if err := run(sseTruncated("thinking", 82393, 2854)); err == nil || !isContextFull(err) || isStuckThinking(err) {
+	if err := run(sseTruncated("thinking", 82393, 2854)); err == nil || !isContextFull(err) || errors.Is(err, errStuckThinking) {
 		t.Errorf("below-cap truncation should be a context ceiling, got: %v", err)
 	}
 	// completion_tokens omitted (0) but prompt+max_tokens overruns n_ctx (85248)
@@ -233,14 +233,14 @@ func TestFinishLengthClassification(t *testing.T) {
 		t.Errorf("no-room truncation with unreported completion should be a ceiling, got: %v", err)
 	}
 	// Reasoning-only AT the cap → stuck in <think> (recover by a thinking-off retry).
-	if err := run(sseTruncated("thinking", 1000, defaultMaxTokens)); err == nil || !isStuckThinking(err) || isContextFull(err) {
+	if err := run(sseTruncated("thinking", 1000, defaultMaxTokens)); err == nil || !errors.Is(err, errStuckThinking) || isContextFull(err) {
 		t.Errorf("reasoning-only cap should be a stuck-thinking stall, got: %v", err)
 	}
 	// Message CONTENT at the cap → a typed cap hit carrying the request's
 	// max_tokens, so the tool loop's cap ladder (be-concise nudge, then a
 	// doubled cap) can recover it.
 	err := run(sseTruncatedContent("verbose output", 1000, defaultMaxTokens))
-	if err == nil || isStuckThinking(err) || isContextFull(err) {
+	if err == nil || errors.Is(err, errStuckThinking) || isContextFull(err) {
 		t.Errorf("content at the cap should be a cap hit, got: %v", err)
 	}
 	if ce := asCapHit(err); ce == nil {
@@ -263,12 +263,12 @@ func TestReasoningArrivesUnderEitherSpelling(t *testing.T) {
 	}
 	for _, field := range []string{"reasoning_content", "reasoning"} {
 		mock := newMockLLM(t, sse(field))
-		a, s := newTestAgent(t)
+		a, _ := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-		conn := a.connForSession(context.Background(), s.ID, "thinking")
+		conn := a.connFor("thinking")
 		if conn == nil {
 			mock.Close()
-			t.Fatalf("%s: connForSession returned nil", field)
+			t.Fatalf("%s: connFor returned nil", field)
 		}
 		var streamed strings.Builder
 		_, _, reasoning, err := a.llmStream(context.Background(), "", conn,
@@ -452,12 +452,12 @@ func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
 		t.Helper()
 		mock := newMockLLM(t, sseText("here you go\n<tool_call>{\"name\":\"read_file\"}"))
 		defer mock.Close()
-		a, s := newTestAgent(t)
+		a, _ := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
 		a.streamRules = compileStreamRules(defaultStreamRules)
-		conn := a.connForSession(context.Background(), s.ID, "execute")
+		conn := a.connFor("execute")
 		if conn == nil {
-			t.Fatal("connForSession returned nil")
+			t.Fatal("connFor returned nil")
 		}
 		if arm {
 			conn = conn.forToolLoop()
@@ -506,9 +506,9 @@ func TestWarnsWhenServerIgnoresThinkingOff(t *testing.T) {
 		a, s := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m",
 			ParamsExecute: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}}}}
-		conn := a.connForSession(context.Background(), s.ID, role)
+		conn := a.connFor(role)
 		if conn == nil {
-			t.Fatalf("connForSession(%s) returned nil", role)
+			t.Fatalf("connFor(%s) returned nil", role)
 		}
 		if _, _, _, err := a.llmStream(context.Background(), s.ID, conn,
 			[]llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil); err != nil {
@@ -546,9 +546,9 @@ func TestRejectedChatTemplateKwargsNamesTheSetting(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.settings = Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "gpt-x",
 		ParamsExecute: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}}}}
-	conn := a.connForSession(context.Background(), s.ID, "execute")
+	conn := a.connFor("execute")
 	if conn == nil {
-		t.Fatal("connForSession returned nil")
+		t.Fatal("connFor returned nil")
 	}
 	_, _, _, err := a.llmStream(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil)

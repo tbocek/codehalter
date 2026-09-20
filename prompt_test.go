@@ -54,40 +54,73 @@ func TestReadLinkedResource(t *testing.T) {
 	if _, _, ok := readLinkedResource(dir, "file://"+filepath.Join(dir, "nope.go")); ok {
 		t.Errorf("expected refusal for missing file")
 	}
+	// A symlink inside the project pointing out of it passes a prefix test;
+	// the file tools refuse it, and an attachment must too.
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skip("symlinks unavailable:", err)
+	}
+	if snip, _, ok := readLinkedResource(dir, "file://"+link); ok {
+		t.Errorf("a symlink out of the project was inlined: %q", snip)
+	}
 }
 
-// TestResourcePath pins the URI → read_file path mapping used when an embedded
-// "resource" / "resource_link" block is folded into the prompt: file:// URIs
-// collapse to their percent-decoded path with the fragment stripped, non-file
-// URIs pass through verbatim.
-func TestResourcePath(t *testing.T) {
-	cases := map[string]string{
-		"file:///workspaces/codehalter/llm.go":          "/workspaces/codehalter/llm.go",
-		"file:///workspaces/codehalter/llm.go#L801-836": "/workspaces/codehalter/llm.go",
-		"file:///a%20b/c.go":                            "/a b/c.go",
-		"/plain/path.go":                                "/plain/path.go",
-		"https://example.com/x":                         "https://example.com/x",
-		"":                                              "",
+// TestParseResourceURI pins the URI → path mapping for attached resources:
+// file:// URIs collapse to their percent-decoded path with the fragment split
+// off (editors put a line range there), anything else passes through as its own
+// path so it can still be named.
+func TestParseResourceURI(t *testing.T) {
+	cases := map[string][2]string{
+		"file:///workspaces/codehalter/llm.go":          {"/workspaces/codehalter/llm.go", ""},
+		"file:///workspaces/codehalter/llm.go#L801-836": {"/workspaces/codehalter/llm.go", "L801-836"},
+		"file:///a%20b/c.go":                            {"/a b/c.go", ""},
+		"/plain/path.go":                                {"/plain/path.go", ""},
+		"https://example.com/x":                         {"https://example.com/x", ""},
+		"":                                              {"", ""},
 	}
 	for uri, want := range cases {
-		if got := resourcePath(uri); got != want {
-			t.Errorf("resourcePath(%q) = %q, want %q", uri, got, want)
+		if path, frag := parseResourceURI(uri); path != want[0] || frag != want[1] {
+			t.Errorf("parseResourceURI(%q) = %q, %q, want %q, %q", uri, path, frag, want[0], want[1])
 		}
 	}
 }
 
-// TestResourceLabel checks the human-readable header: the path plus the URI
-// fragment (an editor line range) in parentheses when present.
-func TestResourceLabel(t *testing.T) {
-	cases := map[string]string{
-		"file:///workspaces/codehalter/llm.go":          "/workspaces/codehalter/llm.go",
-		"file:///workspaces/codehalter/llm.go#L801-836": "/workspaces/codehalter/llm.go (L801-836)",
-		"": "attachment",
-	}
-	for uri, want := range cases {
-		if got := resourceLabel(uri); got != want {
-			t.Errorf("resourceLabel(%q) = %q, want %q", uri, got, want)
+// TestPromptContent pins what the model is handed for a prompt with
+// attachments: an embedded selection is inlined under a header naming the file
+// and its line range, a linked file outside the project is named rather than
+// read, and an image becomes a content-addressed reference, not bytes.
+func TestPromptContent(t *testing.T) {
+	dir := t.TempDir()
+	text, images := promptContent(dir, []ContentBlock{
+		{Type: "text", Text: "why do we need this?"},
+		{Type: "resource", Resource: &EmbeddedResource{URI: "file:///x/llm.go#L801-836", Text: "func f() {}"}},
+		{Type: "resource_link", URI: "file:///etc/passwd", Name: "passwd"},
+		{Type: "image", MimeType: "image/png", Data: "aGVsbG8="},
+	})
+	for _, want := range []string{
+		"why do we need this?",
+		"[Attached context from /x/llm.go (L801-836)]",
+		"func f() {}",
+		"[Referenced file: passwd (/etc/passwd)]",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text is missing %q; got:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "root:") {
+		t.Error("a file outside the project was inlined")
+	}
+	if len(images) != 1 || !strings.HasPrefix(images[0].ID, "img_") || images[0].MimeType != "image/png" {
+		t.Errorf("images = %+v, want one content-addressed png", images)
+	}
+	// Same bytes, same id: a re-pasted screenshot does not grow the store.
+	_, again := promptContent(dir, []ContentBlock{{Type: "image", MimeType: "image/png", Data: "aGVsbG8="}})
+	if len(again) != 1 || again[0].ID != images[0].ID {
+		t.Errorf("re-pasting the same image gave %+v, want id %s", again, images[0].ID)
 	}
 }
 

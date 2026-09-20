@@ -8,7 +8,7 @@ Repo you don't already know (first turn here, or the request names files/command
 - Already listed root this turn → reuse that listing, don't re-list.
 
 ## Tool choice
-- Declared project task (just build, npm test, make) → `run_task`, NOT `run_command`: same UI for the user.
+- Declared project task (just build, npm test, make) → run it through `run_command` (`just build`), rather than retyping what the recipe does: the recipe is where the project keeps its flags and env.
 - Editing a project file → `edit_file`/`write_file` so the change hits the diff/approval UI. Raw `sed -i` or `>` skip it.
 - No long-running service: it dies with codehalter. No daemon.
 - Probe writes into the workspace (cargo check fills target/) are fine — build artifacts, not source.

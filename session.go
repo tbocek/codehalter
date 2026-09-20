@@ -70,7 +70,7 @@ type ToolUse struct {
 	Input  string `toml:"input"`
 	Output string `toml:"output"`
 	// Failed is set by the tool handler when it observed a hard failure
-	// (e.g. run_task saw a non-zero exit). Authoritative — verify uses it
+	// (e.g. run_command saw a non-zero exit). Authoritative — verify uses it
 	// to override an LLM "success=true" verdict when codehalter itself
 	// knows the call failed. omitempty keeps older session files clean.
 	Failed bool `toml:"failed,omitempty"`
@@ -81,11 +81,9 @@ type ToolUse struct {
 	StartedAt  time.Time `toml:"started_at,omitempty"`
 	DurationMs int64     `toml:"duration_ms,omitempty"`
 	// ImageID is the content-addressed id of an image this call PRODUCED
-	// (screenshot). Replay rebuilds the multimodal parts from those STORED
-	// bytes instead of re-running the tool: unlike view_image, re-rendering is
-	// not pure — the page may have changed since — and different bytes in the
-	// middle of the prompt reprocess every message behind them. Empty for
-	// every other tool and for older sessions.
+	// (screenshot). Replay rebuilds the parts from those stored bytes rather
+	// than re-running the tool: re-rendering is not pure, and different bytes
+	// mid-prompt reprocess every message behind them. Empty otherwise.
 	ImageID string `toml:"image_id,omitempty"`
 }
 
@@ -111,85 +109,57 @@ type Session struct {
 	Cwd       string    `toml:"cwd"`
 	CreatedAt time.Time `toml:"created_at"`
 	Summary   string    `toml:"summary,omitempty"`
-	// FoldedSummary is a shorter rewrite of Summary, produced in the background
-	// after a compaction (scheduleSummaryFold) and consumed as the BASE of the
-	// next one. Empty means "no rewrite ready", which is not an error: the next
-	// compaction then concatenates onto Summary exactly as it always did.
-	//
-	// It is a separate field rather than an in-place shrink of Summary because
-	// Summary leads every request. Rewriting it between compactions would
-	// re-render the entire prompt behind it for a saving nothing reads until the
-	// next compaction, which is the one moment the prefix is already gone.
+	// FoldedSummary is a shorter rewrite of Summary, made in the background after
+	// a compaction and used as the BASE of the next one; empty means none is
+	// ready and the next compaction concatenates as before. It is a separate
+	// field because Summary leads every request: shrinking it in place would
+	// re-render the whole prompt for a saving nothing reads until the next
+	// compaction, the one moment the prefix is gone anyway.
 	FoldedSummary string `toml:"folded_summary,omitempty"`
 	// Title is the thread name shown in the client, derived from the first user
 	// message (see setSessionTitle). Persisted so a reloaded thread keeps the
 	// name it was given instead of reverting to its id.
 	Title string `toml:"title,omitempty"`
-	// SystemPrompt holds the rendered skills + project context that leads
-	// every LLM call. Set on the first user turn (see Prompt) and refreshed
-	// after each foldHistory rotation — so it survives the summariser
-	// (which otherwise compresses skills away) and reflects current
-	// .codehalter/SKILL-*.md content. Emitted by buildLLMContext as the
-	// leading user message before any Summary.
+	// SystemPrompt is the rendered skills and project context that leads every
+	// LLM call. Set on the first turn and refreshed after each compaction, so
+	// it survives the summariser and reflects the current SKILL-*.md files.
 	SystemPrompt string    `toml:"system_prompt,omitempty"`
 	Messages     []Message `toml:"messages"`
-	// Shadow holds one structured per-turn note (Goal / Constraints / Progress /
-	// Decisions / Next Steps / Critical Context, per SUMMARISE.md) for every
-	// COMPLETED turn since the last compaction — produced by the background
-	// summariser at each turn boundary. foldHistory folds the whole buffer
-	// into Summary when it rotates, so a note exists for every turn it archives.
-	// Persisted (toml) so the notes survive a restart; the live context never
-	// shows them — they exist only to feed the next compaction.
+	// Shadow holds one structured note per COMPLETED turn since the last
+	// compaction, written by the background summariser at each turn boundary.
+	// foldHistory folds the buffer into Summary, so every archived turn has a
+	// note. Persisted, never shown in the live context.
 	Shadow   []string `toml:"shadow,omitempty"`
 	filePath string
 	// mcpOffer holds the editor's own MCP server list, as it arrived on
 	// session/new. Not persisted: it's the client's configuration, re-sent on
 	// every connect, and offerMCPImport consumes it once at bootstrap.
 	mcpOffer []acpMCPServer
-	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
-	// phaseActive=true means a phase entry is showing as in_progress and
-	// must be marked completed before Prompt returns; phaseCurrent is the
-	// 0-based index into phaseNames it refers to. Guarded by phaseMu, NOT
-	// the main session mu — llmStream calls setStatus mid-stream during long
-	// calls while session writers hold sess.mu, so reusing sess.mu for phase
-	// reads would deadlock.
+	// phaseActive/phaseCurrent track the plan row: an entry showing in_progress
+	// must be completed before the turn ends. Under phaseMu, NOT mu: llmStream
+	// updates the status mid-stream while writers hold mu, which would deadlock.
 	phaseMu      sync.Mutex
 	phaseActive  bool
 	phaseCurrent int
-	// planTableShown records that the planner's subtasks already streamed into
-	// the transcript as a live table (see planTableSink), so renderPlan prints
-	// its heading alone instead of repeating the list. Consumed on read: a later
-	// mid-run revision never went through submit_plan, has nothing on screen, and
-	// must still render in full. Under phaseMu for the same reason as the fields
-	// above, it is written from the SSE read loop.
+	// planTableShown records that the subtasks already streamed as a live table
+	// (planTableSink), so renderPlan prints only its heading. Consumed on read:
+	// a later mid-run revision has nothing on screen and must render in full.
 	planTableShown bool
-	// mu serialises the Save() encoder write against concurrent mutators —
-	// AddUser/AddAssistant/etc. acquire it before touching persisted fields
-	// so a Save() landing in parallel doesn't observe a torn slice. Prompt
-	// runs synchronously per session so contention is rare; the lock mainly
-	// exists for the background summariser path (which reads Messages while
-	// the foreground turn may be appending) and for the encoder invariant
-	// inside saveLocked. The phaseMu field above
-	// intentionally has its own lock — it doesn't touch persisted state and
-	// must not block on mu.
+	// mu guards the persisted fields: mutators take it so a parallel Save()
+	// never encodes a torn slice. Contention is rare (one turn per session); it
+	// exists for the background summariser, which reads Messages while the turn
+	// appends. phaseMu is separate on purpose: it must never block on mu.
 	mu sync.Mutex
-	// turnStartIdx is the index into Messages where the current top-level turn
-	// begins (set by markTurnStart at runTurn entry, after the human/card prompt
-	// is appended). Mid-turn compaction keeps Messages[turnStartIdx:] verbatim
-	// and folds only the completed turns before it; synthetic user messages a
-	// turn injects (subtask/doc prompts, mid-session skills) all land after
-	// turnStartIdx and stay in the in-flight turn. In-memory only: a turn never
-	// spans a restart, and the next prompt re-marks it. Guarded by mu.
+	// turnStartIdx is where the current turn begins in Messages (markTurnStart).
+	// Mid-turn compaction keeps everything from here verbatim and folds only the
+	// completed turns before it; the synthetic prompts a turn injects all land
+	// after it. In-memory only: a turn never spans a restart. Guarded by mu.
 	turnStartIdx int
-	// summariseQueue is a FIFO of completed-turn snapshots waiting for the
-	// background summariser. backgroundSummarise enqueues exactly one per turn
-	// boundary; a single worker goroutine drains the queue sequentially (the LLM
-	// connection's slot semaphore would serialise concurrent runners anyway).
-	// summariseUndone counts enqueued-minus-finished; waitSummarise blocks while
-	// it exceeds 0 — compaction folds the whole Shadow buffer with no anchor held
-	// back, so every note must have landed first. summariseCond is
-	// lazy-initialised under summariseMu on first use so tests that construct
-	// Session{} directly don't need to know about it.
+	// summariseQueue holds completed-turn snapshots for the background
+	// summariser: one per turn boundary, drained by a single worker.
+	// summariseUndone counts enqueued minus finished, and waitSummarise blocks
+	// on it, because compaction folds the whole Shadow buffer and every note
+	// must have landed first. summariseCond is created on first use.
 	summariseMu      sync.Mutex
 	summariseQueue   []summariseTask
 	summariseRunning bool
@@ -211,13 +181,9 @@ type Session struct {
 	// as a user message (NOT folded into the prompt — that would bust the KV
 	// prefix cache) until the next compaction re-renders the prompt. Runtime-only.
 	promptSkills []string
-	// llmHash is hex sha256 of the concatenated global + project
-	// settings.toml contents at the time of the last successful LLM probe.
-	// ensureLLM short-circuits the probe when the current hash matches AND
-	// we still have a reachable connection — the file the user could have
-	// edited hasn't actually changed, no need to re-handshake every prompt.
-	// Reset to "" by failed probes so the next prompt re-probes from scratch.
-	// In-memory only; a restart pays one extra probe on the first turn.
+	// llmHash is the sha256 of the settings files at the last successful probe.
+	// ensureLLM skips the probe while it matches and a connection is reachable;
+	// a failed probe resets it. In-memory only.
 	llmHash string `toml:"-"`
 	// knownStacks is the set of language stacks detectStacks reports for
 	// this session's cwd, with the meta-tooling entries (bash, devcontainer)
@@ -225,25 +191,10 @@ type Session struct {
 	// uses. Populated by checkEnv on every Prompt turn so a stack appearing
 	// or disappearing mid-session takes effect on the next turn.
 	knownStacks []string `toml:"-"`
-	// knownRunners is the set of runner-config kinds detectRunnerConfigs
-	// reports for cwd (just/make/npm/cargo/go) — driven purely by config-
-	// file presence so we can flag "user has a justfile but `just` not on
-	// PATH" as a fixable problem, distinct from "no runner at all".
-	knownRunners []string `toml:"-"`
-	// capabilitiesShown gates the full capabilities banner to once per session.
-	// The first prepare (bootstrap) always emits it, so a session opens with a
-	// visible statement of what codehalter found; afterwards routine changes
-	// (a tool installed, an MCP server starting, a re-probe) surface as
-	// one-line notices / fix cards instead of re-dumping the whole setup
-	// screen mid-conversation. Not persisted — a restart re-shows it once.
+	// capabilitiesShown gates the capabilities banner to once per session.
+	// Later changes (a tool installed, an MCP server starting) surface as a
+	// one-line notice or a fix card instead of re-dumping the setup screen.
 	capabilitiesShown bool `toml:"-"`
-	// formatCardShown gates the formatter-config card to once per session. Every
-	// other fix card re-offers each turn until its condition goes away, which is
-	// right for "a tool is missing" but wrong here: a project can legitimately
-	// want no formatter config, and asking again after every single turn would
-	// be pure nagging. Declining costs one card per session; `format_config =
-	// false` in settings.toml silences it for good. Not persisted.
-	formatCardShown bool `toml:"-"`
 }
 
 // turnState is what one turn accumulates and the next must not see. runTurn
@@ -278,16 +229,11 @@ type turnState struct {
 }
 
 // cacheLineage is the previous tool-loop call, which noteCacheLineage compares
-// the next call's cache split against.
-//
-// It deliberately does NOT reset per turn: the comparison point is a property
-// of the conversation, not of the turn. Zeroing it at every turn start exempted
-// the FIRST call of every turn from the check, which is the one place
-// message-list mutations actually land (compaction, a summariser fold, a tool
-// result that replays differently than it was sent). An 11.6h session logged
-// zero CACHE lines with a 30466-token rewind sitting in it, at exactly such a
-// boundary. Not persisted: a restart re-prefills anyway, so there is no cache
-// to reason about across process boundaries.
+// the next call's cache split against. It does NOT reset per turn: zeroing it
+// exempted the first call of every turn, which is exactly where message-list
+// mutations land (a compaction, a fold, a tool result that replays
+// differently), and hid a 30466-token rewind. Not persisted: a restart
+// re-prefills anyway.
 type cacheLineage struct {
 	prompt int // its prompt_tokens
 	// render is its renderKey: the template-affecting params it was sent with.
@@ -296,12 +242,10 @@ type cacheLineage struct {
 	// for that (a role switch across differing chat_template_kwargs) or the
 	// server did it on its own.
 	render string
-	// at is when it landed. A rewind cannot say why on token counts alone, and
-	// the gap separates the two causes better than anything else in the record:
-	// on the 11.6h session that motivated this detector, every stable-rendering
-	// rewind sat behind an idle gap (2h06 and 13min), while the calls seconds
-	// apart never lost a prefix. Servers reclaim idle slots, and no line of
-	// settings.toml prevents that.
+	// at is when it landed. Token counts cannot say WHY a prefix was lost; the
+	// gap can: every stable-rendering rewind measured sat behind an idle gap
+	// (2h06, 13min), while calls seconds apart never lost one. Servers reclaim
+	// idle slots.
 	at time.Time
 }
 
@@ -319,12 +263,11 @@ type sessionRuntime struct {
 	// the exact same string (friendly to the prefix cache). Range requests
 	// bypass it and go through webBodies.
 	webResults map[string]string
-	// wroteHash is the hash of the bytes codehalter last wrote to each path, and
-	// drifted marks the paths a later read found different. Together they detect
-	// a file being rewritten by something outside this session between our write
-	// and the model's next look at it: an editor's format-on-save is the usual
-	// cause, and the symptom is an edit_file whose old_text was copied from a
-	// read that is no longer true. Not per turn: that drift routinely spans turns.
+	// wroteHash is the hash of what codehalter last wrote to each path, and
+	// drifted marks paths a later read found different: a file rewritten from
+	// outside between our write and the model's next look (an editor's
+	// format-on-save), which shows up as an edit_file whose old_text no longer
+	// matches. Not per turn: that drift routinely spans turns.
 	wroteHash map[string]string
 	drifted   map[string]bool
 	// steer holds what the user typed while a turn was running. The running
@@ -369,24 +312,18 @@ func (s *Session) addTurnTokens(prompt, completion, evaluated int) {
 	s.turnMu.Unlock()
 }
 
-// cacheRewindSlack is how far below the previous call's prompt this call's
-// cached count may sit before it counts as a rewind. Two things eat into it
-// legitimately: llama.cpp always drops the last cache chunk (measured at 4
-// tokens), and the end-of-turn summariser, when it lands on the foreground
-// connection, extends the prefix with an instruction tail that the next call
-// then trims back off. Both are in the low hundreds. Every rewind we have
-// actually diagnosed was thousands (3129, 4366, 6871, 9998 on one turn), so a
-// threshold here is generous without hiding anything worth reporting.
+// cacheRewindSlack is how far below the previous prompt the cached count may
+// sit before it counts as a rewind. Two things eat into it legitimately:
+// llama.cpp drops the last cache chunk, and a summariser instruction tail is
+// trimmed back off. Both are low hundreds; every rewind actually diagnosed
+// was thousands (3129 to 9998), so this hides nothing worth reporting.
 const cacheRewindSlack = 1024
 
 // idleEvictionSuspect is the gap after which a rewind under an unchanged
 // rendering is more likely the server reclaiming an idle slot than anything
-// codehalter did. There is no protocol signal for an eviction, so this is a
-// judgement call from the record: on the 11.6h session that motivated the
-// detector, every same-rendering rewind sat behind a gap of minutes or hours
-// (2h06 and 13min), while the hundreds of calls seconds apart never lost a
-// prefix. One minute is comfortably above the largest gap a tool loop puts
-// between two calls on its own and well below any of the observed evictions.
+// codehalter did. No protocol signal exists, so it is a judgement from the
+// record: a minute is above any gap a tool loop makes on its own and well
+// below every observed eviction.
 const idleEvictionSuspect = time.Minute
 
 // wastedCompletionFloor is how much discarded decode a turn has to accumulate
@@ -407,30 +344,17 @@ type cacheRewind struct {
 	idle          time.Duration // wall gap since the previous call (0 if unknown)
 }
 
-// noteCacheLineage folds one tool-loop call's cache split into the turn's
-// rewind detector and describes what it found. render is this call's renderKey
-// and now is its wall time; both are recorded for the next call to compare
-// against, whether or not this one rewound.
+// noteCacheLineage folds one tool-loop call's cache split into the rewind
+// detector and says what it found. A changed rendering explains a rewind (the
+// server never held that rendering); an unchanged one rules the settings out
+// and leaves the idle gap to tell a server-side eviction from something
+// rewriting the middle of the prompt.
 //
-// When the rendering changed, the rewind is explained: the two calls asked the
-// server for two different renderings of the same conversation, and a rendering
-// the server has never held has no shared prefix to hit. When it did NOT
-// change, that is just as informative: it rules the settings out and leaves the
-// idle gap to separate the remaining two causes, a server-side eviction from
-// something rewriting the middle of the prompt (a tool result that replayed
-// differently than it was sent, or a template that repositions content).
-//
-// Only the tool loop feeds this (LLMConnection.cacheLineage), because only the
-// tool loop guarantees the premise: each call's message list is the previous
-// call's plus an append, so the server should serve the whole previous prompt
-// from cache and evaluate just the new tail. The premise holds ACROSS turn
-// boundaries too (the next turn's first call is the same list plus one user
-// message), which is why the comparison point outlives the turn: the one
-// place where it genuinely does not hold drops it by hand (resetCacheLineage,
-// called by compaction).
-//
-// cached < 0 means the backend reported no cache split; then there is nothing
-// to compare and the lineage restarts at this call.
+// Only the tool loop feeds this, because only there is each call the previous
+// one plus an append. That holds across turn boundaries too, which is why the
+// comparison point outlives the turn; compaction, where it does not hold, drops
+// it by hand (resetCacheLineage). cached < 0 means the backend reported no
+// split, and the lineage restarts at this call.
 func (s *Session) noteCacheLineage(prompt, cached int, render string, now time.Time) cacheRewind {
 	s.turnMu.Lock()
 	defer s.turnMu.Unlock()
@@ -443,12 +367,9 @@ func (s *Session) noteCacheLineage(prompt, cached int, render string, now time.T
 	if prev <= 0 || cached < 0 {
 		return out
 	}
-	// A shrinking prompt is not a rewind: an extension can only grow, so if this
-	// call is SMALLER than the previous one the message list was rewritten and
-	// there was never a prefix to reuse. Reporting prev-cached there invents
-	// enormous faults out of ordinary context resets. Measured against one 11.6h
-	// session, this guard is the difference between 16 reported rewinds (10 of
-	// them a compaction dropping 115135 tokens to 5970) and the 6 that were real.
+	// A shrinking prompt is not a rewind: the message list was rewritten, so
+	// there was never a prefix to reuse. Without this guard ordinary context
+	// resets read as enormous faults (measured: 16 reported, 6 real).
 	if prompt+cacheRewindSlack < prev {
 		return out
 	}
@@ -522,11 +443,9 @@ type turnReport struct {
 	cacheRewound       int
 	cacheRewindsRender int
 	// wastedCompletion is decode the harness threw away: a <think> stall, a
-	// stream-rule abort, a cap retry. It is already inside completion, so
-	// without a name of its own it reads as productive output. It is usually the
-	// largest single cost in a bad turn: one measured stall burned 8192 tokens,
-	// which at that server's 37.7 tok/s is 3.6 min, against 57 s for the prefix
-	// loss the same event caused.
+	// stream-rule abort, a cap retry. It sits inside completion, so without its
+	// own name it reads as productive output, and it is usually the largest
+	// cost in a bad turn (one stall: 8192 tokens, 3.6 min at 37.7 tok/s).
 	wastedCompletion int
 }
 
@@ -566,34 +485,25 @@ func (s *Session) rememberWebBody(url, body string) {
 	s.rt.webBodies[url] = body
 }
 
-// webResultKey distinguishes summarized vs. raw output for the same URL so
-// an answered web_read and a raw one don't collide in the result cache.
-func webResultKey(url string, summarize bool) string {
-	if summarize {
-		return url + "\x00summary"
-	}
-	return url + "\x00raw"
-}
-
 // recallWebResult returns a previously-rendered web_read output
 // for the same URL+mode. Lets the second call on a duplicate URL skip fetch
 // and re-summarize entirely.
-func (s *Session) recallWebResult(url string, summarize bool) (string, bool) {
+func (s *Session) recallWebResult(key string) (string, bool) {
 	s.rt.mu.Lock()
 	defer s.rt.mu.Unlock()
-	r, ok := s.rt.webResults[webResultKey(url, summarize)]
+	r, ok := s.rt.webResults[key]
 	return r, ok
 }
 
 // rememberWebResult stores the final rendered output for a URL+mode so a
 // duplicate call returns the byte-identical string without redoing any work.
-func (s *Session) rememberWebResult(url string, summarize bool, out string) {
+func (s *Session) rememberWebResult(key, out string) {
 	s.rt.mu.Lock()
 	defer s.rt.mu.Unlock()
 	if s.rt.webResults == nil {
 		s.rt.webResults = make(map[string]string)
 	}
-	s.rt.webResults[webResultKey(url, summarize)] = out
+	s.rt.webResults[key] = out
 }
 
 func loadSession(cwd string, id string) (*Session, error) {
@@ -604,12 +514,10 @@ func loadSession(cwd string, id string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	// TOML refuses invalid UTF-8 outright, so one bad byte made the whole
-	// session unloadable: a string cut through a multibyte character before
-	// every cut snapped to rune boundaries (tailUTF8), or a command's raw output.
-	// Each bad byte becomes U+FFFD, which is exactly what the model already saw:
-	// Go's JSON encoder sends every invalid byte as \ufffd, so the repaired
-	// session renders to the same wire bytes and keeps its cached prefix.
+	// TOML refuses invalid UTF-8 outright, so one bad byte (a string cut through
+	// a multibyte character, or raw command output) makes the whole session
+	// unloadable. Each becomes U+FFFD, which is what the model already saw, since
+	// Go's JSON encoder sends invalid bytes that way: same wire bytes, same cache.
 	if !utf8.Valid(data) {
 		slog.Warn("session file has invalid UTF-8, replacing it with U+FFFD", "path", path)
 		var fixed bytes.Buffer
@@ -1010,16 +918,12 @@ func (s *Session) recordLastPromptTokens() {
 	}
 }
 
-// keepWindowStart returns the index the 400 recovery should keep verbatim FROM:
-// the unfinished small turn (the last assistant message, always kept) plus the
-// most recent completed small turns whose combined cost stays under
-// maxCompletedTokens. Sizing uses the server's real per-call prompt_tokens
-// (Message.PromptTokens = cumulative context at each call), so the cost of
-// keeping from K is PromptTokens[unfinished] - PromptTokens[K]. Everything older
-// — earlier small turns and all prior large turns — folds into Summary, so an
-// oversized in-flight turn is NOT kept whole (that was the 194 KB bug). When the
-// server reports no token usage (PromptTokens == 0), it conservatively keeps only
-// the unfinished small turn rather than guess.
+// keepWindowStart returns the index the 400 recovery keeps verbatim FROM: the
+// unfinished small turn, plus the most recent completed small turns that fit
+// under maxCompletedTokens. It sizes by the server's real prompt_tokens, so
+// keeping from K costs PromptTokens[unfinished] - PromptTokens[K]; everything
+// older folds into Summary, so an oversized in-flight turn is never kept
+// whole. With no usage reported it keeps only the unfinished turn.
 func (s *Session) keepWindowStart(maxCompletedTokens int) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()

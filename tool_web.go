@@ -304,12 +304,15 @@ func (b *Browser) waitReady(ctx context.Context) error {
 	return fmt.Errorf("firefox did not become ready on port %d after 15s", b.port)
 }
 
+// findFirefox locates the browser for both users of it, the web tools and
+// screenshot. FIREFOX_PATH wins; then the names it ships under across distros
+// (Debian and Ubuntu package the ESR line as firefox-esr, some tarball installs
+// land as firefox-bin); then the fixed paths a PATH-less launch still finds.
 func findFirefox() (string, error) {
 	if p := os.Getenv("FIREFOX_PATH"); p != "" {
 		return p, nil
 	}
-	candidates := []string{"firefox", "firefox-esr"}
-	for _, name := range candidates {
+	for _, name := range []string{"firefox", "firefox-esr", "firefox-bin"} {
 		if p, err := exec.LookPath(name); err == nil {
 			return p, nil
 		}
@@ -325,7 +328,7 @@ func findFirefox() (string, error) {
 			return p, nil
 		}
 	}
-	return "", fmt.Errorf("firefox not found; set FIREFOX_PATH")
+	return "", fmt.Errorf("no Firefox found (tried firefox, firefox-esr, firefox-bin on PATH and the usual install paths); set FIREFOX_PATH")
 }
 
 // ---------------------------------------------------------------------------
@@ -535,7 +538,7 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 		// summarize is another LLM round-trip). Identical bytes are also nice
 		// to the prefix cache if the second call shows up in the same prompt.
 		if sess := a.getSession(sid); sess != nil {
-			if cached, ok := sess.recallWebResult(resultKey, summarize); ok {
+			if cached, ok := sess.recallWebResult(resultKey); ok {
 				tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
 				a.CompleteToolCallTitled(ctx, sid, tcId,
 					"Web Read (cached): "+targetURL,
@@ -556,7 +559,7 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 				out := a.summarizePage(ctx, sid, question, targetURL, body)
 				a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read (cached): "+targetURL+" — "+question,
 					[]ToolCallContent{TextContent(fmt.Sprintf("answered from the cached page (%d chars, no re-fetch)", len(body)))})
-				sess.rememberWebResult(resultKey, summarize, out)
+				sess.rememberWebResult(resultKey, out)
 				return out, false
 			}
 		}
@@ -626,7 +629,7 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 		}
 	}
 	if sess := a.getSession(sid); sess != nil {
-		sess.rememberWebResult(resultKey, summarize, out)
+		sess.rememberWebResult(resultKey, out)
 	}
 	return out, false
 }

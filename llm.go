@@ -119,15 +119,11 @@ type sseChunk struct {
 		PromptMs    float64 `json:"prompt_ms"`    // server-measured prompt-eval time
 		PredictedMs float64 `json:"predicted_ms"` // server-measured generation time
 	} `json:"timings"`
-	// Error is an error delivered INSIDE the SSE stream under an HTTP 200 — how
-	// llama.cpp / llama-swap and some gateways signal a mid-stream failure
-	// (e.g. a prompt that exceeds the model's real context length) rather than a
-	// non-200 status. Such a chunk has empty Choices, so without this field it
-	// would be skipped and the whole call would surface as a baffling
-	// "(empty response)" → "plan not valid JSON" three layers up. Captured and
-	// raised as the call error so the server's own message reaches the user.
-	// Both shapes seen in the wild: nested {"error":{"message":…}} (OpenAI
-	// style) and a bare top-level {"message":…}; Message catches the latter.
+	// Error is an error delivered INSIDE the stream under HTTP 200, which is how
+	// llama.cpp / llama-swap and some gateways report a mid-stream failure (a
+	// prompt over the real context length). Such a chunk has empty Choices, so
+	// without this field it surfaced as "(empty response)" three layers up. Both
+	// shapes occur: nested {"error":{"message":…}} and a bare {"message":…}.
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -213,10 +209,6 @@ func asCapHit(err error) *capHitError {
 	return nil
 }
 
-// isStuckThinking reports whether err is the <think>-loop stall recovered by a
-// thinking-off retry (see errStuckThinking).
-func isStuckThinking(err error) bool { return errors.Is(err, errStuckThinking) }
-
 // isTransientStreamError reports whether err is a mid-flight connection drop:
 // the server or router closed the stream (EOF, reset, broken pipe) or a network
 // error hit the request — as opposed to a clean LLM error or a deliberate
@@ -260,21 +252,12 @@ func thinkingOn(reqBody map[string]any) bool {
 	return !ok || et
 }
 
-// warnChatTemplateKwargsIgnored says so, once per model, when the server sent
-// back reasoning after being asked not to reason. An OpenAI-compatible server
-// is free to accept chat_template_kwargs and drop it on the floor, and several
-// do: Ollama substitutes its own template, llama.cpp without --jinja runs a
-// fallback template that has no enable_thinking to read. The symptom is
-// invisible — correct answers, arriving at half speed, with the whole reasoning
-// budget silently spent. It took a log analysis across an 11.6h session to
-// notice it the first time, which is the argument for saying it out loud at the
-// moment it happens. Setting enable_thinking=false costs a separate rendering
-// (see paramsFor), so paying that and getting nothing back is the worst case of
-// the trade.
-//
-// Once per Server+Model, not per session or per call: it is a property of the
-// deployment, and a per-call warning on a 400-call session is worse than
-// silence.
+// warnChatTemplateKwargsIgnored says so when the server reasoned after being
+// asked not to. A server may accept chat_template_kwargs and drop it: Ollama
+// substitutes its own template, llama.cpp without --jinja has no
+// enable_thinking to read. The symptom is invisible (correct answers at half
+// speed), and the separate rendering it costs (see paramsFor) then buys
+// nothing. Once per Server+Model: it is a property of the deployment.
 func (a *agent) warnChatTemplateKwargsIgnored(ctx context.Context, sid string, conn *LLMConnection, reqBody map[string]any, reasoningBytes int) {
 	if reasoningBytes == 0 || sid == "" || thinkingOn(reqBody) {
 		return
@@ -308,35 +291,20 @@ func (a *agent) warnChatTemplateKwargsIgnored(ctx context.Context, sid string, c
 }
 
 // noThinkPrefillContent is the assistant prefix a thinking-off call continues
-// from: an already-closed reasoning block, so the model has no way to open one.
-// This is what Qwen3's own template emits for enable_thinking=false, written as
-// message content instead of asked for as a template argument.
-//
-// It is the one model-specific literal on that path. A model whose reasoning
-// delimiters are not <think>/</think> needs a different string here, where
-// chat_template_kwargs would have delegated that to the server's template. That
-// is the price of the append: the payoff is that the prefix cache survives both
-// the switch to thinking-off and the switch back, for free.
+// from: an already-closed reasoning block, which is what Qwen3's template emits
+// for enable_thinking=false. It is the one model-specific literal on this path:
+// a model with other reasoning delimiters needs a different string. That is
+// the price of keeping the prefix cache across the switch, in both directions.
 const noThinkPrefillContent = "<think>\n\n</think>\n\n"
 
-// withThinkingDisabled returns a shallow copy of the connection whose next call
-// answers directly instead of reasoning. It does NOT touch ExtraBody: llmStream
-// appends noThinkPrefillContent as a trailing assistant message and asks the
-// server to continue it, which leaves every earlier token identical and so
-// keeps the prefix cache. Slot/Server/Model are unchanged, so it routes to the
-// same connSem. The original conn is untouched.
-//
-// This is how codehalter turns reasoning off for the "execute" role: the
-// executor and the documenter both call it, so do the summariser and the
-// tool loop's <think>-stall retry. The alternative levers both cost more than
-// they save. Qwen's /no_think text switch is unreliable (237 of 388 execute
-// responses carrying it reasoned anyway, over one 11.6h session), and
-// chat_template_kwargs.enable_thinking=false gives the two roles different
-// prompt renderings, which on a one-slot server evicts the other role's KV at
-// every phase switch (see paramsFor, where that trade is costed).
-//
-// nil in, nil out: connForSession returns nil when no connection is configured
-// and callers chain this straight onto it.
+// withThinkingDisabled returns a shallow copy whose next call answers without
+// reasoning. It does not touch ExtraBody: llmStream appends
+// noThinkPrefillContent as a trailing assistant message for the server to
+// continue, so every earlier token, and the prefix cache, is untouched. Used by
+// the executor, the documenter, the summariser and the <think>-stall retry.
+// The alternatives cost more: /no_think is unreliable (237 of 388 responses
+// reasoned anyway) and enable_thinking=false re-renders (see paramsFor).
+// nil in, nil out, because callers chain it onto connFor.
 func (c *LLMConnection) withThinkingDisabled() *LLMConnection {
 	if c == nil {
 		return nil
@@ -373,65 +341,33 @@ func (c *LLMConnection) forToolLoop() *LLMConnection {
 	return &cp
 }
 
-// withToolChoiceNone returns a shallow copy of the connection that adds
-// tool_choice="none". Used by the prefix-extension summariser: the tools
-// array must still ride the request — the chat template renders it into the
-// HEAD of the prompt, so omitting it changes the rendered bytes from the very
-// first token and evicts the foreground's KV prefix instead of extending it —
-// but generation must not be steered into a tool call; the summariser has to
-// answer with the note text.
-func (c *LLMConnection) withToolChoiceNone() *LLMConnection {
-	cp := *c
-	eb := make(map[string]any, len(c.ExtraBody)+1)
-	maps.Copy(eb, c.ExtraBody)
-	eb["tool_choice"] = "none"
-	cp.ExtraBody = eb
-	return &cp
-}
-
-// withToolChoiceRequired returns a shallow copy of the connection whose next
-// call must answer with a tool call. llama.cpp turns this into a grammar over
-// the tool-call format, so no prompt token changes and the prefix cache is
-// untouched (see samplerParams).
+// withToolChoice returns a shallow copy of the connection that sends
+// tool_choice=v. llama.cpp turns it into a grammar over the reply, so no prompt
+// token changes and the prefix cache is untouched (see samplerParams).
 //
-// Used by the execute phase, where the turn ends only on a terminal tool and
-// prose is therefore always a mistake: the loop otherwise spends a round trip
-// per nudge (noCallNudges) asking for a tool call it can simply require. Not
-// used where prose is a legitimate answer (the document phase), and not on the
-// planner, whose reasoning runs before the tool call and whose own corrective
-// retry already covers the prose slip.
-func (c *LLMConnection) withToolChoiceRequired() *LLMConnection {
+//   - "required": the execute phase ends only on a terminal tool, so prose is
+//     always a slip; requiring a call beats nudging for one afterwards. Not the
+//     planner (it reasons before its call and has its own corrective retry) and
+//     not the documenter, whose one-line answer is legitimate prose.
+//   - "none": the prefix-extension summariser must still SEND the tools array,
+//     because the template renders it into the head of the prompt, but has to
+//     answer with the note rather than a call.
+func (c *LLMConnection) withToolChoice(v string) *LLMConnection {
 	cp := *c
 	eb := make(map[string]any, len(c.ExtraBody)+1)
 	maps.Copy(eb, c.ExtraBody)
-	eb["tool_choice"] = "required"
+	eb["tool_choice"] = v
 	cp.ExtraBody = eb
 	return &cp
 }
 
-// prewarm pays the prompt-processing cost of the session's prefix (system
-// prompt + summary + history + tool schemas) before the user's first message,
-// so turn one only pays for its own delta. One synchronous 1-token call built
-// through the exact renderers a real turn uses (buildLLMContext +
-// toolRegistry.defs), which makes the rendered prompt a byte-prefix of the
-// next real request; llama.cpp's longest-prefix slot routing then reuses the
-// KV cache. Callers run it in a goroutine after the first prepare (probe done,
-// skills seeded, SystemPrompt final). sid is passed to llmStream as "" so the
-// call skips session logging and turn stats. Errors are swallowed by design:
-// an unreachable server or a cache-less backend just makes this a no-op, and
-// the real turn will surface any genuine problem.
 // keepWarm refreshes the server's cached prefix for this conversation while
-// nothing else is calling it, and returns the function that stops doing so.
-//
-// The call is prewarm's: one token, the same renderers, so the request is a
-// byte-prefix of whatever comes next and the refresh costs the server a lookup
-// rather than a prefill. next() is called per tick instead of once, so the
-// refreshed prefix is the current one even if the conversation moved on.
-//
-// Two things make a prefix go cold, and this covers both: a slot reclaimed
-// while the user is away, and a slot reclaimed while a long tool runs, which is
-// the case actually measured (a 174k-token prompt re-read after a 2m59s gap
-// during a test run).
+// nothing else is calling it, and returns the function that stops it. The call
+// is prewarm's (one token, same renderers), so it is a byte-prefix of whatever
+// comes next and costs the server a lookup. next() runs per tick, so the prefix
+// refreshed is the current one. It covers both ways a prefix goes cold: a slot
+// reclaimed while the user is away, and one reclaimed during a long tool run
+// (measured: a 174k-token prompt re-read after a 2m59s gap during a test).
 func (a *agent) keepWarm(sess *Session, conn *LLMConnection, next func() []llmMessage) (stop func()) {
 	every := a.keepWarmInterval()
 	if sess == nil || conn == nil || every <= 0 {
@@ -469,11 +405,16 @@ func (a *agent) keepWarm(sess *Session, conn *LLMConnection, next func() []llmMe
 	return cancel
 }
 
+// prewarm pays the prompt-processing cost of the session's prefix before the
+// user's first message. One synchronous 1-token call through the exact
+// renderers a real turn uses, so the prompt is a byte-prefix of the next
+// request and llama.cpp reuses the KV cache. Errors are swallowed by design: an
+// unreachable server makes this a no-op and the real turn reports the problem.
 func (a *agent) prewarm(sess *Session) {
 	if sess == nil || !a.prewarmEnabled() {
 		return
 	}
-	conn := a.connForSession(context.Background(), sess.ID, "thinking")
+	conn := a.connFor("thinking")
 	if conn == nil {
 		return
 	}
@@ -583,15 +524,11 @@ type streamResult struct {
 	readStart, firstTokenAt time.Time
 }
 
-// readSSEStream consumes the chat-completions event stream, forwarding deltas to
-// the caller's sinks as they arrive and accumulating the reconstructed response.
-// It returns on [DONE], on an in-band error chunk, on a stream-rule hit, or when
-// the body ends. It never closes the body: the caller's deferred Close is what
-// tears the connection down, which is what stops the server generating after a
-// rule hit.
-//
-// genChars counts generated bytes for the live status meter, which reads it from
-// another goroutine — hence the pointer and the atomics.
+// readSSEStream consumes the event stream, forwarding deltas to the caller's
+// sinks and accumulating the response. It returns on [DONE], an in-band error,
+// a stream-rule hit, or end of body, and never closes the body: the caller's
+// deferred Close is what stops the server generating after a rule hit.
+// genChars feeds the status meter from another goroutine, hence the atomics.
 func readSSEStream(body io.Reader, conn *LLMConnection, matcher *ruleMatcher, on, think func(string), onArgs func(idx int, name, delta string), genChars *int64) *streamResult {
 	r := &streamResult{evaluatedTokens: -1, cachedTokens: -1}
 
@@ -787,22 +724,14 @@ func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r 
 }
 
 // streamOutcomeError turns how the stream ended into the one error llmStream
-// returns and the RESPONSE log records. Order matters: an explicit in-band
-// server error is checked FIRST, because gateways commonly emit an {"error":…}
-// chunk and THEN drop the socket. Checking the transport error first would
-// shadow the server's verbatim cause (e.g. "prompt exceeds n_ctx") behind a
-// generic "unexpected EOF", and send a fatal prompt down the useless
-// transient-retry path instead of surfacing the real reason.
+// returns. Order matters: the in-band server error is checked before the
+// transport error, because gateways emit {"error":…} and THEN drop the socket,
+// and "unexpected EOF" would otherwise hide "prompt exceeds n_ctx" and send a
+// fatal prompt down the transient-retry path.
 //   - firedRule: we abandoned the generation ourselves.
-//   - streamErrMsg: server sent an {"error":…} chunk under HTTP 200; surface
-//     its message verbatim (it names the real cause, e.g. prompt > n_ctx).
-//   - scanErr: stream broke mid-flight (e.g. a router model swap force-kills
-//     the connection) with no in-band error to explain it.
-//   - finish_reason="length": truncated at a length limit. If completion hit
-//     the requested max_tokens cap the model is genuinely verbose/looping and we
-//     bail (the message guides tuning); if it stopped BELOW the cap it hit the
-//     n_ctx ceiling (prompt fit but left no room), recoverable, signalled via
-//     errContextCeiling so the tool loop folds history and retries.
+//   - finish_reason="length": AT the max_tokens cap the model is verbose or
+//     looping and we bail; BELOW it, it hit the n_ctx ceiling, which is
+//     recoverable (errContextCeiling: fold history and retry).
 func (a *agent) streamOutcomeError(conn *LLMConnection, reqBody map[string]any, r *streamResult) error {
 	switch {
 	case r.firedRule != nil:
@@ -904,21 +833,13 @@ func (a *agent) logStreamResponse(sid, connLabel string, r *streamResult, err er
 	a.logSession(sid, connLabel+" RESPONSE", "%s", rb.String())
 }
 
-// llmStream is the core LLM call. Streams SSE, collects text and tool calls.
-// sid scopes the debug log: req body and raw SSE response are appended to
-// .codehalter/session_<sid>.log so a single file captures everything that
-// went over the wire for a session. Pass "" to disable logging (used by tests
-// and pre-session probes). think (nil to discard) receives reasoning_content
-// tokens — kept separate from `on` so callers can surface chain-of-thought to
-// the UI as agent_thought_chunk without polluting agent_message_chunk. onArgs
-// (nil to discard) receives each tool-call argument delta tagged with its call
-// index and tool name, which is the only way to see a structured terminal tool
-// being written: its payload never reaches `on`.
-//
-// The body it sends, the stream it reads, and the three passes over the result
-// (turn stats, outcome classification, the RESPONSE log) each live in their own
-// function above; what is left here is the round trip itself — the concurrency
-// gate, the status meter, the HTTP call and its non-200 handling.
+// llmStream is the core LLM call: the concurrency gate, the status meter, the
+// HTTP round trip and its non-200 handling. sid scopes the session log ("" for
+// probes and tests). think receives reasoning tokens separately from `on`, so
+// chain-of-thought can be shown without entering the message; onArgs receives
+// tool-call argument deltas, the only way to watch a terminal tool being
+// written. Request building, stream reading and the passes over the result
+// each live in their own function above.
 func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string), onArgs func(idx int, name, delta string)) (string, []toolCall, string, error) {
 	reqBody := buildChatRequest(conn, messages, tools)
 	body, err := json.Marshal(reqBody)
@@ -926,20 +847,12 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		return "", nil, "", fmt.Errorf("marshalling LLM request body: %w", err)
 	}
 
-	// Per-conn concurrency gate: cap in-flight calls to this conn at its
-	// configured `parallel`. The token is held only for this call (released on
-	// return), so between calls the conn frees up and a background call (the
-	// summariser) can take its turn on a pool of size 1; the wait
-	// shows as "(queued…)". Find the conn's semaphore index by matching
-	// server+model; -1 (test mocks / probes not in settings.LLM) means "no gate,
-	// dispatch directly".
-	// Find the conn's semaphore index and bind its channel under cfgMu (RLock): a
-	// foreground prepare phase can reassign a.settings.LLM / a.connSems while a
-	// background LLM call sits in this gate. Read the pair, capture the channel into
-	// a local, release the lock, THEN do the blocking acquire on that local. Binding
-	// once also survives a rebuild: probeAllLLMs swaps in a fresh a.connSems per
-	// prompt, so re-reading a.connSems[slot] at release time could hit a NEW empty
-	// channel and block forever (the permit lives in the OLD one).
+	// Per-conn concurrency gate: at most `parallel` calls in flight, held for
+	// this call only, so a background call gets its turn on a pool of one (the
+	// wait shows as "(queued…)"). -1 means no gate (mocks, probes). The channel is
+	// bound to a local under cfgMu and released on that local: a prepare phase can
+	// swap a.connSems meanwhile, and re-reading it at release would block forever
+	// on a new empty channel while the permit sits in the old one.
 	a.cfgMu.RLock()
 	slot := -1
 	for i := range a.settings.LLM {
@@ -996,16 +909,10 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent…)", slotLabel, upLabel))
 	defer a.setStatus(ctx, sid, "")
 
-	// Until the first generated byte the row shows "(sent… Ns)", so a busy or
-	// queuing server reads as "(sent… 25s)" rather than a frozen "(sent…)"; once
-	// bytes arrive it switches to the live "↑<body bytes> ↓<gen tokens>" estimate.
-	// The two halves are different quantities, hence the explicit "tok" suffix.
-	// genChars is written by readSSEStream while this reads it, hence atomic. No
-	// warning is ever emitted from here: while the call is alive the climbing
-	// counter is the signal, and if it dies llmStream surfaces the transport
-	// error directly.
-	//
-	// Registered after the status-clear defer above so LIFO joins the meter first.
+	// Until the first generated byte the row shows "(sent… Ns)", so a busy
+	// server does not read as frozen; then the live "↑bytes ↓tok" estimate.
+	// genChars is written by readSSEStream while this reads it, hence atomic.
+	// Registered after the status-clear defer so LIFO joins the meter first.
 	var genChars int64
 	meterStart := time.Now()
 	defer a.startStatusMeter(ctx, sid, func() string {
@@ -1216,15 +1123,11 @@ func probeGetJSON(ctx context.Context, conn *LLMConnection, path, who string, v 
 	return true
 }
 
-// probeViaModels asks /v1/models for the configured model. Always confirms
-// reachability + model presence; image_support / context_size only land
-// when the response carries llama-swap-style `status.args` (--mmproj /
-// --ctx-size). OpenAI/Ollama/vLLM/LiteLLM all 200 here but return the bare
-// OpenAI shape, so the caller's /props enrichment + settings.toml fallback
-// fills the gap. ok=false only on network / non-200 — a bare response still
-// returns ok=true so the caller knows the server is up. Records every
-// enumerated id in AvailableModels so renderLLMStatus can show the real names
-// when the configured model isn't found.
+// probeViaModels asks /v1/models for the configured model: reachability and
+// presence always, image support and context size only from llama-swap's
+// `status.args`. Other backends return the bare OpenAI shape, which is still
+// ok=true (the server is up); /props and settings.toml fill the gap. Every id
+// lands in AvailableModels so a missing model can be reported by real names.
 func probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
 	var models struct {
 		Data []struct {
@@ -1307,11 +1210,11 @@ func probeViaProps(ctx context.Context, conn *LLMConnection, path string) (probe
 	return r, true
 }
 
-// connForSession resolves the connection for the role. Every session runs on
+// connFor resolves the connection for the role. Every session runs on
 // LLM[0], whose KV cache owns the conversation prefix. Concurrency is enforced
 // by per-conn semaphores in llmStream; MainLLM returns a value copy, safe to use
 // after the lock is released.
-func (a *agent) connForSession(_ context.Context, _ string, role string) *LLMConnection {
+func (a *agent) connFor(role string) *LLMConnection {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
 	return a.settings.MainLLM(role)
@@ -1324,32 +1227,19 @@ func (a *agent) connForSession(_ context.Context, _ string, role string) *LLMCon
 // timeout, not enough to spend a session degrading every note.
 const summaryMaxStrikes = 2
 
-// summaryCooldown is how long a struck-out summariser stays out of rotation
-// before it gets another call. It used to be the rest of the run, which retired
-// a summariser for 16 hours after two timeouts while the server was up the
-// whole time. A call that fails again renews the cooldown, so a server that
+// summaryCooldown is how long a struck-out summariser stays out of rotation.
+// Bounded, because "the rest of the run" retired a healthy server for 16 hours
+// after two timeouts. A call that fails again renews it, so a server that
 // really is down costs one note per cooldown.
 const summaryCooldown = 10 * time.Minute
 
-// connForBackgroundLLM returns the connection to host background work (the
-// per-turn summariser). It walks the entries marked `purpose = "summary"` and
-// returns the first with free semaphore capacity, so marking several spreads
-// load across them instead of stacking on one. If all are busy (or none are
-// marked) it falls back to LLM[0], labelled llm[1] when that conn has >=2 slots
-// so the meter shows the work routed off the foreground turn. The capacity peek
-// is racy by design — llmStream's semaphore just queues if the slot was taken
-// meanwhile; falling back rather than queueing keeps a busy summariser conn from
-// stalling the turn's note behind somebody else's call.
-//
-// Index 0 is skipped in the walk because the fallback below already lands there
-// with the right display slot, so `purpose = "summary"` on LLM[0] means the same
-// thing as not marking anything.
-//
-// The second return reports that fallback: true means the call will land on
-// the server whose KV cache holds the foreground conversation. Callers use it
-// to switch to prefix-extension prompts (conversation context + instruction
-// tail) so the call reuses that cache instead of evicting it — what makes a
-// single-slot (parallel = 1) server viable.
+// connForBackgroundLLM returns the connection for background work: the first
+// `purpose = "summary"` entry with free capacity, else LLM[0] (labelled llm[1]
+// when it has two or more slots, so the meter shows the work off the foreground
+// turn). The capacity peek is racy by design: falling back beats queueing
+// behind somebody else's call. The second return reports that fallback, which
+// is the caller's cue for a prefix-extension prompt that reuses the foreground
+// cache instead of evicting it, and is what makes a single slot viable.
 func (a *agent) connForBackgroundLLM() (*LLMConnection, bool) {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()

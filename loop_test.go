@@ -319,7 +319,6 @@ func TestToolMeterShowsTheArgument(t *testing.T) {
 		name, args, want string
 	}{
 		{"run_command", `{"command":"go build ./..."}`, "run_command go build ./..."},
-		{"run_task", `{"task":"just:build"}`, "run_task just:build"},
 		{"search_text", `{"query":"LoadAll","path":"src"}`, "search_text LoadAll"}, // query wins over path
 		{"read_file", `{"path":"loop.go","limit":40}`, "read_file loop.go"},
 		{"web_search", `{"query":"line one\nline two"}`, "web_search line one line two"}, // no row-breaking newline
@@ -929,9 +928,9 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 			ParamsThinking: map[string]any{"temperature": 1.0},
 		}},
 	}
-	conn := a.connForSession(context.Background(), s.ID, "execute")
+	conn := a.connFor("execute")
 	if conn == nil {
-		t.Fatalf("connForSession(execute) returned nil")
+		t.Fatalf("connFor(execute) returned nil")
 	}
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
@@ -981,17 +980,17 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 }
 
 // TestRepetitionLadderExemptsSuccessfulRunTask pins the build/test re-verify
-// carve-out: re-running run_task with identical SUCCESSFUL output (e.g. just:build
+// carve-out: re-running run_command with identical SUCCESSFUL output (e.g. `just build`
 // green both times after an edit) is NOT counted as no-progress, so the loop never
 // nudges or bails on it — unlike the generic repeating tool in the ladder test.
-func TestRepetitionLadderExemptsSuccessfulRunTask(t *testing.T) {
+func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 	var testTools []Tool
 	var execs int
 	testTools = append(testTools, Tool{
 		Def: map[string]any{
 			"type": "function",
 			"function": map[string]any{
-				"name": "run_task", "description": "probe",
+				"name": "run_command", "description": "probe",
 				"parameters": map[string]any{"type": "object"},
 			},
 		},
@@ -1001,10 +1000,10 @@ func TestRepetitionLadderExemptsSuccessfulRunTask(t *testing.T) {
 		},
 	})
 
-	// Six identical successful run_task calls, then a plain-text exit.
+	// Six identical successful run_command calls, then a plain-text exit.
 	var resp []string
 	for i := 0; i < 6; i++ {
-		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "run_task", `{"task":"just:build"}`))
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "run_command", `{"command":"just build"}`))
 	}
 	resp = append(resp, sseText("all green, done"))
 	mock := newMockLLM(t, resp...)
@@ -1013,9 +1012,9 @@ func TestRepetitionLadderExemptsSuccessfulRunTask(t *testing.T) {
 	a, s := newTestAgent(t)
 	withTools(a, testTools...)
 	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
-	conn := a.connForSession(context.Background(), s.ID, "execute")
+	conn := a.connFor("execute")
 	if conn == nil {
-		t.Fatalf("connForSession(execute) returned nil")
+		t.Fatalf("connFor(execute) returned nil")
 	}
 
 	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
@@ -1023,14 +1022,14 @@ func TestRepetitionLadderExemptsSuccessfulRunTask(t *testing.T) {
 		t.Fatalf("runToolLoop: %v", err)
 	}
 	if execs != 6 {
-		t.Errorf("tool execs: got %d, want 6 (no early bail on successful run_task re-runs)", execs)
+		t.Errorf("tool execs: got %d, want 6 (no early bail on successful run_command re-runs)", execs)
 	}
 	for i := 0; i < mock.callCount(); i++ {
 		msgs, _ := mock.request(i)["messages"].([]any)
 		for _, m := range msgs {
 			mm, _ := m.(map[string]any)
 			if c, _ := mm["content"].(string); mm["role"] == "user" && strings.Contains(c, "makes no progress") {
-				t.Errorf("request %d carried a repeat-corrective for a successful run_task re-run", i)
+				t.Errorf("request %d carried a repeat-corrective for a successful run_command re-run", i)
 			}
 		}
 	}
@@ -1083,9 +1082,9 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		}},
 	}
 
-	conn := a.connForSession(context.Background(), s.ID, "execute")
+	conn := a.connFor("execute")
 	if conn == nil {
-		t.Fatalf("connForSession(execute) returned nil")
+		t.Fatalf("connFor(execute) returned nil")
 	}
 	_, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)

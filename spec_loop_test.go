@@ -91,7 +91,7 @@ func TestSpecRoundPrompt(t *testing.T) {
 	}
 	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs libadwaita"}
 
-	prompt, head := a.specRoundPrompt(s.ID, cfg, idx, "F0.1", specModeItem, map[string]string{"§01-files#1-layout": "tests/x.rs"}, "just test", "no test names f0_1", "", "", "")
+	prompt, head := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.1", Reason: "no test names f0_1"}, map[string]string{"§01-files#1-layout": "tests/x.rs"}, "just test")
 	for _, want := range []string{"**F0.1**", "`f0_1`", "just test", "use gtk4-rs libadwaita", "rust/", "S1 Switch.",
 		"did not count", "no test names f0_1", "spec/00-principles.md", "1 of"} {
 		if !strings.Contains(prompt, want) {
@@ -105,12 +105,12 @@ func TestSpecRoundPrompt(t *testing.T) {
 		t.Errorf("heading = %q", head)
 	}
 
-	setup, _ := a.specRoundPrompt(s.ID, cfg, idx, specSetupID, specModeSetup, nil, "", "", "", "", "")
+	setup, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: specSetupID, Mode: specModeSetup}, nil, "")
 	if strings.Contains(setup, "{{") || !strings.Contains(setup, "use gtk4-rs libadwaita") || !strings.Contains(setup, "`rust/`") {
 		t.Errorf("setup prompt:\n%s", setup)
 	}
 
-	answered, _ := a.specRoundPrompt(s.ID, cfg, idx, "F0.2", specModeItem, nil, "just test", "", "keep or drop?", "keep it", "")
+	answered, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Question: "keep or drop?", Answer: "keep it"}, nil, "just test")
 	if !strings.Contains(answered, "keep or drop?") || !strings.Contains(answered, "keep it") {
 		t.Errorf("answered prompt lacks the question and answer:\n%s", answered)
 	}

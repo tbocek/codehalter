@@ -14,23 +14,17 @@ import (
 // ---------------------------------------------------------------------------
 // Inline TUI renderer for the standalone CLI client.
 //
-// The screen is split in two, and the split is the whole design. Everything
-// above the cursor is the TRANSCRIPT: rows that have been printed and are never
-// touched again, exactly like ordinary program output. The bottom liveRows rows
-// are the LIVE REGION: the partial tail of the streaming reply, the current
-// plan, in-flight tool cards and the status line, all reprinted from scratch on
-// every render.
+// The screen is split in two, and the split is the design. Above the cursor is
+// the TRANSCRIPT: rows printed once and never touched again. The bottom
+// liveRows rows are the LIVE REGION (the streaming tail, the plan, in-flight
+// cards, the status line), reprinted from scratch on every render.
 //
-// "Inline" means no alternate screen and no full-screen repaint. Scrollback
-// still holds the whole conversation, Ctrl+Shift+C copies what you'd expect,
-// and the shell prompt comes back below the last line instead of the screen
-// being wiped. It also means the only escape sequences we need are "up N rows"
-// and "clear to end of screen"; with tty false we emit neither, so piping
-// stdout to a file yields a plain readable log rather than a pile of escapes.
-//
-// Every write goes through emitLine (transcript) or drawLive (live region), and
-// both erase the live region first. liveRows is therefore the single piece of
-// cursor state: get it wrong and the display eats real transcript rows.
+// "Inline" means no alternate screen: scrollback keeps the conversation and the
+// shell prompt returns below the last line. The only escapes needed are "up N
+// rows" and "clear to end of screen", and with tty false none are emitted, so
+// piping stdout yields a plain log. Every write goes through emitLine or
+// drawLive, which erase the live region first, so liveRows is the single piece
+// of cursor state: get it wrong and the display eats transcript rows.
 // ---------------------------------------------------------------------------
 
 const (

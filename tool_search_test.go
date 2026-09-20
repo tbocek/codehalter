@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -161,5 +162,45 @@ func TestSearchTextDedupOnRepeat(t *testing.T) {
 	scoped.Function.Arguments = `{"query":"needle","path":"."}`
 	if out, _ := a.executeTool(ctx, s.ID, scoped); strings.Contains(out, readUnchangedMarker) {
 		t.Errorf("a search with a different path must not be flagged as a repeat:\n%s", out)
+	}
+}
+
+// TestSearchContextAndFilePath pins the two things the partial-read note sends
+// the model here for: `context` widens the lines shown around a hit (capped),
+// and `path` may name a single file, so "just the part of this big file I
+// need" is one call.
+func TestSearchContextAndFilePath(t *testing.T) {
+	a, s := newTestAgent(t)
+	var body strings.Builder
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&body, "line %d\n", i)
+	}
+	if err := os.WriteFile(filepath.Join(s.Cwd, "big.txt"), []byte(body.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Cwd, "other.txt"), []byte("line 20\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	search := func(args string) string {
+		out, _ := searchTextTool.Execute(context.Background(), a, s.ID, args)
+		return out
+	}
+
+	narrow := search(`{"query":"line 20","path":"big.txt"}`)
+	if strings.Contains(narrow, "other.txt") {
+		t.Errorf("path=big.txt must search that file only:\n%s", narrow)
+	}
+	if !strings.Contains(narrow, "line 18") || strings.Contains(narrow, "line 15") {
+		t.Errorf("default context should be %d lines a side:\n%s", searchContextLines, narrow)
+	}
+
+	wide := search(`{"query":"line 20","path":"big.txt","context":5}`)
+	if !strings.Contains(wide, "line 15") || !strings.Contains(wide, "line 25") || strings.Contains(wide, "line 14\n") {
+		t.Errorf("context=5 should show lines 15-25:\n%s", wide)
+	}
+
+	capped := search(`{"query":"line 20","path":"big.txt","context":500}`)
+	if strings.Contains(capped, "line 9\n") || !strings.Contains(capped, "line 10") {
+		t.Errorf("context is capped at %d:\n%s", maxSearchContext, capped)
 	}
 }

@@ -12,27 +12,17 @@ import (
 )
 
 // Stream rules abort a generation the moment its *content* matches a pattern
-// that means the reply has gone off the rails, inject a reminder, and re-ask.
+// that means the reply has gone off the rails, then re-ask with a reminder. A
+// small model emitting a literal `<tool_call>` block has committed to a dead
+// turn, so every further token is waste; aborting costs only what was produced,
+// and the retry appends to the same prefix, so the KV cache is untouched.
 //
-// The point is to catch the failure while it is being written rather than after
-// the whole message lands: a small model that starts emitting a literal
-// `<tool_call>` block has already committed to a dead turn, and every token
-// after the first one is wasted generation. Aborting mid-stream costs only the
-// tokens produced up to the match; the retry re-uses the same prefix (the
-// reminder is appended as a suffix), so the KV cache is untouched.
-//
-// This is deliberately narrow. Rules match the assistant's *content* only, not
-// its reasoning stream — a model is allowed to think "I could write
-// <tool_call>" as long as it doesn't do it — and not tool-call arguments, which
-// are structured output, not prose.
-//
-// The default set below is intentionally tiny: two patterns, both unambiguous
-// chat-template control tokens leaking into visible text. That is a mechanical
-// failure with no legitimate reading. Rules for *behavioural* drift ("stop
-// claiming you ran the tests") are far more useful but must be written from
-// failures actually observed in `.codehalter/session_*.log`, not guessed at —
-// a rule that misfires burns two extra round-trips on every turn. Add those per
-// project in `.codehalter/rules.toml`.
+// Deliberately narrow: content only, not reasoning (a model may think about
+// `<tool_call>`) and not tool arguments. The default set is two patterns, both
+// chat-template control tokens leaking into visible text. Rules for
+// behavioural drift belong in `.codehalter/rules.toml`, written from failures
+// seen in the session log, never guessed: a misfiring rule costs two round
+// trips on every turn.
 type streamRule struct {
 	// Name identifies the rule in logs and in the "rule fired" notice.
 	Name string `toml:"name"`

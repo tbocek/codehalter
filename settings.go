@@ -12,11 +12,9 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// defaultMaxTokens is the max_tokens injected into an LLM request when the
-// user's params block doesn't set one. Bounds a runaway completion that loops
-// inside a single LLM round-trip — the per-tool-loop iteration cap can't help
-// there. 8192 is generous headroom (execute ~2-4k, plan/verify <1k); override
-// per-role with `max_tokens` inside params_thinking / params_execute.
+// defaultMaxTokens is the max_tokens sent when the params set none. It bounds
+// a completion that loops inside one round trip, which the tool-loop iteration
+// cap cannot. Override per role with `max_tokens`.
 const defaultMaxTokens = 8192
 
 // purposeSummary is the [[llm]] `purpose` value that hosts the per-turn
@@ -24,29 +22,22 @@ const defaultMaxTokens = 8192
 const purposeSummary = "summary"
 
 type Settings struct {
-	// LLM is the ordered list of OpenAI-compatible endpoints codehalter can
-	// dispatch to. LLM[0] is the "main" connection: the foreground session
-	// always runs on it, its KV cache holds the parent's history, and
-	// background work (summariser) avoids it to keep that cache warm. LLM[1+]
-	// are extras: one may host the summariser (purpose = "summary"). Each entry's
-	// Parallel field caps how many concurrent requests it accepts.
+	// LLM is the ordered list of endpoints. LLM[0] is the main connection: the
+	// foreground session runs on it and its KV cache holds the conversation, so
+	// background work avoids it. LLM[1+] are extras; one may host the summariser
+	// (purpose = "summary").
 	LLM []LLMConnection `toml:"llm"`
 
-	// Prewarm fires one background 1-token LLM call at session open so the
-	// server tokenizes and caches the prompt prefix (system prompt + tools)
-	// before the user's first message; turn one then only pays for its own
-	// delta. Only useful on backends with prefix caching (llama.cpp); elsewhere
-	// it wastes one tiny request. nil means on.
+	// Prewarm fires one 1-token call at session open, so the server caches the
+	// prompt prefix before the first message. Only useful with prefix caching
+	// (llama.cpp); elsewhere it wastes one tiny request. nil means on.
 	Prewarm *bool `toml:"prewarm,omitempty"`
 
-	// KeepWarm is how long a conversation's prefix may sit unused in the
-	// server's KV cache before codehalter refreshes it with the same 1-token
-	// call Prewarm uses. A local server reclaims or unloads an idle slot, and
-	// the next turn then re-reads the whole prompt: one measured session lost a
-	// 174k-token prefix after a 2m59s gap while a test ran, roughly six minutes
-	// of prompt processing at that server's rate. Empty means the default
-	// (keepWarmEvery); "off" or "0" disables it, which is what a metered or
-	// hosted endpoint wants since it caches on its own and bills per request.
+	// KeepWarm is how long a prefix may sit unused before codehalter refreshes
+	// it with Prewarm's 1-token call, since a local server reclaims an idle slot
+	// and the next turn then re-reads the whole prompt (measured: 174k tokens
+	// after a 2m59s gap). Empty means keepWarmEvery; "off" disables it, which is
+	// what a hosted endpoint wants: it caches on its own and bills per request.
 	KeepWarm string `toml:"keep_warm,omitempty"`
 
 	// FormatConfig controls the setup card that offers to pin a formatter config
@@ -55,11 +46,9 @@ type Settings struct {
 	// the card stops being offered at the start of every session.
 	FormatConfig *bool `toml:"format_config,omitempty"`
 
-	// UpdateCheck controls the once-a-day "a newer release exists" check
-	// against the GitHub releases API (see version.go). nil means on. Set it to
-	// false for a machine that should never reach github.com on its own, or for
-	// an installation someone else keeps up to date; CODEHALTER_UPDATE=skip
-	// does the same for a single run.
+	// UpdateCheck controls the once-a-day release check against GitHub (see
+	// version.go). nil means on; false is for a machine that must not reach
+	// github.com on its own. CODEHALTER_UPDATE=skip does the same for one run.
 	UpdateCheck *bool `toml:"update_check,omitempty"`
 
 	path string
@@ -67,21 +56,13 @@ type Settings struct {
 
 // LLMConnection describes one llama.cpp/OpenAI-compatible endpoint.
 //
-// Sampler params can be split by role: `params_thinking` for plan/title/
-// history (higher temperature, exploratory) and `params_execute` for
-// execute/verify/document/summarize (lower temperature, follow-instruction).
-// `params` is the legacy single-set field — still honoured as the fallback
-// when the role-specific variant is empty. Each role-specific set hits the
-// SAME prefix cache on the server because sampler params never enter the KV
-// cache key — only prompt tokens do.
+// Sampler params split by role: `params_thinking` for planning, `params_execute`
+// for execute/document/summarise, with `params` as the fallback. Both roles hit
+// the same prefix cache, because samplers never enter the KV cache key.
 //
-// Parallel is the per-conn concurrent-call cap. Each in-flight llmStream
-// acquires one of N tokens from this conn's semaphore; excess calls block
-// until a token is released. Held *per LLM call*: between calls (during local
-// tool dispatch) the conn is free for another caller. Optional for llama.cpp:
-// probeAllLLMs auto-fills it from /props total_slots (-np) when left at 0. Set
-// it explicitly only for backends that don't report slots (vLLM, OpenAI, …) or
-// to cap concurrency below the server's capacity; 0 with no detection means 1.
+// Parallel caps concurrent calls, held per LLM call, so the conn is free during
+// tool dispatch. probeAllLLMs fills it from llama.cpp's total_slots when left
+// at 0; set it for backends that report no slots. 0 undetected means 1.
 type LLMConnection struct {
 	// Server is the base URL of the OpenAI-compatible server — host root plus
 	// any reverse-proxy path prefix, e.g. "http://localhost:8080" or
@@ -92,16 +73,10 @@ type LLMConnection struct {
 	APIKey string `toml:"api_key,omitempty"`
 	Model  string `toml:"model"`
 	Tag    string `toml:"tag,omitempty"`
-	// Purpose designates which non-foreground work routes to this entry.
-	// "summary" sends the per-turn summariser here instead of LLM[0].
-	// Empty means no designated background work.
-	//
-	// Named explicitly rather than inferred as "the first free entry after
-	// LLM[0]": with two extras the inferred rule sends the summariser to
-	// whichever happens to be idle, a small fast model on one turn, a slow
-	// reasoning model the next. Naming the entry makes the routing stable and
-	// lets the summariser live on a machine picked for it. Marking LLM[0] is allowed and simply means "summarise on the main
-	// conn", which is also what no marking at all yields.
+	// Purpose names the background work this entry hosts: "summary" sends the
+	// per-turn summariser here instead of LLM[0]. Named rather than inferred as
+	// "the first free extra", which with two extras would route the summariser
+	// to whichever happened to be idle. On LLM[0] it means the same as unset.
 	Purpose string `toml:"purpose,omitempty"`
 
 	Parallel       *int           `toml:"parallel,omitempty"`
@@ -123,55 +98,39 @@ type LLMConnection struct {
 
 	// ExtraBody is the runtime alias for the role-resolved Params used by
 	// llmStream when assembling the OpenAI request body. Populated by
-	// connForSession so callers don't have to know which of Params /
+	// connFor so callers don't have to know which of Params /
 	// ParamsThinking / ParamsExecute applies.
 	ExtraBody map[string]any `toml:"-"`
 
-	// Slot is the flat display index shown in the live meter and the session-
-	// log header as llm[<Slot>]. The foreground turn runs as llm[0]; background
-	// work (summariser / git-commit) runs as llm[1] — the same physical
-	// connection when there's a single [[llm]] entry with parallel >= 2, a
-	// distinct slot so you can see which is in use (llama.cpp assigns the real
-	// KV slot). Stamped by MainLLM / ConnAt / connForBackgroundLLM; runtime-only.
+	// Slot is the display index shown in the meter and the log header as
+	// llm[<Slot>]: the foreground turn is llm[0], background work llm[1], even
+	// when both are one physical connection with parallel >= 2 (llama.cpp picks
+	// the real KV slot). Runtime-only.
 	Slot int `toml:"-"`
 
-	// noThinkPrefill suppresses reasoning by APPENDING a closed think block to
-	// the messages instead of changing chat_template_kwargs. Set (on a copy) by
-	// withThinkingDisabled. A kwargs change re-runs the template over the whole
-	// conversation, so the server sees a token sequence it has never held and
-	// re-prefills from zero; an appended message is an extension, so every token
-	// before it still matches. Measured against ai.jos.li on a 13,972-token
-	// prompt: enable_thinking=false came back cached=0, the prefill came back
-	// cached=13,968 of 13,978 and suppressed reasoning just as completely.
-	// Runtime-only.
+	// noThinkPrefill suppresses reasoning by APPENDING a closed think block
+	// instead of changing chat_template_kwargs (set by withThinkingDisabled). A
+	// kwargs change re-renders the whole conversation and re-prefills from zero;
+	// an append leaves every earlier token matching. Measured on a 13,972-token
+	// prompt: the kwargs change came back cached=0, the append cached=13,968.
 	noThinkPrefill bool
 
-	// noTurnStats excludes this call from the per-turn "✅ Done" usage stats.
-	// Set (on a copy) by prewarm: its call logs under the real sid for
-	// diagnosability, but a turn that starts while the warm is still streaming
-	// resets the counters BEFORE the warm's usage lands, so without this flag
-	// the warm's ~10k prefill inflates that turn's "uncached" number.
-	// Runtime-only.
+	// noTurnStats keeps this call out of the turn's "✅ Done" stats. Set by
+	// prewarm and keepWarm: a turn that starts while a warm call is still
+	// streaming resets the counters first, so the warm's prefill would otherwise
+	// inflate that turn's "uncached" number. Runtime-only.
 	noTurnStats bool
 
-	// streamRulesArmed opts this call into the stream-rule check (rules.go): a
-	// pattern match aborts the generation mid-token and returns a
-	// streamRuleError. Opt-IN rather than on-by-default because a rule abort is
-	// only useful where something catches it and re-asks — that is the tool
-	// loop's retry ladder and nowhere else. The background summariser, in
-	// particular, passes the foreground's full tools array (for prefix-cache
-	// reasons, see summariseCall) but has no ladder: a rule firing there would
-	// silently downgrade the turn's note to the raw fallback. Set on a copy by
-	// runToolLoop (forToolLoop). Runtime-only.
+	// streamRulesArmed opts this call into the stream-rule check (rules.go).
+	// Opt-in because an abort is only useful where something re-asks, which is
+	// the tool loop's retry ladder alone: on the summariser it would silently
+	// downgrade the note to the raw fallback. Set by forToolLoop.
 	streamRulesArmed bool
 
-	// cacheLineage folds this call into the session's prefix-cache rewind check
-	// (Session.noteCacheLineage). Opt-in for the same reason: the check compares
-	// this call's cached count against the PREVIOUS call's prompt size, which is
-	// only meaningful when the two share a message history. The tool loop's calls
-	// do (each is the last plus an append); the background summariser's do not.
-	// It runs a one-shot prompt on (usually) another server, and counting it would
-	// report a rewind on every turn. Set on a copy by forToolLoop. Runtime-only.
+	// cacheLineage folds this call into the rewind check (noteCacheLineage).
+	// Opt-in, because comparing against the PREVIOUS call only means something
+	// when the two share a history: the tool loop's calls do, the summariser's
+	// one-shot prompt does not. Set by forToolLoop. Runtime-only.
 	cacheLineage bool
 }
 
@@ -183,29 +142,18 @@ var samplerParams = map[string]bool{
 	"frequency_penalty": true, "max_tokens": true, "min_p": true,
 	"n": true, "presence_penalty": true, "repeat_penalty": true,
 	"seed": true, "stop": true, "temperature": true, "top_k": true, "top_p": true,
-	// tool_choice constrains generation with a grammar; the prompt is rendered
-	// the same either way. Measured on llama.cpp over 14 summariser calls that
-	// set it to "none": prompt=250679 cached=250178, prompt=217887 cached=217256,
-	// so the prefix survived whole. Listing it here keeps a phase switch that
-	// differs only in tool_choice from being REPORTED as a rendering change by
-	// the rewind detector (noteCacheLineage), which would be a false accusation.
+	// tool_choice constrains generation with a grammar and renders the same
+	// prompt (measured: prompt=250679 cached=250178 with "none"). Listed here so
+	// a phase switch differing only in it is not REPORTED as a rendering change.
 	"tool_choice": true,
 }
 
 // renderKey fingerprints the params that reach the server's chat template:
 // everything the role configured except the samplers. Two calls with the same
-// key render the same messages to the same tokens, so the second extends the
-// first's KV prefix. Two different keys are two different token sequences, and
-// a server with one slot can only hold one of them.
-//
-// Built from the role's params, not from the assembled request body: model,
-// messages, tools and stream are codehalter's own and identical by
-// construction. "" means "nothing that touches the template was configured".
-//
-// It exists so a detected rewind can NAME its cause. Without it the log can
-// only list the four things that could have done it and let the user guess,
-// which is what turned one real diagnosis into an offline analysis of a 397 MB
-// session log.
+// key render to the same tokens, so the second extends the first's KV prefix;
+// two keys are two token sequences, and a one-slot server holds only one. It
+// lets a detected rewind NAME its cause instead of listing suspects. "" means
+// nothing template-affecting was configured.
 func renderKey(extra map[string]any) string {
 	keep := map[string]any{}
 	for k, v := range extra {
@@ -243,54 +191,18 @@ func (c *LLMConnection) paramsFor(role string) map[string]any {
 	return c.Params
 }
 
-// Why paramsFor hands back the role's params untouched, and in particular never
-// adds chat_template_kwargs of its own:
-//
-// Turning reasoning off for execute is worth a lot on a thinking model.
-// Measured over one 11.6h session against Qwen3.8-27B: 308 execute calls,
-// 169030 completion tokens, 71.2 minutes of pure decode, of which reasoning was
-// roughly 70%. chat_template_kwargs.enable_thinking=false delivers it: 71
-// responses, 0 with reasoning, 20.7s -> 8.8s per call.
-//
-// Setting it here anyway would be a bad trade on a single-slot server, which is
-// the default. That field is an argument to the server's Jinja chat template,
-// so giving execute a different value from thinking gives the two roles
-// different renderings, and the two alternate: 35 role switches over 436 calls
-// in that same session, one every ~12 calls. With identical renderings those 35
-// switches re-evaluated 121748 tokens between them (median 1526 per switch,
-// 97.4% cached), which is 4.2 minutes at the server's measured 483 tok/s
-// prefill. The same 35 calls carried 2414262 prompt tokens, so re-prefilling
-// each from scratch is 83.3 minutes. That is more than the ~50 minutes of
-// decode the change was buying.
-//
-// Sum, not 35x the median: the switch prompts are right-skewed (median 55308,
-// mean 68978, max 136803) and the deep ones dominate the total.
-//
-// And re-prefill is what was actually observed. The one time the two renderings
-// diverged in that session (the stuck-thinking retry, 22:32Z) the server came
-// back with cached=0 on a 71997-token prompt, then 27585 re-evaluated switching
-// back: a complete cache loss in both directions, on this server, at this
-// context depth. n=1, but it is the only direct measurement and it points the
-// conservative way.
-//
-// codehalter takes the decode win a third way, which costs nothing at all: the
-// execute-role phases append an already-closed <think></think> for the model to
-// continue (withThinkingDisabled). That is a suffix, not a re-render, so both
-// roles keep asking for the same rendering and the 83 minutes never come due.
-// Probed against the same server on a 13978-token prompt: the kwargs change
-// came back cached=0, the append cached=13968, reasoning suppressed either way.
-//
-// The kwargs field stays a per-connection decision the user makes, not a
-// default codehalter imposes, because whether it is affordable depends on the
-// slot count of the server in front of it. res/settings.toml documents when to
-// take it. On a server holding two or more slots each rendering keeps its own
-// KV cache and the switch is cheap; on one slot it is the 83 minutes above.
+// paramsFor never adds chat_template_kwargs of its own, though turning
+// reasoning off for execute is worth ~70% of its decode time. That field is a
+// template argument, so differing per role gives the two roles two renderings,
+// and on a single slot every plan→execute switch then re-prefills from zero:
+// measured, that costs more than the decode it saves. codehalter takes the win
+// with an appended closed <think></think> instead (withThinkingDisabled), which
+// is a suffix and not a re-render. The full measurement, and when the kwargs
+// route IS affordable (two or more slots), is in res/settings.toml.
 
-// endpoint joins the configured server base with an API path, e.g.
-// endpoint("/v1/models") → "http://host:8080/v1/models". The user configures
-// only Server (the host root); codehalter owns the path layout — the
-// OpenAI-compatible /v1/chat/completions and /v1/models, plus llama.cpp's
-// root-level /props. Trailing slashes on Server are tolerated.
+// endpoint joins the configured server base with an API path. The user sets
+// only Server (the host root); codehalter owns the path layout. Trailing
+// slashes on Server are tolerated.
 func (c *LLMConnection) endpoint(path string) string {
 	return strings.TrimRight(c.Server, "/") + path
 }
@@ -314,15 +226,10 @@ type settingsSource struct {
 	Active bool // the one loadSettings reads
 }
 
-// settingsSources lists the candidates in precedence order:
-//  1. <cwd>/.codehalter/settings.toml (project-local, preferred — per-project
-//     overrides win even when a machine-wide config exists)
-//  2. ~/.config/codehalter/settings.toml (global fallback, serving every project
-//     without a local file)
-//
-// loadSettings reads the Active one; /settings prints the whole list so the
-// user can see which file is in force and which it shadows. Both go through
-// here, so the order is defined once.
+// settingsSources lists the candidates in precedence order: the project's
+// .codehalter/settings.toml, then ~/.config/codehalter/settings.toml for every
+// project without one. loadSettings reads the active one and /settings prints
+// the list, so the order is defined once.
 func settingsSources(cwd string) []settingsSource {
 	out := []settingsSource{{Path: filepath.Join(cwd, sessionDir, "settings.toml"), Scope: "project"}}
 	if home, err := os.UserHomeDir(); err == nil {
@@ -412,16 +319,11 @@ type GlobalConfig struct {
 	HasGitconfigInHome bool `toml:"has_gitconfig_in_home"`
 }
 
-// loadGlobalConfig reads ~/.config/codehalter/global.toml, best-effort. A missing
-// or unreadable file yields the zero value (all false), the safe default —
-// codehalter just won't add the corresponding optional mount.
-//
-// Best-effort means the zero value is always returned, never an error, but NOT
-// that the failure goes unmentioned: absence is the normal case (install.sh may
-// not have run) and stays silent, while a file that exists and fails to parse is
-// a real misconfiguration. Silently treating it as "no gitconfig on the host"
-// sends you debugging a devcontainer bind mount instead of a typo, the same
-// misdiagnosis decodeSettings warns about below.
+// loadGlobalConfig reads ~/.config/codehalter/global.toml, best-effort: the
+// zero value (no optional mounts) is always returned, never an error. A missing
+// file is normal and silent; one that exists and fails to parse is logged,
+// since reading it as "no gitconfig on the host" sends you debugging a bind
+// mount instead of a typo.
 func loadGlobalConfig() GlobalConfig {
 	var g GlobalConfig
 	home, err := os.UserHomeDir()

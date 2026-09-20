@@ -14,15 +14,11 @@ import (
 	"strings"
 )
 
-// Fix-card prompts — the message dispatched to the executor when the user
-// accepts a 🟡 card. Each is a THIN trigger: the actual how-to lives in the
-// SKILL it points at (already in the system prompt), so these stay two lines.
-// The %s/%q holes are filled by fmt.Sprintf at the sole call site below.
-//
-// Inline rather than res/*.md like the phase prompts and SKILLs, because these
-// are neither seeded into .codehalter/ nor loadPromptFile-able: nothing reads
-// them at runtime, so a file bought no editability, only a jump between the
-// format string and the fmt.Sprintf that has to match its verbs.
+// Fix-card prompts: what the executor is sent when the user accepts a 🟡 card.
+// Each is a THIN trigger, since the how-to lives in the SKILL it points at.
+// Inline rather than res/*.md because nothing reads them at runtime: a file
+// would add no editability, only distance between the format string and the
+// fmt.Sprintf whose verbs must match it.
 const (
 	// cardSetupHeader opens the combined setup card; every cardSetup* line below
 	// is appended to it as one bullet. Split this way so that N problems produce
@@ -54,6 +50,21 @@ const (
 		"\n" +
 		"SKILL-base.md (\"Formatter config\") has the exact config files and flags. Change no behavior anywhere in this task.\n"
 
+	// cardAgentsFile writes the project brief codehalter loads into the system
+	// prompt at session start. Two things make it worth a card of its own: the
+	// facts are the user's to confirm, not the model's to guess, and the failure
+	// mode of getting it wrong is a line that stays wrong for every later
+	// session. No holes to fill.
+	cardAgentsFile = "This project has no AGENT.md, so every session starts by rediscovering what the project is.\n" +
+		"\n" +
+		"PLAN ONLY → produce execute-phase steps that:\n" +
+		"1. Read enough of the tree to answer for yourself: what this project IS in one sentence, its language and version, the frameworks and notable libraries, how it is built / run / tested, which directory holds what, and any convention the code plainly follows that no file states.\n" +
+		"2. Use `ask_user` ONCE, as a single free-text box, to put those draft answers to the user: they correct what is wrong and add what cannot be read off the tree (who it is for, what it must never do, decisions already settled). Do not ask what the tree already answers.\n" +
+		"3. Write `AGENT.md` in the project root from the corrected answers, under 60 lines, holding ONLY what stays true between sessions: purpose, stack, layout, the build/test commands, standing constraints. NO task list, NO status, NO roadmap, NO \"currently working on\". A line that expires is worse than no line, because the next session believes it.\n" +
+		"4. Write no command you did not run: a build or test line goes in only after it worked.\n" +
+		"\n" +
+		"codehalter folds AGENT.md into the system prompt at session start, so it is read once per session, not once per turn. Do not commit it; that is the user's call.\n"
+
 	cardMCPParseError = "MCP config `.codehalter/mcp.toml` failed to parse: %s.\n" +
 		"\n" +
 		"Read file (header comments = schema), fix syntax, re-read to confirm parses. Do NOT start servers → codehalter reconciles next prompt.\n"
@@ -76,58 +87,48 @@ type fixProblem struct {
 	prompt string
 }
 
-// detectRunnerConfigs returns runner-kind names purely from config-file
-// presence in cwd, regardless of whether the runner binary is installed.
-// Used by checkEnv to flag "user has a justfile but `just` isn't on PATH"
-// so the consolidated install card can offer to install the missing tool.
-// Order is deterministic so envSnapshot diffs don't false-positive on
-// reordering. go.mod is included unconditionally (the user wants to run
-// `go vet` / `go test` even when a justfile or Makefile is also present —
-// missing `go` blocks the executor's self-verify recipe regardless).
-func detectRunnerConfigs(cwd string) []string {
-	var kinds []string
-	for _, name := range []string{"justfile", "Justfile", ".justfile"} {
-		if _, err := os.Stat(filepath.Join(cwd, name)); err == nil {
-			kinds = append(kinds, "just")
-			break
-		}
-	}
-	for _, name := range []string{"Makefile", "makefile", "GNUmakefile"} {
-		if _, err := os.Stat(filepath.Join(cwd, name)); err == nil {
-			kinds = append(kinds, "make")
-			break
-		}
-	}
-	if _, err := os.Stat(filepath.Join(cwd, "package.json")); err == nil {
-		kinds = append(kinds, "npm")
-	}
-	if _, err := os.Stat(filepath.Join(cwd, "Cargo.toml")); err == nil {
-		kinds = append(kinds, "cargo")
-	}
-	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err == nil {
-		kinds = append(kinds, "go")
-	}
-	return kinds
+// projectIsEmpty reports the startup verdict: this agent opened a directory
+// with nothing in it. Read from three places (the banner, the first user
+// message, the AGENT.md card), all of them off the session goroutine.
+func (a *agent) projectIsEmpty() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.emptyProject
 }
 
-// runnerProbeBinary returns the binary that must be on PATH for a runner
-// kind to be usable. Kept as a switch rather than a map so adding a new runner
-// is one obvious place to edit.
-func runnerProbeBinary(kind string) string {
-	switch kind {
-	case "just":
-		return "just"
-	case "make":
-		return "make"
-	case "npm":
-		return "npm"
-	case "cargo":
-		return "cargo"
-	case "go":
-		return "go"
+// isEmptyProject reports whether cwd is a pristine directory: nothing in it
+// but the .codehalter we create ourselves, if that. A hidden directory such as
+// .git means the project exists and merely has no files here yet, which is not
+// the same thing, so only .codehalter is ignored.
+func isEmptyProject(cwd string) bool {
+	entries, err := os.ReadDir(cwd)
+	if err != nil {
+		return false
 	}
-	return ""
+	for _, e := range entries {
+		name := e.Name()
+		if name == ".codehalter" {
+			continue
+		}
+		if strings.HasPrefix(name, ".") && e.IsDir() {
+			// Hidden dirs like .git/.idea don't count as "real" content, but
+			// their presence means this isn't a pristine mkdir — bail out.
+			return false
+		}
+		return false
+	}
+	return true
 }
+
+// emptyProjectHint is injected onto the first user turn when the working
+// directory has no source files, manifests, or runner config. It tells the
+// LLM to ask what language/framework the user wants before writing anything.
+const emptyProjectHint = `[Note: this project directory is empty — no source files or build manifests were found. Before doing anything else, use the ask_user tool to confirm:
+1. What language/framework should this project use? (Rust, Go, Node.js, Python, C, etc.)
+2. Which build runner do they prefer? (Cargo, go modules, npm/pnpm, just, Make)
+
+Only then create the appropriate skeleton — Cargo.toml for Rust, go.mod for Go, package.json for Node, justfile/Makefile otherwise — with sensible build/test/lint/format targets.]
+`
 
 // formatterNeed is a formatter this project would use (from a detected stack or
 // a formatter config file) plus a human-readable reason, for the install card.
@@ -188,19 +189,13 @@ type formatterConfigNeed struct {
 	bin, config string
 }
 
-// formatterConfigNeeds returns the formatters that will reformat this project's
-// files with nothing in the repo saying what its style is.
-//
-// gofmt, rustfmt and zig fmt are deliberately absent: they expose no style
-// options, so there is no config to write and no way for two tools to disagree
-// about their output — a Go project is already pinned by virtue of the language.
-// Only a formatter whose defaults are arbitrary relative to the code already in
-// the repo can drift from it, and that drift is expensive: an editor's
-// format-on-save reindenting a file after a write invalidates the exact text the
-// model just read, which costs failed edits and a repair cycle.
-//
-// The formatter has to be installed for this to be worth asking — a missing one
-// is the install card's business, and it comes first.
+// formatterConfigNeeds returns the installed formatters that will reformat
+// this project with nothing in the repo saying what its style is. gofmt,
+// rustfmt and zig fmt are absent on purpose: they have no style options, so
+// there is nothing to pin. A formatter with arbitrary defaults can drift from
+// the code, and an editor's format-on-save then invalidates the text the model
+// just read, which costs failed edits. A missing formatter is the install
+// card's business and comes first.
 func formatterConfigNeeds(stacks []string, cwd string) []formatterConfigNeed {
 	var needs []formatterConfigNeed
 	// .editorconfig counts as pinned for prettier, which reads it; clang-format
@@ -251,15 +246,11 @@ func pyprojectHasTable(cwd, prefix string) bool {
 // Orchestrator
 // ---------------------------------------------------------------------------
 
-// prepareChecks runs the pre-turn freshness pass: re-advertise the slash-macro
-// menu, re-verify a reachable LLM (looping on a Retry card when not), refresh
-// the per-session environment snapshot (stacks, container, firefox,
-// run_command, per-stack probe binaries), and reconcile .codehalter/mcp.toml so
-// the turn runs against current config. Each check short-circuits on an
-// unchanged settings hash / env snapshot / mcp.toml mtime, so a steady-state
-// turn pays almost nothing. Returns the missing-tool / broken-MCP problems for
-// drainFixes to offer AFTER the turn — surfacing a fix card here, in front of
-// the user's prompt, would let an accepted card dispatch a whole orchestrate
+// prepareChecks is the pre-turn freshness pass: re-advertise the slash menu,
+// re-verify a reachable LLM, refresh the environment snapshot and reconcile
+// mcp.toml. Each check short-circuits on an unchanged hash, snapshot or mtime,
+// so a steady turn pays almost nothing. It RETURNS the problems for drainFixes
+// to offer after the turn: a card shown here could dispatch a whole orchestrate
 // cycle ahead of the request it interrupted.
 func (a *agent) prepareChecks(ctx context.Context, sess *Session, sid string) []fixProblem {
 	if sess == nil {
@@ -271,15 +262,10 @@ func (a *agent) prepareChecks(ctx context.Context, sess *Session, sid string) []
 	a.ensureLLM(ctx, sess, sid)
 	envProblems := a.checkEnv(sess, sid)
 	mcpProblems := a.checkMCP(ctx, sess, sid)
-	// Full capabilities banner: ONCE per session, on the first prepare (which
-	// runs at bootstrap, once state is established). Unconditional: it used to
-	// require that ensureLLM / checkEnv / checkMCP had reported a change, so
-	// the ordinary case — same settings, same tools, same MCP servers as last
-	// time — printed nothing at all and left the user staring at an empty
-	// thread after the gitignore card, with no way to tell setup from a hang.
-	// Every LATER prepare stays silent: a tool getting installed or a server
-	// starting mid-session surfaces as a one-line notice (checkMCP) or a fix
-	// card (drainFixes), not by re-printing the whole setup screen.
+	// Full capabilities banner: once per session, on the first prepare, and
+	// unconditionally, so an unchanged setup does not leave the user staring at
+	// an empty thread unable to tell setup from a hang. Later prepares stay
+	// silent: mid-session changes surface as a one-line notice or a fix card.
 	if !sess.capabilitiesShown {
 		a.notifyCapabilities(ctx, sess, sid)
 		sess.capabilitiesShown = true
@@ -311,23 +297,14 @@ func (a *agent) drainFixes(ctx context.Context, sid string, fixes []fixProblem) 
 // to run and surfaces a Retry card the same way an unreachable LLM does.
 const minSlotTokens = 32 * 1024
 
-// ensureLLM blocks until every startup gate passes: at least one [[llm]]
-// connection answers a probe, and llm[0] reports a per-slot context window of
-// at least minSlotTokens. First call scaffolds .codehalter/settings.toml if
-// neither the global nor the project-local file exists. The probe is skipped
-// when the merged settings-file hash matches sess.llmHash AND every gate is
-// already satisfied — i.e. the file the user could have edited hasn't
-// actually changed AND we know we have a working route. A single "Retry"
-// tool card is shown when any gate fails; clicking it always re-probes
-// regardless of hash (the user may have changed network or launch settings
-// outside the file).
-//
-// There is no Abort: codehalter cannot function without an LLM. In auto-
-// answer mode (autopilot) we cap retries at 3 to avoid
-// spinning forever — those callers handle "no LLM" gracefully via
-// connForSession.
+// ensureLLM blocks until the startup gates pass: some [[llm]] answers a probe
+// and llm[0] reports at least minSlotTokens per slot. The first call scaffolds
+// settings.toml when none exists. The probe is skipped while the settings hash
+// is unchanged AND the gates already hold. On failure it shows a Retry card,
+// which always re-probes. There is no Abort, since codehalter cannot work
+// without an LLM; autopilot caps the retries at 3.
 func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
-	auto, _ := a.shouldAutoAnswer(sid)
+	auto := a.isAutopilot()
 	const autoCap = 3
 	ready := func() bool {
 		return a.hasReachableLLM() && a.mainSlotTokens >= minSlotTokens
@@ -391,7 +368,9 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
 		default:
 			msg = fmt.Sprintf("LLM reachable but per-slot context window is only %d tokens — codehalter requires at least %d. Restart your server with a larger `-c N` (llama.cpp) / `--max-model-len N` (vLLM), or reduce the `parallel` slot count in settings.toml, then click Retry.", a.mainSlotTokens, minSlotTokens)
 		}
-		tcId, err := a.askAcknowledgeWithCard(ctx, sid, msg, "think", "Retry")
+		// One button and no decline path: codehalter cannot go on without an
+		// LLM, so the only useful answer is "I fixed it, try again".
+		_, tcId, err := a.askCard(ctx, sid, msg, "think", []permissionOption{{OptionId: "ack", Name: "Retry", Kind: "allow_once"}})
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return
@@ -578,9 +557,8 @@ func (a *agent) renderLLMStatus() string {
 		// Reachable, but /v1/models answered without listing the configured id.
 		// The connection works yet requests for this model often come back empty
 		// (the gateway routes an unknown/unloaded name to nothing, returning a
-		// clean 200 with no content). Previously swallowed — probeLLM logged
-		// loaded=false and moved on, so the banner showed a bare ✅ and the user
-		// only discovered the problem when the first turn failed to parse.
+		// clean 200 with no content). Said in the banner, because otherwise the
+		// first sign is a turn that fails to parse.
 		if pr := a.connProbe[c.Server+"\x00"+c.Model]; pr.ModelKnown && !pr.ModelLoaded {
 			avail := "its model list came back empty"
 			if len(pr.AvailableModels) > 0 {
@@ -593,16 +571,11 @@ func (a *agent) renderLLMStatus() string {
 			continue
 		}
 		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.Server, c.parallelCap())
-		// The one settings mistake that costs real time and shows no symptom.
-		// Everything that is not a sampler is an argument to the server's chat
-		// template, so two roles that disagree there ask for two different
-		// renderings of the same conversation. The server keeps a prompt state
-		// per rendering, which means each phase switch re-evaluates everything
-		// the OTHER role appended since this one last ran. Measured over one
-		// 11.6h session: 99582 tokens re-read across two switches. The rewind
-		// detector already reports this, but only after the tokens are spent,
-		// and the counts alone do not say which key caused it. Say it here,
-		// before the first call, and name the two renderings.
+		// The one settings mistake that costs real time and shows no symptom:
+		// roles that differ in anything but samplers ask for two renderings, and
+		// each phase switch then re-evaluates what the OTHER role appended
+		// (measured: 99582 tokens across two switches). The rewind detector
+		// reports it only after the tokens are spent, so say it up front.
 		if think, exec := renderKey(c.paramsFor("thinking")), renderKey(c.paramsFor("execute")); think != exec {
 			// "(none)" rather than an empty string: no template params at all is
 			// the good configuration and should not read like missing data.
@@ -653,42 +626,29 @@ func (a *agent) renderLLMStatus() string {
 // checkEnv — stacks, container, firefox, run_command, per-stack probes
 // ---------------------------------------------------------------------------
 
-// toolPresence is one probed dev-tool binary: its name on PATH, a human label
-// (stack name / runner kind / formatter reason), and whether it's installed.
-type toolPresence struct {
-	bin     string
-	label   string
-	present bool
-}
-
 func onPath(bin string) bool { _, err := exec.LookPath(bin); return err == nil }
 
-// probeToolBins resolves PATH presence once for every runner and formatter
-// binary of the session. envSnapshot, checkEnv, and notifyCapabilities each used
-// to re-run this exec.LookPath loop with the prettier project-local special-case
-// duplicated; they now format this one shared result.
-func (a *agent) probeToolBins(sess *Session) (runners, formatters []toolPresence) {
-	for _, k := range sess.knownRunners {
-		if bin := runnerProbeBinary(k); bin != "" {
-			runners = append(runners, toolPresence{bin: bin, label: k, present: onPath(bin)})
-		}
+// hasFormatter reports whether the formatter f can actually run here. prettier
+// is the exception: a JS project usually has it in node_modules rather than on
+// PATH, so prettierBin looks there too.
+func hasFormatter(cwd string, f formatterNeed) bool {
+	if f.bin == "prettier" {
+		return prettierBin(cwd) != ""
 	}
-	for _, f := range detectFormatters(sess.knownStacks, sess.Cwd) {
-		present := onPath(f.bin)
-		if f.bin == "prettier" {
-			present = prettierBin(sess.Cwd) != ""
-		}
-		formatters = append(formatters, toolPresence{bin: f.bin, label: f.reason, present: present})
-	}
-	return
+	return onPath(f.bin)
 }
 
-// checkEnv refreshes sess.knownStacks and sess.knownRunners, probes the
-// environment (container, firefox, run_command, runner-config and formatter
-// binaries on PATH), and reports what is missing. All missing binaries are collapsed into ONE fixProblem so
-// the user sees a single "Install fix? make, just" card instead of one card per
-// tool. Strictly silent — emits no chat output of its own. Bash and devcontainer are filtered out of
-// knownStacks because they're meta-tooling, not stacks.
+// checkEnv refreshes sess.knownStacks, seeds any newly-applicable skill, and
+// reports what this project is missing as fix cards: the formatters that would
+// reformat it but are not installed, a formatter that runs with nothing pinning
+// its style, and a project with no AGENT.md. Bash and devcontainer are filtered
+// out of knownStacks: they are meta-tooling every project has, not stacks.
+// Strictly silent, emitting no chat output of its own.
+//
+// There is no task-runner detection. Knowing a justfile exists told us only
+// that `just` should be installed, which the model finds out anyway the first
+// time a recipe fails, and the classification built on top of it (build / test /
+// lint / format targets) was never read by anything but a banner line.
 func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 	var stacks []string
 	for _, s := range detectStacks(sess.Cwd) {
@@ -698,7 +658,6 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 		stacks = append(stacks, s)
 	}
 	sess.knownStacks = stacks
-	sess.knownRunners = detectRunnerConfigs(sess.Cwd)
 
 	// Seed SKILL-*.md for a stack / runner config / distro added since session
 	// start so its skill is on disk before the next turn's systemPrompt loads
@@ -748,17 +707,11 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 		}
 		fmt.Fprintf(&detail, "%s (%s)", bin, reason)
 	}
-	binRunners, binFormatters := a.probeToolBins(sess)
-	for _, t := range binRunners {
-		if !t.present {
-			note(t.bin, t.label+" runner")
-		}
-	}
-	// Formatters defensive auto-formatting would use (prettier checks the
-	// project-local bin too) — a missing one folds into the same install card.
-	for _, t := range binFormatters {
-		if !t.present {
-			note(t.bin, t.label+" formatter")
+	// Formatters defensive auto-formatting would use: a missing one is the
+	// whole content of the install card now that runners are not probed.
+	for _, f := range detectFormatters(stacks, sess.Cwd) {
+		if !hasFormatter(sess.Cwd, f) {
+			note(f.bin, f.reason+" formatter")
 		}
 	}
 
@@ -782,12 +735,12 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 		})
 	}
 
-	// Formatter config: at most once per session (see Session.formatCardShown),
-	// and never when the project opted out with format_config = false. A separate
-	// card from the container setup above, for the reasons on cardFormatHeader.
-	if !sess.formatCardShown && a.formatConfigEnabled() {
+	// Formatter config: once per PROJECT, and never when it opted out with
+	// format_config = false. A separate card from the container setup above, for
+	// the reasons on cardFormatHeader.
+	if !checkDone(sess.Cwd, checkFormatConfig) && a.formatConfigEnabled() {
 		if needs := formatterConfigNeeds(stacks, sess.Cwd); len(needs) > 0 {
-			sess.formatCardShown = true
+			markCheckDone(sess.Cwd, checkFormatConfig)
 			bins := make([]string, len(needs))
 			cfgs := make([]string, len(needs))
 			for i, n := range needs {
@@ -799,7 +752,72 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 			})
 		}
 	}
+
+	// The project brief. AGENT.md rides in the system prompt from session start
+	// (loadAgentsFile), so writing it once is what stops every later session
+	// spending its first turns working out what the project is.
+	//
+	// Only worth asking once there is something to read: the card's first step
+	// is "read the tree", and a directory holding nothing but a .git has no
+	// answers in it. Checked live and left unmarked below the threshold, so a
+	// project scaffolded during this session is offered the card as soon as it
+	// has a shape, rather than at the next session or never.
+	//
+	// The order of these three tests is load-bearing: checkDone is two syscalls
+	// and is true forever after the first offer, so the walk below happens at
+	// most once per project, and never at all for a project that ships a brief.
+	if !checkDone(sess.Cwd, checkAgentsFile) {
+		if _, content := loadAgentsFile(sess.Cwd); content == "" && len(listProjectFiles(sess.Cwd)) >= minFilesForBrief {
+			markCheckDone(sess.Cwd, checkAgentsFile)
+			probs = append(probs, fixProblem{
+				desc:   "🟡 No AGENT.md: write down what this project is, so every session starts knowing it?",
+				prompt: cardAgentsFile,
+			})
+		}
+	}
 	return probs
+}
+
+// minFilesForBrief is how many files (listProjectFiles rules: no .git, no
+// .codehalter, no node_modules) a project needs before being asked for an
+// AGENT.md. A bare scaffold has nothing to say that its own go.mod does not,
+// and asking about it wastes the one time the card is offered.
+const minFilesForBrief = 5
+
+// Names recorded in checksDoneFile. Each gates a card that asks for work the
+// project only ever needs once.
+const (
+	checkFormatConfig = "format-config"
+	checkAgentsFile   = "agent-md"
+)
+
+// checksDoneFile records, per project, the one-time cards codehalter has
+// already offered. Without it a declined card comes back at every session
+// start, which nags rather than helps. One name per line: the only question
+// asked of the file is whether a name is in it, and deleting a line is how the
+// user re-arms that card.
+const checksDoneFile = "checks.done"
+
+func checkDone(cwd, name string) bool {
+	data, err := os.ReadFile(filepath.Join(cwd, ".codehalter", checksDoneFile))
+	return err == nil && slices.Contains(strings.Fields(string(data)), name)
+}
+
+// markCheckDone records name as offered. Failing to write it costs one repeat
+// offer next session, which is not worth failing a turn over, so it warns.
+func markCheckDone(cwd, name string) {
+	if checkDone(cwd, name) {
+		return
+	}
+	path := filepath.Join(cwd, ".codehalter", checksDoneFile)
+	data, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		slog.Warn("reading the completed-checks file failed", "path", path, "err", err)
+		return
+	}
+	if err := os.WriteFile(path, append(data, (name+"\n")...), 0o644); err != nil {
+		slog.Warn("recording a completed check failed", "path", path, "err", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -891,11 +909,10 @@ func renderMCPChanges(changes []mcpChange) (notices []string, problems []fixProb
 // ---------------------------------------------------------------------------
 
 // notifyCapabilities renders ONE consolidated banner covering everything
-// the user needs to see at the top of a turn: settings.toml path, LLM
-// status, project tooling (runners), detected stacks, container, firefox,
-// run_command, MCP servers, and per-stack dev-tool probes (✅ found / 🟡
-// missing). Called by prepare exactly once per session, on the first
-// prepare; later turns emit nothing.
+// the user needs to see at the top of a turn: settings.toml path, LLM status,
+// detected stacks, container, firefox, run_command, seeded skills and MCP
+// servers. Called by prepare exactly once per session, on the first prepare;
+// later turns emit nothing.
 func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid string) {
 	var b strings.Builder
 
@@ -930,9 +947,6 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	// run_command is always registered by discoverSandbox at this point.
 	b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only — destructive git commands fail at the FS layer)\n\n")
 
-	// Probe every known runner binary once for the ✅/🟡 lines below.
-	pRunners, _ := a.probeToolBins(sess)
-
 	// A stack's language server is not listed here: it's covered by the ✅ MCP
 	// line at the bottom once wired, and by its setup card until then.
 	if len(sess.knownStacks) > 0 {
@@ -943,45 +957,16 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 		b.WriteString("\n\n")
 	}
 
-	// Task-runner block. Three states:
-	//   - empty project → bootstrap hint
-	//   - no runner config at all → "add one" nudge
-	//   - one or more runner configs detected → list populated runners + per-
-	//     kind 🟡 lines for any kind whose binary is missing.
-	a.mu.Lock()
-	caps := a.capabilities
-	empty := a.emptyProject
-	a.mu.Unlock()
-
-	if empty {
-		b.WriteString("Empty project — I'll ask about language and runner on your first message.\n\n")
-	} else if len(sess.knownRunners) == 0 {
-		b.WriteString("🟡 No task runner detected (just, make, npm, go, cargo). Add one so I can build/test/lint.\n\n")
-	} else {
-		if len(caps.runners) > 0 {
-			fmt.Fprintf(&b, "Project tooling (%s):\n", strings.Join(caps.runners, ", "))
-			row := func(label string, entries []string, hint string) {
-				if len(entries) > 0 {
-					fmt.Fprintf(&b, "  %-7s %s\n", label+":", strings.Join(entries, ", "))
-				} else {
-					fmt.Fprintf(&b, "  %-7s (none — %s)\n", label+":", hint)
-				}
-			}
-			row("build", caps.build, "consider adding a `build` target")
-			row("test", caps.test, "consider adding a `test` target")
-			row("lint", caps.lint, "consider adding a `lint`/`vet`/`check` target")
-			row("format", caps.format, "consider adding a `fmt`/`format` target")
-			b.WriteString("\n")
-		}
-		for _, t := range pRunners {
-			if !t.present {
-				fmt.Fprintf(&b, "🟡 %s config detected but `%s` not on PATH\n\n", t.label, t.bin)
-			}
-		}
+	if a.projectIsEmpty() {
+		b.WriteString("Empty project: I'll ask about language and runner on your first message.\n\n")
 	}
 
-	if skills := listSkills(sess.Cwd); len(skills) > 0 {
-		fmt.Fprintf(&b, "🧠 Skills: %s\n\n", strings.Join(skills, ", "))
+	if files := skillFiles(sess.Cwd); len(files) > 0 {
+		names := make([]string, len(files))
+		for i, n := range files {
+			names[i] = strings.TrimSuffix(strings.TrimPrefix(n, "SKILL-"), ".md")
+		}
+		fmt.Fprintf(&b, "🧠 Skills: %s\n\n", strings.Join(names, ", "))
 	}
 
 	a.mu.Lock()
@@ -1010,8 +995,14 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 // visible in the banner so the user can address it manually whenever they
 // choose.
 func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
-	title := p.desc + " — install fix?"
-	ok, tcId, err := a.askYesNoWithCard(ctx, sid, title, "think", "Install fix", "Skip")
+	// A card that asks for something already ends its desc in a question mark;
+	// the container-setup card states a fact, so it gets the question added.
+	// Not every card is an install any more, so the button says neither.
+	title := p.desc
+	if !strings.HasSuffix(title, "?") {
+		title += " (fix it?)"
+	}
+	ok, tcId, err := a.askYesNoWithCard(ctx, sid, title, "think", "Do it", "Skip")
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return

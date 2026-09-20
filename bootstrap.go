@@ -47,7 +47,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	a.say(ctx, sid, "codehalter must run inside a container. I can scaffold "+
 		".devcontainer/Dockerfile and .devcontainer/devcontainer.json for you to edit, then you can reopen the project in the container.\n\n")
 
-	choice, tcId, err := a.askChoiceWithCard(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
+	choice, tcId, err := a.askCard(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", choiceOptions([]string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"}))
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
@@ -183,7 +183,7 @@ func buildDevcontainerJSON(gitWritable, gitconfig, sshAgent bool) string {
 }
 
 // ensureTerminals gates the session on the client being able to run commands
-// for us. Every command codehalter runs — run_command, run_background, run_task
+// for us. Every command codehalter runs — run_command, run_background
 // — goes out as an ACP terminal, so a client that didn't advertise
 // clientCapabilities.terminal leaves the agent with no shell at all. Rather than
 // discover that at the first `go build`, say so up front and refuse the session,
@@ -294,7 +294,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 		title = "No .gitignore found — create one for .codehalter/?"
 		labels = []string{"Add .gitignore, ignore .codehalter", "Add .gitignore, track .codehalter"}
 	}
-	choice, tcId, err := a.askChoiceWithCard(ctx, sid, title, "think", labels)
+	choice, tcId, err := a.askCard(ctx, sid, title, "think", choiceOptions(labels))
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return

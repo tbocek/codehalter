@@ -49,11 +49,6 @@ const (
 	screenshotMargin = 40
 )
 
-// firefoxBinaries are the names Firefox ships under across distros (Debian and
-// Ubuntu package the ESR line as firefox-esr; some tarball installs land as
-// firefox-bin).
-var firefoxBinaries = []string{"firefox", "firefox-esr", "firefox-bin"}
-
 var (
 	headOpenRe  = regexp.MustCompile(`(?i)<head[^>]*>`)
 	bodyCloseRe = regexp.MustCompile(`(?i)</body>`)
@@ -132,7 +127,7 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 	if info, err := os.Stat(abs); err != nil || info.IsDir() {
 		return fmt.Sprintf("screenshot: %s is not a readable file. Only files inside the project can be rendered; there is no URL mode.", rel), nil, "", true
 	}
-	bin, err := firefoxPath()
+	bin, err := findFirefox()
 	if err != nil {
 		return "screenshot: " + err.Error() + ". Install it (the OS skill has the package name) and call screenshot again, or verify the rendering as a number instead.", nil, "", true
 	}
@@ -177,15 +172,6 @@ func imageParts(text, mime string, data []byte) []any {
 			},
 		},
 	}
-}
-
-func firefoxPath() (string, error) {
-	for _, name := range firefoxBinaries {
-		if p, err := exec.LookPath(name); err == nil {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("no Firefox on PATH (tried %s)", strings.Join(firefoxBinaries, ", "))
 }
 
 // clampDimension reads a pixel argument, falling back to def when absent and

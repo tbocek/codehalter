@@ -14,21 +14,25 @@ import (
 
 const (
 	maxSearchResults   = 100
-	searchContextLines = 2 // lines of context shown on each side of a match
+	searchContextLines = 2 // default lines of context on each side of a match
+	// maxSearchContext caps the `context` argument: 100 matches at 10 lines a
+	// side is already 2100 lines, and past that the model wants read_file.
+	maxSearchContext = 10
 )
 
 var searchTextTool = Tool{Def: map[string]any{
 	"type": "function",
 	"function": map[string]any{
 		"name":        "search_text",
-		"description": fmt.Sprintf("Search for text or a regex across all files in the project. Returns up to %d matches, each as `file:line` plus the matched line and %d lines of context on each side (the match line marked with `>`) — so you can often act on a hit without opening the file. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive. Line-oriented by default; set multiline=true so a regex can match across newlines.", maxSearchResults, searchContextLines),
+		"description": fmt.Sprintf("Search for text or a regex across all files in the project. Returns up to %d matches, each as `file:line` plus the matched line and %d lines of context on each side (the match line marked with `>`; raise it with `context`) — so you can often act on a hit without opening the file, and it is the way to get just the part of a large file you need. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive. Line-oriented by default; set multiline=true so a regex can match across newlines.", maxSearchResults, searchContextLines),
 		"parameters": map[string]any{
 			"type":     "object",
 			"required": []string{"query"},
 			"properties": map[string]any{
 				"query":     map[string]any{"type": "string", "description": "Text to search for. Literal substring by default; Go RE2 regex when regex=true."},
-				"path":      map[string]any{"type": "string", "description": "Subdirectory to search in (relative to project root, empty for all)"},
+				"path":      map[string]any{"type": "string", "description": "Subdirectory OR single file to search in (relative to project root, empty for all). Name a file to pull just the relevant part out of a large one."},
 				"regex":     map[string]any{"type": "boolean", "description": "If true, interpret query as a Go RE2 regular expression. Default: false (literal substring)."},
+				"context":   map[string]any{"type": "integer", "description": fmt.Sprintf("Lines of context shown above AND below each match, like grep -C. Default %d, max %d. Use 5-10 to read a function around a hit instead of opening the file.", searchContextLines, maxSearchContext)},
 				"multiline": map[string]any{"type": "boolean", "description": "If true, match against the whole file at once so patterns can span newlines (e.g. `foo\\nbar`). Implies regex=true. Default: false (line-by-line)."},
 			},
 		},
@@ -45,6 +49,10 @@ var searchTextTool = Tool{Def: map[string]any{
 	}
 	multiline := args.flag("multiline")
 	useRegex := multiline || args.flag("regex")
+	context := searchContextLines
+	if n, ok := args.num("context"); ok {
+		context = min(max(n, 0), maxSearchContext)
+	}
 
 	var re *regexp.Regexp
 	matcher := func(s string) bool { return strings.Contains(s, query) }
@@ -104,7 +112,7 @@ var searchTextTool = Tool{Def: map[string]any{
 			}
 		}
 		for _, lineNum := range matches {
-			results = append(results, formatMatchBlock(relPath, lines, lineNum, searchContextLines))
+			results = append(results, formatMatchBlock(relPath, lines, lineNum, context))
 		}
 	}
 
@@ -131,7 +139,7 @@ var searchTextTool = Tool{Def: map[string]any{
 	// instead of re-running. Mirrors read_file's readUnchangedMarker dedup;
 	// loop.go scans the output for the marker to also count it as a stuck
 	// round (the prepended note changes the bytes, so callOutHash misses it).
-	dedupKey := query + "\x00" + subdir + "\x00" + fmt.Sprintf("%t%t", useRegex, multiline)
+	dedupKey := query + "\x00" + subdir + "\x00" + fmt.Sprintf("%t%t%d", useRegex, multiline, context)
 	var dedupNote string
 	if sess.repeatedResult(dedupKey, fnvHash(out)) {
 		dedupNote = fmt.Sprintf("[note: %s — you already ran this exact search (%s) earlier this turn and the results are UNCHANGED. Re-searching makes no progress; reuse the earlier result.]", readUnchangedMarker, label)

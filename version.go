@@ -21,30 +21,20 @@ import (
 // ---------------------------------------------------------------------------
 // Update check and self-update.
 //
-// Releases are plain integer tags (v1, v2, ...): release.sh reads the last one,
-// adds one, pushes the tag, and the build workflow attaches one binary per
-// GOOS/GOARCH and stamps the tag into `version` with -ldflags. So "is there a
-// newer one" is an integer comparison, and a binary built any other way reports
-// "dev", compares as older than nothing, and is never offered an update: a
-// developer running their own build does not want it overwritten by a download.
+// Releases are integer tags (v1, v2, ...), stamped into `version` by the build,
+// so "is there a newer one" is an integer comparison. Any other build reports
+// "dev", compares as older than nothing, and is never offered an update.
 //
-// Three env vars carry a decision that was already made, so it is made once per
-// run rather than once per process. The launcher starts a second codehalter
-// inside the container and a self-update re-executes a third, and asking the
-// same question in each of them would be three prompts for one intent:
+// Env vars carry a decision already made, so it is made once per run and not
+// once per process (the launcher starts a second codehalter in the container, a
+// self-update re-executes a third). They are the manual controls too:
 //
-//	CODEHALTER_LATEST=v42   the newest release, already resolved. Skips the API
-//	                        call (and its cache) entirely.
-//	CODEHALTER_UPDATE=yes   the user consented in this run: update, don't ask.
+//	CODEHALTER_LATEST=v42   the newest release, already resolved: no API call.
+//	CODEHALTER_UPDATE=yes   the user consented: update, don't ask.
 //	CODEHALTER_UPDATE=skip  don't check, don't ask, don't update.
 //
-// They are also the manual controls: CODEHALTER_UPDATE=skip in CI keeps the
-// check off the network, and CODEHALTER_UPDATE=yes makes an unattended run
-// self-update.
-//
-// Nothing here is allowed to stop codehalter from starting. No network, a rate
-// limit, an unwritable install directory: each one is reported in a line and
-// the run continues on the version already installed.
+// Nothing here may stop codehalter from starting: no network, a rate limit or
+// an unwritable install directory is one reported line, then the run goes on.
 // ---------------------------------------------------------------------------
 
 // version is the release tag this binary was built from, stamped by the build
@@ -201,15 +191,12 @@ func newerRelease(ctx context.Context, cwd string) string {
 	return tag
 }
 
-// selfUpdate installs the release asset for this platform over the running
-// binary and reports the path it replaced.
-//
-// The download lands in the install directory (a rename is atomic only within
-// one filesystem) and is only renamed into place once it has been run once and
-// reported the tag that was asked for. A wrong-architecture, truncated or
-// error-page "binary" therefore never replaces a working one, and neither does
-// a build whose version stamp is missing, which is also what stops a re-exec
-// loop: an update that does not change the version cannot commit.
+// selfUpdate installs this platform's release asset over the running binary
+// and reports the path it replaced. The download lands in the install directory
+// (a rename is atomic only within one filesystem) and is renamed into place
+// only after it has RUN once and reported the tag asked for. So a truncated,
+// wrong-architecture or error-page "binary" never replaces a working one, and
+// an update that does not change the version cannot loop.
 func selfUpdate(ctx context.Context, tag string) (string, error) {
 	self, err := executable()
 	if err != nil {
@@ -279,15 +266,11 @@ func selfUpdate(ctx context.Context, tag string) (string, error) {
 // selfUpdate matches the downloaded binary against.
 func versionLine(tag string) string { return "codehalter " + tag }
 
-// offerUpdate is the whole interaction for a terminal run: check, ask, install,
-// and re-exec into the new binary so the run continues on it. It returns before
-// anything else starts, so there is no session or container to lose.
-//
-// ask is false for a one-shot (-p) run and for a run whose stdin is not a
-// terminal: a script must not block on a question nobody is there to answer, so
-// those print the notice and carry on. $CODEHALTER_UPDATE=yes skips the
-// question the other way, which is how the launcher stops the copy inside the
-// container from asking again what the user already answered on the host.
+// offerUpdate is the whole interaction for a terminal run: check, ask, install
+// and re-exec, before anything else starts, so no session or container is
+// lost. ask is false for a one-shot (-p) run or a non-terminal stdin, which
+// print the notice and carry on. $CODEHALTER_UPDATE=yes skips the question,
+// which is how the launcher stops the copy in the container from asking again.
 func offerUpdate(ctx context.Context, cwd string, ask bool) {
 	tag := newerRelease(ctx, cwd)
 	if tag == "" {

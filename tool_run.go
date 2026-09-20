@@ -12,8 +12,8 @@ import (
 // The container itself is the sandbox: it's throwaway, the host workspace is
 // bind-mounted (the LLM can already write to those files via edit_file), and
 // apt-get/dpkg/pip writes are scoped to the container's lifetime. Devcontainers
-// are expected to bind-mount `.git` read-only so destructive git commands fail
-// at the OS layer; we no longer install a PATH shim for `git`.
+// are expected to bind-mount `.git` read-only, so destructive git commands fail
+// at the OS layer.
 func (a *agent) discoverSandbox() {
 	// Only register run_command inside a container — the container IS the
 	// sandbox. Outside one, ensureDevcontainer aborts the session before any

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -215,7 +216,7 @@ func specPaths(cwd, specArg, outArg string) (specRel, outRel string, err error) 
 // Module names are guessed from the spec's chapter files, because a rewrite
 // that follows the spec names its modules after them ("05-cut.md" → cut/).
 func specIgnoredProbes(ctx context.Context, cwd, outRel string, idx *specIndex) []string {
-	if err := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--is-inside-work-tree").Run(); err != nil {
+	if _, err := specGit(ctx, cwd, "rev-parse", "--is-inside-work-tree"); err != nil {
 		return nil
 	}
 	probes := []string{"Cargo.toml", "package.json", "src/lib.rs", "src/main.rs", "tests/smoke.rs", "tests/fixture.json", "test_data/x", "fixtures/x.json"}
@@ -274,104 +275,215 @@ func specModuleNames(idx *specIndex) []string {
 	return names
 }
 
-// runSpec is the /spec command: status, or setup/resume followed by the loop.
+// specRun is one /spec invocation: what every stage of it shares. The loop
+// re-reads the spec each round, so idx is replaced as it goes.
+type specRun struct {
+	a      *agent
+	sid    string
+	sess   *Session
+	cfg    *specConfig
+	idx    *specIndex
+	outAbs string
+
+	reasons   map[string]string // why the last round on an item did not count
+	removeOK  map[string]bool   // removal cards already answered
+	lastDelta string            // the change report already shown
+}
+
+// specWork is one round's assignment: which item, what kind of round, and what
+// the model is told beyond the item's own text.
+type specWork struct {
+	Item     string
+	Mode     specMode
+	Question string // the question this item was blocked on
+	Answer   string // and the user's answer to it
+	Reason   string // why the previous round on this item did not count
+	Note     string // change: the spec's diff; removal: the text that was deleted
+}
+
+func (r *specRun) say(ctx context.Context, s string) { r.a.say(ctx, r.sid, s) }
+
+func (r *specRun) save(ctx context.Context) {
+	if err := saveSpecConfig(r.sess.Cwd, r.cfg); err != nil {
+		r.say(ctx, "⚠ /spec: "+err.Error()+"\n")
+	}
+}
+
+func (r *specRun) scan() error {
+	idx, err := scanSpec(filepath.Join(r.sess.Cwd, r.cfg.SpecDir), r.cfg.idPatterns(), r.cfg.Context, r.cfg.Skip)
+	if err == nil {
+		r.idx = idx
+	}
+	return err
+}
+
+func (r *specRun) testCmd() string {
+	if r.cfg.TestCmd != "" {
+		return r.cfg.TestCmd
+	}
+	return detectSpecTestCmd(r.outAbs)
+}
+
+// runSpec is the /spec command: settle which spec, check it can run unattended,
+// then one round per item until everything is covered or blocked.
 func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args string, pendingFixes []fixProblem) (PromptResponse, error) {
 	end := PromptResponse{StopReason: "end_turn"}
-	say := func(s string) { a.say(ctx, sid, s) }
+	cfg, cmd, ok := a.specResolve(ctx, sid, sess, args)
+	if !ok {
+		return end, nil
+	}
+	r := &specRun{a: a, sid: sid, sess: sess, cfg: cfg, outAbs: filepath.Join(sess.Cwd, cfg.OutDir),
+		reasons: map[string]string{}, removeOK: map[string]bool{}}
+	if err := r.scan(); err != nil {
+		r.say(ctx, "⚠ /spec: reading the spec: "+err.Error()+"\n")
+		return end, nil
+	}
+	if len(r.idx.order) == 0 {
+		r.say(ctx, fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
+		return end, nil
+	}
+	if cmd == "status" {
+		covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
+		if err != nil {
+			r.say(ctx, "⚠ /spec: scanning "+cfg.OutDir+": "+err.Error()+"\n")
+			return end, nil
+		}
+		// The comparison a run would do, so status names the work it picks up first.
+		delta := specReconcile(cfg, r.idx, covered)
+		r.say(ctx, renderSpecStatus(cfg, r.idx, covered, testFiles, r.testCmd())+"\n"+renderSpecDelta(delta))
+		r.save(ctx)
+		return end, nil
+	}
+	if !r.preflight(ctx) {
+		return end, nil
+	}
 
+	sess.setSpecFence(filepath.Join(sess.Cwd, cfg.SpecDir))
+	defer sess.setSpecFence("")
+
+	fixes := pendingFixes
+	stopped := func(err error) (PromptResponse, error) {
+		r.save(context.Background())
+		msg := "⏹ Spec loop stopped. `/spec` resumes it where the ledger says it is.\n"
+		if !errors.Is(err, errUserCancelled) {
+			msg = "⏹ Spec loop cancelled (" + cancelReason(err) + "). `/spec` resumes it where the ledger says it is.\n"
+		}
+		a.say(context.Background(), sid, msg)
+		return PromptResponse{StopReason: "cancelled"}, nil
+	}
+
+	maxBlocked := cfg.MaxBlocked
+	if maxBlocked <= 0 {
+		maxBlocked = defaultSpecMaxBlocked
+	}
+	for consecutive, round := 0, 1; ; round++ {
+		if err := ctx.Err(); err != nil {
+			return stopped(err)
+		}
+		// Re-read everything each round: the user may edit the spec or the code
+		// between rounds, and coverage is never trusted from memory.
+		if err := r.scan(); err != nil {
+			r.say(ctx, "⚠ /spec: reading the spec: "+err.Error()+"\n")
+			break
+		}
+		covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
+		if err != nil {
+			r.say(ctx, "⚠ /spec: scanning "+cfg.OutDir+": "+err.Error()+"\n")
+			break
+		}
+		w := r.pickWork(ctx, covered, testFiles)
+		if w.Item == "" {
+			r.say(ctx, fmt.Sprintf("\n✅ **/spec finished**: every item in `%s/` is covered by a passing test, or blocked.\n\n", cfg.SpecDir))
+			break
+		}
+		// The pre-turn checks a typed prompt gets: settings reload, skills for a
+		// stack the last round introduced, MCP reconcile.
+		fixes = append(fixes, a.prepareChecks(ctx, sess, sid)...)
+
+		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, covered, r.testCmd())
+		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
+		turnErr := a.runPromptTurn(ctx, sess, prompt)
+		if isCancelled(turnErr) {
+			return stopped(turnErr)
+		}
+		done, block, err := r.finishRound(ctx, w, turnErr)
+		if err != nil {
+			return stopped(err)
+		}
+		switch {
+		case done:
+			consecutive = 0
+		case block:
+			consecutive++
+		}
+		if block && w.Mode == specModeSetup {
+			r.say(ctx, "The project setup could not be finished, and every item depends on it. Fix what the block says, then run /spec again.\n")
+			break
+		}
+		if consecutive >= maxBlocked {
+			r.say(ctx, fmt.Sprintf("Stopping: %d items in a row ended blocked, which usually means one shared problem (the build, the test command, a missing toolchain). `/spec status` lists them.\n", consecutive))
+			break
+		}
+	}
+
+	a.drainSteer(ctx, sess)
+	a.drainFixes(ctx, sid, dedupeFixes(fixes))
+	return end, nil
+}
+
+// specResolve settles which spec this run is about: the arguments, the saved
+// config, or on a project's first /spec the setup dialog.
+func (a *agent) specResolve(ctx context.Context, sid string, sess *Session, args string) (cfg *specConfig, cmd string, ok bool) {
+	say := func(s string) { a.say(ctx, sid, s) }
 	cmd, specArg, outArg, target, err := parseSpecArgs(args)
 	if err != nil {
 		say(err.Error() + "\n")
-		return end, nil
+		return nil, "", false
 	}
-	cfg, err := loadSpecConfig(sess.Cwd)
-	if err != nil {
+	if cfg, err = loadSpecConfig(sess.Cwd); err != nil {
 		say("⚠ " + err.Error() + "\n")
-		return end, nil
+		return nil, "", false
 	}
-	// applySetup records where the spec is, what is built from it and where,
-	// whether that came from the command line or from the setup dialog.
-	applySetup := func(specArg, outArg, target string) bool {
-		specRel, outRel, err := specPaths(sess.Cwd, specArg, outArg)
-		if err != nil {
-			say("⚠ /spec: " + err.Error() + "\n")
-			return false
+	if cmd != "setup" {
+		if cfg != nil {
+			return cfg, cmd, true
 		}
-		if cfg == nil || cfg.SpecDir != specRel {
-			cfg = &specConfig{} // a different spec: its attempts and blocks don't carry over
-		}
-		cfg.SpecDir, cfg.OutDir, cfg.Target = specRel, outRel, target
-		if err := os.MkdirAll(filepath.Join(sess.Cwd, outRel), 0o755); err != nil {
-			say("⚠ /spec: creating " + outRel + ": " + err.Error() + "\n")
-			return false
-		}
-		if err := saveSpecConfig(sess.Cwd, cfg); err != nil {
-			say("⚠ /spec: " + err.Error() + "\n")
-			return false
-		}
-		say(fmt.Sprintf("**/spec** `%s/` → `%s/`%s\n\n", cfg.SpecDir, cfg.OutDir,
-			map[bool]string{true: "", false: " · target: " + cfg.Target}[cfg.Target == ""]))
-		return true
-	}
-	switch cmd {
-	case "setup":
-		if !applySetup(specArg, outArg, target) {
-			return end, nil
-		}
-	default:
-		if cfg == nil {
-			// First /spec in this project: ask rather than print a usage line.
-			specDir, outDir, tgt, ok := a.specSetupDialog(ctx, sid, sess)
-			if !ok || !applySetup(specDir, outDir, tgt) {
-				return end, nil
-			}
+		// First /spec in this project: ask rather than print a usage line.
+		if specArg, outArg, target, ok = a.specSetupDialog(ctx, sid, sess); !ok {
+			return nil, "", false
 		}
 	}
-
-	specAbs := filepath.Join(sess.Cwd, cfg.SpecDir)
-	outAbs := filepath.Join(sess.Cwd, cfg.OutDir)
-	scan := func() (*specIndex, error) {
-		var context []string
-		if len(cfg.Context) > 0 {
-			context = cfg.Context
-		}
-		return scanSpec(specAbs, cfg.idPatterns(), context, cfg.Skip)
-	}
-	idx, err := scan()
+	specRel, outRel, err := specPaths(sess.Cwd, specArg, outArg)
 	if err != nil {
-		say("⚠ /spec: reading the spec: " + err.Error() + "\n")
-		return end, nil
+		say("⚠ /spec: " + err.Error() + "\n")
+		return nil, "", false
 	}
-	if len(idx.order) == 0 {
-		say(fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
-		return end, nil
+	if cfg == nil || cfg.SpecDir != specRel {
+		cfg = &specConfig{} // a different spec: its attempts and blocks don't carry over
 	}
-	testCmd := func() string {
-		if cfg.TestCmd != "" {
-			return cfg.TestCmd
-		}
-		return detectSpecTestCmd(outAbs)
+	cfg.SpecDir, cfg.OutDir, cfg.Target = specRel, outRel, target
+	if err := os.MkdirAll(filepath.Join(sess.Cwd, outRel), 0o755); err != nil {
+		say("⚠ /spec: creating " + outRel + ": " + err.Error() + "\n")
+		return nil, "", false
 	}
+	if err := saveSpecConfig(sess.Cwd, cfg); err != nil {
+		say("⚠ /spec: " + err.Error() + "\n")
+		return nil, "", false
+	}
+	line := fmt.Sprintf("**/spec** `%s/` → `%s/`", cfg.SpecDir, cfg.OutDir)
+	if cfg.Target != "" {
+		line += " · target: " + cfg.Target
+	}
+	say(line + "\n\n")
+	return cfg, cmd, true
+}
 
-	if cmd == "status" {
-		covered, testFiles, err := specCoverage(outAbs, idx.order)
-		if err != nil {
-			say("⚠ /spec: scanning " + cfg.OutDir + ": " + err.Error() + "\n")
-			return end, nil
-		}
-		// The same comparison a run would do, so `status` reports the work the
-		// next `/spec` would pick up before anything else.
-		delta := specReconcile(cfg, idx, covered)
-		say(renderSpecStatus(cfg, idx, covered, testFiles, testCmd()) + "\n" + renderSpecDelta(delta))
-		if err := saveSpecConfig(sess.Cwd, cfg); err != nil {
-			say("⚠ /spec: " + err.Error() + "\n")
-		}
-		return end, nil
-	}
-
-	// Pre-flight: what would make an unattended run go wrong from the start.
+// preflight reports what would make an unattended run go wrong from the start,
+// and asks (or, under autopilot, refuses) before starting over it.
+func (r *specRun) preflight(ctx context.Context) bool {
+	cfg := r.cfg
 	var problems []string
-	markers := idx.openMarkers(cfg.openMarkers(), cfg.SpecDir)
+	markers := r.idx.openMarkers(cfg.openMarkers(), cfg.SpecDir)
 	if len(markers) > 0 && !cfg.AcceptOpenMarkers {
 		shown := markers
 		if len(shown) > 10 {
@@ -380,237 +492,164 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		problems = append(problems, fmt.Sprintf("The spec still has %d open-decision marker(s) (%s): %s. Every round would settle those by itself.",
 			len(markers), strings.Join(cfg.openMarkers(), "/"), strings.Join(shown, ", ")))
 	}
-	if ign := specIgnoredProbes(ctx, sess.Cwd, cfg.OutDir, idx); len(ign) > 0 {
+	if ign := specIgnoredProbes(ctx, r.sess.Cwd, cfg.OutDir, r.idx); len(ign) > 0 {
 		problems = append(problems, fmt.Sprintf("git would ignore files the rewrite creates, so the per-item commits would silently leave them out: %s. Anchor those rules to where the old code writes (a leading `/`, e.g. `/cut/`), or scope them to its directory.",
 			strings.Join(ign, "; ")))
 	}
-	if len(problems) > 0 {
-		say("**/spec pre-flight**\n\n- " + strings.Join(problems, "\n- ") + "\n\n")
-		if a.isAutopilot() {
-			say("Autopilot does not start over these. Resolve them, or set `accept_open_markers = true` in `.codehalter/spec.toml` to take the open points as written, then run /spec again.\n")
-			return end, nil
-		}
-		ok, tcId, err := a.askYesNoWithCard(ctx, sid, "Start the spec loop anyway?", "think", "Start anyway", "Stop")
-		if err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return end, nil
-		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(map[bool]string{true: "Starting", false: "Stopped"}[ok])})
-		if !ok {
-			return end, nil
-		}
-		if len(markers) > 0 {
-			cfg.AcceptOpenMarkers = true
-			if err := saveSpecConfig(sess.Cwd, cfg); err != nil {
-				say("⚠ /spec: " + err.Error() + "\n")
+	if len(problems) == 0 {
+		return true
+	}
+	r.say(ctx, "**/spec pre-flight**\n\n- "+strings.Join(problems, "\n- ")+"\n\n")
+	if r.a.isAutopilot() {
+		r.say(ctx, "Autopilot does not start over these. Resolve them, or set `accept_open_markers = true` in `.codehalter/spec.toml` to take the open points as written, then run /spec again.\n")
+		return false
+	}
+	ok, tcId, err := r.a.askYesNoWithCard(ctx, r.sid, "Start the spec loop anyway?", "think", "Start anyway", "Stop")
+	if err != nil {
+		r.a.FailToolCall(ctx, r.sid, tcId, err.Error())
+		return false
+	}
+	r.a.CompleteToolCall(ctx, r.sid, tcId, []ToolCallContent{TextContent(map[bool]string{true: "Starting", false: "Stopped"}[ok])})
+	if ok && len(markers) > 0 {
+		cfg.AcceptOpenMarkers = true
+		r.save(ctx)
+	}
+	return ok
+}
+
+// pickWork compares the spec with what the ledger says was built, and returns
+// the next round: setup, then deletions (an item that is gone must not be
+// worked on by a later round), then items whose spec text moved (the code
+// claims something the spec no longer says), then the first uncovered item.
+// An empty Item means nothing is left.
+func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testFiles int) specWork {
+	cfg := r.cfg
+	delta := specReconcile(cfg, r.idx, covered)
+	if rep := renderSpecDelta(delta); rep != "" && rep != r.lastDelta {
+		r.say(ctx, rep)
+		r.lastDelta = rep
+	}
+	// Each removal is confirmed once. Declining forgets the item: it is gone
+	// from the spec and the user keeps its code, so there is nothing to track.
+	var removals []string
+	for _, id := range delta.Removed {
+		ok, asked := r.removeOK[id]
+		if !asked {
+			ok = r.a.askSpecRemoval(ctx, r.sid, id)
+			r.removeOK[id] = ok
+			if !ok {
+				delete(cfg.Items, id)
+				r.save(ctx)
 			}
+		}
+		if ok {
+			removals = append(removals, id)
 		}
 	}
 
-	sess.setSpecFence(specAbs)
-	defer sess.setSpecFence("")
-
-	reasons := map[string]string{} // why the last round on an item did not count, for its retry
-	consecutive, round := 0, 0
-	// Removals are confirmed once per id, then worked one round each. Declining
-	// forgets the item instead: it is gone from the spec and the user chose to
-	// keep its code, so there is nothing left to track or to ask about again.
-	removeOK := map[string]bool{}
-	lastDelta := ""
-	fixes := pendingFixes
-	stopped := func(err error) (PromptResponse, error) {
-		if serr := saveSpecConfig(sess.Cwd, cfg); serr != nil {
-			a.say(context.Background(), sid, "⚠ /spec: "+serr.Error()+"\n")
-		}
-		msg := "⏹ Spec loop stopped. `/spec` resumes it where the ledger says it is.\n"
-		if !errors.Is(err, errUserCancelled) && !sess.superseded() {
-			msg = "⏹ Spec loop cancelled (" + cancelReason(err) + "). `/spec` resumes it where the ledger says it is.\n"
-		}
-		if !sess.superseded() {
-			a.say(context.Background(), sid, msg)
-		}
-		return PromptResponse{StopReason: "cancelled"}, nil
+	var w specWork
+	switch {
+	case r.testCmd() == "" || testFiles == 0:
+		w = specWork{Item: specSetupID, Mode: specModeSetup}
+	case len(removals) > 0:
+		w = specWork{Item: removals[0], Mode: specModeRemove}
+		w.Note = specRemovedText(ctx, r.sess.Cwd, cfg, w.Item)
+	case len(delta.Changed) > 0:
+		w = specWork{Item: delta.Changed[0], Mode: specModeChange}
+		w.Note = specSpecDiff(ctx, r.sess.Cwd, cfg.Items[w.Item].Commit, cfg.SpecDir+"/"+r.idx.docs[r.idx.items[w.Item].Doc].rel)
+	default:
+		w.Item, w.Answer = nextSpecItem(r.idx, covered, cfg)
 	}
+	if w.Answer != "" {
+		if b := cfg.block(w.Item); b != nil {
+			w.Question = b.Question
+		}
+		cfg.unblock(w.Item)
+		delete(cfg.Attempts, w.Item)
+	}
+	w.Reason = r.reasons[w.Item]
+	return w
+}
 
-	for {
-		if err := ctx.Err(); err != nil {
-			return stopped(err)
+// finishRound judges a round: run the tests, re-scan coverage, commit, then
+// decide the item's fate and record it. err is non-nil only when the run was
+// cancelled meanwhile.
+func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error) (done, block bool, err error) {
+	cfg, item := r.cfg, w.Item
+	res := specRoundResult{Mode: w.Mode}
+	var covered map[string]string
+	var q *specQuestionError
+	if errors.As(turnErr, &q) {
+		res.Question = q.Question
+	} else {
+		if turnErr != nil {
+			res.TurnErr = turnErr.Error()
 		}
-		// Re-read everything each round: the user may edit the spec or the code
-		// between rounds, and coverage is never trusted from memory.
-		if idx, err = scan(); err != nil {
-			say("⚠ /spec: reading the spec: " + err.Error() + "\n")
-			break
-		}
-		covered, testFiles, err := specCoverage(outAbs, idx.order)
-		if err != nil {
-			say("⚠ /spec: scanning " + cfg.OutDir + ": " + err.Error() + "\n")
-			break
-		}
-		// What the spec says now, against what the ledger says was built. This
-		// runs every round because the user may edit the spec while it runs.
-		delta := specReconcile(cfg, idx, covered)
-		if rep := renderSpecDelta(delta); rep != "" && rep != lastDelta {
-			say(rep)
-			lastDelta = rep
-		}
-		var removals []string
-		for _, id := range delta.Removed {
-			ok, asked := removeOK[id]
-			if !asked {
-				ok = a.askSpecRemoval(ctx, sid, id)
-				removeOK[id] = ok
-				if !ok {
-					delete(cfg.Items, id)
-					if err := saveSpecConfig(sess.Cwd, cfg); err != nil {
-						say("⚠ /spec: " + err.Error() + "\n")
-					}
-				}
-			}
-			if ok {
-				removals = append(removals, id)
-			}
-		}
-
-		mode := specModeItem
-		setup := testCmd() == "" || testFiles == 0
-		item, answer := specSetupID, ""
-		switch {
-		case setup:
-			mode = specModeSetup
-		case len(removals) > 0:
-			// Deletions first: they keep the suite honest, and an item that is
-			// gone must not be worked on by a later round.
-			item, mode = removals[0], specModeRemove
-		case len(delta.Changed) > 0:
-			// Then items whose spec text moved: the code claims to implement
-			// something the spec no longer says.
-			item, mode = delta.Changed[0], specModeChange
-		default:
-			item, answer = nextSpecItem(idx, covered, cfg)
-		}
-		if item == "" {
-			say(fmt.Sprintf("\n✅ **/spec finished**: every item in `%s/` is covered by a passing test, or blocked.\n\n", cfg.SpecDir))
-			break
-		}
-		question := ""
-		if answer != "" {
-			if b := cfg.block(item); b != nil {
-				question = b.Question
-			}
-			cfg.unblock(item)
-			delete(cfg.Attempts, item)
-		}
-
-		// The pre-turn checks a typed prompt gets: settings reload, skills for a
-		// stack the last round introduced, MCP reconcile.
-		fixes = append(fixes, a.prepareChecks(ctx, sess, sid)...)
-
-		// A change round is shown the spec edit itself; a removal round the text
-		// that was deleted. Both come out of git, which has the old spec.
-		note := ""
-		switch mode {
-		case specModeChange:
-			note = specSpecDiff(ctx, sess.Cwd, cfg.Items[item].Commit, cfg.SpecDir+"/"+idx.docs[idx.items[item].Doc].rel)
-		case specModeRemove:
-			note = specRemovedText(ctx, sess.Cwd, cfg, item)
-		}
-
-		round++
-		prompt, head := a.specRoundPrompt(sid, cfg, idx, item, mode, covered, testCmd(), reasons[item], question, answer, note)
-		say(fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
-		turnErr := a.runPromptTurn(ctx, sess, prompt)
-		if isCancelled(turnErr) {
-			return stopped(turnErr)
-		}
-		res := specRoundResult{Mode: mode}
-		var q *specQuestionError
-		if errors.As(turnErr, &q) {
-			res.Question = q.Question
+		if cmd := r.testCmd(); cmd == "" {
+			res.TestTail = "no test command found: `" + cfg.OutDir + "/` has no justfile with a test recipe, no Cargo.toml, package.json or go.mod"
 		} else {
-			if turnErr != nil {
-				res.TurnErr = turnErr.Error()
-			}
-			if cmd := testCmd(); cmd == "" {
-				res.TestTail = "no test command found: `" + cfg.OutDir + "/` has no justfile with a test recipe, no Cargo.toml, package.json or go.mod"
-			} else {
-				res.TestsPass, res.TestTail = a.runSpecTests(ctx, sid, outAbs, cfg.OutDir, cmd)
-				if err := ctx.Err(); err != nil {
-					return stopped(err)
-				}
-			}
-			covered, testFiles, _ = specCoverage(outAbs, idx.order)
-			if mode == specModeSetup {
-				res.Covered = testFiles > 0
-			} else {
-				_, res.Covered = covered[item]
+			res.TestsPass, res.TestTail = r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd)
+			if err := ctx.Err(); err != nil {
+				return false, false, err
 			}
 		}
-
-		// Commit before deciding: whether the round changed anything IS the
-		// verdict for a change round (see specDecide), and a removal round has
-		// deletions to record either way.
-		sha := ""
-		if res.TurnErr == "" {
-			sha = a.specCommit(ctx, sid, sess.Cwd, cfg, idx, item, mode)
-			res.Committed = sha != ""
-		}
-		done, block, reason := specDecide(cfg, item, res)
-		switch {
-		case done:
-			delete(cfg.Attempts, item)
-			delete(reasons, item)
-			consecutive = 0
-			switch mode {
-			case specModeRemove:
-				delete(cfg.Items, item)
-				delete(removeOK, item)
-				say(fmt.Sprintf("🗑 %s removed: the spec no longer has it.\n", item))
-			case specModeSetup:
-				say("✅ project setup is done.\n")
-			default:
-				// Record what the spec said, so a later edit to this section is
-				// visible as a change instead of passing as still-implemented.
-				cfg.Items[item] = specLedger{
-					Hash:      specItemHash(idx, item),
-					Title:     idx.items[item].Title,
-					File:      idx.docs[idx.items[item].Doc].rel,
-					CoveredBy: covered[item],
-					Commit:    sha,
-					At:        time.Now().UTC(),
-				}
-				say(fmt.Sprintf("✅ %s is covered.\n", item))
-			}
-		case block:
-			cfg.Blocked = append(cfg.Blocked, specBlock{ID: item, Reason: firstLine(reason), Question: res.Question})
-			delete(cfg.Attempts, item)
-			delete(reasons, item)
-			consecutive++
-			msg := fmt.Sprintf("⛔ %s blocked: %s\n", item, firstLine(reason))
-			if res.Question != "" {
-				msg += "Question for you: " + res.Question + "\nAnswer it in `.codehalter/spec.toml` (the item's `answer`), then run /spec.\n"
-			}
-			say(msg)
-		default:
-			reasons[item] = reason
-			say(fmt.Sprintf("↻ %s is not done yet, one more round: %s\n", item, firstLine(reason)))
-		}
-		if err := saveSpecConfig(sess.Cwd, cfg); err != nil {
-			say("⚠ /spec: " + err.Error() + "\n")
-		}
-		if block && setup {
-			say("The project setup could not be finished, and every item depends on it. Fix what the block says, then run /spec again.\n")
-			break
-		}
-		if consecutive >= cfg.maxBlocked() {
-			say(fmt.Sprintf("Stopping: %d items in a row ended blocked, which usually means one shared problem (the build, the test command, a missing toolchain). `/spec status` lists them.\n", consecutive))
-			break
+		var testFiles int
+		covered, testFiles, _ = specCoverage(r.outAbs, r.idx.order)
+		if w.Mode == specModeSetup {
+			res.Covered = testFiles > 0
+		} else {
+			_, res.Covered = covered[item]
 		}
 	}
 
-	a.drainSteer(ctx, sess)
-	a.drainFixes(ctx, sid, dedupeFixes(fixes))
-	return end, nil
+	// Commit before deciding: whether the round changed anything IS the verdict
+	// for a change round (see specDecide), and a removal round has deletions to
+	// record either way.
+	sha := ""
+	if res.TurnErr == "" {
+		sha = r.a.specCommit(ctx, r.sid, r.sess.Cwd, cfg, r.idx, item, w.Mode)
+		res.Committed = sha != ""
+	}
+	done, block, reason := specDecide(cfg, item, res)
+	switch {
+	case done:
+		delete(cfg.Attempts, item)
+		delete(r.reasons, item)
+		switch w.Mode {
+		case specModeRemove:
+			delete(cfg.Items, item)
+			delete(r.removeOK, item)
+			r.say(ctx, fmt.Sprintf("🗑 %s removed: the spec no longer has it.\n", item))
+		case specModeSetup:
+			r.say(ctx, "✅ project setup is done.\n")
+		default:
+			// Record what the spec said, so a later edit to this section shows
+			// up as a change instead of passing as still-implemented.
+			cfg.Items[item] = specLedger{
+				Hash:      specItemHash(r.idx, item),
+				Title:     r.idx.items[item].Title,
+				File:      r.idx.docs[r.idx.items[item].Doc].rel,
+				CoveredBy: covered[item],
+				Commit:    sha,
+				At:        time.Now().UTC(),
+			}
+			r.say(ctx, fmt.Sprintf("✅ %s is covered.\n", item))
+		}
+	case block:
+		cfg.Blocked = append(cfg.Blocked, specBlock{ID: item, Reason: firstLine(reason), Question: res.Question})
+		delete(cfg.Attempts, item)
+		delete(r.reasons, item)
+		msg := fmt.Sprintf("⛔ %s blocked: %s\n", item, firstLine(reason))
+		if res.Question != "" {
+			msg += "Question for you: " + res.Question + "\nAnswer it in `.codehalter/spec.toml` (the item's `answer`), then run /spec.\n"
+		}
+		r.say(ctx, msg)
+	default:
+		r.reasons[item] = reason
+		r.say(ctx, fmt.Sprintf("↻ %s is not done yet, one more round: %s\n", item, firstLine(reason)))
+	}
+	r.save(ctx)
+	return done, block, nil
 }
 
 // dedupeFixes drops repeated fix cards: the pre-turn checks run once per round,
@@ -630,7 +669,8 @@ func dedupeFixes(fixes []fixProblem) []fixProblem {
 // specRoundPrompt renders the round's user message from res/SPEC.md (or
 // SPEC-SETUP.md for the setup round) and returns it with a one-line heading
 // for the chat.
-func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, item string, mode specMode, covered map[string]string, testCmd, reason, question, answer, note string) (prompt, head string) {
+func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w specWork, covered map[string]string, testCmd string) (prompt, head string) {
+	item, mode, note := w.Item, w.Mode, w.Note
 	target := cfg.Target
 	if target == "" {
 		target = "No technology was given with /spec. Use what the spec implies; where it leaves the choice open, pick a mainstream option and state it in the project README."
@@ -644,22 +684,19 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, ite
 	}
 	previous := ""
 	switch {
-	case answer != "":
+	case w.Answer != "":
 		previous = "## Your earlier question was answered\n\n"
-		if question != "" {
-			previous += "Question: " + question + "\n\n"
+		if w.Question != "" {
+			previous += "Question: " + w.Question + "\n\n"
 		}
-		previous += "Answer: " + answer
-	case reason != "":
-		previous = "## The previous round on this item did not count\n\n" + reason + "\n\nFix that first."
+		previous += "Answer: " + w.Answer
+	case w.Reason != "":
+		previous = "## The previous round on this item did not count\n\n" + w.Reason + "\n\nFix that first."
 	}
 
 	if mode == specModeRemove {
 		led := cfg.Items[item]
-		body := a.loadPromptFile(sid, "SPEC-REMOVE.md")
-		if body == "" {
-			body = defaultSpecRemoveMD
-		}
+		body := cmp.Or(a.loadPromptFile(sid, "SPEC-REMOVE.md"), defaultSpecRemoveMD)
 		title := led.Title
 		if title == "" {
 			title = item
@@ -681,10 +718,7 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, ite
 	}
 
 	if mode == specModeSetup {
-		body := a.loadPromptFile(sid, "SPEC-SETUP.md")
-		if body == "" {
-			body = defaultSpecSetupMD
-		}
+		body := cmp.Or(a.loadPromptFile(sid, "SPEC-SETUP.md"), defaultSpecSetupMD)
 		r := strings.NewReplacer(
 			"{{spec_dir}}", cfg.SpecDir, "{{out_dir}}", cfg.OutDir, "{{target}}", target,
 			"{{context}}", context, "{{previous}}", previous,
@@ -719,10 +753,7 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, ite
 	if len(sl.Related) > 0 {
 		related = "Also relevant, read if you need it: " + strings.Join(sl.Related, ", ") + "\n"
 	}
-	body := a.loadPromptFile(sid, "SPEC.md")
-	if body == "" {
-		body = defaultSpecMD
-	}
+	body := cmp.Or(a.loadPromptFile(sid, "SPEC.md"), defaultSpecMD)
 	if note != "" {
 		previous = "## This item was implemented before, and the spec has changed since\n\n" +
 			"The code and its test match the OLD text. Update both to the text below; where the diff removes something, remove it from the code too.\n\n```diff\n" +
@@ -785,14 +816,17 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 // toolchain lives) after an item passes, so every covered item is one commit
 // and a cancelled or crashed loop loses nothing. Anything else in the tree is
 // left for the user: an unrelated change of theirs must not ride along.
+// specGit runs git in the project and returns its combined output.
+func specGit(ctx context.Context, cwd string, args ...string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", append([]string{"-C", cwd}, args...)...).CombinedOutput()
+	return string(out), err
+}
+
 // specCommit stages the output directory and commits it, returning the new
 // commit's sha (empty when there was nothing to commit, which is how a change
 // round detects that the model did not touch the code).
 func (a *agent) specCommit(ctx context.Context, sid, cwd string, cfg *specConfig, idx *specIndex, item string, mode specMode) string {
-	git := func(args ...string) (string, error) {
-		out, err := exec.CommandContext(ctx, "git", append([]string{"-C", cwd}, args...)...).CombinedOutput()
-		return string(out), err
-	}
+	git := func(args ...string) (string, error) { return specGit(ctx, cwd, args...) }
 	if _, err := git("rev-parse", "--is-inside-work-tree"); err != nil {
 		return ""
 	}
@@ -979,11 +1013,11 @@ func specRemovedText(ctx context.Context, cwd string, cfg *specConfig, id string
 	if led.Commit == "" || led.File == "" {
 		return ""
 	}
-	out, err := exec.CommandContext(ctx, "git", "-C", cwd, "show", led.Commit+":"+cfg.SpecDir+"/"+led.File).Output()
+	out, err := specGit(ctx, cwd, "show", led.Commit+":"+cfg.SpecDir+"/"+led.File)
 	if err != nil {
 		return ""
 	}
-	return clipBytes(specSectionFromText(string(out), id), specSpecDiffBytes)
+	return clipBytes(specSectionFromText(out, id), specSpecDiffBytes)
 }
 
 // specSpecDiff is what changed in an item's spec file since the commit that
@@ -993,9 +1027,9 @@ func specSpecDiff(ctx context.Context, cwd, commit, relPath string) string {
 	if commit == "" {
 		return ""
 	}
-	out, err := exec.CommandContext(ctx, "git", "-C", cwd, "diff", commit+"..HEAD", "--", relPath).CombinedOutput()
+	out, err := specGit(ctx, cwd, "diff", commit+"..HEAD", "--", relPath)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(clipBytes(string(out), specSpecDiffBytes))
+	return strings.TrimSpace(clipBytes(out, specSpecDiffBytes))
 }

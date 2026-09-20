@@ -23,43 +23,22 @@ import (
 // ---------------------------------------------------------------------------
 // Starting the devcontainer for the standalone CLI.
 //
-// codehalter refuses to run outside a container. The editor front end gets that
-// for free: Zed reopens the project in the container and starts the agent
-// there. At a shell prompt nobody does it for you, so --cli does it itself. It
-// reads .devcontainer/devcontainer.json, translates the keys it understands
-// into a generated compose file, and runs
+// codehalter refuses to run outside a container. Zed reopens the project in
+// one; at a shell prompt nobody does, so --cli does it itself: it translates
+// .devcontainer/devcontainer.json into a generated compose file and runs
 //
 //	<runtime> compose up -d      then     <runtime> compose exec ... codehalter --cli
 //
-// with the child's stdio wired straight to the terminal. What you end up
-// talking to is an ordinary codehalter CLI that happens to live in a container,
-// not a second front end.
+// Compose rather than `docker run`, because it already recreates the container
+// when its definition changes and gives the whole thing one name. "I edited the
+// Dockerfile and nothing happened" would otherwise be a frequent bug here.
 //
-// Why compose rather than plain `docker run`: compose already does the two
-// things this would otherwise have to reimplement. It hashes a service
-// definition and recreates the container when the definition changes, and it
-// gives the whole thing one name to start, exec into and stop. Both are easy to
-// get subtly wrong by hand, and "I edited the Dockerfile and nothing happened"
-// is a bug this project would hit often, because the agent is forever proposing
-// Dockerfile edits.
-//
-// This is deliberately NOT a devcontainer implementation. Keys that change what
-// ends up inside the container but that a compose file cannot express (features
-// above all, plus every lifecycle command) are refused BY NAME, with the
-// devcontainer CLI command to run instead. A config we cannot model completely
-// is one we hand off, never one we half-build: a container silently missing
-// half its setup is a worse outcome than a message saying so. The same reason
-// ensureTerminals refuses rather than falling back to running commands itself.
-//
-// Known differences from `devcontainer up`, all listed in the README:
-//   - updateRemoteUserUID is not implemented, so the container user keeps the
-//     uid baked into the image.
-//   - userEnvProbe is not implemented: commands get the image's environment
-//     rather than one probed from a login shell.
-//   - ${devcontainerId} is derived from the workspace path, so it does not
-//     match the id the devcontainer CLI would compute for the same folder.
-//   - shutdownAction defaults to leaving the container running rather than to
-//     stopping it, because the next `codehalter --cli` is then instant.
+// This is deliberately NOT a devcontainer implementation. Keys a compose file
+// cannot express (features, every lifecycle command) are refused BY NAME, with
+// the devcontainer CLI command to run instead: a container silently missing
+// half its setup is worse than a message saying so. Known differences from
+// `devcontainer up` (updateRemoteUserUID, userEnvProbe, ${devcontainerId},
+// shutdownAction defaulting to leave-running) are listed in the README.
 // ---------------------------------------------------------------------------
 
 // launcherService is the service name in a generated compose file. Fixed,

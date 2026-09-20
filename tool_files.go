@@ -135,31 +135,18 @@ const nearMissTieEpsilon = 1e-9
 // and a hard stop on a model that passed half the file as old_text.
 const nearMissSnippetCap = 1500
 
-// nearMiss finds the file region old_text most likely MEANT to match, for the
-// case where both the exact and the whitespace-tolerant match failed.
+// nearMiss finds the region old_text most likely MEANT to match, when both the
+// exact and the whitespace-tolerant match failed. For a small model this is
+// the recovery that matters: the failure is rarely an invented snippet, it is a
+// region reproduced from a read four calls ago in which something drifted.
+// Returning the region's current bytes lets it retry without a read_file.
 //
-// This is the recovery path that matters most for a small model. The failure is
-// almost never "the model invented a snippet"; it is "the model reproduced the
-// region from a read it did four tool calls ago, and something has drifted" — a
-// renamed identifier, an earlier edit of its own, a line it silently dropped.
-// Returning a bare "not found" makes it spend a read_file round-trip to
-// rediscover text codehalter is already holding in memory. Returning the actual
-// current bytes of the region lets it retry immediately.
-//
-// Scoring compares the window to the snippet line by line, positionally, and
-// each line pair by shared prefix and suffix rather than by equality. Equality
-// is too brittle for the dominant case: a renamed identifier changes the whole
-// line, so "one identifier drifted in a six-line block" would score 5/6 on the
-// unchanged lines but 0 on the one that actually moved, and a two-line snippet
-// with one drifted line would score 0.5 and sit right on the floor. Prefix and
-// suffix overlap degrades smoothly instead, which is what makes the common
-// single-token drift recoverable.
-//
-// Returns the 1-based start line and the window's real text, or ok=false when
-// nothing scores above nearMissMinScore or when the best score is a tie —
-// two equally-good candidates means we cannot say which region was meant, and
-// pointing at the wrong one is worse than not pointing at all (the same
-// unique-or-refuse rule tolerantReplace follows).
+// Lines are compared positionally, each by shared prefix and suffix rather
+// than equality: a renamed identifier changes its whole line, so equality would
+// score a two-line snippet with one drifted line at the floor. Returns the
+// 1-based start line and the real text, or ok=false when nothing clears
+// nearMissMinScore or the best score is a tie (unique-or-refuse, like
+// tolerantReplace: the wrong region is worse than none).
 func nearMiss(content, oldText string) (startLine int, snippet string, ok bool) {
 	fileLines := strings.Split(content, "\n")
 	oldLines := trimBlankEdges(strings.Split(oldText, "\n"))
@@ -327,7 +314,10 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	case content == "":
 		note = "[file is empty or past end of file]"
 	case more:
-		note = fmt.Sprintf("[showing lines %d-%d — the file continues. Call continue_read path=%q for the next ~%d lines (or read_file line=%d / search_text for a specific part). Do NOT re-read the whole file.]", start, end, path, readChunkLines, end+1)
+		note = fmt.Sprintf("[showing lines %d-%d, the file continues. "+
+			"MORE of it: continue_read path=%q returns the next ~%d lines (or read_file line=%d to jump). "+
+			"LESS of it: search_text query=<what you are looking for> path=%q context=5 returns only the lines around each hit. "+
+			"Do NOT re-read the whole file.]", start, end, path, readChunkLines, end+1, path)
 	default:
 		note = fmt.Sprintf("[end of file — line %d is the last; you have the file through line %d, do not re-read]", end, end)
 	}

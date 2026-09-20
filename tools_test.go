@@ -276,22 +276,13 @@ func TestAllToolDefinitions(t *testing.T) {
 	}
 }
 
-// TestPhasePolicy covers the dispatch-gate predicates that replaced array
-// pruning: deny rejects a call, terminals end the loop, both independent of the
-// (now full) tools array.
-func TestPhasePolicy(t *testing.T) {
+// TestTerminalList pins how a phase's terminal tools are named in a nudge:
+// sorted, so the message is stable. (The gate itself is covered by
+// TestRunToolLoopDenyGate.)
+func TestTerminalList(t *testing.T) {
 	p := phasePolicy{
 		deny:      map[string]bool{"edit_file": true},
 		terminals: map[string]bool{"respond": true, "submit_plan": true},
-	}
-	if !p.isDenied("edit_file") || p.isDenied("read_file") {
-		t.Error("isDenied wrong")
-	}
-	if !p.isTerminal("respond") || !p.isTerminal("submit_plan") || p.isTerminal("edit_file") {
-		t.Error("isTerminal wrong")
-	}
-	if !p.hasTerminal() || (phasePolicy{}).hasTerminal() {
-		t.Error("hasTerminal wrong")
 	}
 	if got := terminalList(p); got != "`respond` or `submit_plan`" {
 		t.Errorf("terminalList: %q", got)
