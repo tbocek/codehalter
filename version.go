@@ -326,6 +326,64 @@ func offerUpdate(ctx context.Context, cwd string, ask bool) {
 	}
 }
 
+// offerSelfUpdate is the editor's half of offerUpdate: same check, same
+// install, but it never re-execs. This process holds the editor's stdio and a
+// live session, and replacing the process would drop both.
+//
+// Installing over the running binary is safe even so. The rename in selfUpdate
+// unlinks the inode this process is executing, which keeps running to the end
+// of the session, and the new file is what the editor spawns next. So the user
+// accepts a card, finishes what they were doing, and starts a new thread on the
+// new version: no shell inside the container, no image rebuild.
+//
+// $CODEHALTER_UPDATE=yes means the terminal half already asked on the host and
+// was told yes, so the copy in the container installs without asking twice.
+func (a *agent) offerSelfUpdate(ctx context.Context, sess *Session, sid string) {
+	// Free after the banner's own call: the tag is in $CODEHALTER_LATEST.
+	tag := newerRelease(ctx, sess.Cwd)
+	if tag == "" {
+		return
+	}
+	tcId := ""
+	if os.Getenv(envUpdate) != "yes" {
+		ok, id, err := a.askYesNoWithCard(ctx, sid,
+			fmt.Sprintf("codehalter %s is available (running %s). Install it into this container?", tag, version),
+			"think", "Install", "Not now")
+		tcId = id
+		if err != nil {
+			a.FailToolCall(ctx, sid, tcId, err.Error())
+			return
+		}
+		if !ok {
+			// For the life of this process, which is every thread of this editor
+			// window: one decline answers for the release, not for the thread.
+			remember(envUpdate, "skip")
+			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(
+				"Staying on " + version + ". `codehalter --update` installs it whenever you want.")})
+			return
+		}
+	}
+	if tcId == "" {
+		tcId = a.StartToolCall(ctx, sid, "Installing codehalter "+tag, "think", nil)
+	}
+	// The asset is several MB over a link codehalter does not control, so the
+	// thread says something while it downloads.
+	stopBeat := a.heartbeat(ctx, sid)
+	path, err := selfUpdate(ctx, tag)
+	stopBeat()
+	// Answered either way, for the life of this process: a container whose
+	// install dir is read-only would report the same failure at every thread,
+	// and a success has nothing left to offer.
+	remember(envUpdate, "skip")
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("update failed: %v (staying on %s)", err, version))
+		return
+	}
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf(
+		"Installed codehalter %s to %s. This thread finishes on %s; start a new Agent Thread (the + button at the top) to run %s. The container does not need rebuilding.",
+		tag, path, version, tag))})
+}
+
 // runUpdate is --update: check and install with no question asked, for the run
 // that is not a terminal. It prints what it did and never re-executes, because
 // installing is all it was asked to do.

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -696,7 +695,7 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 
 	if mode == specModeRemove {
 		led := cfg.Items[item]
-		body := cmp.Or(a.loadPromptFile(sid, "SPEC-REMOVE.md"), defaultSpecRemoveMD)
+		body := a.loadPromptFile(sid, "SPEC-REMOVE.md")
 		title := led.Title
 		if title == "" {
 			title = item
@@ -718,7 +717,7 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 	}
 
 	if mode == specModeSetup {
-		body := cmp.Or(a.loadPromptFile(sid, "SPEC-SETUP.md"), defaultSpecSetupMD)
+		body := a.loadPromptFile(sid, "SPEC-SETUP.md")
 		r := strings.NewReplacer(
 			"{{spec_dir}}", cfg.SpecDir, "{{out_dir}}", cfg.OutDir, "{{target}}", target,
 			"{{context}}", context, "{{previous}}", previous,
@@ -753,7 +752,7 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 	if len(sl.Related) > 0 {
 		related = "Also relevant, read if you need it: " + strings.Join(sl.Related, ", ") + "\n"
 	}
-	body := cmp.Or(a.loadPromptFile(sid, "SPEC.md"), defaultSpecMD)
+	body := a.loadPromptFile(sid, "SPEC.md")
 	if note != "" {
 		previous = "## This item was implemented before, and the spec has changed since\n\n" +
 			"The code and its test match the OLD text. Update both to the text below; where the diff removes something, remove it from the code too.\n\n```diff\n" +

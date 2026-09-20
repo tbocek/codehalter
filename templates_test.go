@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -116,38 +117,42 @@ func TestExpandMacroCommitRunsBare(t *testing.T) {
 	}
 }
 
-// TestSeedTemplatesRetiresRemovedMacros: a project seeded before a macro was
-// removed still has the file on disk, and templateNames reads the DIRECTORY —
-// so without the sweep the dead command stays in the slash menu forever.
-func TestSeedTemplatesRetiresRemovedMacros(t *testing.T) {
+// TestTemplatesComeFromTheBinary: the shipped macros are in the slash menu with
+// nothing on disk, a file of the same name replaces one, and a file of a new
+// name adds a command. Retiring a macro is deleting its res/ file, because
+// nothing was ever copied into the project to outlive it.
+func TestTemplatesComeFromTheBinary(t *testing.T) {
 	dir := t.TempDir()
 	ch := filepath.Join(dir, ".codehalter")
 	if err := os.MkdirAll(ch, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	stale := filepath.Join(ch, "TEMPLATE-"+retiredTemplates[0]+".md")
-	if err := os.WriteFile(stale, []byte("old macro body"), 0o644); err != nil {
+	if !slices.Contains(templateNames(dir), "commit") {
+		t.Fatalf("shipped macros missing from the menu: %v", templateNames(dir))
+	}
+	if entries, _ := os.ReadDir(ch); len(entries) != 0 {
+		t.Errorf("listing the macros wrote to the project: %v", entries)
+	}
+	shipped, _ := loadTemplate(dir, "commit")
+
+	if err := os.WriteFile(filepath.Join(ch, "TEMPLATE-commit.md"), []byte("mine"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if body, _ := loadTemplate(dir, "commit"); body != "mine" {
+		t.Errorf("the override did not win: %q", body)
+	}
+	if err := os.Remove(filepath.Join(ch, "TEMPLATE-commit.md")); err != nil {
+		t.Fatal(err)
+	}
+	if body, _ := loadTemplate(dir, "commit"); body != shipped {
+		t.Error("removing the override did not go back to the shipped macro")
+	}
 
-	if err := seedTemplates(dir); err != nil {
-		t.Fatalf("seedTemplates: %v", err)
+	if err := os.WriteFile(filepath.Join(ch, "TEMPLATE-standup.md"), []byte("ours"), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(stale); !os.IsNotExist(err) {
-		t.Errorf("retired template still on disk: %v", err)
-	}
-	for _, n := range templateNames(dir) {
-		if n == retiredTemplates[0] {
-			t.Errorf("retired macro %q still advertised in the slash menu", n)
-		}
-	}
-	// Shipped templates are still seeded, and a second run over a clean tree is
-	// a no-op rather than an error.
-	if _, err := os.Stat(filepath.Join(ch, "TEMPLATE-commit.md")); err != nil {
-		t.Errorf("shipped template not seeded: %v", err)
-	}
-	if err := seedTemplates(dir); err != nil {
-		t.Fatalf("second seedTemplates: %v", err)
+	if !slices.Contains(templateNames(dir), "standup") {
+		t.Errorf("a project's own macro is not in the menu: %v", templateNames(dir))
 	}
 }
 

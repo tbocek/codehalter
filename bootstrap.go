@@ -31,7 +31,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	// the binary. A standalone run only lands here when the launcher declined,
 	// which for an existing .devcontainer means no runtime with compose on PATH,
 	// so that hint names what to install rather than repeating the same command.
-	reopen := "Reopen the project in the container to continue. In Zed, press Ctrl-Alt-Shift-O and choose \"Connect Dev Container\"."
+	reopen := "Reopen the project in the container to continue. In Zed, press Ctrl-Shift-P and type \"open dev container\"."
 	restart := "Start a new Agent Thread (the + button at the top) to re-open the devcontainer setup menu."
 	if a.standalone {
 		reopen = "codehalter --cli starts that container itself once docker or podman with the compose plugin is on PATH. " +
@@ -344,6 +344,19 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 // ---------------------------------------------------------------------------
 // Stack detection
 // ---------------------------------------------------------------------------
+
+// projectStacks is detectStacks minus the meta-tooling entries: bash and
+// devcontainer are scaffolding every project has, not stacks, and nothing that
+// keys off a stack (the skill set, the formatter needs, the banner) wants them.
+func projectStacks(cwd string) []string {
+	var stacks []string
+	for _, s := range detectStacks(cwd) {
+		if s != "bash" && s != "devcontainer" {
+			stacks = append(stacks, s)
+		}
+	}
+	return stacks
+}
 
 // detectStacks returns the language/stack identifiers active in cwd, in a
 // fixed order (load-bearing: tests assert it, and ensureSkills walks it).

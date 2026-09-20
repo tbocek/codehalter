@@ -1046,7 +1046,10 @@ func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
 	}
 
 	folded := "Goal: everything so far, in one line."
-	mock := newMockLLM(t, sseText(folded))
+	// Two responses: the fold, then the note for the in-flight slice the
+	// compaction below rotates out (SUMMARISE.md ships in the binary, so that
+	// summarise always has a prompt and always makes its call).
+	mock := newMockLLM(t, sseText(folded), sseText("Goal: the slice that rotated out"))
 	defer mock.Close()
 
 	dir := t.TempDir()
@@ -1084,8 +1087,7 @@ func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
 	}
 
 	// The next compaction consumes it as the base, in place of the long
-	// Summary, and clears it. Without an LLM for the notes the in-flight slice
-	// falls back to a raw excerpt, which is fine: what matters is the base.
+	// Summary, and clears it. What matters here is the base, not the notes.
 	s.AddUser("next question")
 	s.markTurnStart()
 	s.AddAssistant("next answer")

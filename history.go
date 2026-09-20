@@ -110,7 +110,7 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 	// Re-render the system prompt so skills + project context survive the fold.
 	if sysPrompt, err := a.systemPrompt(sess.ID); err == nil {
 		sess.SystemPrompt = sysPrompt
-		sess.promptSkills = skillFiles(sess.Cwd)
+		sess.promptSkills = skillSet(sess.Cwd, sess.knownStacks)
 	}
 	if err := sess.Save(); err != nil {
 		a.say(ctx, sess.ID, fmt.Sprintf("⚠ Compacted in-memory but persisting failed: %s. Archive %s is on disk; the live session file will diverge until the next Save.\n\n", err.Error(), archiveID))

@@ -978,7 +978,7 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	}
 
 	var b strings.Builder
-	if skills := loadSkills(sess.Cwd); skills != "" {
+	if skills := loadSkills(sess.Cwd, skillSet(sess.Cwd, sess.knownStacks)); skills != "" {
 		b.WriteString(skills)
 	}
 	fmt.Fprintf(&b, "Project directory: %s\n", sess.Cwd)
@@ -989,7 +989,6 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	if name, content := loadAgentsFile(sess.Cwd); content != "" {
 		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation. They are meant to hold across sessions, so when your work makes one of them wrong (the stack, the layout, how the project is built, run or tested), update %s in the same task: a line left stale here is believed by every session after this one.\n\n%s\n", name, name, content)
 	}
-	// Project-first investigation guidance — a user-editable prompt seeded to
 
 	// Phase guidance lives in the system prompt (the stable, cached prefix) rather
 	// than being re-injected as a multi-KB user message on every plan/execute
@@ -1009,14 +1008,31 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	return b.String(), nil
 }
 
+// shippedPrompts is every phase prompt codehalter carries, by filename.
+var shippedPrompts = map[string]string{
+	"PLAN.md":        defaultPlanMD,
+	"EXECUTE.md":     defaultExecuteMD,
+	"DOCUMENT.md":    defaultDocumentMD,
+	"SUMMARISE.md":   defaultSummariseMD,
+	"RESUMMARISE.md": defaultResummariseMD,
+	"SPEC.md":        defaultSpecMD,
+	"SPEC-SETUP.md":  defaultSpecSetupMD,
+	"SPEC-REMOVE.md": defaultSpecRemoveMD,
+}
+
+// loadPromptFile returns a phase prompt: the project's own copy in .codehalter
+// when it has one, else the copy in the binary. The file is read every time, so
+// an edit lands on the next turn.
+//
+// A file that exists wins even when EMPTY, which is the documented way to turn
+// a phase off: emptying PLAN.md disables planning (see runPlanPhase).
 func (a *agent) loadPromptFile(sid string, filename string) string {
-	sess := a.getSession(sid)
-	if sess != nil {
+	if sess := a.getSession(sid); sess != nil {
 		if data, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", filename)); err == nil {
 			return string(data)
 		}
 	}
-	return ""
+	return shippedPrompts[filename]
 }
 
 // agentsFileNames are the project-root agent-instruction files codehalter folds

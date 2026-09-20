@@ -31,14 +31,11 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Baseline: seed the always-on skills and freeze them as "already in the
-	// prompt", so only a NEW skill counts as added mid-session.
-	if err := ensureSkills(s.Cwd, nil, readOSInfo()); err != nil {
-		t.Fatal(err)
-	}
+	// Baseline: freeze the skills that already apply as "already in the prompt",
+	// so only a NEW skill counts as added mid-session.
 	const frozen = "EXISTING PROMPT — do not mutate"
 	s.SystemPrompt = frozen
-	s.promptSkills = skillFiles(s.Cwd)
+	s.promptSkills = skillSet(s.Cwd, nil)
 
 	body := "# Zzz skill\n\nuse the zzz tool wisely\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, "SKILL-zzz.md"), []byte(body), 0o644); err != nil {

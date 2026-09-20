@@ -3,183 +3,166 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
 
-// readSkill is a tiny helper: the on-disk body of a skill, or "" if absent.
-func readSkill(t *testing.T, dir, name string) string {
-	t.Helper()
-	b, err := os.ReadFile(filepath.Join(dir, name))
-	if err != nil {
-		return ""
+// TestSkillSetNeedsNothingOnDisk is the point of reading skills out of the
+// binary: a project with an empty .codehalter still gets the shipped text, so a
+// skill edited in res/ reaches every project on its next session. Copying the
+// skills out used to pin a project to the release that created it.
+func TestSkillSetNeedsNothingOnDisk(t *testing.T) {
+	cwd := t.TempDir()
+	names := skillSet(cwd, nil)
+	if !slices.Contains(names, "SKILL-base.md") {
+		t.Fatalf("skillSet on a bare dir = %v, want the base skill in it", names)
 	}
-	return string(b)
+	body := loadSkills(cwd, names)
+	if !strings.Contains(body, "# Container skill") && !strings.HasPrefix(strings.TrimSpace(body), "#") {
+		t.Errorf("the base skill rendered as %q", truncate(body, 120))
+	}
+	if entries, err := os.ReadDir(cwd); err != nil || len(entries) != 0 {
+		t.Errorf("loading skills wrote to the project: %v (err %v)", entries, err)
+	}
 }
 
-// TestEnsureSkillsSeedsOnceAndLeavesEdits: a skill is written when missing, and
-// a later pass leaves an existing copy — user edit or not — untouched.
-func TestEnsureSkillsSeedsOnceAndLeavesEdits(t *testing.T) {
+// TestSkillSetApplicability: what applies is read off the tree and the
+// container, not off what happens to be on disk.
+func TestSkillSetApplicability(t *testing.T) {
+	cwd := t.TempDir()
+	if slices.Contains(skillSet(cwd, nil), "SKILL-justfile.md") {
+		t.Error("the justfile skill applied to a project with no justfile")
+	}
+	if err := os.WriteFile(filepath.Join(cwd, "justfile"), []byte("test:\n\ttrue\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(skillSet(cwd, nil), "SKILL-justfile.md") {
+		t.Error("a justfile in the tree did not pull in its skill")
+	}
+	if slices.Contains(skillSet(cwd, nil), "SKILL-layout.md") {
+		t.Error("the layout skill applied to a project with no stylesheets")
+	}
+	if !slices.Contains(skillSet(cwd, []string{"css"}), "SKILL-layout.md") {
+		t.Error("the css stack did not pull in the layout skill")
+	}
+}
+
+// TestSkillOverrideAndOwnSkills pins the only two reasons a SKILL file exists
+// in .codehalter: it replaces shipped text of the same name, or it is the
+// user's own skill and joins the set. Deleting either goes back to the default.
+func TestSkillOverrideAndOwnSkills(t *testing.T) {
 	cwd := t.TempDir()
 	dir := filepath.Join(cwd, ".codehalter")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// First pass seeds the always-on base skill from the embed.
-	if err := ensureSkills(cwd, nil, osInfo{}); err != nil {
-		t.Fatalf("ensureSkills (seed): %v", err)
+	shipped := skillBody(cwd, "SKILL-base.md")
+	if shipped == "" {
+		t.Fatal("no shipped base skill")
 	}
-	if readSkill(t, dir, "SKILL-base.md") == "" {
-		t.Fatal("SKILL-base.md should have been seeded")
-	}
-	// User edits it; a second pass must NOT overwrite (seed-once).
-	if err := os.WriteFile(filepath.Join(dir, "SKILL-base.md"), []byte("my edits"), 0o644); err != nil {
+
+	override := filepath.Join(dir, "SKILL-base.md")
+	if err := os.WriteFile(override, []byte("my own base\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := ensureSkills(cwd, nil, osInfo{}); err != nil {
-		t.Fatalf("ensureSkills (re-run): %v", err)
+	if got := skillBody(cwd, "SKILL-base.md"); got != "my own base\n" {
+		t.Errorf("the override did not win: %q", truncate(got, 80))
 	}
-	if got := readSkill(t, dir, "SKILL-base.md"); got != "my edits" {
-		t.Errorf("SKILL-base.md = %q, want 'my edits' (seed-once must not overwrite existing)", got)
+	if n := len(skillSet(cwd, nil)); n != len(skillSet(t.TempDir(), nil)) {
+		t.Error("an override changed the size of the set; it replaces, it does not add")
+	}
+	if err := os.Remove(override); err != nil {
+		t.Fatal(err)
+	}
+	if got := skillBody(cwd, "SKILL-base.md"); got != shipped {
+		t.Error("removing the override did not go back to the shipped skill")
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "SKILL-house-rules.md"), []byte("# ours\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	names := skillSet(cwd, nil)
+	if !slices.Contains(names, "SKILL-house-rules.md") {
+		t.Fatalf("a project's own skill was not picked up: %v", names)
+	}
+	if !strings.Contains(loadSkills(cwd, names), "# ours") {
+		t.Error("a project's own skill was not rendered")
+	}
+	if !slices.IsSorted(names) {
+		t.Errorf("skillSet must be sorted so the cached prefix is byte-stable: %v", names)
 	}
 }
 
-func TestEnsureSkillsPrunesOtherOS(t *testing.T) {
-	cwd := t.TempDir()
-	dir := filepath.Join(cwd, ".codehalter")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	// A stale skill from a different OS must be pruned for the active OS.
-	if err := os.WriteFile(filepath.Join(dir, "SKILL-debian.md"), []byte("stale"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := ensureSkills(cwd, nil, osInfo{ID: "arch", Fields: map[string]string{}}); err != nil {
-		t.Fatalf("ensureSkills err: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "SKILL-debian.md")); !os.IsNotExist(err) {
-		t.Errorf("SKILL-debian.md should have been pruned")
-	}
-	if readSkill(t, dir, "SKILL-arch.md") == "" {
-		t.Errorf("SKILL-arch.md should have been seeded for the active OS")
-	}
-}
-
-// TestEnsureSkillsPrunesVariantDir: projects seeded by an older codehalter
-// still carry .codehalter/skills/<variant>/ from the per-model skill split.
-// Nothing loads it now (skillFiles globs the top level only), so ensureSkills
-// clears it rather than leaving dead prompt copies in the tree.
-func TestEnsureSkillsPrunesVariantDir(t *testing.T) {
-	cwd := t.TempDir()
-	dir := filepath.Join(cwd, ".codehalter")
-	vdir := filepath.Join(dir, "skills", "gemma-4-31b")
-	if err := os.MkdirAll(vdir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(vdir, "SKILL-base.md"), []byte("pruned variant"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := ensureSkills(cwd, nil, osInfo{}); err != nil {
-		t.Fatalf("ensureSkills err: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "skills")); !os.IsNotExist(err) {
-		t.Errorf(".codehalter/skills should have been removed, stat err = %v", err)
-	}
-	if readSkill(t, dir, "SKILL-base.md") == "" {
-		t.Errorf("the generic skill set must still seed after the prune")
-	}
-}
-
-// TestExpandCmdPlaceholders pins the seed-time {{cmd:...}} templating: stdout
-// is spliced in trimmed, several placeholders on one line all expand, a
-// failing command leaves its placeholder verbatim (visible in the seeded file
-// instead of baking a silent empty string), and the justfile skill's literal
-// {{var}} examples don't match.
+// TestExpandCmdPlaceholders pins the {{cmd:...}} templating: stdout is spliced
+// in trimmed, several placeholders on one line all expand, a failing command
+// leaves its placeholder verbatim (visible in the prompt instead of baking a
+// silent empty string), and the justfile skill's literal {{var}} examples and
+// the os-release keys don't match.
 func TestExpandCmdPlaceholders(t *testing.T) {
 	got := expandCmdPlaceholders("v={{cmd:echo  1.2.3 }} on {{cmd:echo alpine}}!")
 	if got != "v=1.2.3 on alpine!" {
 		t.Errorf("expand = %q", got)
 	}
-	// Failing command → placeholder stays.
 	in := "v={{cmd:definitely-not-a-binary-xyz --version}}"
 	if got := expandCmdPlaceholders(in); got != in {
 		t.Errorf("failed cmd should leave the placeholder, got %q", got)
 	}
-	// Non-cmd placeholders (os-release keys, justfile examples) pass through.
 	in = "Base: {{PRETTY_NAME}} and {{var}} stay"
 	if got := expandCmdPlaceholders(in); got != in {
 		t.Errorf("non-cmd placeholders must pass through, got %q", got)
 	}
 }
 
-// TestSkillCmdExpandsAtLoad pins the load-time templating contract: the
-// seeded file keeps its {{cmd:...}} placeholder verbatim (user-ownable,
-// re-expands fresh each session), while every model-facing read — loadSkills
-// for the system prompt, readSkillBody for mid-session disclosure — renders
-// the command output.
+// TestSkillCmdExpandsAtLoad: the command runs when the skill is read, not when
+// it is stored, so a skill's live facts (the date, a tool version) are current
+// every session. An override keeps that property.
 func TestSkillCmdExpandsAtLoad(t *testing.T) {
-	dir := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	cwd := t.TempDir()
 	orig := osSkills["alpine"]
 	osSkills["alpine"] = "# Alpine skill\nBase: {{cmd:echo Alpine Test}}, {{cmd:echo apk-tools 9.9}}.\n"
-	defer func() { osSkills["alpine"] = orig }()
+	shippedSkills["SKILL-alpine.md"] = osSkills["alpine"]
+	defer func() {
+		osSkills["alpine"] = orig
+		shippedSkills["SKILL-alpine.md"] = orig
+	}()
 
-	if err := ensureSkills(dir, nil, osInfo{ID: "alpine"}); err != nil {
-		t.Fatalf("ensureSkills: %v", err)
+	want := "Base: Alpine Test, apk-tools 9.9."
+	if body := skillBody(cwd, "SKILL-alpine.md"); !strings.Contains(body, want) {
+		t.Errorf("shipped skill did not expand:\n%s", body)
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, ".codehalter", "SKILL-alpine.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(raw), "{{cmd:echo Alpine Test}}") {
-		t.Errorf("seeded file should keep the placeholder verbatim:\n%s", raw)
-	}
-	if body := readSkillBody(dir, "SKILL-alpine.md"); !strings.Contains(body, "Base: Alpine Test, apk-tools 9.9.") {
-		t.Errorf("readSkillBody should expand:\n%s", body)
-	}
-	if all := loadSkills(dir); !strings.Contains(all, "Base: Alpine Test, apk-tools 9.9.") {
-		t.Errorf("loadSkills should expand:\n%s", all)
+	if all := loadSkills(cwd, []string{"SKILL-alpine.md"}); !strings.Contains(all, want) {
+		t.Errorf("loadSkills did not expand:\n%s", all)
 	}
 }
 
-// TestLoadSkillsDeterministic verifies loadSkills sorts entries so the
-// concatenated system-prompt prefix is byte-stable across calls — a moving
-// SKILL order would invalidate the cache on every session start.
+// TestLoadSkillsDeterministic verifies the concatenation is byte-stable across
+// calls: a moving skill order would invalidate the prompt cache every session.
 func TestLoadSkillsDeterministic(t *testing.T) {
-	dir := t.TempDir()
-	cfgDir := filepath.Join(dir, ".codehalter")
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".codehalter")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-	// Write in non-alphabetical order; readdir order is filesystem-dependent.
-	files := map[string]string{
-		"SKILL-ts.md":   "# TS\n",
-		"SKILL-go.md":   "# Go\n",
-		"SKILL-bash.md": "# Bash\n",
-		"SKILL-java.md": "# Java\n",
-	}
-	for name, body := range files {
-		if err := os.WriteFile(filepath.Join(cfgDir, name), []byte(body), 0o644); err != nil {
+	// Written in non-alphabetical order; readdir order is filesystem-dependent.
+	for name, body := range map[string]string{
+		"SKILL-ts.md": "# TS\n", "SKILL-go.md": "# Go\n",
+		"SKILL-bash.md": "# Bash\n", "SKILL-java.md": "# Java\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
 	}
 
-	first := loadSkills(dir)
-	for i := 0; i < 5; i++ {
-		got := loadSkills(dir)
-		if got != first {
-			t.Errorf("loadSkills run %d differs from run 0:\n  run 0: %q\n  run %d: %q", i, first, i, got)
+	names := skillSet(cwd, nil)
+	first := loadSkills(cwd, names)
+	for i := range 5 {
+		if got := loadSkills(cwd, names); got != first {
+			t.Fatalf("run %d differs from run 0:\n  %q\n  %q", i, truncate(first, 120), truncate(got, 120))
 		}
 	}
-	// Bash should come first alphabetically; TS should be last. Looking at
-	// the order via index ensures we catch a swap, not just presence.
 	idx := func(needle string) int { return strings.Index(first, needle) }
-	if idx("# Bash") != 0 {
-		t.Errorf("expected loadSkills to start with Bash; got %q", truncate(first, 80))
-	}
 	if !(idx("# Bash") < idx("# Go") && idx("# Go") < idx("# Java") && idx("# Java") < idx("# TS")) {
-		t.Errorf("loadSkills not alphabetical:\n%s", first)
+		t.Errorf("not alphabetical:\n%s", first)
 	}
 }

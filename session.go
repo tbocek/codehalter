@@ -177,7 +177,8 @@ type Session struct {
 	// rt is what the session keeps in memory across turns (sessionRuntime).
 	rt sessionRuntime
 	// promptSkills is the set of SKILL-*.md filenames folded into the current
-	// SystemPrompt. A skill seeded on disk AFTER the prompt was built is injected
+	// SystemPrompt. A skill that becomes applicable AFTER the prompt was built
+	// (a justfile appears, a stack is installed) is injected
 	// as a user message (NOT folded into the prompt — that would bust the KV
 	// prefix cache) until the next compaction re-renders the prompt. Runtime-only.
 	promptSkills []string

@@ -223,10 +223,8 @@ func main() {
 	}
 
 	// --update: install the newest release over this binary and exit. The
-	// terminal path asks first (offerUpdate); this is the form for a run with
-	// nobody watching, and the one the capabilities banner points an editor
-	// user at, since replacing the binary an editor is currently talking to is
-	// something to do between sessions rather than during one.
+	// terminal path asks first (offerUpdate) and an editor session asks with a
+	// card (offerSelfUpdate); this is the form for a run with nobody watching.
 	if len(os.Args) > 1 && os.Args[1] == "--update" {
 		os.Exit(runUpdate())
 	}
@@ -544,46 +542,32 @@ func (a *agent) deleteSession(id string) {
 func (a *agent) initSession(cwd string, s *Session) error {
 	a.putSession(s)
 
-	// Seed .codehalter/ defaults when absent. Phase prompts
-	// (PLAN/EXECUTE/DOCUMENT/SUMMARISE/RESUMMARISE) are user-owned templates seeded once;
-	// every SKILL-*.md (including the always-on base skill) is owned by
-	// ensureSkills (skills.go), which seeds it once and otherwise leaves it.
+	// Prompts, skills and macros are read from the binary and are never copied
+	// here: a file of the same name in .codehalter overrides one, which is the
+	// only reason for anything to exist under those names. Copying them out is
+	// what used to leave a project pinned to the prompts of the release that
+	// created it, receiving no fix ever written afterwards.
+	//
+	// mcp.toml is the exception that proves it: it is configuration rather than
+	// a prompt, its header comments are the only schema documentation there is,
+	// and an empty file is not a usable default. It is written once, on a first
+	// run, and never touched again.
 	dir := filepath.Join(cwd, ".codehalter")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
-	for _, f := range []struct{ name, content string }{
-		{"PLAN.md", defaultPlanMD},
-		{"EXECUTE.md", defaultExecuteMD},
-		{"DOCUMENT.md", defaultDocumentMD},
-		{"SUMMARISE.md", defaultSummariseMD},
-		{"RESUMMARISE.md", defaultResummariseMD},
-		{"SPEC.md", defaultSpecMD},
-		{"SPEC-SETUP.md", defaultSpecSetupMD},
-		{"SPEC-REMOVE.md", defaultSpecRemoveMD},
-	} {
-		if err := seedFile(dir, f.name, f.content); err != nil {
-			return err
+	if _, err := os.Stat(filepath.Join(dir, "mcp.toml")); os.IsNotExist(err) {
+		if err := os.WriteFile(filepath.Join(dir, "mcp.toml"), []byte(defaultMCPToml), 0o644); err != nil {
+			return fmt.Errorf("writing the mcp.toml placeholder: %w", err)
 		}
 	}
-	if err := ensureSkills(cwd, detectStacks(cwd), readOSInfo()); err != nil {
-		return err
-	}
-	// Template macros (TEMPLATE-*.md): seed editable copies once, same as the
-	// phase prompts. After this the on-disk copy wins, so users can edit them.
-	if err := seedTemplates(cwd); err != nil {
-		return err
-	}
-	// mcp.toml — only seeded on first run with the minimal placeholder (a header
-	// and ONE generic commented example). Once this file exists we never touch
-	// it again — the user owns it.
-	if err := seedFile(dir, "mcp.toml", defaultMCPToml); err != nil {
-		return err
-	}
+	// knownStacks drives which skills apply, and the first system prompt is
+	// built right below, before checkEnv has ever run.
+	s.knownStacks = projectStacks(cwd)
 
-	// Always rebuild SystemPrompt from the freshly-seeded directory: a loaded
-	// session may carry one from another host (a different OS skill set), and it
-	// must be replaced BEFORE a fix card can send an LLM call with the stale one.
+	// Always rebuild SystemPrompt: a loaded session may carry one from another
+	// host (a different OS skill set), and it must be replaced BEFORE a fix card
+	// can send an LLM call with the stale one.
 	if sp, err := a.systemPrompt(s.ID); err != nil {
 		slog.Warn("initSession: systemPrompt build failed", "sid", s.ID, "err", err)
 	} else {
@@ -666,7 +650,7 @@ func (a *agent) startIndexing(sid string, cwd string) {
 			// model answers in tens of seconds), seeds skills, and reconciles
 			// MCP servers. Without this line the thread sits empty after the
 			// gitignore card and a slow probe is indistinguishable from a hang.
-			a.say(ctx, sid, "Setting up: probing the LLM, seeding skills, checking project tooling. The first probe can take a while if your server still has to load the model.\n\n")
+			a.say(ctx, sid, "Setting up: probing the LLM, reading the project, checking its tooling. The first probe can take a while if your server still has to load the model.\n\n")
 			fixes := a.prepareChecks(ctx, sess, sid)
 			// Prewarm AFTER the checks (SystemPrompt is final, so the warmed bytes
 			// match turn one) but BEFORE the fix cards, whose accepted turn the warm

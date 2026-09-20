@@ -4,7 +4,6 @@ import (
 	"context"
 	"embed"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -14,9 +13,9 @@ import (
 // Template macros are slash commands: `/<name> <args>` expands a
 // TEMPLATE-<name>.md body into the turn's user message and runs it as a normal
 // prompt. Command name = filename minus the TEMPLATE- prefix and .md suffix.
-// Defaults ship embedded and are seeded into .codehalter/ on first run
-// (seedTemplates); from then on the on-disk copy wins, so users can edit a
-// shipped template or drop in their own TEMPLATE-<name>.md.
+// Defaults ship embedded and are read from the binary; a TEMPLATE-<name>.md in
+// .codehalter overrides the shipped text of that name, and one with a new name
+// adds a command. Nothing is ever written there.
 
 //go:embed res/TEMPLATE-*.md
 var templateFS embed.FS
@@ -54,37 +53,6 @@ func isTemplateFile(n string) (name string, ok bool) {
 		return strings.TrimSuffix(strings.TrimPrefix(n, "TEMPLATE-"), ".md"), true
 	}
 	return "", false
-}
-
-// retiredTemplates names macros codehalter used to ship and has since dropped.
-// Seeding only ever adds, so a project set up before the removal keeps its
-// seeded copy: templateNames reads the directory, the command stays in the
-// slash menu, and running it aims the model at tools that no longer exist.
-// Sweeping exactly those filenames is what actually retires the command.
-var retiredTemplates = []string{"improve"}
-
-// seedTemplates copies each embedded TEMPLATE-*.md into .codehalter/ when absent
-// (seed-once, like the phase prompts), so the user has editable copies, and
-// removes the templates of features that no longer exist.
-func seedTemplates(cwd string) error {
-	for _, name := range retiredTemplates {
-		path := filepath.Join(cwd, ".codehalter", "TEMPLATE-"+name+".md")
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			slog.Warn("removing retired template", "path", path, "err", err)
-		}
-	}
-	entries, _ := templateFS.ReadDir("res")
-	for _, e := range entries {
-		n := e.Name()
-		if _, ok := isTemplateFile(n); !ok {
-			continue
-		}
-		data, _ := templateFS.ReadFile("res/" + n)
-		if err := seedFile(filepath.Join(cwd, ".codehalter"), n, string(data)); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // templateNames returns the macro command names (sorted, deduped) from both the

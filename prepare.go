@@ -55,13 +55,21 @@ const (
 	// facts are the user's to confirm, not the model's to guess, and the failure
 	// mode of getting it wrong is a line that stays wrong for every later
 	// session. No holes to fill.
+	//
+	// Step 3 is emphatic for a measured reason. An earlier draft asked for the
+	// file "under 60 lines" and listed words it must not contain, and the model
+	// read both as acceptance criteria: it wrote the file, then ran wc -l and a
+	// grep over it and trimmed, 26 edits across 42 rounds and 12k generated
+	// tokens for a 59-line file. A target a tool can measure is a target the
+	// model will iterate against, so brevity is stated without a number.
 	cardAgentsFile = "This project has no AGENT.md, so every session starts by rediscovering what the project is.\n" +
 		"\n" +
 		"PLAN ONLY → produce execute-phase steps that:\n" +
 		"1. Read enough of the tree to answer for yourself: what this project IS in one sentence, its language and version, the frameworks and notable libraries, how it is built / run / tested, which directory holds what, and any convention the code plainly follows that no file states.\n" +
 		"2. Use `ask_user` ONCE, as a single free-text box, to put those draft answers to the user: they correct what is wrong and add what cannot be read off the tree (who it is for, what it must never do, decisions already settled). Do not ask what the tree already answers.\n" +
-		"3. Write `AGENT.md` in the project root from the corrected answers, under 60 lines, holding ONLY what stays true between sessions: purpose, stack, layout, the build/test commands, standing constraints. NO task list, NO status, NO roadmap, NO \"currently working on\". A line that expires is worse than no line, because the next session believes it.\n" +
-		"4. Write no command you did not run: a build or test line goes in only after it worked.\n" +
+		"3. Compose the whole file, write it in ONE `write_file` call, and stop. It is prose, not code: there is nothing to verify, so do not read it back, count its lines, grep it for words you were told to avoid, or edit it into shape a line at a time. Short enough to read in a minute, and you are the judge of that.\n" +
+		"4. It holds ONLY what stays true between sessions: purpose, stack, layout, the build and test commands, standing constraints. NO task list, NO status, NO roadmap, NO \"currently working on\". A line that expires is worse than no line, because the next session believes it.\n" +
+		"5. Name no command you have not run: a build or test line goes in only once it worked.\n" +
 		"\n" +
 		"codehalter folds AGENT.md into the system prompt at session start, so it is read once per session, not once per turn. Do not commit it; that is the user's call.\n"
 
@@ -269,6 +277,8 @@ func (a *agent) prepareChecks(ctx context.Context, sess *Session, sid string) []
 	if !sess.capabilitiesShown {
 		a.notifyCapabilities(ctx, sess, sid)
 		sess.capabilitiesShown = true
+		// After the banner, so the card lands under the line announcing it.
+		a.offerSelfUpdate(ctx, sess, sid)
 	}
 	slog.Debug("prepareChecks: done", "sid", sid, "hasLLM", a.hasReachableLLM(), "stacks", sess.knownStacks)
 	return append(envProblems, mcpProblems...)
@@ -650,47 +660,32 @@ func hasFormatter(cwd string, f formatterNeed) bool {
 // time a recipe fails, and the classification built on top of it (build / test /
 // lint / format targets) was never read by anything but a banner line.
 func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
-	var stacks []string
-	for _, s := range detectStacks(sess.Cwd) {
-		if s == "bash" || s == "devcontainer" {
-			continue
-		}
-		stacks = append(stacks, s)
-	}
+	stacks := projectStacks(sess.Cwd)
 	sess.knownStacks = stacks
-
-	// Seed SKILL-*.md for a stack / runner config / distro added since session
-	// start so its skill is on disk before the next turn's systemPrompt loads
-	// it. Keyed on FILE presence (justfile / Makefile / go.mod / ...), not on
-	// installed tools — the LLM needs the skill to know how to install the
-	// missing tool. ensureSkills seeds each skill once (leaving existing copies)
-	// and prunes other-OS copies.
 	osi := readOSInfo()
-	if err := ensureSkills(sess.Cwd, sess.knownStacks, osi); err != nil {
-		slog.Warn("prepare: ensureSkills failed", "sid", sid, "err", err)
-	}
+
 	// The system prompt is the leading message of every request, so changing it
 	// mid-session busts the LLM's KV prefix cache — which only compaction may do.
-	// So: set it on the FIRST build; afterward, a skill SEEDED on disk this
-	// session (e.g. a stack newly detected after an install) is injected as a
+	// So: set it on the FIRST build; afterward, a skill that became applicable
+	// this session (a justfile appeared, a stack was installed) is injected as a
 	// user message for this turn instead — cache-safe, since it appends to the
 	// tail. The next compaction re-renders the prompt (history.go) and is where
 	// the skill finally enters the cached prefix. promptSkills tracks what the
 	// current prompt already holds, so each new skill is injected exactly once.
 	if sess.promptSkills == nil {
-		sess.promptSkills = skillFiles(sess.Cwd)
+		sess.promptSkills = skillSet(sess.Cwd, stacks)
 	}
 	if sp, err := a.systemPrompt(sid); err != nil {
 		slog.Warn("prepare: systemPrompt rebuild failed", "sid", sid, "err", err)
 	} else if sess.SystemPrompt == "" {
 		sess.SystemPrompt = sp
-		sess.promptSkills = skillFiles(sess.Cwd)
+		sess.promptSkills = skillSet(sess.Cwd, stacks)
 	} else if sp != sess.SystemPrompt {
-		for _, name := range skillFiles(sess.Cwd) {
+		for _, name := range skillSet(sess.Cwd, stacks) {
 			if slices.Contains(sess.promptSkills, name) {
 				continue
 			}
-			if body := readSkillBody(sess.Cwd, name); body != "" {
+			if body := skillBody(sess.Cwd, name); body != "" {
 				sess.AddUser("[New skill available this session — " + name +
 					". It enters the system prompt at the next history compaction; until then it's here.]\n\n" + body)
 				sess.promptSkills = append(sess.promptSkills, name)
@@ -910,7 +905,7 @@ func renderMCPChanges(changes []mcpChange) (notices []string, problems []fixProb
 
 // notifyCapabilities renders ONE consolidated banner covering everything
 // the user needs to see at the top of a turn: settings.toml path, LLM status,
-// detected stacks, container, firefox, run_command, seeded skills and MCP
+// detected stacks, container, firefox, run_command, the skills in force and MCP
 // servers. Called by prepare exactly once per session, on the first prepare;
 // later turns emit nothing.
 func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid string) {
@@ -919,14 +914,11 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	if a.settings.path != "" {
 		fmt.Fprintf(&b, "Using %s\n\n", a.settings.path)
 	}
-	// One line, once per session. This path cannot install the update itself:
-	// the editor is holding this binary's stdio, so replacing it under a live
-	// connection is something to do between sessions, and the line names the
-	// command that does it. The check answers from a day-old cache most of the
-	// time and says nothing at all when it cannot reach GitHub.
+	// One line, once per session, and the card that installs it follows the
+	// banner (offerSelfUpdate). The check answers from a day-old cache most of
+	// the time and says nothing at all when it cannot reach GitHub.
 	if tag := newerRelease(ctx, sess.Cwd); tag != "" {
-		fmt.Fprintf(&b, "🟡 Update: codehalter %s is available (running %s). Run `codehalter --update` in this container, "+
-			"or start `codehalter --cli` on the host, which offers to update the host and the container together.\n\n", tag, version)
+		fmt.Fprintf(&b, "🟡 Update: codehalter %s is available (running %s).\n\n", tag, version)
 	}
 	b.WriteString(a.renderLLMStatus())
 
@@ -961,7 +953,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 		b.WriteString("Empty project: I'll ask about language and runner on your first message.\n\n")
 	}
 
-	if files := skillFiles(sess.Cwd); len(files) > 0 {
+	if files := skillSet(sess.Cwd, sess.knownStacks); len(files) > 0 {
 		names := make([]string, len(files))
 		for i, n := range files {
 			names[i] = strings.TrimSuffix(strings.TrimPrefix(n, "SKILL-"), ".md")
