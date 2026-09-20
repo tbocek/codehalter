@@ -10,8 +10,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 const (
@@ -143,7 +141,7 @@ var searchTextTool = Tool{Def: map[string]any{
 	if dedupNote != "" {
 		title += " (repeat)"
 	}
-	a.CompleteToolCallTitled(ctx, sid, tcId, title, []acp.ToolCallContent{acp.TextContent(summary)})
+	a.CompleteToolCallTitled(ctx, sid, tcId, title, []ToolCallContent{TextContent(summary)})
 	if dedupNote != "" {
 		out = dedupNote + "\n" + out
 	}

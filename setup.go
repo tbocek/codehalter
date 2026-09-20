@@ -13,8 +13,6 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
-
-	"github.com/tbocek/codehalter/llm"
 )
 
 // runSetup runs an interactive terminal flow that configures the LLM
@@ -63,7 +61,7 @@ func runSetup() {
 
 	// Build a temporary settings object and validate the connection
 	settings := Settings{
-		LLM: []llm.Conn{{
+		LLM: []LLMConnection{{
 			Server: server,
 			Model:  model,
 		}},
@@ -81,10 +79,10 @@ func runSetup() {
 		os.Exit(1)
 	}
 
-	result := llm.Probe(context.Background(), conn)
+	result := probeLLM(context.Background(), conn)
 	if !result.ModelKnown {
 		// Try a simple HTTP check to distinguish network vs model issues
-		endpoint := conn.Endpoint("/v1/models")
+		endpoint := conn.endpoint("/v1/models")
 		// Bounded: this request had no context and no timeout at all, so a
 		// server that accepts the connection and never answers hung setup.
 		checkCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -97,7 +95,7 @@ func runSetup() {
 		if apiKey != "" {
 			req.Header.Set("Authorization", "Bearer "+apiKey)
 		}
-		resp, httpErr := llm.MetaHTTPClient.Do(req)
+		resp, httpErr := metaHTTPClient.Do(req)
 		if httpErr != nil {
 			fmt.Fprintf(os.Stderr, "Connection failed: %v\n", httpErr)
 			os.Exit(1)

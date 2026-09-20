@@ -12,10 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
-	"github.com/tbocek/codehalter/llm"
-	"github.com/tbocek/codehalter/mcp"
 )
 
 //go:embed res/PLAN.md
@@ -80,7 +76,7 @@ type agent struct {
 	// what they need (ConnAt returns a value copy), and release before any blocking
 	// call. A strict leaf: never held while acquiring a.mu or sess.mu.
 	cfgMu        sync.RWMutex
-	conn         *acp.AgentSideConnection
+	conn         *AgentSideConnection
 	cancel       context.CancelFunc
 	sessions     map[string]*Session
 	settings     Settings
@@ -91,13 +87,13 @@ type agent struct {
 	mode         string // "Interactive" | "Autopilot"
 
 	// connProbe holds the full prepare-phase probe result per configured
-	// llm.Conn, keyed by Server+"\x00"+Model.
+	// LLMConnection, keyed by Server+"\x00"+Model.
 	// renderLLMStatus reads ModelKnown/ModelLoaded/AvailableModels from it to
 	// warn when a server is reachable but the configured model id isn't in its
 	// /v1/models list (the silent cause of empty completions). Populated by
 	// probeAllLLMs; nil before the first prepare — a nil-map read is the zero
-	// llm.ProbeResult, so renderLLMStatus stays safe.
-	connProbe map[string]llm.ProbeResult
+	// probeResult, so renderLLMStatus stays safe.
+	connProbe map[string]probeResult
 
 	// summaryStrikes counts consecutive failures of the dedicated summariser
 	// connection (purpose = "summary"), and summaryStruckAt is when the latest
@@ -137,7 +133,7 @@ type agent struct {
 	// fsRead/fsWrite to decide between the ACP filesystem and plain disk I/O.
 	// Zero value = "the client advertised nothing", which is the safe reading:
 	// every capability gate falls back to doing the work ourselves.
-	clientCaps acp.ClientCapabilities
+	clientCaps ClientCapabilities
 
 	// connSems caps concurrent LLM calls per configured [[llm]] entry —
 	// settings.LLM[i] has a buffered channel at connSems[i] of capacity
@@ -197,13 +193,13 @@ type mcpState struct {
 	// as `<name>__<tool>` so multiple servers can ship a tool called e.g.
 	// "search" without colliding. Populated and mutated by reconcileMCP; nil on
 	// projects without an mcp.toml.
-	clients map[string]*mcp.Client
+	clients map[string]*MCPClient
 	// applied is the set of [[server]] entries the last successful reconcile
 	// actually brought up. The next pass diffs the new file against this to
 	// decide what to start, stop, or restart. Entries that failed to start are
 	// NOT included, so the next reconcile retries them with a fresh
-	// mcp.Start call once the file changes again.
-	applied []mcp.ServerConfig
+	// StartMCPClient call once the file changes again.
+	applied []MCPServerConfig
 	// appliedMtime is the mtime of .codehalter/mcp.toml at the time of the last
 	// reconcile. Unchanged mtime → skip the diff entirely, which also keeps a
 	// persistently-broken server from re-emitting the same failed card on every
@@ -274,7 +270,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	a := &agent{sessions: make(map[string]*Session), mode: "Interactive"}
-	conn := acp.NewAgentSideConnection(a, os.Stdout, os.Stdin)
+	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin)
 	a.conn = conn
 
 	slog.Info("waiting for connection")
@@ -288,16 +284,16 @@ func main() {
 // ACP protocol handlers
 // ---------------------------------------------------------------------------
 
-func (a *agent) Initialize(ctx context.Context, req acp.InitializeRequest) (acp.InitializeResponse, error) {
+func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
 	// Version negotiation is NOT a handshake we may fail: the spec says an agent
 	// that doesn't speak the requested version MUST answer with the latest version
 	// it does support and let the client decide whether to continue. Erroring here
 	// broke every client ahead of us — and with an ACP v2 in alpha, that will be
 	// most of them. res.ProtocolVersion below is always ours, so the reply already
 	// says what we speak; this only logs the mismatch.
-	if req.ProtocolVersion != acp.ProtocolVersion {
+	if req.ProtocolVersion != protocolVersion {
 		slog.Info("initialize: client speaks a different protocol version, answering with ours",
-			"client", req.ProtocolVersion, "agent", acp.ProtocolVersion)
+			"client", req.ProtocolVersion, "agent", protocolVersion)
 	}
 	// Remember what the client can do before anything tries to use it. Written
 	// once, here, before any session exists — but handlers run concurrently, so
@@ -317,11 +313,11 @@ func (a *agent) Initialize(ctx context.Context, req acp.InitializeRequest) (acp.
 		a.buildConnSems()
 		a.cfgMu.Unlock()
 		if conn := a.settings.MainLLM("execute"); conn != nil {
-			a.imagesSupported = llm.Probe(ctx, conn).ImageSupport
+			a.imagesSupported = probeLLM(ctx, conn).ImageSupport
 		}
 	}
-	var res acp.InitializeResponse
-	res.ProtocolVersion = acp.ProtocolVersion
+	var res InitializeResponse
+	res.ProtocolVersion = protocolVersion
 	res.AgentCapabilities.LoadSession = true
 	res.AgentCapabilities.PromptCapabilities.Image = a.imagesSupported
 	res.AgentCapabilities.PromptCapabilities.EmbeddedContext = true
@@ -338,7 +334,7 @@ func (a *agent) Initialize(ctx context.Context, req acp.InitializeRequest) (acp.
 		Name    string `json:"name,omitempty"`
 		Version string `json:"version,omitempty"`
 	}{"codehalter", version}
-	res.AuthMethods = []acp.AuthMethod{{
+	res.AuthMethods = []AuthMethod{{
 		ID:          "terminal-setup",
 		Name:        "Terminal Setup",
 		Description: "Interactive LLM configuration",
@@ -369,16 +365,16 @@ func (a *agent) clientCan(which string) bool {
 	return a.clientCaps.Fs.ReadTextFile
 }
 
-func (a *agent) NewSession(_ context.Context, req acp.NewSessionRequest) (acp.NewSessionResponse, error) {
+func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSessionResponse, error) {
 	cwd, _, err := usableCwd(req.Cwd)
 	if err != nil {
-		return acp.NewSessionResponse{}, err
+		return NewSessionResponse{}, err
 	}
 	slog.Debug("NewSession: enter", "cwd", cwd)
 	s, err := newSession(cwd)
 	if err != nil {
 		slog.Debug("NewSession: newSession err", "err", err)
-		return acp.NewSessionResponse{}, err
+		return NewSessionResponse{}, err
 	}
 	// newSession steps over the ids already on disk. A session that has not
 	// saved yet (no turn taken) exists only in a.sessions, and putSession would
@@ -394,17 +390,17 @@ func (a *agent) NewSession(_ context.Context, req acp.NewSessionRequest) (acp.Ne
 	if err := a.initSession(cwd, s); err != nil {
 		slog.Debug("NewSession: initSession err", "err", err, "sid", s.ID)
 		a.deleteSession(s.ID)
-		return acp.NewSessionResponse{}, err
+		return NewSessionResponse{}, err
 	}
 	a.startIndexing(s.ID, cwd)
 	slog.Debug("NewSession: returning", "sid", s.ID)
-	return acp.NewSessionResponse{SessionId: s.ID, Modes: a.sessionModes()}, nil
+	return NewSessionResponse{SessionId: s.ID, Modes: a.sessionModes()}, nil
 }
 
-func (a *agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
+func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
 	cwd, substituted, err := usableCwd(req.Cwd)
 	if err != nil {
-		return acp.LoadSessionResponse{}, err
+		return LoadSessionResponse{}, err
 	}
 	slog.Debug("LoadSession: enter", "cwd", cwd, "sid", req.SessionId)
 	// The requested workspace isn't mounted here (Zed restored a thread from a
@@ -429,23 +425,23 @@ func (a *agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (ac
 			s.mcpOffer = req.McpServers
 			if err := a.initSession(cwd, s); err != nil {
 				a.deleteSession(s.ID)
-				return acp.LoadSessionResponse{}, err
+				return LoadSessionResponse{}, err
 			}
 			a.startIndexing(s.ID, cwd)
-			return acp.LoadSessionResponse{Modes: a.sessionModes()}, nil
+			return LoadSessionResponse{Modes: a.sessionModes()}, nil
 		}
-		return acp.LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
+		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
 	}
 	s.mcpOffer = req.McpServers
 	if err := a.initSession(cwd, s); err != nil {
 		a.deleteSession(s.ID)
-		return acp.LoadSessionResponse{}, err
+		return LoadSessionResponse{}, err
 	}
 	// Re-announce the thread's name: the client asked us to restore this
 	// session, so it's ours to label, and a reload otherwise drops back to the
 	// session id.
 	if s.Title != "" {
-		a.sendUpdate(ctx, req.SessionId, acp.SessionInfoUpdate{Kind: "session_info_update", Title: s.Title})
+		a.sendUpdate(ctx, req.SessionId, sessionInfoUpdate{Kind: "session_info_update", Title: s.Title})
 	}
 	// Replay the restored thread's messages to the client so the UI shows the
 	// prior conversation. An empty chunk of the opposite role is emitted before
@@ -458,21 +454,21 @@ func (a *agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (ac
 			if m.Role == "user" {
 				a.say(ctx, req.SessionId, "")
 			} else {
-				a.sendUpdate(ctx, req.SessionId, acp.MessageChunk{Kind: acp.KindUserMessage, Content: acp.ContentBlock{Type: "text", Text: ""}})
+				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: ""}})
 			}
 		}
 		if m.Role == "user" {
-			a.sendUpdate(ctx, req.SessionId, acp.MessageChunk{Kind: acp.KindUserMessage, Content: acp.ContentBlock{Type: "text", Text: m.Content}})
+			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: m.Content}})
 			for _, img := range m.Images {
 				data, mime, err := readImageFile(s.Cwd, img.ID)
 				if err != nil {
-					a.sendUpdate(ctx, req.SessionId, acp.MessageChunk{Kind: acp.KindUserMessage, Content: acp.ContentBlock{Type: "text", Text: fmt.Sprintf("[image %s missing on disk]", img.ID)}})
+					a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[image %s missing on disk]", img.ID)}})
 					continue
 				}
 				if mime == "" {
 					mime = img.MimeType
 				}
-				a.sendUpdate(ctx, req.SessionId, acp.MessageChunk{Kind: acp.KindUserMessage, Content: acp.ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}})
+				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}})
 			}
 		} else {
 			a.say(ctx, req.SessionId, m.Content)
@@ -480,21 +476,21 @@ func (a *agent) LoadSession(ctx context.Context, req acp.LoadSessionRequest) (ac
 		lastRole = m.Role
 	}
 	a.startIndexing(s.ID, cwd)
-	return acp.LoadSessionResponse{Modes: a.sessionModes()}, nil
+	return LoadSessionResponse{Modes: a.sessionModes()}, nil
 }
 
-func (a *agent) ListSessions(_ context.Context, req acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
+func (a *agent) ListSessions(_ context.Context, req ListSessionsRequest) (ListSessionsResponse, error) {
 	sessions, err := listSessions(cwdOrDefault(req.Cwd))
 	if err != nil {
-		return acp.ListSessionsResponse{Sessions: []acp.SessionInfo{}}, err
+		return ListSessionsResponse{Sessions: []SessionInfo{}}, err
 	}
 	if sessions == nil {
-		sessions = []acp.SessionInfo{}
+		sessions = []SessionInfo{}
 	}
-	return acp.ListSessionsResponse{Sessions: sessions}, nil
+	return ListSessionsResponse{Sessions: sessions}, nil
 }
 
-func (a *agent) SetSessionMode(ctx context.Context, req acp.SetSessionModeRequest) error {
+func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) error {
 	if req.ModeId != "Interactive" && req.ModeId != "Autopilot" {
 		return nil
 	}
@@ -516,7 +512,7 @@ func (a *agent) SetSessionMode(ctx context.Context, req acp.SetSessionModeReques
 // CloseSession cancels any in-flight turn for sid and drops the session from
 // the live map. The on-disk TOML is preserved so /session resume still works
 // — close is a "this client is done watching" signal, not a delete.
-func (a *agent) CloseSession(_ context.Context, req acp.CloseSessionRequest) error {
+func (a *agent) CloseSession(_ context.Context, req CloseSessionRequest) error {
 	if sess := a.getSession(req.SessionId); sess != nil {
 		sess.cancelTurn()
 	}
@@ -529,7 +525,7 @@ func (a *agent) CloseSession(_ context.Context, req acp.CloseSessionRequest) err
 	return nil
 }
 
-func (a *agent) Cancel(_ context.Context, n acp.CancelNotification) {
+func (a *agent) Cancel(_ context.Context, n CancelNotification) {
 	if sess := a.getSession(n.SessionId); sess != nil {
 		sess.cancelTurn() // the in-flight turn for THIS session
 	}
@@ -732,14 +728,14 @@ func (a *agent) startIndexing(sid string, cwd string) {
 // sessionModes is the mode state advertised to the client on session
 // create/load. The client uses this to render the mode selector. The mode id
 // IS the display name — there's no separate identifier to keep in sync.
-func (a *agent) sessionModes() *acp.SessionModeState {
+func (a *agent) sessionModes() *SessionModeState {
 	a.mu.Lock()
 	current := a.mode
 	a.mu.Unlock()
 	if current == "" {
 		current = "Interactive"
 	}
-	return &acp.SessionModeState{
+	return &SessionModeState{
 		CurrentModeId: current,
 		AvailableModes: []struct {
 			Id          string `json:"id"`
@@ -790,7 +786,7 @@ func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 // line. Callers own their own trailing newlines, because some of these chunks
 // are streamed fragments that must concatenate seamlessly.
 func (a *agent) say(ctx context.Context, sid, text string) {
-	a.sendUpdate(ctx, sid, acp.MessageChunk{Kind: acp.KindAgentMessage, Content: acp.ContentBlock{Type: "text", Text: text}})
+	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: text}})
 }
 
 // heartbeatEvery paces the "I am still here" dots. A var, not a const, so a

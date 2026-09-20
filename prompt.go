@@ -15,8 +15,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // This file owns the prompt orchestrator. Prompt() is the ACP entry point.
@@ -225,11 +223,11 @@ var phaseNames = []string{"Planning", "Working", "Documenting"}
 // surface transient lifecycle markers like " (thinking…)" or " (running
 // read_file…)"). Document (phase 2) only appears once it actually starts,
 // so a no-doc run ends with two rows.
-func phaseEntries(phase int, done bool, suffix string) []acp.PlanEntry {
+func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
 	if phase < 0 || phase >= len(phaseNames) {
 		return nil
 	}
-	entries := make([]acp.PlanEntry, 0, phase+1)
+	entries := make([]PlanEntry, 0, phase+1)
 	for i := 0; i <= phase; i++ {
 		status := "completed"
 		content := phaseNames[i]
@@ -237,7 +235,7 @@ func phaseEntries(phase int, done bool, suffix string) []acp.PlanEntry {
 			status = "in_progress"
 			content += suffix
 		}
-		entries = append(entries, acp.PlanEntry{Content: content, Priority: "medium", Status: status})
+		entries = append(entries, PlanEntry{Content: content, Priority: "medium", Status: status})
 	}
 	return entries
 }
@@ -257,7 +255,7 @@ func (a *agent) sendPhase(ctx context.Context, sid string, phase int, done bool)
 		sess.phaseActive = !done
 		sess.phaseMu.Unlock()
 	}
-	a.sendUpdate(ctx, sid, acp.PlanUpdate{Kind: "plan", Entries: entries})
+	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
 // setStatus re-emits the full multi-row plan with `suffix` appended to
@@ -283,7 +281,7 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 	if entries == nil {
 		return
 	}
-	a.sendUpdate(ctx, sid, acp.PlanUpdate{Kind: "plan", Entries: entries})
+	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
 // startStatusMeter refreshes the active phase row once a second with whatever
@@ -337,7 +335,7 @@ func (a *agent) finalizePlan(sid string) {
 		return
 	}
 	// Background ctx so the finalize fires even when the request ctx is cancelled.
-	a.sendUpdate(context.Background(), sid, acp.PlanUpdate{Kind: "plan", Entries: entries})
+	a.sendUpdate(context.Background(), sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
 // failPrompt records a fatal error in the session and returns it so the ACP
@@ -346,7 +344,7 @@ func (a *agent) finalizePlan(sid string) {
 // (LLM auth / out-of-credits / runPlanPhase crash). Pass any tool uses
 // captured before the failure so they're preserved in history. Recoverable
 // warnings should keep using sendUpdate with a "⚠ ..." chunk.
-func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (acp.PromptResponse, error) {
+func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptResponse, error) {
 	if sess := a.getSession(sid); sess != nil {
 		if len(toolUses) > 0 {
 			sess.AddAssistantWithTools("❌ "+err.Error(), toolUses)
@@ -355,7 +353,7 @@ func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (acp.Promp
 		}
 		sess.saveOrLog()
 	}
-	return acp.PromptResponse{}, err
+	return PromptResponse{}, err
 }
 
 // sessionTitleMax is how many runes of the opening message become the thread
@@ -398,14 +396,14 @@ func (a *agent) setSessionTitle(ctx context.Context, sess *Session, raw string) 
 		return
 	}
 	sess.Title = title
-	a.sendUpdate(ctx, sess.ID, acp.SessionInfoUpdate{
+	a.sendUpdate(ctx, sess.ID, sessionInfoUpdate{
 		Kind:      "session_info_update",
 		Title:     title,
 		UpdatedAt: time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
-func (a *agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptResponse, error) {
+func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
 	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
 
 	// A typed prompt replaces the turn in flight and waits for it to unwind
@@ -586,7 +584,7 @@ func (a *agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 	if rendered, stopMsg, handled := a.expandMacro(ctx, req.SessionId, macroCwd, userText); handled {
 		if stopMsg != "" {
 			a.say(ctx, req.SessionId, stopMsg+"\n")
-			return acp.PromptResponse{StopReason: "end_turn"}, nil
+			return PromptResponse{StopReason: "end_turn"}, nil
 		}
 		userText = rendered
 	}
@@ -657,7 +655,7 @@ func (a *agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 			if msg != "" {
 				a.say(context.Background(), req.SessionId, msg)
 			}
-			return acp.PromptResponse{StopReason: "cancelled"}, nil
+			return PromptResponse{StopReason: "cancelled"}, nil
 		}
 		return a.failPrompt(req.SessionId, err, nil)
 	}
@@ -673,9 +671,9 @@ func (a *agent) Prompt(ctx context.Context, req acp.PromptRequest) (acp.PromptRe
 	// A turn whose ctx was cancelled along the way still returns normally here:
 	// the stop reason is how the client tells a clean turn from an abort.
 	if ctx.Err() != nil {
-		return acp.PromptResponse{StopReason: "cancelled"}, nil
+		return PromptResponse{StopReason: "cancelled"}, nil
 	}
-	return acp.PromptResponse{StopReason: "end_turn"}, nil
+	return PromptResponse{StopReason: "end_turn"}, nil
 }
 
 // runTurn drives one full turn through the single shared path: reset the
@@ -741,7 +739,7 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		// that omits usage leaves lastPrompt 0, or n_ctx isn't probed yet), so no
 		// data means no update rather than a misleading empty ring.
 		if size := a.getMainSlotTokens(); size > 0 && r.lastPrompt > 0 {
-			a.sendUpdate(ctx, sid, acp.UsageUpdate{Kind: "usage_update", Used: r.lastPrompt, Size: size})
+			a.sendUpdate(ctx, sid, usageUpdate{Kind: "usage_update", Used: r.lastPrompt, Size: size})
 		}
 		// \n\n keeps the stats on their own markdown line. With the server cache
 		// split, headline the work done (evaluated + gen) plus sent/cached%;

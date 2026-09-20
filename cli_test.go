@@ -12,8 +12,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // syncBuf is the UI's output while a serve goroutine is writing to it and the
@@ -118,7 +116,7 @@ func TestCLIConnRequestUsesACPWireShape(t *testing.T) {
 	c, p, _ := newCLIHarness(t, "")
 	done := make(chan json.RawMessage, 1)
 	go func() {
-		raw, err := c.conn.request("session/new", acp.NewSessionRequest{Cwd: "/tmp/x"})
+		raw, err := c.conn.request("session/new", NewSessionRequest{Cwd: "/tmp/x"})
 		if err != nil {
 			t.Errorf("request: %v", err)
 		}
@@ -143,7 +141,7 @@ func TestCLIConnRequestUsesACPWireShape(t *testing.T) {
 
 	select {
 	case raw := <-done:
-		var res acp.NewSessionResponse
+		var res NewSessionResponse
 		if err := json.Unmarshal(raw, &res); err != nil || res.SessionId != "s1" {
 			t.Errorf("result = %s (%v)", raw, err)
 		}
@@ -231,7 +229,7 @@ func TestSessionUpdatesRenderInOrder(t *testing.T) {
 		p.send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{
 			"sessionId": "s1",
 			"update": map[string]any{
-				"sessionUpdate": acp.KindAgentMessage,
+				"sessionUpdate": KindAgentMessage,
 				"content":       map[string]any{"type": "text", "text": fmt.Sprintf("%d\n", i)},
 			},
 		}})
@@ -261,7 +259,7 @@ func TestSessionUpdateIgnoresGarbage(t *testing.T) {
 	p.sendRaw(`not json at all`)
 	p.send(map[string]any{"jsonrpc": "2.0", "method": "session/update", "params": map[string]any{
 		"sessionId": "s",
-		"update":    map[string]any{"sessionUpdate": acp.KindAgentMessage, "content": map[string]any{"type": "text", "text": "alive\n"}},
+		"update":    map[string]any{"sessionUpdate": KindAgentMessage, "content": map[string]any{"type": "text", "text": "alive\n"}},
 	}})
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && !strings.Contains(buf.String(), "alive") {
@@ -457,10 +455,10 @@ func TestCancelRequestUnblocksWaitForExit(t *testing.T) {
 
 func TestRequestPermissionSelectsByNumber(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "2\n")
-	params, _ := json.Marshal(acp.PermissionRequest{
+	params, _ := json.Marshal(permissionRequest{
 		SessionId: "s1",
-		ToolCall:  acp.PermissionToolCall{ToolCallId: "tc1", Title: "Run `rm -rf build`?"},
-		Options: []acp.PermissionOption{
+		ToolCall:  permissionToolCall{ToolCallId: "tc1", Title: "Run `rm -rf build`?"},
+		Options: []permissionOption{
 			{OptionId: "yes", Name: "Allow", Kind: "allow_once"},
 			{OptionId: "no", Name: "Deny", Kind: "reject_once"},
 		},
@@ -469,7 +467,7 @@ func TestRequestPermissionSelectsByNumber(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := res.(acp.PermissionResponse)
+	got := res.(permissionResponse)
 	if got.Outcome.Outcome != "selected" || got.Outcome.OptionId != "no" {
 		t.Errorf("outcome = %#v, want selected/no", got.Outcome)
 	}
@@ -477,15 +475,15 @@ func TestRequestPermissionSelectsByNumber(t *testing.T) {
 
 func TestRequestPermissionEmptyLineDismisses(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "\n")
-	params, _ := json.Marshal(acp.PermissionRequest{
+	params, _ := json.Marshal(permissionRequest{
 		SessionId: "s1",
-		Options:   []acp.PermissionOption{{OptionId: "yes", Name: "Allow"}},
+		Options:   []permissionOption{{OptionId: "yes", Name: "Allow"}},
 	})
 	res, err := c.requestPermission(params)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := res.(acp.PermissionResponse); got.Outcome.Outcome != "cancelled" {
+	if got := res.(permissionResponse); got.Outcome.Outcome != "cancelled" {
 		t.Errorf("outcome = %#v, want cancelled", got.Outcome)
 	}
 }
@@ -636,15 +634,15 @@ func TestHelpListsAgentCommands(t *testing.T) {
 
 func TestBlockText(t *testing.T) {
 	cases := []struct {
-		in   acp.ContentBlock
+		in   ContentBlock
 		want string
 	}{
-		{acp.ContentBlock{Type: "text", Text: "hello"}, "hello"},
+		{ContentBlock{Type: "text", Text: "hello"}, "hello"},
 		// An image the terminal cannot draw is named, not dropped: a screenshot
 		// that renders as nothing looks like a tool that did nothing.
-		{acp.ContentBlock{Type: "image", MimeType: "image/png"}, "[image image/png]"},
-		{acp.ContentBlock{Type: "resource_link", URI: "file:///a.go"}, "[file:///a.go]"},
-		{acp.ContentBlock{Type: "resource", Resource: &acp.EmbeddedResource{Text: "inline"}}, "inline"},
+		{ContentBlock{Type: "image", MimeType: "image/png"}, "[image image/png]"},
+		{ContentBlock{Type: "resource_link", URI: "file:///a.go"}, "[file:///a.go]"},
+		{ContentBlock{Type: "resource", Resource: &EmbeddedResource{Text: "inline"}}, "inline"},
 	}
 	for _, c := range cases {
 		if got := blockText(c.in); got != c.want {
@@ -656,7 +654,7 @@ func TestBlockText(t *testing.T) {
 func TestAdoptRecordsAvailableModes(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "")
 	c.ui.Usage(4000, 8000)
-	c.adopt("s2", &acp.SessionModeState{
+	c.adopt("s2", &SessionModeState{
 		CurrentModeId: "Interactive",
 		AvailableModes: []struct {
 			Id          string `json:"id"`
@@ -795,7 +793,7 @@ func TestOneShotExitsOnTheStopReason(t *testing.T) {
 		code := make(chan int, 1)
 		go func() { code <- c.run(false, "", "do the thing", true) }()
 
-		p.reply(p.recv(), map[string]any{"protocolVersion": acp.ProtocolVersion})
+		p.reply(p.recv(), map[string]any{"protocolVersion": protocolVersion})
 		p.reply(p.recv(), map[string]any{"sessionId": "s1"})
 		req := p.recv()
 		if req["method"] != "session/prompt" {

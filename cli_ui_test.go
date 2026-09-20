@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // uiFor builds a renderer writing into a buffer at a known geometry. Tests are
@@ -137,7 +135,7 @@ func stripANSI(s string) string {
 // Off by one here eats a transcript row on every redraw.
 func TestLiveRegionRowAccounting(t *testing.T) {
 	u, buf := uiFor(true, 60, 24)
-	u.Card(acp.ToolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "run tests", Status: "in_progress"})
+	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "run tests", Status: "in_progress"})
 	if u.liveRows != 1 {
 		t.Fatalf("liveRows after one running card = %d, want 1", u.liveRows)
 	}
@@ -158,7 +156,7 @@ func TestLiveRegionFitsScreen(t *testing.T) {
 	u, _ := uiFor(true, 60, 8) // room for 6 live rows
 	u.Begin()
 	for i := 0; i < 20; i++ {
-		u.Card(acp.ToolCallUpdate{Kind: "tool_call", ToolCallId: string(rune('a' + i)), Title: "tool", Status: "in_progress"})
+		u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: string(rune('a' + i)), Title: "tool", Status: "in_progress"})
 	}
 	if u.liveRows > u.rows-2 {
 		t.Errorf("live region is %d rows on a %d-row screen", u.liveRows, u.rows)
@@ -170,13 +168,13 @@ func TestLiveRegionFitsScreen(t *testing.T) {
 func TestLiveRowsFitWidth(t *testing.T) {
 	u, _ := uiFor(true, 30, 24)
 	u.Begin()
-	u.Card(acp.ToolCallUpdate{
+	u.Card(toolCallUpdate{
 		Kind: "tool_call", ToolCallId: "1", Status: "in_progress",
 		Title:   "a title far longer than thirty columns of terminal",
-		Content: []acp.ToolCallContent{{Type: "terminal", TerminalId: "t1"}},
+		Content: []ToolCallContent{{Type: "terminal", TerminalId: "t1"}},
 	})
 	u.TerminalTail("t1", []string{strings.Repeat("x", 200)})
-	u.Plan([]acp.PlanEntry{{Content: strings.Repeat("plan ", 40), Status: "in_progress"}})
+	u.Plan([]PlanEntry{{Content: strings.Repeat("plan ", 40), Status: "in_progress"}})
 	for _, l := range u.liveLines() {
 		if w := len([]rune(stripANSI(l))); w > u.cols-1 {
 			t.Errorf("live row is %d columns wide (max %d): %q", w, u.cols-1, stripANSI(l))
@@ -186,13 +184,13 @@ func TestLiveRowsFitWidth(t *testing.T) {
 
 func TestCardCommitsOnCompletion(t *testing.T) {
 	u, buf := uiFor(false, 80, 24)
-	u.Card(acp.ToolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "read main.go", Status: "in_progress"})
+	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "read main.go", Status: "in_progress"})
 	if buf.String() != "" {
 		t.Fatalf("a running card must stay in the live region, got %q", buf.String())
 	}
-	u.Card(acp.ToolCallUpdate{
+	u.Card(toolCallUpdate{
 		Kind: "tool_call_update", ToolCallId: "1", Status: "completed",
-		Content: []acp.ToolCallContent{{Type: "content", Content: &acp.ContentBlock{Type: "text", Text: "42 lines"}}},
+		Content: []ToolCallContent{{Type: "content", Content: &ContentBlock{Type: "text", Text: "42 lines"}}},
 	})
 	out := buf.String()
 	if !strings.Contains(out, "✓ read main.go") {
@@ -208,8 +206,8 @@ func TestCardCommitsOnCompletion(t *testing.T) {
 
 func TestFailedCardIsMarked(t *testing.T) {
 	u, buf := uiFor(false, 80, 24)
-	u.Card(acp.ToolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "run build", Status: "in_progress"})
-	u.Card(acp.ToolCallUpdate{Kind: "tool_call_update", ToolCallId: "1", Status: "failed"})
+	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "run build", Status: "in_progress"})
+	u.Card(toolCallUpdate{Kind: "tool_call_update", ToolCallId: "1", Status: "failed"})
 	if !strings.Contains(buf.String(), "✗ run build") {
 		t.Errorf("failed card not marked: %q", buf.String())
 	}
@@ -220,7 +218,7 @@ func TestFailedCardIsMarked(t *testing.T) {
 func TestEndCommitsInterruptedCards(t *testing.T) {
 	u, buf := uiFor(false, 80, 24)
 	u.Begin()
-	u.Card(acp.ToolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "npm test", Status: "in_progress"})
+	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "npm test", Status: "in_progress"})
 	u.End()
 	if !strings.Contains(buf.String(), "npm test (interrupted)") {
 		t.Errorf("interrupted card lost: %q", buf.String())
@@ -234,12 +232,12 @@ func TestEndCommitsInterruptedCards(t *testing.T) {
 // must drop the right map entry or the tails accumulate for the whole session.
 func TestCardDropsItsTerminalTail(t *testing.T) {
 	u, _ := uiFor(false, 80, 24)
-	u.Card(acp.ToolCallUpdate{
+	u.Card(toolCallUpdate{
 		Kind: "tool_call", ToolCallId: "call_1", Title: "run", Status: "in_progress",
-		Content: []acp.ToolCallContent{{Type: "terminal", TerminalId: "term_1"}},
+		Content: []ToolCallContent{{Type: "terminal", TerminalId: "term_1"}},
 	})
 	u.TerminalTail("term_1", []string{"building…"})
-	u.Card(acp.ToolCallUpdate{Kind: "tool_call_update", ToolCallId: "call_1", Status: "completed"})
+	u.Card(toolCallUpdate{Kind: "tool_call_update", ToolCallId: "call_1", Status: "completed"})
 	if _, ok := u.terms["term_1"]; ok {
 		t.Errorf("terminal tail outlived its card: %v", u.terms)
 	}
@@ -341,9 +339,9 @@ func TestNonTTYEmitsNoEscapes(t *testing.T) {
 	u, buf := uiFor(false, 80, 24)
 	u.Begin()
 	u.Stream("", "", "hello\n")
-	u.Card(acp.ToolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "work", Status: "in_progress"})
+	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "work", Status: "in_progress"})
 	u.Tick()
-	u.Card(acp.ToolCallUpdate{Kind: "tool_call_update", ToolCallId: "1", Status: "completed"})
+	u.Card(toolCallUpdate{Kind: "tool_call_update", ToolCallId: "1", Status: "completed"})
 	u.Note(ansiRed, "an error")
 	u.End()
 	if strings.Contains(buf.String(), "\x1b") {
@@ -395,7 +393,7 @@ func TestTerminalTailExpandsTabs(t *testing.T) {
 
 func TestCardTitleIsSanitized(t *testing.T) {
 	u, _ := uiFor(true, 80, 24)
-	u.Card(acp.ToolCallUpdate{ToolCallId: "t1", Title: "run \x1b[1;1Hls", Status: "in_progress"})
+	u.Card(toolCallUpdate{ToolCallId: "t1", Title: "run \x1b[1;1Hls", Status: "in_progress"})
 	if got := u.calls["t1"].title; got != "run [1;1Hls" {
 		t.Errorf("title = %q", got)
 	}

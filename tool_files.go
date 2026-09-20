@@ -9,8 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // binarySniffLen is how many leading bytes we sniff for a NUL to classify a file
@@ -262,7 +260,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	}
 	if looksBinary([]byte(content)) {
 		msg := fmt.Sprintf("%s is a binary file (NUL bytes) — not shown. Reading it as text would corrupt the context. Use a shell tool to inspect its bytes if you must.", path)
-		a.CompleteToolCallTitled(ctx, sid, tcId, "Read (binary, skipped): "+path, []acp.ToolCallContent{acp.TextContent(msg)})
+		a.CompleteToolCallTitled(ctx, sid, tcId, "Read (binary, skipped): "+path, []ToolCallContent{TextContent(msg)})
 		return msg, false
 	}
 
@@ -352,7 +350,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 		}
 		refusal := fmt.Sprintf("This file is already in the context — %s. You read %s lines %d-%d earlier this turn and it has not changed; re-read refused.%s",
 			readUnchangedMarker, path, start, end, ptr)
-		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Read (already in context): %s (%d-%d)", path, start, end), []acp.ToolCallContent{acp.TextContent(refusal)})
+		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Read (already in context): %s (%d-%d)", path, start, end), []ToolCallContent{TextContent(refusal)})
 		return refusal, false
 	}
 
@@ -377,7 +375,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	} else {
 		title += " (complete)"
 	}
-	a.CompleteToolCallTitled(ctx, sid, tcId, title, []acp.ToolCallContent{acp.TextContent(out)})
+	a.CompleteToolCallTitled(ctx, sid, tcId, title, []ToolCallContent{TextContent(out)})
 	return out, false
 }
 
@@ -453,11 +451,11 @@ var fileTools = []Tool{
 		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
 			return fmt.Sprintf("error: no such directory: %s", dir), false
 		}
-		tcId := a.StartToolCall(ctx, sid, "Listing: "+dir, "search", []acp.ToolCallLocation{{Path: dir}})
+		tcId := a.StartToolCall(ctx, sid, "Listing: "+dir, "search", []ToolCallLocation{{Path: dir}})
 		files := listProjectFiles(dir)
 		a.CompleteToolCallTitled(ctx, sid, tcId,
 			fmt.Sprintf("Listing: %s (%d files)", dir, len(files)),
-			[]acp.ToolCallContent{acp.TextContent(fmt.Sprintf("%d files", len(files)))})
+			[]ToolCallContent{TextContent(fmt.Sprintf("%d files", len(files)))})
 		if len(files) == 0 {
 			return "(directory is empty: " + dir + ")", false
 		}
@@ -509,7 +507,7 @@ var fileTools = []Tool{
 		if haveLine {
 			title = fmt.Sprintf("Reading: %s:%d", path, line)
 		}
-		tcId := a.StartToolCall(ctx, sid, title, "read", []acp.ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
 		return a.serveRead(ctx, sid, path, start, maxLines, tcId)
 	}},
 
@@ -540,7 +538,7 @@ var fileTools = []Tool{
 			}
 			sess.turnMu.Unlock()
 		}
-		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Continuing: %s:%d", path, start), "read", []acp.ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Continuing: %s:%d", path, start), "read", []ToolCallLocation{{Path: path}})
 		return a.serveRead(ctx, sid, path, start, readChunkLines, tcId)
 	}},
 
@@ -571,7 +569,7 @@ var fileTools = []Tool{
 			return refusal, true
 		}
 		newContent := args.str("content")
-		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []acp.ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, "Writing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
 		// Pre-edit read for the diff card + formatGuarded's dry run. A missing file
 		// (the common new-file case) and a read fault both surface as an error here,
@@ -596,7 +594,7 @@ var fileTools = []Tool{
 			return "error writing file: " + err.Error(), false
 		}
 
-		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.DiffContent(path, &oldContent, newContent)})
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &oldContent, newContent)})
 
 		return "file written successfully" + drift, false
 	}},
@@ -631,7 +629,7 @@ var fileTools = []Tool{
 		oldText := args.str("old_text")
 		newText := args.str("new_text")
 
-		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []acp.ToolCallLocation{{Path: path}})
+		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
 		content, err := fsRead(a, ctx, sid, path, nil, nil)
 		if err != nil {
@@ -697,7 +695,7 @@ var fileTools = []Tool{
 			return "error writing file: " + err.Error(), false
 		}
 
-		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.DiffContent(path, &content, newContent)})
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
 
 		return okNote + drift, false
 	}},
@@ -716,7 +714,7 @@ func fsRead(a *agent, ctx context.Context, sid string, path string, line, limit 
 		if !a.clientCan("read") {
 			return directRead(path, line, limit)
 		}
-		raw, err := a.conn.SendRequest(ctx, "fs/read_text_file", struct {
+		raw, err := a.conn.sendRequest(ctx, "fs/read_text_file", struct {
 			SessionId string `json:"sessionId"`
 			Path      string `json:"path"`
 			Line      *int   `json:"line,omitempty"`
@@ -768,7 +766,7 @@ func fsWrite(a *agent, ctx context.Context, sid string, path, content string) er
 	if direct {
 		err = os.WriteFile(path, []byte(content), 0644)
 	} else {
-		_, err = a.conn.SendRequest(ctx, "fs/write_text_file", struct {
+		_, err = a.conn.sendRequest(ctx, "fs/write_text_file", struct {
 			SessionId string `json:"sessionId"`
 			Path      string `json:"path"`
 			Content   string `json:"content"`

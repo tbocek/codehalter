@@ -1,4 +1,4 @@
-package acp
+package main
 
 import (
 	"bufio"
@@ -44,9 +44,9 @@ func readLine(t *testing.T, r io.Reader) []byte {
 	return []byte(strings.TrimRight(line, "\r\n"))
 }
 
-func TestJSONRPCRequestEncoding(t *testing.T) {
+func TestJsonrpcRequestEncoding(t *testing.T) {
 	id := json.RawMessage(`"7"`)
-	req := JSONRPCRequest{JSONRPC: "2.0", ID: &id, Method: "session/prompt", Params: json.RawMessage(`{"x":1}`)}
+	req := jsonrpcRequest{JSONRPC: "2.0", ID: &id, Method: "session/prompt", Params: json.RawMessage(`{"x":1}`)}
 	b, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestJSONRPCRequestEncoding(t *testing.T) {
 	}
 
 	// Notification: no id field on the wire.
-	notif := JSONRPCRequest{JSONRPC: "2.0", Method: "session/update", Params: json.RawMessage(`{}`)}
+	notif := jsonrpcRequest{JSONRPC: "2.0", Method: "session/update", Params: json.RawMessage(`{}`)}
 	b, _ = json.Marshal(notif)
 	if strings.Contains(string(b), `"id"`) {
 		t.Fatalf("notification leaked id field: %s", b)
@@ -77,7 +77,7 @@ func TestSessionUpdateWrapsPayload(t *testing.T) {
 	agentW, agentR, _, peerR := pipePair(t)
 	c := NewAgentSideConnection(nil, agentW, agentR)
 
-	chunk := MessageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "hi"}}
+	chunk := messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: "hi"}}
 	if err := c.SessionUpdate(context.Background(), "sid-42", chunk); err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestSessionUpdateWrapsPayload(t *testing.T) {
 		Method string `json:"method"`
 		Params struct {
 			SessionId string       `json:"sessionId"`
-			Update    MessageChunk `json:"update"`
+			Update    messageChunk `json:"update"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(line, &env); err != nil {
@@ -112,14 +112,14 @@ func TestSendRequestRoundtrip(t *testing.T) {
 			ID *json.RawMessage `json:"id"`
 		}
 		_ = json.Unmarshal(line, &probe)
-		resp := JSONRPCResponse{JSONRPC: "2.0", ID: probe.ID, Result: map[string]string{"ok": "yes"}}
+		resp := jsonrpcResponse{JSONRPC: "2.0", ID: probe.ID, Result: map[string]string{"ok": "yes"}}
 		b, _ := json.Marshal(resp)
 		_, _ = peerW.Write(append(b, '\n'))
 	}()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	raw, err := c.SendRequest(ctx, "fs/read_text_file", map[string]string{"path": "/tmp/x"})
+	raw, err := c.sendRequest(ctx, "fs/read_text_file", map[string]string{"path": "/tmp/x"})
 	if err != nil {
 		t.Fatalf("sendRequest: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSendRequestContextCancel(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
-	if _, err := c.SendRequest(ctx, "fs/read_text_file", nil); err == nil {
+	if _, err := c.sendRequest(ctx, "fs/read_text_file", nil); err == nil {
 		t.Fatal("expected context error, got nil")
 	}
 }
@@ -149,14 +149,14 @@ func TestUnknownMethodRepliesMethodNotFound(t *testing.T) {
 	_ = c
 
 	// Send a request whose method doesn't match any case in handle().
-	req := JSONRPCRequest{JSONRPC: "2.0", ID: ptrRaw(`"99"`), Method: "no/such/method"}
+	req := jsonrpcRequest{JSONRPC: "2.0", ID: ptrRaw(`"99"`), Method: "no/such/method"}
 	b, _ := json.Marshal(req)
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
 		t.Fatal(err)
 	}
 
 	line := readLine(t, peerR)
-	var resp JSONRPCResponse
+	var resp jsonrpcResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -187,14 +187,14 @@ func TestCancelRequestAnswersImmediately(t *testing.T) {
 	c.inflight[`"7"`] = entry
 	c.inflightMu.Unlock()
 
-	cancelReq := JSONRPCRequest{JSONRPC: "2.0", Method: "$/cancel_request", Params: json.RawMessage(`{"requestId":"7"}`)}
+	cancelReq := jsonrpcRequest{JSONRPC: "2.0", Method: "$/cancel_request", Params: json.RawMessage(`{"requestId":"7"}`)}
 	b, _ := json.Marshal(cancelReq)
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
 		t.Fatal(err)
 	}
 
 	line := readLine(t, peerR)
-	var resp JSONRPCResponse
+	var resp jsonrpcResponse
 	if err := json.Unmarshal(line, &resp); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -221,17 +221,17 @@ func TestCancelRequestUnknownIdIsIgnored(t *testing.T) {
 	agentW, agentR, peerW, peerR := pipePair(t)
 	NewAgentSideConnection(nil, agentW, agentR)
 
-	b, _ := json.Marshal(JSONRPCRequest{JSONRPC: "2.0", Method: "$/cancel_request", Params: json.RawMessage(`{"requestId":"404"}`)})
+	b, _ := json.Marshal(jsonrpcRequest{JSONRPC: "2.0", Method: "$/cancel_request", Params: json.RawMessage(`{"requestId":"404"}`)})
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
 		t.Fatal(err)
 	}
 	// Then a request we know produces a reply — if the cancel wrote anything,
 	// this read returns that instead of the -32601.
-	b, _ = json.Marshal(JSONRPCRequest{JSONRPC: "2.0", ID: ptrRaw(`"1"`), Method: "no/such/method"})
+	b, _ = json.Marshal(jsonrpcRequest{JSONRPC: "2.0", ID: ptrRaw(`"1"`), Method: "no/such/method"})
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
 		t.Fatal(err)
 	}
-	var resp JSONRPCResponse
+	var resp jsonrpcResponse
 	if err := json.Unmarshal(readLine(t, peerR), &resp); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestSendRequestCancelsOutboundOnCtxDone(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if _, err := c.SendRequest(ctx, "session/request_permission", map[string]string{"sessionId": "s1"}); err == nil {
+		if _, err := c.sendRequest(ctx, "session/request_permission", map[string]string{"sessionId": "s1"}); err == nil {
 			t.Error("sendRequest returned nil error after cancel")
 		}
 	}()
@@ -261,7 +261,7 @@ func TestSendRequestCancelsOutboundOnCtxDone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read request: %v", err)
 	}
-	var out JSONRPCRequest
+	var out jsonrpcRequest
 	if err := json.Unmarshal([]byte(first), &out); err != nil {
 		t.Fatalf("parse request: %v", err)
 	}
@@ -271,7 +271,7 @@ func TestSendRequestCancelsOutboundOnCtxDone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read cancel: %v", err)
 	}
-	var got JSONRPCRequest
+	var got jsonrpcRequest
 	if err := json.Unmarshal([]byte(second), &got); err != nil {
 		t.Fatalf("parse cancel: %v", err)
 	}

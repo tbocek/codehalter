@@ -7,8 +7,6 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
-
-	"github.com/tbocek/codehalter/llm"
 )
 
 // TestLoadSettingsProjectLocalFirst pins the settings precedence: the
@@ -88,7 +86,7 @@ func TestLoadSettingsProjectLocalFirst(t *testing.T) {
 }
 
 // TestSeedSettingsRolesDifferInSamplersOnly pins the rule that the SEEDED
-// settings.toml gives both roles the same llm.RenderKey. Samplers may differ freely
+// settings.toml gives both roles the same renderKey. Samplers may differ freely
 // (temperature, max_tokens and friends never reach the chat template); anything
 // else means the two roles ask the server for two different token sequences of
 // the same conversation, and on a one-slot server they evict each other at
@@ -101,7 +99,7 @@ func TestLoadSettingsProjectLocalFirst(t *testing.T) {
 // on that session) and res/settings.toml says when it pays. What ships by
 // default must not, because the default server holds one slot.
 //
-// Asserted through llm.RenderKey itself, not a re-implementation of it: the
+// Asserted through renderKey itself, not a re-implementation of it: the
 // fingerprint the rewind detector compares at runtime is the thing that has to
 // match.
 func TestSeedSettingsRolesDifferInSamplersOnly(t *testing.T) {
@@ -113,12 +111,62 @@ func TestSeedSettingsRolesDifferInSamplersOnly(t *testing.T) {
 		t.Fatal("res/settings.toml declares no [[llm]] entry")
 	}
 	for i, c := range s.LLM {
-		think, exec := llm.RenderKey(c.ParamsThinking), llm.RenderKey(c.ParamsExecute)
+		think, exec := renderKey(c.ParamsThinking), renderKey(c.ParamsExecute)
 		if think != exec {
 			t.Errorf("llm[%d] renders differently per role (thinking=%s execute=%s): "+
 				"non-sampler params re-render the prompt, so every phase switch re-prefills the context",
 				i, think, exec)
 		}
+	}
+}
+
+// TestParamsForInventsNoChatTemplateKwargs pins that codehalter never puts a
+// chat-template argument on the wire that the user did not write. It is
+// tempting to: turning reasoning off for the execute role is worth ~50 minutes
+// of decode on an 11.6h session against Qwen3.8-27B.
+//
+// But it gives the two roles different renderings, and on a one-slot server
+// they evict each other on every plan -> execute switch: 35 switches in that
+// session carrying 2414262 prompt tokens, at 483 tok/s prefill, so 83.3 minutes
+// of re-prefill against the 50 it saves. codehalter banks that decode win by
+// appending a closed <think></think> instead (withThinkingDisabled), which is
+// a suffix and leaves the rendering alone. The kwargs field stays the user's
+// call per connection (res/settings.toml costs it), so paramsFor hands back
+// exactly what was configured.
+func TestParamsForInventsNoChatTemplateKwargs(t *testing.T) {
+	c := LLMConnection{
+		ParamsThinking: map[string]any{"temperature": 1.0},
+		ParamsExecute:  map[string]any{"temperature": 0.6},
+	}
+	for _, role := range []string{"thinking", "execute"} {
+		if _, set := c.paramsFor(role)["chat_template_kwargs"]; set {
+			t.Errorf("%s: codehalter invented chat_template_kwargs: %v", role, c.paramsFor(role))
+		}
+	}
+	// The legacy single `params` set gets the same treatment.
+	legacy := LLMConnection{Params: map[string]any{"temperature": 0.7}}
+	if _, set := legacy.paramsFor("execute")["chat_template_kwargs"]; set {
+		t.Errorf("legacy params: codehalter invented chat_template_kwargs: %v", legacy.paramsFor("execute"))
+	}
+
+	// What the user DID write is passed through untouched, on the role they put
+	// it on and only that role. The divergence is theirs to place.
+	opted := LLMConnection{
+		ParamsThinking: map[string]any{"temperature": 1.0},
+		ParamsExecute: map[string]any{
+			"temperature":          0.6,
+			"chat_template_kwargs": map[string]any{"enable_thinking": false},
+		},
+	}
+	ctk, _ := opted.paramsFor("execute")["chat_template_kwargs"].(map[string]any)
+	if ctk["enable_thinking"] != false {
+		t.Errorf("the user's own kwargs did not survive: %v", opted.paramsFor("execute"))
+	}
+	if _, set := opted.paramsFor("thinking")["chat_template_kwargs"]; set {
+		t.Error("params_execute kwargs leaked onto the thinking role")
+	}
+	if got := opted.paramsFor("execute")["temperature"]; got != 0.6 {
+		t.Errorf("temperature = %v, want 0.6", got)
 	}
 }
 

@@ -18,9 +18,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
-	"github.com/tbocek/codehalter/launcher"
 )
 
 // ---------------------------------------------------------------------------
@@ -147,11 +144,7 @@ func runCLI(argv []string) int {
 		if oneshot {
 			inner = append(inner, "-p", prompt)
 		}
-		if code, launched := launcher.Run(launcher.Options{
-			Workspace: cwd, Inner: inner, Rebuild: rebuild,
-			Interactive: stdinIsTTY(), Styled: stdoutStyled(),
-			Forward: []string{envLatest, envUpdate}, CacheDir: cacheDir(),
-		}); launched {
+		if code, launched := launchInDevcontainer(cwd, inner, rebuild); launched {
 			return code
 		}
 	}
@@ -176,7 +169,7 @@ func runCLI(argv []string) int {
 	clientIn, agentOut := io.Pipe()
 
 	a := &agent{sessions: make(map[string]*Session), mode: "Interactive", standalone: true}
-	acp := acp.NewAgentSideConnection(a, agentOut, agentIn)
+	acp := NewAgentSideConnection(a, agentOut, agentIn)
 	a.conn = acp
 
 	c := &cliClient{
@@ -303,7 +296,7 @@ func (c *cliClient) setSessionID(id string) {
 
 func (c *cliClient) run(resume bool, resumeID, prompt string, oneshot bool) int {
 	if _, err := c.conn.request("initialize", map[string]any{
-		"protocolVersion": acp.ProtocolVersion,
+		"protocolVersion": protocolVersion,
 		"clientCapabilities": map[string]any{
 			"terminal":    true,
 			"elicitation": map[string]any{"form": map[string]any{}},
@@ -354,11 +347,11 @@ func (c *cliClient) openSession(resume bool, resumeID string) error {
 		return c.loadSession(resumeID)
 	}
 
-	raw, err := c.conn.request("session/new", acp.NewSessionRequest{Cwd: c.cwd})
+	raw, err := c.conn.request("session/new", NewSessionRequest{Cwd: c.cwd})
 	if err != nil {
 		return fmt.Errorf("session/new failed: %w", err)
 	}
-	var res acp.NewSessionResponse
+	var res NewSessionResponse
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("session/new returned nonsense: %w", err)
 	}
@@ -371,11 +364,11 @@ func (c *cliClient) openSession(resume bool, resumeID string) error {
 
 // loadSession resumes a stored session by id.
 func (c *cliClient) loadSession(id string) error {
-	raw, err := c.conn.request("session/load", acp.LoadSessionRequest{SessionId: id, Cwd: c.cwd})
+	raw, err := c.conn.request("session/load", LoadSessionRequest{SessionId: id, Cwd: c.cwd})
 	if err != nil {
 		return fmt.Errorf("session/load failed: %w", err)
 	}
-	var res acp.LoadSessionResponse
+	var res LoadSessionResponse
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("session/load returned nonsense: %w", err)
 	}
@@ -392,12 +385,12 @@ func (c *cliClient) loadSession(id string) error {
 // ISO 8601, so lexical order is chronological order. The agent already sorts,
 // but a client that relies on that is a client that breaks quietly the day it
 // stops being true.
-func (c *cliClient) storedSessions() ([]acp.SessionInfo, error) {
-	raw, err := c.conn.request("session/list", acp.ListSessionsRequest{Cwd: c.cwd})
+func (c *cliClient) storedSessions() ([]SessionInfo, error) {
+	raw, err := c.conn.request("session/list", ListSessionsRequest{Cwd: c.cwd})
 	if err != nil {
 		return nil, fmt.Errorf("session/list failed: %w", err)
 	}
-	var list acp.ListSessionsResponse
+	var list ListSessionsResponse
 	if err := json.Unmarshal(raw, &list); err != nil {
 		return nil, fmt.Errorf("session/list returned nonsense: %w", err)
 	}
@@ -410,7 +403,7 @@ func (c *cliClient) storedSessions() ([]acp.SessionInfo, error) {
 // adopt switches to a session the agent just handed us. The context meter is
 // zeroed because it describes the conversation we just left; the agent sends a
 // usage_update for the new one on its first turn.
-func (c *cliClient) adopt(sid string, modes *acp.SessionModeState) {
+func (c *cliClient) adopt(sid string, modes *SessionModeState) {
 	c.setSessionID(sid)
 	c.modes = nil
 	if modes != nil {
@@ -436,7 +429,7 @@ func (c *cliClient) installSignals() {
 		for range sigs {
 			if c.turnActive.Load() {
 				c.ui.Note(ansiYell, "  interrupting…")
-				if err := c.conn.notify("session/cancel", acp.CancelNotification{SessionId: c.sessionID()}); err != nil {
+				if err := c.conn.notify("session/cancel", CancelNotification{SessionId: c.sessionID()}); err != nil {
 					slog.Debug("cli: cancel failed", "err", err)
 				}
 				continue
@@ -561,7 +554,7 @@ func (c *cliClient) setMode(mode string) {
 	}
 	for _, m := range c.modes {
 		if strings.EqualFold(m, mode) {
-			if _, err := c.conn.request("session/set_mode", acp.SetSessionModeRequest{SessionId: c.sessionID(), ModeId: m}); err != nil {
+			if _, err := c.conn.request("session/set_mode", SetSessionModeRequest{SessionId: c.sessionID(), ModeId: m}); err != nil {
 				c.ui.Note(ansiRed, "  set_mode: "+err.Error())
 				return
 			}
@@ -598,12 +591,12 @@ func (c *cliClient) printSessions() {
 // is not closed: it stays on disk and /resume brings it back, exactly like
 // opening a second thread in an editor.
 func (c *cliClient) newSession() {
-	raw, err := c.conn.request("session/new", acp.NewSessionRequest{Cwd: c.cwd})
+	raw, err := c.conn.request("session/new", NewSessionRequest{Cwd: c.cwd})
 	if err != nil {
 		c.ui.Note(ansiRed, "  session/new: "+err.Error())
 		return
 	}
-	var res acp.NewSessionResponse
+	var res NewSessionResponse
 	if err := json.Unmarshal(raw, &res); err != nil || res.SessionId == "" {
 		c.ui.Note(ansiRed, "  session/new returned no session id")
 		return
@@ -652,9 +645,9 @@ func (c *cliClient) turn(text string) bool {
 	c.ui.Begin()
 	stop := c.startTicker()
 
-	raw, err := c.conn.request("session/prompt", acp.PromptRequest{
+	raw, err := c.conn.request("session/prompt", PromptRequest{
 		SessionId: c.sessionID(),
-		Content:   []acp.ContentBlock{{Type: "text", Text: text}},
+		Content:   []ContentBlock{{Type: "text", Text: text}},
 	})
 
 	stop()
@@ -665,7 +658,7 @@ func (c *cliClient) turn(text string) bool {
 		c.ui.Note(ansiRed, "  turn failed: "+err.Error())
 		return false
 	}
-	var res acp.PromptResponse
+	var res PromptResponse
 	if err := json.Unmarshal(raw, &res); err != nil {
 		c.ui.Note(ansiRed, "  turn returned nonsense: "+err.Error())
 		return false
@@ -737,36 +730,36 @@ func (c *cliClient) sessionUpdate(params json.RawMessage) {
 		return
 	}
 	switch kind.Kind {
-	case acp.KindAgentMessage, acp.KindAgentThought, acp.KindUserMessage:
-		var m acp.MessageChunk
+	case KindAgentMessage, KindAgentThought, KindUserMessage:
+		var m messageChunk
 		if json.Unmarshal(p.Update, &m) != nil {
 			return
 		}
 		sty, pre := "", ""
 		switch kind.Kind {
-		case acp.KindAgentThought:
+		case KindAgentThought:
 			sty, pre = ansiDim, "  "
-		case acp.KindUserMessage:
+		case KindUserMessage:
 			sty, pre = ansiDim, "❯ "
 		}
 		c.ui.Stream(sty, pre, blockText(m.Content))
 
 	case "tool_call", "tool_call_update":
-		var up acp.ToolCallUpdate
+		var up toolCallUpdate
 		if json.Unmarshal(p.Update, &up) != nil {
 			return
 		}
 		c.ui.Card(up)
 
 	case "plan":
-		var pl acp.PlanUpdate
+		var pl planUpdate
 		if json.Unmarshal(p.Update, &pl) != nil {
 			return
 		}
 		c.ui.Plan(pl.Entries)
 
 	case "usage_update":
-		var u acp.UsageUpdate
+		var u usageUpdate
 		if json.Unmarshal(p.Update, &u) != nil {
 			return
 		}
@@ -791,7 +784,7 @@ func (c *cliClient) sessionUpdate(params json.RawMessage) {
 		c.cmdMu.Unlock()
 
 	case "session_info_update":
-		var s acp.SessionInfoUpdate
+		var s sessionInfoUpdate
 		if json.Unmarshal(p.Update, &s) != nil || s.Title == "" {
 			return
 		}
@@ -802,7 +795,7 @@ func (c *cliClient) sessionUpdate(params json.RawMessage) {
 // blockText renders one content block as terminal text. Images are named rather
 // than drawn: the CLI has no way to show one, and silently dropping the block
 // would make a screenshot look like it produced nothing.
-func blockText(b acp.ContentBlock) string {
+func blockText(b ContentBlock) string {
 	switch b.Type {
 	case "text":
 		return b.Text
@@ -826,7 +819,7 @@ func blockText(b acp.ContentBlock) string {
 // number. Empty input dismisses, which the agent reads as "cancelled" and is
 // how you back out without choosing.
 func (c *cliClient) requestPermission(params json.RawMessage) (any, error) {
-	var p acp.PermissionRequest
+	var p permissionRequest
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, err
 	}
@@ -839,7 +832,7 @@ func (c *cliClient) requestPermission(params json.RawMessage) (any, error) {
 		title = "Permission required"
 	}
 	idx, _ := c.askChoiceOrText(title, labels, false)
-	var resp acp.PermissionResponse
+	var resp permissionResponse
 	if idx < 0 {
 		resp.Outcome.Outcome = "cancelled"
 		return resp, nil
@@ -1207,7 +1200,7 @@ func (c *cliConn) notify(method string, params any) error {
 	if err != nil {
 		return err
 	}
-	return c.write(acp.JSONRPCRequest{JSONRPC: "2.0", Method: method, Params: raw})
+	return c.write(jsonrpcRequest{JSONRPC: "2.0", Method: method, Params: raw})
 }
 
 // request sends one client->agent call and waits for its reply. It takes no
@@ -1237,7 +1230,7 @@ func (c *cliConn) request(method string, params any) (json.RawMessage, error) {
 		}
 		raw = b
 	}
-	if err := c.write(acp.JSONRPCRequest{JSONRPC: "2.0", ID: &idRaw, Method: method, Params: raw}); err != nil {
+	if err := c.write(jsonrpcRequest{JSONRPC: "2.0", ID: &idRaw, Method: method, Params: raw}); err != nil {
 		return nil, err
 	}
 
@@ -1306,7 +1299,7 @@ func (c *cliConn) serve(r io.Reader) {
 			continue
 		}
 
-		var req acp.JSONRPCRequest
+		var req jsonrpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
 			slog.Warn("cli: unparseable request", "err", err)
 			continue
@@ -1347,7 +1340,7 @@ func (c *cliConn) cancelInflight(params json.RawMessage) {
 // handle runs one agent->client request or notification. Handlers that can
 // block on something other than the user take a context so $/cancel_request can
 // reach them; see askChoiceOrText for why the ones blocked on stdin don't.
-func (c *cliConn) handle(req *acp.JSONRPCRequest) {
+func (c *cliConn) handle(req *jsonrpcRequest) {
 	ctx := context.Background()
 	if req.ID != nil {
 		key := string(*req.ID)
@@ -1394,13 +1387,13 @@ func (c *cliConn) handle(req *acp.JSONRPCRequest) {
 		c.replyError(req.ID, -32603, err.Error())
 		return
 	}
-	if writeErr := c.write(acp.JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: res}); writeErr != nil {
+	if writeErr := c.write(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: res}); writeErr != nil {
 		slog.Debug("cli: reply failed", "method", req.Method, "err", writeErr)
 	}
 }
 
 func (c *cliConn) replyError(id *json.RawMessage, code int, msg string) {
-	resp := acp.JSONRPCResponse{JSONRPC: "2.0", ID: id}
+	resp := jsonrpcResponse{JSONRPC: "2.0", ID: id}
 	resp.Error = &struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`

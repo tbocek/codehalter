@@ -15,9 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
-	"github.com/tbocek/codehalter/llm"
 )
 
 // ---------------------------------------------------------------------------
@@ -317,7 +314,7 @@ func (a toolArgs) has(key string) bool {
 	return ok
 }
 
-func (a *agent) executeTool(ctx context.Context, sid string, tc llm.ToolCall) (string, bool) {
+func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (string, bool) {
 	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 
 	// Run outside the registry lock: a tool may take seconds (a build, a web
@@ -356,7 +353,7 @@ func nextToolUseID() string {
 // message stream. Truncation lives here, not in individual tools, so every tool
 // returns its complete output and this one place decides "small → whole, big →
 // truncate + cache the rest".
-func (a *agent) runToolCall(ctx context.Context, sid string, tc llm.ToolCall) (ToolUse, any) {
+func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolUse, any) {
 	started := time.Now()
 
 	// Image short-circuit: when the server supports images, deliver the bytes
@@ -413,7 +410,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc llm.ToolCall) (T
 // tool card + a recorded rejection so the model corrects. Failed is for the
 // record only — the caller doesn't feed it to the fail cap (the repetition
 // ladder catches genuine spamming).
-func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc llm.ToolCall) (ToolUse, string) {
+func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall) (ToolUse, string) {
 	msg := fmt.Sprintf("error: %s is not available during the %s phase — %s", tc.Function.Name, phase, denyHint(phase))
 	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
 	a.FailToolCall(ctx, sid, tcId, msg)
@@ -433,22 +430,63 @@ func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc llm.Tool
 	return tu, msg
 }
 
-func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []acp.ToolCallLocation) string {
+type toolCallUpdate struct {
+	Kind       string             `json:"sessionUpdate"`
+	ToolCallId string             `json:"toolCallId"`
+	Title      string             `json:"title,omitempty"`
+	ToolKind   string             `json:"kind,omitempty"`
+	Status     string             `json:"status,omitempty"`
+	Content    []ToolCallContent  `json:"content,omitempty"`
+	Locations  []ToolCallLocation `json:"locations,omitempty"`
+}
+
+type ToolCallContent struct {
+	Type       string        `json:"type"`
+	Content    *ContentBlock `json:"content,omitempty"`
+	Path       string        `json:"path,omitempty"`
+	OldText    *string       `json:"oldText,omitempty"`
+	NewText    string        `json:"newText,omitempty"`
+	TerminalId string        `json:"terminalId,omitempty"`
+}
+
+type ToolCallLocation struct {
+	Path string `json:"path"`
+	Line *int   `json:"line,omitempty"`
+}
+
+func TextContent(text string) ToolCallContent {
+	b := ContentBlock{Type: "text", Text: text}
+	return ToolCallContent{Type: "content", Content: &b}
+}
+
+func DiffContent(path string, oldText *string, newText string) ToolCallContent {
+	return ToolCallContent{Type: "diff", Path: path, OldText: oldText, NewText: newText}
+}
+
+// TerminalContent embeds a terminal created with terminal/create into a tool
+// call, so the client renders its output live instead of us relaying it as
+// message chunks. Must be sent before terminal/release; the client keeps
+// showing the output afterwards.
+func TerminalContent(terminalId string) ToolCallContent {
+	return ToolCallContent{Type: "terminal", TerminalId: terminalId}
+}
+
+func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []ToolCallLocation) string {
 	id := fmt.Sprintf("tc_%d", toolCallCounter.Add(1))
-	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
+	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call",
 		ToolCallId: id,
 		Title:      title,
 		ToolKind:   kind,
 		Status:     "in_progress",
-		Content:    []acp.ToolCallContent{},
+		Content:    []ToolCallContent{},
 		Locations:  locations,
 	})
 	return id
 }
 
-func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, content []acp.ToolCallContent) {
-	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
+func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, content []ToolCallContent) {
+	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
 		Status:     "completed",
@@ -460,8 +498,8 @@ func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, con
 // tool-call's title. Use this to surface a result preview in the panel
 // without requiring the user to expand the disclosure (e.g. change
 // "go_symbols: Foo" → "go_symbols: Foo → router.go:27 (+1)").
-func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, title string, content []acp.ToolCallContent) {
-	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
+func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, title string, content []ToolCallContent) {
+	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
 		Title:      title,
@@ -471,11 +509,11 @@ func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, titl
 }
 
 func (a *agent) FailToolCall(ctx context.Context, sid string, id, errMsg string) {
-	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
+	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: id,
 		Status:     "failed",
-		Content:    []acp.ToolCallContent{acp.TextContent("❌ " + errMsg)},
+		Content:    []ToolCallContent{TextContent("❌ " + errMsg)},
 	})
 }
 

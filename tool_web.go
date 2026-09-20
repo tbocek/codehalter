@@ -17,9 +17,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/coder/websocket"
-
-	"github.com/tbocek/codehalter/acp"
-	"github.com/tbocek/codehalter/llm"
 )
 
 // ---------------------------------------------------------------------------
@@ -423,7 +420,7 @@ var webTools = []Tool{
 		formatted := formatDDGResults(results)
 		a.CompleteToolCallTitled(ctx, sid, tcId,
 			fmt.Sprintf("DuckDuckGo: %s (%d results)", query, len(results)),
-			[]acp.ToolCallContent{acp.TextContent(formatted)})
+			[]ToolCallContent{TextContent(formatted)})
 		// Surface the list inline in the chat too, so the user can see the
 		// URLs and snippets without expanding the tool card.
 		a.say(ctx, sid, "\n"+formatted+"\n")
@@ -534,7 +531,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
 					a.CompleteToolCallTitled(ctx, sid, tcId,
 						fmt.Sprintf("Web Read (cached): %s [%d:%d of %d]", targetURL, offset, offset+len(slice), len(body)),
-						[]acp.ToolCallContent{acp.TextContent(fmt.Sprintf("returned %d chars from cache (offset %d, body %d)", len(slice), offset, len(body)))})
+						[]ToolCallContent{TextContent(fmt.Sprintf("returned %d chars from cache (offset %d, body %d)", len(slice), offset, len(body)))})
 					a.logSession(sid, "WEB", "range from cache: url=%s offset=%d limit=%d returned=%d body=%d", targetURL, offset, limit, len(slice), len(body))
 					return slice, false
 				}
@@ -551,7 +548,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
 					a.CompleteToolCallTitled(ctx, sid, tcId,
 						"Web Read (cached): "+targetURL,
-						[]acp.ToolCallContent{acp.TextContent(fmt.Sprintf("returned cached result (%d chars, no re-fetch)", len(cached)))})
+						[]ToolCallContent{TextContent(fmt.Sprintf("returned cached result (%d chars, no re-fetch)", len(cached)))})
 					a.logSession(sid, "WEB", "result from cache: url=%s summarize=%v returned=%d", targetURL, summarize, len(cached))
 					return cached, false
 				}
@@ -567,7 +564,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 					tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL+" — "+question, "search", nil)
 					out := a.summarizePage(ctx, sid, question, targetURL, body)
 					a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read (cached): "+targetURL+" — "+question,
-						[]acp.ToolCallContent{acp.TextContent(fmt.Sprintf("answered from the cached page (%d chars, no re-fetch)", len(body)))})
+						[]ToolCallContent{TextContent(fmt.Sprintf("answered from the cached page (%d chars, no re-fetch)", len(body)))})
 					sess.rememberWebResult(resultKey, summarize, out)
 					return out, false
 				}
@@ -616,7 +613,7 @@ func makeWebRead(summarize bool) func(context.Context, *agent, string, string) (
 			icon, msg = "❌", issue
 		}
 		a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read: "+targetURL+" "+icon,
-			[]acp.ToolCallContent{acp.TextContent(icon + " " + msg)})
+			[]ToolCallContent{TextContent(icon + " " + msg)})
 
 		a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))
 
@@ -679,7 +676,7 @@ func (a *agent) summarizePage(ctx context.Context, sid string, question, url, pa
 		question, url, pageText,
 	)
 
-	messages := []llm.Message{{Role: "user", Content: prompt}}
+	messages := []llmMessage{{Role: "user", Content: prompt}}
 	summary, _, _, err := a.llmStream(ctx, sid, conn, messages, nil, nil, nil, nil)
 	if err != nil {
 		const maxLen = 2000

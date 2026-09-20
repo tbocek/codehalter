@@ -10,8 +10,6 @@ import (
 	"slices"
 	"strings"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // /spec drives the implementation of a specification as a loop of rounds, one
@@ -233,8 +231,8 @@ func specModuleNames(idx *specIndex) []string {
 }
 
 // runSpec is the /spec command: status, or setup/resume followed by the loop.
-func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args string, pendingFixes []fixProblem) (acp.PromptResponse, error) {
-	end := acp.PromptResponse{StopReason: "end_turn"}
+func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args string, pendingFixes []fixProblem) (PromptResponse, error) {
+	end := PromptResponse{StopReason: "end_turn"}
 	say := func(s string) { a.say(ctx, sid, s) }
 
 	cmd, specArg, outArg, target, err := parseSpecArgs(args)
@@ -334,7 +332,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return end, nil
 		}
-		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent(map[bool]string{true: "Starting", false: "Stopped"}[ok])})
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(map[bool]string{true: "Starting", false: "Stopped"}[ok])})
 		if !ok {
 			return end, nil
 		}
@@ -352,7 +350,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	reasons := map[string]string{} // why the last round on an item did not count, for its retry
 	consecutive, round := 0, 0
 	fixes := pendingFixes
-	stopped := func(err error) (acp.PromptResponse, error) {
+	stopped := func(err error) (PromptResponse, error) {
 		if serr := saveSpecConfig(sess.Cwd, cfg); serr != nil {
 			a.say(context.Background(), sid, "⚠ /spec: "+serr.Error()+"\n")
 		}
@@ -363,7 +361,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		if !sess.superseded() {
 			a.say(context.Background(), sid, msg)
 		}
-		return acp.PromptResponse{StopReason: "cancelled"}, nil
+		return PromptResponse{StopReason: "cancelled"}, nil
 	}
 
 	for {

@@ -7,8 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"github.com/tbocek/codehalter/llm"
 )
 
 // writeLines writes n newline-terminated lines ("L1\n".."Ln\n") to path.
@@ -187,7 +185,7 @@ func TestReadFileHonoursNumericLineAndLimit(t *testing.T) {
 
 	read := func(t *testing.T, rawArgs string) string {
 		t.Helper()
-		var tc llm.ToolCall
+		var tc toolCall
 		tc.Function.Name = "read_file"
 		tc.Function.Arguments = rawArgs
 		out, failed := a.executeTool(ctx, s.ID, tc)
@@ -229,7 +227,7 @@ func TestEditFileMissFailsAndSteers(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	var miss llm.ToolCall
+	var miss toolCall
 	miss.Function.Name = "edit_file"
 	miss.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func ZZZ() {}","new_text":"x"}`, path)
 	out, failed := a.executeTool(ctx, s.ID, miss)
@@ -242,7 +240,7 @@ func TestEditFileMissFailsAndSteers(t *testing.T) {
 		}
 	}
 
-	var hit llm.ToolCall
+	var hit toolCall
 	hit.Function.Name = "edit_file"
 	hit.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func A() {}","new_text":"func A() { return }"}`, path)
 	if _, failed := a.executeTool(ctx, s.ID, hit); failed {
@@ -348,7 +346,7 @@ func TestEditFileMissQuotesNearbyRegion(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	var miss llm.ToolCall
+	var miss toolCall
 	miss.Function.Name = "edit_file"
 	miss.Function.Arguments = fmt.Sprintf(`{"path":%q,"old_text":"func load(path string) error {\n\tf, err := os.Open(path)\n\tif err != nil {","new_text":"x"}`, path)
 	out, failed := a.executeTool(ctx, s.ID, miss)

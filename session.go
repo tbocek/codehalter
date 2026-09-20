@@ -14,9 +14,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
-
-	"github.com/tbocek/codehalter/acp"
-	"github.com/tbocek/codehalter/llm"
 )
 
 const sessionDir = ".codehalter"
@@ -97,7 +94,7 @@ type ToolUse struct {
 // at enqueue time so the runner doesn't have to reach back into the agent.
 type summariseTask struct {
 	Turn []Message
-	Conn *llm.Conn
+	Conn *LLMConnection
 	// Prompt is the SUMMARISE.md body for the paste-mode render (unused in
 	// prefix-extension mode, where it is already baked into Msgs).
 	Prompt string
@@ -106,7 +103,7 @@ type summariseTask struct {
 	// instruction (see appendSummariseMsgs). Frozen at ENQUEUE time so a
 	// queued task still summarises exactly its own turn even when the next
 	// turn has already started by the time the worker runs it.
-	Msgs []llm.Message
+	Msgs []llmMessage
 }
 
 type Session struct {
@@ -148,7 +145,7 @@ type Session struct {
 	// mcpOffer holds the editor's own MCP server list, as it arrived on
 	// session/new. Not persisted: it's the client's configuration, re-sent on
 	// every connect, and offerMCPImport consumes it once at bootstrap.
-	mcpOffer []acp.MCPServer
+	mcpOffer []acpMCPServer
 	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
 	// phaseActive=true means a phase entry is showing as in_progress and
 	// must be marked completed before Prompt returns; phaseCurrent is the
@@ -293,7 +290,7 @@ type turnState struct {
 // to reason about across process boundaries.
 type cacheLineage struct {
 	prompt int // its prompt_tokens
-	// render is its llm.RenderKey: the template-affecting params it was sent with.
+	// render is its renderKey: the template-affecting params it was sent with.
 	// It answers the question the token counts raise but cannot settle: a
 	// rewind means the prompt was re-rendered, and this says whether WE asked
 	// for that (a role switch across differing chat_template_kwargs) or the
@@ -400,13 +397,13 @@ const wastedCompletionFloor = 256
 // a rendering change, a rewritten message, and a server-side eviction alike.
 type cacheRewind struct {
 	tokens        int           // prompt the previous call had already sent, re-read now
-	prevRender    string        // the previous call's llm.RenderKey
+	prevRender    string        // the previous call's renderKey
 	renderChanged bool          // ... and this call asked for a different one
 	idle          time.Duration // wall gap since the previous call (0 if unknown)
 }
 
 // noteCacheLineage folds one tool-loop call's cache split into the turn's
-// rewind detector and describes what it found. render is this call's llm.RenderKey
+// rewind detector and describes what it found. render is this call's renderKey
 // and now is its wall time; both are recorded for the next call to compare
 // against, whether or not this one rewound.
 //
@@ -418,7 +415,7 @@ type cacheRewind struct {
 // something rewriting the middle of the prompt (a tool result that replayed
 // differently than it was sent, or a template that repositions content).
 //
-// Only the tool loop feeds this (llm.Conn.CacheLineage), because only the
+// Only the tool loop feeds this (LLMConnection.cacheLineage), because only the
 // tool loop guarantees the premise: each call's message list is the previous
 // call's plus an append, so the server should serve the whole previous prompt
 // from cache and evaluate just the new tail. The premise holds ACROSS turn
@@ -1167,7 +1164,14 @@ func (s *Session) saveLocked() error {
 	return f.Close()
 }
 
-func listSessions(cwd string) ([]acp.SessionInfo, error) {
+// SessionInfo is returned by session/list.
+type SessionInfo struct {
+	SessionId string `json:"sessionId"`
+	Cwd       string `json:"cwd"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
+}
+
+func listSessions(cwd string) ([]SessionInfo, error) {
 	dir := filepath.Join(cwd, sessionDir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -1177,7 +1181,7 @@ func listSessions(cwd string) ([]acp.SessionInfo, error) {
 		return nil, err
 	}
 
-	var sessions []acp.SessionInfo
+	var sessions []SessionInfo
 	for _, e := range entries {
 		if !strings.HasPrefix(e.Name(), "session_") || !strings.HasSuffix(e.Name(), ".toml") {
 			continue
@@ -1195,7 +1199,7 @@ func listSessions(cwd string) ([]acp.SessionInfo, error) {
 		id := strings.TrimPrefix(e.Name(), "session_")
 		id = strings.TrimSuffix(id, ".toml")
 
-		sessions = append(sessions, acp.SessionInfo{
+		sessions = append(sessions, SessionInfo{
 			SessionId: id,
 			Cwd:       cwd,
 			UpdatedAt: info.ModTime().Format(time.RFC3339),

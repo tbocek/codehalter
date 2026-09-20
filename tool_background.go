@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // bgJobGrace is how long run_background waits after launch before returning, to
@@ -166,11 +164,11 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	// The terminal is NOT released here: release kills the process, and this job
 	// is meant to outlive the tool call. It stays embedded in the card, so the
 	// user watches the dev server's output live for as long as it runs.
-	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
+	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: tcId,
 		Status:     "in_progress",
-		Content:    []acp.ToolCallContent{acp.TerminalContent(tid)},
+		Content:    []ToolCallContent{TerminalContent(tid)},
 	})
 
 	// Grace window: catch an immediate exit (failed bind, bad command) before
@@ -206,7 +204,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 		a.terminalRelease(sid, tid)
 		a.forgetBgJob(job)
 		result := fmt.Sprintf("background job %d exited immediately (exit %d) — it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", id, exit.code(), tail)
-		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, exit.code()), []acp.ToolCallContent{acp.TextContent(result)})
+		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, exit.code()), []ToolCallContent{TextContent(result)})
 		return result, false
 	}
 
@@ -223,7 +221,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	go a.watchBgJob(job)
 	// Retitle only: the card is holding the live terminal, and text content here
 	// would replace it with a static snapshot taken at second one of a dev server.
-	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
+	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: tcId,
 		Title:      fmt.Sprintf("Background: %s (pid %d)", cmdStr, job.pid),

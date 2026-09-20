@@ -12,8 +12,6 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-
-	"github.com/tbocek/codehalter/llm"
 )
 
 func hasFormatterNeed(needs []formatterNeed, bin string) bool {
@@ -203,7 +201,7 @@ func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
 	yes := true
 	a := &agent{
 		settings: Settings{
-			LLM: []llm.Conn{{
+			LLM: []LLMConnection{{
 				Server:       ts.URL,
 				Model:        "gpt-4o",
 				Parallel:     ptr(1),
@@ -239,7 +237,7 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 
 	a := &agent{
 		settings: Settings{
-			LLM: []llm.Conn{{
+			LLM: []LLMConnection{{
 				Server:   ts.URL,
 				Model:    "gpt-4o",
 				Parallel: ptr(1),
@@ -260,7 +258,7 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 // silent failure mode behind "plan not valid JSON": the server is reachable and
 // /v1/models enumerates models, but the configured id isn't among them. The
 // gateway then routes the unknown name to an empty 200, which only surfaces
-// three layers down at plan time. llm.Probe used to log loaded=false and move on
+// three layers down at plan time. probeLLM used to log loaded=false and move on
 // (bare ✅ in the banner); now renderLLMStatus names the mismatch and lists the
 // ids the server actually offers.
 func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
@@ -277,7 +275,7 @@ func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
 
 	a := &agent{
 		settings: Settings{
-			LLM: []llm.Conn{{
+			LLM: []LLMConnection{{
 				Server:      ts.URL,
 				Model:       "qwopus3.6-27b",
 				Parallel:    ptr(1),
@@ -328,12 +326,12 @@ func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	base := llm.Conn{Server: ts.URL, Model: "m", Parallel: ptr(1), ContextSize: ptr(128000)}
+	base := LLMConnection{Server: ts.URL, Model: "m", Parallel: ptr(1), ContextSize: ptr(128000)}
 	status := func(t *testing.T, think, exec map[string]any) string {
 		t.Helper()
 		c := base
 		c.ParamsThinking, c.ParamsExecute = think, exec
-		a := &agent{settings: Settings{LLM: []llm.Conn{c}}}
+		a := &agent{settings: Settings{LLM: []LLMConnection{c}}}
 		a.probeAllLLMs(context.Background())
 		return a.renderLLMStatus()
 	}
@@ -378,7 +376,7 @@ func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
 	no := false
 	a := &agent{
 		settings: Settings{
-			LLM: []llm.Conn{{
+			LLM: []LLMConnection{{
 				Server:       ts.URL,
 				Model:        "qwen-vl",
 				Parallel:     ptr(1),
@@ -416,7 +414,7 @@ func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	ts := llamaCppServer(16384, 2)
 	defer ts.Close()
 
-	a := &agent{settings: Settings{LLM: []llm.Conn{{Server: ts.URL, Model: "qwen"}}}}
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen"}}}}
 	a.probeAllLLMs(context.Background())
 
 	if got := a.settings.LLM[0].Parallel; *got != 2 {
@@ -453,7 +451,7 @@ func TestProbeAllLLMsRouterModelProps(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	a := &agent{settings: Settings{LLM: []llm.Conn{{Server: ts.URL, Model: modelID}}}}
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: modelID}}}}
 	a.probeAllLLMs(context.Background())
 
 	if got := gotModel.Load(); got == nil || *got != modelID {
@@ -473,7 +471,7 @@ func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 	ts := llamaCppServer(16384, 4)
 	defer ts.Close()
 
-	a := &agent{settings: Settings{LLM: []llm.Conn{{Server: ts.URL, Model: "qwen", Parallel: ptr(1)}}}}
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "qwen", Parallel: ptr(1)}}}}
 	a.probeAllLLMs(context.Background())
 
 	if got := a.settings.LLM[0].Parallel; *got != 1 {

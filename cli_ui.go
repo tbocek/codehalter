@@ -9,8 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // ---------------------------------------------------------------------------
@@ -105,7 +103,7 @@ type cliUI struct {
 	order []string
 	terms map[string][]string
 
-	plan []acp.PlanEntry
+	plan []PlanEntry
 
 	mode  string
 	used  int
@@ -124,8 +122,8 @@ type cliUI struct {
 }
 
 // stdoutStyled reports whether stdout takes ANSI styling: a terminal, not
-// TERM=dumb, and NO_COLOR unset. The CLI's UI uses it, and hands it to the
-// launcher for its notice, which prints before any UI exists.
+// TERM=dumb, and NO_COLOR unset. Shared by the CLI's UI and the launcher's
+// notice, which prints before any UI exists.
 func stdoutStyled() bool {
 	fi, err := os.Stdout.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0 &&
@@ -523,7 +521,7 @@ func (u *cliUI) Note(sty, s string) {
 // Card records a tool call. A card announced or updated as still running goes
 // into the live region; one that reports completed or failed is committed to
 // the transcript with its result and removed from the live set.
-func (u *cliUI) Card(up acp.ToolCallUpdate) {
+func (u *cliUI) Card(up toolCallUpdate) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -584,7 +582,7 @@ func (u *cliUI) dropCall(c *cliCall) {
 // contentLines renders a finished card's result blocks. Text is previewed, a
 // diff is rendered as a hunk, and a terminal block is dropped: its output was
 // already on screen live and the agent sends the same bytes as text.
-func (u *cliUI) contentLines(cs []acp.ToolCallContent) []string {
+func (u *cliUI) contentLines(cs []ToolCallContent) []string {
 	var out []string
 	for _, c := range cs {
 		switch c.Type {
@@ -610,10 +608,10 @@ func (u *cliUI) contentLines(cs []acp.ToolCallContent) []string {
 // Plan replaces the current plan. It stays in the live region rather than being
 // committed on every change: a plan is current state, and each entry's status
 // is rewritten several times per turn.
-func (u *cliUI) Plan(entries []acp.PlanEntry) {
+func (u *cliUI) Plan(entries []PlanEntry) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.plan = make([]acp.PlanEntry, len(entries))
+	u.plan = make([]PlanEntry, len(entries))
 	for i, e := range entries {
 		e.Content = sanitize(e.Content)
 		u.plan[i] = e

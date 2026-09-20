@@ -6,8 +6,6 @@ import (
 	"log/slog"
 	"strings"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // discoverSandbox registers `run_command` whenever we're inside a container.
@@ -182,7 +180,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	// release. Sending text content here would replace that live view with a
 	// static copy, so retitle only: a nil Content is omitted from the update, and
 	// an absent field leaves the existing content alone.
-	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
+	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: tcId,
 		Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),

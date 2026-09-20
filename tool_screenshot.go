@@ -18,8 +18,6 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // screenshot renders a file from the workspace with headless Firefox and hands
@@ -143,7 +141,7 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 	selector := strings.TrimSpace(args.str("selector"))
 
 	title := fmt.Sprintf("Screenshot: %s (%dx%d)", rel, width, height)
-	tcID := a.StartToolCall(ctx, sid, title, "read", []acp.ToolCallLocation{{Path: rel}})
+	tcID := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: rel}})
 
 	png, note, err := renderPage(ctx, bin, abs, selector, width, height)
 	if err != nil {
@@ -161,7 +159,7 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 		return msg, nil, "", true
 	}
 	text := fmt.Sprintf("[Screenshot of %s (%dx%d) attached as %s.%s]", rel, width, height, id, note)
-	a.CompleteToolCall(ctx, sid, tcID, []acp.ToolCallContent{acp.TextContent(fmt.Sprintf("%s, %d KiB%s", id, len(png)/1024, note))})
+	a.CompleteToolCall(ctx, sid, tcID, []ToolCallContent{TextContent(fmt.Sprintf("%s, %d KiB%s", id, len(png)/1024, note))})
 	return text, imageParts(text, "image/png", png), id, false
 }
 

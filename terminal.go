@@ -7,8 +7,6 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // ACP terminals are how codehalter runs commands: the client starts the process
@@ -69,7 +67,7 @@ func (a *agent) terminalCreate(ctx context.Context, sid, command string, args []
 	if args == nil {
 		args = []string{}
 	}
-	raw, err := a.conn.SendRequest(ctx, "terminal/create", map[string]any{
+	raw, err := a.conn.sendRequest(ctx, "terminal/create", map[string]any{
 		"sessionId":       sid,
 		"command":         command,
 		"args":            args,
@@ -94,7 +92,7 @@ func (a *agent) terminalCreate(ctx context.Context, sid, command string, args []
 // terminalOutput fetches everything the terminal has produced so far. exit is
 // nil while the command is still running.
 func (a *agent) terminalOutput(ctx context.Context, sid, tid string) (out string, truncated bool, exit *terminalExit, err error) {
-	raw, err := a.conn.SendRequest(ctx, "terminal/output", map[string]any{"sessionId": sid, "terminalId": tid})
+	raw, err := a.conn.sendRequest(ctx, "terminal/output", map[string]any{"sessionId": sid, "terminalId": tid})
 	if err != nil {
 		return "", false, nil, err
 	}
@@ -111,7 +109,7 @@ func (a *agent) terminalOutput(ctx context.Context, sid, tid string) (out string
 
 // terminalWaitForExit blocks until the command finishes.
 func (a *agent) terminalWaitForExit(ctx context.Context, sid, tid string) (terminalExit, error) {
-	raw, err := a.conn.SendRequest(ctx, "terminal/wait_for_exit", map[string]any{"sessionId": sid, "terminalId": tid})
+	raw, err := a.conn.sendRequest(ctx, "terminal/wait_for_exit", map[string]any{"sessionId": sid, "terminalId": tid})
 	if err != nil {
 		return terminalExit{}, err
 	}
@@ -125,7 +123,7 @@ func (a *agent) terminalWaitForExit(ctx context.Context, sid, tid string) (termi
 // terminalKill kills the command but keeps the terminal id valid, so output
 // produced before the kill can still be read.
 func (a *agent) terminalKill(ctx context.Context, sid, tid string) error {
-	_, err := a.conn.SendRequest(ctx, "terminal/kill", map[string]any{"sessionId": sid, "terminalId": tid})
+	_, err := a.conn.sendRequest(ctx, "terminal/kill", map[string]any{"sessionId": sid, "terminalId": tid})
 	return err
 }
 
@@ -139,7 +137,7 @@ func (a *agent) terminalRelease(sid, tid string) {
 	// context, so reusing it would skip the kill exactly when it matters most.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := a.conn.SendRequest(ctx, "terminal/release", map[string]any{"sessionId": sid, "terminalId": tid}); err != nil {
+	if _, err := a.conn.sendRequest(ctx, "terminal/release", map[string]any{"sessionId": sid, "terminalId": tid}); err != nil {
 		slog.Debug("terminal/release failed", "terminal", tid, "err", err)
 	}
 }
@@ -161,11 +159,11 @@ func (a *agent) runTerminalCmd(ctx context.Context, sid, tcId, command string, a
 
 	// Put the live terminal in the card before anything can release it — after
 	// release the client keeps displaying it, but it won't accept the embed.
-	a.sendUpdate(ctx, sid, acp.ToolCallUpdate{
+	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: tcId,
 		Status:     "in_progress",
-		Content:    []acp.ToolCallContent{acp.TerminalContent(tid)},
+		Content:    []ToolCallContent{TerminalContent(tid)},
 	})
 
 	type waitResult struct {

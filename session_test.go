@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 	"unicode/utf8"
-
-	"github.com/tbocek/codehalter/llm"
 )
 
 // TestTurnServerCache pins the server-driven accounting: with the evaluated
@@ -257,7 +255,7 @@ func TestKeepWindowStart(t *testing.T) {
 
 // TestCacheLineageNamesTheRenderChange pins the attribution half of the rewind
 // detector. The token counts alone say the prompt was re-rendered; they cannot
-// say who did it. Recording the llm.RenderKey of each call answers that, and the
+// say who did it. Recording the renderKey of each call answers that, and the
 // two answers have nothing in common: a rendering that changed is one line of
 // settings.toml, a rendering that held is compaction, a tool result that
 // replayed differently, or a server-side eviction.
@@ -268,7 +266,7 @@ func TestKeepWindowStart(t *testing.T) {
 // more. 99582 tokens for one setting, and nothing in the log said so.
 //
 // codehalter no longer causes this: the retry appends a closed <think></think>
-// instead (see llm.Conn.WithThinkingDisabled). The detector stays because a settings.toml
+// instead (see withThinkingDisabled). The detector stays because a settings.toml
 // whose two roles disagree on chat_template_kwargs reproduces it exactly, and
 // the numbers below are what that costs.
 func TestCacheLineageNamesTheRenderChange(t *testing.T) {
@@ -402,8 +400,8 @@ func TestTurnStatsNamesDiscardedDecode(t *testing.T) {
 // including fields nobody has thought of yet (Qwen3.8 reads a top-level
 // reasoning_effort, for instance).
 func TestRenderKeyIgnoresSamplers(t *testing.T) {
-	plan := llm.RenderKey(map[string]any{"temperature": 1.0, "top_p": 0.95, "max_tokens": 8000})
-	exec := llm.RenderKey(map[string]any{"temperature": 0.6, "top_p": 0.8, "max_tokens": 4000})
+	plan := renderKey(map[string]any{"temperature": 1.0, "top_p": 0.95, "max_tokens": 8000})
+	exec := renderKey(map[string]any{"temperature": 0.6, "top_p": 0.8, "max_tokens": 4000})
 	if plan != "" || exec != "" {
 		t.Errorf("samplers entered the key: thinking=%q execute=%q", plan, exec)
 	}
@@ -411,15 +409,15 @@ func TestRenderKeyIgnoresSamplers(t *testing.T) {
 	// Same kwargs, written in a different order, must fingerprint identically:
 	// Go map iteration is randomised, and a key that flapped would report a
 	// rewind on every other call.
-	a := llm.RenderKey(map[string]any{"temperature": 1.0, "chat_template_kwargs": map[string]any{"preserve_thinking": true, "enable_thinking": true}})
-	b := llm.RenderKey(map[string]any{"temperature": 0.6, "chat_template_kwargs": map[string]any{"enable_thinking": true, "preserve_thinking": true}})
+	a := renderKey(map[string]any{"temperature": 1.0, "chat_template_kwargs": map[string]any{"preserve_thinking": true, "enable_thinking": true}})
+	b := renderKey(map[string]any{"temperature": 0.6, "chat_template_kwargs": map[string]any{"enable_thinking": true, "preserve_thinking": true}})
 	if a != b || a == "" {
 		t.Errorf("kwargs key is not canonical: %q vs %q", a, b)
 	}
 
 	// An unknown non-sampler counts: assuming it is harmless is how the
 	// expensive kind of rewind goes unnoticed.
-	if k := llm.RenderKey(map[string]any{"reasoning_effort": "low"}); k == "" {
+	if k := renderKey(map[string]any{"reasoning_effort": "low"}); k == "" {
 		t.Error("reasoning_effort was dropped from the key")
 	}
 }

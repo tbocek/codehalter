@@ -1,8 +1,4 @@
-// Package acp is the Agent Client Protocol side codehalter speaks to the
-// editor: JSON-RPC over a line-delimited stdio pair (AgentSideConnection), and
-// the wire types of the session methods, the session/update notifications and
-// session/request_permission.
-package acp
+package main
 
 import (
 	"bufio"
@@ -22,14 +18,14 @@ import (
 // JSON-RPC 2.0 message envelopes used over the ACP line protocol.
 // ---------------------------------------------------------------------------
 
-type JSONRPCRequest struct {
+type jsonrpcRequest struct {
 	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id,omitempty"`
 	Method  string           `json:"method"`
 	Params  json.RawMessage  `json:"params,omitempty"`
 }
 
-type JSONRPCResponse struct {
+type jsonrpcResponse struct {
 	JSONRPC string           `json:"jsonrpc"`
 	ID      *json.RawMessage `json:"id"`
 	Result  any              `json:"result,omitempty"`
@@ -45,7 +41,7 @@ type JSONRPCResponse struct {
 
 // Session-update content-chunk kinds.
 const (
-	ProtocolVersion  = 1
+	protocolVersion  = 1
 	KindAgentMessage = "agent_message_chunk"
 	// KindAgentThought is reasoning_content from thinking models (Qwen3,
 	// DeepSeek-R1, GPT-OSS) — Zed renders it greyed/collapsible so
@@ -89,24 +85,24 @@ type ClientCapabilities struct {
 	} `json:"elicitation"`
 }
 
-// MCPServer is one entry of session/new's mcpServers. The wire type is a
+// acpMCPServer is one entry of session/new's mcpServers. The wire type is a
 // union discriminated by "type", which is ABSENT for stdio (the transport every
 // agent must support) and "http"/"sse" for the two network ones. Flattening the
 // union into one struct keeps the decode trivial: the fields of the other
 // variants simply come back zero.
-type MCPServer struct {
-	Type    string      `json:"type"` // "" (stdio), "http", "sse"
-	Name    string      `json:"name"`
-	Command string      `json:"command"`
-	Args    []string    `json:"args"`
-	Env     []NameValue `json:"env"`
-	URL     string      `json:"url"`
-	Headers []NameValue `json:"headers"`
+type acpMCPServer struct {
+	Type    string         `json:"type"` // "" (stdio), "http", "sse"
+	Name    string         `json:"name"`
+	Command string         `json:"command"`
+	Args    []string       `json:"args"`
+	Env     []acpNameValue `json:"env"`
+	URL     string         `json:"url"`
+	Headers []acpNameValue `json:"headers"`
 }
 
-// NameValue is the {name, value} pair ACP uses for both env variables and
+// acpNameValue is the {name, value} pair ACP uses for both env variables and
 // HTTP headers, rather than a map.
-type NameValue struct {
+type acpNameValue struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
 }
@@ -152,7 +148,7 @@ type (
 		// codehalter runs its own MCP clients from .codehalter/mcp.toml rather
 		// than adopting these silently, so they're offered for import at
 		// bootstrap instead (see offerMCPImport).
-		McpServers []MCPServer `json:"mcpServers,omitempty"`
+		McpServers []acpMCPServer `json:"mcpServers,omitempty"`
 	}
 	NewSessionResponse struct {
 		SessionId string            `json:"sessionId"`
@@ -165,9 +161,9 @@ type (
 	}
 
 	LoadSessionRequest struct {
-		SessionId  string      `json:"sessionId"`
-		Cwd        string      `json:"cwd"`
-		McpServers []MCPServer `json:"mcpServers,omitempty"`
+		SessionId  string         `json:"sessionId"`
+		Cwd        string         `json:"cwd"`
+		McpServers []acpMCPServer `json:"mcpServers,omitempty"`
 	}
 	LoadSessionResponse struct {
 		SessionId string            `json:"sessionId,omitempty"`
@@ -245,7 +241,7 @@ type EmbeddedResource struct {
 	Blob     string `json:"blob,omitempty"`
 }
 
-type MessageChunk struct {
+type messageChunk struct {
 	Kind    string       `json:"sessionUpdate"`
 	Content ContentBlock `json:"content"`
 }
@@ -256,27 +252,27 @@ type PlanEntry struct {
 	Status   string `json:"status"`
 }
 
-type PlanUpdate struct {
+type planUpdate struct {
 	Kind    string      `json:"sessionUpdate"`
 	Entries []PlanEntry `json:"entries"`
 }
 
-// UsageUpdate is the ACP "usage_update" session notification that drives the
+// usageUpdate is the ACP "usage_update" session notification that drives the
 // client's context-window ring. Used is the tokens currently in context (the
 // last call's prompt_tokens); Size is the total window (per-slot n_ctx). Stable
 // since schema v1.17 and these two fields are the whole required shape; the
 // spec also allows an optional `cost`, which is meaningless for a local model.
-type UsageUpdate struct {
+type usageUpdate struct {
 	Kind string `json:"sessionUpdate"` // "usage_update"
 	Used int    `json:"used"`
 	Size int    `json:"size"`
 }
 
-// SessionInfoUpdate is the ACP "session_info_update" notification, which is how
+// sessionInfoUpdate is the ACP "session_info_update" notification, which is how
 // an agent names a thread: without it Zed labels every thread with its id.
 // Every field but the kind is optional and independently patchable, so sending
 // only Title leaves the client's other metadata alone.
-type SessionInfoUpdate struct {
+type sessionInfoUpdate struct {
 	Kind      string `json:"sessionUpdate"` // "session_info_update"
 	Title     string `json:"title,omitempty"`
 	UpdatedAt string `json:"updatedAt,omitempty"` // ISO 8601
@@ -284,26 +280,14 @@ type SessionInfoUpdate struct {
 
 // ---------------------------------------------------------------------------
 // AgentSideConnection — JSON-RPC dispatch + outgoing-request demux on a
-// line-delimited stdio pair.
+// line-delimited stdio pair. The agent type is concrete (there is only one).
 // ---------------------------------------------------------------------------
-
-// Agent is what the connection dispatches the client's requests to.
-type Agent interface {
-	Initialize(context.Context, InitializeRequest) (InitializeResponse, error)
-	NewSession(context.Context, NewSessionRequest) (NewSessionResponse, error)
-	LoadSession(context.Context, LoadSessionRequest) (LoadSessionResponse, error)
-	ListSessions(context.Context, ListSessionsRequest) (ListSessionsResponse, error)
-	SetSessionMode(context.Context, SetSessionModeRequest) error
-	CloseSession(context.Context, CloseSessionRequest) error
-	Prompt(context.Context, PromptRequest) (PromptResponse, error)
-	Cancel(context.Context, CancelNotification)
-}
 
 type AgentSideConnection struct {
 	w       io.Writer
 	r       io.Reader
 	writeMu sync.Mutex
-	agent   Agent
+	agent   *agent
 
 	done chan struct{}
 
@@ -329,7 +313,7 @@ type inflightRequest struct {
 	answered atomic.Bool
 }
 
-func NewAgentSideConnection(a Agent, w io.Writer, r io.Reader) *AgentSideConnection {
+func NewAgentSideConnection(a *agent, w io.Writer, r io.Reader) *AgentSideConnection {
 	c := &AgentSideConnection{
 		w:        w,
 		r:        r,
@@ -373,17 +357,17 @@ func (a *AgentSideConnection) SessionUpdate(ctx context.Context, sid string, upd
 	if err != nil {
 		return err
 	}
-	return a.writeMessage(JSONRPCRequest{
+	return a.writeMessage(jsonrpcRequest{
 		JSONRPC: "2.0",
 		Method:  "session/update",
 		Params:  raw,
 	})
 }
 
-// SendRequest writes a JSON-RPC request and blocks until the matching
+// sendRequest writes a JSON-RPC request and blocks until the matching
 // response arrives. Returns the raw `result` bytes — callers unmarshal into
 // whatever shape they expect.
-func (a *AgentSideConnection) SendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
+func (a *AgentSideConnection) sendRequest(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id := a.nextID.Add(1)
 	idStr := fmt.Sprintf("%d", id)
 	idRaw := json.RawMessage(`"` + idStr + `"`)
@@ -406,7 +390,7 @@ func (a *AgentSideConnection) SendRequest(ctx context.Context, method string, pa
 		}
 		raw = b
 	}
-	if err := a.writeMessage(JSONRPCRequest{
+	if err := a.writeMessage(jsonrpcRequest{
 		JSONRPC: "2.0",
 		ID:      &idRaw,
 		Method:  method,
@@ -423,7 +407,7 @@ func (a *AgentSideConnection) SendRequest(ctx context.Context, method string, pa
 		// that dialog on screen forever, still expecting an answer we will never
 		// read. Best-effort — a client that ignores $/cancel_request is no worse
 		// off than before.
-		if err := a.writeMessage(JSONRPCRequest{
+		if err := a.writeMessage(jsonrpcRequest{
 			JSONRPC: "2.0",
 			Method:  "$/cancel_request",
 			Params:  json.RawMessage(`{"requestId":` + string(idRaw) + `}`),
@@ -507,7 +491,7 @@ func (a *AgentSideConnection) serve() {
 		}
 
 		// Incoming request or notification.
-		var req JSONRPCRequest
+		var req jsonrpcRequest
 		if err := json.Unmarshal(line, &req); err != nil {
 			slog.Warn("failed to parse message", "error", err)
 			continue
@@ -522,7 +506,7 @@ func (a *AgentSideConnection) serve() {
 			continue
 		}
 
-		// Must be async: handlers issue outbound SendRequest calls whose
+		// Must be async: handlers issue outbound sendRequest calls whose
 		// responses come back through this same read loop. Running handle
 		// inline would block the loop and deadlock the response routing.
 		go a.runHandler(ctx, &req)
@@ -534,7 +518,7 @@ func (a *AgentSideConnection) serve() {
 // cancellable context registered in a.inflight so $/cancel_request can reach
 // them; notifications share the connection context and are never registered
 // (there is nothing to cancel and no id to name them by).
-func (a *AgentSideConnection) runHandler(ctx context.Context, req *JSONRPCRequest) {
+func (a *AgentSideConnection) runHandler(ctx context.Context, req *jsonrpcRequest) {
 	defer func() {
 		if r := recover(); r != nil {
 			// A panic in ONE handler must not take down the process and every
@@ -568,7 +552,7 @@ func (a *AgentSideConnection) runHandler(ctx context.Context, req *JSONRPCReques
 // leave the client hanging on a request it has already given up on, and the
 // answered flag makes sure its eventual reply is dropped rather than sent as a
 // second response for the same id.
-func (a *AgentSideConnection) cancelInflight(req *JSONRPCRequest) {
+func (a *AgentSideConnection) cancelInflight(req *jsonrpcRequest) {
 	var p struct {
 		RequestId json.RawMessage `json:"requestId"`
 	}
@@ -598,7 +582,7 @@ func (a *AgentSideConnection) cancelInflight(req *JSONRPCRequest) {
 	}
 }
 
-func (a *AgentSideConnection) handle(ctx context.Context, req *JSONRPCRequest) {
+func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
 	switch req.Method {
 	case "initialize":
 		var p InitializeRequest
@@ -685,7 +669,7 @@ func (a *AgentSideConnection) handle(ctx context.Context, req *JSONRPCRequest) {
 // decodeParams unmarshals req.Params into dst. Returns false (and writes a
 // -32602 "invalid params" error) when the bytes won't decode. nil params is
 // allowed and treated as an empty object.
-func (a *AgentSideConnection) decodeParams(req *JSONRPCRequest, dst any) bool {
+func (a *AgentSideConnection) decodeParams(req *jsonrpcRequest, dst any) bool {
 	if req.Params == nil {
 		return true
 	}
@@ -699,7 +683,7 @@ func (a *AgentSideConnection) decodeParams(req *JSONRPCRequest, dst any) bool {
 // reply finishes a handler: emit result on success, -32603 error otherwise.
 // Skips entirely when req.ID is nil (notification) or when the request was
 // already answered -32800 by a $/cancel_request.
-func (a *AgentSideConnection) reply(req *JSONRPCRequest, result any, err error) {
+func (a *AgentSideConnection) reply(req *jsonrpcRequest, result any, err error) {
 	if err != nil {
 		slog.Error("handler failed", "method", req.Method, "error", err)
 		a.replyError(req, -32603, err.Error())
@@ -708,7 +692,7 @@ func (a *AgentSideConnection) reply(req *JSONRPCRequest, result any, err error) 
 	if req.ID == nil || !a.claimReply(req.ID) {
 		return
 	}
-	if werr := a.writeMessage(JSONRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: result}); werr != nil {
+	if werr := a.writeMessage(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: result}); werr != nil {
 		slog.Warn("write reply failed", "method", req.Method, "error", werr)
 	}
 }
@@ -718,7 +702,7 @@ func (a *AgentSideConnection) reply(req *JSONRPCRequest, result any, err error) 
 // AUTH_REQUIRED, so using it for generic handler failures makes Zed render a
 // misleading "Authentication Required" red box (with an Authenticate button)
 // for unrelated problems — e.g. an LLM stream cancelled mid-flight by the user.
-func (a *AgentSideConnection) replyError(req *JSONRPCRequest, code int, message string) {
+func (a *AgentSideConnection) replyError(req *jsonrpcRequest, code int, message string) {
 	if req.ID == nil || !a.claimReply(req.ID) {
 		return
 	}
@@ -742,7 +726,7 @@ func (a *AgentSideConnection) claimReply(id *json.RawMessage) bool {
 // writeError puts an error response on the wire with no claim check. Callers
 // must already hold the right to answer this id.
 func (a *AgentSideConnection) writeError(id *json.RawMessage, code int, message string) {
-	if err := a.writeMessage(JSONRPCResponse{
+	if err := a.writeMessage(jsonrpcResponse{
 		JSONRPC: "2.0",
 		ID:      id,
 		Error: &struct {
@@ -752,98 +736,4 @@ func (a *AgentSideConnection) writeError(id *json.RawMessage, code int, message 
 	}); err != nil {
 		slog.Warn("write error reply failed", "code", code, "error", err)
 	}
-}
-
-// ---------------------------------------------------------------------------
-// session/request_permission
-// ---------------------------------------------------------------------------
-
-type PermissionOption struct {
-	OptionId string `json:"optionId"`
-	Name     string `json:"name"`
-	Kind     string `json:"kind"`
-}
-
-// PermissionToolCall is the ACP toolCall block carried in a
-// session/request_permission. ToolCallId is always set; Title/Kind/Status are
-// populated only by the WithCard variants, which need Zed to register the card
-// inline (the prior tool_call SessionUpdate may have been dropped during the
-// session-registration race — see unknownSessionBackoffs).
-type PermissionToolCall struct {
-	ToolCallId string `json:"toolCallId"`
-	Title      string `json:"title,omitempty"`
-	Kind       string `json:"kind,omitempty"`
-	Status     string `json:"status,omitempty"`
-}
-
-type PermissionRequest struct {
-	SessionId string             `json:"sessionId"`
-	ToolCall  PermissionToolCall `json:"toolCall"`
-	Options   []PermissionOption `json:"options"`
-
-	// Message is the question in prose. It is NOT sent as part of
-	// session/request_permission (whose wire shape has no such field, and a
-	// strict client rejects unknown properties) — it exists because
-	// elicitation/create requires a human-readable message, and only the call
-	// site knows it. The permission path carries the same text as the card title.
-	Message string `json:"-"`
-}
-
-type PermissionResponse struct {
-	Outcome struct {
-		Outcome  string `json:"outcome"`
-		OptionId string `json:"optionId,omitempty"`
-	} `json:"outcome"`
-}
-
-// SessionInfo is returned by session/list.
-type SessionInfo struct {
-	SessionId string `json:"sessionId"`
-	Cwd       string `json:"cwd"`
-	UpdatedAt string `json:"updatedAt,omitempty"`
-}
-
-// ---------------------------------------------------------------------------
-// Tool-call session updates
-// ---------------------------------------------------------------------------
-
-type ToolCallUpdate struct {
-	Kind       string             `json:"sessionUpdate"`
-	ToolCallId string             `json:"toolCallId"`
-	Title      string             `json:"title,omitempty"`
-	ToolKind   string             `json:"kind,omitempty"`
-	Status     string             `json:"status,omitempty"`
-	Content    []ToolCallContent  `json:"content,omitempty"`
-	Locations  []ToolCallLocation `json:"locations,omitempty"`
-}
-
-type ToolCallContent struct {
-	Type       string        `json:"type"`
-	Content    *ContentBlock `json:"content,omitempty"`
-	Path       string        `json:"path,omitempty"`
-	OldText    *string       `json:"oldText,omitempty"`
-	NewText    string        `json:"newText,omitempty"`
-	TerminalId string        `json:"terminalId,omitempty"`
-}
-
-type ToolCallLocation struct {
-	Path string `json:"path"`
-	Line *int   `json:"line,omitempty"`
-}
-
-func TextContent(text string) ToolCallContent {
-	b := ContentBlock{Type: "text", Text: text}
-	return ToolCallContent{Type: "content", Content: &b}
-}
-
-func DiffContent(path string, oldText *string, newText string) ToolCallContent {
-	return ToolCallContent{Type: "diff", Path: path, OldText: oldText, NewText: newText}
-}
-
-// TerminalContent embeds a terminal created with terminal/create into a tool
-// call, so the client renders its output live instead of us relaying it as
-// message chunks. Must be sent before terminal/release; the client keeps
-// showing the output afterwards.
-func TerminalContent(terminalId string) ToolCallContent {
-	return ToolCallContent{Type: "terminal", TerminalId: terminalId}
 }

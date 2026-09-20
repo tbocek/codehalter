@@ -8,9 +8,6 @@ import (
 	"log/slog"
 	"strings"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
-	"github.com/tbocek/codehalter/llm"
 )
 
 // This file owns the plan + per-subtask machinery. The orchestrator
@@ -278,7 +275,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
 		choice, err := a.askChoiceAuto(ctx, sid, tcId, question, plan.Choices)
-		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("User chose: " + choice)})
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
 		// err = the card's ctx was cancelled (the editor aborted this turn to send
 		// a new prompt) — NOT a stop the user made; surface the real cause so the
@@ -361,10 +358,10 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	// respond ends the subtask; submit_plan revises the remaining plan in place
 	// (the orchestrator adopts it — see subtaskOutcome).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
-	// Reasoning off for the whole subtask: llm.Conn.WithThinkingDisabled appends a closed
+	// Reasoning off for the whole subtask: withThinkingDisabled appends a closed
 	// <think></think> for the model to continue, which suppresses it without
 	// changing a single earlier token (see llm.go).
-	conn := a.connForSession(ctx, sid, "execute").WithThinkingDisabled()
+	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
 	res, err := a.runToolLoop(ctx, sid, conn, policy, "execute", true, executeFailCap)
 	// The executor's turns (prose + respond's call/result) are already in the
 	// session, stored verbatim by the loop — no post-hoc patch.
@@ -455,8 +452,8 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	// not background work — only the summariser and git-commit drafter belong on
 	// the background LLM. Run it on the SAME connection as execute so it reuses
 	// execute's warm KV prefix instead of cold-prefilling a separate slot.
-	// Reasoning off, like the executor it follows (see llm.Conn.WithThinkingDisabled).
-	conn := a.connForSession(ctx, sid, "execute").WithThinkingDisabled()
+	// Reasoning off, like the executor it follows (see withThinkingDisabled).
+	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
 	if conn == nil {
 		return exec, nil
 	}
@@ -637,8 +634,8 @@ type toolLoopResult struct {
 // retry). It is STORED before the rebuild instead of appended after it, for the
 // reason addCorrective gives. Every phase uses this; runToolLoopSeeded is the
 // loop itself, taking the context explicitly.
-func (a *agent) runToolLoop(ctx context.Context, sid string, conn *llm.Conn, policy phasePolicy, phase string, stream bool, failSoftCap int, corrective ...string) (toolLoopResult, error) {
-	var messages []llm.Message
+func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, policy phasePolicy, phase string, stream bool, failSoftCap int, corrective ...string) (toolLoopResult, error) {
+	var messages []llmMessage
 	if sess := a.getSession(sid); sess != nil {
 		for _, c := range corrective {
 			sess.AddUser(c)
@@ -651,7 +648,7 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *llm.Conn, pol
 		// No session to store into (probe paths): nothing will ever rebuild this
 		// context, so the wire is the only place the corrective can live.
 		for _, c := range corrective {
-			messages = append(messages, llm.Message{Role: "user", Content: c})
+			messages = append(messages, llmMessage{Role: "user", Content: c})
 		}
 	}
 	return a.runToolLoopSeeded(ctx, sid, conn, messages, policy, phase, stream, failSoftCap)
@@ -675,12 +672,12 @@ func (a *agent) runToolLoop(ctx context.Context, sid string, conn *llm.Conn, pol
 // for the rest of the session (a few hundred bytes), and session/load replays it
 // to the client as a user message — which the phase prompts (AddUser at
 // runExecutePhase / runDocumentPhase) and the skill disclosures already do.
-func (a *agent) addCorrective(sid string, messages []llm.Message, text string) []llm.Message {
+func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []llmMessage {
 	if sess := a.getSession(sid); sess != nil {
 		sess.AddUser(text)
 		sess.saveOrLog()
 	}
-	return append(messages, llm.Message{Role: "user", Content: text})
+	return append(messages, llmMessage{Role: "user", Content: text})
 }
 
 // startToolMeter shows "(running run_command go build ./...… 12s)" for as long
@@ -690,7 +687,7 @@ func (a *agent) addCorrective(sid string, messages []llm.Message, text string) [
 // sitting at 77s says something is slow but not WHAT, and the arguments are only
 // in the transcript above, scrolled away behind whatever streamed since. So the
 // one argument that identifies the call rides along.
-func (a *agent) startToolMeter(ctx context.Context, sid string, tc llm.ToolCall) (stop func()) {
+func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (stop func()) {
 	label := tc.Function.Name
 	// Tried in priority order: a tool can carry several of these (search_text has
 	// both a query and a path) and only one fits the row. Whitespace runs collapse
@@ -732,7 +729,7 @@ type toolLoopCaller struct {
 	a     *agent
 	sid   string
 	phase string
-	conn  *llm.Conn
+	conn  *LLMConnection
 	tools []map[string]any
 	// on/think are the UI sinks (nil for a silent internal pass); flush emits
 	// whatever the throttled sinks still hold.
@@ -755,10 +752,10 @@ type toolLoopCaller struct {
 // It is its own function because the ladder is a self-contained state machine
 // over a single call, with five independent retry latches; inline, it buried
 // the loop's actual shape (call → run tools → repeat) 150 lines deep.
-func (c *toolLoopCaller) round(ctx context.Context, messages []llm.Message) (string, []llm.ToolCall, string, []llm.Message, error) {
+func (c *toolLoopCaller) round(ctx context.Context, messages []llmMessage) (string, []toolCall, string, []llmMessage, error) {
 	a, sid := c.a, c.sid
 	var text, reasoning string
-	var calls []llm.ToolCall
+	var calls []toolCall
 	var err error
 	// On a context-overflow 400 (ground truth from the server), escalate the fold
 	// and retry: step 1 keeps the unfinished small turn plus the most recent
@@ -774,9 +771,9 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llm.Message) (str
 	// Arm the stream-rule check for this round. The tool loop is the only
 	// caller that does: it owns the retry ladder below, which is what makes a
 	// mid-generation abort recoverable rather than just a failed call.
-	callConn := c.conn.ForToolLoop() // a <think> stall retries (and latches) on a thinking-off copy
+	callConn := c.conn.forToolLoop() // a <think> stall retries (and latches) on a thinking-off copy
 	if c.stalled {
-		callConn = callConn.WithThinkingDisabled()
+		callConn = callConn.withThinkingDisabled()
 	}
 	thinkingRetried := false // at most one such retry per round
 	capNudged := false       // cap ladder rung 1: one be-concise nudge retry per round
@@ -799,10 +796,10 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llm.Message) (str
 		// must answer directly, and latch it for the rest of the run so it can't
 		// re-burn the budget next round. Any phase/depth — swaps the conn, no
 		// history fold needed.
-		if llm.IsStuckThinking(err) && !thinkingRetried {
+		if isStuckThinking(err) && !thinkingRetried {
 			thinkingRetried = true
 			c.stalled = true
-			// llm.Conn.WithThinkingDisabled appends a closed <think></think> for the
+			// withThinkingDisabled appends a closed <think></think> for the
 			// model to continue instead of re-rendering the prompt, so the
 			// prefix cache survives both the retry and the return to normal at
 			// the end of this loop. No cache-lineage reset is needed: the next
@@ -813,7 +810,7 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llm.Message) (str
 			// thinking-off window, then 27585 more leaving it, for a 99614-token
 			// context. Probed against the same server afterwards, the append
 			// keeps 13968 of 13978 tokens where the kwargs change kept none.
-			callConn = callConn.WithThinkingDisabled()
+			callConn = callConn.withThinkingDisabled()
 			a.logSession(sid, "RECOVER", "model stuck in <think>: continuing a closed <think></think> for the rest of this tool loop")
 			continue
 		}
@@ -855,7 +852,7 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llm.Message) (str
 		// output is genuinely too big for the cap, retry once on a doubled cap
 		// (sampler-side param, so the prefix cache survives). A third hit
 		// surfaces as a normal failure into the replan machinery.
-		if ce := llm.AsCapHit(err); ce != nil {
+		if ce := asCapHit(err); ce != nil {
 			if !capNudged {
 				capNudged = true
 				a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
@@ -870,9 +867,9 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llm.Message) (str
 				capDoubled = true
 				base := ce.Cap
 				if base <= 0 {
-					base = llm.DefaultMaxTokens
+					base = defaultMaxTokens
 				}
-				callConn = callConn.WithMaxTokens(base * 2)
+				callConn = callConn.withMaxTokens(base * 2)
 				a.logSession(sid, "RECOVER", "still at the cap after the nudge — one retry with max_tokens=%d", base*2)
 				if sid != "" {
 					a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", base*2))
@@ -905,7 +902,7 @@ func (c *toolLoopCaller) round(ctx context.Context, messages []llm.Message) (str
 				err = ctx.Err() // cancelled during backoff → falls through to the cancel path
 			}
 		}
-		if !llm.IsContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
+		if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
 			(c.phase != "plan" && c.phase != "execute") || sid == "" {
 			break
 		}
@@ -946,7 +943,7 @@ type repetitionTracker struct {
 }
 
 // sawAgain records this call's output and reports whether it made no progress.
-func (rt *repetitionTracker) sawAgain(tc llm.ToolCall, tu ToolUse) bool {
+func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 	key := tc.Function.Name + "\x00" + tc.Function.Arguments
 	h := fnvHash(tu.Output)
 	bag := issueBag([]string{tu.Output})
@@ -982,7 +979,7 @@ func (rt *repetitionTracker) sawAgain(tc llm.ToolCall, tu ToolUse) bool {
 // reaches the status ticker ("running run_command… 94s"), so without this a long
 // tool ran with nothing on screen saying which command it was, and no ACP
 // tool-call update carries it either.
-func (a *agent) announceToolCall(ctx context.Context, sid string, tc llm.ToolCall) {
+func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 	// Most tools already put their arguments on screen themselves: the ACP card
 	// they open is titled with them ("Run: <command>", "Reading: <path> (1-150)",
 	// "Searching: <query> in <dir>", "Web Read: <url>"), the file tools add the
@@ -1019,7 +1016,7 @@ func (a *agent) announceToolCall(ctx context.Context, sid string, tc llm.ToolCal
 // runToolLoop is its one production caller (tests drive it directly with a
 // hand-built context). The failSoftCap / loop-exit semantics in the doc above
 // apply here too.
-func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *llm.Conn, messages []llm.Message, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
+func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
 	// `stream` gates the TEXT channel only. Reasoning always streams when there
 	// is a session to stream to: it is the sole live signal during a long call,
 	// and it is never the machinery `stream=false` exists to hide — the planner's
@@ -1038,7 +1035,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *llm.Con
 		think, flushThink = throttledStream(func(chunk string) {
 			// The reasoning channel, which clients render collapsed/dimmed
 			// rather than as an answer.
-			a.sendUpdate(ctx, sid, acp.MessageChunk{Kind: acp.KindAgentThought, Content: acp.ContentBlock{Type: "text", Text: chunk}})
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: chunk}})
 		})
 		flushStream = func() {
 			if flushOn != nil { // nil when stream=false: no text channel to flush
@@ -1110,7 +1107,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *llm.Con
 		// toolLoopCaller.round). messages comes back rewritten when the ladder
 		// added a corrective turn or folded history to make the context fit.
 		var text, reasoning string
-		var calls []llm.ToolCall
+		var calls []toolCall
 		var err error
 		text, calls, reasoning, messages, err = caller.round(ctx, messages)
 		genElapsed += time.Since(streamStart)
@@ -1154,7 +1151,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *llm.Con
 				}
 				// The assistant turn above is already in the session (AddAssistant at
 				// the top of this iteration); only the nudge needs storing.
-				messages = append(messages, llm.Message{Role: "assistant", Content: text})
+				messages = append(messages, llmMessage{Role: "assistant", Content: text})
 				messages = a.addCorrective(sid, messages, nudge)
 				continue
 			}
@@ -1163,7 +1160,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *llm.Con
 			return res, nil
 		}
 
-		messages = append(messages, llm.Message{
+		messages = append(messages, llmMessage{
 			Role:      "assistant",
 			Content:   text,
 			ToolCalls: calls,
@@ -1230,7 +1227,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *llm.Con
 				terminalName = tc.Function.Name
 				terminalMessage = tu.Output
 			}
-			messages = append(messages, llm.Message{
+			messages = append(messages, llmMessage{
 				Role:       "tool",
 				Content:    content,
 				ToolCallID: tc.ID,

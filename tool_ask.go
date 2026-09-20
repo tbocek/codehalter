@@ -6,8 +6,6 @@ import (
 	"errors"
 	"strings"
 	"time"
-
-	"github.com/tbocek/codehalter/acp"
 )
 
 // shouldAutoAnswer reports whether prompts must be auto-answered (autopilot
@@ -31,9 +29,9 @@ func (a *agent) askChoiceAuto(ctx context.Context, sid string, tcId, question st
 
 // askChoice shows N green choices + a red Abort and returns the chosen option.
 func (a *agent) askChoice(ctx context.Context, sid string, tcId, question string, choices []string) (string, error) {
-	choice, err := a.doPermissionRequest(ctx, acp.PermissionRequest{
+	choice, err := a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
-		ToolCall:  acp.PermissionToolCall{ToolCallId: tcId},
+		ToolCall:  permissionToolCall{ToolCallId: tcId},
 		Options:   choiceOptions(choices),
 		Message:   question,
 	})
@@ -45,12 +43,12 @@ func (a *agent) askChoice(ctx context.Context, sid string, tcId, question string
 
 // choiceOptions is choices as allow buttons plus the Abort that ends every
 // choice card.
-func choiceOptions(choices []string) []acp.PermissionOption {
-	var options []acp.PermissionOption
+func choiceOptions(choices []string) []permissionOption {
+	var options []permissionOption
 	for _, c := range choices {
-		options = append(options, acp.PermissionOption{OptionId: c, Name: c, Kind: "allow_once"})
+		options = append(options, permissionOption{OptionId: c, Name: c, Kind: "allow_once"})
 	}
-	return append(options, acp.PermissionOption{OptionId: "abort", Name: "Abort", Kind: "reject_once"})
+	return append(options, permissionOption{OptionId: "abort", Name: "Abort", Kind: "reject_once"})
 }
 
 // askFormAuto asks one question as N options, a free-text box, or both. Options
@@ -116,7 +114,7 @@ func (a *agent) askFormAuto(ctx context.Context, sid string, tcId, question stri
 	if tcId != "" {
 		req["toolCallId"] = tcId
 	}
-	raw, err := a.conn.SendRequest(ctx, "elicitation/create", req)
+	raw, err := a.conn.sendRequest(ctx, "elicitation/create", req)
 	if err != nil {
 		return "", err
 	}
@@ -164,9 +162,9 @@ func (a *agent) askChoiceWithCard(ctx context.Context, sid, title, kind string, 
 		a.say(ctx, sid, "["+reason+"] "+choices[0]+"\n\n")
 		return choices[0], tcId, nil
 	}
-	choice, err := a.doPermissionRequest(ctx, acp.PermissionRequest{
+	choice, err := a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
-		ToolCall:  acp.PermissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
+		ToolCall:  permissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
 		Message:   title,
 		Options:   choiceOptions(choices),
 	})
@@ -183,11 +181,11 @@ func (a *agent) askYesNoWithCard(ctx context.Context, sid, title, kind, yesLabel
 		a.say(ctx, sid, "["+reason+"] "+yesLabel+"\n\n")
 		return true, tcId, nil
 	}
-	choice, err := a.doPermissionRequest(ctx, acp.PermissionRequest{
+	choice, err := a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
-		ToolCall:  acp.PermissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
+		ToolCall:  permissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
 		Message:   title,
-		Options: []acp.PermissionOption{
+		Options: []permissionOption{
 			{OptionId: "yes", Name: yesLabel, Kind: "allow_once"},
 			{OptionId: "no", Name: noLabel, Kind: "reject_once"},
 		},
@@ -210,11 +208,11 @@ func (a *agent) askAcknowledgeWithCard(ctx context.Context, sid, title, kind, la
 		a.say(ctx, sid, "["+reason+"] "+label+"\n\n")
 		return tcId, nil
 	}
-	_, err := a.doPermissionRequest(ctx, acp.PermissionRequest{
+	_, err := a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
-		ToolCall:  acp.PermissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
+		ToolCall:  permissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
 		Message:   title,
-		Options:   []acp.PermissionOption{{OptionId: "ack", Name: label, Kind: "allow_once"}},
+		Options:   []permissionOption{{OptionId: "ack", Name: label, Kind: "allow_once"}},
 	})
 	return tcId, err
 }
@@ -262,28 +260,66 @@ var askUserTool = Tool{Def: map[string]any{
 	answer, err := a.askFormAuto(ctx, sid, tcId, args.Question, options, allowText)
 	switch {
 	case errors.Is(err, errNoFreeText):
-		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("This editor has no free-text prompt")})
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("This editor has no free-text prompt")})
 		return "error: this editor cannot show a free-text prompt — ask again with `options`", false
 	case errors.Is(err, errPermissionCancelled):
 		// Far likelier with a text box than with two buttons, and not a tool
 		// failure: the user just closed the form.
-		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("No answer")})
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("No answer")})
 		return "user dismissed the question without answering", false
 	case err != nil:
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return "error: " + err.Error(), false
 	}
 	if answer == "" || answer == "abort" {
-		a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("No answer")})
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("No answer")})
 		return "no answer given — use your own judgement and continue", false
 	}
-	a.CompleteToolCall(ctx, sid, tcId, []acp.ToolCallContent{acp.TextContent("User answered: " + answer)})
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User answered: " + answer)})
 	return "user answered: " + answer, false
 }}
 
 // ---------------------------------------------------------------------------
 // Permission RPCs
 // ---------------------------------------------------------------------------
+
+type permissionOption struct {
+	OptionId string `json:"optionId"`
+	Name     string `json:"name"`
+	Kind     string `json:"kind"`
+}
+
+// permissionToolCall is the ACP toolCall block carried in a
+// session/request_permission. ToolCallId is always set; Title/Kind/Status are
+// populated only by the WithCard variants, which need Zed to register the card
+// inline (the prior tool_call SessionUpdate may have been dropped during the
+// session-registration race — see unknownSessionBackoffs).
+type permissionToolCall struct {
+	ToolCallId string `json:"toolCallId"`
+	Title      string `json:"title,omitempty"`
+	Kind       string `json:"kind,omitempty"`
+	Status     string `json:"status,omitempty"`
+}
+
+type permissionRequest struct {
+	SessionId string             `json:"sessionId"`
+	ToolCall  permissionToolCall `json:"toolCall"`
+	Options   []permissionOption `json:"options"`
+
+	// Message is the question in prose. It is NOT sent as part of
+	// session/request_permission (whose wire shape has no such field, and a
+	// strict client rejects unknown properties) — it exists because
+	// elicitation/create requires a human-readable message, and only the call
+	// site knows it. The permission path carries the same text as the card title.
+	Message string `json:"-"`
+}
+
+type permissionResponse struct {
+	Outcome struct {
+		Outcome  string `json:"outcome"`
+		OptionId string `json:"optionId,omitempty"`
+	} `json:"outcome"`
+}
 
 // unknownSessionBackoffs covers the race between Zed acknowledging our
 // session/new response and registering the sessionId in its session map:
@@ -301,7 +337,7 @@ var unknownSessionBackoffs = []time.Duration{
 	128 * time.Millisecond,
 }
 
-func (a *agent) doPermissionRequest(ctx context.Context, r acp.PermissionRequest) (string, error) {
+func (a *agent) doPermissionRequest(ctx context.Context, r permissionRequest) (string, error) {
 	// Every interactive card blocks here waiting on the user; record that span
 	// so the turn's "✅ Done" line can exclude it from active time. (Auto-answer
 	// paths never reach here: they return before asking.)
@@ -322,7 +358,7 @@ func (a *agent) doPermissionRequest(ctx context.Context, r acp.PermissionRequest
 	var raw json.RawMessage
 	var err error
 	for attempt := 0; attempt <= len(unknownSessionBackoffs); attempt++ {
-		raw, err = a.conn.SendRequest(ctx, "session/request_permission", r)
+		raw, err = a.conn.sendRequest(ctx, "session/request_permission", r)
 		if err == nil || !strings.Contains(err.Error(), "unknown session") || attempt == len(unknownSessionBackoffs) {
 			break
 		}
@@ -335,7 +371,7 @@ func (a *agent) doPermissionRequest(ctx context.Context, r acp.PermissionRequest
 	if err != nil {
 		return "", err
 	}
-	var resp acp.PermissionResponse
+	var resp permissionResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
 		return "", err
 	}
@@ -358,7 +394,7 @@ const elicitChoiceKey = "choice"
 // the enum values and the labels become oneOf titles, so the answer maps back
 // to exactly the optionId the permission path would have returned and every
 // caller is unchanged.
-func (a *agent) doElicitation(ctx context.Context, r acp.PermissionRequest) (string, error) {
+func (a *agent) doElicitation(ctx context.Context, r permissionRequest) (string, error) {
 	values := make([]map[string]any, 0, len(r.Options))
 	for _, o := range r.Options {
 		values = append(values, map[string]any{"const": o.OptionId, "title": o.Name})
@@ -382,7 +418,7 @@ func (a *agent) doElicitation(ctx context.Context, r acp.PermissionRequest) (str
 	if r.ToolCall.ToolCallId != "" {
 		req["toolCallId"] = r.ToolCall.ToolCallId
 	}
-	raw, err := a.conn.SendRequest(ctx, "elicitation/create", req)
+	raw, err := a.conn.sendRequest(ctx, "elicitation/create", req)
 	if err != nil {
 		return "", err
 	}
