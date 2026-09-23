@@ -198,14 +198,9 @@ func newerRelease(ctx context.Context, cwd string) string {
 // wrong-architecture or error-page "binary" never replaces a working one, and
 // an update that does not change the version cannot loop.
 func selfUpdate(ctx context.Context, tag string) (string, error) {
-	self, err := executable()
+	self, err := installTarget(ctx)
 	if err != nil {
 		return "", err
-	}
-	// Follow the symlink: replacing the link itself would leave the real
-	// binary in place and the next start would run the old one again.
-	if resolved, err := filepath.EvalSymlinks(self); err == nil {
-		self = resolved
 	}
 
 	// The download has to land in the install directory: a rename is atomic
@@ -247,19 +242,64 @@ func selfUpdate(ctx context.Context, tag string) (string, error) {
 		return "", fmt.Errorf("%s returned %d bytes, too small to be the binary", url, n)
 	}
 
-	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(probe, tmp.Name(), "--version").Output()
+	got, err := reportedVersion(ctx, tmp.Name())
 	if err != nil {
 		return "", fmt.Errorf("the downloaded binary does not run here: %w", err)
 	}
-	if got := strings.TrimSpace(string(out)); got != versionLine(tag) {
+	if got != versionLine(tag) {
 		return "", fmt.Errorf("the downloaded binary reports %q, not %q", got, versionLine(tag))
 	}
 	if err := os.Rename(tmp.Name(), self); err != nil {
 		return "", err
 	}
 	return self, nil
+}
+
+// installTarget is the file a self-update replaces: this program's own binary,
+// found by asking each candidate path to identify itself, never by trusting a
+// path alone.
+//
+// Trusting /proc/self/exe alone bricked a container once. On Alpine, gcompat
+// runs a glibc-linked binary by re-executing it through /lib/ld-musl-x86_64.so.1,
+// so the "executable" of the running process was the musl loader; the update
+// renamed the download over it, and from then on no program in that container
+// could start. The path the user invoked (argv[0] on PATH) is tried first
+// because it survives such re-execs, the kernel's answer second, and whichever
+// is chosen must print this program's exact version line before it can be
+// replaced: a loader, a wrapper script or some other codehalter all fail that.
+func installTarget(ctx context.Context) (string, error) {
+	var candidates []string
+	if p, err := exec.LookPath(os.Args[0]); err == nil {
+		candidates = append(candidates, p)
+	}
+	if p, err := executable(); err == nil {
+		candidates = append(candidates, p)
+	}
+	var tried []string
+	for _, c := range candidates {
+		// Follow the symlink: replacing the link itself would leave the real
+		// binary in place and the next start would run the old one again.
+		if resolved, err := filepath.EvalSymlinks(c); err == nil {
+			c = resolved
+		}
+		if got, err := reportedVersion(ctx, c); err == nil && got == versionLine(version) {
+			return c, nil
+		}
+		tried = append(tried, c)
+	}
+	return "", fmt.Errorf("refusing to update: nothing at %s reports %q, so none of them is the running binary", strings.Join(tried, " or "), versionLine(version))
+}
+
+// reportedVersion runs path with --version and returns the trimmed line, which
+// is the only proof accepted that a file is a codehalter binary.
+func reportedVersion(ctx context.Context, path string) (string, error) {
+	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(probe, path, "--version").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // versionLine is the whole of what --version prints, and the exact string

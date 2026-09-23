@@ -221,7 +221,9 @@ func TestSelfUpdateReplacesTheBinary(t *testing.T) {
 			t.Fatal(err)
 		}
 		executable = func() (string, error) { return self, nil }
-		t.Cleanup(func() { executable = os.Executable })
+		// installTarget accepts only the file that reports the running version.
+		version = "v41"
+		t.Cleanup(func() { executable = os.Executable; version = "dev" })
 		return self
 	}
 	unchanged := func(t *testing.T, self string) {
@@ -270,6 +272,31 @@ func TestSelfUpdateReplacesTheBinary(t *testing.T) {
 			t.Fatal("selfUpdate accepted a 14-byte error page")
 		}
 		unchanged(t, self)
+	})
+
+	// The Alpine incident: gcompat re-executes a glibc binary through the musl
+	// loader, so the process's "executable" is /lib/ld-musl-x86_64.so.1. Nothing
+	// that fails to print this program's version line may be replaced, however
+	// the path was arrived at.
+	t.Run("refuses to replace a file that is not this program", func(t *testing.T) {
+		isolateUpdate(t)
+		self := install(t)
+		loader := filepath.Join(filepath.Dir(self), "ld-musl-x86_64.so.1")
+		if err := os.WriteFile(loader, []byte("#!/bin/sh\necho 'musl libc (x86_64)' >&2; exit 1\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		executable = func() (string, error) { return loader, nil }
+		releaseServer(t, "v42", fakeBinary(versionLine("v42"), updateMinBytes+1))
+		_, err := selfUpdate(context.Background(), "v42")
+		if err == nil || !strings.Contains(err.Error(), "refusing to update") {
+			t.Fatalf("selfUpdate over a loader: err = %v, want a refusal", err)
+		}
+		if buf, _ := os.ReadFile(loader); !strings.Contains(string(buf), "musl libc") {
+			t.Fatalf("the loader was replaced:\n%.80s", buf)
+		}
+		if _, err := os.Stat(self); err != nil {
+			t.Fatal(err)
+		}
 	})
 
 	t.Run("refuses a binary reporting another version", func(t *testing.T) {
