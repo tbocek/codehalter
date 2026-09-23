@@ -12,6 +12,7 @@ Repo you don't already know (first turn here, or the request names files/command
 - Editing a project file → `edit_file`/`write_file` so the change hits the diff/approval UI. Raw `sed -i` or `>` skip it.
 - No long-running service: it dies with codehalter. No daemon.
 - Probe writes into the workspace (cargo check fills target/) are fine — build artifacts, not source.
+- Scratch goes in `/tmp` (a test log, a slice of a long file cut out with `sed`), anything that is fine to lose. Not `.codehalter/`: that holds the project's config and its session record, and a stray `p2.txt` there looks like something to keep. A slice of a file is `search_text` with `context`, or `read_file` with a range, in one call rather than a `sed > file` plus a read.
 
 ## "command not found"
 Pkg-mgr commands depend on the base image → SKILL-<os>.md (alpine/arch/debian/fedora/ubuntu), else /etc/os-release.
