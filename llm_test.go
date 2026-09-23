@@ -182,21 +182,32 @@ func TestCfgConcurrentReloadAndRead(t *testing.T) {
 	wg.Wait()
 }
 
+// TestIsContextFull pins that a 400 is a full context only when the body says
+// so. Both counter-examples were seen for real: llama.cpp's refusal to continue
+// an assistant message with tool calls, and Halogen's refusal of the prefill
+// shape. Under the old rule each started the compaction ladder.
 func TestIsContextFull(t *testing.T) {
-	cases := []struct {
+	for _, tc := range []struct {
 		name string
 		err  error
 		want bool
 	}{
-		{"400 reject", &llmHTTPError{Status: 400}, true},
-		{"context ceiling", fmt.Errorf("ceiling: %w", errContextCeiling), true},
-		{"500 error", &llmHTTPError{Status: 500}, false},
-		{"plain error", errors.New("boom"), false},
+		{"llama.cpp overflow", &llmHTTPError{Status: 400, Body: "request (262314 tokens) exceeds the available context size (262144 tokens), try increasing it"}, true},
+		{"llama.cpp structured type", &llmHTTPError{Status: 400, Type: "exceed_context_size_error", Body: "n/a"}, true},
+		{"vLLM / OpenAI wording", &llmHTTPError{Status: 400, Body: "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens"}, true},
+		{"413", &llmHTTPError{Status: 413, Body: "payload too large"}, true},
+		{"ceiling truncation", errContextCeiling, true},
+		{"llama.cpp cannot continue", &llmHTTPError{Status: 400, Body: "Cannot continue an assistant message that contains tool calls."}, false},
+		{"halogen prefill shape", &llmHTTPError{Status: 400, Body: "continue_final_message cannot be combined with a forced tool choice: one resumes the assistant turn already in the history, the other starts a new call"}, false},
+		{"500 mentioning context", &llmHTTPError{Status: 500, Body: "context size"}, false},
+		{"bare 400, no reason given", &llmHTTPError{Status: 400}, false},
+		{"500 error", &llmHTTPError{Status: 500, Body: "boom"}, false},
+		{"wrapped ceiling", fmt.Errorf("ceiling: %w", errContextCeiling), true},
+		{"transport", errors.New("dial tcp: connection refused"), false},
 		{"nil", nil, false},
-	}
-	for _, c := range cases {
-		if got := isContextFull(c.err); got != c.want {
-			t.Errorf("%s: isContextFull=%v, want %v", c.name, got, c.want)
+	} {
+		if got := isContextFull(tc.err); got != tc.want {
+			t.Errorf("%s: isContextFull = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
@@ -808,5 +819,80 @@ func TestKeepWarmOff(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if mock.callCount() != 0 {
 		t.Errorf("keep_warm=off still called the model %d time(s)", mock.callCount())
+	}
+}
+
+// TestLLMStreamDropsPrefillWhenRejected is the Halogen path end to end: the
+// first execute call carries the closed-think continuation, the server refuses
+// it by name, the call goes again without it and with the forced tool choice
+// alone (no thinking flag beside it: that would be a third rendering), and the
+// entry remembers, so a later call that forces nothing uses enable_thinking
+// instead. A server that accepts the shape never reaches any of this, which is
+// the llama.cpp path staying byte-identical.
+func TestLLMStreamDropsPrefillWhenRejected(t *testing.T) {
+	var mu sync.Mutex
+	var reqs []map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		mu.Lock()
+		reqs = append(reqs, body)
+		n := len(reqs)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"continue_final_message cannot be combined with a forced tool choice: one resumes the assistant turn already in the history, the other starts a new call","type":"invalid_request_error"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sseText("ok")))
+	}))
+	defer ts.Close()
+
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "m"}}}}
+	conn := a.settings.ConnAt(0, "execute").withThinkingDisabled().withToolChoice("required")
+	msgs := []llmMessage{{Role: "user", Content: "go"}}
+	if _, _, _, err := a.llmStream(context.Background(), "", conn, msgs, nil, nil, nil, nil); err != nil {
+		t.Fatalf("llmStream: %v", err)
+	}
+	if len(reqs) != 2 {
+		t.Fatalf("calls = %d, want the rejected one and the retry", len(reqs))
+	}
+	first, retry := reqs[0], reqs[1]
+	if first["continue_final_message"] != true || first["add_generation_prompt"] != false {
+		t.Errorf("first call did not carry the prefill shape: %v", first)
+	}
+	if _, has := retry["continue_final_message"]; has {
+		t.Error("the retry still carried continue_final_message")
+	}
+	if retry["tool_choice"] != "required" {
+		t.Errorf("the retry lost tool_choice: %v", retry["tool_choice"])
+	}
+	if _, has := retry["chat_template_kwargs"]; has {
+		t.Error("the retry added a thinking flag beside a forced choice, a third rendering")
+	}
+	if msgsOut := retry["messages"].([]any); len(msgsOut) != len(msgs) {
+		t.Errorf("the retry still carried the prefill message: %d messages", len(msgsOut))
+	}
+
+	// Remembered on the entry: a call that forces nothing now uses the flag.
+	next := a.settings.ConnAt(0, "thinking").withThinkingDisabled()
+	req := buildChatRequest(next, msgs, nil)
+	if _, has := req["continue_final_message"]; has {
+		t.Error("the entry did not remember the rejection")
+	}
+	if kw, _ := req["chat_template_kwargs"].(map[string]any); kw["enable_thinking"] != false {
+		t.Errorf("a call that forces nothing must use enable_thinking=false here, got %v", req["chat_template_kwargs"])
+	}
+	// And thinking ON stays exactly what it was: no flag, no continuation.
+	on := buildChatRequest(a.settings.ConnAt(0, "thinking"), msgs, nil)
+	if _, has := on["chat_template_kwargs"]; has {
+		t.Errorf("a thinking-on call grew a flag: %v", on["chat_template_kwargs"])
 	}
 }

@@ -153,6 +153,7 @@ func chunkErrorMessage(c *sseChunk) string {
 type llmHTTPError struct {
 	Status int
 	Body   string
+	Type   string // the OpenAI-style error.type, when the body carried one
 	URL    string
 }
 
@@ -168,12 +169,35 @@ func (e *llmHTTPError) Error() string {
 var errContextCeiling = errors.New("generation hit the context ceiling")
 
 // isContextFull reports whether err means the prompt filled the context: the
-// server rejected it outright (HTTP 400) or a generation truncated at the n_ctx
-// ceiling (errContextCeiling). Both are recovered by folding history and retrying.
+// server said so on a 400 (or a 413), or a generation truncated at the n_ctx
+// ceiling (errContextCeiling). Both are recovered by folding history and
+// retrying.
+//
+// The status alone is not enough. A 400 is also what a server answers to a
+// request shape it will not take: llama.cpp's "Cannot continue an assistant
+// message that contains tool calls", Halogen's refusal of continue_final_message
+// beside a forced tool choice. Reading those as a full context started the
+// compaction ladder over a request that no amount of folding could fix. So the
+// body has to be about the context: llama.cpp's structured type, or a message
+// naming the context size or length ("request (262314 tokens) exceeds the
+// available context size (262144 tokens)"; vLLM and OpenAI say "maximum
+// context length").
 func isContextFull(err error) bool {
 	var he *llmHTTPError
-	if errors.As(err, &he) && he.Status == 400 {
-		return true
+	if errors.As(err, &he) {
+		if he.Status == 413 || he.Type == "exceed_context_size_error" {
+			return true
+		}
+		if he.Status != 400 {
+			return false
+		}
+		msg := strings.ToLower(he.Body)
+		for _, p := range []string{"context size", "context length", "context window", "exceeds the available", "too many tokens", "prompt is too long", "input is too long"} {
+			if strings.Contains(msg, p) {
+				return true
+			}
+		}
+		return false
 	}
 	return errors.Is(err, errContextCeiling)
 }
@@ -466,7 +490,8 @@ func buildChatRequest(conn *LLMConnection, messages []llmMessage, tools []map[st
 	// detail.
 	reqBody["stream_options"] = map[string]any{"include_usage": true}
 	reqBody["messages"] = messages
-	if conn.noThinkPrefill {
+	switch {
+	case conn.noThinkPrefill && !conn.noPrefill:
 		// Append the closed think block and tell the server to continue that
 		// message rather than open a fresh assistant turn. Written straight onto
 		// reqBody and not into ExtraBody on purpose: renderKey reads ExtraBody to
@@ -479,6 +504,16 @@ func buildChatRequest(conn *LLMConnection, messages []llmMessage, tools []map[st
 		reqBody["messages"] = append(withPrefill, llmMessage{Role: "assistant", Content: noThinkPrefillContent})
 		reqBody["add_generation_prompt"] = false
 		reqBody["continue_final_message"] = true
+	case conn.noThinkPrefill && reqBody["tool_choice"] != "required":
+		// No continuation on this server (see LLMConnection.noPrefill). A forced
+		// tool choice already renders without reasoning there, so only a call
+		// that forces nothing needs the flag; sending it beside "required" would
+		// be a third rendering for no gain.
+		kw, _ := reqBody["chat_template_kwargs"].(map[string]any)
+		merged := make(map[string]any, len(kw)+1)
+		maps.Copy(merged, kw)
+		merged["enable_thinking"] = false
+		reqBody["chat_template_kwargs"] = merged
 	}
 	if tools != nil {
 		reqBody["tools"] = tools
@@ -672,6 +707,11 @@ func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r 
 	// our backs; logged per call, and reported once on the Done line.
 	if conn.cacheLineage && r.promptTokens > 0 {
 		render := renderKey(conn.ExtraBody)
+		if conn.noPrefill {
+			// A forced tool choice is a rendering on this server (see noPrefill),
+			// so it belongs in the key the rewind check compares.
+			render += fmt.Sprintf(" tool_choice=%v", conn.ExtraBody["tool_choice"])
+		}
 		rw := sess.noteCacheLineage(r.promptTokens, r.cachedTokens, render, time.Now())
 		if rw.tokens > 0 {
 			// "(none)" rather than an empty string: a params table with no
@@ -690,6 +730,9 @@ func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r 
 			// Only the diagnosis differs, so only the diagnosis branches.
 			var cause string
 			switch {
+			case rw.renderChanged && conn.noPrefill:
+				cause = "Expected on this server: it keeps one prompt state per rendering and has no cache-preserving way to switch " +
+					"thinking off, so a role switch re-reads what the other role appended since. The re-read is real; nothing is misconfigured."
 			case rw.renderChanged:
 				cause = fmt.Sprintf("We asked for a different rendering than last call: template params went %s -> %s. "+
 					"The server keeps a prompt state per rendering, so this call could only reuse what THIS rendering held "+
@@ -840,7 +883,42 @@ func (a *agent) logStreamResponse(sid, connLabel string, r *streamResult, err er
 // tool-call argument deltas, the only way to watch a terminal tool being
 // written. Request building, stream reading and the passes over the result
 // each live in their own function above.
+//
+// One retry lives here, outside the gate llmStreamOnce holds: a server that
+// rejects the closed-think continuation says so on the first call that sends
+// it, and that 400 is the whole detection. The connection is marked for the
+// rest of the process (markNoPrefill) and the call goes again without the
+// prefill. A server that accepts the shape never pays anything for this.
 func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string), onArgs func(idx int, name, delta string)) (string, []toolCall, string, error) {
+	text, calls, reasoning, err := a.llmStreamOnce(ctx, sid, conn, messages, tools, on, think, onArgs)
+	var he *llmHTTPError
+	if conn != nil && conn.noThinkPrefill && !conn.noPrefill && errors.As(err, &he) && he.Status == 400 && strings.Contains(he.Body, "continue_final_message") {
+		a.markNoPrefill(conn)
+		cp := *conn
+		cp.noPrefill = true
+		return a.llmStreamOnce(ctx, sid, &cp, messages, tools, on, think, onArgs)
+	}
+	return text, calls, reasoning, err
+}
+
+// markNoPrefill records, for the life of the process, that conn's server
+// rejects the prefill shape (LLMConnection.noPrefill). Every connection built
+// from that [[llm]] entry afterwards carries the flag. A settings reload
+// rebuilds the entries and forgets it, which costs one more rejected call.
+func (a *agent) markNoPrefill(conn *LLMConnection) {
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+	for i := range a.settings.LLM {
+		e := &a.settings.LLM[i]
+		if e.Server == conn.Server && e.Model == conn.Model && !e.noPrefill {
+			e.noPrefill = true
+			slog.Info("server rejects the closed-think continuation; thinking off is its own tool_choice / enable_thinking from here on, one prompt rendering per role",
+				"server", conn.Server, "model", conn.Model)
+		}
+	}
+}
+
+func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string), onArgs func(idx int, name, delta string)) (string, []toolCall, string, error) {
 	reqBody := buildChatRequest(conn, messages, tools)
 	body, err := json.Marshal(reqBody)
 	if err != nil {
@@ -963,6 +1041,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		var apiErr struct {
 			Error struct {
 				Message string `json:"message"`
+				Type    string `json:"type"`
 			} `json:"error"`
 		}
 		if json.Unmarshal(bodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
@@ -975,7 +1054,7 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 		if strings.Contains(msg, "chat_template_kwargs") {
 			msg += "\n\nThis backend does not accept chat_template_kwargs (it is a llama.cpp / vLLM extension). Remove it from params_thinking / params_execute for this [[llm]] entry."
 		}
-		return "", nil, "", &llmHTTPError{Status: resp.StatusCode, Body: msg, URL: resp.Request.URL.String()}
+		return "", nil, "", &llmHTTPError{Status: resp.StatusCode, Body: msg, Type: apiErr.Error.Type, URL: resp.Request.URL.String()}
 	}
 
 	res := readSSEStream(resp.Body, conn, matcher, on, think, onArgs, &genChars)

@@ -115,6 +115,21 @@ type LLMConnection struct {
 	// prompt: the kwargs change came back cached=0, the append cached=13,968.
 	noThinkPrefill bool
 
+	// noPrefill records that this server has no continuation to offer. Halogen
+	// answers the prefill shape with 400 "continue_final_message cannot be
+	// combined with a forced tool choice", and honours the continuation only as
+	// plain text anyway: the model reasons after the closed block (measured on
+	// 0.13.7). Set by markNoPrefill on the first such 400, for the life of the
+	// process, and copied into every connection built from the entry since.
+	//
+	// With it, thinking off is the server's own mechanism: a forced tool_choice
+	// already renders without reasoning there, and enable_thinking=false covers
+	// a call that forces nothing. Either is a second rendering with a cache of
+	// its own, so each role switch re-reads what the other role appended since.
+	// That is the price on such a server; the prefill path stays as it is for
+	// every server that accepts it.
+	noPrefill bool
+
 	// noTurnStats keeps this call out of the turn's "✅ Done" stats. Set by
 	// prewarm and keepWarm: a turn that starts while a warm call is still
 	// streaming resets the counters first, so the warm's prefill would otherwise
