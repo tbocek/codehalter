@@ -570,11 +570,6 @@ func truncationHint(toolName, args string) string {
 		return "To see more: call this tool again with offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched."
 	case "run_command":
 		return "To see more: re-run it with the output narrowed (`| grep <pattern>`, `| tail -n <n>`, `| head -n <n>`), or redirect it to a file and read_file that. If re-running is slow or has side effects, redirect to a file the FIRST time."
-	case "list_files":
-		if path := a["path"]; path != "" {
-			return fmt.Sprintf("To see more: call list_files on a subdirectory of %q.", path)
-		}
-		return "To see more: call list_files on a deeper subdirectory."
 	case "web_search":
 		return "To see more: refine the query (fewer, more specific terms) and search again, then web_read the most promising result."
 	default:

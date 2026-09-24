@@ -22,7 +22,7 @@ Do NOT update for: internal refactors, single-function bug fixes, test-only chan
 Routine → reply `No documentation change needed.`, call NO tools, stop.
 
 ## Step 2 — Find or make README
-1. `list_files` root for `README.md`/`.rst`/`.txt`/`README`.
+1. `ls` the root (via run_command) for `README.md`/`.rst`/`.txt`/`README`.
 2. Exists → `read_file` ONCE, then `edit_file` relevant section. Minimal edits.
 3. None → `write_file` `README.md`: short description + a section for the change.
 

@@ -413,56 +413,6 @@ var fileTools = []Tool{
 	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name":        "list_files",
-			"description": "List project files. Returns relative paths, newline-separated. Skips .git/.codehalter/node_modules/vendor and similar junk dirs automatically.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"path": map[string]any{"type": "string", "description": `Subdirectory relative to project root. Omitting, passing "" or "." all mean the same thing: list from root. Do not call list_files again on the same directory — if you already have the listing this turn, reuse it.`},
-				},
-			},
-		},
-	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-		args := parseArgs(rawArgs)
-		sess := a.getSession(sid)
-		if sess == nil {
-			return "error: no session", false
-		}
-		root := sess.Cwd
-		dir := root
-		if subdir := args.str("path"); subdir != "" {
-			resolved, err := a.resolvePath(sid, subdir)
-			if err != nil {
-				return "error: " + err.Error(), false
-			}
-			dir = resolved
-		}
-
-		if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
-			return fmt.Sprintf("error: no such directory: %s", dir), false
-		}
-		tcId := a.StartToolCall(ctx, sid, "Listing: "+dir, "search", []ToolCallLocation{{Path: dir}})
-		files := listProjectFiles(dir)
-		a.CompleteToolCallTitled(ctx, sid, tcId,
-			fmt.Sprintf("Listing: %s (%d files)", dir, len(files)),
-			[]ToolCallContent{TextContent(fmt.Sprintf("%d files", len(files)))})
-		if len(files) == 0 {
-			return "(directory is empty: " + dir + ")", false
-		}
-		listing := strings.Join(files, "\n")
-		// Dedup: same directory listed again this turn with the same result.
-		// Mirrors read_file's readUnchangedMarker so the repetition ladder
-		// counts it and the model knows to reuse the listing it already has.
-		dedupKey := "list_files|" + dir
-		if sess.repeatedResult(dedupKey, fnvHash(listing)) {
-			return fmt.Sprintf("[note: %s — you already listed %s this turn and the contents are UNCHANGED. Reuse the listing you already have.]\n%s", readUnchangedMarker, dir, listing), false
-		}
-		return listing, false
-	}},
-
-	{Def: map[string]any{
-		"type": "function",
-		"function": map[string]any{
 			"name":        "read_file",
 			"description": fmt.Sprintf("Read a text file from the top (or from `line`). Prefer it to `cat`/`sed -n` through run_command: line-numbered, ranged, one call. Serves up to %d lines per call. If the file continues past that, the output is marked partial and ends with a pointer to call continue_read for the next chunk (it remembers where you left off, so no line math). When the output ends with an end-of-file marker you have the file through that point, so do not re-read. A repeat read whose exact content is still in this conversation is refused (scroll back to it, or call continue_read for the next part); once it has scrolled out of context it is re-served. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
 			"parameters": map[string]any{
