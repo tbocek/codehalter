@@ -625,7 +625,7 @@ func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []
 // WHAT, and the arguments have scrolled away by then.
 func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (stop func()) {
 	label := tc.Function.Name
-	// Tried in priority order: a tool can carry several of these (search_text has
+	// Tried in priority order: a tool can carry several of these (a search has
 	// both a query and a path) and only one fits the row. Whitespace runs collapse
 	// to single spaces because a heredoc or a multi-line command would otherwise
 	// break the row apart, and the cut is on runes so it can't split one in half.
@@ -882,10 +882,10 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 	if repeated && !tu.Failed && tc.Function.Name == "run_command" {
 		repeated = false
 	}
-	// read_file/continue_read/search_text also honour the content-dedup marker —
+	// read_file/continue_read also honour the content-dedup marker —
 	// serveRead prepends a note on a repeat, which would otherwise defeat the
 	// hash on the first re-read.
-	if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read" || tc.Function.Name == "search_text") &&
+	if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read") &&
 		strings.Contains(tu.Output, readUnchangedMarker) {
 		repeated = true
 	}

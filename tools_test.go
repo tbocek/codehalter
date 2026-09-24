@@ -148,7 +148,7 @@ func TestArgsTypedAccessors(t *testing.T) {
 func TestLiveToolOutput(t *testing.T) {
 	big := strings.Repeat("x", truncateThreshold*3)
 
-	for _, tool := range []string{"read_file", "continue_read", "search_text", "web_search", "web_read"} {
+	for _, tool := range []string{"read_file", "continue_read", "web_search", "web_read"} {
 		if got := liveToolOutput(tool, "{}", big); got != big {
 			t.Errorf("liveToolOutput(%s) clipped a size-managing tool (len %d, want %d)", tool, len(got), len(big))
 		}
@@ -172,9 +172,9 @@ func TestLiveExemptCap(t *testing.T) {
 	line := strings.Repeat("a", 80) + "\n"
 	huge := strings.Repeat(line, liveExemptCap/len(line)+50) // comfortably over the cap
 
-	got := liveToolOutput("search_text", "{}", huge)
+	got := liveToolOutput("read_file", "{}", huge)
 	if got == huge {
-		t.Fatal("oversized search_text output should be capped, not passed whole")
+		t.Fatal("oversized read_file output should be capped, not passed whole")
 	}
 	if !strings.Contains(got, "chars omitted") || !strings.Contains(got, "capped") {
 		t.Errorf("capped output must report the omission, got tail %q", got[max(0, len(got)-160):])

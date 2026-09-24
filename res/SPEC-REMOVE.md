@@ -12,7 +12,7 @@
 
 ## Do
 
-1. Find what implements it. The test that named it was `{{covered_by}}`; the implementation is whatever that test exercises. `search_text` for the id `{{id}}`, for its test name, and for the names of the functions or types the test calls.
+1. Find what implements it. The test that named it was `{{covered_by}}`; the implementation is whatever that test exercises. `grep -rn` for the id `{{id}}`, for its test name, and for the names of the functions or types the test calls.
 2. Delete that implementation and its tests, including fixtures and sample data that exist only for it.
 3. Keep everything else working. Code the removed item shares with items that are still in the spec STAYS: a helper two other items call is not part of this removal. When in doubt about a shared piece, leave it and say so.
 4. Remove what is now dead because of the deletion: an import that no longer resolves, a menu entry pointing at a screen that is gone, a settings field nothing reads.

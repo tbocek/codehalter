@@ -150,7 +150,7 @@ func (r *toolRegistry) seedLocked() {
 	// project's own (run_command and run_background inside a container) and
 	// MCP adds its servers', both at runtime through add.
 	builtin := slices.Concat(fileTools, webTools, []Tool{
-		searchTextTool, askUserTool, submitPlanTool, respondTool,
+		askUserTool, submitPlanTool, respondTool,
 		insightsTool, screenshotTool, viewImageTool,
 	})
 	for _, t := range builtin {
@@ -512,7 +512,7 @@ const (
 )
 
 // liveToolOutput is the model-visible content for a tool call. The content-
-// retrieval tools (read_file/continue_read/search_text + web_search/web_read/
+// retrieval tools (read_file/continue_read + web_search/web_read/
 // web_read) pass through whole (up to the line-aware liveExemptCap); every
 // other tool gets the 1.5 KB head/tail cap. history.go re-renders stored outputs
 // through THIS same function, so a replay is byte-identical to the live wire
@@ -520,7 +520,7 @@ const (
 // change the bytes and force a reprocess. n_ctx is bounded by compaction instead.
 func liveToolOutput(toolName, args, content string) string {
 	switch toolName {
-	case "read_file", "continue_read", "search_text", "web_search", "web_read":
+	case "read_file", "continue_read", "web_search", "web_read":
 		if len(content) <= liveExemptCap {
 			return content
 		}
@@ -575,8 +575,6 @@ func truncationHint(toolName, args string) string {
 			return fmt.Sprintf("To see more: call list_files on a subdirectory of %q.", path)
 		}
 		return "To see more: call list_files on a deeper subdirectory."
-	case "search_text":
-		return "To see more: re-run search_text with a more specific pattern or a narrower path."
 	case "web_search":
 		return "To see more: refine the query (fewer, more specific terms) and search again, then web_read the most promising result."
 	default:

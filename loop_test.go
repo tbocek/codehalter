@@ -319,7 +319,6 @@ func TestToolMeterShowsTheArgument(t *testing.T) {
 		name, args, want string
 	}{
 		{"run_command", `{"command":"go build ./..."}`, "run_command go build ./..."},
-		{"search_text", `{"query":"LoadAll","path":"src"}`, "search_text LoadAll"}, // query wins over path
 		{"read_file", `{"path":"loop.go","limit":40}`, "read_file loop.go"},
 		{"web_search", `{"query":"line one\nline two"}`, "web_search line one line two"}, // no row-breaking newline
 		{"run_command", `{"command":"` + long + `"}`, "run_command " + strings.Repeat("x", toolMeterArgRunes)},
@@ -1287,12 +1286,12 @@ func TestPlanRoundNudgeAsksToSubmit(t *testing.T) {
 	a, s := newTestAgent(t)
 	withTools(a, Tool{
 		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "search_text", "description": "probe", "parameters": map[string]any{"type": "object"}}},
+			"name": "read_file", "description": "probe", "parameters": map[string]any{"type": "object"}}},
 		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) { return "hit", false },
 	})
 	var resp []string
 	for i := 0; i <= planRoundNudge+1; i++ {
-		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "search_text", fmt.Sprintf(`{"query":"q%d"}`, i)))
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "read_file", fmt.Sprintf(`{"path":"f%d.rs"}`, i)))
 	}
 	resp = append(resp, sseText("done"))
 	mock := newMockLLM(t, resp...)

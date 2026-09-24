@@ -23,9 +23,9 @@ func buildSessionLog(t *testing.T, lastRequestJSON string, extra ...string) stri
 func TestDigestLogLoopsFailuresAndPairing(t *testing.T) {
 	req := `{"messages":[
 	 {"role":"user","content":"fix the bug"},
-	 {"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"search_text","arguments":"{\"pattern\":\"LoadAll\"}"}}]},
+	 {"role":"assistant","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{\"path\":\"LoadAll\"}"}}]},
 	 {"role":"tool","tool_call_id":"c1","content":"3 matches"},
-	 {"role":"assistant","tool_calls":[{"id":"c2","function":{"name":"search_text","arguments":"{\"pattern\":\"LoadAll\"}"}}]},
+	 {"role":"assistant","tool_calls":[{"id":"c2","function":{"name":"read_file","arguments":"{\"path\":\"LoadAll\"}"}}]},
 	 {"role":"tool","tool_call_id":"c2","content":"3 matches"},
 	 {"role":"assistant","tool_calls":[{"id":"c3","function":{"name":"run_command","arguments":"{\"command\":\"go build ./...\"}"}}]},
 	 {"role":"tool","tool_call_id":"c3","content":"error: undefined symbol foo\nmore lines"},
@@ -55,7 +55,7 @@ func TestDigestLogLoopsFailuresAndPairing(t *testing.T) {
 	var rendered strings.Builder
 	d.render(&rendered)
 	out := rendered.String()
-	if !strings.Contains(out, "LOOP: search_text") || !strings.Contains(out, "2× with identical args") {
+	if !strings.Contains(out, "LOOP: read_file") || !strings.Contains(out, "2× with identical args") {
 		t.Fatalf("loop not surfaced:\n%s", out)
 	}
 	if !strings.Contains(out, "FAIL ×1: run_command") || !strings.Contains(out, "undefined symbol foo") {

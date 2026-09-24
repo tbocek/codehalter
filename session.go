@@ -204,8 +204,8 @@ type Session struct {
 // Background goroutines (summariser, git commit) add their tokens to whichever
 // turn is current. In-memory only.
 type turnState struct {
-	// seen maps each read_file window, list_files directory and search_text
-	// query to the fnv hash of what it returned, so a literal repeat with an
+	// seen maps each read_file window and list_files directory to the fnv hash
+	// of what it returned, so a literal repeat with an
 	// unchanged result gets a note instead of silently re-running (repeatedRead).
 	// fsWrite drops a path's entries, so a post-edit re-read starts fresh.
 	seen map[string]uint64
@@ -744,7 +744,7 @@ func (s *Session) takeBgNotes() []bgNote {
 
 // repeatedResult records that the tool call named by key returned a result
 // hashing to sum, and reports whether the same call already returned exactly
-// that earlier this turn. read_file, list_files and search_text use it to flag
+// that earlier this turn. read_file and list_files use it to flag
 // a literal repeat with readUnchangedMarker instead of silently re-running.
 func (s *Session) repeatedResult(key string, sum uint64) bool {
 	s.turnMu.Lock()

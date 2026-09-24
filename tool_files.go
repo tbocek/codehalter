@@ -13,7 +13,7 @@ import (
 
 // binarySniffLen is how many leading bytes we sniff for a NUL to classify a file
 // as binary (the git/grep heuristic). Binary files (zips, images) must never be
-// scanned by search_text or rendered by read_file — their bytes poison the
+// rendered by read_file — their bytes poison the
 // context (the model emits garbage and stalls).
 const binarySniffLen = 8192
 
@@ -266,7 +266,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	if len(content) > maxReadBytes {
 		content = content[:maxReadBytes]
 		more = true
-		byteNote = fmt.Sprintf("[truncated at %d bytes — long lines; use search_text or read_file line+limit to narrow] ", maxReadBytes)
+		byteNote = fmt.Sprintf("[truncated at %d bytes — long lines; use read_file line+limit, or grep -n through run_command, to narrow] ", maxReadBytes)
 	}
 	end := start
 	if served > 0 {
@@ -316,7 +316,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	case more:
 		note = fmt.Sprintf("[showing lines %d-%d, the file continues. "+
 			"MORE of it: continue_read path=%q returns the next ~%d lines (or read_file line=%d to jump). "+
-			"LESS of it: search_text query=<what you are looking for> path=%q context=5 returns only the lines around each hit. "+
+			"LESS of it: `grep -n -C5 -F '<what you are looking for>' %s` through run_command returns only the lines around each hit. "+
 			"Do NOT re-read the whole file.]", start, end, path, readChunkLines, end+1, path)
 	default:
 		note = fmt.Sprintf("[end of file — line %d is the last; you have the file through line %d, do not re-read]", end, end)
@@ -336,7 +336,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	if !editFailed && sess != nil && len(content) > 0 && len(content) <= liveExemptCap && sess.readContentInContext(content) {
 		ptr := " You already have these lines above — scroll back to that output instead of re-reading."
 		if more {
-			ptr = fmt.Sprintf(" You already have lines %d-%d above; for the rest of the file call continue_read path=%q (or read_file line=%d / search_text for a specific part).", start, end, path, end+1)
+			ptr = fmt.Sprintf(" You already have lines %d-%d above; for the rest of the file call continue_read path=%q (or read_file line=%d, or grep -n -C for a specific part).", start, end, path, end+1)
 		}
 		refusal := fmt.Sprintf("This file is already in the context — %s. You read %s lines %d-%d earlier this turn and it has not changed; re-read refused.%s",
 			readUnchangedMarker, path, start, end, ptr)
