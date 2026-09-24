@@ -332,7 +332,7 @@
       <ol class="steps">
         <li>
           <h3>It asks, then starts</h3>
-          <p>The first <code>/spec</code> in a project asks which folder holds the spec, reads that folder's entry page, and proposes what to build and where, for example <b>rust/ with gtk4-rs and libadwaita</b>. Accept it and the loop starts. Already know the answers? <code>/spec spec/ rust/</code> skips the questions.</p>
+          <p>The first <code>/spec</code> in a project asks three questions, each with up to three options read off the project: which folder holds the spec, where to build (the entry page's own answer first, then any folder that already holds a manifest), and with what (the page's answer, what that folder already is, and a keyword reading of the page). The answers go to <code>.codehalter/spec.toml</code> and the loop starts. Already know the answers? <code>/spec spec/ rust/</code> skips the questions.</p>
         </li>
         <li>
           <h3>One item per round</h3>
@@ -385,7 +385,7 @@
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/><path d="M7 6.5h.01M7 17.5h.01"/></svg></div>
           <h3>Spec loop: <code>/spec</code></h3>
-          <p>A whole specification implemented item by item, unattended, each finished item one commit (<a href="#spec">above</a>). Cancel any time, <code>/spec</code> resumes where the ledger says it is, and <code>/spec status</code> reports coverage per chapter plus anything you changed in the spec since. The spec folder is read-only to the file tools while the loop runs, so a round cannot quietly rewrite the requirement it failed to meet.</p>
+          <p>A whole specification implemented item by item, unattended, each finished item one commit (<a href="#spec">above</a>). Cancel any time, <code>/spec</code> resumes where the ledger says it is and <code>/spec stop</code> ends it after the round in flight (its commit lands first), and <code>/spec status</code> reports coverage per chapter plus anything you changed in the spec since. The spec folder is read-only to the file tools while the loop runs, so a round cannot quietly rewrite the requirement it failed to meet.</p>
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10 21 3"/><path d="M3 21l7-7"/></svg></div>

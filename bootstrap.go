@@ -359,7 +359,7 @@ func projectStacks(cwd string) []string {
 }
 
 // detectStacks returns the language/stack identifiers active in cwd, in a
-// fixed order (load-bearing: tests assert it, and ensureSkills walks it).
+// fixed order (load-bearing: tests assert it, and skillSet reads it).
 // Used to seed only the relevant SKILL files.
 func detectStacks(cwd string) []string {
 	var stacks []string
