@@ -258,7 +258,7 @@ func parseSpecArgs(args string) (cmd, specDir, outDir, target string, err error)
 	}
 	specDir, outDir = next(), next()
 	if outDir == "" {
-		return "", "", "", "", fmt.Errorf("usage: /spec <spec-dir> <out-dir> [technology prompt], /spec to resume, /spec status")
+		return "", "", "", "", fmt.Errorf("usage: /spec <spec-dir> <out-dir> [technology prompt], /spec to resume, /spec status, /spec stop")
 	}
 	return "setup", filepath.Clean(specDir), filepath.Clean(outDir), strings.TrimSpace(rest), nil
 }

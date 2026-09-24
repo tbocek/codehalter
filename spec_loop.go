@@ -20,6 +20,7 @@ import (
 // document) and checks each one afterwards.
 //
 //	/spec <spec-dir> <out-dir> [technology prompt]   set up, then loop
+//	/spec stop                                       end after the round in flight
 //	/spec                                            resume the loop
 //	/spec status                                     coverage report, no turn
 //
