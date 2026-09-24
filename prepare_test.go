@@ -737,3 +737,37 @@ func TestEmptyProject(t *testing.T) {
 		t.Error("expected dir with main.go to not be empty")
 	}
 }
+
+// TestRenderLLMStatusNamesPurpose: the banner says what each [[llm]] entry is
+// for, so a second entry is not a mystery: llm[0] carries the session and,
+// with nobody else designated, the summariser too; an entry with
+// purpose = "summary" takes the summariser off it; any other extra is idle.
+func TestRenderLLMStatusNamesPurpose(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"m"}]}`))
+	}))
+	defer ts.Close()
+	base := LLMConnection{Server: ts.URL, Model: "m", Parallel: ptr(1), ContextSize: ptr(128000)}
+	status := func(conns ...LLMConnection) string {
+		a := &agent{settings: Settings{LLM: conns}}
+		a.probeAllLLMs(context.Background())
+		return a.renderLLMStatus()
+	}
+
+	alone := status(base)
+	if !strings.Contains(alone, "llm[0]: m @ "+ts.URL+" (parallel=1) · the session (planning, execution, documentation) and the background summariser") {
+		t.Errorf("a lone entry must carry everything:\n%s", alone)
+	}
+	summ := base
+	summ.Purpose = "summary"
+	two := status(base, summ)
+	for _, want := range []string{"llm[0]: m @ " + ts.URL + " (parallel=1) · the session (planning, execution, documentation)\n", "llm[1]: m @ " + ts.URL + " (parallel=1) · background work (the summariser, side questions), off the session's cache"} {
+		if !strings.Contains(two, want) {
+			t.Errorf("missing %q:\n%s", want, two)
+		}
+	}
+	if idle := status(base, base); !strings.Contains(idle, "llm[1]: m @ "+ts.URL+" (parallel=1) · unused: nothing routes here") {
+		t.Errorf("an extra with no purpose must say it is idle:\n%s", idle)
+	}
+}

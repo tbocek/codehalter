@@ -135,7 +135,7 @@ This walks through server URL, model name, and API key (optional), validates the
 One `[[llm]]` array. Order matters: `llm[0]` is the main connection, `llm[1+]` are extras.
 
 - `llm[0]`, owns the foreground session's KV cache, so its prefix stays warm across turns. Every plan/execute/verify/document call on the main session lands here. Typically a smaller/faster model.
-- `llm[1]`, optional, marked `purpose = "summary"`: hosts the per-turn structured summariser and `web_read`'s page reader off `llm[0]`, so its prefix cache isn't evicted. Without it the summariser extends `llm[0]`'s own context as a prefix-extension — cache-safe, just serialised.
+- `llm[1]`, optional, marked `purpose = "summary"`: hosts the background work (the compaction summariser, and one-off side questions such as `/spec`'s target suggestion) off `llm[0]`, so its prefix cache isn't evicted. The banner says which entry carries what. Without it the summariser extends `llm[0]`'s own context as a prefix-extension — cache-safe, just serialised.
 
 `parallel = N` per entry caps how many concurrent LLM calls that entry accepts. The token is held for the duration of one LLM round-trip only, so between calls the slot is free for another caller, and pool size 1 simply serialises everything.
 

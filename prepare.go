@@ -540,6 +540,31 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 // renderLLMStatus formats the LLM probe results into the chat summary used
 // by notifyCapabilities. Pure function over agent state — produces the same
 // string until probeAllLLMs or settings changes.
+// connPurpose says in the banner what an [[llm]] entry is for, so a second
+// entry is not a mystery: the session runs on llm[0]; an entry with
+// purpose = "summary" hosts the background work (the compaction summariser
+// and one-off side questions such as /spec's target suggestion), which
+// otherwise also runs on llm[0]; any other extra is configured but nothing
+// routes to it.
+func connPurpose(conns []LLMConnection, i int) string {
+	hasSummariser := false
+	for j := 1; j < len(conns); j++ {
+		if strings.EqualFold(conns[j].Purpose, purposeSummary) {
+			hasSummariser = true
+		}
+	}
+	switch {
+	case i == 0 && hasSummariser:
+		return "the session (planning, execution, documentation)"
+	case i == 0:
+		return "the session (planning, execution, documentation) and the background summariser"
+	case strings.EqualFold(conns[i].Purpose, purposeSummary):
+		return "background work (the summariser, side questions), off the session's cache"
+	default:
+		return "unused: nothing routes here (purpose = \"summary\" would host the summariser)"
+	}
+}
+
 func (a *agent) renderLLMStatus() string {
 	conns := a.settings.allConnections()
 	var b strings.Builder
@@ -580,7 +605,7 @@ func (a *agent) renderLLMStatus() string {
 			}
 			continue
 		}
-		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d)\n\n", label, c.Model, c.Server, c.parallelCap())
+		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d) · %s\n\n", label, c.Model, c.Server, c.parallelCap(), connPurpose(conns, i))
 		// The one settings mistake that costs real time and shows no symptom:
 		// roles that differ in anything but samplers ask for two renderings, and
 		// each phase switch then re-evaluates what the OTHER role appended
