@@ -897,6 +897,17 @@ func (a *agent) logStreamResponse(sid, connLabel string, r *streamResult, err er
 // rest of the process (markNoPrefill) and the call goes again without the
 // prefill. A server that accepts the shape never pays anything for this.
 func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string), onArgs func(idx int, name, delta string)) (string, []toolCall, string, error) {
+	// Connections are copied freely (the tool loop's per-subtask copy, the
+	// keep-warm's, a stall retry's), and a flag set on one copy reaches none of
+	// the others: marking only the copy that saw the 400 left every other copy
+	// paying a refused request per call, 126 of them in one afternoon. So the
+	// mark lives on the settings entry and is read here, on every call, for
+	// whatever copy arrives.
+	if conn != nil && conn.noThinkPrefill && !conn.noPrefill && a.prefillRejected(conn) {
+		cp := *conn
+		cp.noPrefill = true
+		conn = &cp
+	}
 	text, calls, reasoning, err := a.llmStreamOnce(ctx, sid, conn, messages, tools, on, think, onArgs)
 	var he *llmHTTPError
 	if conn != nil && conn.noThinkPrefill && !conn.noPrefill && errors.As(err, &he) && he.Status == 400 && strings.Contains(he.Body, "continue_final_message") {
@@ -909,9 +920,9 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 }
 
 // markNoPrefill records, for the life of the process, that conn's server
-// rejects the prefill shape (LLMConnection.noPrefill). Every connection built
-// from that [[llm]] entry afterwards carries the flag. A settings reload
-// rebuilds the entries and forgets it, which costs one more rejected call.
+// rejects the prefill shape (LLMConnection.noPrefill); prefillRejected reads
+// it back for every later call on that server. A settings reload rebuilds the
+// entries and forgets it, which costs one more rejected call.
 func (a *agent) markNoPrefill(conn *LLMConnection) {
 	a.cfgMu.Lock()
 	defer a.cfgMu.Unlock()
@@ -923,6 +934,17 @@ func (a *agent) markNoPrefill(conn *LLMConnection) {
 				"server", conn.Server, "model", conn.Model)
 		}
 	}
+}
+
+func (a *agent) prefillRejected(conn *LLMConnection) bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
+	for i := range a.settings.LLM {
+		if e := &a.settings.LLM[i]; e.Server == conn.Server && e.Model == conn.Model {
+			return e.noPrefill
+		}
+	}
+	return false
 }
 
 func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string), onArgs func(idx int, name, delta string)) (string, []toolCall, string, error) {

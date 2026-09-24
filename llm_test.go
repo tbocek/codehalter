@@ -844,9 +844,9 @@ func TestLLMStreamDropsPrefillWhenRejected(t *testing.T) {
 		}
 		mu.Lock()
 		reqs = append(reqs, body)
-		n := len(reqs)
 		mu.Unlock()
-		if n == 1 {
+		// Like Halogen: the prefill shape is refused every time, not just once.
+		if body["continue_final_message"] == true {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"error":{"message":"continue_final_message cannot be combined with a forced tool choice: one resumes the assistant turn already in the history, the other starts a new call","type":"invalid_request_error"}}`))
 			return
@@ -880,6 +880,23 @@ func TestLLMStreamDropsPrefillWhenRejected(t *testing.T) {
 	}
 	if msgsOut := retry["messages"].([]any); len(msgsOut) != len(msgs) {
 		t.Errorf("the retry still carried the prefill message: %d messages", len(msgsOut))
+	}
+
+	// Every copy must know, however it was made: the tool loop's reused copy,
+	// and a keep-warm copy taken from the ORIGINAL pointer that never saw the
+	// 400 (126 refused warm-ups and execute calls in one afternoon were exactly
+	// this). One request each, no 400.
+	for name, c := range map[string]*LLMConnection{"the reused connection": conn, "a fresh copy of the original": conn.withMaxTokens(1)} {
+		before := len(reqs)
+		if _, _, _, err := a.llmStream(context.Background(), "", c, msgs, nil, nil, nil, nil); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(reqs) != before+1 {
+			t.Fatalf("%s: %d requests, want 1 (must skip the prefill without a refusal)", name, len(reqs)-before)
+		}
+		if _, has := reqs[len(reqs)-1]["continue_final_message"]; has {
+			t.Errorf("%s sent the prefill again", name)
+		}
 	}
 
 	// Remembered on the entry: a call that forces nothing now uses the flag.
