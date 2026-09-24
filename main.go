@@ -213,15 +213,20 @@ type mcpState struct {
 // ---------------------------------------------------------------------------
 
 func main() {
-	// --version: the release tag this binary was built from. selfUpdate runs the
-	// binary it has just downloaded with this flag and compares the whole line
-	// before replacing anything, so the format is load-bearing rather than
-	// cosmetic (see versionLine).
+	// --version: the release tag this binary was built from, one line and
+	// nothing else. Every installed updater runs the binary it has just
+	// downloaded with this flag and compares the output before replacing
+	// anything; the updaters up to v78 compare the whole output, so a second
+	// line here (v81 printed the build stamp there) leaves those installs
+	// unable to update ever again. The stamp has its own flag.
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Println(versionLine(version))
-		if stamp := buildStamp(); stamp != "" {
-			fmt.Println("built " + stamp)
-		}
+		os.Exit(0)
+	}
+	// --build: the commit date and hash this binary was built at, the same
+	// stamp the banner shows.
+	if len(os.Args) > 1 && os.Args[1] == "--build" {
+		fmt.Println(versionBanner())
 		os.Exit(0)
 	}
 

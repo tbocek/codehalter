@@ -56,8 +56,9 @@ Run outside a container in a project that has .devcontainer/devcontainer.json,
 this starts that container with docker (or podman) compose and runs the CLI
 inside it. Inside a container it just starts.
 
-Other flags: --version prints the release tag, --update installs the newest
-release over this binary, --setup reconfigures the LLM connection.
+Other flags: --version prints the release tag, --build its build date and
+hash, --update installs the newest release over this binary, --setup
+reconfigures the LLM connection.
 `
 
 func runCLI(argv []string) int {

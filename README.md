@@ -90,7 +90,8 @@ The other ways in:
 | | |
 |---|---|
 | `codehalter --update` | check and install, no question asked, for a run nobody is watching |
-| `codehalter --version` | the release tag this binary was built from, and on a second line the commit date and hash it was built at (the banner shows the same: `codehalter v78 (2026-09-24, 73b7d58)`) |
+| `codehalter --version` | the release tag this binary was built from, one line, which the updater of every installed release compares against before replacing itself |
+| `codehalter --build` | the tag with the commit date and hash it was built at, as the banner shows it: `codehalter v78 (2026-09-24, 73b7d58)` |
 | `update_check = false` | in `settings.toml`: never contact GitHub about releases |
 | `CODEHALTER_UPDATE=skip` | the same for one run (CI); `=yes` updates without asking |
 
@@ -263,8 +264,9 @@ codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT] [--rebuild]
                       so a script can branch on it.
   --rebuild           rebuild the devcontainer image before starting it
 
-Other flags: --version prints the release tag, --update installs the newest
-release over this binary, --setup reconfigures the LLM connection.
+Other flags: --version prints the release tag, --build its build date and
+hash, --update installs the newest release over this binary, --setup
+reconfigures the LLM connection.
 ```
 
 Like every other codehalter run this one is **devcontainer-first**: it refuses to start outside a container. Starting that container is its own job, though.
