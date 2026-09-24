@@ -280,6 +280,10 @@ type sessionRuntime struct {
 	// point (see deliverBgNotesWhenIdle / flushBgNotes). The job died with the
 	// process that would have reported it.
 	bgNotes []bgNote
+	// specStop is "/spec stop" typed while the loop runs. The loop reads it at
+	// its next round boundary, after the round in flight has committed, so
+	// nothing is left half done. Runtime-only.
+	specStop bool
 	// specFenceDir is the spec directory a running /spec loop has made
 	// read-only for the file tools (spec_loop.go); "" when no loop runs.
 	specFenceDir string

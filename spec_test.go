@@ -218,6 +218,9 @@ func TestParseSpecArgs(t *testing.T) {
 	if cmd, _, _, _, _ := parseSpecArgs("status"); cmd != "status" {
 		t.Errorf("status = %q", cmd)
 	}
+	if cmd, _, _, _, _ := parseSpecArgs("stop"); cmd != "stop" {
+		t.Errorf("stop = %q", cmd)
+	}
 	if _, _, _, _, err := parseSpecArgs("spec/"); err == nil {
 		t.Error("a spec dir without an output dir parsed")
 	}
@@ -460,5 +463,56 @@ func TestSpecSectionFromText(t *testing.T) {
 	}
 	if got := specSectionFromText(doc, "§01-files#nope"); got != "" {
 		t.Errorf("an unknown slug should find nothing, got %q", got)
+	}
+}
+
+// TestSpecSetupOptions pins where the three setup cards get their options:
+// out-dir from the page's suggestion first, then directories holding a
+// manifest (never the spec dir, never build output); target from the page's
+// answer, then what the chosen directory already is, read off its manifest.
+func TestSpecSetupOptions(t *testing.T) {
+	root := t.TempDir()
+	for path, body := range map[string]string{
+		"spec/README.md":  "# The spec\n\nThe rewrite targets Rust with gtk4-rs and libadwaita.\n",
+		"spec/01.md":      "# 01",
+		"rust/Cargo.toml": "[package]\nname = \"x\"\n\n[dependencies]\ngtk4 = \"0.11\"\nlibadwaita = \"0.9\"\nserde_json = \"1\"\ncairo-rs = \"0.20\"\n\n[dev-dependencies]\ntempfile = \"3\"\n",
+		"gui/go.mod":      "module example.com/gui\n\ngo 1.26\n\nrequire (\n\tgithub.com/diamondburned/gotk4 v0.4.1\n\tgithub.com/coder/websocket v1.8.0 // indirect\n)\n",
+		"target/x.rs":     "",
+		"notes.txt":       "",
+	} {
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if lang, deps := manifestStack(filepath.Join(root, "rust")); lang != "rust" || strings.Join(deps, ",") != "gtk4,libadwaita,serde_json" {
+		t.Errorf("rust manifest = %q %v, want rust and the first three [dependencies]", lang, deps)
+	}
+	if lang, deps := manifestStack(filepath.Join(root, "gui")); lang != "go" || strings.Join(deps, ",") != "gotk4" {
+		t.Errorf("go manifest = %q %v, want go and gotk4 (indirect skipped)", lang, deps)
+	}
+	if lang, _ := manifestStack(filepath.Join(root, "spec")); lang != "" {
+		t.Errorf("a directory with no manifest reports %q", lang)
+	}
+
+	outs := specOutDirOptions(root, "spec", "rust")
+	if strings.Join(outs, ",") != "rust,gui" {
+		t.Errorf("out-dir options = %v, want the suggestion first, then the other project, never spec or target", outs)
+	}
+	if outs := specOutDirOptions(root, "spec", "app"); outs[0] != "app" || len(outs) != 3 {
+		t.Errorf("a suggested new directory must lead: %v", outs)
+	}
+
+	entry := "The rewrite targets Rust with gtk4-rs and libadwaita."
+	got := specTargetOptions(root, "rust", "rust with gtk4-rs (v4_14) and libadwaita", entry)
+	want := []string{"rust with gtk4-rs (v4_14) and libadwaita", "rust with gtk4, libadwaita, serde_json", "rust with gtk4-rs and libadwaita"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("target options = %v, want %v", got, want)
+	}
+	if got := specTargetOptions(root, "gui", "", entry); got[0] != "go with gotk4" {
+		t.Errorf("with no page suggestion the directory's own stack leads: %v", got)
 	}
 }

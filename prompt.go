@@ -459,6 +459,18 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// rather than dropping them silently.
 	if sess := a.getSession(req.SessionId); sess != nil && sess.turnRunning() {
 		text, images := promptContent(sess.Cwd, req.Content)
+		// "/spec stop" is an instruction to the loop, not text for the model.
+		// The round in flight finishes and commits; the loop then reports and
+		// returns instead of picking the next item.
+		if strings.TrimSpace(text) == "/spec stop" {
+			if sess.specFence() == "" {
+				a.say(ctx, req.SessionId, "No /spec loop is running in this session.\n")
+			} else {
+				sess.requestSpecStop()
+				a.say(ctx, req.SessionId, "⏹ /spec stops after the round in flight; its commit lands first. `/spec` later resumes where the ledger says.\n")
+			}
+			return PromptResponse{StopReason: "end_turn"}, nil
+		}
 		if strings.TrimSpace(text) != "" {
 			sess.addSteer(text)
 			note := "↪ Queued for the turn in flight, it lands at its next step. Stop the turn to interrupt it instead.\n"

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -227,7 +230,7 @@ func (c *specConfig) unblock(id string) {
 }
 
 // parseSpecArgs reads the text after "/spec". Empty resumes, "status" reports,
-// anything else is `<spec-dir> <out-dir> [target prompt...]`: the first two
+// "stop" ends a running loop at its next round boundary, anything else is `<spec-dir> <out-dir> [target prompt...]`: the first two
 // tokens are paths and everything after them is the prompt, verbatim, so a
 // target like "use gtk4-rs libadwaita" needs no quoting.
 func parseSpecArgs(args string) (cmd, specDir, outDir, target string, err error) {
@@ -237,6 +240,8 @@ func parseSpecArgs(args string) (cmd, specDir, outDir, target string, err error)
 		return "resume", "", "", "", nil
 	case "status":
 		return "status", "", "", "", nil
+	case "stop":
+		return "stop", "", "", "", nil
 	}
 	rest := args
 	next := func() string {
@@ -1333,6 +1338,140 @@ func specEntryPage(specAbs string) (rel, content string) {
 		return "", ""
 	}
 	return pick, string(data)
+}
+
+// specOutDirOptions ranks where the implementation could go, for the setup
+// dialog: what the spec's entry page asked for first (a new directory, or an
+// existing one), then every top-level directory that already holds a manifest,
+// since a prototype or an earlier attempt is the likeliest other answer. The
+// spec directory itself is never an option. At most three.
+func specOutDirOptions(cwd, specDir, suggested string) []string {
+	var out []string
+	add := func(d string) {
+		d = strings.Trim(filepath.ToSlash(filepath.Clean(d)), "/")
+		if d == "" || d == "." || d == specDir || slices.Contains(out, d) || len(out) >= 3 {
+			return
+		}
+		out = append(out, d)
+	}
+	add(suggested)
+	entries, _ := os.ReadDir(cwd)
+	for _, e := range entries {
+		if !e.IsDir() || specSkipDirs[e.Name()] || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		if lang, _ := manifestStack(filepath.Join(cwd, e.Name())); lang != "" {
+			add(e.Name())
+		}
+	}
+	return out
+}
+
+// specTargetOptions ranks what to build it with: what the entry page asked for
+// first, then what the chosen directory already is (its manifest's language
+// and first dependencies), then the keyword table's reading of the page when
+// it differs. At most three.
+func specTargetOptions(cwd, outDir, suggested, entry string) []string {
+	var out []string
+	add := func(t string) {
+		t = strings.TrimSpace(t)
+		if t == "" || slices.Contains(out, t) || len(out) >= 3 {
+			return
+		}
+		out = append(out, t)
+	}
+	add(suggested)
+	if lang, deps := manifestStack(filepath.Join(cwd, outDir)); lang != "" {
+		if len(deps) > 0 {
+			add(lang + " with " + strings.Join(deps, ", "))
+		} else {
+			add(lang)
+		}
+	}
+	if _, guess := specGuessTarget(entry); guess != "" {
+		add(guess)
+	}
+	return out
+}
+
+// manifestStack reads the manifest at the top of dir and reports the language
+// it declares and up to three of its dependencies, in file order: enough to
+// describe an existing directory in the setup dialog ("rust with gtk4,
+// libadwaita"). It is not a build-system parser; a manifest it cannot read is
+// a language with no dependencies named.
+func manifestStack(dir string) (lang string, deps []string) {
+	read := func(name string) (string, bool) {
+		b, err := os.ReadFile(filepath.Join(dir, name))
+		return string(b), err == nil
+	}
+	first3 := func(names []string) []string {
+		if len(names) > 3 {
+			names = names[:3]
+		}
+		return names
+	}
+	if s, ok := read("Cargo.toml"); ok {
+		var names []string
+		in := false
+		for _, line := range strings.Split(s, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "[") {
+				in = line == "[dependencies]"
+				continue
+			}
+			if name, _, found := strings.Cut(line, "="); in && found && name != "" && !strings.HasPrefix(name, "#") {
+				names = append(names, strings.TrimSpace(name))
+			}
+		}
+		return "rust", first3(names)
+	}
+	if s, ok := read("go.mod"); ok {
+		var names []string
+		in := false
+		for _, line := range strings.Split(s, "\n") {
+			line = strings.TrimSpace(line)
+			switch {
+			case line == "require (":
+				in = true
+			case line == ")":
+				in = false
+			case strings.HasPrefix(line, "require "):
+				names = append(names, path.Base(strings.Fields(line)[1]))
+			case in && line != "" && !strings.HasPrefix(line, "//"):
+				if f := strings.Fields(line); len(f) >= 1 && !strings.Contains(line, "// indirect") {
+					names = append(names, path.Base(f[0]))
+				}
+			}
+		}
+		return "go", first3(names)
+	}
+	if s, ok := read("package.json"); ok {
+		var pkg struct {
+			Dependencies map[string]string `json:"dependencies"`
+		}
+		var names []string
+		if json.Unmarshal([]byte(s), &pkg) == nil {
+			for name := range pkg.Dependencies {
+				names = append(names, name)
+			}
+			sort.Strings(names)
+		}
+		lang = "javascript"
+		if _, err := os.Stat(filepath.Join(dir, "tsconfig.json")); err == nil {
+			lang = "typescript"
+		}
+		return lang, first3(names)
+	}
+	if _, ok := read("pyproject.toml"); ok {
+		return "python", nil
+	}
+	if _, ok := read("CMakeLists.txt"); ok {
+		return "c", nil
+	}
+	if _, ok := read("build.zig"); ok {
+		return "zig", nil
+	}
+	return "", nil
 }
 
 // specTargetGuess is the fallback when no model is available or it has nothing

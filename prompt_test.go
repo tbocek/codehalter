@@ -289,3 +289,45 @@ func TestSetSessionTitleAnnouncesOnce(t *testing.T) {
 		t.Errorf("sent %d session_info_updates, want 1 — the title didn't change", n)
 	}
 }
+
+// TestSpecStopIsAnInstructionNotSteer: "/spec stop" typed while a /spec loop
+// holds the turn sets the loop's stop flag and is NOT queued as text for the
+// model; with no loop running it only says so. Anything else typed during a
+// turn still steers it.
+func TestSpecStopIsAnInstructionNotSteer(t *testing.T) {
+	a, s := newTestAgent(t)
+	ctx, release, ok := a.holdTurn(context.Background(), s, true)
+	if !ok {
+		t.Fatal("could not hold the turn")
+	}
+	defer release()
+	_ = ctx
+	prompt := func(text string) {
+		t.Helper()
+		if _, err := a.Prompt(context.Background(), PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: text}}}); err != nil {
+			t.Fatalf("Prompt(%q): %v", text, err)
+		}
+	}
+
+	prompt("/spec stop") // no loop running
+	if s.takeSpecStop() {
+		t.Error("a stop was requested with no loop running")
+	}
+	if q := s.takeSteer(); len(q) != 0 {
+		t.Errorf("/spec stop was queued as steer text: %v", q)
+	}
+
+	s.setSpecFence(filepath.Join(s.Cwd, "spec"))
+	defer s.setSpecFence("")
+	prompt("/spec stop")
+	if !s.takeSpecStop() {
+		t.Error("the running loop did not get the stop request")
+	}
+	if q := s.takeSteer(); len(q) != 0 {
+		t.Errorf("/spec stop was queued as steer text: %v", q)
+	}
+	prompt("also update the README")
+	if q := s.takeSteer(); len(q) != 1 {
+		t.Errorf("an ordinary message during the loop must still steer: %v", q)
+	}
+}

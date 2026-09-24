@@ -61,6 +61,21 @@ func (s *Session) setSpecFence(dir string) {
 }
 
 // specFence returns the fenced spec dir, or "" when no loop is running.
+func (s *Session) requestSpecStop() {
+	s.rt.mu.Lock()
+	s.rt.specStop = true
+	s.rt.mu.Unlock()
+}
+
+// takeSpecStop reports and clears a pending stop request.
+func (s *Session) takeSpecStop() bool {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	stop := s.rt.specStop
+	s.rt.specStop = false
+	return stop
+}
+
 func (s *Session) specFence() string {
 	s.rt.mu.Lock()
 	defer s.rt.mu.Unlock()
@@ -341,11 +356,16 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		r.say(ctx, fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
 		return end, nil
 	}
-	if cmd == "status" {
+	if cmd == "status" || cmd == "stop" {
 		covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
 		if err != nil {
 			r.say(ctx, "⚠ /spec: scanning "+cfg.OutDir+": "+err.Error()+"\n")
 			return end, nil
+		}
+		if cmd == "stop" {
+			// Reaching here means no loop held the turn; the running case is
+			// intercepted in Prompt and honoured at the round boundary below.
+			r.say(ctx, "No /spec loop is running. Where it stands:\n\n")
 		}
 		// The comparison a run would do, so status names the work it picks up first.
 		delta := specReconcile(cfg, r.idx, covered)
@@ -359,6 +379,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 
 	sess.setSpecFence(filepath.Join(sess.Cwd, cfg.SpecDir))
 	defer sess.setSpecFence("")
+	sess.takeSpecStop() // a request left over from an earlier loop is not this one's
 
 	fixes := pendingFixes
 	stopped := func(err error) (PromptResponse, error) {
@@ -388,6 +409,15 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
 		if err != nil {
 			r.say(ctx, "⚠ /spec: scanning "+cfg.OutDir+": "+err.Error()+"\n")
+			break
+		}
+		// "/spec stop" typed during the last round: that round has committed and
+		// the ledger holds it, so this is the clean place to end. Report where
+		// things stand, the way `/spec status` would, and return.
+		if sess.takeSpecStop() {
+			r.say(ctx, fmt.Sprintf("\n⏹ **/spec stopped** as asked, after %d round(s). Nothing is half done: every finished item is committed and in the ledger. `/spec` resumes with the next item.\n\n", round-1))
+			r.say(ctx, renderSpecStatus(cfg, r.idx, covered, testFiles, r.testCmd())+"\n")
+			r.save(ctx)
 			break
 		}
 		w := r.pickWork(ctx, covered, testFiles)
@@ -919,10 +949,13 @@ func (a *agent) suggestSpecTarget(ctx context.Context, sid, entry string) (outDi
 	return outDir, target
 }
 
-// specSetupDialog is the first /spec in a project: one card for where the spec
-// is, then one for what to build from it and where. The second question's
-// suggestion is read off the entry page of whatever the first answered, which
-// is why they are two cards and not one.
+// specSetupDialog is the first /spec in a project: three cards, each with up
+// to three options read off the project. Where the spec is (directories of
+// markdown, named ones first); where to build (what the entry page asks for,
+// then directories that already hold a manifest); with what (the page's
+// answer, what the chosen directory already is, the keyword table's reading).
+// Each question's options depend on the previous answer, which is why they
+// are three cards and not one.
 //
 // Autopilot takes the suggestion on both (askFormAuto answers with the first
 // option), so an unattended run still starts, and says what it chose.
@@ -954,35 +987,56 @@ func (a *agent) specSetupDialog(ctx context.Context, sid string, sess *Session) 
 	}
 	entryRel, entry := specEntryPage(filepath.Join(sess.Cwd, specDir))
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Spec: " + specDir + "/, entry page " + entryRel)})
-
 	say("Reading `" + specDir + "/" + entryRel + "` for what it asks to be built…\n")
 	gOut, gTarget := a.suggestSpecTarget(ctx, sid, entry)
-	var options []string
-	if gOut != "" {
-		options = append(options, gOut+" "+gTarget)
+
+	// Where: the page's own answer first, then the directories that already
+	// hold a project (a prototype, an earlier attempt), named for what they are.
+	outOpts := specOutDirOptions(sess.Cwd, specDir, gOut)
+	var described []string
+	for _, d := range outOpts {
+		desc := "new"
+		if lang, deps := manifestStack(filepath.Join(sess.Cwd, d)); lang != "" {
+			desc = "existing " + lang
+			if len(deps) > 0 {
+				desc += " project: " + strings.Join(deps, ", ")
+			}
+		}
+		described = append(described, "`"+d+"/` ("+desc+")")
 	}
-	q := "What should be built from `" + specDir + "/`, and where? Answer as `<out-dir> <technology>`, for example `rust/ gtk4-rs with libadwaita`."
-	if gOut != "" {
-		q = "`" + specDir + "/" + entryRel + "` reads as **" + gTarget + "**. Build it into `" + gOut + "/`? Pick that, or type `<out-dir> <technology>`."
+	q := "Where should the implementation go? Pick a directory, or type one."
+	if len(described) > 0 {
+		q += " " + strings.Join(described, "; ") + "."
 	}
-	tcId2 := a.StartToolCall(ctx, sid, "What to build, and where?", "think", nil)
-	answer2, err := a.askFormAuto(ctx, sid, tcId2, q, options, true)
+	tcId2 := a.StartToolCall(ctx, sid, "Where to build?", "think", nil)
+	answer2, err := a.askFormAuto(ctx, sid, tcId2, q, outOpts, true)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId2, err.Error())
 		return "", "", "", false
 	}
-	answer2 = strings.TrimSpace(answer2)
-	if answer2 == "" {
-		a.FailToolCall(ctx, sid, tcId2, "no target given")
+	outDir = filepath.Clean(strings.Trim(strings.TrimSpace(answer2), "`\"/ "))
+	if outDir == "" || outDir == "." {
+		a.FailToolCall(ctx, sid, tcId2, "no directory given")
 		say("⚠ /spec: nothing to build into. Run `/spec " + specDir + " <out-dir> [technology]` when you know where it should go.\n")
 		return "", "", "", false
 	}
-	outDir, target = answer2, ""
-	if i := strings.IndexAny(answer2, " \t"); i >= 0 {
-		outDir, target = answer2[:i], strings.TrimSpace(answer2[i+1:])
+	a.CompleteToolCall(ctx, sid, tcId2, []ToolCallContent{TextContent("Building into " + outDir + "/")})
+
+	// With what: the page's answer, what the chosen directory already is, and
+	// the keyword table's reading when it differs.
+	targetOpts := specTargetOptions(sess.Cwd, outDir, gTarget, entry)
+	tcId3 := a.StartToolCall(ctx, sid, "Build it with what?", "think", nil)
+	answer3, err := a.askFormAuto(ctx, sid, tcId3, "Build `"+outDir+"/` with what? Pick one, or type the language and toolkit.", targetOpts, true)
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId3, err.Error())
+		return "", "", "", false
 	}
-	outDir = filepath.Clean(strings.Trim(outDir, "`\""))
-	a.CompleteToolCall(ctx, sid, tcId2, []ToolCallContent{TextContent("Building into " + outDir + "/" + map[bool]string{true: "", false: " · target: " + target}[target == ""])})
+	target = strings.Trim(strings.TrimSpace(answer3), "`\"")
+	done := "Target: " + target
+	if target == "" {
+		done = "No target stated"
+	}
+	a.CompleteToolCall(ctx, sid, tcId3, []ToolCallContent{TextContent(done)})
 	return specDir, outDir, target, true
 }
 
