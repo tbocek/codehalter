@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -177,6 +178,9 @@ func (h *terminalHarness) serve(method string, params json.RawMessage) any {
 	case "terminal/create":
 		cmd := exec.Command(p.Command, p.Args...)
 		cmd.Dir = p.Cwd
+		// Its own process group, as under a pty: the job wrapper's group kill
+		// relies on being the leader.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		term := &fakeTerminal{cmd: cmd, done: make(chan struct{})}
 		cmd.Stdout = termWriter{h, term}
 		cmd.Stderr = termWriter{h, term}
@@ -223,8 +227,11 @@ func (h *terminalHarness) serve(method string, params json.RawMessage) any {
 		return term.exit
 
 	case "terminal/kill":
+		// A hangup to the leader only, as a pty would deliver: the wrapper's
+		// trap has to take the rest of the group down, or cmd.Wait never
+		// returns because a child still holds the output pipe.
 		if term := h.term(p.TerminalId); term != nil && term.cmd.Process != nil {
-			_ = term.cmd.Process.Kill()
+			_ = term.cmd.Process.Signal(syscall.SIGHUP)
 		}
 		return map[string]any{}
 

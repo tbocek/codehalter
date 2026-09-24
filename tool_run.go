@@ -28,7 +28,7 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name": "run_command",
-			"description": "Run a shell command that EXITS ON ITS OWN inside this devcontainer and wait for it to finish. For a long-running / never-exits process (a dev server, watcher, `python3 -m http.server`, `npm run dev`) use `run_background` instead — started here it stalls the turn until the idle timeout kills it, and adding a trailing `&` is worse: the process then survives with no pid or log recorded, so nothing can read or stop it afterwards. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. To FIND something in the tree: `grep -rn -C3 -F --exclude-dir=target '<text>' <path>` here, one call that returns line numbers, the match and its context and skips the build directory (`-E` for a regex). To READ a region you already know: `read_file` with a `line` range, not `cat`/`sed -n`. Use this for: (1) PROBE — `which <tool>`, `cargo check`, `node --version`, `apt list --installed | grep <pkg>` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install <pkg>`), first run the same install via run_command, then verify it works (e.g. `<tool> --version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which <tool>` exiting 1 means <tool> is missing, not that the tool failed. Output is auto-capped keeping the START and the END (only the middle is elided), so do NOT pipe to `head`/`tail` to shorten it: that throws away what the cap already keeps, and the most useful lines (errors, and search hits like `yay -Ss` / `apt search`) come LAST. Run the command raw; use `grep` only to filter for a specific match, never to trim length. " +
+			"description": "Run a shell command inside this devcontainer and wait for it, up to two minutes. Exits in time (the normal case): you get its exit code and output. Still running after two minutes: it is NOT killed, it continues as a background job, you get what it printed so far, and the moment it exits codehalter hands you its exit code and last output by itself, before your next step; if you have nothing else to do, call `respond` saying you are waiting for it, which parks the turn (it does not end it) until the job reports. Never `sleep` or poll for it. If you already know a command runs longer than two minutes, start it with `run_background` instead and skip the wait. For a process that never exits (a dev server, a watcher, `npm run dev`) always use `run_background`, and never add a trailing `&` here: the process would survive with no pid or log recorded. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. To FIND something in the tree: `grep -rn -C3 -F --exclude-dir=target '<text>' <path>` here, one call that returns line numbers, the match and its context and skips the build directory (`-E` for a regex). To READ a region you already know: `read_file` with a `line` range, not `cat`/`sed -n`. Use this for: (1) PROBE — `which <tool>`, `cargo check`, `node --version`, `apt list --installed | grep <pkg>` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install <pkg>`), first run the same install via run_command, then verify it works (e.g. `<tool> --version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which <tool>` exiting 1 means <tool> is missing, not that the tool failed. Output is auto-capped keeping the START and the END (only the middle is elided), so do NOT pipe to `head`/`tail` to shorten it: that throws away what the cap already keeps, and the most useful lines (errors, and search hits like `yay -Ss` / `apt search`) come LAST. Run the command raw; use `grep` only to filter for a specific match, never to trim length. " +
 				"For project-file edits prefer `edit_file` / `write_file` — they go through the agent's diff/approval UI, raw `>` or `sed -i` do not. " +
 				"The `.git` directory is bind-mounted read-only; destructive git commands (push, reset --hard, etc.) will fail at the filesystem layer. Read-only git is fine (clone, log, ls-remote, archive).",
 			"parameters": map[string]any{
@@ -37,7 +37,7 @@ func (a *agent) discoverSandbox() {
 				"properties": map[string]any{
 					"wake_after": map[string]any{
 						"type":        "integer",
-						"description": "Optional, seconds. Wake me once at this age with the log tail even if the job is still running (for a server or watcher that never exits, or a long run you want a mid-way look at). The exit is reported separately, whenever it comes. Without it you are woken only at exit.",
+						"description": "Optional, seconds. If the command is still running after the two-minute wait and continues in the background, wake me once at this age with its log tail (the exit is reported separately, whenever it comes).",
 					},
 					"command": map[string]any{
 						"type":        "string",
@@ -52,11 +52,15 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_background",
-			"description": "Start a LONG-RUNNING / background process (a dev server, watcher, daemon) inside this devcontainer and return immediately, leaving it running. Use this INSTEAD of run_command for anything that does not exit on its own: `python3 -m http.server 8765`, `npm run dev`, `vite`, `flask run`, a file watcher. run_command WAITS for the command to finish, so starting a server there (even with a trailing `&`) hangs the turn. run_background launches the command, waits briefly to catch an immediate failure (e.g. port already in use), then returns the pid and a log-file path. The process keeps running across later tool calls, so a following run_command can probe it (e.g. `curl -s localhost:8765`). Its output streams to the log file, which you read with run_command (`cat`/`tail`). Stop it with `run_command: kill <pid>`. Also right for a LONG EXPERIMENT that does exit (a benchmark, a training run, a test suite you can keep working alongside): the moment it exits, codehalter hands you its exit code, log path and last output on its own, before your next step, so do other work meanwhile, or simply end your turn saying the job is running: you are resumed with the result when it exits, whether or not the user has typed anything in between. Never poll and never `sleep` for it (a foreground `sleep` is refused while a job runs); to look at a job that does not exit, give `wake_after` and you are woken at that age with its log tail. Do NOT add a trailing `&` — run_background already detaches it.",
+			"description": "Start a process inside this devcontainer and return immediately, leaving it running: a dev server, a watcher, a daemon, or any command you already know takes longer than two minutes (a full test suite, a benchmark), so that run_command's wait is not spent on it. Use this INSTEAD of run_command for anything that does not exit on its own: `python3 -m http.server 8765`, `npm run dev`, `vite`, `flask run`, a file watcher. run_command WAITS for the command to finish, so starting a server there (even with a trailing `&`) hangs the turn. run_background launches the command, waits briefly to catch an immediate failure (e.g. port already in use), then returns the pid and a log-file path. The process keeps running across later tool calls, so a following run_command can probe it (e.g. `curl -s localhost:8765`). Its output streams to the log file, which you read with run_command (`cat`/`tail`). Stop it with `run_command: kill <pid>`. Also right for a LONG EXPERIMENT that does exit (a benchmark, a training run, a test suite you can keep working alongside): the moment it exits, codehalter hands you its exit code, log path and last output on its own, before your next step, so do other work meanwhile, or simply end your turn saying the job is running: you are resumed with the result when it exits, whether or not the user has typed anything in between. Never poll and never `sleep` for it (a foreground `sleep` is refused while a job runs); to look at a job that does not exit, give `wake_after` and you are woken at that age with its log tail. Do NOT add a trailing `&` — run_background already detaches it.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
 				"properties": map[string]any{
+					"wake_after": map[string]any{
+						"type":        "integer",
+						"description": "Optional, seconds. Wake me once at this age with the log tail even if the job is still running (for a server or watcher that never exits, or a long run you want a mid-way look at). The exit is reported separately, whenever it comes. Without it you are woken only at exit.",
+					},
 					"command": map[string]any{
 						"type":        "string",
 						"description": "Shell command to run under bash -c, WITHOUT a trailing `&`. Examples: `python3 -m http.server 8765`, `npm run dev`, `flask --app app run --port 5000`.",
@@ -82,21 +86,6 @@ func isSleepCmd(cmd string) bool {
 	}
 	return first == "sleep" || strings.HasPrefix(first, "sleep ")
 }
-
-// cmdIdleTimeout reaps a run_command that prints NOTHING for this long: no
-// output, no IO, nothing on the console. It is an IDLE timeout and deliberately
-// not a total one. A command that keeps producing output is making progress and
-// runs unbounded, however long that takes: a `grep -rln` over an archived
-// lecture site (thousands of files, gigabytes of video) took 9 minutes here and
-// exited 0 with the 14 matches that answered the question. A total cap would
-// have killed that at the 5 minute mark and thrown the answer away, while the
-// case it is supposed to catch, a hung command, is silent and this already
-// catches it. Only a user Stop overrides.
-//
-// 120s rather than 60s because "quiet" is not "hung": a compile step, a
-// download that buffers, or a walk over a slow bind mount can all go a full
-// minute without printing.
-var cmdIdleTimeout = 120 * time.Second
 
 // cmdOutputCap bounds how many bytes of a command's output we hand the model.
 // The idle watchdog only fires on SILENCE, so a steadily-printing command
@@ -163,6 +152,23 @@ func (b *boundedOutput) String() string {
 	}
 }
 
+// cmdHandoverWait is how long run_command stays with a command before handing
+// it to the background. Nothing is killed at this point: the command keeps
+// running as a job, the model gets what it printed so far and is woken when
+// it exits (or at its wake_after), and a turn that ends on `respond`
+// meanwhile is parked, not finished. Two minutes because that is what a probe,
+// a build or a short suite needs, and past it the model is better off doing
+// something else. A var so tests can shorten it.
+var cmdHandoverWait = 120 * time.Second
+
+// boundedCapture puts a finished terminal's output through the head+tail window
+// that bounds what any command can hand a small-context model.
+func boundedCapture(out string) string {
+	b := newBoundedOutput(cmdOutputCap)
+	b.Write([]byte(out))
+	return b.String()
+}
+
 func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
 	cmdStr := args.str("command")
@@ -173,53 +179,98 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	if sess == nil {
 		return "error: no session", false
 	}
+	secs, ok := args.num("wake_after")
+	if args.has("wake_after") && (!ok || secs < 0) {
+		return "error: wake_after must be a number of seconds, 0 or absent for none", false
+	}
+	wakeAfter := time.Duration(secs) * time.Second
 	// A foreground sleep while one of this session's background jobs runs is
 	// the model waiting for that job by guessing a number: in one afternoon 10
 	// of 22 background suites were followed by a 90-150 s sleep, and one of them
 	// idled 36 s past the job's exit because a running shell cannot be
 	// interrupted with the note. The job wakes the model on its own, so the
 	// sleep is refused with the reason, and the turn either does other work or
-	// ends and is resumed by the job (Claude Code refuses a foreground sleep for
-	// the same reason).
+	// parks on `respond` until the job reports (Claude Code refuses a
+	// foreground sleep for the same reason).
 	if isSleepCmd(cmdStr) {
 		if jobs := a.runningBgJobs(sid); len(jobs) > 0 {
 			return fmt.Sprintf("refused: do not sleep for a background job. %s still running; the moment it exits codehalter hands you its exit code and last output on its own. "+
-				"Continue with other work, or end your turn now (tell the user the job is running) and you will be resumed with the result. "+
-				"If you need a look at it while it still runs (a server, a watcher), start such jobs with run_background's `wake_after`: you are woken at that age with the log tail, no sleep needed.", jobs), false
+				"Continue with other work, or call `respond` saying you are waiting: the turn is parked, not ended, and continues here when the job reports. "+
+				"For a look at a job before it exits, give `wake_after` when you start it.", jobs), false
 		}
 	}
 
 	tcId := a.StartToolCall(ctx, sid, "Run: "+cmdStr, "execute", nil)
-
-	out, exit, started, err := a.runTerminalCmd(ctx, sid, tcId, "bash", []string{"-c", cmdStr}, sess.Cwd, cmdIdleTimeout)
-	if !started {
+	job, err := a.launchJob(ctx, sid, tcId, cmdStr, sess.Cwd, wakeAfter, true)
+	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return "error starting terminal: " + err.Error(), false
 	}
 
-	// Always surface the exit code. run_command is a probe: non-zero is data, not
-	// failure. Title and result both carry "(exit N)" so the model can read either
-	// and act on it. Failed is always false here: a probe exiting non-zero
-	// shouldn't fail the turn.
-	exitCode := exit.code()
-	if err != nil {
-		// Killed by the idle watchdog, cancelled by the user, or the client broke
-		// mid-command. -1 plus the error text lets the model tell "the command
-		// exited 1" apart from "the command never got to finish".
-		exitCode = -1
-		out += fmt.Sprintf("\n[terminal error: %s]\n", err)
+	select {
+	case res := <-job.exited:
+		out, _, _, oerr := a.terminalOutput(ctx, sid, job.terminalId)
+		a.terminalRelease(sid, job.terminalId)
+		a.forgetBgJob(job)
+		if res.err != nil {
+			// The client broke mid-command. -1 plus the error text lets the
+			// model tell "the command exited 1" apart from "the command never
+			// got to finish".
+			a.FailToolCall(ctx, sid, tcId, res.err.Error())
+			return fmt.Sprintf("exit -1\n\n%s\n[terminal error: %s]\n", boundedCapture(out), res.err), false
+		}
+		if oerr != nil {
+			slog.Debug("run_command: output read failed", "job", job.id, "err", oerr)
+		}
+		// Always surface the exit code. run_command is a probe: non-zero is
+		// data, not failure. Title and result both carry "(exit N)" so the
+		// model can read either and act on it. Failed is always false here: a
+		// probe exiting non-zero shouldn't fail the turn.
+		exitCode := res.exit.code()
+		// The card already holds the terminal, which the client keeps rendering
+		// after release. Sending text content here would replace that live
+		// view with a static copy, so retitle only.
+		a.sendUpdate(ctx, sid, toolCallUpdate{
+			Kind:       "tool_call_update",
+			ToolCallId: tcId,
+			Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),
+			Status:     "completed",
+		})
+		return fmt.Sprintf("exit %d\n\n%s", exitCode, boundedCapture(out)), false
+	case <-ctx.Done():
+		// The user hit Stop, or the turn was cancelled. Release kills the
+		// command; report what it managed to print.
+		out, _, _, _ := a.terminalOutput(context.Background(), sid, job.terminalId)
+		a.killJob(job)
+		a.terminalRelease(sid, job.terminalId)
+		a.forgetBgJob(job)
+		a.FailToolCall(ctx, sid, tcId, ctx.Err().Error())
+		return fmt.Sprintf("exit -1\n\n%s\n[terminal error: %s]\n", boundedCapture(out), ctx.Err()), false
+	case <-time.After(cmdHandoverWait):
 	}
 
-	result := fmt.Sprintf("exit %d\n\n%s", exitCode, out)
-	// The card already holds the terminal, which the client keeps rendering after
-	// release. Sending text content here would replace that live view with a
-	// static copy, so retitle only: a nil Content is omitted from the update, and
-	// an absent field leaves the existing content alone.
+	// Still running: it becomes a background job. Nothing is lost, the model
+	// gets what it has so far, and the exit finds it wherever it is: before
+	// its next step, parked on `respond`, or idle between turns.
+	job.pid = readPidFile(job.pidPath)
+	go a.watchBgJob(job)
+	if wakeAfter > 0 {
+		go a.wakeForBgJob(job)
+	}
+	waited := humanDuration(cmdHandoverWait.Milliseconds())
+	wake := ""
+	if wakeAfter > 0 {
+		wake = fmt.Sprintf(" You asked to be woken after %s if it is still running by then.", humanDuration(wakeAfter.Milliseconds()))
+	}
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
 		ToolCallId: tcId,
-		Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),
-		Status:     "completed",
+		Title:      fmt.Sprintf("Run: %s (still running after %s, continues as job %d)", cmdStr, waited, job.id),
+		Status:     "in_progress",
 	})
-	return result, false
+	return fmt.Sprintf("still running after %s: it continues as background job %d (pid %d), nothing was killed. "+
+		"When it exits, codehalter hands you its exit code and last output by itself, before your next step.%s "+
+		"Do other work meanwhile if there is any; if not, call `respond` saying you are waiting for job %d: that parks the turn, it does not end it, and you continue here the moment the job reports. "+
+		"Never sleep or poll for it. Read its output any time with `run_command: cat %s`; stop it with `run_command: kill %d`. Output so far:\n\n%s",
+		waited, job.id, job.pid, wake, job.id, job.logPath, job.pid, readLogTail(job.logPath, bgLogTailCap)), false
 }

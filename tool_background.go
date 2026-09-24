@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -30,6 +31,7 @@ const bgLogTailCap = 8 * 1024
 type backgroundJob struct {
 	id         int
 	sid        string // the session that launched it; terminal calls are addressed by it
+	tcId       string // the tool call whose card holds the terminal; retitled at exit
 	cmdStr     string
 	pid        int
 	logPath    string
@@ -38,6 +40,74 @@ type backgroundJob struct {
 	started    time.Time
 	wakeAfter  time.Duration // >0: wake the model once at this age even if still running
 	announced  bool          // named to the user at a turn end already (under bgMu)
+	// expectExit marks a run_command handed over after its wait: the model
+	// expected it to finish, so a turn ending on `respond` parks until it
+	// does, and a stall (no output, no log growth) kills it. A run_background
+	// job is the opposite: a server is quiet on purpose and outlives turns.
+	expectExit bool
+	redirects  []string // files the command redirects into; growth is progress
+	stalled    bool     // killed by the stall watchdog (under bgMu)
+	exited     chan jobExit
+}
+
+// jobExit is what the one wait_for_exit per job delivers, to whichever side
+// is listening: run_command inside its wait, or watchBgJob after handover.
+type jobExit struct {
+	exit terminalExit
+	err  error
+}
+
+// shellQuote wraps s in single quotes for bash, the one quoting that needs no
+// escaping beyond the quote itself.
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// launchJob starts cmdStr in a client terminal with the two handles the model
+// knows how to use, a log file it reads with `cat` and a pid it stops with
+// `kill`, embeds the live terminal in the tool call's card, and starts the one
+// wait for its exit. Both run_command and run_background begin here; they
+// differ only in how long they stay to watch.
+//
+// The wrapper: the outer shell records its pid, which under a pty (Zed) is
+// also its process group, and traps TERM/INT/HUP to kill that whole group,
+// so `kill <pid>` from the model, a client kill, or codehalter's own killJob
+// takes the command, its children and tee with it instead of orphaning them;
+// output goes through `tee` so the terminal shows it live AND the log has
+// every byte; pipefail plus `wait` make the wrapper's exit status the
+// command's, not tee's. Neither handle is available from an ACP terminal
+// (the client owns the process), which is why the shell inside the terminal
+// produces them, on the filesystem codehalter and the terminal share (Zed's
+// dev-container flow runs both inside the container).
+func (a *agent) launchJob(ctx context.Context, sid, tcId, cmdStr, cwd string, wakeAfter time.Duration, expectExit bool) (*backgroundJob, error) {
+	id := a.nextBgID()
+	job := &backgroundJob{
+		id: id, sid: sid, tcId: tcId, cmdStr: cmdStr, started: time.Now(),
+		logPath:    filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-job-%d.log", id)),
+		pidPath:    filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-job-%d.pid", id)),
+		wakeAfter:  wakeAfter,
+		expectExit: expectExit,
+		redirects:  redirectTargets("bash", []string{"-c", cmdStr}, cwd),
+		exited:     make(chan jobExit, 1),
+	}
+	script := fmt.Sprintf("echo $$ > %s\nset -o pipefail\ntrap 'trap - TERM INT HUP; kill -- -$$ 2>/dev/null; exit 143' TERM INT HUP\n( exec bash -c %s ) 2>&1 | tee %s &\nwait $!", job.pidPath, shellQuote(cmdStr), job.logPath)
+	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", script}, cwd)
+	if err != nil {
+		return nil, err
+	}
+	job.terminalId = tid
+	// Registered before anything else so a shutdown racing the launch still
+	// releases the terminal instead of orphaning the process.
+	a.registerBgJob(job)
+	a.sendUpdate(ctx, sid, toolCallUpdate{
+		Kind:       "tool_call_update",
+		ToolCallId: tcId,
+		Status:     "in_progress",
+		Content:    []ToolCallContent{TerminalContent(tid)},
+	})
+	go func() {
+		e, werr := a.terminalWaitForExit(context.Background(), sid, tid)
+		job.exited <- jobExit{e, werr}
+	}()
+	return job, nil
 }
 
 // nextBgID reserves the next sequential job id (used to name the log file before
@@ -95,6 +165,64 @@ func (a *agent) sayRunningBgJobs(sess *Session) {
 	a.say(context.Background(), sess.ID, "\n⏳ Running in the background: "+strings.Join(names, ", ")+". When it exits I pick up the work that was waiting on it and tell you; you can carry on meanwhile.\n")
 }
 
+// parkableJobs names the handed-over run_command jobs of this session that
+// started after since and are still running: the ones a `respond` must wait
+// for. A job from an earlier turn, or a run_background server, never parks a
+// turn.
+func (a *agent) parkableJobs(sid string, since time.Time) string {
+	a.bgMu.Lock()
+	defer a.bgMu.Unlock()
+	var names []string
+	for _, j := range a.bgJobs {
+		if j.sid == sid && j.expectExit && j.started.After(since) {
+			names = append(names, fmt.Sprintf("job %d `%s` (%s so far)", j.id, truncate(j.cmdStr, 60), humanDuration(time.Since(j.started).Milliseconds())))
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// parkPoll is how often a parked turn looks for what resumes it.
+var parkPoll = 500 * time.Millisecond
+
+// parkForJobs holds a turn that ended on `respond` while its own commands are
+// still running in the background, and returns the message that resumes it:
+// the job's note (exit, or wake_after) with a nudge to continue the work that
+// was waiting, or whatever the user typed meanwhile, verbatim. The turn is
+// not over, the user is told so, and Stop still cancels it.
+func (a *agent) parkForJobs(ctx context.Context, sid, jobs string) (string, error) {
+	sess := a.getSession(sid)
+	if sess == nil {
+		return "", fmt.Errorf("no session")
+	}
+	a.say(ctx, sid, "\n⏸ Waiting for "+jobs+". This turn continues when it reports; type and Send Now to interject.\n")
+	for {
+		if notes := sess.takeBgNotes(); len(notes) > 0 {
+			var full []string
+			for _, n := range notes {
+				a.say(ctx, sid, "\n🔔 "+n.line+"\n")
+				full = append(full, n.full)
+			}
+			return strings.Join(full, "\n\n") + "\n\nContinue the work that was waiting on this.", nil
+		}
+		if queued := sess.takeSteer(); len(queued) > 0 {
+			joined := strings.Join(queued, "\n\n")
+			a.say(ctx, sid, "\n↪ picked up: "+firstLine(joined)+"\n")
+			return joined, nil
+		}
+		if a.parkableJobs(sid, time.Time{}) == "" && !sess.hasBgNotes() {
+			// Every job is gone and none left a note: the notes went out
+			// another way (a session teardown). Resume rather than hang.
+			return "[codehalter, not the user: the background job you were waiting for is no longer running; check its log.]", nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(parkPoll):
+		}
+	}
+}
+
 // forgetBgJob drops a job from the table and removes its scratch files. Used
 // both for a job that never stayed up and, via shutdownBackground, at exit.
 func (a *agent) forgetBgJob(job *backgroundJob) {
@@ -119,6 +247,7 @@ func (a *agent) shutdownBackground() {
 	a.bgMu.Unlock()
 	for _, j := range jobs {
 		if j.terminalId != "" && a.conn != nil {
+			a.killJob(j)
 			a.terminalRelease(j.sid, j.terminalId)
 		}
 		_ = os.Remove(j.logPath)
@@ -152,11 +281,11 @@ func readPidFile(path string) int {
 	return pid
 }
 
-// runBackgroundExecute starts a long-running command in a client terminal that
-// outlives this tool call, waits a short grace period to catch an immediate
-// crash, then returns the pid + log path while the process keeps running.
-// Cleanup happens at session exit (shutdownBackground) or when the model kills
-// the pid via run_command.
+// runBackgroundExecute starts a command that is meant to keep running (a
+// server, a watcher, a long experiment), waits a short grace period to catch
+// an immediate crash, then returns the pid + log path while the process keeps
+// running. Cleanup happens at session exit (shutdownBackground) or when the
+// model kills the pid via run_command.
 func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
 	cmdStr := args.str("command")
@@ -174,91 +303,37 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	wakeAfter := time.Duration(secs) * time.Second
 
 	tcId := a.StartToolCall(ctx, sid, "Background: "+cmdStr, "execute", nil)
-
-	id := a.nextBgID()
-	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.log", id))
-	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.pid", id))
-	job := &backgroundJob{id: id, sid: sid, cmdStr: cmdStr, logPath: logPath, pidPath: pidPath, started: time.Now(), wakeAfter: wakeAfter}
-
-	// bgScript wraps the model's command so the job keeps the two handles the model
-	// already knows how to use: a log file it reads with `run_command: cat …` and a
-	// pid it stops with `run_command: kill …`. Neither is available from an ACP
-	// terminal — the client owns the process and only ever tells us a terminal id —
-	// so the shell inside the terminal produces them instead.
-	//
-	// This works because the client's terminal and codehalter share a filesystem
-	// (Zed's dev-container flow runs both inside the container), which is the same
-	// assumption run_command makes when the model cats a file a command just wrote.
-	//
-	// `cmd &` then `$!` rather than `$$` + exec: for a simple command bash execs it
-	// directly into the backgrounded child, so `$!` is the real process, and for a
-	// compound one (`cd x && npm run dev`) it's the subshell — the same pid the
-	// old exec.Command path recorded. `wait` keeps the shell alive so the terminal
-	// exits when the job does, which is what the grace check reads.
-	script := fmt.Sprintf("exec > %s 2>&1\n%s &\necho $! > %s\nwait $!", logPath, cmdStr, pidPath)
-	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", script}, sess.Cwd)
+	job, err := a.launchJob(ctx, sid, tcId, cmdStr, sess.Cwd, wakeAfter, false)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return "error starting terminal: " + err.Error(), false
 	}
-	job.terminalId = tid
-	// Registered before the grace wait so a shutdown racing the launch still
-	// releases the terminal instead of orphaning the process.
-	a.registerBgJob(job)
-
-	// The terminal is NOT released here: release kills the process, and this job
-	// is meant to outlive the tool call. It stays embedded in the card, so the
-	// user watches the dev server's output live for as long as it runs.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: tcId,
-		Status:     "in_progress",
-		Content:    []ToolCallContent{TerminalContent(tid)},
-	})
 
 	// Grace window: catch an immediate exit (failed bind, bad command) before
-	// reporting the job as running. Polled rather than a flat sleep so a fast
-	// crash is reported without making every healthy launch wait it out.
-	var exit *terminalExit
-	deadline := time.Now().Add(bgJobGrace)
-	for {
-		_, _, status, oerr := a.terminalOutput(ctx, sid, tid)
-		if oerr != nil {
-			a.forgetBgJob(job)
-			a.terminalRelease(sid, tid)
-			a.FailToolCall(ctx, sid, tcId, oerr.Error())
-			return "error reading terminal: " + oerr.Error(), false
-		}
-		if status != nil {
-			exit = status
-			break
-		}
-		if remaining := time.Until(deadline); remaining <= 0 {
-			break
-		} else if remaining > 50*time.Millisecond {
-			time.Sleep(50 * time.Millisecond)
-		} else {
-			time.Sleep(remaining)
-		}
-	}
-
-	tail := readLogTail(logPath, bgLogTailCap)
-	if exit != nil {
-		// It already exited, so there's nothing to keep alive: release the terminal
-		// and drop the job (its output is in the result below).
-		a.terminalRelease(sid, tid)
+	// reporting the job as running.
+	select {
+	case res := <-job.exited:
+		// It already exited, so there's nothing to keep alive: release the
+		// terminal and drop the job (its output is in the result below).
+		tail := readLogTail(job.logPath, bgLogTailCap)
+		a.terminalRelease(sid, job.terminalId)
 		a.forgetBgJob(job)
-		result := fmt.Sprintf("background job %d exited immediately (exit %d) — it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", id, exit.code(), tail)
-		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, exit.code()), []ToolCallContent{TextContent(result)})
+		if res.err != nil {
+			a.FailToolCall(ctx, sid, tcId, res.err.Error())
+			return "error reading terminal: " + res.err.Error(), false
+		}
+		result := fmt.Sprintf("background job %d exited immediately (exit %d) — it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", job.id, res.exit.code(), tail)
+		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, res.exit.code()), []ToolCallContent{TextContent(result)})
 		return result, false
+	case <-time.After(bgJobGrace):
 	}
 
-	job.pid = readPidFile(pidPath)
+	job.pid = readPidFile(job.pidPath)
 	stop := fmt.Sprintf("stop it with `run_command: kill %d`", job.pid)
 	if job.pid == 0 {
-		// bgScript writes the pid before anything slow happens, so an empty file
-		// here means the shell died oddly. Say so rather than printing "kill 0",
-		// which would signal the whole process group.
+		// The wrapper writes the pid before anything slow happens, so an empty
+		// file here means the shell died oddly. Say so rather than printing
+		// "kill 0", which would signal the whole process group.
 		stop = "its pid was not recorded, so it can only be stopped by ending the session"
 	}
 	wake := ""
@@ -266,7 +341,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 		wake = fmt.Sprintf(" You also asked to be woken after %s if it is still running by then.", humanDuration(wakeAfter.Milliseconds()))
 	}
 	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, end the turn with `respond` saying the job is running.%s Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
-		id, job.pid, wake, logPath, stop, tail)
+		job.id, job.pid, wake, job.logPath, stop, readLogTail(job.logPath, bgLogTailCap))
 	go a.watchBgJob(job)
 	if wakeAfter > 0 {
 		go a.wakeForBgJob(job)
@@ -291,17 +366,35 @@ const bgNoteTailCap = 3 * 1024
 // turn is running.
 const bgWakeRetry = 2 * time.Second
 
+// bgStallTimeout is how long a handed-over run_command may go without any
+// progress (no byte on the terminal, no growth of its log or of a file it
+// redirects into) before it is killed as hung. Long on purpose: the two-minute
+// foreground wait is where a working command is spared, and this only has to
+// catch the command that will never finish (a hang, a prompt waiting for
+// input). Vars so tests can shorten them.
+var (
+	bgStallTimeout = 10 * time.Minute
+	bgStallPoll    = 30 * time.Second
+)
+
 // watchBgJob waits for a running job to exit and hands its result to the
 // session. This is what lets a long experiment run while the chat stays usable:
 // the model ends its turn instead of polling, and the result comes back on its
 // own. The terminal is released once the job is gone (nothing left to show live
 // that the log doesn't have) and the log file is kept for the model to read.
 func (a *agent) watchBgJob(job *backgroundJob) {
-	exit, err := a.terminalWaitForExit(context.Background(), job.sid, job.terminalId)
+	if job.expectExit {
+		stop := make(chan struct{})
+		go a.stallWatch(job, stop)
+		defer close(stop)
+	}
+	res := <-job.exited
+	exit, err := res.exit, res.err
 	// Shutdown reaps every job and drops the table: a job that "exits" because
 	// we killed it on the way out has nothing to report and nobody to report to.
 	a.bgMu.Lock()
 	_, tracked := a.bgJobs[job.id]
+	stalled := job.stalled
 	delete(a.bgJobs, job.id)
 	a.bgMu.Unlock()
 	if !tracked {
@@ -314,9 +407,22 @@ func (a *agent) watchBgJob(job *backgroundJob) {
 		return
 	}
 	outcome := fmt.Sprintf("exited with code %d", exit.code())
-	if err != nil {
+	switch {
+	case stalled:
+		outcome = fmt.Sprintf("was killed after %s without any output (hung, or waiting for input)", humanDuration(bgStallTimeout.Milliseconds()))
+	case err != nil:
 		outcome = "was lost (" + err.Error() + ")"
 	}
+	kind := "Background"
+	if job.expectExit {
+		kind = "Run"
+	}
+	a.sendUpdate(context.Background(), job.sid, toolCallUpdate{
+		Kind:       "tool_call_update",
+		ToolCallId: job.tcId,
+		Title:      fmt.Sprintf("%s: %s (job %d %s)", kind, job.cmdStr, job.id, outcome),
+		Status:     "completed",
+	})
 	took := humanDuration(time.Since(job.started).Milliseconds())
 	sess.addBgNote(bgNote{
 		line: fmt.Sprintf("background job %d `%s` %s after %s", job.id, truncate(job.cmdStr, 80), outcome, took),
@@ -324,6 +430,55 @@ func (a *agent) watchBgJob(job *backgroundJob) {
 			job.id, job.cmdStr, outcome, took, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
 	})
 	a.deliverBgNotesWhenIdle(sess)
+}
+
+// killJob stops a job's whole process group itself, then asks the client to
+// kill the terminal. Codehalter and the terminal share the container, so the
+// signal is delivered directly and does not depend on what the client sends
+// or to whom; the wrapper's trap covers the client's own kill the same way.
+func (a *agent) killJob(job *backgroundJob) {
+	if job.pid == 0 {
+		job.pid = readPidFile(job.pidPath)
+	}
+	if job.pid > 0 {
+		if err := syscall.Kill(-job.pid, syscall.SIGTERM); err != nil {
+			_ = syscall.Kill(job.pid, syscall.SIGTERM)
+		}
+	}
+	if err := a.terminalKill(context.Background(), job.sid, job.terminalId); err != nil {
+		slog.Debug("terminal kill failed", "job", job.id, "err", err)
+	}
+}
+
+// stallWatch kills a handed-over command that makes no progress for
+// bgStallTimeout. Progress is any growth of the job's log (every byte the
+// command prints goes there through tee) or of a file the command redirects
+// into, so a quiet-but-working suite is never touched and a hung one does
+// not live forever in the background.
+func (a *agent) stallWatch(job *backgroundJob, stop <-chan struct{}) {
+	files := append([]string{job.logPath}, job.redirects...)
+	last, lastChange := progressSignature("", files), time.Now()
+	ticker := time.NewTicker(bgStallPoll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if sig := progressSignature("", files); sig != last {
+				last, lastChange = sig, time.Now()
+				continue
+			}
+			if time.Since(lastChange) < bgStallTimeout {
+				continue
+			}
+			a.bgMu.Lock()
+			job.stalled = true
+			a.bgMu.Unlock()
+			a.killJob(job)
+			return
+		}
+	}
 }
 
 // wakeForBgJob is the timed half of a job started with wake_after: once, at

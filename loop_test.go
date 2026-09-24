@@ -1341,3 +1341,67 @@ func TestPlanResultAcceptsStringifiedSubtasks(t *testing.T) {
 		t.Errorf("a plan with no subtasks must still parse: %v %+v", err, none)
 	}
 }
+
+// TestToolLoopParksOnRespondWhileJobRuns pins what "the subtask never ends, it
+// only gives control back" means: a respond while a command this loop handed
+// to the background is still running does not end the turn. The loop waits;
+// something the user types meanwhile resumes it (and parks it again if the
+// model has still nothing to do); the job's exit resumes it with the result,
+// and only then does a respond end the turn.
+func TestToolLoopParksOnRespondWhileJobRuns(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	oldWait, oldPoll := cmdHandoverWait, parkPoll
+	cmdHandoverWait, parkPoll = 100*time.Millisecond, 20*time.Millisecond
+	defer func() { cmdHandoverWait, parkPoll = oldWait, oldPoll }()
+
+	mock := newMockLLM(t,
+		sseToolCall("c1", "run_command", `{"command":"sleep 1.2; echo suite-green"}`),
+		sseToolCall("c2", respondToolName, `{"message":"Waiting for job 1."}`),
+		sseToolCall("c3", respondToolName, `{"message":"Still waiting, as you asked."}`),
+		sseToolCall("c4", respondToolName, `{"message":"final: suite green"}`),
+	)
+	defer mock.Close()
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
+
+	// The user interjects once the turn is parked.
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			for _, u := range h.updatesOfKind(KindAgentMessage) {
+				if c, _ := u["content"].(map[string]any); c != nil && strings.Contains(fmt.Sprint(c["text"]), "⏸ Waiting for job 1") {
+					h.sess.addSteer("how is it going?")
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	res, err := h.agent.runToolLoopSeeded(context.Background(), h.sess.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "run the suite and report"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if res.Text != "final: suite green" {
+		t.Errorf("res.Text = %q, want the respond that came after the job reported", res.Text)
+	}
+	if mock.callCount() != 4 {
+		t.Errorf("LLM calls = %d, want 4: run, park, resume on the user's text and park again, resume on the exit", mock.callCount())
+	}
+	var users []string
+	for _, m := range h.sess.Messages {
+		if m.Role == "user" {
+			users = append(users, m.Content)
+		}
+	}
+	joined := strings.Join(users, "\n")
+	for _, want := range []string{"how is it going?", "exited with code 0", "suite-green", "Continue the work that was waiting"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the resumes did not reach the model as user messages; missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Index(joined, "how is it going?") > strings.Index(joined, "exited with code 0") {
+		t.Error("the user's interjection must arrive before the job's exit, not after")
+	}
+}

@@ -6,6 +6,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -130,144 +134,43 @@ func (a *agent) terminalRelease(sid, tid string) {
 	}
 }
 
-// runTerminalCmd runs command+args to completion in a client terminal: create,
-// show it live in the tool call's card, wait for exit, then read the full
-// output back. idle > 0 kills a command that produces nothing new for that
-// long; idle == 0 waits indefinitely (a build may legitimately go quiet while
-// linking or fetching deps).
-//
-// The returned text is the captured output, already head+tail bounded.
-// started=false means the terminal never came up, and err is the reason.
-func (a *agent) runTerminalCmd(ctx context.Context, sid, tcId, command string, args []string, cwd string, idle time.Duration) (text string, exit terminalExit, started bool, err error) {
-	tid, err := a.terminalCreate(ctx, sid, command, args, cwd)
-	if err != nil {
-		return "", terminalExit{}, false, err
+// redirectRe finds the files a shell line writes into: `> f`, `>> f`, `&> f`,
+// with an optional descriptor in front (`2> f`). `2>&1` names no file.
+var redirectRe = regexp.MustCompile(`(?:^|[^&])(?:\d?>>?|&>)\s*([^\s;&|()<>]+)`)
+
+// redirectTargets returns the files a `bash -c` command redirects into,
+// resolved against cwd, so the watchdog can watch them grow. Anything that is
+// not a plain path (a `$var`, a quote) is skipped: a wrong guess only means
+// the file is not watched, which is where every command was before.
+func redirectTargets(command string, args []string, cwd string) []string {
+	if command != "bash" || len(args) != 2 || args[0] != "-c" {
+		return nil
 	}
-	defer a.terminalRelease(sid, tid)
-
-	// Put the live terminal in the card before anything can release it — after
-	// release the client keeps displaying it, but it won't accept the embed.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: tcId,
-		Status:     "in_progress",
-		Content:    []ToolCallContent{TerminalContent(tid)},
-	})
-
-	type waitResult struct {
-		exit terminalExit
-		err  error
-	}
-	exited := make(chan waitResult, 1)
-	go func() {
-		e, werr := a.terminalWaitForExit(ctx, sid, tid)
-		exited <- waitResult{e, werr}
-	}()
-
-	idleKilled := false
-	if idle > 0 {
-		// Polled at HALF the timeout, and silence measured from a timestamp rather
-		// than from "the last two polls matched". A poll that fires only once per
-		// interval cannot tell 1s of silence from 59s, so the old scheme killed
-		// somewhere between one and two intervals: with a 2m timeout that is a
-		// command dying anywhere from 2 to 4 minutes in, and the notice it hands
-		// the model ("no output for 2m0s") would be a lie half the time. Two polls
-		// per interval bound the error at idle/2 and cost exactly what one poll
-		// per interval cost at the old, shorter timeout: each poll drags the whole
-		// accumulated output across the wire, which is why this is not polled
-		// faster.
-		ticker := time.NewTicker(idle / 2)
-		defer ticker.Stop()
-		// Seeded with the hash of EMPTY output, not the zero value: a command that
-		// never prints anything would otherwise register its first poll as a
-		// "change" and get measured from there, buying a hung command an extra
-		// poll interval of life for having produced nothing.
-		lastHash := hashOutput("")
-		lastChange := time.Now()
-	wait:
-		for {
-			select {
-			case res := <-exited:
-				if res.err != nil {
-					return "", terminalExit{}, true, res.err
-				}
-				exit = res.exit
-				break wait
-			case <-ctx.Done():
-				// The user hit Stop, or the turn was cancelled. The deferred release
-				// kills the command; report what it managed to print.
-				out, _, _, _ := a.terminalOutput(context.Background(), sid, tid)
-				return boundedCapture(out), terminalExit{}, true, ctx.Err()
-			case <-ticker.C:
-				out, _, status, oerr := a.terminalOutput(ctx, sid, tid)
-				if oerr != nil {
-					// Polling is only the watchdog; a failed poll must not fail the
-					// command. Skip this round and let wait_for_exit decide.
-					slog.Debug("terminal/output poll failed", "terminal", tid, "err", oerr)
-					continue
-				}
-				if status != nil {
-					continue // finished between ticks; wait_for_exit is about to return
-				}
-				if h := hashOutput(out); h != lastHash {
-					lastHash, lastChange = h, time.Now()
-					continue
-				}
-				if idleKilled {
-					continue // already killed; still waiting for wait_for_exit to land
-				}
-				if time.Since(lastChange) < idle {
-					continue // quiet, but not yet quiet for long enough
-				}
-				// Nothing new for a whole timeout: silent or hung. Kill it, but do
-				// NOT release yet — we still want to read what it printed.
-				idleKilled = true
-				if kerr := a.terminalKill(ctx, sid, tid); kerr != nil {
-					slog.Debug("terminal/kill failed", "terminal", tid, "err", kerr)
-				}
-			}
+	var files []string
+	for _, m := range redirectRe.FindAllStringSubmatch(args[1], -1) {
+		f := m[1]
+		if strings.ContainsAny(f, "$\"'`*") || f == "/dev/null" {
+			continue
 		}
-	} else {
-		select {
-		case res := <-exited:
-			if res.err != nil {
-				return "", terminalExit{}, true, res.err
-			}
-			exit = res.exit
-		case <-ctx.Done():
-			out, _, _, _ := a.terminalOutput(context.Background(), sid, tid)
-			return boundedCapture(out), terminalExit{}, true, ctx.Err()
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(cwd, f)
 		}
+		files = append(files, f)
 	}
-
-	out, truncated, _, oerr := a.terminalOutput(ctx, sid, tid)
-	if oerr != nil {
-		return "", exit, true, oerr
-	}
-	text = boundedCapture(out)
-	if truncated {
-		text = "[... earlier output truncated by the client ...]\n" + text
-	}
-	if idleKilled {
-		text += fmt.Sprintf("\n[killed: no output for %s, command timed out]\n", idle)
-	}
-	return text, exit, true, nil
+	return files
 }
 
-// boundedCapture puts a finished terminal's output through the head+tail window
-// that bounds what any command can hand a small-context model.
-func boundedCapture(out string) string {
-	b := newBoundedOutput(cmdOutputCap)
-	b.Write([]byte(out))
-	return b.String()
-}
-
-// hashOutput fingerprints accumulated output for the idle check. A hash rather
-// than a length because once the client's byte cap is reached the output stops
-// growing while the command is still very much alive, and a length comparison
-// would read that as silence.
-func hashOutput(s string) uint64 {
+// progressSignature is what the watchdog compares between polls: the
+// terminal's output, and the size of every file the command redirects into.
+func progressSignature(out string, files []string) uint64 {
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(s))
+	_, _ = h.Write([]byte(out))
+	for _, f := range files {
+		size := int64(-1)
+		if st, err := os.Stat(f); err == nil {
+			size = st.Size()
+		}
+		_, _ = fmt.Fprintf(h, "\x00%s=%d", f, size)
+	}
 	return h.Sum64()
 }

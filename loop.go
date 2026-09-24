@@ -993,6 +993,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	// of tool-calling grammar" — see the nudge + fallback there.
 	hasTerminal := len(policy.terminals) > 0
 	termList := terminalList(policy)
+	// loopStart bounds which background jobs can park this loop: only the
+	// ones its own run_command calls handed over (see parkForJobs).
+	loopStart := time.Now()
 
 	var res toolLoopResult
 	var allText strings.Builder
@@ -1237,6 +1240,29 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		// the text-stream callback) and exit. The repetition ladder below is
 		// skipped — this turn is over.
 		if terminalCalled {
+			// A respond while a command this loop handed to the background is
+			// still running does not end the turn: the model has nothing else
+			// to do until that job reports. The turn is parked here, the user
+			// can interject meanwhile, and the job's note (its exit, or its
+			// wake_after) resumes the loop where it stands. Inside /spec that
+			// is the difference between a subtask waiting for its suite and a
+			// subtask ending without a result.
+			if terminalName == respondToolName {
+				if jobs := a.parkableJobs(sid, loopStart); jobs != "" {
+					if on != nil && terminalMessage != "" {
+						on(terminalMessage)
+						flushStream()
+					}
+					resume, perr := a.parkForJobs(ctx, sid, jobs)
+					if perr != nil {
+						res.Text = terminalMessage
+						stampTiming()
+						return res, perr
+					}
+					messages = a.addCorrective(sid, messages, resume)
+					continue
+				}
+			}
 			switch {
 			case on == nil:
 				// Silent internal pass (e.g. the planner): no UI emit.

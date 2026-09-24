@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 )
 
@@ -170,5 +173,123 @@ func TestRunCommandRefusesSleepForBackgroundJob(t *testing.T) {
 		if failed || strings.Contains(res, "refused") {
 			t.Errorf("%q must run: %s (failed=%v)", cmd, res, failed)
 		}
+	}
+}
+
+// TestRunCommandSignalExit pins that a signal death is not read as success:
+// the wrapper reports the command's status through pipefail, so a SIGKILL
+// comes back as 137, never as a zero-value 0.
+func TestRunCommandSignalExit(t *testing.T) {
+	h := newTerminalHarness(t)
+	result, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"kill -9 $$"}`)
+	if !strings.HasPrefix(result, "exit 137\n") {
+		t.Errorf("result = %q, want exit 137 for a signal death", result)
+	}
+	if !h.sawMethod("terminal/release") {
+		t.Errorf("terminal was never released; got %v", h.sentMethods())
+	}
+}
+
+// TestRunCommandCancelReportsPartialOutput pins that a cancelled turn still
+// hands back what the command printed, kills it, and leaves no job behind.
+func TestRunCommandCancelReportsPartialOutput(t *testing.T) {
+	h := newTerminalHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+	result, _ := runCmdExecute(ctx, h.agent, h.sess.ID, `{"command":"echo early; sleep 30"}`)
+	if !strings.Contains(result, "early") || !strings.Contains(result, "terminal error") {
+		t.Errorf("result = %q, want the output produced before the cancel and the error", result)
+	}
+	if left := h.agent.runningBgJobs(h.sess.ID); left != "" {
+		t.Errorf("a cancelled command stayed tracked: %s", left)
+	}
+}
+
+// TestRunCommandHandsOverAfterWait is the point of launching every command as
+// a job: one that outlives the wait is not killed. The model gets what it
+// printed so far and a job id, the card says so, and the exit later arrives
+// as a note with the exit code and the log tail, exactly as for run_background.
+func TestRunCommandHandsOverAfterWait(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	old := cmdHandoverWait
+	cmdHandoverWait = 300 * time.Millisecond
+	defer func() { cmdHandoverWait = old }()
+	h.sess.ctl.held.Lock() // a turn is running, so the note queues instead of starting a turn
+	defer h.sess.ctl.held.Unlock()
+
+	result, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo started; sleep 1; echo finished; exit 3","wake_after":60}`)
+	if failed {
+		t.Fatal("a handover must not fail the turn")
+	}
+	for _, want := range []string{"still running after", "background job 1", "nothing was killed", "started", "parks the turn", "woken after 1m"} {
+		if !strings.Contains(result, want) {
+			t.Errorf("handover result lacks %q: %q", want, result)
+		}
+	}
+	if jobs := h.agent.parkableJobs(h.sess.ID, time.Time{}); !strings.Contains(jobs, "job 1") {
+		t.Errorf("the handed-over command is not a parkable job: %q", jobs)
+	}
+	if h.sawMethod("terminal/kill") {
+		t.Error("the command was killed at the handover")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !h.sess.hasBgNotes() {
+		if time.Now().After(deadline) {
+			t.Fatal("the job never reported its exit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	note := h.sess.takeBgNotes()[0]
+	for _, want := range []string{"exited with code 3", "finished", "codehalter-job-1.log"} {
+		if !strings.Contains(note.full, want) {
+			t.Errorf("exit note lacks %q: %q", want, note.full)
+		}
+	}
+	if jobs := h.agent.parkableJobs(h.sess.ID, time.Time{}); jobs != "" {
+		t.Errorf("finished job still parkable: %s", jobs)
+	}
+	if b, err := os.ReadFile(filepath.Join(os.TempDir(), "codehalter-job-1.log")); err != nil || !strings.Contains(string(b), "finished") {
+		t.Errorf("the log the model is pointed at is not there or incomplete: %v %q", err, b)
+	}
+}
+
+// TestRunCommandStallKillsHungJob: a handed-over command that shows no
+// progress at all (nothing on the terminal, no growth of its log or of a file
+// it redirects into) is killed after bgStallTimeout and reported as such; one
+// that keeps writing into a redirect file is never touched, however quiet the
+// terminal is.
+func TestRunCommandStallKillsHungJob(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	oldWait, oldStall, oldPoll := cmdHandoverWait, bgStallTimeout, bgStallPoll
+	cmdHandoverWait, bgStallTimeout, bgStallPoll = 100*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
+	defer func() { cmdHandoverWait, bgStallTimeout, bgStallPoll = oldWait, oldStall, oldPoll }()
+	h.sess.ctl.held.Lock()
+	defer h.sess.ctl.held.Unlock()
+	waitNote := func() bgNote {
+		deadline := time.Now().Add(5 * time.Second)
+		for !h.sess.hasBgNotes() {
+			if time.Now().After(deadline) {
+				t.Fatal("no note")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return h.sess.takeBgNotes()[0]
+	}
+
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo start; sleep 30"}`)
+	if n := waitNote(); !strings.Contains(n.full, "killed after") || !strings.Contains(n.full, "without any output") {
+		t.Errorf("hung command's note: %q", n.full)
+	}
+
+	log := filepath.Join(t.TempDir(), "suite.log")
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"(for i in 1 2 3 4 5 6 7 8 9 10; do echo tick $i; sleep 0.1; done) > `+log+` 2>&1; echo exit=$? >> `+log+`"}`)
+	if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
+		t.Errorf("a suite writing into its file was not left alone: %q", n.full)
 	}
 }
