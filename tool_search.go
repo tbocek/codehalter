@@ -24,7 +24,7 @@ var searchTextTool = Tool{Def: map[string]any{
 	"type": "function",
 	"function": map[string]any{
 		"name":        "search_text",
-		"description": fmt.Sprintf("Search for text or a regex across all files in the project. Returns up to %d matches, each as `file:line` plus the matched line and %d lines of context on each side (the match line marked with `>`; raise it with `context`) — so you can often act on a hit without opening the file, and it is the way to get just the part of a large file you need. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive. Line-oriented by default; set multiline=true so a regex can match across newlines.", maxSearchResults, searchContextLines),
+		"description": fmt.Sprintf("Search for text or a regex across all files in the project. Returns up to %d matches, each as `file:line` plus the matched line and %d lines of context on each side (the match line marked with `>`; raise it with `context`) — so you can often act on a hit without opening the file, and it is the way to get just the part of a large file you need. Prefer it to `grep` through run_command: one call replaces a `grep -n | head` followed by a `sed -n` read, with no shell quoting to get wrong. Case-sensitive by default — use `(?i)` inline flag in regex mode for case-insensitive. Line-oriented by default; set multiline=true so a regex can match across newlines.", maxSearchResults, searchContextLines),
 		"parameters": map[string]any{
 			"type":     "object",
 			"required": []string{"query"},

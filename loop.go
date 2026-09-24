@@ -445,6 +445,11 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	return exec, nil
 }
 
+// planRoundNudge is the planning round after which the planner is told to
+// submit. It sits above the median plan (16 rounds) and below the runaways
+// (32); an executor that reads for itself makes what is left cheap.
+const planRoundNudge = 20
+
 // maxToolLoopIterations is runToolLoop's hard runaway backstop: a model
 // emitting "different enough" tool calls forever can't spin past it. One
 // iteration is one LLM round-trip; a complex execute pass is usually 10-20, so
@@ -1033,6 +1038,15 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				}
 				messages = a.addCorrective(sid, messages, strings.Join(full, "\n\n"))
 			}
+		}
+		// Planning reasons for ~900 tokens a round, so a plan that keeps
+		// exploring is the most expensive thing codehalter does: the median plan
+		// took 16 rounds, the longest 32 rounds and 86k tokens. Past the nudge
+		// the planner is told to submit with what it has; the executor reads
+		// cheaply what the planner did not.
+		if phase == "plan" && iter == planRoundNudge {
+			messages = a.addCorrective(sid, messages, fmt.Sprintf("You have gathered for %d rounds. Call `submit_plan` NOW with what you have: name the files and the approach, and say in each subtask what you did not verify; the executor reads and checks cheaply.", iter))
+			a.say(ctx, sid, "\n⏱ Planning past "+fmt.Sprint(planRoundNudge)+" rounds: asked to submit with what it has.\n")
 		}
 
 		streamStart := time.Now()

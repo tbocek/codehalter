@@ -1279,3 +1279,42 @@ func TestBackgroundNoteReachesTheLoopMidTurn(t *testing.T) {
 		t.Error("the note was delivered but left queued, so the turn end would deliver it again")
 	}
 }
+
+// TestPlanRoundNudgeAsksToSubmit: a planner still gathering at planRoundNudge
+// rounds gets told to submit with what it has, once, as a user message before
+// its next call; the execute phase never sees it.
+func TestPlanRoundNudgeAsksToSubmit(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a, Tool{
+		Def: map[string]any{"type": "function", "function": map[string]any{
+			"name": "search_text", "description": "probe", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) { return "hit", false },
+	})
+	var resp []string
+	for i := 0; i <= planRoundNudge+1; i++ {
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "search_text", fmt.Sprintf(`{"query":"q%d"}`, i)))
+	}
+	resp = append(resp, sseText("done"))
+	mock := newMockLLM(t, resp...)
+	defer mock.Close()
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
+
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, a.connFor("thinking"),
+		[]llmMessage{{Role: "user", Content: "plan"}}, phasePolicy{}, "plan", false, 0); err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	nudges := 0
+	for i := 0; i < mock.callCount(); i++ {
+		msgs, _ := mock.request(i)["messages"].([]any)
+		last, _ := msgs[len(msgs)-1].(map[string]any)
+		if c, _ := last["content"].(string); last["role"] == "user" && strings.Contains(c, "Call `submit_plan` NOW") {
+			nudges++
+			if i != planRoundNudge {
+				t.Errorf("nudge arrived before call %d, want before call %d", i, planRoundNudge)
+			}
+		}
+	}
+	if nudges != 1 {
+		t.Errorf("nudges = %d, want exactly 1", nudges)
+	}
+}
