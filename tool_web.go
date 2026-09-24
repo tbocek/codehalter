@@ -350,7 +350,7 @@ var webTools = []Tool{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "web_search",
-			"description": "Search the web with DuckDuckGo. Returns up to 10 results as a numbered list (title, URL, snippet) for you to triage — does NOT fetch page content. Snippets alone are NOT enough to answer factual questions: you MUST follow up by calling web_read (summarized) or web_read_raw (raw text — for finding a specific link/string verbatim) on at least one (ideally 1-3) of the most promising URLs. Skipping web_read is only acceptable if every result is clearly off-topic, in which case you should refine the query and search again.",
+			"description": "Search the web with DuckDuckGo. Returns up to 10 results as a numbered list (title, URL, snippet) for you to triage — does NOT fetch page content. Snippets alone are NOT enough to answer factual questions: you MUST follow up by calling web_read on at least one (ideally 1-3) of the most promising URLs. Skipping web_read is only acceptable if every result is clearly off-topic, in which case you should refine the query and search again.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"query"},
@@ -434,15 +434,16 @@ var webTools = []Tool{
 	{Def: webReadDef(), Execute: webReadExecute},
 }
 
-// webReadDef builds web_read's schema. `question` is what picks the mode, so it
-// is described as the normal way to call the tool and omitting it as the
-// exception: the answer costs a fraction of the raw text in context.
+// webReadDef builds web_read's schema: the page's extracted text, paged with
+// offset/limit from a cached body. There is no "answer my question" mode: the
+// model reads the text itself, which it does as well as a second reader would
+// and without the extra round trip.
 func webReadDef() map[string]any {
 	def := map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "web_read",
-			"description": "Open a URL in Firefox and get an ANSWER from the page: a separate reader sees ONLY the page and your `question`, and returns what the page says about it. Much cheaper for your context than the raw text. Use this for \"what does this page say about X\". OMIT `question` to get the raw extracted text instead (truncated), which you want only when an answer would lose precision: a download URL, an exact version number, a code snippet, any string that must survive verbatim. The user will review the page before the result is returned.",
+			"description": fmt.Sprintf("Open a URL in Firefox and return the page's extracted text, truncated at %d characters. The full body is cached for this session, so `offset`/`limit` read a deeper region without re-fetching. Read it yourself: quote exact versions, names, commands and URLs from it. The user will review the page before the result is returned.", maxRawPageChars),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"url"},
@@ -463,29 +464,21 @@ func webReadDef() map[string]any {
 			},
 		},
 	}
-	params := def["function"].(map[string]any)["parameters"].(map[string]any)
-	params["properties"].(map[string]any)["question"] = map[string]any{
-		"type":        "string",
-		"description": "What you want to know from this page, as a STANDALONE question. The reader sees only the page and this text, nothing of our conversation: name the product, version, platform and what exactly you need (\"Which gtk4-rs crate version supports GTK 4.14, and what cargo feature enables it?\"), not \"what about the version?\". Omit it to get the raw page text instead.",
-	}
 	return def
 }
 
 const (
-	// maxRawPageChars caps the bytes a question-less web_read returns on the FIRST
-	// fetch (before truncateForLLM further compresses for the model). Full
-	// body is still cached so range reads can dip past this.
+	// maxRawPageChars caps the bytes web_read returns on the FIRST fetch (before
+	// truncateForLLM further compresses for the model). Full body is still
+	// cached so range reads can dip past this.
 	maxRawPageChars = 30000
 	// maxWebRangeChars caps a single offset/limit slice from the cached body
 	// so a "view more" can't dump megabytes back into the prefix at once.
 	maxWebRangeChars = 8000
 )
 
-// webReadExecute serves both modes of web_read: with a `question` the page is
-// read by a separate LLM call that answers it, without one the raw text comes
-// back truncated. One tool rather than two because the choice between them is a
-// choice small models get wrong, and the argument they already have to write
-// says which one they meant.
+// webReadExecute fetches a page in Firefox and returns its text, truncated, or
+// a slice of the cached body when offset/limit ask for one.
 func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
 	targetURL := args.str("url")
@@ -503,16 +496,7 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 	// Any supplied `limit` means the model wants a slice, even one we then
 	// clamp — presence is the signal, not the value.
 	rangeRequest := offset > 0 || args.has("limit")
-	// web_read's answer depends on the question, so the result cache is keyed
-	// on both: the same page asked something else is a different result.
-	question := strings.TrimSpace(args.str("question"))
-	// The question is what picks the mode: with one, a separate reader
-	// answers it; without one, the raw text comes back.
-	summarize := question != ""
 	resultKey := targetURL
-	if summarize {
-		resultKey += "\x00" + question
-	}
 
 	// Range request hits the cache first — no second HTTP round-trip when
 	// the page was fetched earlier in this session. Cache miss falls
@@ -531,11 +515,10 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 			}
 		}
 	} else {
-		// No-range repeat on the same URL+mode: return the previously-rendered
-		// output verbatim. Small models often re-ask for the same URL within
-		// one phase (or across plan→execute); skipping the fetch + summarize
-		// here saves the dominant cost (Firefox launch + page load is 30-60s,
-		// summarize is another LLM round-trip). Identical bytes are also nice
+		// No-range repeat on the same URL: return the previously-rendered output
+		// verbatim. Small models often re-ask for the same URL within one phase
+		// (or across plan→execute); skipping the fetch saves the dominant cost
+		// (Firefox launch + page load is 30-60s). Identical bytes are also nice
 		// to the prefix cache if the second call shows up in the same prompt.
 		if sess := a.getSession(sid); sess != nil {
 			if cached, ok := sess.recallWebResult(resultKey); ok {
@@ -543,35 +526,15 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 				a.CompleteToolCallTitled(ctx, sid, tcId,
 					"Web Read (cached): "+targetURL,
 					[]ToolCallContent{TextContent(fmt.Sprintf("returned cached result (%d chars, no re-fetch)", len(cached)))})
-				a.logSession(sid, "WEB", "result from cache: url=%s summarize=%v returned=%d", targetURL, summarize, len(cached))
+				a.logSession(sid, "WEB", "result from cache: url=%s returned=%d", targetURL, len(cached))
 				return cached, false
-			}
-		}
-	}
-
-	// A new question about a page already fetched this session: answer from
-	// the cached body. The Firefox launch and page load are the slow part
-	// (30-60s) and the page has not changed.
-	if summarize && !rangeRequest {
-		if sess := a.getSession(sid); sess != nil {
-			if body, ok := sess.recallWebBody(targetURL); ok {
-				tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL+" — "+question, "search", nil)
-				out := a.summarizePage(ctx, sid, question, targetURL, body)
-				a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read (cached): "+targetURL+" — "+question,
-					[]ToolCallContent{TextContent(fmt.Sprintf("answered from the cached page (%d chars, no re-fetch)", len(body)))})
-				sess.rememberWebResult(resultKey, out)
-				return out, false
 			}
 		}
 	}
 
 	a.logSession(sid, "WEB", "open URL: %s", targetURL)
 
-	title := "Web Read: " + targetURL
-	if question != "" {
-		title += " — " + question
-	}
-	tcId := a.StartToolCall(ctx, sid, title, "search", nil)
+	tcId := a.StartToolCall(ctx, sid, "Web Read: "+targetURL, "search", nil)
 
 	port := nextBrowserPort()
 	browser, err := StartBrowser(ctx, port, targetURL)
@@ -589,9 +552,8 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 		return "error getting page text: " + err.Error(), false
 	}
 
-	// Cache the full extracted text BEFORE summarization / raw truncation.
-	// Later offset/limit calls slice from this — they should be able to
-	// reach past the raw 30k cap or the summary's compression.
+	// Cache the full extracted text BEFORE truncation: later offset/limit
+	// calls slice from this and can reach past the raw cap.
 	if sess := a.getSession(sid); sess != nil {
 		sess.rememberWebBody(targetURL, text)
 	}
@@ -599,8 +561,8 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 	// Binary success/failure marker after the URL: ✅ when the body looks
 	// like real content, ❌ when pageIssue flags a load failure, bot wall,
 	// or content too thin to use. The card itself is still marked
-	// completed (not failed) because the model can decide to retry without
-	// a question or fall back to web_search; we don't want Zed to bury
+	// completed (not failed) because the model can decide to retry or fall
+	// back to web_search; we don't want Zed to bury
 	// the result in a red-collapsed card.
 	icon, msg := "✅", "Page loaded"
 	if issue := pageIssue(text); issue != "" {
@@ -619,14 +581,9 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 	if rangeRequest {
 		return sliceWebBody(text, offset, limit), false
 	}
-	var out string
-	if summarize {
-		out = a.summarizePage(ctx, sid, question, targetURL, text)
-	} else {
-		out = text
-		if len(out) > maxRawPageChars {
-			out = clipUTF8(out, maxRawPageChars) + "\n... (truncated)"
-		}
+	out := text
+	if len(out) > maxRawPageChars {
+		out = clipUTF8(out, maxRawPageChars) + "\n... (truncated)"
 	}
 	if sess := a.getSession(sid); sess != nil {
 		sess.rememberWebResult(resultKey, out)
@@ -648,37 +605,6 @@ func sliceWebBody(body string, offset, limit int) string {
 		offset++
 	}
 	return clipUTF8(body[offset:], limit)
-}
-
-// summarizePage answers one standalone question from a web page. It is a
-// self-contained call (the page and the question, nothing of the conversation),
-// so it runs on the background connection: a dedicated summariser when one is
-// configured, else llm[0]. The foreground context then carries the answer
-// instead of the page. sid scopes the per-session debug log.
-func (a *agent) summarizePage(ctx context.Context, sid string, question, url, pageText string) string {
-	conn, _ := a.connForBackgroundLLM()
-	if conn == nil {
-		return clipUTF8(pageText, 2000) + "\n... (truncated; no LLM available to answer from the page)"
-	}
-	// Head of the page only: the reader's context is not the foreground's, but a
-	// documentation page with its sidebar can still run to megabytes.
-	pageText = clipUTF8(pageText, maxLLMInputBytes)
-
-	prompt := fmt.Sprintf(
-		"Answer this question using ONLY the web page below:\n\n%s\n\nBe concise and factual. Quote exact versions, names, commands, URLs and dates as the page gives them. If the page does not answer the question, say so in one line and say what the page IS about; do not answer from your own knowledge. Skip navigation, menus and ads. Max 300 words.\n\nURL: %s\n\n%s",
-		question, url, pageText,
-	)
-
-	messages := []llmMessage{{Role: "user", Content: prompt}}
-	summary, _, _, err := a.llmStream(ctx, sid, conn, messages, nil, nil, nil, nil)
-	if err != nil {
-		const maxLen = 2000
-		if len(pageText) > maxLen {
-			return clipUTF8(pageText, maxLen) + "\n... (truncated)"
-		}
-		return pageText
-	}
-	return strings.TrimSpace(summary)
 }
 
 // HTML log cleanup: keep semantic structure (headings, lists, tables, code,

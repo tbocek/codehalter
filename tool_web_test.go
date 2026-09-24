@@ -19,21 +19,24 @@ func TestSliceWebBodyRunes(t *testing.T) {
 	}
 }
 
-// TestWebReadQuestionPicksTheMode pins the one-tool contract: `question` is
-// optional and is what chooses between an answered read and the raw text, and
-// the schema still spells out that the reader sees only the page and that
-// question (it is a separate LLM call with no view of the conversation).
-func TestWebReadQuestionPicksTheMode(t *testing.T) {
-	def := webReadDef()["function"].(map[string]any)
-	params := def["parameters"].(map[string]any)
-	if got := params["required"].([]string); len(got) != 1 || got[0] != "url" {
-		t.Errorf("web_read required = %v, want url only: the question is what picks the mode", got)
+// TestWebReadIsRawTextOnly pins web_read's shape after the question mode went:
+// the page's text, paged with offset/limit, and no `question` parameter. The
+// model reads the page itself; a second reader was a round trip that bought
+// nothing the model could not do.
+func TestWebReadIsRawTextOnly(t *testing.T) {
+	def := webReadDef()
+	fn := def["function"].(map[string]any)
+	props := fn["parameters"].(map[string]any)["properties"].(map[string]any)
+	if _, has := props["question"]; has {
+		t.Error("web_read still offers a question parameter")
 	}
-	q, ok := params["properties"].(map[string]any)["question"].(map[string]any)
-	if !ok || !strings.Contains(q["description"].(string), "STANDALONE") {
-		t.Errorf("web_read must still ask for a standalone question, got %v", q)
+	for _, p := range []string{"url", "offset", "limit"} {
+		if _, has := props[p]; !has {
+			t.Errorf("web_read lost its %q parameter", p)
+		}
 	}
-	if !strings.Contains(def["description"].(string), "OMIT `question`") {
-		t.Errorf("the description must say how to get raw text, got %q", def["description"])
+	desc, _ := fn["description"].(string)
+	if !strings.Contains(desc, "offset") || !strings.Contains(desc, "cached") {
+		t.Errorf("the description must say the body is cached and paged with offset/limit: %q", desc)
 	}
 }

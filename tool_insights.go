@@ -21,7 +21,7 @@ import (
 // what a weak model won't do reliably from instructions must be done for it.
 
 // logEntry is one `=== <timestamp> [<tag>] ===` block of a session log (the
-// exact format logSession writes and logy parses).
+// exact format logSession writes).
 type logEntry struct {
 	time string
 	tag  string
