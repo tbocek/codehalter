@@ -179,9 +179,16 @@ var errContextCeiling = errors.New("generation hit the context ceiling")
 // beside a forced tool choice. Reading those as a full context started the
 // compaction ladder over a request that no amount of folding could fix. So the
 // body has to be about the context: llama.cpp's structured type, or a message
-// naming the context size or length ("request (262314 tokens) exceeds the
-// available context size (262144 tokens)"; vLLM and OpenAI say "maximum
-// context length").
+// that names it. Every server words that differently and a phrase list missed
+// one within a day, so the test is the word itself:
+//
+//	llama.cpp: request (262314 tokens) exceeds the available context size (262144 tokens)
+//	Halogen:   max_tokens 32768 does not fit: prompt is 255003 tokens and the context is 262144, leaving room for 7141
+//	vLLM/OpenAI: This model's maximum context length is 8192 tokens
+//
+// plus the servers that say "too long" or "too many tokens" without the word.
+// Halogen's check is prompt + max_tokens against the window, where llama.cpp
+// checks the prompt alone, so on Halogen the fold comes max_tokens earlier.
 func isContextFull(err error) bool {
 	var he *llmHTTPError
 	if errors.As(err, &he) {
@@ -192,7 +199,7 @@ func isContextFull(err error) bool {
 			return false
 		}
 		msg := strings.ToLower(he.Body)
-		for _, p := range []string{"context size", "context length", "context window", "exceeds the available", "too many tokens", "prompt is too long", "input is too long"} {
+		for _, p := range []string{"context", "too many tokens", "too long", "maximum prompt"} {
 			if strings.Contains(msg, p) {
 				return true
 			}

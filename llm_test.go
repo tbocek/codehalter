@@ -194,6 +194,7 @@ func TestIsContextFull(t *testing.T) {
 	}{
 		{"llama.cpp overflow", &llmHTTPError{Status: 400, Body: "request (262314 tokens) exceeds the available context size (262144 tokens), try increasing it"}, true},
 		{"llama.cpp structured type", &llmHTTPError{Status: 400, Type: "exceed_context_size_error", Body: "n/a"}, true},
+		{"halogen: prompt + max_tokens over the window", &llmHTTPError{Status: 400, Body: "max_tokens 32768 does not fit: prompt is 255003 tokens and the context is 262144, leaving room for 7141"}, true},
 		{"vLLM / OpenAI wording", &llmHTTPError{Status: 400, Body: "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens"}, true},
 		{"413", &llmHTTPError{Status: 413, Body: "payload too large"}, true},
 		{"ceiling truncation", errContextCeiling, true},
