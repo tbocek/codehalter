@@ -132,6 +132,35 @@ func expandCmdPlaceholders(body string) string {
 	})
 }
 
+// overriddenBuiltins names the files in .codehalter that shadow something the
+// binary ships: a phase prompt, a skill or a template macro. Sorted. A file of
+// a new name (the user's own skill or macro) is an addition, not an override,
+// and is not listed; the banner's skills line already shows those.
+func overriddenBuiltins(cwd string) []string {
+	entries, err := os.ReadDir(filepath.Join(cwd, ".codehalter"))
+	if err != nil {
+		return nil
+	}
+	shippedTemplates := map[string]bool{}
+	if res, err := templateFS.ReadDir("res"); err == nil {
+		for _, e := range res {
+			shippedTemplates[e.Name()] = true
+		}
+	}
+	var over []string
+	for _, e := range entries {
+		n := e.Name()
+		if e.IsDir() {
+			continue
+		}
+		if _, ok := shippedPrompts[n]; ok || shippedSkills[n] != "" || shippedTemplates[n] {
+			over = append(over, n)
+		}
+	}
+	sort.Strings(over)
+	return over
+}
+
 // diskSkillFiles returns the SKILL-*.md filenames actually present in
 // .codehalter/, sorted. These are the user's: either an override of a shipped
 // skill, or one of their own.

@@ -94,6 +94,29 @@ func TestSkillOverrideAndOwnSkills(t *testing.T) {
 	}
 }
 
+// TestOverriddenBuiltins: only files that carry a shipped name count, across
+// all three kinds; a skill of the user's own and the config files do not.
+func TestOverriddenBuiltins(t *testing.T) {
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, ".codehalter")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := overriddenBuiltins(cwd); len(got) != 0 {
+		t.Fatalf("empty dir reports overrides: %v", got)
+	}
+	for _, n := range []string{"EXECUTE.md", "SKILL-base.md", "TEMPLATE-commit.md", "SKILL-house-rules.md", "settings.toml", "mcp.toml", "checks.done"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := overriddenBuiltins(cwd)
+	want := []string{"EXECUTE.md", "SKILL-base.md", "TEMPLATE-commit.md"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("overrides = %v, want %v", got, want)
+	}
+}
+
 // TestExpandCmdPlaceholders pins the {{cmd:...}} templating: stdout is spliced
 // in trimmed, several placeholders on one line all expand, a failing command
 // leaves its placeholder verbatim (visible in the prompt instead of baking a

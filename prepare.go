@@ -911,9 +911,14 @@ func renderMCPChanges(changes []mcpChange) (notices []string, problems []fixProb
 func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid string) {
 	var b strings.Builder
 
+	// The version first: which binary is talking is the first question when a
+	// prompt change or an update seems not to have arrived, and it is the one
+	// fact the rest of the banner cannot be read without.
+	b.WriteString(versionLine(version))
 	if a.settings.path != "" {
-		fmt.Fprintf(&b, "Using %s\n\n", a.settings.path)
+		fmt.Fprintf(&b, " · settings: %s", a.settings.path)
 	}
+	b.WriteString("\n\n")
 	// One line, once per session, and the card that installs it follows the
 	// banner (offerSelfUpdate). The check answers from a day-old cache most of
 	// the time and says nothing at all when it cannot reach GitHub.
@@ -959,6 +964,14 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 			names[i] = strings.TrimSuffix(strings.TrimPrefix(n, "SKILL-"), ".md")
 		}
 		fmt.Fprintf(&b, "🧠 Skills: %s\n\n", strings.Join(names, ", "))
+	}
+	// A file in .codehalter that carries a built-in's name replaces the shipped
+	// text, and nothing else on screen says so. Twice now a copy written by an
+	// older codehalter took over silently and the model ran on prompts naming
+	// tools that no longer exist; this line is what makes that visible.
+	if over := overriddenBuiltins(sess.Cwd); len(over) > 0 {
+		fmt.Fprintf(&b, "🟡 .codehalter overrides %d built-in file(s): %s. Each replaces the shipped text; delete it to use the built-in.\n\n",
+			len(over), strings.Join(over, ", "))
 	}
 
 	a.mu.Lock()
