@@ -442,11 +442,15 @@ func (a *agent) offerSelfUpdate(ctx context.Context, sess *Session, sid string) 
 	remember(envUpdate, "skip")
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("update failed: %v (staying on %s)", err, version))
+		a.say(ctx, sid, fmt.Sprintf("\n⚠ Update to %s failed: %v. Staying on %s.\n", tag, err, version))
 		return
 	}
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf(
-		"Installed codehalter %s to %s. Restart Zed to use %s: this process keeps running %s until then, and the thread comes back as it is. The container does not need rebuilding.",
-		tag, path, tag, version))})
+	// The card's content is collapsed in Zed until clicked; its title and a
+	// plain line are what the user actually sees, so the outcome goes there.
+	done := fmt.Sprintf("Installed codehalter %s to %s. Restart Zed to use %s: this process keeps running %s until then, and the thread comes back as it is. The container does not need rebuilding.",
+		tag, path, tag, version)
+	a.CompleteToolCallTitled(ctx, sid, tcId, "Installed codehalter "+tag+": restart Zed to use it", []ToolCallContent{TextContent(done)})
+	a.say(ctx, sid, "\n✅ "+done+"\n")
 }
 
 // runUpdate is --update: check and install with no question asked, for the run
