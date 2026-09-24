@@ -1242,3 +1242,40 @@ func TestSteeringLandsBetweenRounds(t *testing.T) {
 		t.Errorf("the queue should be empty after it was picked up, got %v", q)
 	}
 }
+
+// TestBackgroundNoteReachesTheLoopMidTurn: a run_background job that exits
+// while the tool loop is still running is handed to the model before its next
+// call, as a user message carrying the job's note. Before this the note waited
+// for the turn to end, and a model that needed the result polled with `sleep`.
+func TestBackgroundNoteReachesTheLoopMidTurn(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a, Tool{
+		Def: map[string]any{"type": "function", "function": map[string]any{
+			"name": "run_command", "description": "probe", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			// The job finishes while this round's tool is still running.
+			s.addBgNote(bgNote{line: "background job 7 `just test` exited with code 0 after 2m20s",
+				full: "[codehalter, not the user: background job 7 `just test` exited with code 0 after 2m20s. Last output:]\n\ntest result: ok. 12 passed"})
+			return "edited", false
+		},
+	})
+	mock := newMockLLM(t, sseToolCall("c1", "run_command", `{"command":"sed -i s/a/b/ x.rs"}`), sseText("done"))
+	defer mock.Close()
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
+
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, a.connFor("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0); err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if mock.callCount() != 2 {
+		t.Fatalf("calls = %d, want 2", mock.callCount())
+	}
+	msgs, _ := mock.request(1)["messages"].([]any)
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	if c, _ := last["content"].(string); last["role"] != "user" || !strings.Contains(c, "12 passed") {
+		t.Fatalf("the finished job's note did not reach the model before its next call; last message: %v", last)
+	}
+	if s.hasBgNotes() {
+		t.Error("the note was delivered but left queued, so the turn end would deliver it again")
+	}
+}

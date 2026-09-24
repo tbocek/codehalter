@@ -1018,6 +1018,21 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				messages = a.addCorrective(sid, messages, joined)
 				a.say(ctx, sid, "\n↪ picked up: "+firstLine(joined)+"\n")
 			}
+			// A background job that finished during this turn is handed over
+			// the same way, before the next model call. run_background promises
+			// "do other work, the result comes back on its own"; until this it
+			// only came back once the whole turn had ended, so a model that
+			// needed the result to finish its subtask had no way to get it but
+			// polling, and it polled with `sleep 150` in a foreground command,
+			// worse than having run the job in the foreground to begin with.
+			if notes := sess.takeBgNotes(); len(notes) > 0 {
+				var full []string
+				for _, n := range notes {
+					a.say(ctx, sid, "\n🔔 "+n.line+"\n")
+					full = append(full, n.full)
+				}
+				messages = a.addCorrective(sid, messages, strings.Join(full, "\n\n"))
+			}
 		}
 
 		streamStart := time.Now()
