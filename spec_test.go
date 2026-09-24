@@ -208,24 +208,14 @@ func TestGithubSlug(t *testing.T) {
 }
 
 func TestParseSpecArgs(t *testing.T) {
-	cmd, spec, out, target, err := parseSpecArgs("spec/ rust/ use gtk4-rs  libadwaita")
-	if err != nil || cmd != "setup" || spec != "spec" || out != "rust" || target != "use gtk4-rs  libadwaita" {
-		t.Errorf("setup = (%q %q %q %q %v)", cmd, spec, out, target, err)
+	for args, want := range map[string]string{"": "resume", "  ": "resume", "status": "status", " stop ": "stop"} {
+		if cmd, err := parseSpecArgs(args); err != nil || cmd != want {
+			t.Errorf("parseSpecArgs(%q) = %q, %v; want %q", args, cmd, err, want)
+		}
 	}
-	if cmd, _, _, _, _ := parseSpecArgs("  "); cmd != "resume" {
-		t.Errorf("empty args = %q, want resume", cmd)
-	}
-	if cmd, _, _, _, _ := parseSpecArgs("status"); cmd != "status" {
-		t.Errorf("status = %q", cmd)
-	}
-	if cmd, _, _, _, _ := parseSpecArgs("stop"); cmd != "stop" {
-		t.Errorf("stop = %q", cmd)
-	}
-	if _, _, _, _, err := parseSpecArgs("spec/"); err == nil {
-		t.Error("a spec dir without an output dir parsed")
-	}
-	if _, _, _, target, _ := parseSpecArgs("spec out"); target != "" {
-		t.Errorf("target = %q, want empty (it is optional)", target)
+	// The positional form is gone: the first run asks, it does not parse paths.
+	if _, err := parseSpecArgs("spec/ rust/ use gtk4-rs"); err == nil {
+		t.Error("a positional spec-dir/out-dir form parsed")
 	}
 }
 

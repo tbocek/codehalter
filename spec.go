@@ -229,38 +229,20 @@ func (c *specConfig) unblock(id string) {
 	c.Blocked = kept
 }
 
-// parseSpecArgs reads the text after "/spec". Empty resumes, "status" reports,
-// "stop" ends a running loop at its next round boundary, anything else is `<spec-dir> <out-dir> [target prompt...]`: the first two
-// tokens are paths and everything after them is the prompt, verbatim, so a
-// target like "use gtk4-rs libadwaita" needs no quoting.
-func parseSpecArgs(args string) (cmd, specDir, outDir, target string, err error) {
-	args = strings.TrimSpace(args)
-	switch args {
+// parseSpecArgs reads the text after "/spec": nothing starts or resumes the
+// loop (the first run asks its three questions), "status" reports, "stop" ends
+// a running loop at its next round boundary. There is no positional form: the
+// questions read their options off the project, which a typed path cannot.
+func parseSpecArgs(args string) (cmd string, err error) {
+	switch strings.TrimSpace(args) {
 	case "":
-		return "resume", "", "", "", nil
+		return "resume", nil
 	case "status":
-		return "status", "", "", "", nil
+		return "status", nil
 	case "stop":
-		return "stop", "", "", "", nil
+		return "stop", nil
 	}
-	rest := args
-	next := func() string {
-		rest = strings.TrimLeft(rest, " \t\r\n")
-		i := strings.IndexAny(rest, " \t\r\n")
-		if i < 0 {
-			tok := rest
-			rest = ""
-			return tok
-		}
-		tok := rest[:i]
-		rest = rest[i:]
-		return tok
-	}
-	specDir, outDir = next(), next()
-	if outDir == "" {
-		return "", "", "", "", fmt.Errorf("usage: /spec <spec-dir> <out-dir> [technology prompt], /spec to resume, /spec status, /spec stop")
-	}
-	return "setup", filepath.Clean(specDir), filepath.Clean(outDir), strings.TrimSpace(rest), nil
+	return "", fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop")
 }
 
 // ---------------------------------------------------------------------------

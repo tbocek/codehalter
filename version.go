@@ -445,8 +445,8 @@ func (a *agent) offerSelfUpdate(ctx context.Context, sess *Session, sid string) 
 		return
 	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(fmt.Sprintf(
-		"Installed codehalter %s to %s. This thread finishes on %s; start a new Agent Thread (the + button at the top) to run %s. The container does not need rebuilding.",
-		tag, path, version, tag))})
+		"Installed codehalter %s to %s. Restart Zed to use %s: this process keeps running %s until then, and the thread comes back as it is. The container does not need rebuilding.",
+		tag, path, tag, version))})
 }
 
 // runUpdate is --update: check and install with no question asked, for the run

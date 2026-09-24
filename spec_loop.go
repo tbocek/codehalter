@@ -19,7 +19,6 @@ import (
 // rounds through the ordinary turn pipeline (runTurn: plan, execute, verify,
 // document) and checks each one afterwards.
 //
-//	/spec <spec-dir> <out-dir> [technology prompt]   set up, then loop
 //	/spec stop                                       end after the round in flight
 //	/spec                                            resume the loop
 //	/spec status                                     coverage report, no turn
@@ -465,7 +464,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 // config, or on a project's first /spec the setup dialog.
 func (a *agent) specResolve(ctx context.Context, sid string, sess *Session, args string) (cfg *specConfig, cmd string, ok bool) {
 	say := func(s string) { a.say(ctx, sid, s) }
-	cmd, specArg, outArg, target, err := parseSpecArgs(args)
+	cmd, err := parseSpecArgs(args)
 	if err != nil {
 		say(err.Error() + "\n")
 		return nil, "", false
@@ -474,14 +473,13 @@ func (a *agent) specResolve(ctx context.Context, sid string, sess *Session, args
 		say("⚠ " + err.Error() + "\n")
 		return nil, "", false
 	}
-	if cmd != "setup" {
-		if cfg != nil {
-			return cfg, cmd, true
-		}
-		// First /spec in this project: ask rather than print a usage line.
-		if specArg, outArg, target, ok = a.specSetupDialog(ctx, sid, sess); !ok {
-			return nil, "", false
-		}
+	if cfg != nil {
+		return cfg, cmd, true
+	}
+	// First /spec in this project: the three questions are the setup.
+	specArg, outArg, target, ok := a.specSetupDialog(ctx, sid, sess)
+	if !ok {
+		return nil, "", false
 	}
 	specRel, outRel, err := specPaths(sess.Cwd, specArg, outArg)
 	if err != nil {
@@ -964,7 +962,7 @@ func (a *agent) specSetupDialog(ctx context.Context, sid string, sess *Session) 
 	say := func(s string) { a.say(ctx, sid, s) }
 	cands := specDirCandidates(sess.Cwd)
 	if len(cands) == 0 {
-		say("No specification found: `/spec` looks for a directory holding at least two markdown files. Point it at one with `/spec <spec-dir> <out-dir> [technology]`.\n")
+		say("No specification found: `/spec` looks for a directory holding at least two markdown files. Put the spec in one and run `/spec` again.\n")
 		return "", "", "", false
 	}
 	if len(cands) > 3 {
@@ -1018,7 +1016,7 @@ func (a *agent) specSetupDialog(ctx context.Context, sid string, sess *Session) 
 	outDir = filepath.Clean(strings.Trim(strings.TrimSpace(answer2), "`\"/ "))
 	if outDir == "" || outDir == "." {
 		a.FailToolCall(ctx, sid, tcId2, "no directory given")
-		say("⚠ /spec: nothing to build into. Run `/spec " + specDir + " <out-dir> [technology]` when you know where it should go.\n")
+		say("⚠ /spec: nothing to build into. Run `/spec` again when you know where it should go.\n")
 		return "", "", "", false
 	}
 	a.CompleteToolCall(ctx, sid, tcId2, []ToolCallContent{TextContent("Building into " + outDir + "/")})
