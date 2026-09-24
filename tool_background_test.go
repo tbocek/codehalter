@@ -200,9 +200,9 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	}
 }
 
-// TestTurnEndNamesRunningJobs: when a turn hands the prompt back with a job
-// still running, the user is told which, and that the work resumes on its own
-// when it exits. With nothing running the turn ends silently.
+// TestTurnEndNamesRunningJobs: when a turn hands the prompt back with a new
+// job still running, the user is told which, once, and that the work resumes
+// on its own when it exits. With nothing new running the turn ends silently.
 func TestTurnEndNamesRunningJobs(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
@@ -226,10 +226,21 @@ func TestTurnEndNamesRunningJobs(t *testing.T) {
 	if c, _ := u["content"].(map[string]any); c != nil {
 		said = fmt.Sprint(c["text"])
 	}
-	for _, want := range []string{"Still running in the background", "job 3 `just test", "carry on meanwhile"} {
+	for _, want := range []string{"Running in the background", "job 3 `just test", "carry on meanwhile"} {
 		if !strings.Contains(said, want) {
 			t.Errorf("turn-end line lacks %q: %q", want, said)
 		}
+	}
+	// A job is named once: a dev server that lives for hours must not close
+	// every later turn with the same line.
+	_, release, ok = h.agent.holdTurn(context.Background(), h.sess, false)
+	if !ok {
+		t.Fatal("could not hold the turn")
+	}
+	release()
+	time.Sleep(50 * time.Millisecond)
+	if n := len(h.updatesOfKind(KindAgentMessage)); n != 1 {
+		t.Errorf("the same job was announced again: %d messages", n)
 	}
 }
 

@@ -37,6 +37,7 @@ type backgroundJob struct {
 	terminalId string
 	started    time.Time
 	wakeAfter  time.Duration // >0: wake the model once at this age even if still running
+	announced  bool          // named to the user at a turn end already (under bgMu)
 }
 
 // nextBgID reserves the next sequential job id (used to name the log file before
@@ -72,16 +73,26 @@ func (a *agent) runningBgJobs(sid string) string {
 	return strings.Join(names, ", ")
 }
 
-// sayRunningBgJobs is the last line of a turn that leaves jobs behind: the
-// user is about to get the prompt back and should know what is still running,
-// that the model picks the work up by itself when it exits, and that they need
-// not wait for it.
+// sayRunningBgJobs is the last line of a turn that leaves a new job behind:
+// the user is about to get the prompt back and should know what is still
+// running, that the model picks the work up by itself when it exits, and that
+// they need not wait for it. Each job is named once; a dev server that lives
+// for hours would otherwise close every turn with the same line.
 func (a *agent) sayRunningBgJobs(sess *Session) {
-	jobs := a.runningBgJobs(sess.ID)
-	if jobs == "" {
+	a.bgMu.Lock()
+	var names []string
+	for _, j := range a.bgJobs {
+		if j.sid == sess.ID && !j.announced {
+			j.announced = true
+			names = append(names, fmt.Sprintf("job %d `%s`", j.id, truncate(j.cmdStr, 60)))
+		}
+	}
+	a.bgMu.Unlock()
+	if len(names) == 0 {
 		return
 	}
-	a.say(context.Background(), sess.ID, "\n⏳ Still running in the background: "+jobs+". As soon as it finishes I continue the work around it and tell you; you can carry on meanwhile.\n")
+	sort.Strings(names)
+	a.say(context.Background(), sess.ID, "\n⏳ Running in the background: "+strings.Join(names, ", ")+". When it exits I pick up the work that was waiting on it and tell you; you can carry on meanwhile.\n")
 }
 
 // forgetBgJob drops a job from the table and removes its scratch files. Used
@@ -367,7 +378,7 @@ func (a *agent) deliverBgNotesWhenIdle(sess *Session) {
 			a.say(ctx, sess.ID, "\n🔔 "+n.line+"\n\n")
 			full = append(full, n.full)
 		}
-		prompt := strings.Join(full, "\n\n") + "\n\nLook at the result and tell the user what it means for the work in progress. Do not start new work the user did not ask for."
+		prompt := strings.Join(full, "\n\n") + "\n\nContinue the work that was waiting on this result, if any was; otherwise tell the user what the result means. Do not start new work the user did not ask for."
 		if err := a.runPromptTurn(ctx, sess, prompt); err != nil && !isCancelled(err) {
 			slog.Warn("background job report turn failed", "sid", sess.ID, "err", err)
 			a.say(context.Background(), sess.ID, "⚠ Could not report on the finished background job: "+err.Error()+"\n")
