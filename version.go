@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -315,8 +316,9 @@ func installTarget(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("refusing to update: nothing at %s reports %q, so none of them is the running binary", strings.Join(tried, " or "), versionLine(version))
 }
 
-// reportedVersion runs path with --version and returns the trimmed line, which
-// is the only proof accepted that a file is a codehalter binary.
+// reportedVersion runs path with --version and returns its first line trimmed,
+// the only proof accepted that a file is a codehalter binary. Later lines (the
+// build stamp) are for people and never compared.
 func reportedVersion(ctx context.Context, path string) (string, error) {
 	probe, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -324,12 +326,60 @@ func reportedVersion(ctx context.Context, path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	first, _, _ := strings.Cut(string(out), "\n")
+	return strings.TrimSpace(first), nil
 }
 
-// versionLine is the whole of what --version prints, and the exact string
-// selfUpdate matches the downloaded binary against.
+// versionLine is the first line of what --version prints, and the exact string
+// selfUpdate matches a binary against. Everything after it is decoration.
 func versionLine(tag string) string { return "codehalter " + tag }
+
+// buildStamp is when and from what this binary was built: the commit date and
+// short hash Go records in every binary built from a git checkout, release
+// builds included ("2026-09-24, 73b7d58", "+dirty" when the tree had edits).
+// "" when the binary carries no such record (a `go test` binary does not).
+// A version number says which release; this says how old that release is.
+func buildStamp() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var date, rev, dirty string
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.time":
+			if len(s.Value) >= 10 {
+				date = s.Value[:10]
+			}
+		case "vcs.revision":
+			if len(s.Value) >= 7 {
+				rev = s.Value[:7]
+			}
+		case "vcs.modified":
+			if s.Value == "true" {
+				dirty = "+dirty"
+			}
+		}
+	}
+	if date == "" && rev == "" {
+		return ""
+	}
+	return strings.TrimPrefix(date+", "+rev+dirty, ", ")
+}
+
+// versionStamp is the version with its build stamp, "v78 (2026-09-24,
+// 73b7d58)": what the banner shows after "codehalter" and what the spec ledger
+// records against each item. The stamp is what tells two builds of one day
+// apart.
+func versionStamp() string {
+	if stamp := buildStamp(); stamp != "" {
+		return version + " (" + stamp + ")"
+	}
+	return version
+}
+
+// versionBanner is the banner's first words: "codehalter v78 (2026-09-24, 73b7d58)".
+func versionBanner() string { return "codehalter " + versionStamp() }
 
 // offerUpdate is the whole interaction for a terminal run: check, ask, install
 // and re-exec, before anything else starts, so no session or container is

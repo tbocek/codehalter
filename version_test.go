@@ -271,7 +271,8 @@ func TestSelfUpdateReplacesTheBinary(t *testing.T) {
 	t.Run("installs and reports the path", func(t *testing.T) {
 		isolateUpdate(t)
 		self := install(t)
-		releaseServer(t, "v42", fakeBinary(versionLine("v42"), updateMinBytes+1))
+		// The stamp on --version's second line is decoration; identity is line one.
+		releaseServer(t, "v42", fakeBinary(versionLine("v42")+"\nbuilt 2026-09-24, abc1234", updateMinBytes+1))
 		got, err := selfUpdate(context.Background(), "v42")
 		if err != nil {
 			t.Fatalf("selfUpdate: %v", err)

@@ -382,6 +382,9 @@ func TestSpecReconcile(t *testing.T) {
 	if d.Adopted != 1 || cfg.Items[adoptable].CoveredBy != "tests/flows.rs" {
 		t.Errorf("covered work predating the ledger should be adopted, got %d and %+v", d.Adopted, cfg.Items[adoptable])
 	}
+	if e := cfg.Items[adoptable]; e.At.IsZero() || e.Version == "" || e.Commit != "" {
+		t.Errorf("an adopted entry must say when and by which codehalter it was recorded, and carry no commit: %+v", e)
+	}
 	// A second pass adopts nothing new and finds no further renames: the item
 	// still to redo and the one still to delete keep being reported, because
 	// nothing has acted on them yet.

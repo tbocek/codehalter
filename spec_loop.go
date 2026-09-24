@@ -660,6 +660,7 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error) (d
 				CoveredBy: covered[item],
 				Commit:    sha,
 				At:        time.Now().UTC(),
+				Version:   versionStamp(),
 			}
 			r.say(ctx, fmt.Sprintf("✅ %s is covered.\n", item))
 		}

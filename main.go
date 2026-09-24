@@ -219,6 +219,9 @@ func main() {
 	// cosmetic (see versionLine).
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		fmt.Println(versionLine(version))
+		if stamp := buildStamp(); stamp != "" {
+			fmt.Println("built " + stamp)
+		}
 		os.Exit(0)
 	}
 

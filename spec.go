@@ -114,12 +114,17 @@ type specConfig struct {
 // moved to another file keeps its heading, and matching on it means the item is
 // not reported as one removal plus one new item.
 type specLedger struct {
-	Hash      string    `toml:"hash"`
-	Title     string    `toml:"title,omitempty"`
-	File      string    `toml:"file,omitempty"` // spec file, relative to spec_dir
-	CoveredBy string    `toml:"covered_by,omitempty"`
-	Commit    string    `toml:"commit,omitempty"`
-	At        time.Time `toml:"at,omitempty"`
+	Hash      string `toml:"hash"`
+	Title     string `toml:"title,omitempty"`
+	File      string `toml:"file,omitempty"` // spec file, relative to spec_dir
+	CoveredBy string `toml:"covered_by,omitempty"`
+	Commit    string `toml:"commit,omitempty"`
+	// At and Version say when the entry was recorded and by which codehalter
+	// (tag plus build date and commit), for a round's work and for an item
+	// adopted because a test already covered it alike. Commit is the
+	// difference between the two: an adopted item has none.
+	At      time.Time `toml:"at,omitempty"`
+	Version string    `toml:"version,omitempty"`
 }
 
 // specBlock is an item the loop gave up on, with the reason and, when the
@@ -1202,7 +1207,8 @@ func specReconcile(cfg *specConfig, idx *specIndex, covered map[string]string) s
 		switch {
 		case !known && covered[id] != "":
 			cfg.Items[id] = specLedger{Hash: hashes[id], Title: idx.items[id].Title,
-				File: idx.docs[idx.items[id].Doc].rel, CoveredBy: covered[id]}
+				File: idx.docs[idx.items[id].Doc].rel, CoveredBy: covered[id],
+				At: time.Now().UTC(), Version: versionStamp()}
 			d.Adopted++
 		case known && led.Hash != hashes[id]:
 			d.Changed = append(d.Changed, id)

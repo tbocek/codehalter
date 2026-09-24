@@ -914,7 +914,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	// The version first: which binary is talking is the first question when a
 	// prompt change or an update seems not to have arrived, and it is the one
 	// fact the rest of the banner cannot be read without.
-	b.WriteString(versionLine(version))
+	b.WriteString(versionBanner())
 	if a.settings.path != "" {
 		fmt.Fprintf(&b, " · settings: %s", a.settings.path)
 	}
