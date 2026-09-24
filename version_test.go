@@ -37,7 +37,15 @@ func releaseServer(t *testing.T, tag, asset string) (*httptest.Server, *int) {
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
+			// Conditional like GitHub: the ETag is the tag, and a matching
+			// If-None-Match is a 304 that GitHub does not count.
+			etag := fmt.Sprintf("%q", tag)
+			if r.Header.Get("If-None-Match") == etag {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
 			calls++
+			w.Header().Set("ETag", etag)
 			fmt.Fprintf(w, `{"tag_name": %q}`, tag)
 			return
 		}
@@ -82,12 +90,15 @@ func TestReleaseNum(t *testing.T) {
 	}
 }
 
-// TestLatestReleaseSources: three answers, cheapest first. The environment is
-// what the launcher fills in for the container, the cache is what keeps a
-// restart off the rate-limited API, and only a stale cache reaches the network.
+// TestLatestReleaseSources: the environment is what the launcher fills in for
+// the container and costs nothing; otherwise GitHub is asked every time, with
+// the cached ETag so an unchanged answer is an uncounted 304. A cache that
+// merely said "nothing newer" must NOT stand in for the check: trusting one for
+// a day is how a restarted container missed a release for sixteen hours. The
+// cache does answer when GitHub cannot be reached, and only while it is young.
 func TestLatestReleaseSources(t *testing.T) {
 	isolateUpdate(t)
-	_, calls := releaseServer(t, "v42", "")
+	srv, calls := releaseServer(t, "v42", "")
 
 	t.Setenv(envLatest, "v99")
 	if tag, err := latestRelease(context.Background()); err != nil || tag != "v99" {
@@ -98,37 +109,50 @@ func TestLatestReleaseSources(t *testing.T) {
 	}
 	t.Setenv(envLatest, "")
 
+	// A young cache saying v7 is not believed: GitHub says v42, and that is
+	// what comes back, cached with its ETag.
 	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fresh, _ := json.Marshal(updateCache{Tag: "v7", Checked: time.Now().Add(-time.Hour)})
-	if err := os.WriteFile(updateCachePath(), fresh, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if tag, err := latestRelease(context.Background()); err != nil || tag != "v7" {
-		t.Fatalf("fresh cache: got %q, %v; want v7 and no error", tag, err)
-	}
-	if *calls != 0 {
-		t.Errorf("a %v-old cache entry should answer on its own, but the API was called %d times", updateTTL, *calls)
-	}
-
-	stale, _ := json.Marshal(updateCache{Tag: "v7", Checked: time.Now().Add(-2 * updateTTL)})
-	if err := os.WriteFile(updateCachePath(), stale, 0o644); err != nil {
+	young, _ := json.Marshal(updateCache{Tag: "v7", ETag: `"v7"`, Checked: time.Now().Add(-time.Hour)})
+	if err := os.WriteFile(updateCachePath(), young, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if tag, err := latestRelease(context.Background()); err != nil || tag != "v42" {
-		t.Fatalf("stale cache: got %q, %v; want the API's v42", tag, err)
+		t.Fatalf("young cache with an old answer: got %q, %v; want GitHub's v42", tag, err)
 	}
 	if *calls != 1 {
-		t.Errorf("stale cache: %d API calls, want exactly 1", *calls)
+		t.Errorf("%d counted API calls, want 1", *calls)
 	}
 	var back updateCache
 	buf, err := os.ReadFile(updateCachePath())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(buf, &back); err != nil || back.Tag != "v42" {
-		t.Errorf("the fresh answer was not cached: %+v, %v", back, err)
+	if err := json.Unmarshal(buf, &back); err != nil || back.Tag != "v42" || back.ETag != `"v42"` {
+		t.Errorf("the fresh answer and its ETag were not cached: %+v, %v", back, err)
+	}
+
+	// Unchanged upstream: the conditional request is a 304, which GitHub does
+	// not count, and the cached tag is the answer.
+	if tag, err := latestRelease(context.Background()); err != nil || tag != "v42" {
+		t.Fatalf("after a 304: got %q, %v; want v42", tag, err)
+	}
+	if *calls != 1 {
+		t.Errorf("a 304 was counted: %d calls", *calls)
+	}
+
+	// GitHub unreachable: a young cache stands in, a stale one does not.
+	srv.Close()
+	if tag, err := latestRelease(context.Background()); err != nil || tag != "v42" {
+		t.Fatalf("unreachable with a young cache: got %q, %v; want v42", tag, err)
+	}
+	stale, _ := json.Marshal(updateCache{Tag: "v42", ETag: `"v42"`, Checked: time.Now().Add(-2 * updateTTL)})
+	if err := os.WriteFile(updateCachePath(), stale, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if tag, err := latestRelease(context.Background()); err == nil {
+		t.Fatalf("unreachable with a stale cache answered %q; want an error", tag)
 	}
 }
 

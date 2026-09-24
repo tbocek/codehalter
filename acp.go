@@ -230,6 +230,24 @@ type ContentBlock struct {
 	Resource *EmbeddedResource `json:"resource,omitempty"`
 }
 
+// MarshalJSON keeps `text` on a text block even when it is empty. The ACP
+// schema requires the field, and Zed rejects the whole notification without it
+// ("missing field `text`"), which silently broke the empty separator chunk the
+// history replay sends between two same-role messages (LoadSession). Every
+// other block type keeps its omitempty shape.
+func (b ContentBlock) MarshalJSON() ([]byte, error) {
+	type raw ContentBlock
+	if b.Type != "text" {
+		return json.Marshal(raw(b))
+	}
+	// The outer Text shadows raw's omitempty one: encoding/json takes the
+	// shallower field of two with the same name.
+	return json.Marshal(struct {
+		raw
+		Text string `json:"text"`
+	}{raw(b), b.Text})
+}
+
 // EmbeddedResource is the nested payload of a "resource" content block. Text is
 // set for textual resources (code selections, file excerpts); Blob holds
 // base64 bytes for binary ones. URI identifies the source so we can label the

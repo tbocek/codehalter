@@ -94,30 +94,42 @@ func releaseNum(tag string) int {
 	return n
 }
 
-// updateCachePath is where the last answer from the GitHub API is kept. The
-// unauthenticated API allows 60 requests per hour per IP (release.sh runs into
-// this too), and codehalter starts often enough that a check per start would
-// spend that budget on a version number that changes a few times a month.
+// updateCachePath is where the last answer from the GitHub API is kept, with
+// the ETag it came with. The cache is not there to skip the check: a check that
+// said "nothing newer" is exactly the one worth repeating after a release, and
+// trusting it for a day is how a container missed v67 for sixteen hours. It
+// holds the ETag so the check can be a conditional request, which GitHub does
+// not count against the 60 requests per hour it allows unauthenticated, and it
+// is the answer when GitHub cannot be reached at all.
 func updateCachePath() string { return filepath.Join(cacheDir(), "update.json") }
 
 type updateCache struct {
 	Tag     string    `json:"tag"`
+	ETag    string    `json:"etag,omitempty"`
 	Checked time.Time `json:"checked"`
 }
 
 // latestRelease reports the newest release tag. It answers from $CODEHALTER_LATEST
-// when the process that started us already resolved it, then from the cache file
-// while that is younger than updateTTL, and only then asks GitHub.
+// when the process that started us already resolved it; otherwise it asks
+// GitHub every time, conditionally: with the cached ETag a 304 costs nothing,
+// and only a new release costs a counted request. When GitHub is unreachable or
+// rate-limits us, a cached answer younger than updateTTL stands in.
 func latestRelease(ctx context.Context) (string, error) {
 	if tag := os.Getenv(envLatest); tag != "" {
 		return tag, nil
 	}
 	var c updateCache
 	if buf, err := os.ReadFile(updateCachePath()); err == nil {
-		if err := json.Unmarshal(buf, &c); err == nil && c.Tag != "" && time.Since(c.Checked) < updateTTL {
-			slog.Debug("update: answered from cache", "tag", c.Tag, "age", time.Since(c.Checked))
+		if err := json.Unmarshal(buf, &c); err != nil {
+			c = updateCache{}
+		}
+	}
+	fallback := func(err error) (string, error) {
+		if c.Tag != "" && time.Since(c.Checked) < updateTTL {
+			slog.Debug("update: GitHub unavailable, answering from the cache", "tag", c.Tag, "age", time.Since(c.Checked), "err", err)
 			return c.Tag, nil
 		}
+		return "", err
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
@@ -127,17 +139,25 @@ func latestRelease(ctx context.Context) (string, error) {
 		return "", err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
+	if c.ETag != "" {
+		req.Header.Set("If-None-Match", c.ETag)
+	}
 	resp, err := metaHTTPClient.Do(req)
 	if err != nil {
-		return "", err
+		return fallback(err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified && c.Tag != "" {
+		c.Checked = time.Now()
+		writeUpdateCache(c)
+		return c.Tag, nil
+	}
 	if resp.StatusCode != http.StatusOK {
 		// 403/429 is the rate limit, and the body says so; it is the one failure
 		// here a user can act on (wait, or use a different network), so it is
 		// worth keeping in the message rather than reporting a bare status.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 400))
-		return "", fmt.Errorf("GitHub API: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return fallback(fmt.Errorf("GitHub API: %s: %s", resp.Status, strings.TrimSpace(string(body))))
 	}
 	var rel struct {
 		TagName string `json:"tag_name"`
@@ -148,17 +168,22 @@ func latestRelease(ctx context.Context) (string, error) {
 	if rel.TagName == "" {
 		return "", errors.New("GitHub API returned a release with no tag_name")
 	}
-
-	// Best-effort cache write: a read-only cache dir costs an API call per run,
-	// which is a reason to log, not to fail a check that already succeeded.
-	if buf, err := json.Marshal(updateCache{Tag: rel.TagName, Checked: time.Now()}); err == nil {
-		if err := os.MkdirAll(filepath.Dir(updateCachePath()), 0o755); err != nil {
-			slog.Debug("update: cache dir not writable", "err", err)
-		} else if err := os.WriteFile(updateCachePath(), buf, 0o644); err != nil {
-			slog.Debug("update: cache not written", "err", err)
-		}
-	}
+	writeUpdateCache(updateCache{Tag: rel.TagName, ETag: resp.Header.Get("ETag"), Checked: time.Now()})
 	return rel.TagName, nil
+}
+
+// writeUpdateCache is best effort: a read-only cache dir costs a counted API
+// call per start, which is a reason to log, not to fail a check that succeeded.
+func writeUpdateCache(c updateCache) {
+	buf, err := json.Marshal(c)
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(updateCachePath()), 0o755); err != nil {
+		slog.Debug("update: cache dir not writable", "err", err)
+	} else if err := os.WriteFile(updateCachePath(), buf, 0o644); err != nil {
+		slog.Debug("update: cache not written", "err", err)
+	}
 }
 
 // newerRelease returns the latest release tag when it is newer than this

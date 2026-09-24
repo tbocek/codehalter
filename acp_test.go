@@ -292,3 +292,24 @@ func TestSendRequestCancelsOutboundOnCtxDone(t *testing.T) {
 	}
 	<-done
 }
+
+// TestTextBlockKeepsEmptyText: the ACP schema requires `text` on a text block,
+// and Zed rejects the notification without it. The history replay relies on an
+// EMPTY text chunk as the separator between two same-role messages, which
+// omitempty was silently deleting. Other block types keep their sparse shape.
+func TestTextBlockKeepsEmptyText(t *testing.T) {
+	sep, err := json.Marshal(messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sep), `"text":""`) {
+		t.Errorf("empty text block lost its text field: %s", sep)
+	}
+	img, err := json.Marshal(ContentBlock{Type: "image", MimeType: "image/png", Data: "AA=="})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(img), `"text"`) {
+		t.Errorf("an image block grew a text field: %s", img)
+	}
+}
