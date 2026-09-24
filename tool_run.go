@@ -35,6 +35,10 @@ func (a *agent) discoverSandbox() {
 				"type":     "object",
 				"required": []string{"command"},
 				"properties": map[string]any{
+					"wake_after": map[string]any{
+						"type":        "integer",
+						"description": "Optional, seconds. Wake me once at this age with the log tail even if the job is still running (for a server or watcher that never exits, or a long run you want a mid-way look at). The exit is reported separately, whenever it comes. Without it you are woken only at exit.",
+					},
 					"command": map[string]any{
 						"type":        "string",
 						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Run it raw: output is auto-capped (start+end kept), so do NOT append `| head` / `| tail` to limit size. Examples: `which <tool>`, `apt-get install -y <pkg> && <tool> --version`, `cargo check 2>&1`.",
@@ -48,7 +52,7 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_background",
-			"description": "Start a LONG-RUNNING / background process (a dev server, watcher, daemon) inside this devcontainer and return immediately, leaving it running. Use this INSTEAD of run_command for anything that does not exit on its own: `python3 -m http.server 8765`, `npm run dev`, `vite`, `flask run`, a file watcher. run_command WAITS for the command to finish, so starting a server there (even with a trailing `&`) hangs the turn. run_background launches the command, waits briefly to catch an immediate failure (e.g. port already in use), then returns the pid and a log-file path. The process keeps running across later tool calls, so a following run_command can probe it (e.g. `curl -s localhost:8765`). Its output streams to the log file, which you read with run_command (`cat`/`tail`). Stop it with `run_command: kill <pid>`. Also right for a LONG EXPERIMENT that does exit (a benchmark, a training run, a test suite you can keep working alongside): the moment it exits, codehalter hands you its exit code, log path and last output on its own, before your next step, so do other work meanwhile and never poll or `sleep` for it. If you cannot do anything until the result is in, it is not a background job: use run_command, which waits (a silent compile of up to two minutes is fine). Do NOT add a trailing `&` — run_background already detaches it.",
+			"description": "Start a LONG-RUNNING / background process (a dev server, watcher, daemon) inside this devcontainer and return immediately, leaving it running. Use this INSTEAD of run_command for anything that does not exit on its own: `python3 -m http.server 8765`, `npm run dev`, `vite`, `flask run`, a file watcher. run_command WAITS for the command to finish, so starting a server there (even with a trailing `&`) hangs the turn. run_background launches the command, waits briefly to catch an immediate failure (e.g. port already in use), then returns the pid and a log-file path. The process keeps running across later tool calls, so a following run_command can probe it (e.g. `curl -s localhost:8765`). Its output streams to the log file, which you read with run_command (`cat`/`tail`). Stop it with `run_command: kill <pid>`. Also right for a LONG EXPERIMENT that does exit (a benchmark, a training run, a test suite you can keep working alongside): the moment it exits, codehalter hands you its exit code, log path and last output on its own, before your next step, so do other work meanwhile, or simply end your turn saying the job is running: you are resumed with the result when it exits, whether or not the user has typed anything in between. Never poll and never `sleep` for it (a foreground `sleep` is refused while a job runs); to look at a job that does not exit, give `wake_after` and you are woken at that age with its log tail. Do NOT add a trailing `&` — run_background already detaches it.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
@@ -61,6 +65,22 @@ func (a *agent) discoverSandbox() {
 			},
 		},
 	}, Execute: runBackgroundExecute})
+}
+
+// isSleepCmd reports a command whose only point is to pass time: `sleep N`,
+// possibly followed by more (`sleep 90 && tail /tmp/t.log`), or `sleep` after a
+// `cd`. A `sleep` inside a for-loop or after another command is not a wait
+// for a job and passes.
+func isSleepCmd(cmd string) bool {
+	first := strings.TrimSpace(cmd)
+	if i := strings.IndexAny(first, ";&|\n"); i >= 0 {
+		head := strings.TrimSpace(first[:i])
+		if strings.HasPrefix(head, "cd ") {
+			first = strings.TrimSpace(first[i+1:])
+			first = strings.TrimLeft(first, "&|; ")
+		}
+	}
+	return first == "sleep" || strings.HasPrefix(first, "sleep ")
 }
 
 // cmdIdleTimeout reaps a run_command that prints NOTHING for this long: no
@@ -152,6 +172,21 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	sess := a.getSession(sid)
 	if sess == nil {
 		return "error: no session", false
+	}
+	// A foreground sleep while one of this session's background jobs runs is
+	// the model waiting for that job by guessing a number: in one afternoon 10
+	// of 22 background suites were followed by a 90-150 s sleep, and one of them
+	// idled 36 s past the job's exit because a running shell cannot be
+	// interrupted with the note. The job wakes the model on its own, so the
+	// sleep is refused with the reason, and the turn either does other work or
+	// ends and is resumed by the job (Claude Code refuses a foreground sleep for
+	// the same reason).
+	if isSleepCmd(cmdStr) {
+		if jobs := a.runningBgJobs(sid); len(jobs) > 0 {
+			return fmt.Sprintf("refused: do not sleep for a background job. %s still running; the moment it exits codehalter hands you its exit code and last output on its own. "+
+				"Continue with other work, or end your turn now (tell the user the job is running) and you will be resumed with the result. "+
+				"If you need a look at it while it still runs (a server, a watcher), start such jobs with run_background's `wake_after`: you are woken at that age with the log tail, no sleep needed.", jobs), false
+		}
 	}
 
 	tcId := a.StartToolCall(ctx, sid, "Run: "+cmdStr, "execute", nil)

@@ -79,6 +79,7 @@ func (a *agent) holdTurn(parent context.Context, sess *Session, wait bool) (ctx 
 	release = func() {
 		a.finalizePlan(sess.ID)
 		a.flushBgNotes(context.Background(), sess)
+		a.sayRunningBgJobs(sess)
 		// Between turns the conversation's prefix sits unused in the server's
 		// KV cache, where an idle slot is reclaimed and the next turn pays to
 		// re-read the whole prompt. Refresh it until the next turn starts, or

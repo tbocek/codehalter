@@ -199,3 +199,96 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 		t.Errorf("finished job still tracked: %d", left)
 	}
 }
+
+// TestTurnEndNamesRunningJobs: when a turn hands the prompt back with a job
+// still running, the user is told which, and that the work resumes on its own
+// when it exits. With nothing running the turn ends silently.
+func TestTurnEndNamesRunningJobs(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	_, release, ok := h.agent.holdTurn(context.Background(), h.sess, false)
+	if !ok {
+		t.Fatal("could not hold the turn")
+	}
+	release()
+	if n := len(h.updatesOfKind(KindAgentMessage)); n != 0 {
+		t.Fatalf("a turn with no jobs said %d things", n)
+	}
+
+	h.agent.registerBgJob(&backgroundJob{id: 3, sid: h.sess.ID, cmdStr: "just test > /tmp/t.log 2>&1", started: time.Now()})
+	_, release, ok = h.agent.holdTurn(context.Background(), h.sess, false)
+	if !ok {
+		t.Fatal("could not hold the turn")
+	}
+	release()
+	u := h.waitForKind(KindAgentMessage)
+	var said string
+	if c, _ := u["content"].(map[string]any); c != nil {
+		said = fmt.Sprint(c["text"])
+	}
+	for _, want := range []string{"Still running in the background", "job 3 `just test", "carry on meanwhile"} {
+		if !strings.Contains(said, want) {
+			t.Errorf("turn-end line lacks %q: %q", want, said)
+		}
+	}
+}
+
+// TestBackgroundJobWakeAfter: a job started with wake_after wakes the model
+// once at that age while it still runs, with the log tail and a note that it
+// is not the exit; the exit is reported on its own afterwards. A job that
+// exits before the age is reported once, at exit.
+func TestBackgroundJobWakeAfter(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	old := bgJobGrace
+	bgJobGrace = 50 * time.Millisecond
+	defer func() { bgJobGrace = old }()
+	h.sess.ctl.held.Lock() // a turn is running, so notes queue instead of starting turns
+	defer h.sess.ctl.held.Unlock()
+
+	res, _ := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo serving; sleep 1.5; exit 0","wake_after":1}`)
+	if !strings.Contains(res, "woken after 1.0s") {
+		t.Fatalf("launch did not confirm the wake: %q", res)
+	}
+	waitNote := func(what string) []bgNote {
+		deadline := time.Now().Add(5 * time.Second)
+		for !h.sess.hasBgNotes() {
+			if time.Now().After(deadline) {
+				t.Fatalf("no %s note", what)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return h.sess.takeBgNotes()
+	}
+	notes := waitNote("wake")
+	h.agent.bgMu.Lock()
+	still := len(h.agent.bgJobs)
+	h.agent.bgMu.Unlock()
+	if still != 1 {
+		t.Errorf("the job should still be running at the wake: %d tracked", still)
+	}
+	for _, want := range []string{"still running after", "wake_after you asked for, not its exit", "serving"} {
+		if !strings.Contains(notes[0].full, want) {
+			t.Errorf("wake note lacks %q: %q", want, notes[0].full)
+		}
+	}
+	notes = waitNote("exit")
+	if !strings.Contains(notes[0].full, "exited with code 0") {
+		t.Errorf("exit note: %q", notes[0].full)
+	}
+
+	if res, _ = runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 3","wake_after":"soon"}`); !strings.Contains(res, "error: wake_after") {
+		t.Errorf("a non-numeric wake_after was accepted: %q", res)
+	}
+	res, _ = runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 0.3; exit 0","wake_after":1}`)
+	if !strings.Contains(res, "woken after 1.0s") {
+		t.Fatalf("launch: %q", res)
+	}
+	if notes = waitNote("exit"); !strings.Contains(notes[0].full, "exited with code 0") {
+		t.Errorf("exit note: %q", notes[0].full)
+	}
+	time.Sleep(1200 * time.Millisecond)
+	if h.sess.hasBgNotes() {
+		t.Error("a job that exited before its wake age was woken for anyway")
+	}
+}

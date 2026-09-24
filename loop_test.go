@@ -1317,3 +1317,27 @@ func TestPlanRoundNudgeAsksToSubmit(t *testing.T) {
 		t.Errorf("nudges = %d, want exactly 1", nudges)
 	}
 }
+
+// TestPlanResultAcceptsStringifiedSubtasks: the planner sometimes serialises
+// the subtasks array into a string; both shapes must parse to the same plan,
+// and a string that is not an array is still an error.
+func TestPlanResultAcceptsStringifiedSubtasks(t *testing.T) {
+	var direct, quoted planResult
+	if err := json.Unmarshal([]byte(`{"clear":true,"subtasks":[{"description":"do x","verify":["run just test via run_command"]}]}`), &direct); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(`{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"run just test via run_command\"]}]"}`), &quoted); err != nil {
+		t.Fatalf("stringified subtasks rejected: %v", err)
+	}
+	if !direct.Clear || len(direct.Subtasks) != 1 || len(quoted.Subtasks) != 1 || quoted.Subtasks[0].Description != "do x" || len(quoted.Subtasks[0].Verify) != 1 {
+		t.Errorf("shapes differ: direct=%+v quoted=%+v", direct, quoted)
+	}
+	var bad planResult
+	if err := json.Unmarshal([]byte(`{"clear":true,"subtasks":"do x"}`), &bad); err == nil {
+		t.Error("a plain string that is not an array parsed as subtasks")
+	}
+	var none planResult
+	if err := json.Unmarshal([]byte(`{"clear":true,"report_only":true}`), &none); err != nil || !none.ReportOnly {
+		t.Errorf("a plan with no subtasks must still parse: %v %+v", err, none)
+	}
+}

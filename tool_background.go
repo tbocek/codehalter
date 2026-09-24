@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -35,6 +36,7 @@ type backgroundJob struct {
 	pidPath    string
 	terminalId string
 	started    time.Time
+	wakeAfter  time.Duration // >0: wake the model once at this age even if still running
 }
 
 // nextBgID reserves the next sequential job id (used to name the log file before
@@ -53,6 +55,33 @@ func (a *agent) registerBgJob(job *backgroundJob) {
 		a.bgJobs = make(map[int]*backgroundJob)
 	}
 	a.bgJobs[job.id] = job
+}
+
+// runningBgJobs names the session's jobs still tracked, with how long each has
+// run, for the sleep refusal and the turn-end line.
+func (a *agent) runningBgJobs(sid string) string {
+	a.bgMu.Lock()
+	defer a.bgMu.Unlock()
+	var names []string
+	for _, j := range a.bgJobs {
+		if j.sid == sid {
+			names = append(names, fmt.Sprintf("job %d `%s` (%s so far)", j.id, truncate(j.cmdStr, 60), humanDuration(time.Since(j.started).Milliseconds())))
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// sayRunningBgJobs is the last line of a turn that leaves jobs behind: the
+// user is about to get the prompt back and should know what is still running,
+// that the model picks the work up by itself when it exits, and that they need
+// not wait for it.
+func (a *agent) sayRunningBgJobs(sess *Session) {
+	jobs := a.runningBgJobs(sess.ID)
+	if jobs == "" {
+		return
+	}
+	a.say(context.Background(), sess.ID, "\n⏳ Still running in the background: "+jobs+". As soon as it finishes I continue the work around it and tell you; you can carry on meanwhile.\n")
 }
 
 // forgetBgJob drops a job from the table and removes its scratch files. Used
@@ -127,13 +156,18 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	if sess == nil {
 		return "error: no session", false
 	}
+	secs, ok := args.num("wake_after")
+	if args.has("wake_after") && (!ok || secs < 0) {
+		return "error: wake_after must be a number of seconds, 0 or absent for none", false
+	}
+	wakeAfter := time.Duration(secs) * time.Second
 
 	tcId := a.StartToolCall(ctx, sid, "Background: "+cmdStr, "execute", nil)
 
 	id := a.nextBgID()
 	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.log", id))
 	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.pid", id))
-	job := &backgroundJob{id: id, sid: sid, cmdStr: cmdStr, logPath: logPath, pidPath: pidPath, started: time.Now()}
+	job := &backgroundJob{id: id, sid: sid, cmdStr: cmdStr, logPath: logPath, pidPath: pidPath, started: time.Now(), wakeAfter: wakeAfter}
 
 	// bgScript wraps the model's command so the job keeps the two handles the model
 	// already knows how to use: a log file it reads with `run_command: cat …` and a
@@ -216,9 +250,16 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 		// which would signal the whole process group.
 		stop = "its pid was not recorded, so it can only be stopped by ending the session"
 	}
-	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, end the turn with `respond` saying the job is running. Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
-		id, job.pid, logPath, stop, tail)
+	wake := ""
+	if wakeAfter > 0 {
+		wake = fmt.Sprintf(" You also asked to be woken after %s if it is still running by then.", humanDuration(wakeAfter.Milliseconds()))
+	}
+	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, end the turn with `respond` saying the job is running.%s Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
+		id, job.pid, wake, logPath, stop, tail)
 	go a.watchBgJob(job)
+	if wakeAfter > 0 {
+		go a.wakeForBgJob(job)
+	}
 	// Retitle only: the card is holding the live terminal, and text content here
 	// would replace it with a static snapshot taken at second one of a dev server.
 	a.sendUpdate(ctx, sid, toolCallUpdate{
@@ -270,6 +311,33 @@ func (a *agent) watchBgJob(job *backgroundJob) {
 		line: fmt.Sprintf("background job %d `%s` %s after %s", job.id, truncate(job.cmdStr, 80), outcome, took),
 		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` %s after %s. Full log: %s. Last output:]\n\n%s",
 			job.id, job.cmdStr, outcome, took, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
+	})
+	a.deliverBgNotesWhenIdle(sess)
+}
+
+// wakeForBgJob is the timed half of a job started with wake_after: once, at
+// that age, if the job is still tracked, the model gets the log tail as it
+// would at exit, with the job left running. This is how a server that never
+// exits gets looked at without the model sleeping in the foreground: the wait
+// belongs to codehalter, so the user keeps the prompt meanwhile and a job that
+// exits first is reported first.
+func (a *agent) wakeForBgJob(job *backgroundJob) {
+	time.Sleep(job.wakeAfter)
+	a.bgMu.Lock()
+	_, tracked := a.bgJobs[job.id]
+	a.bgMu.Unlock()
+	if !tracked {
+		return // it exited (and was reported) or the session is gone
+	}
+	sess := a.getSession(job.sid)
+	if sess == nil {
+		return
+	}
+	age := humanDuration(time.Since(job.started).Milliseconds())
+	sess.addBgNote(bgNote{
+		line: fmt.Sprintf("background job %d `%s` still running after %s, as asked", job.id, truncate(job.cmdStr, 80), age),
+		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` is still running after %s; this is the wake_after you asked for, not its exit. It is reported again when it exits. Full log: %s. Last output:]\n\n%s",
+			job.id, job.cmdStr, age, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
 	})
 	a.deliverBgNotesWhenIdle(sess)
 }

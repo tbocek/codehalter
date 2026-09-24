@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -144,5 +145,30 @@ func TestRunCommandRequiresCommand(t *testing.T) {
 	res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{}`)
 	if failed || !strings.Contains(res, "command is required") {
 		t.Fatalf("expected command-required error, got: %s (failed=%v)", res, failed)
+	}
+}
+
+// TestRunCommandRefusesSleepForBackgroundJob: a foreground sleep while one of
+// the session's jobs runs is a guessed wait for it; the job wakes the model on
+// its own, so the sleep is refused and names the job. With no job running a
+// sleep is an ordinary command, and a sleep inside other work is not a wait.
+func TestRunCommandRefusesSleepForBackgroundJob(t *testing.T) {
+	h := newTerminalHarness(t)
+	res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 0.01"}`)
+	if failed || strings.Contains(res, "refused") {
+		t.Fatalf("sleep with no job running: %s (failed=%v)", res, failed)
+	}
+	h.agent.registerBgJob(&backgroundJob{id: 7, sid: h.sess.ID, cmdStr: "cd rust && just test > /tmp/t.log 2>&1"})
+	for _, cmd := range []string{"sleep 120", "sleep 90 && tail -20 /tmp/t.log", "cd /workspaces/x; sleep 60", "sleep"} {
+		res, failed = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":`+strconv.Quote(cmd)+`}`)
+		if !strings.Contains(res, "refused") || !strings.Contains(res, "job 7") {
+			t.Errorf("%q with job 7 running: %s (failed=%v)", cmd, res, failed)
+		}
+	}
+	for _, cmd := range []string{"tail -20 /tmp/t.log", "for i in 1; do sleep 0.01; done", "echo hi; sleep 0.01"} {
+		res, failed = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":`+strconv.Quote(cmd)+`}`)
+		if failed || strings.Contains(res, "refused") {
+			t.Errorf("%q must run: %s (failed=%v)", cmd, res, failed)
+		}
 	}
 }

@@ -32,6 +32,33 @@ type subtask struct {
 	Verify      []string `json:"verify,omitempty"`
 }
 
+// UnmarshalJSON accepts `subtasks` both as the array the schema asks for and
+// as that array serialised into a string, which the planner sent six times in
+// one afternoon ("subtasks": "[{\"description\": ...}]"). Each rejection cost a
+// whole planning call to retry; decoding the string costs nothing.
+func (p *planResult) UnmarshalJSON(b []byte) error {
+	type plain planResult
+	var raw struct {
+		plain
+		Subtasks json.RawMessage `json:"subtasks"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*p = planResult(raw.plain)
+	if len(raw.Subtasks) == 0 || string(raw.Subtasks) == "null" {
+		return nil
+	}
+	if raw.Subtasks[0] == '"' {
+		var inner string
+		if err := json.Unmarshal(raw.Subtasks, &inner); err != nil {
+			return err
+		}
+		raw.Subtasks = json.RawMessage(inner)
+	}
+	return json.Unmarshal(raw.Subtasks, &p.Subtasks)
+}
+
 type planResult struct {
 	Clear    bool      `json:"clear"`
 	Choices  []string  `json:"choices"`
