@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,5 +193,47 @@ func TestSpecDecideChangeAndRemove(t *testing.T) {
 	// The suite must still pass: deleting an item cannot take the build with it.
 	if done, _, reason := specDecide(cfg, "F0.3", specRoundResult{Mode: specModeRemove, TestTail: "3 failed"}); done || !strings.Contains(reason, "did not pass") {
 		t.Errorf("a removal that broke the suite: done=%v reason=%q", done, reason)
+	}
+}
+
+// TestSpecFinalPrompt: the round after the last item gets the whole picture:
+// target, every spec file, the test command, the counts and the blocked list,
+// with no placeholder left.
+func TestSpecFinalPrompt(t *testing.T) {
+	a, s := newTestAgent(t)
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs libadwaita",
+		Items:   map[string]specLedger{"F0.1": {}, "F0.2": {}},
+		Blocked: []specBlock{{ID: "§12-decisions#x", Reason: "the planner asked a question"}}}
+	prompt := a.specFinalPrompt(s.ID, cfg, idx, "just test")
+	for _, want := range []string{"use gtk4-rs libadwaita", "`rust/README.md`", "just test", "2 items, 1 blocked",
+		"§12-decisions#x: the planner asked a question", "spec/00-principles.md", "`--help`", "snapshot"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("final prompt lacks %q", want)
+		}
+	}
+	if strings.Contains(prompt, "{{") {
+		t.Errorf("unfilled placeholder:\n%s", prompt)
+	}
+	if !strings.Contains(a.specFinalPrompt(s.ID, &specConfig{SpecDir: "spec", OutDir: "rust"}, idx, "cargo test"), "none") {
+		t.Error("no blocked items must render as none")
+	}
+}
+
+// TestRunSpecTestsTailCarriesExitStatus: a test command that dies before
+// printing anything still tells why; an empty "end of its output" helped
+// nobody.
+func TestRunSpecTestsTailCarriesExitStatus(t *testing.T) {
+	h := newTerminalHarness(t)
+	pass, tail := h.agent.runSpecTests(context.Background(), h.sess.ID, t.TempDir(), "rust", "exit 3")
+	if pass || !strings.Contains(tail, "printed nothing") || !strings.Contains(tail, "exit status 3") {
+		t.Errorf("pass=%v tail=%q", pass, tail)
+	}
+	pass, tail = h.agent.runSpecTests(context.Background(), h.sess.ID, t.TempDir(), "rust", "echo boom; exit 4")
+	if pass || !strings.Contains(tail, "boom") || !strings.Contains(tail, "exit status 4") {
+		t.Errorf("pass=%v tail=%q", pass, tail)
 	}
 }

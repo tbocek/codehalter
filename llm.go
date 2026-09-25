@@ -811,6 +811,12 @@ func (a *agent) streamOutcomeError(conn *LLMConnection, reqBody map[string]any, 
 		case float64:
 			reqMax = int(v)
 		}
+		// A one-token request is a warm-up (prewarm, keepWarm): the single
+		// token it can produce is a reasoning token, and that is not the
+		// model stuck in <think>, it is the request doing its job.
+		if reqMax == 1 {
+			return nil
+		}
 		// The length limit was the n_ctx ceiling, not the cap, when EITHER the
 		// generation stopped below the cap (completion < reqMax), OR the prompt
 		// left less than a full generation of room (prompt + reqMax > n_ctx). The

@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -422,7 +423,16 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		}
 		w := r.pickWork(ctx, covered, testFiles)
 		if w.Item == "" {
-			r.say(ctx, fmt.Sprintf("\n✅ **/spec finished**: every item in `%s/` is covered by a passing test, or blocked.\n\n", cfg.SpecDir))
+			if r.needsFinalPass() {
+				if err := r.finalPass(ctx); err != nil {
+					return stopped(err)
+				}
+			}
+			r.say(ctx, fmt.Sprintf("\n✅ **/spec finished**: every item in `%s/` is covered by a passing test, or blocked.", cfg.SpecDir))
+			if cfg.Final != nil {
+				r.say(ctx, fmt.Sprintf(" `%s/README.md` says how to build, run and test it.", cfg.OutDir))
+			}
+			r.say(ctx, "\n\n")
 			break
 		}
 		// The pre-turn checks a typed prompt gets: settings reload, skills for a
@@ -597,6 +607,82 @@ func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testF
 	}
 	w.Reason = r.reasons[w.Item]
 	return w
+}
+
+// specFinalPrompt renders SPEC-FINAL.md: the whole-program round after the
+// last item, with the target, the standing rules, every spec file, the test
+// command and the blocked list filled in.
+func (a *agent) specFinalPrompt(sid string, cfg *specConfig, idx *specIndex, testCmd string) string {
+	target := cfg.Target
+	if target == "" {
+		target = "No technology was given with /spec; the project in the output directory is what it is."
+	}
+	context := ""
+	if files := cfg.context(idx); len(files) > 0 {
+		for i, f := range files {
+			files[i] = "`" + cfg.SpecDir + "/" + f + "`"
+		}
+		context = "Standing rules: " + strings.Join(files, ", ") + "."
+	}
+	var docs []string
+	for _, d := range idx.docs {
+		docs = append(docs, "`"+cfg.SpecDir+"/"+d.rel+"`")
+	}
+	blocked := "none"
+	if len(cfg.Blocked) > 0 {
+		var lines []string
+		for _, b := range cfg.Blocked {
+			lines = append(lines, "- "+b.ID+": "+b.Reason)
+		}
+		blocked = strings.Join(lines, "\n")
+	}
+	rep := strings.NewReplacer(
+		"{{spec_dir}}", cfg.SpecDir, "{{out_dir}}", cfg.OutDir, "{{target}}", target,
+		"{{test_cmd}}", testCmd, "{{items}}", strconv.Itoa(len(cfg.Items)),
+		"{{blocked_count}}", strconv.Itoa(len(cfg.Blocked)), "{{blocked}}", blocked,
+		"{{context}}", context, "{{files}}", strings.Join(docs, ", "),
+	)
+	return collapseBlankLines(rep.Replace(a.loadPromptFile(sid, "SPEC-FINAL.md")))
+}
+
+// needsFinalPass: the final pass runs once every item is done, and again when
+// the ledger has moved since (an item finished later, a block resolved), so
+// the README and the whole-program check stay true to what was built.
+func (r *specRun) needsFinalPass() bool {
+	f := r.cfg.Final
+	return f == nil || f.Items != len(r.cfg.Items) || f.Blocked != len(r.cfg.Blocked)
+}
+
+// finalPass is the round after the last item (SPEC-FINAL.md): build the whole
+// the way a user would, run it, compare screens with the spec, look for the
+// seams between items, and write the README that tells the user how to try
+// it. It counts when the test command passes afterwards; then it is committed
+// and recorded, and it is not repeated until the ledger moves.
+func (r *specRun) finalPass(ctx context.Context) error {
+	cfg := r.cfg
+	prompt := r.a.specFinalPrompt(r.sid, cfg, r.idx, r.testCmd())
+	r.say(ctx, "\n## /spec final pass · build, run and write the README\n\n")
+	turnErr := r.a.runPromptTurn(ctx, r.sess, prompt)
+	if isCancelled(turnErr) {
+		return turnErr
+	}
+	if turnErr != nil {
+		r.say(ctx, "⚠ final pass: the round ended with an error: "+firstLine(turnErr.Error())+". It runs again on the next /spec.\n")
+		return nil
+	}
+	pass, tail := r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, r.testCmd())
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !pass {
+		r.say(ctx, "⚠ final pass: the test command did not pass afterwards, so it is not recorded and runs again on the next /spec. The end of its output:\n"+tail+"\n")
+		return nil
+	}
+	sha := r.a.specCommit(ctx, r.sid, r.sess.Cwd, cfg, r.idx, "final pass", specModeItem)
+	cfg.Final = &specFinal{Items: len(cfg.Items), Blocked: len(cfg.Blocked), Commit: sha, At: time.Now().UTC(), Version: versionStamp()}
+	r.save(ctx)
+	r.say(ctx, "✅ final pass done.\n")
+	return nil
 }
 
 // finishRound judges a round: run the tests, re-scan coverage, commit, then
@@ -831,8 +917,17 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 	}
 	took := humanDuration(time.Since(start).Milliseconds())
 	if err != nil {
-		if tctx.Err() == context.DeadlineExceeded {
+		// The exit status always goes on the tail: a command that dies
+		// before printing (a signal, a missing binary, a shell that bailed)
+		// otherwise leaves the user and the model with an empty "end of its
+		// output".
+		switch {
+		case tctx.Err() == context.DeadlineExceeded:
 			tail += fmt.Sprintf("\n[codehalter stopped the test command after %s]", specTestTimeout)
+		case strings.TrimSpace(tail) == "":
+			tail = fmt.Sprintf("[the command printed nothing and ended with: %v]", err)
+		default:
+			tail += fmt.Sprintf("\n[%v]", err)
 		}
 		a.say(ctx, sid, fmt.Sprintf("🧪 tests failed after %s\n", took))
 		return false, tail

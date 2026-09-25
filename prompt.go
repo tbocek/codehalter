@@ -1030,6 +1030,7 @@ var shippedPrompts = map[string]string{
 	"SPEC.md":        defaultSpecMD,
 	"SPEC-SETUP.md":  defaultSpecSetupMD,
 	"SPEC-REMOVE.md": defaultSpecRemoveMD,
+	"SPEC-FINAL.md":  defaultSpecFinalMD,
 }
 
 // loadPromptFile returns a phase prompt: the project's own copy in .codehalter

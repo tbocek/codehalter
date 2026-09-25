@@ -106,6 +106,19 @@ type specConfig struct {
 	// from the code every round; this answers "is that test still about what
 	// the spec says NOW?", which nothing in the code can know.
 	Items map[string]specLedger `toml:"items,omitempty"`
+	// Final records the final pass (SPEC-FINAL.md): the round that runs once
+	// every item is covered, builds and runs the whole and writes the README.
+	// It is redone when the item or blocked count has moved since.
+	Final *specFinal `toml:"final,omitempty"`
+}
+
+// specFinal is the ledger's record of the final pass.
+type specFinal struct {
+	Items   int       `toml:"items"`
+	Blocked int       `toml:"blocked"`
+	Commit  string    `toml:"commit,omitempty"`
+	At      time.Time `toml:"at"`
+	Version string    `toml:"version,omitempty"`
 }
 
 // specLedger is one finished item, recorded when its test passed and its commit
@@ -1205,7 +1218,11 @@ func specReconcile(cfg *specConfig, idx *specIndex, covered map[string]string) s
 	for _, id := range idx.order {
 		led, known := cfg.Items[id]
 		switch {
-		case !known && covered[id] != "":
+		// A test that names the item counts as done only when no round on
+		// it has failed: after a failed round the test is there but the
+		// suite did not pass, and adopting it would end the run with the
+		// item unfinished (one did, and /spec reported itself finished).
+		case !known && covered[id] != "" && cfg.Attempts[id] == 0:
 			cfg.Items[id] = specLedger{Hash: hashes[id], Title: idx.items[id].Title,
 				File: idx.docs[idx.items[id].Doc].rel, CoveredBy: covered[id],
 				At: time.Now().UTC(), Version: versionStamp()}
@@ -1559,7 +1576,13 @@ func renderSpecDelta(d specDelta) string {
 
 func nextSpecItem(idx *specIndex, covered map[string]string, cfg *specConfig) (id, answer string) {
 	for _, it := range idx.order {
-		if _, ok := covered[it]; ok {
+		// In the ledger: done. Covered but not in the ledger: done too, unless
+		// a round on it failed since, in which case the test exists but the
+		// suite does not pass, and the item is open.
+		if _, done := cfg.Items[it]; done {
+			continue
+		}
+		if _, ok := covered[it]; ok && cfg.Attempts[it] == 0 {
 			continue
 		}
 		if b := cfg.block(it); b != nil {

@@ -509,3 +509,44 @@ func TestSpecSetupOptions(t *testing.T) {
 		t.Errorf("with no page suggestion the directory's own stack leads: %v", got)
 	}
 }
+
+// TestSpecFailedRoundStaysOpen: a test that names an item counts as done only
+// while no round on it has failed. After a failed round the test is there but
+// the suite did not pass; adopting it then ended a run with the item
+// unfinished and /spec reporting itself finished.
+func TestSpecFailedRoundStaysOpen(t *testing.T) {
+	root := writeSpecFixture(t)
+	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := idx.order[0]
+	covered := map[string]string{item: "tests/x.rs"}
+	cfg := &specConfig{Attempts: map[string]int{item: 1}}
+
+	if d := specReconcile(cfg, idx, covered); d.Adopted != 0 {
+		t.Errorf("adopted %d, want 0: the item's last round failed", d.Adopted)
+	}
+	if _, known := cfg.Items[item]; known {
+		t.Error("a failed item landed in the ledger")
+	}
+	if id, _ := nextSpecItem(idx, covered, cfg); id != item {
+		t.Errorf("next = %q, want %q picked again", id, item)
+	}
+
+	// An item already in the ledger is done whatever its attempt count says
+	// (a ledger written before this rule may carry a stale count).
+	cfg.Items[item] = specLedger{Hash: specItemHash(idx, item)}
+	if id, _ := nextSpecItem(idx, covered, cfg); id == item {
+		t.Error("a ledgered item was picked again because of a stale attempt count")
+	}
+	delete(cfg.Items, item)
+
+	delete(cfg.Attempts, item) // the item passed
+	if d := specReconcile(cfg, idx, covered); d.Adopted != 1 {
+		t.Errorf("adopted %d, want 1 once no failed round stands", d.Adopted)
+	}
+	if id, _ := nextSpecItem(idx, covered, cfg); id == item {
+		t.Error("a covered item with no failed round was picked again")
+	}
+}

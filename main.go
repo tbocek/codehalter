@@ -38,6 +38,9 @@ var defaultSpecSetupMD string
 //go:embed res/SPEC-REMOVE.md
 var defaultSpecRemoveMD string
 
+//go:embed res/SPEC-FINAL.md
+var defaultSpecFinalMD string
+
 //go:embed res/Dockerfile.devcontainer.alpine
 var defaultDevcontainerDockerfileAlpine string
 
