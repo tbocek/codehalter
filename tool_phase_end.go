@@ -71,6 +71,26 @@ var submitPlanTool = Tool{Def: map[string]any{
 					"type":        "boolean",
 					"description": "True when the whole request is informational and you already have the answer — no edits, no commands. Skips the execute-confirmation gate.",
 				},
+				"redo": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"description": "Only in a project built with /spec: the ids of the spec items this request concerns when it is more than one plan's worth of work (a page to build, a program to make work). codehalter reopens them and rebuilds them one per round. No subtasks with this.",
+				},
+				"spec": map[string]any{
+					"type":        "array",
+					"description": "Only in a project WITHOUT a spec, when the request is more than one plan's worth of work: the request written down as a specification, one or more markdown files, one headed section per requirement with the statements a test can check. codehalter writes them, shows the user, and runs /spec on them. No subtasks with this.",
+					"items": map[string]any{
+						"type":     "object",
+						"required": []string{"path", "content"},
+						"properties": map[string]any{
+							"path":    map[string]any{"type": "string", "description": "File name inside the spec directory, for example `01-files.md`."},
+							"content": map[string]any{"type": "string", "description": "The markdown."},
+						},
+					},
+				},
+				"spec_dir": map[string]any{"type": "string", "description": "With `spec`: the directory to write it to, relative to the project root. Default `spec`."},
+				"out_dir":  map[string]any{"type": "string", "description": "With `spec`: where the program is built, relative to the project root (an existing manifest's directory, or a new one)."},
+				"target":   map[string]any{"type": "string", "description": "With `spec`: the technology to build it with, in a few words."},
 				"answer": map[string]any{
 					"type":        "string",
 					"description": "The complete answer for the user, when report_only=true and subtasks is empty. This is what the user reads: everything you found, in full, not a promise to write it. Empty otherwise.",

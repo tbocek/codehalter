@@ -287,6 +287,10 @@ type sessionRuntime struct {
 	// specFenceDir is the spec directory a running /spec loop has made
 	// read-only for the file tools (spec_loop.go); "" when no loop runs.
 	specFenceDir string
+	// specHandoff is a /spec command the planner asked for instead of a
+	// plan ("resume", or "redo <ids>"), run by Prompt once the planning turn
+	// has closed. Runtime-only.
+	specHandoff string
 }
 
 // startTurn gives the session a fresh turnState: nothing one turn saw (dedup,

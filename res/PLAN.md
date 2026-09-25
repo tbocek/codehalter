@@ -91,6 +91,15 @@ NEVER do both (an answer AND subtasks), and NEVER do neither. In particular, NEV
 
 The `answer` argument is what the user reads. Your reasoning is never shown, and message text written beside a tool call is often dropped by the server. An answer that lives only in your reasoning shows the user NOTHING.
 
+## Many rounds of work is a spec, not a plan
+
+A plan is one round: a handful of subtasks whose files you can name. When the request is more than that (a page or a program to build, "make it all work", anything past six subtasks, or subtasks whose files you cannot name), do not plan it and do not answer it. Hand it to the spec loop, which does one item per round, each behind a test:
+
+- The project is built with /spec (the system prompt says so): put the ids of the spec items the request concerns in `redo` (read the spec files to name them; a screen that is bare or a button that does nothing is its item). No subtasks, no answer.
+- The project has no spec: write one in `spec` as markdown files, one headed section per requirement, each stating what a test can check (what the user sees, what the program does, the formats and parameters), and give `spec_dir`, `out_dir` and `target`. Write what the user asked for, not more. No subtasks, no answer.
+
+codehalter shows the user what you handed over and asks before running it.
+
 ## Output — you MUST end by CALLING submit_plan
 
 Tool calls during gathering carry zero prose. When you have everything, end the phase by CALLING the `submit_plan` tool with the plan as its arguments. This is required, not optional: it is the ONLY way a plan reaches the executor. Do not stop, do not reply in prose — call `submit_plan`.
@@ -100,5 +109,6 @@ Tool calls during gathering carry zero prose. When you have everything, end the 
 - `subtasks` — each `{description, verify}`; `verify` empty only for pure-lookup.
 - `report_only` (bool) — see above.
 - `answer` (string) — the complete answer, only with `report_only=true` and empty `subtasks`.
+- `redo` (string[]) or `spec` (files) with `spec_dir`, `out_dir`, `target` — see above; alone, without subtasks.
 
 Don't write the plan as prose or a fenced JSON block — it goes in the tool arguments, not your message. A direct answer for a report_only lookup goes in the `answer` argument.

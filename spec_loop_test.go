@@ -5,8 +5,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSpecDecide pins an item's fate after a round: done only when a test names
@@ -235,5 +237,83 @@ func TestRunSpecTestsTailCarriesExitStatus(t *testing.T) {
 	pass, tail = h.agent.runSpecTests(context.Background(), h.sess.ID, t.TempDir(), "rust", "echo boom; exit 4")
 	if pass || !strings.Contains(tail, "boom") || !strings.Contains(tail, "exit status 4") {
 		t.Errorf("pass=%v tail=%q", pass, tail)
+	}
+}
+
+// TestSpecRoundOwnGreenRun: the round's last plain run of the test command,
+// exit 0 from the terminal, in the output directory, with nothing written
+// since, is the check; anything less means codehalter runs the suite itself.
+func TestSpecRoundOwnGreenRun(t *testing.T) {
+	a, sess := newTestAgent(t)
+	out := filepath.Join(sess.Cwd, "rust")
+	if err := os.MkdirAll(filepath.Join(out, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(out, "src", "lib.rs"), []byte("fn a() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: &specConfig{OutDir: "rust"}, outAbs: out}
+	ran := func(cmd, output string) ToolUse {
+		return ToolUse{Name: "run_command", Input: `{"command":` + strconv.Quote(cmd) + `}`, Output: output, StartedAt: time.Now().Add(time.Second), DurationMs: 10}
+	}
+	edit := ToolUse{Name: "edit_file", Input: `{"path":"rust/src/lib.rs"}`}
+
+	if !r.roundRanGreen([]ToolUse{edit, ran("cd rust && just test > /tmp/t.log 2>&1", "exit 0\n\n")}, "just test") {
+		t.Error("a plain green run after the last edit did not count")
+	}
+	if !r.roundRanGreen([]ToolUse{ran("cd "+out+" && just test", "exit 0\n\nok")}, "just test") {
+		t.Error("an absolute cd to the output dir did not count")
+	}
+	for name, uses := range map[string][]ToolUse{
+		"wrapped, exit is the echo's": {ran("cd rust && (just test > /tmp/t.log 2>&1; echo exit=$? >> /tmp/t.log)", "exit 0\n")},
+		"red":                         {ran("cd rust && just test", "exit 101\n")},
+		"edited after the run":        {ran("cd rust && just test", "exit 0\n"), edit},
+		"wrong directory":             {ran("just test", "exit 0\n")},
+		"handed over, no exit yet":    {ran("cd rust && just test", "still running after 2m")},
+	} {
+		if r.roundRanGreen(uses, "just test") {
+			t.Errorf("%s: counted as green", name)
+		}
+	}
+	// A file written after the run, by whatever means.
+	uses := []ToolUse{ran("cd rust && just test", "exit 0\n")}
+	uses[0].StartedAt = time.Now().Add(-time.Minute)
+	if r.roundRanGreen(uses, "just test") {
+		t.Error("a source file newer than the run did not force a re-run")
+	}
+}
+
+// TestSpecUIChangeNeedsALook: a round that edits a file importing a UI
+// toolkit without one screenshot call is not done, with the reason; a round
+// that looked, or one that touched no UI file, is unaffected.
+func TestSpecUIChangeNeedsALook(t *testing.T) {
+	_, sess := newTestAgent(t)
+	ui := filepath.Join(sess.Cwd, "rust", "src", "ui.rs")
+	plain := filepath.Join(sess.Cwd, "rust", "src", "rules.rs")
+	if err := os.MkdirAll(filepath.Dir(ui), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ui, []byte("use gtk::prelude::*;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(plain, []byte("pub fn floor() -> f64 { 0.1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	editUI := ToolUse{Name: "edit_file", Input: `{"path":"rust/src/ui.rs"}`}
+	editPlain := ToolUse{Name: "write_file", Input: `{"path":"rust/src/rules.rs"}`}
+	look := ToolUse{Name: "screenshot", Input: `{"path":"rust/shots/03-window.png"}`}
+
+	if got := uiEditedUnseen([]ToolUse{editPlain, editUI}, sess.Cwd); strings.Join(got, ",") != "rust/src/ui.rs" {
+		t.Errorf("unseen = %v, want the UI file alone", got)
+	}
+	if got := uiEditedUnseen([]ToolUse{editUI, look}, sess.Cwd); got != nil {
+		t.Errorf("a round that looked reports %v", got)
+	}
+	if got := uiEditedUnseen([]ToolUse{editPlain}, sess.Cwd); got != nil {
+		t.Errorf("a round with no UI change reports %v", got)
+	}
+	done, block, reason := specDecide(&specConfig{}, "F1.1", specRoundResult{Covered: true, TestsPass: true, UIUnseen: []string{"rust/src/ui.rs"}})
+	if done || block || !strings.Contains(reason, "never looked at it") {
+		t.Errorf("decide = %v %v %q, want one more round with the reason", done, block, reason)
 	}
 }

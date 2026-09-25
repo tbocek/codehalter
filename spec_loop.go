@@ -68,6 +68,22 @@ func (s *Session) requestSpecStop() {
 	s.rt.mu.Unlock()
 }
 
+// setSpecHandoff records the /spec command the planner handed back instead
+// of a plan; takeSpecHandoff returns and clears it.
+func (s *Session) setSpecHandoff(cmd string) {
+	s.rt.mu.Lock()
+	s.rt.specHandoff = cmd
+	s.rt.mu.Unlock()
+}
+
+func (s *Session) takeSpecHandoff() string {
+	s.rt.mu.Lock()
+	cmd := s.rt.specHandoff
+	s.rt.specHandoff = ""
+	s.rt.mu.Unlock()
+	return cmd
+}
+
 // takeSpecStop reports and clears a pending stop request.
 func (s *Session) takeSpecStop() bool {
 	s.rt.mu.Lock()
@@ -118,6 +134,9 @@ type specRoundResult struct {
 	Mode      specMode
 	Committed bool   // the round left something to commit
 	Question  string // the planner asked instead of working (autopilot)
+	// UIUnseen lists UI source files the round edited without once looking
+	// at a screen (no screenshot call): a screen that was built blind.
+	UIUnseen  []string
 	TurnErr   string // the round itself failed
 	TestsPass bool
 	TestTail  string
@@ -146,11 +165,14 @@ func specDecide(cfg *specConfig, item string, r specRoundResult) (done, block bo
 			return true, false, ""
 		}
 	default:
-		if r.TurnErr == "" && r.Covered && r.TestsPass {
+		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen) == 0 {
 			return true, false, ""
 		}
 	}
 	var why []string
+	if len(r.UIUnseen) > 0 && r.TurnErr == "" {
+		why = append(why, fmt.Sprintf("you changed the UI (%s) and never looked at it: render the screen with the `snapshot` recipe and look at the image with `screenshot`, whether or not the spec has a picture of it; check that every widget the text names is there, nothing is empty, overlapping or unlabeled, and fix what you see", strings.Join(r.UIUnseen, ", ")))
+	}
 	if r.TurnErr != "" {
 		why = append(why, "the round ended with an error: "+r.TurnErr)
 	}
@@ -452,11 +474,12 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 
 		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, covered, r.testCmd())
 		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
+		since := len(sess.Messages) // the round's own tool calls start here
 		turnErr := a.runPromptTurn(ctx, sess, prompt)
 		if isCancelled(turnErr) {
 			return stopped(turnErr)
 		}
-		done, block, err := r.finishRound(ctx, w, turnErr)
+		done, block, err := r.finishRound(ctx, w, turnErr, roundToolUses(sess, since))
 		if err != nil {
 			return stopped(err)
 		}
@@ -664,6 +687,274 @@ func (a *agent) specFinalPrompt(sid string, cfg *specConfig, idx *specIndex, tes
 	return collapseBlankLines(rep.Replace(a.loadPromptFile(sid, "SPEC-FINAL.md")))
 }
 
+// roundToolUses flattens the tool calls a round made, in order: everything
+// recorded on the session since the round's prompt was added.
+func roundToolUses(sess *Session, since int) []ToolUse {
+	var uses []ToolUse
+	for i := since; i < len(sess.Messages); i++ {
+		uses = append(uses, sess.Messages[i].ToolUses...)
+	}
+	return uses
+}
+
+// roundRanGreen reports that the round's own last test run counts as the
+// check: a run_command that was the test command itself, run in the output
+// directory, exited 0 (the exit code comes from the terminal, not from the
+// model), with no file tool after it and no file under the output directory
+// written since. A wrapped run (`(just test > log; echo exit=$?)`) does not
+// count: its exit code is the echo's.
+func (r *specRun) roundRanGreen(uses []ToolUse, cmd string) bool {
+	last := -1
+	for i, u := range uses {
+		switch u.Name {
+		case "edit_file", "write_file":
+			last = -1 // a later change: the run before it proves nothing
+		case "run_command":
+			if testRunMatches(parseArgs(u.Input).str("command"), cmd, r.sess.Cwd, r.outAbs) && strings.HasPrefix(u.Output, "exit 0\n") {
+				last = i
+			}
+		}
+	}
+	if last < 0 {
+		return false
+	}
+	u := uses[last]
+	ended := u.StartedAt.Add(time.Duration(u.DurationMs) * time.Millisecond)
+	if u.StartedAt.IsZero() {
+		return false
+	}
+	return !writtenSince(r.outAbs, ended)
+}
+
+// testRunMatches: line is `<test cmd>` run in outAbs, either as is (the
+// terminal's cwd is the project root, so a bare run only matches when the
+// output directory IS the root) or after `cd <output dir> &&`, optionally
+// followed by redirections and nothing else.
+func testRunMatches(line, cmd, cwd, outAbs string) bool {
+	line = strings.TrimSpace(line)
+	dir := cwd
+	if strings.HasPrefix(line, "cd ") {
+		rest := strings.TrimSpace(line[3:])
+		i := strings.Index(rest, "&&")
+		if i < 0 {
+			return false
+		}
+		d := strings.Trim(strings.TrimSpace(rest[:i]), "'\"")
+		if !filepath.IsAbs(d) {
+			d = filepath.Join(cwd, d)
+		}
+		dir = d
+		line = strings.TrimSpace(rest[i+2:])
+	}
+	if filepath.Clean(dir) != filepath.Clean(outAbs) {
+		return false
+	}
+	if !strings.HasPrefix(line, cmd) {
+		return false
+	}
+	tail := strings.TrimSpace(line[len(cmd):])
+	// Only redirections may follow: `> f`, `>> f`, `2>&1`, `2> f`.
+	for _, tok := range strings.Fields(tail) {
+		switch {
+		case tok == "2>&1", strings.HasPrefix(tok, ">"), strings.HasPrefix(tok, "2>"):
+		case strings.ContainsAny(tok, ";&|(`$"):
+			return false
+		default:
+			// a redirection's file name, which must have followed a `>`
+			if !strings.Contains(tail, ">") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// writtenSince reports a regular file under root with a modification time
+// after t, skipping build output, dependencies, screenshots and dot dirs.
+func writtenSince(root string, t time.Time) bool {
+	found := false
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || found {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != root && (strings.HasPrefix(name, ".") || name == "target" || name == "node_modules" || name == "shots" || name == "dist" || name == "build") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.ModTime().After(t) {
+			found = true
+		}
+		return nil
+	})
+	return found
+}
+
+// hasSnapshotRecipe: the output directory's justfile can render a screen, so
+// looking at one is possible and a UI change without a look is a blind one.
+func hasSnapshotRecipe(outAbs string) bool {
+	for _, name := range []string{"justfile", "Justfile", ".justfile"} {
+		if data, err := os.ReadFile(filepath.Join(outAbs, name)); err == nil {
+			for _, ln := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(ln, "snapshot:") || strings.HasPrefix(ln, "snapshot ") {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// uiMarkers are what a desktop UI source file imports.
+var uiMarkers = []string{"gtk::", "adw::", "use gtk", "use adw", "gtk4::", "libadwaita", "QtWidgets", "QWidget", "#include <Q", "from PyQt", "from PySide", "import tkinter", "egui::", "iced::", "slint::", "fltk::"}
+
+// uiEditedUnseen returns the UI source files the round wrote (by their
+// content now, not by their name) when the round made no screenshot call.
+func uiEditedUnseen(uses []ToolUse, cwd string) []string {
+	seen := map[string]bool{}
+	var files []string
+	for _, u := range uses {
+		switch u.Name {
+		case "screenshot":
+			return nil
+		case "edit_file", "write_file":
+			path := parseArgs(u.Input).str("path")
+			if path == "" || seen[path] {
+				continue
+			}
+			seen[path] = true
+			abs := path
+			if !filepath.IsAbs(abs) {
+				abs = filepath.Join(cwd, abs)
+			}
+			data, err := os.ReadFile(abs)
+			if err != nil {
+				continue
+			}
+			for _, m := range uiMarkers {
+				if strings.Contains(string(data), m) {
+					files = append(files, path)
+					break
+				}
+			}
+		}
+	}
+	return files
+}
+
+// specFile is one file of a spec the planner wrote for a request too large
+// for a plan.
+type specFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+// writeSpecFiles puts the planner's spec on disk under specDir, relative to
+// cwd. It writes new files only: a spec the user may already have edited is
+// never overwritten, and a path that leaves the directory is refused. The
+// written paths come back relative to cwd.
+func writeSpecFiles(cwd, specDir string, files []specFile) ([]string, error) {
+	dir := filepath.Clean(filepath.Join(cwd, specDir))
+	var written []string
+	for _, f := range files {
+		rel := filepath.Clean(strings.TrimPrefix(f.Path, specDir+"/"))
+		if rel == "." || rel == "" || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+			return written, fmt.Errorf("spec file path %q is not inside %s/", f.Path, specDir)
+		}
+		abs := filepath.Join(dir, rel)
+		if _, err := os.Stat(abs); err == nil {
+			return written, fmt.Errorf("%s exists already; the planner writes a spec only into empty space", filepath.Join(specDir, rel))
+		}
+		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
+			return written, err
+		}
+		if err := os.WriteFile(abs, []byte(strings.TrimRight(f.Content, "\n")+"\n"), 0o644); err != nil {
+			return written, err
+		}
+		written = append(written, filepath.ToSlash(filepath.Join(specDir, rel)))
+	}
+	return written, nil
+}
+
+// specFromPlan is the planner's third exit: the request is more work than a
+// plan can carry, so it came back as spec items to reopen (a project with a
+// spec) or as a spec to write (a project without). Either way the loop does
+// the work, one item per round with its test gate, and the user says yes
+// first: a spec the model wrote is the model's reading of the request, and
+// forty rounds should not be tested against it unread.
+func (a *agent) specFromPlan(ctx context.Context, sid string, sess *Session, p *planResult) (toolLoopResult, error) {
+	cfg, err := loadSpecConfig(sess.Cwd)
+	if err != nil {
+		a.say(ctx, sid, "⚠ "+err.Error()+"\n")
+		return toolLoopResult{}, nil
+	}
+	if len(p.Redo) > 0 {
+		if cfg == nil {
+			a.say(ctx, sid, "⚠ The planner named spec items to redo, but this project has no /spec ledger. Run /spec first.\n")
+			return toolLoopResult{}, nil
+		}
+		ids := strings.Join(p.Redo, " ")
+		a.say(ctx, sid, fmt.Sprintf("The planner reads this request as %d item(s) of the spec that are recorded as done but do not deliver: %s\n\n", len(p.Redo), strings.Join(p.Redo, ", ")))
+		ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Reopen %d spec item(s) and rebuild them with /spec, one per round?", len(p.Redo)), "think", "Run /spec", "Not now")
+		if err != nil {
+			a.FailToolCall(ctx, sid, tcId, err.Error())
+			return toolLoopResult{}, nil
+		}
+		if !ok {
+			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Nothing reopened")})
+			a.say(ctx, sid, "Nothing reopened. `/spec redo "+ids+"` does it later.\n")
+			return toolLoopResult{Text: "not now"}, nil
+		}
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Handing over to /spec")})
+		sess.setSpecHandoff("redo " + ids)
+		return toolLoopResult{Text: "handed over to /spec"}, nil
+	}
+	// A spec to write.
+	if cfg != nil {
+		a.say(ctx, sid, fmt.Sprintf("⚠ The planner wrote a new spec, but this project already has one in `%s/`. A request this size maps onto that spec's items (`redo`), it does not get a second spec. Nothing was written.\n", cfg.SpecDir))
+		return toolLoopResult{}, nil
+	}
+	specDir := strings.Trim(filepath.ToSlash(filepath.Clean(p.SpecDir)), "/")
+	if specDir == "" || specDir == "." {
+		specDir = "spec"
+	}
+	written, err := writeSpecFiles(sess.Cwd, specDir, p.Spec)
+	if err != nil {
+		a.say(ctx, sid, "⚠ writing the spec: "+err.Error()+"\n")
+		return toolLoopResult{}, nil
+	}
+	idx, err := scanSpec(filepath.Join(sess.Cwd, specDir), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		a.say(ctx, sid, "⚠ reading the spec back: "+err.Error()+"\n")
+		return toolLoopResult{}, nil
+	}
+	a.say(ctx, sid, fmt.Sprintf("This request is more than one round of work, so the planner wrote it down as a spec: %s, %d item(s). Read it; it is the model's reading of what you asked, and the loop will build and test exactly that.\n\n", strings.Join(written, ", "), len(idx.order)))
+	if p.OutDir != "" {
+		specRel, outRel, err := specPaths(sess.Cwd, specDir, p.OutDir)
+		if err == nil {
+			err = saveSpecConfig(sess.Cwd, &specConfig{SpecDir: specRel, OutDir: outRel, Target: p.Target})
+		}
+		if err != nil {
+			a.say(ctx, sid, "⚠ /spec: "+err.Error()+"\n")
+		}
+	}
+	ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Run /spec on %s now (%d items, one per round)?", specDir+"/", len(idx.order)), "think", "Run /spec", "Let me read it first")
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		return toolLoopResult{}, nil
+	}
+	if !ok {
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Spec written, loop not started")})
+		a.say(ctx, sid, "The spec is in `"+specDir+"/`. Edit it as you like, then `/spec` builds it.\n")
+		return toolLoopResult{Text: "spec written"}, nil
+	}
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Handing over to /spec")})
+	sess.setSpecHandoff("resume")
+	return toolLoopResult{Text: "handed over to /spec"}, nil
+}
+
 // specRedoReason is what a round on a reopened item is told, in the place
 // where a failed round's reason goes.
 const specRedoReason = "The user sent this item back with /spec redo. It was implemented and its test passes, but what was built does not do what the spec says: a screen without its widgets, a button without its wire, a flow that cannot be reached from the UI. Rebuild it against the spec text below under the rules above. Keep and extend the existing code and tests where they are right. Where AGENT.md describes the old state as the design, correct it."
@@ -711,7 +1002,7 @@ func (r *specRun) finalPass(ctx context.Context) error {
 // finishRound judges a round: run the tests, re-scan coverage, commit, then
 // decide the item's fate and record it. err is non-nil only when the run was
 // cancelled meanwhile.
-func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error) (done, block bool, err error) {
+func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, uses []ToolUse) (done, block bool, err error) {
 	cfg, item := r.cfg, w.Item
 	res := specRoundResult{Mode: w.Mode}
 	var covered map[string]string
@@ -722,13 +1013,23 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error) (d
 		if turnErr != nil {
 			res.TurnErr = turnErr.Error()
 		}
-		if cmd := r.testCmd(); cmd == "" {
+		switch cmd := r.testCmd(); {
+		case cmd == "":
 			res.TestTail = "no test command found: `" + cfg.OutDir + "/` has no justfile with a test recipe, no Cargo.toml, package.json or go.mod"
-		} else {
+		case r.roundRanGreen(uses, cmd):
+			// The round ended with the suite green, after its last change:
+			// that run is the check. Running it again cost four of every
+			// round's twenty-three minutes for the same answer.
+			res.TestsPass = true
+			r.say(ctx, fmt.Sprintf("🧪 `%s` passed in the round, after its last change; not run again\n", cmd))
+		default:
 			res.TestsPass, res.TestTail = r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd)
 			if err := ctx.Err(); err != nil {
 				return false, false, err
 			}
+		}
+		if w.Mode != specModeRemove && hasSnapshotRecipe(r.outAbs) {
+			res.UIUnseen = uiEditedUnseen(uses, r.sess.Cwd)
 		}
 		var testFiles int
 		covered, testFiles, _ = specCoverage(r.outAbs, r.idx.order)

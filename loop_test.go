@@ -1424,3 +1424,21 @@ func TestPlanAnswerInArgument(t *testing.T) {
 		t.Fatalf("plan = %+v, want the argument as the answer", plan)
 	}
 }
+
+// TestPlanRedoIsAPlan: the planner's third exit, spec items to reopen or a
+// spec to write, counts as a plan: no "neither answer nor plan" nudge, and
+// the ids come through.
+func TestPlanRedoIsAPlan(t *testing.T) {
+	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
+		`{"clear":true,"report_only":false,"subtasks":[],"redo":["F0.9","§03-shell#1-screen"]}`))
+	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if got := mock.callCount(); got != 1 {
+		t.Errorf("a redo submission cost %d LLM calls, want 1", got)
+	}
+	if plan == nil || strings.Join(plan.Redo, ",") != "F0.9,§03-shell#1-screen" {
+		t.Fatalf("plan = %+v, want the redo ids", plan)
+	}
+}

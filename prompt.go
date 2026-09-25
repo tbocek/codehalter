@@ -655,6 +655,18 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	slog.Debug("Prompt: draining pre-turn fix cards (post-turn)", "sid", req.SessionId, "fixes", len(pendingFixes))
 	a.drainFixes(ctx, req.SessionId, pendingFixes)
 
+	// The planner handed the request to /spec (specFromPlan) and the user
+	// agreed: the loop runs now, in this same turn, exactly as if /spec had
+	// been typed.
+	if sess := a.getSession(req.SessionId); sess != nil {
+		if cmd := sess.takeSpecHandoff(); cmd != "" {
+			if cmd == "resume" {
+				cmd = ""
+			}
+			return a.runSpec(ctx, req.SessionId, sess, cmd, nil)
+		}
+	}
+
 	// A turn whose ctx was cancelled along the way still returns normally here:
 	// the stop reason is how the client tells a clean turn from an abort.
 	if ctx.Err() != nil {
@@ -816,6 +828,10 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	if p == nil {
 		// No PLAN.md or unparseable response — pipeline cannot proceed.
 		return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
+	}
+	if len(p.Redo) > 0 || len(p.Spec) > 0 {
+		// Too much for a plan: the loop does it, after the user has said yes.
+		return a.specFromPlan(ctx, sid, sess, p)
 	}
 	if len(p.Subtasks) == 0 {
 		// No subtasks: a report_only direct answer — surface it (returning it as
@@ -1007,6 +1023,14 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	// mid-session cache churn.
 	if name, content := loadAgentsFile(sess.Cwd); content != "" {
 		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation. They are meant to hold across sessions, so when your work makes one of them wrong (the stack, the layout, how the project is built, run or tested), update %s in the same task: a line left stale here is believed by every session after this one.\n\n%s\n", name, name, content)
+	}
+
+	// A project built from a spec says so in the prefix, so a request that is
+	// really many rounds of work is mapped onto the spec's items (submit_plan's
+	// `redo`) instead of being planned as one turn. Stable across the session:
+	// only the two directories are named, never the moving item count.
+	if cfg, err := loadSpecConfig(sess.Cwd); err == nil && cfg != nil {
+		fmt.Fprintf(&b, "\n\n## This project is built with /spec\n\nThe specification in `%s/` is implemented into `%s/` item by item, each item done when a test names it and the suite passes (the item ids are in the spec files). A request that amounts to many rounds of work, or that says something built does not work, is not a plan here: name the spec items it concerns in submit_plan's `redo` and codehalter rebuilds them one per round.\n", cfg.SpecDir, cfg.OutDir)
 	}
 
 	// Phase guidance lives in the system prompt (the stable, cached prefix) rather

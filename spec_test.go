@@ -596,3 +596,23 @@ func TestSpecFailedRoundStaysOpen(t *testing.T) {
 		t.Error("a covered item with no failed round was picked again")
 	}
 }
+
+// TestWriteSpecFiles: the planner's spec lands under the spec dir as new
+// files only; an existing file is never overwritten and a path that leaves
+// the directory is refused.
+func TestWriteSpecFiles(t *testing.T) {
+	cwd := t.TempDir()
+	written, err := writeSpecFiles(cwd, "spec", []specFile{{Path: "01-files.md", Content: "# Files\n\n## 1. Layout\n\nF1.1 the layout"}, {Path: "spec/02-ui.md", Content: "# UI"}})
+	if err != nil || strings.Join(written, ",") != "spec/01-files.md,spec/02-ui.md" {
+		t.Fatalf("written = %v, err = %v", written, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(cwd, "spec", "02-ui.md")); string(b) != "# UI\n" {
+		t.Errorf("02-ui.md = %q", b)
+	}
+	if _, err := writeSpecFiles(cwd, "spec", []specFile{{Path: "01-files.md", Content: "again"}}); err == nil {
+		t.Error("an existing spec file was overwritten")
+	}
+	if _, err := writeSpecFiles(cwd, "spec", []specFile{{Path: "../evil.md", Content: "x"}}); err == nil {
+		t.Error("a path outside the spec dir was written")
+	}
+}

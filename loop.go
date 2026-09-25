@@ -69,6 +69,15 @@ type planResult struct {
 	// subtask only relays findings — no file edits, no commands. When
 	// true the orchestrator skips the "Execute this plan?" confirmation.
 	ReportOnly bool `json:"report_only"`
+	// Redo and Spec are the planner's third exit, for a request that is more
+	// work than one plan should carry (see specFromPlan): the ids of spec
+	// items to rebuild when the project has a spec, or a spec to write when
+	// it has none, with where it goes, where to build and with what.
+	Redo    []string   `json:"redo"`
+	Spec    []specFile `json:"spec"`
+	SpecDir string     `json:"spec_dir"`
+	OutDir  string     `json:"out_dir"`
+	Target  string     `json:"target"`
 	// Answer is the planner's user-facing prose when it answered a lookup
 	// directly (report_only with no subtasks), given as an argument. It has
 	// its own field because a server that forces the tool call (Halogen)
@@ -216,7 +225,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// pick a lane, then a re-parse. A "message" that is really a promise ("I'll
 	// summarize") reads as an answer here; keeping the model off that is
 	// PLAN.md's job, not a brittle string match.
-	hasPlan := len(plan.Subtasks) > 0
+	hasPlan := len(plan.Subtasks) > 0 || len(plan.Redo) > 0 || len(plan.Spec) > 0
 	// Prose alongside subtasks is a PREAMBLE, not an answer: report_only=false
 	// says the plan is meant to run, so there is nothing to choose between.
 	// Nudging on it cost a round trip (4-50s) on 10 of 35 measured submissions, to
