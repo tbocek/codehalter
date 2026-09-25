@@ -84,12 +84,12 @@ The executor runs every `verify` before respond; fails → fix and re-run; can't
 
 Your submission must do exactly ONE of these:
 
-- **Answer** — you already have the complete answer (a question, an explanation, a summary you can write now): put the FULL answer in your message text, set `report_only=true`, leave `subtasks` EMPTY. No execution step after this — your message IS the whole reply.
+- **Answer** — you already have the complete answer (a question, an explanation, a summary you can write now): put the FULL answer in submit_plan's `answer` argument, set `report_only=true`, leave `subtasks` EMPTY. No execution step after this — that argument IS the whole reply.
 - **Plan** — the request needs work done (produce or assemble something, an edit, a command): submit `subtasks`, leave the message empty. The executor does the work and reports back.
 
 NEVER do both (an answer AND subtasks), and NEVER do neither. In particular, NEVER write a PROMISE like "I'll summarize for you" / "let me gather the details" and stop — that is neither an answer nor a plan. report_only has NO next step, so a promise shows the user nothing. If you intend to PRODUCE something, that's a **Plan** (subtasks): leave the message empty and let execution do it. If you can answer NOW, write the WHOLE answer, not an intro to it.
 
-Your message text is what the user reads — the submit_plan arguments are machinery they never see, and your reasoning is never shown. An answer that lives only in the arguments or your reasoning shows the user NOTHING.
+The `answer` argument is what the user reads. Your reasoning is never shown, and message text written beside a tool call is often dropped by the server. An answer that lives only in your reasoning shows the user NOTHING.
 
 ## Output — you MUST end by CALLING submit_plan
 
@@ -99,5 +99,6 @@ Tool calls during gathering carry zero prose. When you have everything, end the 
 - `choices` (string[]) and `question` (string) — only when `clear=false`.
 - `subtasks` — each `{description, verify}`; `verify` empty only for pure-lookup.
 - `report_only` (bool) — see above.
+- `answer` (string) — the complete answer, only with `report_only=true` and empty `subtasks`.
 
-Don't write the plan as prose or a fenced JSON block — it goes in the tool arguments, not your message. The only prose you write is a direct answer for a report_only lookup.
+Don't write the plan as prose or a fenced JSON block — it goes in the tool arguments, not your message. A direct answer for a report_only lookup goes in the `answer` argument.

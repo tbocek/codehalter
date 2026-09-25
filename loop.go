@@ -69,12 +69,33 @@ type planResult struct {
 	// subtask only relays findings — no file edits, no commands. When
 	// true the orchestrator skips the "Execute this plan?" confirmation.
 	ReportOnly bool `json:"report_only"`
-	// answer is the planner's user-facing prose when it answered a lookup
-	// directly (report_only with no subtasks). It rides on the struct rather
-	// than the JSON — runPlanPhase sets it from the loop's separate content
-	// channel — so orchestrate can surface it instead of silently dropping a
-	// finished answer. No json tag: it never comes from the model's arguments.
+	// Answer is the planner's user-facing prose when it answered a lookup
+	// directly (report_only with no subtasks), given as an argument. It has
+	// its own field because a server that forces the tool call (Halogen)
+	// returns no message text beside it: a planner told "write the answer as
+	// your message" wrote a full audit into its reasoning twice, and the user
+	// saw "I couldn't produce a clear answer".
+	Answer string `json:"answer"`
+	// answer is the resolved answer: Answer when given, else the message
+	// text beside the call (runPlanPhase sets it from the loop's separate
+	// content channel), so orchestrate can surface it instead of silently
+	// dropping a finished answer.
 	answer string
+}
+
+// resolveAnswer fills plan.answer from the argument or, failing that, from the
+// prose the model wrote beside the call (a free-text plan has it mashed with
+// the JSON, so the JSON object is dropped out).
+func (p *planResult) resolveAnswer(res toolLoopResult) {
+	if a := strings.TrimSpace(p.Answer); a != "" {
+		p.answer = a
+		return
+	}
+	if res.RespondCalled {
+		p.answer = strings.TrimSpace(res.Content)
+	} else {
+		p.answer = strings.TrimSpace(strings.Replace(res.Text, trimJSON(res.Text), "", 1))
+	}
 }
 
 // runPlanPhase runs the planner and returns its plan, resolving any
@@ -186,14 +207,9 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		return nil, planRes.ToolUses, fmt.Errorf("plan not valid JSON: %w", parseErr)
 	}
 
-	// Direct-answer prose: when the planner called submit_plan it's in the clean
-	// content channel; a free-text plan has it mashed with the JSON, so drop the
-	// JSON object out. orchestrate shows this when the plan has no subtasks.
-	if planRes.RespondCalled {
-		plan.answer = strings.TrimSpace(planRes.Content)
-	} else {
-		plan.answer = strings.TrimSpace(strings.Replace(planRes.Text, trimJSON(planRes.Text), "", 1))
-	}
+	// Direct answer: the `answer` argument, else the prose beside the call.
+	// orchestrate shows this when the plan has no subtasks.
+	plan.resolveAnswer(planRes)
 
 	// The planner must submit EITHER an answer (a message, no subtasks) OR a
 	// plan, never both and never neither. Structural violations get ONE nudge to
@@ -208,7 +224,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 	// still nudges: those subtasks relay findings the message may already carry.
 	hasAnswer := plan.answer != "" && (!hasPlan || plan.ReportOnly)
 	if plan.Clear && hasPlan == hasAnswer {
-		nudge := "You submitted neither a usable answer nor a plan — your message is empty or only promises to act (\"I'll…\"). Either write the COMPLETE answer now (report_only=true, no subtasks), OR submit subtasks that produce it. Never write \"I'll…\" / \"let me…\"."
+		nudge := "You submitted neither a usable answer nor a plan: the `answer` argument and your message are empty, or only promise to act (\"I'll…\"). Your reasoning is never shown. Either call submit_plan again with the COMPLETE answer in its `answer` argument (report_only=true, no subtasks), OR submit subtasks that produce it. Never write \"I'll…\" / \"let me…\"."
 		if hasPlan {
 			nudge = "You submitted BOTH a final answer and a plan. Pick one: answer the user completely now (report_only=true, no subtasks), OR drop the message and submit only the subtasks to execute."
 		}
@@ -235,11 +251,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 				plan = planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(retry.Text)}
 			case json.Unmarshal([]byte(trimJSON(retry.Text)), &rp) == nil:
 				plan = rp
-				if retry.RespondCalled {
-					plan.answer = strings.TrimSpace(retry.Content)
-				} else {
-					plan.answer = strings.TrimSpace(strings.Replace(retry.Text, trimJSON(retry.Text), "", 1))
-				}
+				plan.resolveAnswer(retry)
 			default:
 				a.say(ctx, sid, "⚠ The corrected reply was not valid JSON either! Going ahead with the planner's first submission.\n")
 			}

@@ -1405,3 +1405,22 @@ func TestToolLoopParksOnRespondWhileJobRuns(t *testing.T) {
 		t.Error("the user's interjection must arrive before the job's exit, not after")
 	}
 }
+
+// TestPlanAnswerInArgument: the answer to a lookup travels in submit_plan's
+// `answer` argument and needs no message text. A server that forces the tool
+// call returns none, and a planner that wrote its audit "as message text"
+// twice delivered nothing but its reasoning.
+func TestPlanAnswerInArgument(t *testing.T) {
+	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
+		`{"clear":true,"report_only":true,"subtasks":[],"answer":"Only the Prepare page builds widgets; Cut, Narrate and Produce are bare."}`))
+	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if got := mock.callCount(); got != 1 {
+		t.Errorf("an answer in the argument cost %d LLM calls, want 1 (no nudge)", got)
+	}
+	if plan == nil || !strings.HasPrefix(plan.answer, "Only the Prepare page") || len(plan.Subtasks) != 0 {
+		t.Fatalf("plan = %+v, want the argument as the answer", plan)
+	}
+}

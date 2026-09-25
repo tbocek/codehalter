@@ -27,9 +27,10 @@ var submitPlanTool = Tool{Def: map[string]any{
 		"name": submitPlanToolName,
 		"description": "Submit your finished plan and end the planning phase. Call this exactly " +
 			"once when you have gathered everything and decided how to proceed. Put the structured " +
-			"plan in the arguments. If the request is a pure lookup you can already answer, write " +
-			"that answer as your normal message text FIRST, then call this with report_only=true and " +
-			"an empty subtasks list. After this call returns, no further planning tools run.",
+			"plan in the arguments. If the request is a pure lookup you can already answer, put the " +
+			"COMPLETE answer in the `answer` argument and call this with report_only=true and an " +
+			"empty subtasks list: your reasoning is never shown, and message text beside a tool call " +
+			"is often dropped. After this call returns, no further planning tools run.",
 		"parameters": map[string]any{
 			"type":     "object",
 			"required": []string{"clear", "subtasks", "report_only"},
@@ -49,7 +50,7 @@ var submitPlanTool = Tool{Def: map[string]any{
 				},
 				"subtasks": map[string]any{
 					"type":        "array",
-					"description": "One or more units of work for the executor. Empty only when clear=false (clarification) or report_only with the answer already given in your message text.",
+					"description": "One or more units of work for the executor. Empty only when clear=false (clarification) or report_only with the answer in the `answer` argument.",
 					"items": map[string]any{
 						"type":     "object",
 						"required": []string{"description"},
@@ -69,6 +70,10 @@ var submitPlanTool = Tool{Def: map[string]any{
 				"report_only": map[string]any{
 					"type":        "boolean",
 					"description": "True when the whole request is informational and you already have the answer — no edits, no commands. Skips the execute-confirmation gate.",
+				},
+				"answer": map[string]any{
+					"type":        "string",
+					"description": "The complete answer for the user, when report_only=true and subtasks is empty. This is what the user reads: everything you found, in full, not a promise to write it. Empty otherwise.",
 				},
 			},
 		},
