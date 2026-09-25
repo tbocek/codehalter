@@ -237,8 +237,8 @@ func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
 		availableCommand{Name: "settings", Description: "Show which settings.toml is in use and re-probe every configured model"},
 		availableCommand{
 			Name:        "spec",
-			Description: "Implement a spec item by item until every requirement has a passing test. /spec starts or resumes (the first run asks where the spec is, where to build, with what); `status` reports the ledger; `stop` ends the loop after the round in flight; `redo <item id or spec file>` sends finished items back and rebuilds them",
-			Input:       &commandInput{Hint: "status | stop | redo <id or file>"},
+			Description: "Implement a spec item by item until every requirement has a passing test. /spec starts or resumes (the first run asks where the spec is, where to build, with what); `status` reports the ledger; `stop` ends the loop after the round in flight; `redo` finds the finished items that do not deliver and rebuilds them; `redo <item id or spec file>` names them",
+			Input:       &commandInput{Hint: "status | stop | redo [id or file]"},
 		},
 	)
 	for _, n := range names {

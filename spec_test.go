@@ -216,8 +216,8 @@ func TestParseSpecArgs(t *testing.T) {
 	if cmd, targets, err := parseSpecArgs(" redo 03-shell.md F2.3 "); err != nil || cmd != "redo" || strings.Join(targets, ",") != "03-shell.md,F2.3" {
 		t.Errorf("redo = %q %v %v", cmd, targets, err)
 	}
-	if _, _, err := parseSpecArgs("redo"); err == nil {
-		t.Error("a bare redo parsed; it needs targets")
+	if cmd, targets, err := parseSpecArgs("redo"); err != nil || cmd != "redo" || len(targets) != 0 {
+		t.Errorf("bare redo = %q %v %v, want the audit form", cmd, targets, err)
 	}
 	// The positional form is gone: the first run asks, it does not parse paths.
 	if _, _, err := parseSpecArgs("spec/ rust/ use gtk4-rs"); err == nil {

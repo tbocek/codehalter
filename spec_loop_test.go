@@ -317,3 +317,22 @@ func TestSpecUIChangeNeedsALook(t *testing.T) {
 		t.Errorf("decide = %v %v %q, want one more round with the reason", done, block, reason)
 	}
 }
+
+// TestSpecAuditPrompt: a bare /spec redo asks the model which finished items
+// fall short; the prompt names the spec files and the way to answer.
+func TestSpecAuditPrompt(t *testing.T) {
+	a, s := newTestAgent(t)
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := a.specAuditPrompt(s.ID, &specConfig{SpecDir: "spec", OutDir: "rust", Target: "gtk4"}, idx, "just test")
+	for _, want := range []string{"`redo`", "spec/00-principles.md", "just test", "gtk4", "snapshot", "report_only"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("audit prompt lacks %q", want)
+		}
+	}
+	if strings.Contains(prompt, "{{") {
+		t.Errorf("unfilled placeholder:\n%s", prompt)
+	}
+}

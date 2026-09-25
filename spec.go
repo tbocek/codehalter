@@ -264,10 +264,10 @@ func parseSpecArgs(args string) (cmd string, targets []string, err error) {
 		return "status", nil, nil
 	case len(fields) == 1 && fields[0] == "stop":
 		return "stop", nil, nil
-	case fields[0] == "redo" && len(fields) > 1:
+	case fields[0] == "redo":
 		return "redo", fields[1:], nil
 	}
-	return "", nil, fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop, /spec redo <item id or spec file>...")
+	return "", nil, fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop, /spec redo [item id or spec file...]")
 }
 
 // specRedoTargets resolves what the user named to item ids: an item id as is,

@@ -379,6 +379,26 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		r.say(ctx, fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
 		return end, nil
 	}
+	if cmd == "redo" {
+		// No targets: the model audits the program against the spec and
+		// names the items that fall short (SPEC-REDO.md); its submit_plan
+		// `redo` goes through specFromPlan, which shows the list and asks,
+		// and leaves the reopen command as a handoff for this loop.
+		if !r.preflight(ctx) {
+			return end, nil
+		}
+		r.say(ctx, "\n## /spec redo · finding what falls short\n\n")
+		turnErr := a.runPromptTurn(ctx, sess, a.specAuditPrompt(sid, cfg, r.idx, r.testCmd()))
+		if isCancelled(turnErr) {
+			return PromptResponse{StopReason: "cancelled"}, nil
+		}
+		handoff := sess.takeSpecHandoff()
+		if !strings.HasPrefix(handoff, "redo ") {
+			r.say(ctx, "Nothing was reopened. `/spec redo <item id or spec file>` names items directly.\n")
+			return end, nil
+		}
+		cmd = handoff
+	}
 	if strings.HasPrefix(cmd, "redo ") {
 		ids, unknown := specRedoTargets(cfg, r.idx, strings.Fields(strings.TrimPrefix(cmd, "redo ")))
 		if len(unknown) > 0 {
@@ -515,8 +535,9 @@ func (a *agent) specResolve(ctx context.Context, sid string, sess *Session, args
 	}
 	if cmd == "redo" {
 		// Carried to runSpec in the command itself; the targets are
-		// resolved there, against the scanned spec.
-		cmd = "redo " + strings.Join(targets, " ")
+		// resolved there, against the scanned spec. Bare "redo" stays bare:
+		// the model finds what to redo.
+		cmd = strings.TrimSpace("redo " + strings.Join(targets, " "))
 	}
 	if cfg, err = loadSpecConfig(sess.Cwd); err != nil {
 		say("⚠ " + err.Error() + "\n")
@@ -958,6 +979,31 @@ func (a *agent) specFromPlan(ctx context.Context, sid string, sess *Session, p *
 // specRedoReason is what a round on a reopened item is told, in the place
 // where a failed round's reason goes.
 const specRedoReason = "The user sent this item back with /spec redo. It was implemented and its test passes, but what was built does not do what the spec says: a screen without its widgets, a button without its wire, a flow that cannot be reached from the UI. Rebuild it against the spec text below under the rules above. Keep and extend the existing code and tests where they are right. Where AGENT.md describes the old state as the design, correct it."
+
+// specAuditPrompt renders SPEC-REDO.md: the round that finds which finished
+// items do not deliver, for a bare /spec redo.
+func (a *agent) specAuditPrompt(sid string, cfg *specConfig, idx *specIndex, testCmd string) string {
+	target := cfg.Target
+	if target == "" {
+		target = "No technology was given with /spec; the project in the output directory is what it is."
+	}
+	context := ""
+	if files := cfg.context(idx); len(files) > 0 {
+		for i, f := range files {
+			files[i] = "`" + cfg.SpecDir + "/" + f + "`"
+		}
+		context = "Standing rules: " + strings.Join(files, ", ") + "."
+	}
+	var docs []string
+	for _, d := range idx.docs {
+		docs = append(docs, "`"+cfg.SpecDir+"/"+d.rel+"`")
+	}
+	rep := strings.NewReplacer(
+		"{{spec_dir}}", cfg.SpecDir, "{{out_dir}}", cfg.OutDir, "{{target}}", target,
+		"{{test_cmd}}", testCmd, "{{context}}", context, "{{files}}", strings.Join(docs, ", "),
+	)
+	return collapseBlankLines(rep.Replace(a.loadPromptFile(sid, "SPEC-REDO.md")))
+}
 
 // needsFinalPass: the final pass runs once every item is done, and again when
 // the ledger has moved since (an item finished later, a block resolved), so
