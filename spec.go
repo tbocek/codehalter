@@ -100,7 +100,11 @@ type specConfig struct {
 	// must not become items.
 	Skip     []string       `toml:"skip,omitempty"`
 	Attempts map[string]int `toml:"attempts,omitempty"`
-	Blocked  []specBlock    `toml:"blocked,omitempty"`
+	// Redo holds items the user sent back with /spec redo, with the reason
+	// the round is shown: they are out of Items and stay open until a round
+	// passes, whatever their tests say.
+	Redo    map[string]string `toml:"redo,omitempty"`
+	Blocked []specBlock       `toml:"blocked,omitempty"`
 	// Items is what the loop finished: id -> what the spec said at the time.
 	// Coverage answers "is there a passing test for this?" and is recomputed
 	// from the code every round; this answers "is that test still about what
@@ -251,16 +255,76 @@ func (c *specConfig) unblock(id string) {
 // loop (the first run asks its three questions), "status" reports, "stop" ends
 // a running loop at its next round boundary. There is no positional form: the
 // questions read their options off the project, which a typed path cannot.
-func parseSpecArgs(args string) (cmd string, err error) {
-	switch strings.TrimSpace(args) {
-	case "":
-		return "resume", nil
-	case "status":
-		return "status", nil
-	case "stop":
-		return "stop", nil
+func parseSpecArgs(args string) (cmd string, targets []string, err error) {
+	fields := strings.Fields(args)
+	switch {
+	case len(fields) == 0:
+		return "resume", nil, nil
+	case len(fields) == 1 && fields[0] == "status":
+		return "status", nil, nil
+	case len(fields) == 1 && fields[0] == "stop":
+		return "stop", nil, nil
+	case fields[0] == "redo" && len(fields) > 1:
+		return "redo", fields[1:], nil
 	}
-	return "", fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop")
+	return "", nil, fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop, /spec redo <item id or spec file>...")
+}
+
+// specRedoTargets resolves what the user named to item ids: an item id as is,
+// or a spec file (with or without the spec dir and the .md) meaning every
+// item it defines. Anything it cannot place comes back in unknown, and then
+// nothing should be reopened: a typo must not reopen half a list.
+func specRedoTargets(cfg *specConfig, idx *specIndex, targets []string) (ids, unknown []string) {
+	seen := map[string]bool{}
+	add := func(id string) {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	for _, t := range targets {
+		if _, ok := idx.items[t]; ok {
+			add(t)
+			continue
+		}
+		file := strings.TrimPrefix(strings.TrimPrefix(t, cfg.SpecDir+"/"), "./")
+		found := false
+		for d, doc := range idx.docs {
+			if doc.rel == file || strings.TrimSuffix(doc.rel, ".md") == file {
+				for _, id := range idx.order {
+					if idx.items[id].Doc == d {
+						add(id)
+					}
+				}
+				found = true
+			}
+		}
+		if !found {
+			unknown = append(unknown, t)
+		}
+	}
+	return ids, unknown
+}
+
+// reopen sends finished items back to the loop: out of the ledger, and marked
+// so that their still-present tests do not count as done until a round passes
+// (see open). The reason reaches the model as the round's "did not count"
+// section and is dropped when the item passes.
+func (c *specConfig) reopen(ids []string, reason string) {
+	if c.Redo == nil {
+		c.Redo = map[string]string{}
+	}
+	for _, id := range ids {
+		delete(c.Items, id)
+		c.Redo[id] = reason
+	}
+}
+
+// open reports that a test naming the item does not make it done: a round on
+// it failed (Attempts), or the user sent it back (Redo). Both mean the test
+// exists and proves too little.
+func (c *specConfig) open(id string) bool {
+	return c.Attempts[id] > 0 || c.Redo[id] != ""
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,7 +1286,7 @@ func specReconcile(cfg *specConfig, idx *specIndex, covered map[string]string) s
 		// it has failed: after a failed round the test is there but the
 		// suite did not pass, and adopting it would end the run with the
 		// item unfinished (one did, and /spec reported itself finished).
-		case !known && covered[id] != "" && cfg.Attempts[id] == 0:
+		case !known && covered[id] != "" && !cfg.open(id):
 			cfg.Items[id] = specLedger{Hash: hashes[id], Title: idx.items[id].Title,
 				File: idx.docs[idx.items[id].Doc].rel, CoveredBy: covered[id],
 				At: time.Now().UTC(), Version: versionStamp()}
@@ -1582,7 +1646,7 @@ func nextSpecItem(idx *specIndex, covered map[string]string, cfg *specConfig) (i
 		if _, done := cfg.Items[it]; done {
 			continue
 		}
-		if _, ok := covered[it]; ok && cfg.Attempts[it] == 0 {
+		if _, ok := covered[it]; ok && !cfg.open(it) {
 			continue
 		}
 		if b := cfg.block(it); b != nil {

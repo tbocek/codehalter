@@ -209,13 +209,59 @@ func TestGithubSlug(t *testing.T) {
 
 func TestParseSpecArgs(t *testing.T) {
 	for args, want := range map[string]string{"": "resume", "  ": "resume", "status": "status", " stop ": "stop"} {
-		if cmd, err := parseSpecArgs(args); err != nil || cmd != want {
+		if cmd, _, err := parseSpecArgs(args); err != nil || cmd != want {
 			t.Errorf("parseSpecArgs(%q) = %q, %v; want %q", args, cmd, err, want)
 		}
 	}
+	if cmd, targets, err := parseSpecArgs(" redo 03-shell.md F2.3 "); err != nil || cmd != "redo" || strings.Join(targets, ",") != "03-shell.md,F2.3" {
+		t.Errorf("redo = %q %v %v", cmd, targets, err)
+	}
+	if _, _, err := parseSpecArgs("redo"); err == nil {
+		t.Error("a bare redo parsed; it needs targets")
+	}
 	// The positional form is gone: the first run asks, it does not parse paths.
-	if _, err := parseSpecArgs("spec/ rust/ use gtk4-rs"); err == nil {
+	if _, _, err := parseSpecArgs("spec/ rust/ use gtk4-rs"); err == nil {
 		t.Error("a positional spec-dir/out-dir form parsed")
+	}
+}
+
+// TestSpecRedoReopens: /spec redo takes finished items out of the ledger and
+// keeps them open although their tests still name them, by id or by file; a
+// target it cannot place reopens nothing.
+func TestSpecRedoReopens(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &specConfig{SpecDir: "spec", Items: map[string]specLedger{}}
+	covered := map[string]string{}
+	for _, id := range idx.order {
+		cfg.Items[id] = specLedger{Hash: specItemHash(idx, id)}
+		covered[id] = "tests/all.rs"
+	}
+	byFile := idx.docs[idx.items[idx.order[0]].Doc].rel
+	ids, unknown := specRedoTargets(cfg, idx, []string{"spec/" + byFile, idx.order[len(idx.order)-1]})
+	if len(unknown) != 0 || len(ids) < 2 {
+		t.Fatalf("targets = %v unknown = %v", ids, unknown)
+	}
+	if _, unknown := specRedoTargets(cfg, idx, []string{"F9.9", byFile}); len(unknown) != 1 || unknown[0] != "F9.9" {
+		t.Errorf("unknown = %v, want the typo alone", unknown)
+	}
+
+	cfg.reopen(ids, "sent back")
+	for _, id := range ids {
+		if _, known := cfg.Items[id]; known {
+			t.Errorf("%s still in the ledger", id)
+		}
+	}
+	if d := specReconcile(cfg, idx, covered); d.Adopted != 0 {
+		t.Errorf("adopted %d reopened items back", d.Adopted)
+	}
+	if next, _ := nextSpecItem(idx, covered, cfg); next != ids[0] {
+		t.Errorf("next = %q, want the first reopened item %q", next, ids[0])
+	}
+	if cfg.Redo[ids[0]] != "sent back" {
+		t.Error("the reason did not stick")
 	}
 }
 

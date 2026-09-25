@@ -471,6 +471,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			}
 			return PromptResponse{StopReason: "end_turn"}, nil
 		}
+		// Any other /spec command typed mid-loop is for the loop as well, and
+		// the loop cannot take it while it runs: say so instead of handing
+		// the model a line it would read as a request.
+		if t := strings.TrimSpace(text); strings.HasPrefix(t, "/spec") && sess.specFence() != "" {
+			a.say(ctx, req.SessionId, "A /spec loop is running. `/spec stop` ends it after the round in flight; then `"+t+"`.\n")
+			return PromptResponse{StopReason: "end_turn"}, nil
+		}
 		if strings.TrimSpace(text) != "" {
 			sess.addSteer(text)
 			note := "↪ Queued for the turn in flight, it lands at its next step. Stop the turn to interrupt it instead.\n"

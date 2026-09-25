@@ -357,6 +357,17 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		r.say(ctx, fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
 		return end, nil
 	}
+	if strings.HasPrefix(cmd, "redo ") {
+		ids, unknown := specRedoTargets(cfg, r.idx, strings.Fields(strings.TrimPrefix(cmd, "redo ")))
+		if len(unknown) > 0 {
+			r.say(ctx, fmt.Sprintf("⚠ /spec redo: not in `%s/`: %s. Name an item id (`F2.3`, `P.policy.x`, `§03-shell#1-screen`) or a spec file (`03-shell.md`). Nothing was reopened.\n", cfg.SpecDir, strings.Join(unknown, ", ")))
+			return end, nil
+		}
+		cfg.reopen(ids, specRedoReason)
+		r.save(ctx)
+		r.say(ctx, fmt.Sprintf("↩ reopened %d item(s): %s. The loop rebuilds them now, under the current rules.\n\n", len(ids), strings.Join(ids, ", ")))
+		// Then run: reopening is the first half of "do these again".
+	}
 	if cmd == "status" || cmd == "stop" {
 		covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
 		if err != nil {
@@ -474,10 +485,15 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 // config, or on a project's first /spec the setup dialog.
 func (a *agent) specResolve(ctx context.Context, sid string, sess *Session, args string) (cfg *specConfig, cmd string, ok bool) {
 	say := func(s string) { a.say(ctx, sid, s) }
-	cmd, err := parseSpecArgs(args)
+	cmd, targets, err := parseSpecArgs(args)
 	if err != nil {
 		say(err.Error() + "\n")
 		return nil, "", false
+	}
+	if cmd == "redo" {
+		// Carried to runSpec in the command itself; the targets are
+		// resolved there, against the scanned spec.
+		cmd = "redo " + strings.Join(targets, " ")
 	}
 	if cfg, err = loadSpecConfig(sess.Cwd); err != nil {
 		say("⚠ " + err.Error() + "\n")
@@ -606,6 +622,9 @@ func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testF
 		delete(cfg.Attempts, w.Item)
 	}
 	w.Reason = r.reasons[w.Item]
+	if w.Reason == "" {
+		w.Reason = cfg.Redo[w.Item]
+	}
 	return w
 }
 
@@ -644,6 +663,10 @@ func (a *agent) specFinalPrompt(sid string, cfg *specConfig, idx *specIndex, tes
 	)
 	return collapseBlankLines(rep.Replace(a.loadPromptFile(sid, "SPEC-FINAL.md")))
 }
+
+// specRedoReason is what a round on a reopened item is told, in the place
+// where a failed round's reason goes.
+const specRedoReason = "The user sent this item back with /spec redo. It was implemented and its test passes, but what was built does not do what the spec says: a screen without its widgets, a button without its wire, a flow that cannot be reached from the UI. Rebuild it against the spec text below under the rules above. Keep and extend the existing code and tests where they are right. Where AGENT.md describes the old state as the design, correct it."
 
 // needsFinalPass: the final pass runs once every item is done, and again when
 // the ledger has moved since (an item finished later, a block resolved), so
@@ -728,6 +751,7 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error) (d
 	switch {
 	case done:
 		delete(cfg.Attempts, item)
+		delete(cfg.Redo, item)
 		delete(r.reasons, item)
 		switch w.Mode {
 		case specModeRemove:
