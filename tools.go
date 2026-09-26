@@ -348,6 +348,16 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		}
 	default:
 		result, failed = a.executeTool(ctx, sid, tc)
+		// A command that rendered a screen gets the screen attached: the
+		// executor, which runs without reasoning, did not reach for the
+		// screenshot tool in four visual-check subtasks in a row and polled a
+		// file listing instead. Handing it the picture with the render is a
+		// lever that does not depend on it remembering.
+		if !failed && tc.Function.Name == "run_command" && a.imagesSupported {
+			if text, parts, id := a.attachRenderedScreen(ctx, sid, tc.Function.Arguments, result, started); id != "" {
+				result, multimodal, imageID = text, parts, id
+			}
+		}
 	}
 
 	useID := nextToolUseID()

@@ -42,7 +42,7 @@ If this task changed how something RENDERS (CSS, HTML/template, generated docume
 - Change ONE rule, take the SAME number again, report both ("16.0 -> 1.9"), never "should be better now".
 - Number unchanged after the edit? Your DIAGNOSIS was wrong, not your value. Revert that edit before trying another. Do NOT stack a second guess on the first.
 - Measure the artifact the user actually sees (the BUILT output file), not the source template it was generated from.
-- `screenshot(path=..., selector=...)` renders a local page and shows it to you: use it to see WHETHER something is off and where. It cannot give you a distance; that is still a number you print.
+- `screenshot(path=..., selector=...)` renders a local page or image file and shows it to you: use it to see WHETHER something is off and where. It cannot give you a distance; that is still a number you print. It is the ONLY way you see a picture: a PNG on disk (`shots/05-cut.png`, a spec image) is looked at with `screenshot path=<that file>`, in one call. Copying the file somewhere, listing it, printing READY, waiting, or parsing its pixels shows you nothing.
 - Nothing available to render it with? Say exactly that on the FIRST turn and ask. Do not guess twice.
 
 ## Sustainability

@@ -915,6 +915,13 @@ type repetitionTracker struct {
 	writeAt map[string]int
 }
 
+// digitRunRe collapses runs of digits in a shell line and in an output, so a
+// counter the model bumps to make each call look new does not make it new:
+// 361 `ls -l x.png; echo READY<n>` in a row looked new to an exact-key check.
+var digitRunRe = regexp.MustCompile(`\d+`)
+
+func digitBlind(s string) string { return digitRunRe.ReplaceAllString(s, "#") }
+
 // changesFiles reports a call that may have changed the tree: the file tools,
 // and a shell line with an in-place writer in it.
 func changesFiles(tc toolCall) bool {
@@ -936,9 +943,14 @@ var inPlaceWriterRe = regexp.MustCompile(`sed -i|-i\b.*\bsed|cargo fmt|gofmt -w|
 
 // sawAgain records this call's output and reports whether it made no progress.
 func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
-	key := tc.Function.Name + "\x00" + tc.Function.Arguments
-	h := fnvHash(tu.Output)
-	bag := issueBag([]string{tu.Output})
+	args := tc.Function.Arguments
+	if tc.Function.Name == "run_command" {
+		args = digitBlind(args) // a counter in the line is still the same line
+	}
+	key := tc.Function.Name + "\x00" + args
+	out := digitBlind(tu.Output)
+	h := fnvHash(out)
+	bag := issueBag([]string{out})
 	repeated := false
 	if prev, ok := rt.hash[key]; ok && prev == h {
 		repeated = true

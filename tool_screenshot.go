@@ -382,3 +382,71 @@ func (b *beacon) report() string {
 		return ""
 	}
 }
+
+// attachRenderedScreen: after a run_command that renders a screen (its line
+// names a snapshot and it exited 0), the newest PNG the command left under
+// the project is attached to the result, with what to look for. The parts
+// and the stored id follow the screenshot tool's own scheme, so the replay
+// rebuilds the same message. Returns an empty id when there is nothing to
+// attach.
+func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result string, since time.Time) (string, []any, string) {
+	cmd := parseArgs(rawArgs).str("command")
+	if !strings.Contains(cmd, "snapshot") || !strings.HasPrefix(result, "exit 0\n") {
+		return "", nil, ""
+	}
+	sess := a.getSession(sid)
+	if sess == nil {
+		return "", nil, ""
+	}
+	// Whole-second mtimes on some filesystems: a file written in the same
+	// second the command started must still count.
+	png := newestPNGSince(sess.Cwd, since.Truncate(time.Second).Add(-time.Nanosecond))
+	if png == "" {
+		return "", nil, ""
+	}
+	data, err := os.ReadFile(png)
+	if err != nil || len(data) == 0 || len(data) > screenshotMaxBytes {
+		return "", nil, ""
+	}
+	sum := sha256.Sum256(data)
+	id := "img_" + hex.EncodeToString(sum[:8])
+	if err := writeImageFile(sess.Cwd, id, "image/png", data); err != nil {
+		return "", nil, ""
+	}
+	rel, _ := filepath.Rel(sess.Cwd, png)
+	rel = filepath.ToSlash(rel)
+	text := result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s, is attached below as %s. Look at it now, before anything else: is every widget the spec names on it, in the order it says; is anything empty, overlapping, cut off or unlabeled? Where the spec has its own picture of this screen (its image with the same name), look at that too with `screenshot` and compare widgets, order and labels, not pixels. Fix what you see, then render again.]", rel, id)
+	a.say(ctx, sid, fmt.Sprintf("👁 attached the rendered screen %s to the model's view\n", rel))
+	return text, imageParts(text, "image/png", data), id
+}
+
+// screenshotMaxBytes bounds an attached PNG: a screen is tens of KB, and
+// anything past this is a photo or a mistake, not a screen to check.
+const screenshotMaxBytes = 4 << 20
+
+// newestPNGSince finds the most recently modified .png under root written
+// after t, skipping build output, dependencies and dot dirs, so a snapshot
+// recipe's output is found wherever the project keeps it.
+func newestPNGSince(root string, t time.Time) string {
+	best, bestT := "", t
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != root && (strings.HasPrefix(name, ".") || name == "target" || name == "node_modules" || name == "dist" || name == "build" || name == "vendor") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(path), ".png") {
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.ModTime().After(bestT) {
+			best, bestT = path, info.ModTime()
+		}
+		return nil
+	})
+	return best
+}

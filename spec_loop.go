@@ -859,6 +859,9 @@ func uiEditedUnseen(uses []ToolUse, cwd string) []string {
 	seen := map[string]bool{}
 	var files []string
 	for _, u := range uses {
+		if u.ImageID != "" {
+			return nil // a screenshot, or a render codehalter attached (attachRenderedScreen)
+		}
 		switch u.Name {
 		case "screenshot":
 			return nil

@@ -1517,6 +1517,15 @@ func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
 	if rt.sawAgain(probe, out) {
 		t.Error("a re-run after a Python heredoc edit is a re-verify, not a repeat")
 	}
+	// A counter bumped into the command to make each call look new (`echo
+	// READY79`, READY80, …) changes neither the key nor the answer.
+	for i := 1; i <= 3; i++ {
+		poll := mk("r", "run_command", fmt.Sprintf(`{"command":"ls -l shotview/cut.png | cut -c1-70; echo READY%d"}`, i))
+		pollOut := ToolUse{Name: "run_command", Output: fmt.Sprintf("exit 0\n\n-rw-r--r-- 1 dev dev 115300 Sep 26 22:20 shotview/cut.\nREADY%d\n", i)}
+		if got := rt.sawAgain(poll, pollOut); got != (i > 1) {
+			t.Errorf("poll %d: repeat = %v, want %v", i, got, i > 1)
+		}
+	}
 	// A redirect to a log is not a change to the tree: rendering the same
 	// screen into /tmp again and again is a spin.
 	snap := mk("n", "run_command", `{"command":"cd rust && just snapshot 04-prepare > /tmp/snap.log 2>&1"}`)

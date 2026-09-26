@@ -324,3 +324,43 @@ func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 		t.Errorf("text = %q, want it to name the missing capability", text)
 	}
 }
+
+// TestRunCommandAttachesRenderedScreen: a command that renders a snapshot
+// and exits 0 comes back with the PNG it wrote attached to its result, under
+// the screenshot tool's own id scheme, and that counts as a look for the
+// spec loop's UI rule. A render that failed, or a command that is not a
+// render, attaches nothing.
+func TestRunCommandAttachesRenderedScreen(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.imagesSupported = true
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
+	shots := filepath.Join(h.sess.Cwd, "rust", "shots")
+	if err := os.MkdirAll(shots, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Any bytes will do: the attachment is the file's content, unread.
+	png := "PNG-BYTES"
+	var tc toolCall
+	tc.ID, tc.Function.Name = "c1", "run_command"
+	tc.Function.Arguments = `{"command":"printf '` + png + `' > rust/shots/05-cut.png; echo 'just snapshot 05-cut -> rust/shots/05-cut.png'"}`
+	tu, content := h.agent.runToolCall(context.Background(), h.sess.ID, tc)
+	if tu.ImageID == "" || !strings.Contains(tu.Output, "attached below as "+tu.ImageID) || !strings.Contains(tu.Output, "rust/shots/05-cut.png") {
+		t.Fatalf("no render attached: %+v", tu)
+	}
+	parts, ok := content.([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %T %v, want text + image parts", content, content)
+	}
+	if got := uiEditedUnseen([]ToolUse{{Name: "edit_file", Input: `{"path":"rust/src/ui.rs"}`}, tu}, h.sess.Cwd); got != nil {
+		t.Errorf("an attached render did not count as a look: %v", got)
+	}
+
+	tc.ID, tc.Function.Arguments = "c2", `{"command":"echo snapshot failed; exit 1"}`
+	if tu, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); tu.ImageID != "" {
+		t.Error("a failed render attached a picture")
+	}
+	tc.ID, tc.Function.Arguments = "c3", `{"command":"printf '`+png+`' > rust/shots/06-lane.png; echo wrote"}`
+	if tu, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); tu.ImageID != "" {
+		t.Error("a command that is not a render attached a picture")
+	}
+}
