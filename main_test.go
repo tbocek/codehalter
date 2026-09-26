@@ -670,3 +670,22 @@ func TestHeartbeatSilentWhenFast(t *testing.T) {
 		t.Errorf("heartbeat that never ticked emitted %d chunk(s)", len(got))
 	}
 }
+
+// TestSayLandsInSessionLog: what codehalter tells the user is also in the
+// session log, so a run's round outcomes, test verdicts and nudges can be
+// read back without the editor.
+func TestSayLandsInSessionLog(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.say(context.Background(), h.sess.ID, "🧪 `just test` passed in the round, after its last change; not run again\n")
+	h.agent.say(context.Background(), h.sess.ID, "  \n")
+	data, err := os.ReadFile(h.sess.sessionFilePath("session_" + h.sess.ID + ".log"))
+	if err != nil {
+		t.Fatalf("no session log: %v", err)
+	}
+	if !strings.Contains(string(data), "[SAY] ===\n🧪 `just test` passed in the round") {
+		t.Errorf("the line is not in the log:\n%s", data)
+	}
+	if strings.Count(string(data), "[SAY]") != 1 {
+		t.Errorf("a blank line was logged:\n%s", data)
+	}
+}

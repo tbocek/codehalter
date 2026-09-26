@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -905,11 +906,30 @@ type repetitionTracker struct {
 	// timestamp in its output.
 	hash map[string]uint64
 	bag  map[string]map[string]bool
-	// lastKey is the call before this one. A successful command re-run is a
-	// legitimate re-verify only when something else happened in between; the
-	// same command straight after itself, with the same output, is a spin.
-	lastKey string
+	// writes counts the file-changing calls so far; writeAt is that count
+	// when each call last ran. A successful command re-run is a legitimate
+	// re-verify only when something was written since its last run; the same
+	// command again with nothing changed, alone or alternating with another
+	// probe, is a spin.
+	writes  int
+	writeAt map[string]int
 }
+
+// changesFiles reports a call that may have changed the tree: the file tools,
+// and a shell line with an in-place writer in it.
+func changesFiles(tc toolCall) bool {
+	switch tc.Function.Name {
+	case "edit_file", "write_file":
+		return true
+	case "run_command":
+		return inPlaceWriterRe.MatchString(tc.Function.Arguments)
+	}
+	return false
+}
+
+// inPlaceWriterRe: shell commands that rewrite files, so a green re-run after
+// one of them is a re-verify, not a repeat.
+var inPlaceWriterRe = regexp.MustCompile(`sed -i|-i\b.*\bsed|cargo fmt|gofmt -w|prettier --write|go mod tidy|git (checkout|stash|apply|revert|reset)|cargo add|npm i|apk add|apt-get install|>>? *[^&\s]`)
 
 // sawAgain records this call's output and reports whether it made no progress.
 func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
@@ -931,13 +951,19 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 	// legitimate re-verify after an edit (re-running just:build / just:test to
 	// confirm a change held), NOT spinning — don't count it as no-progress. A
 	// FAILED re-run still counts: the model IS stuck on a red build/test. And
-	// so does a successful one issued straight after itself: nothing changed
-	// in between, so it verified nothing. Without this an executor ran one
-	// `ls; grep` line 75 times in a row and hit the iteration cap, because
-	// every one of them exited 0.
-	consecutive := rt.lastKey == key
-	rt.lastKey = key
-	if repeated && !tu.Failed && tc.Function.Name == "run_command" && !consecutive {
+	// so does a successful one with no file changed since its last run:
+	// it verified nothing. Without this an executor ran one `ls; grep` line
+	// 75 times in a row, then two `grep` lines in alternation 73 times, and
+	// hit the iteration cap both times, because every one of them exited 0.
+	if rt.writeAt == nil {
+		rt.writeAt = map[string]int{}
+	}
+	if changesFiles(tc) {
+		rt.writes++
+	}
+	changedSince := rt.writeAt[key] < rt.writes
+	rt.writeAt[key] = rt.writes
+	if repeated && !tu.Failed && tc.Function.Name == "run_command" && changedSince {
 		repeated = false
 	}
 	// read_file/continue_read also honour the content-dedup marker —
@@ -1001,7 +1027,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		var flushOn, flushThink func()
 		if stream {
 			on, flushOn = throttledStream(func(chunk string) {
-				a.say(ctx, sid, chunk)
+				// Straight to the client, not through say: the model's text
+				// is logged whole in its RESPONSE block, not chunk by chunk.
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: chunk}})
 			})
 		}
 		think, flushThink = throttledStream(func(chunk string) {

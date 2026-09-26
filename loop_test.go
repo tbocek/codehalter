@@ -1474,15 +1474,30 @@ func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
 	edit := mk("e", "edit_file", `{"path":"a.rs"}`)
 	out := ToolUse{Name: "run_command", Output: "exit 0\n\n-rw-r--r-- 1 dev dev 33037 x.png\n"}
 
+	other := mk("o", "run_command", `{"command":"grep -n foo a.rs"}`)
+	otherOut := ToolUse{Name: "run_command", Output: "exit 0\n\n12:foo\n"}
+
 	if rt.sawAgain(probe, out) {
 		t.Fatal("the first run is new")
 	}
 	if !rt.sawAgain(probe, out) {
 		t.Error("the same successful command straight after itself did not count as a repeat")
 	}
+	// Alternating two probes changes nothing either.
+	rt.sawAgain(other, otherOut)
+	if !rt.sawAgain(probe, out) {
+		t.Error("a successful command re-run after only another probe did not count as a repeat")
+	}
+	if !rt.sawAgain(other, otherOut) {
+		t.Error("the alternating probe did not count as a repeat")
+	}
 	rt.sawAgain(edit, ToolUse{Name: "edit_file", Output: "ok"})
 	if rt.sawAgain(probe, out) {
 		t.Error("a re-run after an edit is a re-verify, not a repeat")
+	}
+	rt.sawAgain(mk("s", "run_command", `{"command":"sed -i s/a/b/ a.rs"}`), ToolUse{Name: "run_command", Output: "exit 0\n"})
+	if rt.sawAgain(probe, out) {
+		t.Error("a re-run after an in-place shell write is a re-verify, not a repeat")
 	}
 	if !rt.sawAgain(probe, ToolUse{Name: "run_command", Output: "exit 1\n\nboom", Failed: true}) {
 		// A different output than before: new information, so this one is not

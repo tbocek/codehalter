@@ -751,8 +751,15 @@ func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 // prose the user reads, as opposed to a tool card, a plan entry, or a status
 // line. Callers own their own trailing newlines, because some of these chunks
 // are streamed fragments that must concatenate seamlessly.
+// say puts codehalter's own line in the chat and in the session log, so a
+// run can be read back from the log alone: round headers and outcomes, test
+// verdicts, the ladder's nudges, a job's exit. The model's streamed text does
+// not come through here (its full replies are logged as RESPONSE blocks).
 func (a *agent) say(ctx context.Context, sid, text string) {
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: text}})
+	if t := strings.TrimSpace(text); t != "" {
+		a.logSession(sid, "SAY", "%s", t)
+	}
 }
 
 // heartbeatEvery paces the "I am still here" dots. A var, not a const, so a
