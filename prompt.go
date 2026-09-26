@@ -1030,7 +1030,7 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	// `redo`) instead of being planned as one turn. Stable across the session:
 	// only the two directories are named, never the moving item count.
 	if cfg, err := loadSpecConfig(sess.Cwd); err == nil && cfg != nil {
-		fmt.Fprintf(&b, "\n\n## This project is built with /spec\n\nThe specification in `%s/` is implemented into `%s/` item by item, each item done when a test names it and the suite passes (the item ids are in the spec files). A request that amounts to many rounds of work, or that says something built does not work, is not a plan here: name the spec items it concerns in submit_plan's `redo` and codehalter rebuilds them one per round.\n", cfg.SpecDir, cfg.OutDir)
+		fmt.Fprintf(&b, "\n\n## This project is built with /spec\n\nThe specification in `%s/` is implemented into `%s/` item by item, each item done when a test names it and the suite passes (the item ids are in the spec files). A chat request that amounts to many rounds of work, or that says something built does not work, is not a plan here: name the spec items it concerns in submit_plan's `redo` and codehalter rebuilds them one per round. Inside a /spec round (the prompt says which item it is) the item is already chosen: plan and execute that item.\n", cfg.SpecDir, cfg.OutDir)
 	}
 
 	// Phase guidance lives in the system prompt (the stable, cached prefix) rather

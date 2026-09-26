@@ -2,6 +2,8 @@
 
 You are implementing a specification one item per round. codehalter picked this round's item from the spec's ledger: **{{id}}** ({{title}}), defined in `{{file}}`. Progress so far: {{progress}}.
 
+This round runs as your usual two phases. In the PLANNING phase, read what you need and submit a plan whose subtasks build this one item and its tests; the item is already chosen, so `redo` and `spec` do not apply here, and an answer instead of a plan does not finish an item. In the EXECUTION phase, do the subtasks. Everything below is for both phases.
+
 ## Target
 
 {{target}}
