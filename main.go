@@ -167,7 +167,11 @@ type agent struct {
 	// by the sequential id shown to the model; bgSeq hands out ids. Guarded by bgMu.
 	bgMu   sync.Mutex
 	bgJobs map[int]*backgroundJob
-	bgSeq  int
+	// logPrev is the last request body logged per session and connection,
+	// so the next one is logged as what changed (requestLogDelta).
+	logPrevMu sync.Mutex
+	logPrev   map[string][]byte
+	bgSeq     int
 }
 
 // mcpState owns the spawned MCP server children plus the bookkeeping

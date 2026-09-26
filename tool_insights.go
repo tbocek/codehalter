@@ -100,11 +100,24 @@ func digestLog(path string, data string) sessionDigest {
 	d.firstTime, d.lastTime = entries[0].time, entries[len(entries)-1].time
 
 	var lastReq string
+	// A request is logged as its delta against the previous one on the same
+	// connection (requestLogDelta); the full body is rebuilt from the chain.
+	full := map[string]string{}
 	for _, e := range entries {
 		switch {
 		case strings.HasSuffix(e.tag, " REQUEST"):
 			d.requests++
-			lastReq = e.body
+			body := e.body
+			if strings.HasPrefix(body, requestLogSame) {
+				var n, total int
+				if _, err := fmt.Sscanf(strings.TrimPrefix(body, requestLogSame), "%d of %d bytes", &n, &total); err == nil {
+					if i := strings.IndexByte(body, '\n'); i >= 0 && n <= len(full[e.tag]) {
+						body = full[e.tag][:n] + body[i+1:]
+					}
+				}
+			}
+			full[e.tag] = body
+			lastReq = body
 		case e.tag == "RECOVER":
 			d.recovers = append(d.recovers, firstLine(e.body))
 		case strings.HasPrefix(e.body, "[transport error]") || strings.HasPrefix(e.body, "[HTTP "):

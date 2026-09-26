@@ -905,6 +905,10 @@ type repetitionTracker struct {
 	// timestamp in its output.
 	hash map[string]uint64
 	bag  map[string]map[string]bool
+	// lastKey is the call before this one. A successful command re-run is a
+	// legitimate re-verify only when something else happened in between; the
+	// same command straight after itself, with the same output, is a spin.
+	lastKey string
 }
 
 // sawAgain records this call's output and reports whether it made no progress.
@@ -926,8 +930,14 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 	// A SUCCESSFUL run_command re-run with identical output is a
 	// legitimate re-verify after an edit (re-running just:build / just:test to
 	// confirm a change held), NOT spinning — don't count it as no-progress. A
-	// FAILED re-run still counts: the model IS stuck on a red build/test.
-	if repeated && !tu.Failed && tc.Function.Name == "run_command" {
+	// FAILED re-run still counts: the model IS stuck on a red build/test. And
+	// so does a successful one issued straight after itself: nothing changed
+	// in between, so it verified nothing. Without this an executor ran one
+	// `ls; grep` line 75 times in a row and hit the iteration cap, because
+	// every one of them exited 0.
+	consecutive := rt.lastKey == key
+	rt.lastKey = key
+	if repeated && !tu.Failed && tc.Function.Name == "run_command" && !consecutive {
 		repeated = false
 	}
 	// read_file/continue_read also honour the content-dedup marker —

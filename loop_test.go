@@ -978,10 +978,12 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 	}
 }
 
-// TestRepetitionLadderExemptsSuccessfulRunTask pins the build/test re-verify
-// carve-out: re-running run_command with identical SUCCESSFUL output (e.g. `just build`
-// green both times after an edit) is NOT counted as no-progress, so the loop never
-// nudges or bails on it — unlike the generic repeating tool in the ladder test.
+// TestRepetitionLadderExemptsSuccessfulRunCommand pins the build/test
+// re-verify carve-out: re-running run_command with identical SUCCESSFUL output
+// (`just build` green again after an edit) is NOT counted as no-progress, so
+// the loop never nudges or bails on it. The edit in between is what makes it
+// a re-verify; the same command straight after itself is a spin
+// (TestStuckLadderCatchesSuccessfulCommandSpin).
 func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 	var testTools []Tool
 	var execs int
@@ -997,11 +999,24 @@ func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 			execs++
 			return "go build -o codehalter .", false // identical green output, success
 		},
+	}, Tool{
+		Def: map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name": "edit_file", "description": "probe",
+				"parameters": map[string]any{"type": "object"},
+			},
+		},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			return "edited", false
+		},
 	})
 
-	// Six identical successful run_command calls, then a plain-text exit.
+	// Six identical successful run_command calls, each after an edit, then a
+	// plain-text exit.
 	var resp []string
 	for i := 0; i < 6; i++ {
+		resp = append(resp, sseToolCall(fmt.Sprintf("e%d", i), "edit_file", fmt.Sprintf(`{"path":"a.go","old_text":"%d","new_text":"%d"}`, i, i+1)))
 		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "run_command", `{"command":"just build"}`))
 	}
 	resp = append(resp, sseText("all green, done"))
@@ -1440,5 +1455,41 @@ func TestPlanRedoIsAPlan(t *testing.T) {
 	}
 	if plan == nil || strings.Join(plan.Redo, ",") != "F0.9,§03-shell#1-screen" {
 		t.Fatalf("plan = %+v, want the redo ids", plan)
+	}
+}
+
+// TestStuckLadderCatchesSuccessfulCommandSpin: a successful run_command
+// re-run counts as progress only when something happened in between (a
+// re-verify after an edit). The same command straight after itself, exit 0
+// and the same output, is a spin the ladder must bail on; one executor ran
+// one `ls; grep` line 75 times that way.
+func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
+	rt := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
+	mk := func(id, name, args string) toolCall {
+		var tc toolCall
+		tc.ID, tc.Function.Name, tc.Function.Arguments = id, name, args
+		return tc
+	}
+	probe := mk("c", "run_command", `{"command":"ls -la shots/x.png"}`)
+	edit := mk("e", "edit_file", `{"path":"a.rs"}`)
+	out := ToolUse{Name: "run_command", Output: "exit 0\n\n-rw-r--r-- 1 dev dev 33037 x.png\n"}
+
+	if rt.sawAgain(probe, out) {
+		t.Fatal("the first run is new")
+	}
+	if !rt.sawAgain(probe, out) {
+		t.Error("the same successful command straight after itself did not count as a repeat")
+	}
+	rt.sawAgain(edit, ToolUse{Name: "edit_file", Output: "ok"})
+	if rt.sawAgain(probe, out) {
+		t.Error("a re-run after an edit is a re-verify, not a repeat")
+	}
+	if !rt.sawAgain(probe, ToolUse{Name: "run_command", Output: "exit 1\n\nboom", Failed: true}) {
+		// A different output than before: new information, so this one is not
+		// a repeat either; the next identical failure is.
+		t.Log("first failure is new output")
+	}
+	if !rt.sawAgain(probe, ToolUse{Name: "run_command", Output: "exit 1\n\nboom", Failed: true}) {
+		t.Error("a repeated failure did not count")
 	}
 }

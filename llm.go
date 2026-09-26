@@ -889,6 +889,46 @@ func (a *agent) logStreamResponse(sid, connLabel string, r *streamResult, err er
 	a.logSession(sid, connLabel+" RESPONSE", "%s", rb.String())
 }
 
+// requestLogSame opens the log entry of a request that repeats the previous
+// one's bytes: the conversation is a prefix of the next request, so logging
+// every body whole wrote the same 800 KB per call and a session log reached
+// 6.8 GB. The entry keeps only the bytes from the first change on; digestLog
+// (session_insights) reassembles a full body from the chain when it needs one.
+const requestLogSame = "[same as the previous request to this connection for the first "
+
+// requestLogText returns what to log for this request: the whole body for
+// the first request on a connection, else the delta against the previous one.
+func (a *agent) requestLogText(sid, connLabel string, body []byte) string {
+	key := sid + "\x00" + connLabel
+	a.logPrevMu.Lock()
+	prev := a.logPrev[key]
+	if a.logPrev == nil {
+		a.logPrev = map[string][]byte{}
+	}
+	a.logPrev[key] = body
+	a.logPrevMu.Unlock()
+	return requestLogDelta(prev, body)
+}
+
+// requestLogDelta: the bytes of body from its first difference to prev, under
+// a line that says how much was the same. A change early in the body is
+// called out: it is the prefix cache being lost, which the log is otherwise
+// silent about until the token counts come back.
+func requestLogDelta(prev, body []byte) string {
+	n := 0
+	for n < len(prev) && n < len(body) && prev[n] == body[n] {
+		n++
+	}
+	if n == 0 {
+		return string(body)
+	}
+	head := fmt.Sprintf("%s%d of %d bytes; the rest:]\n", requestLogSame, n, len(body))
+	if n*2 < len(prev) {
+		head = fmt.Sprintf("%s%d of %d bytes ONLY: a change this early is a prefix the server cannot reuse; the rest:]\n", requestLogSame, n, len(body))
+	}
+	return head + strings.ToValidUTF8(string(body[n:]), "")
+}
+
 // llmStream is the core LLM call: the concurrency gate, the status meter, the
 // HTTP round trip and its non-200 handling. sid scopes the session log ("" for
 // probes and tests). think receives reasoning tokens separately from `on`, so
@@ -1041,7 +1081,7 @@ func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnecti
 	// llm[<slot>] + role + model so grepping "llm[1]" finds every request routed
 	// to a given entry.
 	connLabel := fmt.Sprintf("llm[%s] %s model=%s", slotLabel, conn.Tag, conn.Model)
-	a.logSession(sid, connLabel+" REQUEST", "%s", string(body))
+	a.logSession(sid, connLabel+" REQUEST", "%s", a.requestLogText(sid, connLabel, body))
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", conn.endpoint("/v1/chat/completions"), bytes.NewReader(body))
 	if err != nil {

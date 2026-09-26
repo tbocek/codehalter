@@ -97,3 +97,25 @@ func TestDigestLogDegradesGracefully(t *testing.T) {
 		t.Fatal("unparseable REQUEST should carry a parse note")
 	}
 }
+
+// TestDigestLogReassemblesDeltas: request entries logged as deltas
+// (requestLogDelta) are rebuilt into full bodies, so the last request still
+// parses as the complete messages array.
+func TestDigestLogReassemblesDeltas(t *testing.T) {
+	first := `{"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{}"}}]}]}`
+	second := `{"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}`
+	log := "=== 2026-09-26T10:00:00Z [llm[0] execute model=m REQUEST] ===\n" + first + "\n" +
+		"=== 2026-09-26T10:00:05Z [llm[0] execute model=m REQUEST] ===\n" + requestLogDelta([]byte(first), []byte(second)) + "\n"
+	d := digestLog("session_x.log", log)
+	if d.requests != 2 {
+		t.Errorf("requests = %d, want 2", d.requests)
+	}
+	for _, n := range d.parseNotes {
+		if strings.Contains(n, "unparseable") {
+			t.Errorf("the reassembled request did not parse: %s", n)
+		}
+	}
+	if st := d.calls["read_file\x00{}"]; st == nil || st.count != 1 {
+		t.Errorf("read_file call not found in the reassembled request: %+v", d.calls)
+	}
+}

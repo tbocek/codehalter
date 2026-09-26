@@ -914,3 +914,22 @@ func TestLLMStreamDropsPrefillWhenRejected(t *testing.T) {
 		t.Errorf("a thinking-on call grew a flag: %v", on["chat_template_kwargs"])
 	}
 }
+
+// TestRequestLogDelta: a request is logged whole the first time, then as the
+// bytes from its first difference to the previous one, and a change early in
+// the body is called out as a lost prefix.
+func TestRequestLogDelta(t *testing.T) {
+	first := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	if got := requestLogDelta(nil, first); got != string(first) {
+		t.Errorf("first request logged as %q", got)
+	}
+	second := []byte(`{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}`)
+	got := requestLogDelta(first, second)
+	if !strings.HasPrefix(got, requestLogSame+"43 of ") || !strings.HasSuffix(got, `,{"role":"assistant","content":"yo"}]}`) || strings.Contains(got, "ONLY") {
+		t.Errorf("appended request logged as %q", got)
+	}
+	changed := []byte(`{"messages":[{"role":"system","content":"new"}]}`)
+	if got := requestLogDelta(second, changed); !strings.Contains(got, "ONLY: a change this early") {
+		t.Errorf("an early change was not called out: %q", got)
+	}
+}
