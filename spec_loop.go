@@ -1264,14 +1264,17 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 	}
 	var k [4]int
 	var kd [4]int
+	done := 0
 	for _, id := range idx.order {
 		k[idx.items[id].Kind]++
-		if _, ok := covered[id]; ok {
+		// Reopened and failed items are open, whatever their tests say.
+		if _, ok := covered[id]; ok && !cfg.open(id) {
 			kd[idx.items[id].Kind]++
+			done++
 		}
 	}
 	progress := fmt.Sprintf("%d of %d items covered (flows %d/%d, sections %d/%d, parameters and tools %d/%d)",
-		len(covered), len(idx.order), kd[specDefHeading], k[specDefHeading], kd[specDefSection], k[specDefSection], kd[specDefTableRow], k[specDefTableRow])
+		done, len(idx.order), kd[specDefHeading], k[specDefHeading], kd[specDefSection], k[specDefSection], kd[specDefTableRow], k[specDefTableRow])
 	screens := ""
 	if len(sl.Images) > 0 {
 		screens = "Screens this text shows (look at them with `screenshot path=...`): " + strings.Join(sl.Images, ", ") + "\n"

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -283,6 +284,32 @@ func TestSpecRedoReopens(t *testing.T) {
 	if cfg.Redo[ids[0]] != "sent back" {
 		t.Error("the reason did not stick")
 	}
+	// Status counts a reopened item as open although its test still names it.
+	status := renderSpecStatus(cfg, idx, covered, 1, "just test")
+	want := fmt.Sprintf("Covered: %d/%d flows", countKind(idx, specDefHeading)-countKindIn(idx, ids, specDefHeading), countKind(idx, specDefHeading))
+	if !strings.Contains(status, want) {
+		t.Errorf("status lacks %q:\n%s", want, status)
+	}
+}
+
+func countKind(idx *specIndex, kind int) int {
+	n := 0
+	for _, id := range idx.order {
+		if idx.items[id].Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+func countKindIn(idx *specIndex, ids []string, kind int) int {
+	n := 0
+	for _, id := range ids {
+		if idx.items[id].Kind == kind {
+			n++
+		}
+	}
+	return n
 }
 
 // TestDetectSpecTestCmd: a justfile test recipe wins, since that is where a

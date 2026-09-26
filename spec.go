@@ -1723,7 +1723,10 @@ func renderSpecStatus(cfg *specConfig, idx *specIndex, covered map[string]string
 		}
 		t.total++
 		kinds[it.Kind].total++
-		if _, ok := covered[id]; ok {
+		// A test naming the item counts only while no failed round or /spec
+		// redo stands against it: a reopened item is open, whatever its
+		// test says (the same rule nextSpecItem and adoption use).
+		if _, ok := covered[id]; ok && !cfg.open(id) {
 			t.done++
 			kinds[it.Kind].done++
 		} else if cfg.block(id) != nil {
