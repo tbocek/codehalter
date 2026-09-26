@@ -108,11 +108,14 @@ func digestLog(path string, data string) sessionDigest {
 		case strings.HasSuffix(e.tag, " REQUEST"):
 			d.requests++
 			body := e.body
-			if strings.HasPrefix(body, requestLogSame) {
+			if k := strings.Index(body, requestLogSame); k >= 0 {
+				// wrapper + marker + the messages from the first change on;
+				// the unchanged messages come from the previous full body.
 				var n, total int
-				if _, err := fmt.Sscanf(strings.TrimPrefix(body, requestLogSame), "%d of %d bytes", &n, &total); err == nil {
-					if i := strings.IndexByte(body, '\n'); i >= 0 && n <= len(full[e.tag]) {
-						body = full[e.tag][:n] + body[i+1:]
+				if _, err := fmt.Sscanf(body[k+len(requestLogSame):], "%d of %d bytes", &n, &total); err == nil {
+					pm := strings.Index(full[e.tag], `"messages":`)
+					if i := strings.IndexByte(body, '\n'); i >= 0 && pm >= 0 && pm+n <= len(full[e.tag]) {
+						body = body[:k] + full[e.tag][pm:pm+n] + body[i+1:]
 					}
 				}
 			}

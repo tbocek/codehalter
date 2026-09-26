@@ -102,8 +102,8 @@ func TestDigestLogDegradesGracefully(t *testing.T) {
 // (requestLogDelta) are rebuilt into full bodies, so the last request still
 // parses as the complete messages array.
 func TestDigestLogReassemblesDeltas(t *testing.T) {
-	first := `{"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{}"}}]}]}`
-	second := `{"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}`
+	first := `{"max_tokens":8192,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{}"}}]}]}`
+	second := `{"max_tokens":16384,"messages":[{"role":"user","content":"go"},{"role":"assistant","content":"","tool_calls":[{"id":"c1","function":{"name":"read_file","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"ok"}]}`
 	log := "=== 2026-09-26T10:00:00Z [llm[0] execute model=m REQUEST] ===\n" + first + "\n" +
 		"=== 2026-09-26T10:00:05Z [llm[0] execute model=m REQUEST] ===\n" + requestLogDelta([]byte(first), []byte(second)) + "\n"
 	d := digestLog("session_x.log", log)

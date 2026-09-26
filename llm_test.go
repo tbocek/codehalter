@@ -919,16 +919,20 @@ func TestLLMStreamDropsPrefillWhenRejected(t *testing.T) {
 // bytes from its first difference to the previous one, and a change early in
 // the body is called out as a lost prefix.
 func TestRequestLogDelta(t *testing.T) {
-	first := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
+	first := []byte(`{"max_tokens":8192,"messages":[{"role":"user","content":"hi"}]}`)
 	if got := requestLogDelta(nil, first); got != string(first) {
 		t.Errorf("first request logged as %q", got)
 	}
-	second := []byte(`{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}`)
+	// A different wrapper (thinking off, another cap) with the same messages
+	// plus one: the wrapper is logged whole, the messages as their tail, and
+	// nothing is called a lost prefix.
+	second := []byte(`{"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16384,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}`)
 	got := requestLogDelta(first, second)
-	if !strings.HasPrefix(got, requestLogSame+"43 of ") || !strings.HasSuffix(got, `,{"role":"assistant","content":"yo"}]}`) || strings.Contains(got, "ONLY") {
+	if !strings.HasPrefix(got, `{"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16384,`+requestLogSame+"42 of ") ||
+		!strings.HasSuffix(got, `,{"role":"assistant","content":"yo"}]}`) || strings.Contains(got, "ONLY") {
 		t.Errorf("appended request logged as %q", got)
 	}
-	changed := []byte(`{"messages":[{"role":"system","content":"new"}]}`)
+	changed := []byte(`{"max_tokens":8192,"messages":[{"role":"system","content":"new"}]}`)
 	if got := requestLogDelta(second, changed); !strings.Contains(got, "ONLY: a change this early") {
 		t.Errorf("an early change was not called out: %q", got)
 	}

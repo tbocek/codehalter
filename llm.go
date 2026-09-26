@@ -915,18 +915,30 @@ func (a *agent) requestLogText(sid, connLabel string, body []byte) string {
 // called out: it is the prefix cache being lost, which the log is otherwise
 // silent about until the token counts come back.
 func requestLogDelta(prev, body []byte) string {
+	// The wrapper before "messages" (max_tokens, the prefill or thinking
+	// switches, tool_choice) changes between renderings while the messages
+	// do not, and the server's cache is keyed on the messages. Comparing
+	// from the first byte called every rendering switch a lost prefix and
+	// logged the whole body for it: 89 times in one afternoon, 2.8 MB each.
+	// So the wrapper is logged as is, and the comparison starts at the
+	// messages.
+	pm, bm := bytes.Index(prev, []byte(`"messages":`)), bytes.Index(body, []byte(`"messages":`))
+	if len(prev) == 0 || pm < 0 || bm < 0 {
+		return string(body)
+	}
+	wrapper, rest, prevRest := body[:bm], body[bm:], prev[pm:]
 	n := 0
-	for n < len(prev) && n < len(body) && prev[n] == body[n] {
+	for n < len(prevRest) && n < len(rest) && prevRest[n] == rest[n] {
 		n++
 	}
 	if n == 0 {
 		return string(body)
 	}
-	head := fmt.Sprintf("%s%d of %d bytes; the rest:]\n", requestLogSame, n, len(body))
-	if n*2 < len(prev) {
-		head = fmt.Sprintf("%s%d of %d bytes ONLY: a change this early is a prefix the server cannot reuse; the rest:]\n", requestLogSame, n, len(body))
+	head := fmt.Sprintf("%s%s%d of %d bytes of messages; the rest:]\n", string(wrapper), requestLogSame, n, len(rest))
+	if n*2 < len(prevRest) {
+		head = fmt.Sprintf("%s%s%d of %d bytes of messages ONLY: a change this early is a prefix the server cannot reuse; the rest:]\n", string(wrapper), requestLogSame, n, len(rest))
 	}
-	return head + strings.ToValidUTF8(string(body[n:]), "")
+	return head + strings.ToValidUTF8(string(rest[n:]), "")
 }
 
 // llmStream is the core LLM call: the concurrency gate, the status meter, the
