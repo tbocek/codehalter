@@ -846,6 +846,10 @@ func hasSnapshotRecipe(outAbs string) bool {
 	return false
 }
 
+// uiSourceExt are the file types the UI rule looks inside. A README that
+// mentions libadwaita is not a screen; an edit to it must not demand a look.
+var uiSourceExt = map[string]bool{".rs": true, ".py": true, ".go": true, ".c": true, ".cc": true, ".cpp": true, ".h": true, ".hpp": true, ".ts": true, ".tsx": true, ".js": true, ".jsx": true, ".vue": true, ".svelte": true, ".swift": true, ".kt": true, ".ui": true, ".blp": true, ".qml": true, ".slint": true}
+
 // uiMarkers are what a desktop UI source file imports.
 var uiMarkers = []string{"gtk::", "adw::", "use gtk", "use adw", "gtk4::", "libadwaita", "QtWidgets", "QWidget", "#include <Q", "from PyQt", "from PySide", "import tkinter", "egui::", "iced::", "slint::", "fltk::"}
 
@@ -860,7 +864,7 @@ func uiEditedUnseen(uses []ToolUse, cwd string) []string {
 			return nil
 		case "edit_file", "write_file":
 			path := parseArgs(u.Input).str("path")
-			if path == "" || seen[path] {
+			if path == "" || seen[path] || !uiSourceExt[strings.ToLower(filepath.Ext(path))] {
 				continue
 			}
 			seen[path] = true

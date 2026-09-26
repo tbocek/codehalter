@@ -55,7 +55,7 @@ func (p *planResult) UnmarshalJSON(b []byte) error {
 		if err := json.Unmarshal(raw.Subtasks, &inner); err != nil {
 			return err
 		}
-		raw.Subtasks = json.RawMessage(inner)
+		raw.Subtasks = json.RawMessage(trimJSONArray(inner))
 	}
 	return json.Unmarshal(raw.Subtasks, &p.Subtasks)
 }
@@ -927,9 +927,12 @@ func changesFiles(tc toolCall) bool {
 	return false
 }
 
-// inPlaceWriterRe: shell commands that rewrite files, so a green re-run after
-// one of them is a re-verify, not a repeat.
-var inPlaceWriterRe = regexp.MustCompile(`sed -i|-i\b.*\bsed|cargo fmt|gofmt -w|prettier --write|go mod tidy|git (checkout|stash|apply|revert|reset)|cargo add|npm i|apk add|apt-get install|>>? *[^&\s]`)
+// inPlaceWriterRe: shell commands that rewrite source files, so a green
+// re-run after one of them is a re-verify, not a repeat. A Python heredoc is
+// on the list because the model edits files with one when edit_file did not
+// match. A redirect is NOT: `just snapshot x > /tmp/log` writes a log, not
+// the tree, and counting it let one screen be rendered 33 times in a row.
+var inPlaceWriterRe = regexp.MustCompile(`sed -i|-i\b.*\bsed|cargo fmt|gofmt -w|prettier --write|go mod tidy|git (checkout|stash|apply|revert|reset)|cargo add|npm i|apk add|apt-get install|python3? -\s|<<-?'?(PY|EOF|PYTHON)'?`)
 
 // sawAgain records this call's output and reports whether it made no progress.
 func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {

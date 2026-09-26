@@ -113,9 +113,16 @@ func jaccard(a, b map[string]bool) float64 {
 // keep that slice. Brace counting respects strings + escapes so braces inside
 // string values don't confuse the scan. Returns the trimmed input unchanged
 // if no balanced object is found — caller surfaces the parse error.
-func trimJSON(s string) string {
+func trimJSON(s string) string { return trimBalanced(s, '{', '}') }
+
+// trimJSONArray is trimJSON for an array: the first `[` to its matching `]`.
+// A stringified subtask list once arrived as `[{…}]}`, one brace too many
+// inside the string, and the whole plan was rejected for it.
+func trimJSONArray(s string) string { return trimBalanced(s, '[', ']') }
+
+func trimBalanced(s string, open, close byte) string {
 	s = strings.TrimSpace(s)
-	start := strings.IndexByte(s, '{')
+	start := strings.IndexByte(s, open)
 	if start < 0 {
 		return s
 	}
@@ -138,9 +145,9 @@ func trimJSON(s string) string {
 		switch c {
 		case '"':
 			inStr = true
-		case '{':
+		case open:
 			depth++
-		case '}':
+		case close:
 			depth--
 			if depth == 0 {
 				return s[start : i+1]

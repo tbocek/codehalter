@@ -301,6 +301,15 @@ func TestSpecUIChangeNeedsALook(t *testing.T) {
 	}
 	editUI := ToolUse{Name: "edit_file", Input: `{"path":"rust/src/ui.rs"}`}
 	editPlain := ToolUse{Name: "write_file", Input: `{"path":"rust/src/rules.rs"}`}
+	// A README naming the toolkit is not a screen.
+	readme := filepath.Join(sess.Cwd, "Readme.md")
+	if err := os.WriteFile(readme, []byte("Built with gtk:: and libadwaita.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	editDoc := ToolUse{Name: "edit_file", Input: `{"path":"Readme.md"}`}
+	if got := uiEditedUnseen([]ToolUse{editDoc}, sess.Cwd); got != nil {
+		t.Errorf("a markdown edit demanded a look: %v", got)
+	}
 	look := ToolUse{Name: "screenshot", Input: `{"path":"rust/shots/03-window.png"}`}
 
 	if got := uiEditedUnseen([]ToolUse{editPlain, editUI}, sess.Cwd); strings.Join(got, ",") != "rust/src/ui.rs" {

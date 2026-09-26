@@ -1458,6 +1458,20 @@ func TestPlanRedoIsAPlan(t *testing.T) {
 	}
 }
 
+// TestPlanStringifiedSubtasksWithStrayBrace: a stringified subtask array
+// with one brace too many inside the string still parses; the balanced
+// array is what counts.
+func TestPlanStringifiedSubtasksWithStrayBrace(t *testing.T) {
+	var p planResult
+	raw := `{"clear": true, "report_only": false, "subtasks": "[{\"description\": \"look\", \"verify\": [\"a\"]}]}"}`
+	if err := json.Unmarshal([]byte(raw), &p); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(p.Subtasks) != 1 || p.Subtasks[0].Description != "look" {
+		t.Errorf("subtasks = %+v", p.Subtasks)
+	}
+}
+
 // TestStuckLadderCatchesSuccessfulCommandSpin: a successful run_command
 // re-run counts as progress only when something happened in between (a
 // re-verify after an edit). The same command straight after itself, exit 0
@@ -1498,6 +1512,18 @@ func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
 	rt.sawAgain(mk("s", "run_command", `{"command":"sed -i s/a/b/ a.rs"}`), ToolUse{Name: "run_command", Output: "exit 0\n"})
 	if rt.sawAgain(probe, out) {
 		t.Error("a re-run after an in-place shell write is a re-verify, not a repeat")
+	}
+	rt.sawAgain(mk("p", "run_command", "{\"command\":\"cd rust && python3 - <<'PY'\\nopen('a.rs','w').write('x')\\nPY\"}"), ToolUse{Name: "run_command", Output: "exit 0\n"})
+	if rt.sawAgain(probe, out) {
+		t.Error("a re-run after a Python heredoc edit is a re-verify, not a repeat")
+	}
+	// A redirect to a log is not a change to the tree: rendering the same
+	// screen into /tmp again and again is a spin.
+	snap := mk("n", "run_command", `{"command":"cd rust && just snapshot 04-prepare > /tmp/snap.log 2>&1"}`)
+	snapOut := ToolUse{Name: "run_command", Output: "exit 0\n\n-> shots/04-prepare.png\n"}
+	rt.sawAgain(snap, snapOut)
+	if !rt.sawAgain(snap, snapOut) {
+		t.Error("a repeated snapshot render with only a log redirect did not count as a repeat")
 	}
 	if !rt.sawAgain(probe, ToolUse{Name: "run_command", Output: "exit 1\n\nboom", Failed: true}) {
 		// A different output than before: new information, so this one is not
