@@ -287,6 +287,15 @@ func specRedoTargets(cfg *specConfig, idx *specIndex, targets []string) (ids, un
 			add(t)
 			continue
 		}
+		// A section id with the right file and number but a paraphrased slug
+		// ("§03-shell#4-sources" for "§03-shell#4-sources-list-lives-on-…"):
+		// the number pins the section, the words were from memory.
+		if strings.HasPrefix(t, "§") && strings.Contains(t, "#") {
+			if id := sectionByNumber(idx, t); id != "" {
+				add(id)
+				continue
+			}
+		}
 		file := strings.TrimPrefix(strings.TrimPrefix(t, cfg.SpecDir+"/"), "./")
 		found := false
 		for d, doc := range idx.docs {
@@ -304,6 +313,31 @@ func specRedoTargets(cfg *specConfig, idx *specIndex, targets []string) (ids, un
 		}
 	}
 	return ids, unknown
+}
+
+// sectionByNumber resolves "§<file>#<n>-<anything>" to the one section item
+// of that file whose slug starts with "<n>-", or "" when there is none or
+// the file has no such numbered section.
+func sectionByNumber(idx *specIndex, t string) string {
+	hash := strings.Index(t, "#")
+	stem, slug := t[:hash+1], t[hash+1:]
+	num := slug
+	if i := strings.Index(slug, "-"); i > 0 {
+		num = slug[:i]
+	}
+	if num == "" || strings.Trim(num, "0123456789.") != "" {
+		return ""
+	}
+	match := ""
+	for _, id := range idx.order {
+		if strings.HasPrefix(id, stem) && (strings.HasPrefix(id[len(stem):], num+"-") || id[len(stem):] == num) {
+			if match != "" {
+				return "" // two sections with that number: not a pin
+			}
+			match = id
+		}
+	}
+	return match
 }
 
 // reopen sends finished items back to the loop: out of the ledger, and marked

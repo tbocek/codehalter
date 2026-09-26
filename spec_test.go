@@ -247,6 +247,26 @@ func TestSpecRedoReopens(t *testing.T) {
 	if _, unknown := specRedoTargets(cfg, idx, []string{"F9.9", byFile}); len(unknown) != 1 || unknown[0] != "F9.9" {
 		t.Errorf("unknown = %v, want the typo alone", unknown)
 	}
+	// A section named by file and number with a paraphrased slug resolves to
+	// the real section; a number the file does not have does not.
+	var section string
+	for _, id := range idx.order {
+		if strings.HasPrefix(id, "§") && strings.Contains(id, "#") {
+			section = id
+			break
+		}
+	}
+	if section != "" {
+		stem := section[:strings.Index(section, "#")+1]
+		num := strings.SplitN(section[len(stem):], "-", 2)[0]
+		got, unknown := specRedoTargets(cfg, idx, []string{stem + num + "-something-else"})
+		if len(unknown) != 0 || len(got) != 1 || got[0] != section {
+			t.Errorf("paraphrased section = %v %v, want %q", got, unknown, section)
+		}
+		if _, unknown := specRedoTargets(cfg, idx, []string{stem + "99-nothing"}); len(unknown) != 1 {
+			t.Errorf("a section number the file lacks resolved: %v", unknown)
+		}
+	}
 
 	cfg.reopen(ids, "sent back")
 	for _, id := range ids {

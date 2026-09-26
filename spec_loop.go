@@ -379,6 +379,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		r.say(ctx, fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
 		return end, nil
 	}
+	fromModel := false
 	if cmd == "redo" {
 		// No targets: the model audits the program against the spec and
 		// names the items that fall short (SPEC-REDO.md); its submit_plan
@@ -388,7 +389,13 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			return end, nil
 		}
 		r.say(ctx, "\n## /spec redo · finding what falls short\n\n")
+		sess.rt.mu.Lock()
+		sess.rt.specAudit = true
+		sess.rt.mu.Unlock()
 		turnErr := a.runPromptTurn(ctx, sess, a.specAuditPrompt(sid, cfg, r.idx, r.testCmd()))
+		sess.rt.mu.Lock()
+		sess.rt.specAudit = false
+		sess.rt.mu.Unlock()
 		if isCancelled(turnErr) {
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
@@ -398,11 +405,22 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			return end, nil
 		}
 		cmd = handoff
+		fromModel = true
 	}
 	if strings.HasPrefix(cmd, "redo ") {
 		ids, unknown := specRedoTargets(cfg, r.idx, strings.Fields(strings.TrimPrefix(cmd, "redo ")))
-		if len(unknown) > 0 {
-			r.say(ctx, fmt.Sprintf("⚠ /spec redo: not in `%s/`: %s. Name an item id (`F2.3`, `P.policy.x`, `§03-shell#1-screen`) or a spec file (`03-shell.md`). Nothing was reopened.\n", cfg.SpecDir, strings.Join(unknown, ", ")))
+		switch {
+		case len(unknown) > 0 && !fromModel:
+			// Typed by the user: a typo must not reopen half a list.
+			r.say(ctx, fmt.Sprintf("⚠ /spec redo: not in `%s/`: %s. Name an item id exactly as the spec writes it, or a spec file (`03-shell.md`). Nothing was reopened.\n", cfg.SpecDir, strings.Join(unknown, ", ")))
+			return end, nil
+		case len(unknown) > 0:
+			// Named by the model: one id it misremembered must not throw away
+			// the forty it got right.
+			r.say(ctx, fmt.Sprintf("⚠ not in `%s/`, skipped: %s\n", cfg.SpecDir, strings.Join(unknown, ", ")))
+		}
+		if len(ids) == 0 {
+			r.say(ctx, "Nothing to reopen.\n")
 			return end, nil
 		}
 		cfg.reopen(ids, specRedoReason)
@@ -918,6 +936,14 @@ func (a *agent) specFromPlan(ctx context.Context, sid string, sess *Session, p *
 		}
 		ids := strings.Join(p.Redo, " ")
 		a.say(ctx, sid, fmt.Sprintf("The planner reads this request as %d item(s) of the spec that are recorded as done but do not deliver: %s\n\n", len(p.Redo), strings.Join(p.Redo, ", ")))
+		sess.rt.mu.Lock()
+		audit := sess.rt.specAudit
+		sess.rt.mu.Unlock()
+		if audit {
+			// A bare /spec redo asked for exactly this: no second question.
+			sess.setSpecHandoff("redo " + ids)
+			return toolLoopResult{Text: "handed over to /spec"}, nil
+		}
 		ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Reopen %d spec item(s) and rebuild them with /spec, one per round?", len(p.Redo)), "think", "Run /spec", "Not now")
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
@@ -998,9 +1024,24 @@ func (a *agent) specAuditPrompt(sid string, cfg *specConfig, idx *specIndex, tes
 	for _, d := range idx.docs {
 		docs = append(docs, "`"+cfg.SpecDir+"/"+d.rel+"`")
 	}
+	// Every id, by file, exactly as the ledger spells it: an audit that has
+	// to name forty of them from memory invented one from an example.
+	var ids strings.Builder
+	for d, doc := range idx.docs {
+		var in []string
+		for _, id := range idx.order {
+			if idx.items[id].Doc == d {
+				in = append(in, "`"+id+"`")
+			}
+		}
+		if len(in) > 0 {
+			fmt.Fprintf(&ids, "- `%s`: %s\n", doc.rel, strings.Join(in, ", "))
+		}
+	}
 	rep := strings.NewReplacer(
 		"{{spec_dir}}", cfg.SpecDir, "{{out_dir}}", cfg.OutDir, "{{target}}", target,
 		"{{test_cmd}}", testCmd, "{{context}}", context, "{{files}}", strings.Join(docs, ", "),
+		"{{ids}}", strings.TrimRight(ids.String(), "\n"),
 	)
 	return collapseBlankLines(rep.Replace(a.loadPromptFile(sid, "SPEC-REDO.md")))
 }

@@ -327,7 +327,7 @@ func TestSpecAuditPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompt := a.specAuditPrompt(s.ID, &specConfig{SpecDir: "spec", OutDir: "rust", Target: "gtk4"}, idx, "just test")
-	for _, want := range []string{"`redo`", "spec/00-principles.md", "just test", "gtk4", "snapshot", "report_only"} {
+	for _, want := range []string{"`redo`", "spec/00-principles.md", "just test", "gtk4", "snapshot", "report_only", "`F0.1`", "copied from the list below"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("audit prompt lacks %q", want)
 		}

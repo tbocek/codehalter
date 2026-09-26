@@ -291,6 +291,10 @@ type sessionRuntime struct {
 	// plan ("resume", or "redo <ids>"), run by Prompt once the planning turn
 	// has closed. Runtime-only.
 	specHandoff string
+	// specAudit is set while a bare /spec redo runs its audit round: the
+	// user asked for the items to be found and rebuilt, so the planner's
+	// list is not put to them again as a question. Runtime-only.
+	specAudit bool
 }
 
 // startTurn gives the session a fresh turnState: nothing one turn saw (dedup,
