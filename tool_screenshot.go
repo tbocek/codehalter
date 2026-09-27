@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	_ "image/jpeg"
 	"image/png"
 	"log/slog"
 	"net"
@@ -76,6 +77,11 @@ var screenshotTool = Tool{
 						"type":        "string",
 						"description": "Project-relative path of the file to render, e.g. `out/index.html`. Must be inside the project; there is no URL mode.",
 					},
+					"region": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "integer"},
+						"description": "Only for a picture file (.png, .jpg): [x, y, width, height] in the picture's own pixels, returned enlarged, for a close look at one part of a screen: {\"path\": \"shots/06-lane.png\", \"region\": [0, 560, 1500, 260]}. The reply for a whole picture states its size in pixels. Use this instead of cropping with a script.",
+					},
 					"selector": map[string]any{
 						"type":        "string",
 						"description": "Optional CSS selector. Its first match is scrolled to the top of the shot, and the reply says whether it matched and where it sits.",
@@ -130,6 +136,13 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 	}
 	if info, err := os.Stat(abs); err != nil || info.IsDir() {
 		return fmt.Sprintf("screenshot: %s is not a readable file. Only files inside the project can be rendered; there is no URL mode.", rel), nil, "", true
+	}
+	// A picture file is looked at directly, whole or as a region: decoding
+	// it here is exact, and a region is what the model otherwise builds with
+	// a PIL crop script per guess (14 of them in one subtask that ran out of
+	// iterations). Firefox only renders pages.
+	if isPictureFile(abs) {
+		return a.viewPicture(ctx, sid, sess, rel, abs, args)
 	}
 	bin, err := findFirefox()
 	if err != nil {
@@ -420,7 +433,11 @@ func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result s
 	}
 	rel, _ := filepath.Rel(sess.Cwd, png)
 	rel = filepath.ToSlash(rel)
-	text := result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s, is attached below as %s. Look at it now, before anything else: is every widget the spec names on it, in the order it says; is anything empty, overlapping, cut off or unlabeled? Where the spec has its own picture of this screen (its image with the same name), look at that too with `screenshot` and compare widgets, order and labels, not pixels. Fix what you see, then render again.]", rel, id)
+	size := ""
+	if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		size = fmt.Sprintf(", %dx%d px as attached", cfg.Width, cfg.Height)
+	}
+	text := result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s%s, is attached below as %s. For a closer look at one part, call screenshot on that file with \"region\": [x, y, width, height] in the file's own pixels; never crop with a script. Look at it now, before anything else: is every widget the spec names on it, in the order it says; is anything empty, overlapping, cut off or unlabeled? Where the spec has its own picture of this screen (its image with the same name), look at that too with `screenshot` and compare widgets, order and labels, not pixels. Fix what you see, then render again.]", rel, size, id)
 	a.say(ctx, sid, fmt.Sprintf("👁 attached the rendered screen %s to the model's view\n", rel))
 	return text, imageParts(text, "image/png", data), id
 }
@@ -500,4 +517,81 @@ func newestPNGSince(root string, t time.Time) string {
 		return nil
 	})
 	return best
+}
+
+// isPictureFile: a PNG or JPEG, which screenshot shows directly.
+func isPictureFile(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png", ".jpg", ".jpeg":
+		return true
+	}
+	return false
+}
+
+// pictureRegionMaxSide is the long side a region is enlarged to at most, by
+// a whole factor, so a thin strip of a screen comes back big enough to read.
+const pictureRegionMaxSide = 1400
+
+// viewPicture shows a picture file: whole (scaled down like an attached
+// render), or the `region` [x, y, width, height] of it in the picture's own
+// pixels, enlarged by a whole factor. The reply names the picture's size, so
+// the next region can be aimed without guessing.
+func (a *agent) viewPicture(ctx context.Context, sid string, sess *Session, rel, abs string, args toolArgs) (string, []any, string, bool) {
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return "screenshot: " + err.Error(), nil, "", true
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Sprintf("screenshot: %s could not be decoded as an image: %v", rel, err), nil, "", true
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	what := fmt.Sprintf("%s (%dx%d px)", rel, w, h)
+	var out []byte
+	if r, ok := args["region"].([]any); ok {
+		if len(r) != 4 {
+			return "screenshot: `region` is [x, y, width, height] in the picture's pixels, four numbers.", nil, "", true
+		}
+		ta := toolArgs{"x": r[0], "y": r[1], "w": r[2], "h": r[3]}
+		x, _ := ta.num("x")
+		y, _ := ta.num("y")
+		rw, _ := ta.num("w")
+		rh, _ := ta.num("h")
+		cut := image.Rect(x, y, x+rw, y+rh).Intersect(image.Rect(0, 0, w, h))
+		if cut.Empty() {
+			return fmt.Sprintf("screenshot: region %v lies outside %s; the picture is %dx%d.", r, rel, w, h), nil, "", true
+		}
+		f := 1
+		for (f+1)*max(cut.Dx(), cut.Dy()) <= pictureRegionMaxSide {
+			f++
+		}
+		dst := image.NewRGBA(image.Rect(0, 0, cut.Dx()*f, cut.Dy()*f))
+		for yy := 0; yy < dst.Bounds().Dy(); yy++ {
+			for xx := 0; xx < dst.Bounds().Dx(); xx++ {
+				dst.Set(xx, yy, img.At(b.Min.X+cut.Min.X+xx/f, b.Min.Y+cut.Min.Y+yy/f))
+			}
+		}
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, dst); err != nil {
+			return "screenshot: " + err.Error(), nil, "", true
+		}
+		out = buf.Bytes()
+		what = fmt.Sprintf("%s, region x %d-%d, y %d-%d, enlarged %dx", what, cut.Min.X, cut.Max.X, cut.Min.Y, cut.Max.Y, f)
+	} else {
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			return "screenshot: " + err.Error(), nil, "", true
+		}
+		out = downscalePNG(buf.Bytes(), attachMaxSide)
+	}
+	sum := sha256.Sum256(out)
+	id := "img_" + hex.EncodeToString(sum[:8])
+	if err := writeImageFile(sess.Cwd, id, "image/png", out); err != nil {
+		return "screenshot: could not be stored: " + err.Error(), nil, "", true
+	}
+	text := fmt.Sprintf("[Picture %s attached as %s. For a closer look at one part, pass \"region\": [x, y, width, height] in these pixels; it comes back enlarged.]", what, id)
+	tcID := a.StartToolCall(ctx, sid, "Picture: "+what, "read", []ToolCallLocation{{Path: rel}})
+	a.CompleteToolCall(ctx, sid, tcID, []ToolCallContent{TextContent(id)})
+	return text, imageParts(text, "image/png", out), id, false
 }

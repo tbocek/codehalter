@@ -405,3 +405,53 @@ func TestDownscalePNG(t *testing.T) {
 		t.Error("undecodable bytes were changed")
 	}
 }
+
+// TestScreenshotPictureRegion: a picture file is shown directly with its
+// size, and a region comes back enlarged by a whole factor; a region outside
+// the picture says how big it is.
+func TestScreenshotPictureRegion(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.imagesSupported = true
+	img := image.NewRGBA(image.Rect(0, 0, 300, 200))
+	for y := 0; y < 200; y++ {
+		for x := 0; x < 300; x++ {
+			if y >= 100 {
+				img.Set(x, y, color.Black)
+			} else {
+				img.Set(x, y, color.White)
+			}
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.sess.Cwd, "shot.png"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	text, parts, id, failed := dispatchScreenshot(context.Background(), h.agent, h.sess.ID, `{"path":"shot.png"}`)
+	if failed || id == "" || len(parts) != 2 || !strings.Contains(text, "shot.png (300x200 px)") {
+		t.Fatalf("whole picture = %q %v", text, failed)
+	}
+	text, _, id, failed = dispatchScreenshot(context.Background(), h.agent, h.sess.ID, `{"path":"shot.png","region":[0,90,100,20]}`)
+	if failed || !strings.Contains(text, "region x 0-100, y 90-110, enlarged 14x") {
+		t.Fatalf("region = %q %v", text, failed)
+	}
+	data, _, err := readImageFile(h.sess.Cwd, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := png.Decode(bytes.NewReader(data))
+	if b := got.Bounds(); b.Dx() != 1400 || b.Dy() != 280 {
+		t.Errorf("region size = %v, want 1400x280", b)
+	}
+	if r, _, _, _ := got.At(5, 5).RGBA(); r != 0xffff {
+		t.Error("top of the region should be white")
+	}
+	if r, _, _, _ := got.At(5, 275).RGBA(); r != 0 {
+		t.Error("bottom of the region should be black")
+	}
+	if text, _, _, failed := dispatchScreenshot(context.Background(), h.agent, h.sess.ID, `{"path":"shot.png","region":[500,500,10,10]}`); !failed || !strings.Contains(text, "300x200") {
+		t.Errorf("region outside = %q %v", text, failed)
+	}
+}
