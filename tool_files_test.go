@@ -512,3 +512,70 @@ func TestEditFileByAnchors(t *testing.T) {
 		t.Errorf("neither form = %v %s", failed, out)
 	}
 }
+
+// TestReadFileSeveralReads: `reads` serves each target in order under its own
+// header, a failing one does not stop the rest, and more than the cap are
+// named as not served.
+func TestReadFileSeveralReads(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, "w.rs")
+	if err := os.WriteFile(path, []byte("fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var tc toolCall
+	tc.Function.Name = "read_file"
+	tc.Function.Arguments = fmt.Sprintf(`{"reads":[{"path":%q,"symbol":"b"},{"path":%q,"symbol":"nope"},{"path":%q,"line":1,"limit":1}]}`, path, path, path)
+	out, failed := a.executeTool(context.Background(), s.ID, tc)
+	if failed {
+		t.Fatalf("reads failed: %s", out)
+	}
+	for _, want := range []string{"=== read 1 of 3: " + path + " b ===", "two();", "=== read 2 of 3:", "no definition of `nope`", "=== read 3 of 3: " + path + " from line 1 ===", "fn a() {"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("reads output lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Index(out, "read 1 of 3") > strings.Index(out, "read 3 of 3") {
+		t.Error("reads out of order")
+	}
+	var many []string
+	for i := 0; i < maxReadsPerCall+2; i++ {
+		many = append(many, fmt.Sprintf(`{"path":%q,"line":%d,"limit":1}`, path, i+1))
+	}
+	tc.Function.Arguments = `{"reads":[` + strings.Join(many, ",") + `]}`
+	if out, _ := a.executeTool(context.Background(), s.ID, tc); !strings.Contains(out, "not served: at most") {
+		t.Errorf("the cap was not reported:\n%s", out)
+	}
+}
+
+// TestEditFileSeveralEdits: `edits` applies in order, each on the result of
+// the one before, and writes once; one failing edit writes nothing and says
+// which.
+func TestEditFileSeveralEdits(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, "w.rs")
+	src := "let zoom = 1.0;\n\nfn wire_zoom() {\n    old();\n} // wire_zoom\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	edit := func(args string) (string, bool) {
+		var tc toolCall
+		tc.Function.Name = "edit_file"
+		tc.Function.Arguments = args
+		return a.executeTool(context.Background(), s.ID, tc)
+	}
+	out, failed := edit(fmt.Sprintf(`{"path":%q,"edits":[{"old_text":"let zoom = 1.0;","new_text":"let zoom = ZOOM;"},{"start":"fn wire_zoom(","end":"// wire_zoom","new_text":"fn wire_zoom() {\n    new();\n}"}]}`, path))
+	if failed || !strings.Contains(out, "all 2 edits applied in order") {
+		t.Fatalf("edits = %v %s", failed, out)
+	}
+	got, _ := os.ReadFile(path)
+	if want := "let zoom = ZOOM;\n\nfn wire_zoom() {\n    new();\n}\n"; string(got) != want {
+		t.Errorf("file =\n%s\nwant\n%s", got, want)
+	}
+	out, failed = edit(fmt.Sprintf(`{"path":%q,"edits":[{"old_text":"let zoom = ZOOM;","new_text":"let zoom = 2.0;"},{"old_text":"not in the file at all","new_text":"x"}]}`, path))
+	if !failed || !strings.Contains(out, "edit 2 of 2 failed, so NOTHING was written") {
+		t.Errorf("failing list = %v %s", failed, out)
+	}
+	if after, _ := os.ReadFile(path); string(after) != string(got) {
+		t.Errorf("a failed list changed the file:\n%s", after)
+	}
+}

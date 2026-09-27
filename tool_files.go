@@ -234,6 +234,62 @@ const (
 // marks EOF when it doesn't. read_file/continue_read are exempt from the
 // downstream byte-clip (truncateForLLM), so this output is exactly what the
 // model sees. tcId is the already-started tool-call card to complete/fail.
+// maxReadsPerCall bounds a read_file `reads` list.
+const maxReadsPerCall = 8
+
+// readTarget serves one read: a definition by symbol, or a line window.
+func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (string, bool) {
+	path, err := a.resolvePath(sid, args.str("path"))
+	if err != nil {
+		return "error: " + err.Error(), false
+	}
+	if sym := strings.TrimSpace(args.str("symbol")); sym != "" {
+		content, err := fsRead(a, ctx, sid, path, nil, nil)
+		if err != nil {
+			return "error reading file: " + err.Error(), false
+		}
+		loc := locateSymbol(content, sym)
+		if loc.start == 0 {
+			msg := fmt.Sprintf("error: no definition of `%s` found in %s.", sym, path)
+			if len(loc.mentions) > 0 {
+				msg += fmt.Sprintf(" The name appears at lines %s; read one of those with line=, or pass the exact declared name.", joinInts(loc.mentions))
+			} else {
+				msg += " The name does not appear in this file at all; find the right file with `grep -rn` first."
+			}
+			return msg, true
+		}
+		n := loc.end - loc.start + 1
+		if n > maxReadLines {
+			n = maxReadLines
+		}
+		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Reading: %s (%s)", path, sym), "read", []ToolCallLocation{{Path: path, Line: &loc.start}})
+		out, failed := a.serveRead(ctx, sid, path, loc.start, n, tcId)
+		head := fmt.Sprintf("[`%s`: lines %d-%d, block end found by %s", sym, loc.start, loc.end, loc.how)
+		if len(loc.others) > 0 {
+			head += fmt.Sprintf("; also declared at lines %s", joinInts(loc.others))
+		}
+		return head + "]\n" + out, failed
+	}
+	start := 1
+	line, haveLine := args.num("line")
+	if haveLine && line > 0 {
+		start = line
+	}
+	maxLines := readChunkLines
+	if v, ok := args.num("limit"); ok && v > 0 {
+		maxLines = v
+		if maxLines > maxReadLines {
+			maxLines = maxReadLines
+		}
+	}
+	title := "Reading: " + path
+	if haveLine {
+		title = fmt.Sprintf("Reading: %s:%d", path, line)
+	}
+	tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
+	return a.serveRead(ctx, sid, path, start, maxLines, tcId)
+}
+
 func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines int, tcId string) (string, bool) {
 	sess := a.getSession(sid)
 	// Key format is contractual: fsWrite busts entries by `path+"|"` prefix.
@@ -415,12 +471,29 @@ var fileTools = []Tool{
 	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name":        "read_file",
-			"description": fmt.Sprintf("Read a text file from the top (or from `line`), up to %d lines per call. The text comes back PLAIN, exactly as in the file, with no line-number prefixes: a snippet can be copied straight into edit_file's old_text. The note under it states which lines were served (\"showing lines 120-165\"), so you know where you are without numbering anything yourself. Prefer this to `cat`, `sed -n` or `awk 'NR>=a && NR<=b'` through run_command for a region you already know: one call, no shell quoting, and edit_file needs the text, never the numbers. Use `grep -n` through run_command only to FIND a region, not to read one. If the file continues past that, the output is marked partial and ends with a pointer to call continue_read for the next chunk (it remembers where you left off, so no line math). When the output ends with an end-of-file marker you have the file through that point, so do not re-read. A repeat read whose exact content is still in this conversation is refused (scroll back to it, or call continue_read for the next part); once it has scrolled out of context it is re-served. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
+			"name": "read_file",
+			"description": fmt.Sprintf("Read files. THREE WAYS, pick one per call:\n"+
+				"(1) A line window: {\"path\": \"src/cut.rs\", \"line\": 120, \"limit\": 60}.\n"+
+				"(2) One definition by name, the whole function, type, class or test, in any language: {\"path\": \"src/ui/window.rs\", \"symbol\": \"cut_form_column\"}. Use this instead of `grep -n` followed by `sed -n`: one call, the whole block, its line range in the note.\n"+
+				"(3) SEVERAL reads at once, the way you put several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"src/fx_zoom.rs\", \"symbol\": \"zoom_at\"}, {\"path\": \"tests/zoom_widgets.rs\", \"line\": 1, \"limit\": 40}]}. Each comes back under its own \"=== read N of M ===\" header. When you know you need two or three things, ask for them in ONE call like this, not one call each.\n"+
+				"Details: up to %d lines per read. The text comes back PLAIN, exactly as in the file, with no line-number prefixes: a snippet can be copied straight into edit_file's old_text. The note under it states which lines were served (\"showing lines 120-165\"), so you know where you are without numbering anything yourself. Prefer this to `cat`, `sed -n` or `awk 'NR>=a && NR<=b'` through run_command for a region you already know: one call, no shell quoting, and edit_file needs the text, never the numbers. Use `grep -n` through run_command only to FIND a region, not to read one. If the file continues past that, the output is marked partial and ends with a pointer to call continue_read for the next chunk (it remembers where you left off, so no line math). When the output ends with an end-of-file marker you have the file through that point, so do not re-read. A repeat read whose exact content is still in this conversation is refused (scroll back to it, or call continue_read for the next part); once it has scrolled out of context it is re-served. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
 			"parameters": map[string]any{
-				"type":     "object",
-				"required": []string{"path"},
+				"type": "object",
 				"properties": map[string]any{
+					"reads": map[string]any{
+						"type":        "array",
+						"description": fmt.Sprintf("SEVERAL reads in ONE call, instead of the fields below: a list, each item its own {path, symbol} or {path, line, limit}. Up to %d. Example: [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"tests/zoom_widgets.rs\", \"line\": 1, \"limit\": 40}].", maxReadsPerCall),
+						"items": map[string]any{
+							"type":     "object",
+							"required": []string{"path"},
+							"properties": map[string]any{
+								"path":   map[string]any{"type": "string"},
+								"symbol": map[string]any{"type": "string"},
+								"line":   map[string]any{"type": "integer"},
+								"limit":  map[string]any{"type": "integer"},
+							},
+						},
+					},
 					"path":   map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
 					"line":   map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
 					"limit":  map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk, then use continue_read for more.", maxReadLines, readChunkLines)},
@@ -430,55 +503,45 @@ var fileTools = []Tool{
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		path, err := a.resolvePath(sid, args.str("path"))
-		if err != nil {
-			return "error: " + err.Error(), false
+		list, isList := args["reads"].([]any)
+		if !isList {
+			return a.readTarget(ctx, sid, args)
 		}
-		if sym := strings.TrimSpace(args.str("symbol")); sym != "" {
-			content, err := fsRead(a, ctx, sid, path, nil, nil)
-			if err != nil {
-				return "error reading file: " + err.Error(), false
+		// Several reads in one call, served in order, each under its own
+		// header. The model packs several commands into one shell line all
+		// the time and almost never sends two tool calls in one reply; this
+		// is that habit for reads.
+		if len(list) == 0 {
+			return "error: `reads` is empty. Give one or more reads, each {\"path\": ..., \"symbol\": ...} or {\"path\": ..., \"line\": N, \"limit\": M}.", true
+		}
+		var b strings.Builder
+		failedAll := true
+		for i, item := range list {
+			if i == maxReadsPerCall {
+				fmt.Fprintf(&b, "=== reads %d-%d not served: at most %d per call; ask for them in the next call ===\n", i+1, len(list), maxReadsPerCall)
+				break
 			}
-			loc := locateSymbol(content, sym)
-			if loc.start == 0 {
-				msg := fmt.Sprintf("error: no definition of `%s` found in %s.", sym, path)
-				if len(loc.mentions) > 0 {
-					msg += fmt.Sprintf(" The name appears at lines %s; read one of those with line=, or pass the exact declared name.", joinInts(loc.mentions))
+			t, ok := item.(map[string]any)
+			if !ok {
+				fmt.Fprintf(&b, "=== read %d: not an object; each read is {\"path\": ..., \"symbol\" or \"line\"/\"limit\"} ===\n\n", i+1)
+				continue
+			}
+			ta := toolArgs(t)
+			what := ta.str("symbol")
+			if what == "" {
+				if l, ok := ta.num("line"); ok {
+					what = fmt.Sprintf("from line %d", l)
 				} else {
-					msg += " The name does not appear in this file at all; find the right file with `grep -rn` first."
+					what = "from the top"
 				}
-				return msg, true
 			}
-			n := loc.end - loc.start + 1
-			if n > maxReadLines {
-				n = maxReadLines
+			out, failed := a.readTarget(ctx, sid, ta)
+			if !failed {
+				failedAll = false
 			}
-			tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Reading: %s (%s)", path, sym), "read", []ToolCallLocation{{Path: path, Line: &loc.start}})
-			out, failed := a.serveRead(ctx, sid, path, loc.start, n, tcId)
-			head := fmt.Sprintf("[`%s`: lines %d-%d, block end found by %s", sym, loc.start, loc.end, loc.how)
-			if len(loc.others) > 0 {
-				head += fmt.Sprintf("; also declared at lines %s", joinInts(loc.others))
-			}
-			return head + "]\n" + out, failed
+			fmt.Fprintf(&b, "=== read %d of %d: %s %s ===\n%s\n\n", i+1, len(list), ta.str("path"), what, strings.TrimRight(out, "\n"))
 		}
-		start := 1
-		line, haveLine := args.num("line")
-		if haveLine && line > 0 {
-			start = line
-		}
-		maxLines := readChunkLines
-		if v, ok := args.num("limit"); ok && v > 0 {
-			maxLines = v
-			if maxLines > maxReadLines {
-				maxLines = maxReadLines
-			}
-		}
-		title := "Reading: " + path
-		if haveLine {
-			title = fmt.Sprintf("Reading: %s:%d", path, line)
-		}
-		tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
-		return a.serveRead(ctx, sid, path, start, maxLines, tcId)
+		return strings.TrimRight(b.String(), "\n") + "\n", failedAll
 	}},
 
 	{Def: map[string]any{
@@ -572,12 +635,31 @@ var fileTools = []Tool{
 	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name":        "edit_file",
-			"description": "Change an EXISTING file — always prefer this over write_file for a file that already exists, and ALWAYS prefer it over a Python, sed or awk script through run_command: this edit is checked for uniqueness, shown to the user as a diff, and counted as an edit; a script is none of that, and a wrong anchor in it silently rewrites the wrong span. Two ways: (1) `old_text`: one exact snippet, unique, copied from a fresh read_file, small (a few lines); (2) `start` and `end`: to replace a whole BLOCK (a function body, a test, a match arm, a widget section), give a unique fragment of the block's first line as `start` and a fragment of its last line as `end` (the first line containing it at or after start); every line from start through end is replaced by new_text. Use (2) instead of copying forty lines into old_text. Errors (not found / not unique / unwritable) come back as messages — fix and retry.",
+			"name": "edit_file",
+			"description": "Change an EXISTING file. Always prefer this over write_file for a file that exists, and ALWAYS over a Python, sed or awk script through run_command: this edit is checked, shown to the user as a diff, and counted as an edit; a script is none of that, and a wrong anchor in it silently rewrites the wrong span. THREE WAYS, pick one per call:\n" +
+				"(1) A small exact change: {\"path\": \"src/cut.rs\", \"old_text\": \"let zoom = 1.0;\", \"new_text\": \"let zoom = params::ZOOM;\"}. old_text must be unique in the file; copy it from a fresh read.\n" +
+				"(2) A whole BLOCK (a function, a test, a match arm, a widget section): {\"path\": \"src/ui/window.rs\", \"start\": \"fn wire_zoom(\", \"end\": \"} // wire_zoom\", \"new_text\": \"fn wire_zoom(...) {\\n    ...\\n}\"}. `start` is a fragment of the block's FIRST line, unique in the file; `end` a fragment of its LAST line (the first line containing it at or after start). Every line from start through end is replaced by new_text. Use this instead of copying forty lines into old_text.\n" +
+				"(3) SEVERAL changes to the same file at once: {\"path\": \"src/ui/window.rs\", \"edits\": [{\"old_text\": \"let zoom = 1.0;\", \"new_text\": \"let zoom = params::ZOOM;\"}, {\"start\": \"fn wire_zoom(\", \"end\": \"} // wire_zoom\", \"new_text\": \"...\"}]}. Applied in order, all or none; an error names the edit that failed. When you have two or three changes to one file, send them in ONE call like this.\n" +
+				"Errors (not found / not unique / unwritable) come back as messages: fix and retry.",
+
 			"parameters": map[string]any{
 				"type":     "object",
-				"required": []string{"path", "new_text"},
+				"required": []string{"path"},
 				"properties": map[string]any{
+					"edits": map[string]any{
+						"type":        "array",
+						"description": "SEVERAL changes to this ONE file in ONE call, instead of old_text/start/end/new_text below: a list applied in order, each {old_text, new_text} or {start, end, new_text}. All apply or none does; an error names the one that failed.",
+						"items": map[string]any{
+							"type":     "object",
+							"required": []string{"new_text"},
+							"properties": map[string]any{
+								"old_text": map[string]any{"type": "string"},
+								"start":    map[string]any{"type": "string"},
+								"end":      map[string]any{"type": "string"},
+								"new_text": map[string]any{"type": "string"},
+							},
+						},
+					},
 					"path":     map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
 					"old_text": map[string]any{"type": "string", "description": "Way (1): exact text to find. MUST match the file byte-for-byte (whitespace, indentation, trailing newlines included) AND must be unique in the file — include enough surrounding context to disambiguate."},
 					"start":    map[string]any{"type": "string", "description": "Way (2): a fragment of the block's FIRST line, unique in the file (for example `fn cut_form_column(`)."},
@@ -598,11 +680,34 @@ var fileTools = []Tool{
 		if refusal := a.specFenceRefusal(sid, path); refusal != "" {
 			return refusal, true
 		}
-		oldText := args.str("old_text")
-		newText := args.str("new_text")
-		startAnchor, endAnchor := args.str("start"), args.str("end")
-		if oldText == "" && startAnchor == "" {
-			return "error: give either `old_text` (an exact snippet) or `start` (and `end`) for a block; with neither there is nothing to replace.", true
+		type editSpec struct{ oldText, start, end, newText string }
+		var edits []editSpec
+		if list, ok := args["edits"].([]any); ok {
+			for i, item := range list {
+				m, ok := item.(map[string]any)
+				if !ok {
+					return fmt.Sprintf("error: edit %d of %d is not an object. Each edit is {\"old_text\": ..., \"new_text\": ...} or {\"start\": ..., \"end\": ..., \"new_text\": ...}. Nothing was written.", i+1, len(list)), true
+				}
+				e := toolArgs(m)
+				if e.wrongType("old_text") || e.wrongType("new_text") {
+					return fmt.Sprintf("error: edit %d of %d: `old_text` and `new_text` must be JSON strings. Nothing was written.", i+1, len(list)), false
+				}
+				edits = append(edits, editSpec{e.str("old_text"), e.str("start"), e.str("end"), e.str("new_text")})
+			}
+			if len(edits) == 0 {
+				return "error: `edits` is empty; nothing to change.", true
+			}
+		} else {
+			edits = []editSpec{{args.str("old_text"), args.str("start"), args.str("end"), args.str("new_text")}}
+		}
+		for i, e := range edits {
+			if e.oldText == "" && e.start == "" {
+				msg := "error: give either `old_text` (an exact snippet) or `start` (and `end`) for a block; with neither there is nothing to replace."
+				if len(edits) > 1 {
+					msg = fmt.Sprintf("error: edit %d of %d has neither `old_text` nor `start`. Nothing was written.", i+1, len(edits))
+				}
+				return msg, true
+			}
 		}
 
 		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []ToolCallLocation{{Path: path}})
@@ -611,21 +716,6 @@ var fileTools = []Tool{
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error reading file: " + err.Error(), false
-		}
-		if oldText == "" {
-			// Way (2): a block between two anchors, whole lines.
-			newContent, span, msg := replaceBlock(content, startAnchor, endAnchor, newText)
-			if msg != "" {
-				a.FailToolCall(ctx, sid, tcId, msg)
-				return "error: " + msg, true
-			}
-			newContent = a.formatGuarded(sid, path, content, newContent)
-			if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
-				a.FailToolCall(ctx, sid, tcId, err.Error())
-				return "error writing file: " + err.Error(), false
-			}
-			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
-			return fmt.Sprintf("file written successfully (lines %s replaced)", span), false
 		}
 		// Rides along on every outcome below. On a failed match it is the ANSWER:
 		// old_text was copied from a read that something else has since rewritten,
@@ -637,49 +727,28 @@ var fileTools = []Tool{
 			drift = sess.takeDriftNote(path)
 		}
 
-		count := strings.Count(content, oldText)
-		var newContent string
-		okNote := "file written successfully"
-		switch {
-		case count > 1:
-			a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("old_text matches %d times, must be unique", count))
-			return fmt.Sprintf("error: old_text matches %d places — it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count) + drift, true
-		case count == 1:
-			newContent = strings.Replace(content, oldText, newText, 1)
-		default:
-			// Exact match failed. Small models routinely mis-reproduce indentation
-			// or trailing whitespace from a read_file, so retry ignoring per-line
-			// whitespace (still unique-or-fail) before sending them back to re-read.
-			tol, n := tolerantReplace(content, oldText, newText)
-			switch {
-			case n == 1:
-				newContent = tol
-				okNote = "file written successfully (old_text matched ignoring whitespace/indentation)"
-			case n > 1:
-				a.FailToolCall(ctx, sid, tcId, fmt.Sprintf("old_text matches %d times ignoring whitespace, must be unique", n))
-				return fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n) + drift, true
-			default:
-				a.FailToolCall(ctx, sid, tcId, "old_text not found in file")
-				if sess := a.getSession(sid); sess != nil {
-					sess.markEditFailed(path)
+		// All or nothing: each edit applies to the result of the one before,
+		// in memory; the file is written once, as one diff, or not at all.
+		cur := content
+		var notes []string
+		for i, e := range edits {
+			next, note, msg, notFound := applyEdit(path, cur, e.oldText, e.start, e.end, e.newText)
+			if msg != "" {
+				a.FailToolCall(ctx, sid, tcId, firstLine(msg))
+				if notFound {
+					if sess := a.getSession(sid); sess != nil {
+						sess.markEditFailed(path)
+					}
 				}
-				// Quote the region old_text was probably aiming at, when we can find
-				// one. The model can then retry straight away against text it can see,
-				// instead of spending a read_file round-trip to recover bytes
-				// codehalter already has in hand. Failed=true either way: it feeds the
-				// loop's fail cap (a model spraying wrong edits gives up instead of
-				// looping to the iteration backstop), and the verdict authority
-				// excludes edit_file, so a recovered miss never condemns.
-				if line, snippet, found := nearMiss(content, oldText); found {
-					return fmt.Sprintf("error: old_text not found — the file has drifted from what you remember. The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
-						"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT call read_file first — the text above is the file's current content. Do NOT rewrite the whole file with write_file.",
-						path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap)) + drift, true
+				if len(edits) > 1 {
+					msg = fmt.Sprintf("error: edit %d of %d failed, so NOTHING was written (the %d before it are not applied either): %s", i+1, len(edits), i, strings.TrimPrefix(msg, "error: "))
 				}
-				return "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file." + drift, true
+				return msg + drift, true
 			}
+			cur = next
+			notes = append(notes, note)
 		}
-
-		newContent = a.formatGuarded(sid, path, content, newContent)
+		newContent := a.formatGuarded(sid, path, content, cur)
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
@@ -688,7 +757,10 @@ var fileTools = []Tool{
 
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
 
-		return okNote + drift, false
+		if len(edits) == 1 {
+			return "file written successfully" + notes[0] + drift, false
+		}
+		return fmt.Sprintf("file written successfully: all %d edits applied in order%s", len(edits), strings.Join(notes, "")) + drift, false
 	}},
 }
 
@@ -860,6 +932,45 @@ func stripLineComment(ln string) string {
 		}
 	}
 	return ln
+}
+
+// applyEdit applies one edit to content: an exact old_text, the same ignoring
+// whitespace, or a block between start and end anchors. It returns the new
+// content and a note for the success message, or the message saying why
+// nothing was replaced (notFound when old_text matched nowhere, which the
+// caller records against the path).
+func applyEdit(path, content, oldText, start, end, newText string) (string, string, string, bool) {
+	if oldText == "" {
+		next, span, msg := replaceBlock(content, start, end, newText)
+		if msg != "" {
+			return "", "", "error: " + msg, false
+		}
+		return next, fmt.Sprintf(" (lines %s replaced)", span), "", false
+	}
+	switch count := strings.Count(content, oldText); {
+	case count > 1:
+		return "", "", fmt.Sprintf("error: old_text matches %d places — it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count), false
+	case count == 1:
+		return strings.Replace(content, oldText, newText, 1), "", "", false
+	}
+	// Exact match failed. Small models routinely mis-reproduce indentation
+	// or trailing whitespace from a read_file, so retry ignoring per-line
+	// whitespace (still unique-or-fail) before sending them back to re-read.
+	tol, n := tolerantReplace(content, oldText, newText)
+	switch {
+	case n == 1:
+		return tol, " (old_text matched ignoring whitespace/indentation)", "", false
+	case n > 1:
+		return "", "", fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n), false
+	}
+	// Quote the region old_text was probably aiming at, when there is one:
+	// the model retries against text it can see instead of spending a read.
+	if line, snippet, found := nearMiss(content, oldText); found {
+		return "", "", fmt.Sprintf("error: old_text not found — the file has drifted from what you remember. The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
+			"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT call read_file first — the text above is the file's current content. Do NOT rewrite the whole file with write_file.",
+			path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap)), true
+	}
+	return "", "", "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file.", true
 }
 
 // replaceBlock replaces whole lines from the unique line containing start
