@@ -9,10 +9,20 @@ Repo you don't already know (first turn here, or the request names files/command
 
 ## Tool choice
 - Declared project task (just build, npm test, make) → run it through `run_command` (`just build`), rather than retyping what the recipe does: the recipe is where the project keeps its flags and env.
-- Editing a project file → `edit_file`/`write_file` so the change hits the diff/approval UI. Raw `sed -i` or `>` skip it.
+- Reading code → `read_file`, not `sed -n`/`awk NR`/`grep -A` through the shell:
+  - lines 120-179 (what `sed -n '120,179p'` prints): `{"path": "src/cut.rs", "start_line": 120, "end_line": 179}`
+  - a whole function or type by name (what `grep -n "fn wire_zoom" -A 40` tries to get): `{"path": "src/ui/window.rs", "symbol": "wire_zoom"}`
+  - with line numbers in front (what `awk '{printf "%d|%s\n", NR, $0}'` gives): add `"numbered": true`
+  - several at once, one call: `{"reads": [{"path": "src/ui/window.rs", "symbol": "wire_zoom"}, {"path": "tests/zoom.rs", "start_line": 1, "end_line": 40}]}`
+  Searching stays `grep -rn` through `run_command`; `read_file` reads what the search found.
+- Editing a project file → `edit_file`/`write_file` so the change hits the diff/approval UI. Raw `sed -i`, `>` or a Python script skip it:
+  - small change: `{"path": "src/cut.rs", "old_text": "let zoom = 1.0;", "new_text": "let zoom = ZOOM;"}`
+  - a whole block: `{"path": "src/ui/window.rs", "start": "fn wire_zoom(", "end": "} // wire_zoom", "new_text": "..."}`
+  - several changes to one file, one call: `{"path": "src/ui/window.rs", "edits": [{"old_text": "...", "new_text": "..."}, {"start": "...", "end": "...", "new_text": "..."}]}`
+- Looking at a picture (a snapshot, a spec image) → `screenshot` on the file; a close look at one part: `{"path": "shots/05-cut.png", "region": [0, 560, 1500, 260]}` in its pixels. Never crop with a script.
 - No long-running service: it dies with codehalter. No daemon.
 - Probe writes into the workspace (cargo check fills target/) are fine — build artifacts, not source.
-- Scratch goes in `/tmp` (a test log, a slice of a long file cut out with `sed`), anything that is fine to lose. Not `.codehalter/`: that holds the project's config and its session record, and a stray `p2.txt` there looks like something to keep. A slice of a file is `grep -n -C5` or `read_file` with a range, in one call rather than a `sed > file` plus a read.
+- Scratch goes in `/tmp` (a test log), anything that is fine to lose. Not `.codehalter/`: that holds the project's config and its session record, and a stray `p2.txt` there looks like something to keep. A slice of a file is `read_file` with a range, in one call rather than a `sed > file` plus a read.
 
 ## "command not found"
 Pkg-mgr commands depend on the base image → SKILL-<os>.md (alpine/arch/debian/fedora/ubuntu), else /etc/os-release.

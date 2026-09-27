@@ -5,10 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -240,7 +237,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 			Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),
 			Status:     "completed",
 		})
-		note, told := sess.toolHints(cmdStr, out)
+		note, told := sess.toolHints(cmdStr)
 		if told != "" {
 			a.say(ctx, sid, told+"\n")
 		}
@@ -276,139 +273,35 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 		Title:      fmt.Sprintf("Run: %s (still running after %s, continues as job %d)", cmdStr, waited, job.id),
 		Status:     "in_progress",
 	})
-	return fmt.Sprintf("still running after %s: it continues as background job %d (pid %d), nothing was killed. "+
+	note, told := sess.toolHints(cmdStr)
+	if told != "" {
+		a.say(ctx, sid, told+"\n")
+	}
+	return note + "\n" + fmt.Sprintf("still running after %s: it continues as background job %d (pid %d), nothing was killed. "+
 		"When it exits, codehalter hands you its exit code and last output by itself, before your next step.%s "+
 		"Do other work meanwhile if there is any; if not, call `respond` saying you are waiting for job %d: that parks the turn, it does not end it, and you continue here the moment the job reports. "+
 		"Never sleep or poll for it. Read its output any time with `run_command: cat %s`; stop it with `run_command: kill %d`. Output so far:\n\n%s",
 		waited, job.id, job.pid, wake, job.id, job.logPath, job.pid, readLogTail(job.logPath, bgLogTailCap)), false
 }
 
-// toolHints is the note a finished run_command result gets when the model
-// took a shell route that ONE file tool call does as well, and only then (a
-// line that also searches or builds is already one call): the read_file symbol call
-// for a grep that found a definition, the edit_file call for a script that
-// spliced a source file, the read_file call for a range read. A note, never
-// a refusal: the command ran. Every time, with the concrete call filled in,
-// because once per session did not move this model: after the first note it
-// made 17 more range reads. The second return is the line the user sees in
-// the chat, so a nudge is never invisible.
-func (s *Session) toolHints(cmd, output string) (string, string) {
-	var out string
-	var seen []string
-	if path, name := grepDefinitionHit(cmd, output, s.Cwd); name != "" && grepsForDefinition(cmd, name) {
-		out += fmt.Sprintf("\n[codehalter: that hit is where `%s` is defined. To read the whole definition, read_file does it in one call, in any language: {\"path\": %q, \"symbol\": %q}%s; several at once as {\"reads\": [{\"path\": ..., \"symbol\": ...}, ...]}.]", name, path, name, symbolPreview(s.Cwd, path, name))
-		seen = append(seen, "read_file symbol="+name+" instead of grep")
+// toolHints is the note a finished run_command result gets for a shell
+// habit a tool does properly: a `& sleep N` wait (run_background), or a
+// Python script that spliced a source file (the edit_file call it amounts
+// to). A note,
+// never a refusal. (Notes after grep and sed reads were tried and dropped:
+// the executor, running without reasoning, followed 0 of 154.) The second
+// return is the line the user sees in the chat.
+func (s *Session) toolHints(cmd string) (string, string) {
+	if note, told := bgSleepHint(cmd); note != "" {
+		return note, told
 	}
-	if target, ok := scriptEditTarget(cmd); ok {
-		out += "\n[codehalter: that script edited " + target + ". " + scriptEditPreview(cmd, target) +
-			" edit_file checks that old_text (or start) matches exactly one place, applies the change, shows the user a diff, and answers `file written successfully` or says exactly why not; a script does none of that. Use edit_file for the next change.]"
-		seen = append(seen, "edit_file instead of a script on "+target)
-	}
-	if h := rangeReadHint(cmd, s.Cwd); h != "" && onlyRangeReads(cmd) {
-		out += h
-		seen = append(seen, "read_file instead of sed/awk line ranges")
-	}
-	if len(seen) == 0 {
+	target, ok := scriptEditTarget(cmd)
+	if !ok {
 		return "", ""
 	}
-	return out, "💡 told the model: " + strings.Join(seen, "; ")
-}
-
-// symbolPreview says what a read_file symbol call would return, from the
-// file as it is now: the line range, its length and its first line, so the
-// note shows the result instead of describing it. Empty when the file cannot
-// be read or the definition not delimited.
-func symbolPreview(cwd, path, name string) string {
-	data, err := os.ReadFile(filepath.Join(cwd, path))
-	if err != nil {
-		return ""
-	}
-	loc := locateSymbol(string(data), name)
-	if loc.start == 0 {
-		return ""
-	}
-	lines := strings.Split(string(data), "\n")
-	first := ""
-	for i := loc.start - 1; i < loc.end && i < len(lines); i++ {
-		if t := strings.TrimSpace(lines[i]); t != "" && !strings.HasPrefix(t, "//") && !strings.HasPrefix(t, "#") && !strings.HasPrefix(t, "@") && !strings.HasPrefix(t, "*") && !strings.HasPrefix(t, "/*") {
-			first = t
-			break
-		}
-	}
-	return fmt.Sprintf(", which returns lines %d-%d (%d lines, the whole block, found by %s), starting `%s`", loc.start, loc.end, loc.end-loc.start+1, loc.how, truncate(first, 100))
-}
-
-// grepsForDefinition: the grep's own pattern names the definition, keyword
-// and name (`grep -n "pub fn opens_gesture" -A 12`). Then the model knew
-// what it wanted to read, and read_file's symbol mode is the same in one
-// call. A broad search that happens to turn up a definition is a search,
-// which read_file cannot do, and gets no note.
-func grepsForDefinition(cmd, name string) bool {
-	re := regexp.MustCompile(`(?:fn|func|def|class|struct|enum|trait|impl|interface|type|function)\s+(?:\([^)]*\)\s*)?` + regexp.QuoteMeta(name) + `\b`)
-	return re.MatchString(cmd)
-}
-
-// onlyRangeReads: every part of the shell line is a line-range read (or a
-// cd, or an echo separator). A line that also searches, builds or tests is
-// already one call doing several things, and read_file could not replace it.
-func onlyRangeReads(cmd string) bool {
-	for _, part := range shellSepRe.Split(cmd, -1) {
-		p := strings.TrimSpace(part)
-		if p == "" || strings.HasPrefix(p, "cd ") || strings.HasPrefix(p, "echo ") {
-			continue
-		}
-		if !sedRangeRe.MatchString(p) && !awkRangeRe.MatchString(p) {
-			return false
-		}
-	}
-	return true
-}
-
-// grepHitRe is one line of grep -n output: "path:line:text" when grep names
-// files, "line:text" for a single file (context lines use '-' and are not hits).
-var grepHitRe = regexp.MustCompile(`^(?:([^:\s][^:]*):)?(\d+):(.*)$`)
-
-// identRe is a name as most languages spell one.
-var identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)
-
-// grepDefinitionHit finds, in a grep's output, the first hit whose text
-// declares the name the grep searched for (declKeywordRe, the same detection
-// read_file's symbol mode uses), and returns its file relative to the
-// project and the declared name. A single-file grep's path is its last argument. Empty when the
-// command is not a grep or no hit declares anything.
-func grepDefinitionHit(cmd, output, cwd string) (string, string) {
-	if !grepCmdRe.MatchString(cmd) {
-		return "", ""
-	}
-	single := ""
-	if f := strings.Fields(pipeSepRe.Split(cmd[strings.LastIndex(cmd, "grep"):], 2)[0]); len(f) > 0 {
-		single = strings.Trim(f[len(f)-1], `'"`)
-	}
-	for _, ln := range strings.Split(output, "\n") {
-		m := grepHitRe.FindStringSubmatch(ln)
-		if m == nil {
-			continue
-		}
-		file, text := m[1], m[3]
-		if file == "" {
-			file = single
-		}
-		if file == "" || strings.HasPrefix(file, "-") {
-			continue
-		}
-		loc := declKeywordRe.FindStringIndex(text + " ")
-		if loc == nil {
-			continue
-		}
-		name := identRe.FindString(text[min(loc[1], len(text)):])
-		// The hit must declare what the model was looking for: `let col =
-		// cut_form_column(…)` declares col, which nobody grepped for.
-		if name == "" || len(name) < 3 || !regexp.MustCompile(`\b`+regexp.QuoteMeta(name)+`\b`).MatchString(cmd) {
-			continue
-		}
-		return shellPath(cmd, file, cwd), name
-	}
-	return "", ""
+	return "\n[codehalter: that script edited " + target + ". " + scriptEditPreview(cmd, target) +
+			" edit_file checks that old_text (or start) matches exactly one place, applies the change, shows the user a diff, and answers `file written successfully` or says exactly why not; a script does none of that. Use edit_file for the next change.]",
+		"💡 told the model: edit_file instead of a script on " + target
 }
 
 // pyReplaceRe finds a Python `.replace(A, B)` with two string literals:
@@ -476,65 +369,6 @@ func scriptEditTarget(cmd string) (string, bool) {
 	return "", false
 }
 
-// rangeReadRe matches the shell's line-range reads: `sed -n 'a,bp' file`
-// and `awk 'NR>=a && NR<=b ...' file`.
-var (
-	sedRangeRe = regexp.MustCompile(`sed -n '?(\d+),(\d+)p'? +([^\s;|&]+)`)
-	awkRangeRe = regexp.MustCompile(`awk '[^']*NR *>= *(\d+)[^']*NR *<= *(\d+)[^']*' +([^\s;|&]+)`)
-	cdPrefixRe = regexp.MustCompile(`^\s*cd +([^\s;&]+) *(&&|;)`)
-	shellSepRe = regexp.MustCompile(`&&|;|\n`)
-	grepCmdRe  = regexp.MustCompile(`\b(grep|rg)\b`)
-	pipeSepRe  = regexp.MustCompile(`[;|&]`)
-)
-
-// shellPath resolves a file a shell line names to a project-relative path:
-// through the line's leading `cd`, then relative to the project root when it
-// lies inside it.
-func shellPath(cmd, file, cwd string) string {
-	p := file
-	if m := cdPrefixRe.FindStringSubmatch(cmd); m != nil && !filepath.IsAbs(p) {
-		p = filepath.Join(m[1], p)
-	}
-	if filepath.IsAbs(p) {
-		if rel, err := filepath.Rel(cwd, p); err == nil && !strings.HasPrefix(rel, "..") {
-			p = rel
-		}
-	}
-	return filepath.ToSlash(p)
-}
-
-// rangeReadHint: after a shell line that read files by line range, the
-// read_file call that does the same, spelled out (see toolHints for when).
-func rangeReadHint(cmd, cwd string) string {
-	var reads []string
-	add := func(from, to, file string, numbered bool) {
-		a, _ := strconv.Atoi(from)
-		b, _ := strconv.Atoi(to)
-		if b < a || len(reads) == maxReadsPerCall {
-			return
-		}
-		num := ""
-		if numbered {
-			num = `, "numbered": true`
-		}
-		reads = append(reads, fmt.Sprintf(`{"path": %q, "start_line": %d, "end_line": %d%s}`, shellPath(cmd, file, cwd), a, b, num))
-	}
-	for _, m := range sedRangeRe.FindAllStringSubmatch(cmd, -1) {
-		add(m[1], m[2], m[3], false)
-	}
-	// An awk range that prints NR is a numbered read.
-	for _, m := range awkRangeRe.FindAllStringSubmatch(cmd, -1) {
-		add(m[1], m[2], m[3], strings.Contains(m[0], "printf") && strings.Count(m[0], "NR") > 2)
-	}
-	switch len(reads) {
-	case 0:
-		return ""
-	case 1:
-		return "\n[codehalter: read_file does this without the shell: " + reads[0] + "; for a whole function use \"symbol\" instead of line numbers.]"
-	}
-	return "\n[codehalter: read_file does all of these in ONE call without the shell: {\"reads\": [" + strings.Join(reads, ", ") + "]}; for a whole function use \"symbol\" instead of line numbers.]"
-}
-
 // wrongToolHint names the tool a run_command call without a command was
 // meant for, from the arguments it carried: a model that has just learned
 // read_file's `reads` list sent it to run_command once, and "command is
@@ -547,4 +381,31 @@ func wrongToolHint(args toolArgs) string {
 		return ": these arguments are edit_file's. Call edit_file with them, not run_command."
 	}
 	return ""
+}
+
+// bgSleepRe spots a shell line that starts something in the background with
+// `&` and then sleeps to wait for it: `(cargo test > log) & sleep 45; tail
+// log`. The sleep rule only sees a line that starts with sleep; this is the
+// same wait, spelled inside a longer line. Group 1 is what was backgrounded
+// when it is a (subshell), group 2 the seconds.
+var bgSleepRe = regexp.MustCompile(`(?:\(([^()]*)\)\s*&|(?:^|[^&])&)\s*(?:;\s*)?sleep\s+(\d+)`)
+
+// bgSleepHint: the run_background call a hand-rolled `& sleep N` amounts to.
+func bgSleepHint(cmd string) (string, string) {
+	m := bgSleepRe.FindStringSubmatch(cmd)
+	if m == nil {
+		return "", ""
+	}
+	job := strings.TrimSpace(m[1])
+	if job == "" {
+		job = "<the command you put in the background>"
+	}
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(map[string]any{"command": job})
+	return "\n[codehalter: that line put a command in the background with `&` and slept " + m[2] + " s to wait for it, which is a guess, and the backgrounded command also kept this terminal open. " +
+			"run_background does it properly, and tells you the exit code and the last output the moment it finishes, with nothing to poll: " + strings.TrimSpace(buf.String()) +
+			" (add \"wake_after\": seconds only if you want a look before it finishes). Meanwhile do other work, or call `respond` saying you are waiting.]",
+		"💡 told the model: run_background instead of `& sleep`"
 }

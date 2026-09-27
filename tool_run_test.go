@@ -294,9 +294,9 @@ func TestRunCommandStallKillsHungJob(t *testing.T) {
 	}
 }
 
-// TestToolHints: a script that does what edit_file does gets a note with
-// the edit_file call, once per session, and runs; a script that computes or
-// generates gets none. A range read gets the read_file call, once too.
+// TestToolHints: a Python script that splices a source file gets a note with
+// the edit_file call it amounts to, every time, and a chat line; scripts
+// that compute or generate, reads and builds get none.
 func TestToolHints(t *testing.T) {
 	edit := "cd rust && python3 - <<'PY'\np='tests/zoom_widgets.rs'\ns=open(p).read()\nopen(p,'w').write(s.replace('a','b'))\nPY"
 	if target, ok := scriptEditTarget(edit); !ok || target != "tests/zoom_widgets.rs" {
@@ -306,110 +306,27 @@ func TestToolHints(t *testing.T) {
 		"python3 - <<'PY'\nprint(open('src/a.rs').read().count('fn '))\nPY",
 		"python3 - <<'PY'\nimport json\njson.dump({'a': 1}, open('fixtures/demo.toml','w'))\nPY",
 		"cargo test",
+		"cd rust && sed -n '1,5p' src/a.rs; grep -n 'fn a' -A 8 src/a.rs",
 	} {
-		if target, ok := scriptEditTarget(cmd); ok {
-			t.Errorf("%q counted as an edit of %q", cmd, target)
+		if note, _ := (&Session{}).toolHints(cmd); note != "" {
+			t.Errorf("%q got a note: %q", cmd, note)
 		}
 	}
 	h := newTerminalHarness(t)
-	first, told := h.sess.toolHints(edit, "")
-	if !strings.Contains(told, "edit_file instead of a script on tests/zoom_widgets.rs") {
-		t.Errorf("chat line = %q", told)
+	first, told := h.sess.toolHints(edit)
+	if !strings.Contains(first, `Its replace is exactly this edit_file call: {"path": "tests/zoom_widgets.rs", "old_text": "a", "new_text": "b"}`) || !strings.Contains(told, "edit_file instead of a script on tests/zoom_widgets.rs") {
+		t.Errorf("hint = %q / %q", first, told)
 	}
-	if _, told := h.sess.toolHints("cd rust && sed -n '1,5p' src/a.rs; echo ===; sed -n '9,12p' src/b.rs", ""); !strings.Contains(told, "read_file instead of sed/awk") {
-		t.Errorf("a pure range-read line got no note: %q", told)
+	if again, _ := h.sess.toolHints(edit); again == "" {
+		t.Error("the second occurrence got no hint; every occurrence gets one")
 	}
-	if note, _ := h.sess.toolHints("cd rust && grep -n foo src/a.rs; sed -n '1,5p' src/a.rs", ""); note != "" {
-		t.Errorf("a line that also searches got a note: %q", note)
-	}
-	if !strings.Contains(first, "that script edited tests/zoom_widgets.rs") ||
-		!strings.Contains(first, `Its replace is exactly this edit_file call: {"path": "tests/zoom_widgets.rs", "old_text": "a", "new_text": "b"}`) {
-		t.Errorf("first hints = %q", first)
-	}
-	// Triple-quoted anchors, several replaces: one edits list.
 	multi := "python3 - <<'PY'\np='src/ui/window.rs'\ns=open(p).read()\ns=s.replace(\"\"\"let zoom = 1.0;\"\"\", \"\"\"let zoom = ZOOM;\"\"\")\ns=s.replace('old()', 'new()')\nopen(p,'w').write(s)\nPY"
-	if got := scriptEditPreview(multi, "src/ui/window.rs"); !strings.Contains(got, "Its 2 replaces are ONE edit_file call with an edits list") || !strings.Contains(got, `"old_text": "let zoom = 1.0;"`) {
+	if got := scriptEditPreview(multi, "src/ui/window.rs"); !strings.Contains(got, "Its 2 replaces are ONE edit_file call with an edits list") {
 		t.Errorf("multi preview = %q", got)
 	}
-	// An index-anchored splice has no literal pair: the block form.
 	splice := "python3 - <<'PY'\np='src/a.rs'\ns=open(p).read()\ni=s.index('fn a(')\nopen(p,'w').write(s[:i])\nPY"
 	if got := scriptEditPreview(splice, "src/a.rs"); !strings.Contains(got, `"start": "<fragment of the block's first line>"`) {
 		t.Errorf("splice preview = %q", got)
-	}
-	if again, _ := h.sess.toolHints(edit, ""); again == "" {
-		t.Error("the second occurrence got no hint; every occurrence gets one")
-	}
-}
-
-// TestRangeReadHint: a shell range read comes back with the read_file call
-// that does the same, paths resolved through a leading cd; one range gives
-// a single read, several a reads list, and other commands get nothing.
-func TestRangeReadHint(t *testing.T) {
-	cwd := "/workspaces/naivepost"
-	one := rangeReadHint("cd /workspaces/naivepost/rust && sed -n '96,104p' tests/settings.rs", cwd)
-	if !strings.Contains(one, `{"path": "rust/tests/settings.rs", "start_line": 96, "end_line": 104}`) || strings.Contains(one, "reads") {
-		t.Errorf("one range = %q", one)
-	}
-	two := rangeReadHint("cd rust && grep -n foo src/a.rs; sed -n '10,20p' src/a.rs; awk 'NR>=5 && NR<=8 {print}' src/b.rs", cwd)
-	if !strings.Contains(two, `{"reads": [{"path": "rust/src/a.rs", "start_line": 10, "end_line": 20}, {"path": "rust/src/b.rs", "start_line": 5, "end_line": 8}]}`) {
-		t.Errorf("two ranges = %q", two)
-	}
-	if got := rangeReadHint(`cd rust && awk 'NR>=130 && NR<=205 {printf "%d|%s\n", NR, $0}' tests/speed.rs`, cwd); !strings.Contains(got, `{"path": "rust/tests/speed.rs", "start_line": 130, "end_line": 205, "numbered": true}`) {
-		t.Errorf("numbered awk read = %q", got)
-	}
-	if got := rangeReadHint("cargo build 2>&1 | grep error", cwd); got != "" {
-		t.Errorf("a build got a hint: %q", got)
-	}
-	h := newTerminalHarness(t)
-	if err := os.WriteFile(filepath.Join(h.sess.Cwd, "f.txt"), []byte("a\nb\nc\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sed -n '1,2p' f.txt"}`)
-	if !strings.Contains(res, "a\nb\n") || !strings.Contains(res, `read_file does this without the shell: {"path": "f.txt", "start_line": 1, "end_line": 2}`) {
-		t.Errorf("run result = %q", res)
-	}
-	if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sed -n '2,3p' f.txt"}`); !strings.Contains(res, "codehalter:") {
-		t.Errorf("the second range read got no hint: %q", res)
-	}
-}
-
-// TestGrepDefinitionHint: a grep hit that is a declaration, in any language,
-// names the read_file symbol call; a plain use of the name does not; the
-// note comes once.
-func TestGrepDefinitionHint(t *testing.T) {
-	cwd := "/workspaces/naivepost"
-	for _, c := range []struct{ cmd, out, path, name string }{
-		{"cd /workspaces/naivepost/rust && grep -rn -C3 'cut_form_column' src", "src/ui/window.rs-1455-// the form\nsrc/ui/window.rs:1457:pub fn cut_form_column(page: &Page) -> gtk::Box {", "rust/src/ui/window.rs", "cut_form_column"},
-		{"grep -n 'def load' tools/prep.py", "12:    def load(self, path):", "tools/prep.py", "load"},
-		{"grep -rn 'Step(' cmd", "cmd/run.go:40:func (r *Runner) Step(n int) error {", "cmd/run.go", "Step"},
-	} {
-		if path, name := grepDefinitionHit(c.cmd, c.out, cwd); path != c.path || name != c.name {
-			t.Errorf("%q -> %q %q, want %q %q", c.cmd, path, name, c.path, c.name)
-		}
-	}
-	if _, name := grepDefinitionHit("grep -rn cut_form_column src", "src/ui/window.rs:900:    let col = cut_form_column(&page);", cwd); name != "" {
-		t.Errorf("a call site was taken for a definition: %q", name)
-	}
-	if _, name := grepDefinitionHit("sed -n '1,3p' a.rs", "1:fn a() {}", cwd); name != "" {
-		t.Error("a non-grep command got a definition hint")
-	}
-	h := newTerminalHarness(t)
-	if err := os.MkdirAll(filepath.Join(h.sess.Cwd, "cmd"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(h.sess.Cwd, "cmd", "run.go"), []byte("package cmd\n\n// Step runs one step.\nfunc (r *Runner) Step(n int) error {\n\treturn nil\n}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	// A broad search that turns up the definition is a search: no note.
-	if note, _ := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:4:func (r *Runner) Step(n int) error {"); note != "" {
-		t.Errorf("a broad search got the definition note: %q", note)
-	}
-	first, _ := h.sess.toolHints(`grep -rn "func (r \*Runner) Step" -A 8 cmd`, "cmd/run.go:4:func (r *Runner) Step(n int) error {")
-	if !strings.Contains(first, `{"path": "cmd/run.go", "symbol": "Step"}, which returns lines 3-6 (4 lines, the whole block, found by braces), starting `+"`func (r *Runner) Step(n int) error {`") {
-		t.Errorf("first grep hint = %q", first)
-	}
-	if again, _ := h.sess.toolHints("grep -n 'fn Step' -A 8 cmd/run.go", "4:func (r *Runner) Step(n int) error {"); again == "" {
-		t.Error("the second grep got no hint; every occurrence gets one")
 	}
 }
 
@@ -427,5 +344,24 @@ func TestRunCommandNamesTheToolItWasMeantFor(t *testing.T) {
 	}
 	if res, _ = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{}`); res != "error: command is required" {
 		t.Errorf("empty call = %q", res)
+	}
+}
+
+// TestBgSleepHint: a command put in the background with `&` and waited for
+// with sleep gets the run_background call it amounts to; a plain sleep, a
+// plain background start and ordinary lines get nothing.
+func TestBgSleepHint(t *testing.T) {
+	cmd := `ps aux | grep -c x; cd rust && (xvfb-run -a cargo test --test deco > /tmp/d.log 2>&1; echo "exit=$?" >> /tmp/d.log) & sleep 45; tail -6 /tmp/d.log`
+	note, told := bgSleepHint(cmd)
+	if !strings.Contains(note, "slept 45 s") || !strings.Contains(note, `xvfb-run -a cargo test --test deco`) || !strings.Contains(told, "run_background") {
+		t.Errorf("note = %q / %q", note, told)
+	}
+	if note, _ := bgSleepHint("cargo build & sleep 10"); !strings.Contains(note, "<the command you put in the background>") {
+		t.Errorf("unparenthesised = %q", note)
+	}
+	for _, c := range []string{"sleep 3", "npm run dev &", "cargo test 2>&1 | tail", "echo a && sleep 1"} {
+		if note, _ := bgSleepHint(c); note != "" {
+			t.Errorf("%q got a note: %q", c, note)
+		}
 	}
 }
