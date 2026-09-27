@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
 	"net/url"
 	"os"
@@ -362,5 +366,42 @@ func TestRunCommandAttachesRenderedScreen(t *testing.T) {
 	tc.ID, tc.Function.Arguments = "c3", `{"command":"printf '`+png+`' > rust/shots/06-lane.png; echo wrote"}`
 	if tu, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); tu.ImageID != "" {
 		t.Error("a command that is not a render attached a picture")
+	}
+}
+
+// TestDownscalePNG: a render over the limit comes back scaled by the
+// smallest whole factor that fits, a 2x render at exactly half, with each
+// box averaged; a small one and a non-PNG come back untouched.
+func TestDownscalePNG(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 40, 30))
+	for y := 0; y < 30; y++ {
+		for x := 0; x < 40; x++ {
+			if (x+y)%2 == 0 {
+				img.Set(x, y, color.White)
+			} else {
+				img.Set(x, y, color.Black)
+			}
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	out := downscalePNG(buf.Bytes(), 20)
+	got, err := png.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := got.Bounds(); b.Dx() != 20 || b.Dy() != 15 {
+		t.Errorf("scaled to %dx%d, want 20x15", b.Dx(), b.Dy())
+	}
+	if r, _, _, _ := got.At(3, 3).RGBA(); r < 0x7000 || r > 0x9000 {
+		t.Errorf("a 2x2 checker box averaged to %x, want mid grey", r)
+	}
+	if same := downscalePNG(buf.Bytes(), 100); !bytes.Equal(same, buf.Bytes()) {
+		t.Error("a small image was re-encoded")
+	}
+	if same := downscalePNG([]byte("PNG-BYTES"), 20); string(same) != "PNG-BYTES" {
+		t.Error("undecodable bytes were changed")
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -8,6 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"log/slog"
 	"net"
 	"net/http"
@@ -408,6 +412,7 @@ func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result s
 	if err != nil || len(data) == 0 || len(data) > screenshotMaxBytes {
 		return "", nil, ""
 	}
+	data = downscalePNG(data, attachMaxSide)
 	sum := sha256.Sum256(data)
 	id := "img_" + hex.EncodeToString(sum[:8])
 	if err := writeImageFile(sess.Cwd, id, "image/png", data); err != nil {
@@ -418,6 +423,52 @@ func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result s
 	text := result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s, is attached below as %s. Look at it now, before anything else: is every widget the spec names on it, in the order it says; is anything empty, overlapping, cut off or unlabeled? Where the spec has its own picture of this screen (its image with the same name), look at that too with `screenshot` and compare widgets, order and labels, not pixels. Fix what you see, then render again.]", rel, id)
 	a.say(ctx, sid, fmt.Sprintf("👁 attached the rendered screen %s to the model's view\n", rel))
 	return text, imageParts(text, "image/png", data), id
+}
+
+// attachMaxSide is the long side an attached render is scaled down to. A
+// HiDPI snapshot comes out at twice the window's size (2669 by 3025 for the
+// Cut page), and a vision model pays for pixels: halving it restores the
+// window's own size, where text is still sharp, at a quarter of the cost.
+const attachMaxSide = 1600
+
+// downscalePNG shrinks a PNG by the smallest whole factor that brings its
+// long side to at most max, averaging each factor-by-factor box, so a 2x
+// render comes back at exactly 1x. Anything it cannot decode, or that is
+// small enough already, is returned as it was.
+func downscalePNG(data []byte, max int) []byte {
+	src, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return data
+	}
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	f := 1
+	for (w+f-1)/f > max || (h+f-1)/f > max {
+		f++
+	}
+	if f == 1 {
+		return data
+	}
+	nw, nh := w/f, h/f
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	n := uint32(f * f)
+	for y := 0; y < nh; y++ {
+		for x := 0; x < nw; x++ {
+			var r, g, bl, a uint32
+			for dy := 0; dy < f; dy++ {
+				for dx := 0; dx < f; dx++ {
+					cr, cg, cb, ca := src.At(b.Min.X+x*f+dx, b.Min.Y+y*f+dy).RGBA()
+					r, g, bl, a = r+cr, g+cg, bl+cb, a+ca
+				}
+			}
+			dst.Set(x, y, color.RGBA64{uint16(r / n), uint16(g / n), uint16(bl / n), uint16(a / n)})
+		}
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, dst); err != nil {
+		return data
+	}
+	return out.Bytes()
 }
 
 // screenshotMaxBytes bounds an attached PNG: a screen is tens of KB, and
