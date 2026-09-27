@@ -278,9 +278,30 @@ func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (stri
 	maxLines := readChunkLines
 	if v, ok := args.num("limit"); ok && v > 0 {
 		maxLines = v
-		if maxLines > maxReadLines {
-			maxLines = maxReadLines
+	}
+	// The shapes the model already writes: `sed -n '130,205p'` is
+	// start_line/end_line, and Qwen's own file tool takes view_range
+	// [130, 205]. Both inclusive, no limit arithmetic.
+	from, to := 0, 0
+	if a, ok := args.num("start_line"); ok {
+		from = a
+		if b, ok := args.num("end_line"); ok {
+			to = b
 		}
+	}
+	if vr, ok := args["view_range"].([]any); ok && len(vr) == 2 {
+		ta := toolArgs{"a": vr[0], "b": vr[1]}
+		from, _ = ta.num("a")
+		to, _ = ta.num("b")
+	}
+	if from > 0 {
+		start, line, haveLine = from, from, true
+		if to >= from {
+			maxLines = to - from + 1
+		}
+	}
+	if maxLines > maxReadLines {
+		maxLines = maxReadLines
 	}
 	title := "Reading: " + path
 	if haveLine {
@@ -496,34 +517,38 @@ var fileTools = []Tool{
 		"function": map[string]any{
 			"name": "read_file",
 			"description": fmt.Sprintf("Read files. THREE WAYS, pick one per call:\n"+
-				"(1) A line window: {\"path\": \"src/cut.rs\", \"line\": 120, \"limit\": 60}.\n"+
+				"(1) A line range, both ends inclusive, like `sed -n '120,179p'`: {\"path\": \"src/cut.rs\", \"start_line\": 120, \"end_line\": 179}.\n"+
 				"(2) One definition by name, the whole function, type, class or test, in any language: {\"path\": \"src/ui/window.rs\", \"symbol\": \"cut_form_column\"}. Use this instead of `grep -n` followed by `sed -n`: one call, the whole block, its line range in the note.\n"+
 				"Add \"numbered\": true to any of them for `N|text` lines with line numbers, as the awk printf NR idiom gives.\n"+
-				"(3) SEVERAL reads at once, the way you put several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"src/fx_zoom.rs\", \"symbol\": \"zoom_at\"}, {\"path\": \"tests/zoom_widgets.rs\", \"line\": 1, \"limit\": 40}]}. Each comes back under its own \"=== read N of M ===\" header. When you know you need two or three things, ask for them in ONE call like this, not one call each.\n"+
+				"(3) SEVERAL reads at once, the way you put several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"src/fx_zoom.rs\", \"symbol\": \"zoom_at\"}, {\"path\": \"tests/zoom_widgets.rs\", \"start_line\": 1, \"end_line\": 40}]}. Each comes back under its own \"=== read N of M ===\" header. When you know you need two or three things, ask for them in ONE call like this, not one call each.\n"+
 				"Details: up to %d lines per read. The text comes back PLAIN, exactly as in the file, with no line-number prefixes: a snippet can be copied straight into edit_file's old_text. The note under it states which lines were served (\"showing lines 120-165\"), so you know where you are without numbering anything yourself. Prefer this to `cat`, `sed -n` or `awk 'NR>=a && NR<=b'` through run_command for a region you already know: one call, no shell quoting, and edit_file needs the text, never the numbers. Use `grep -n` through run_command only to FIND a region, not to read one. If the file continues past that, the output is marked partial and ends with a pointer to call continue_read for the next chunk (it remembers where you left off, so no line math). When the output ends with an end-of-file marker you have the file through that point, so do not re-read. A repeat read whose exact content is still in this conversation is refused (scroll back to it, or call continue_read for the next part); once it has scrolled out of context it is re-served. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"reads": map[string]any{
 						"type":        "array",
-						"description": fmt.Sprintf("SEVERAL reads in ONE call, instead of the fields below: a list, each item its own {path, symbol} or {path, line, limit}. Up to %d. Example: [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"tests/zoom_widgets.rs\", \"line\": 1, \"limit\": 40}].", maxReadsPerCall),
+						"description": fmt.Sprintf("SEVERAL reads in ONE call, instead of the fields below: a list, each item its own {path, symbol} or {path, line, limit}. Up to %d. Example: [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"tests/zoom_widgets.rs\", \"start_line\": 1, \"end_line\": 40}].", maxReadsPerCall),
 						"items": map[string]any{
 							"type":     "object",
 							"required": []string{"path"},
 							"properties": map[string]any{
-								"path":     map[string]any{"type": "string"},
-								"symbol":   map[string]any{"type": "string"},
-								"line":     map[string]any{"type": "integer"},
-								"limit":    map[string]any{"type": "integer"},
-								"numbered": map[string]any{"type": "boolean"},
+								"path":       map[string]any{"type": "string"},
+								"symbol":     map[string]any{"type": "string"},
+								"start_line": map[string]any{"type": "integer"},
+								"end_line":   map[string]any{"type": "integer"},
+								"line":       map[string]any{"type": "integer"},
+								"limit":      map[string]any{"type": "integer"},
+								"numbered":   map[string]any{"type": "boolean"},
 							},
 						},
 					},
-					"path":     map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
-					"line":     map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
-					"limit":    map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk, then use continue_read for more.", maxReadLines, readChunkLines)},
-					"numbered": map[string]any{"type": "boolean", "description": "true: every line comes back as `N|text` with its line number, like `awk '{printf \"%d|%s\\n\", NR, $0}'`. Works with line windows, symbol and each item of reads. For edit_file's old_text copy the text without the `N|` (edit_file strips it if you do not)."},
-					"symbol":   map[string]any{"type": "string", "description": "Read one definition instead of a line range: a function, method, type, class, trait or impl by name (`cut_form_column`, or `fn cut_form_column`). Any language: the block ends where its braces close, or where the indentation returns (Python), or after 50 lines when neither can be found (broken code). Comments and attributes directly above it come along. Replaces grep -n followed by a sed range: one call, the whole definition, its line range in the note."},
+					"path":       map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
+					"start_line": map[string]any{"type": "integer", "description": "First line to read, 1-based, with end_line the last, both inclusive: `sed -n '130,205p'` is start_line 130, end_line 205."},
+					"end_line":   map[string]any{"type": "integer", "description": "Last line to read, inclusive (see start_line)."},
+					"line":       map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
+					"limit":      map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk, then use continue_read for more.", maxReadLines, readChunkLines)},
+					"numbered":   map[string]any{"type": "boolean", "description": "true: every line comes back as `N|text` with its line number, like `awk '{printf \"%d|%s\\n\", NR, $0}'`. Works with line windows, symbol and each item of reads. For edit_file's old_text copy the text without the `N|` (edit_file strips it if you do not)."},
+					"symbol":     map[string]any{"type": "string", "description": "Read one definition instead of a line range: a function, method, type, class, trait or impl by name (`cut_form_column`, or `fn cut_form_column`). Any language: the block ends where its braces close, or where the indentation returns (Python), or after 50 lines when neither can be found (broken code). Comments and attributes directly above it come along. Replaces grep -n followed by a sed range: one call, the whole definition, its line range in the note."},
 				},
 			},
 		},
@@ -555,7 +580,9 @@ var fileTools = []Tool{
 			ta := toolArgs(t)
 			what := ta.str("symbol")
 			if what == "" {
-				if l, ok := ta.num("line"); ok {
+				if a, ok := ta.num("start_line"); ok {
+					what = fmt.Sprintf("from line %d", a)
+				} else if l, ok := ta.num("line"); ok {
 					what = fmt.Sprintf("from line %d", l)
 				} else {
 					what = "from the top"
@@ -1234,7 +1261,7 @@ func (s *Session) batchHint(name, args string, failed bool) (string, string) {
 			return "", ""
 		}
 		return "\n[codehalter: that was your second read_file in a row, and each is a model call. Independent reads go in ONE call, like several commands in one shell line; these two as one: {\"reads\": [" +
-			keep(before, "path", "symbol", "line", "limit") + ", " + keep(cur, "path", "symbol", "line", "limit") + "]}. Up to 8 per call.]", "💡 told the model: several reads go in one read_file call"
+			keep(before, "path", "symbol", "start_line", "end_line", "line", "limit") + ", " + keep(cur, "path", "symbol", "start_line", "end_line", "line", "limit") + "]}. Up to 8 per call.]", "💡 told the model: several reads go in one read_file call"
 	case "edit_file":
 		if cur.has("edits") || before.has("edits") || cur.str("path") != before.str("path") || cur.str("path") == "" {
 			return "", ""

@@ -347,14 +347,14 @@ func TestToolHints(t *testing.T) {
 func TestRangeReadHint(t *testing.T) {
 	cwd := "/workspaces/naivepost"
 	one := rangeReadHint("cd /workspaces/naivepost/rust && sed -n '96,104p' tests/settings.rs", cwd)
-	if !strings.Contains(one, `{"path": "rust/tests/settings.rs", "line": 96, "limit": 9}`) || strings.Contains(one, "reads") {
+	if !strings.Contains(one, `{"path": "rust/tests/settings.rs", "start_line": 96, "end_line": 104}`) || strings.Contains(one, "reads") {
 		t.Errorf("one range = %q", one)
 	}
 	two := rangeReadHint("cd rust && grep -n foo src/a.rs; sed -n '10,20p' src/a.rs; awk 'NR>=5 && NR<=8 {print}' src/b.rs", cwd)
-	if !strings.Contains(two, `{"reads": [{"path": "rust/src/a.rs", "line": 10, "limit": 11}, {"path": "rust/src/b.rs", "line": 5, "limit": 4}]}`) {
+	if !strings.Contains(two, `{"reads": [{"path": "rust/src/a.rs", "start_line": 10, "end_line": 20}, {"path": "rust/src/b.rs", "start_line": 5, "end_line": 8}]}`) {
 		t.Errorf("two ranges = %q", two)
 	}
-	if got := rangeReadHint(`cd rust && awk 'NR>=130 && NR<=205 {printf "%d|%s\n", NR, $0}' tests/speed.rs`, cwd); !strings.Contains(got, `{"path": "rust/tests/speed.rs", "line": 130, "limit": 76, "numbered": true}`) {
+	if got := rangeReadHint(`cd rust && awk 'NR>=130 && NR<=205 {printf "%d|%s\n", NR, $0}' tests/speed.rs`, cwd); !strings.Contains(got, `{"path": "rust/tests/speed.rs", "start_line": 130, "end_line": 205, "numbered": true}`) {
 		t.Errorf("numbered awk read = %q", got)
 	}
 	if got := rangeReadHint("cargo build 2>&1 | grep error", cwd); got != "" {
@@ -365,7 +365,7 @@ func TestRangeReadHint(t *testing.T) {
 		t.Fatal(err)
 	}
 	res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sed -n '1,2p' f.txt"}`)
-	if !strings.Contains(res, "a\nb\n") || !strings.Contains(res, `read_file does this without the shell: {"path": "f.txt", "line": 1, "limit": 2}`) {
+	if !strings.Contains(res, "a\nb\n") || !strings.Contains(res, `read_file does this without the shell: {"path": "f.txt", "start_line": 1, "end_line": 2}`) {
 		t.Errorf("run result = %q", res)
 	}
 	if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sed -n '2,3p' f.txt"}`); !strings.Contains(res, "codehalter:") {

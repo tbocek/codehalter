@@ -661,3 +661,26 @@ func TestReadFileNumbered(t *testing.T) {
 		t.Error("stripped numbers from a snippet where not every line had one")
 	}
 }
+
+// TestReadFileStartEndLine: start_line/end_line and view_range read the
+// inclusive range the model names, the shape of `sed -n 'a,bp'`.
+func TestReadFileStartEndLine(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, "big.txt")
+	writeLines(t, path, 50)
+	read := func(args string) string {
+		var tc toolCall
+		tc.Function.Name, tc.Function.Arguments = "read_file", args
+		out, _ := a.executeTool(context.Background(), s.ID, tc)
+		return out
+	}
+	if out := read(fmt.Sprintf(`{"path":%q,"start_line":10,"end_line":12}`, path)); !strings.Contains(out, "L10\nL11\nL12\n") || strings.Contains(out, "L13\n") {
+		t.Errorf("start/end:\n%s", out)
+	}
+	if out := read(fmt.Sprintf(`{"path":%q,"view_range":[20,21]}`, path)); !strings.Contains(out, "L20\nL21\n") || strings.Contains(out, "L22\n") {
+		t.Errorf("view_range:\n%s", out)
+	}
+	if out := read(fmt.Sprintf(`{"reads":[{"path":%q,"start_line":30,"end_line":30}]}`, path)); !strings.Contains(out, "from line 30") || !strings.Contains(out, "L30\n") || strings.Contains(out, "L31\n") {
+		t.Errorf("reads item:\n%s", out)
+	}
+}

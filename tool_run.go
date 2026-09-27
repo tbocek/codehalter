@@ -525,7 +525,7 @@ func rangeReadHint(cmd, cwd string) string {
 		if numbered {
 			num = `, "numbered": true`
 		}
-		reads = append(reads, fmt.Sprintf(`{"path": %q, "line": %d, "limit": %d%s}`, filepath.ToSlash(p), a, b-a+1, num))
+		reads = append(reads, fmt.Sprintf(`{"path": %q, "start_line": %d, "end_line": %d%s}`, filepath.ToSlash(p), a, b, num))
 	}
 	for _, m := range sedRangeRe.FindAllStringSubmatch(cmd, -1) {
 		add(m[1], m[2], m[3], false)
