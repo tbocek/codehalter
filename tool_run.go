@@ -178,7 +178,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	args := parseArgs(rawArgs)
 	cmdStr := args.str("command")
 	if cmdStr == "" {
-		return "error: command is required", false
+		return "error: command is required" + wrongToolHint(args), false
 	}
 	sess := a.getSession(sid)
 	if sess == nil {
@@ -514,4 +514,18 @@ func rangeReadHint(cmd, cwd string) string {
 		return "\n[codehalter: read_file does this without the shell: " + reads[0] + "; for a whole function use \"symbol\" instead of line numbers.]"
 	}
 	return "\n[codehalter: read_file does all of these in ONE call without the shell: {\"reads\": [" + strings.Join(reads, ", ") + "]}; for a whole function use \"symbol\" instead of line numbers.]"
+}
+
+// wrongToolHint names the tool a run_command call without a command was
+// meant for, from the arguments it carried: a model that has just learned
+// read_file's `reads` list sent it to run_command once, and "command is
+// required" alone did not say what went wrong.
+func wrongToolHint(args toolArgs) string {
+	switch {
+	case args.has("reads") || args.has("symbol") || (args.has("path") && (args.has("line") || args.has("limit"))):
+		return ": these arguments are read_file's. Call read_file with them, not run_command."
+	case args.has("edits") || args.has("old_text") || args.has("start"):
+		return ": these arguments are edit_file's. Call edit_file with them, not run_command."
+	}
+	return ""
 }

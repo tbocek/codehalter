@@ -402,3 +402,20 @@ func TestGrepDefinitionHint(t *testing.T) {
 		t.Error("the second grep got no hint; every occurrence gets one")
 	}
 }
+
+// TestRunCommandNamesTheToolItWasMeantFor: read_file's or edit_file's
+// arguments sent to run_command get told which tool takes them.
+func TestRunCommandNamesTheToolItWasMeantFor(t *testing.T) {
+	h := newTerminalHarness(t)
+	res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"reads":[{"path":"a.rs","line":1,"limit":5}]}`)
+	if !strings.Contains(res, "Call read_file with them") {
+		t.Errorf("reads sent to run_command = %q", res)
+	}
+	res, _ = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"path":"a.rs","old_text":"x","new_text":"y"}`)
+	if !strings.Contains(res, "Call edit_file with them") {
+		t.Errorf("an edit sent to run_command = %q", res)
+	}
+	if res, _ = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{}`); res != "error: command is required" {
+		t.Errorf("empty call = %q", res)
+	}
+}

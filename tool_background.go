@@ -290,7 +290,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	args := parseArgs(rawArgs)
 	cmdStr := args.str("command")
 	if cmdStr == "" {
-		return "error: command is required", false
+		return "error: command is required" + wrongToolHint(args), false
 	}
 	sess := a.getSession(sid)
 	if sess == nil {
