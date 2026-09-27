@@ -401,3 +401,114 @@ func TestFsGatedOnClientCapabilities(t *testing.T) {
 		}
 	}()
 }
+
+// TestLocateSymbol pins the language-generic definition finder: braces for
+// Rust and Go (a brace inside a string does not count, a Go method's
+// receiver is skipped, attributes and doc comments above come along),
+// indentation for Python, a prototype ending in ';' as its own block, the
+// 50-line fallback for a block that never closes, and mentions when the
+// name is used but never declared.
+func TestLocateSymbol(t *testing.T) {
+	rust := strings.Join([]string{
+		"use gtk::prelude::*;",              // 1
+		"",                                  // 2
+		"/// Builds the form.",              // 3
+		"#[allow(dead_code)]",               // 4
+		"pub fn cut_form_column(x: i32) {",  // 5
+		`    let s = "}{";`,                 // 6
+		"    if x > 0 {",                    // 7
+		"        println!(\"{}\", x);",      // 8
+		"    }",                             // 9
+		"}",                                 // 10
+		"fn other() { cut_form_column(1) }", // 11
+	}, "\n")
+	loc := locateSymbol(rust, "fn cut_form_column")
+	if loc.start != 3 || loc.end != 10 || loc.how != "braces" {
+		t.Errorf("rust = %+v, want 3-10 by braces", loc)
+	}
+
+	goSrc := "package x\n\nfunc (r *Runner) Step(n int) error {\n\treturn nil\n}\n"
+	if loc := locateSymbol(goSrc, "Step"); loc.start != 3 || loc.end != 5 {
+		t.Errorf("go method = %+v, want 3-5", loc)
+	}
+
+	py := "import os\n\n@cache\ndef load(path):\n    with open(path) as f:\n\n        return f.read()\n\nx = load('a')\n"
+	if loc := locateSymbol(py, "load"); loc.start != 3 || loc.end != 7 || loc.how != "indentation" {
+		t.Errorf("python = %+v, want 3-7 by indentation", loc)
+	}
+
+	proto := "trait T {\n    fn draw(&self);\n    fn size(&self) -> u32 { 1 }\n}\n"
+	if loc := locateSymbol(proto, "draw"); loc.start != 2 || loc.end != 2 {
+		t.Errorf("prototype = %+v, want line 2 alone", loc)
+	}
+
+	var broken []string
+	broken = append(broken, "fn half_written() {")
+	for i := 0; i < 80; i++ {
+		broken = append(broken, "    step();")
+	}
+	if loc := locateSymbol(strings.Join(broken, "\n"), "half_written"); loc.end != symbolFallbackLines || !strings.Contains(loc.how, "fallback") {
+		t.Errorf("broken = %+v, want the 50-line fallback", loc)
+	}
+
+	if loc := locateSymbol("let a = helper(1);\nlet b = helper(2);\n", "helper"); loc.start != 0 || len(loc.mentions) != 2 {
+		t.Errorf("undeclared = %+v, want no definition and two mentions", loc)
+	}
+}
+
+// TestReadFileBySymbol: read_file with `symbol` serves the whole definition
+// with its line range in the note.
+func TestReadFileBySymbol(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, "w.rs")
+	src := "fn a() {}\n\nfn target() {\n    one();\n    two();\n}\n\nfn b() {}\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var tc toolCall
+	tc.Function.Name = "read_file"
+	tc.Function.Arguments = fmt.Sprintf(`{"path":%q,"symbol":"target"}`, path)
+	out, failed := a.executeTool(context.Background(), s.ID, tc)
+	if failed || !strings.HasPrefix(out, "[`target`: lines 3-6, block end found by braces]") || !strings.Contains(out, "two();") || strings.Contains(out, "fn b()") {
+		t.Errorf("symbol read = failed %v:\n%s", failed, out)
+	}
+	tc.Function.Arguments = fmt.Sprintf(`{"path":%q,"symbol":"missing"}`, path)
+	if out, failed := a.executeTool(context.Background(), s.ID, tc); !failed || !strings.Contains(out, "grep -rn") {
+		t.Errorf("unknown symbol = failed %v: %s", failed, out)
+	}
+}
+
+// TestEditFileByAnchors: a block is replaced by its first and last line's
+// fragments, whole lines; an ambiguous start or a missing end changes
+// nothing and says why.
+func TestEditFileByAnchors(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, "w.rs")
+	src := "fn a() {}\n\nfn target() {\n    one();\n    two();\n} // end target\n\nfn b() {}\n"
+	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	edit := func(args string) (string, bool) {
+		var tc toolCall
+		tc.Function.Name = "edit_file"
+		tc.Function.Arguments = args
+		return a.executeTool(context.Background(), s.ID, tc)
+	}
+	out, failed := edit(fmt.Sprintf(`{"path":%q,"start":"fn target()","end":"// end target","new_text":"fn target() {\n    three();\n}"}`, path))
+	if failed || !strings.Contains(out, "lines 3-6 replaced") {
+		t.Fatalf("anchor edit = %v %s", failed, out)
+	}
+	got, _ := os.ReadFile(path)
+	if want := "fn a() {}\n\nfn target() {\n    three();\n}\n\nfn b() {}\n"; string(got) != want {
+		t.Errorf("file =\n%s\nwant\n%s", got, want)
+	}
+	if out, failed := edit(fmt.Sprintf(`{"path":%q,"start":"fn ","end":"}","new_text":"x"}`, path)); !failed || !strings.Contains(out, "on 3 lines") {
+		t.Errorf("ambiguous start = %v %s", failed, out)
+	}
+	if out, failed := edit(fmt.Sprintf(`{"path":%q,"start":"fn b()","end":"nowhere","new_text":"x"}`, path)); !failed || !strings.Contains(out, "`end`") {
+		t.Errorf("missing end = %v %s", failed, out)
+	}
+	if out, failed := edit(fmt.Sprintf(`{"path":%q,"new_text":"x"}`, path)); !failed || !strings.Contains(out, "either") {
+		t.Errorf("neither form = %v %s", failed, out)
+	}
+}

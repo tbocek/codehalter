@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -419,9 +421,10 @@ var fileTools = []Tool{
 				"type":     "object",
 				"required": []string{"path"},
 				"properties": map[string]any{
-					"path":  map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
-					"line":  map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
-					"limit": map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk, then use continue_read for more.", maxReadLines, readChunkLines)},
+					"path":   map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
+					"line":   map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
+					"limit":  map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk, then use continue_read for more.", maxReadLines, readChunkLines)},
+					"symbol": map[string]any{"type": "string", "description": "Read one definition instead of a line range: a function, method, type, class, trait or impl by name (`cut_form_column`, or `fn cut_form_column`). Any language: the block ends where its braces close, or where the indentation returns (Python), or after 50 lines when neither can be found (broken code). Comments and attributes directly above it come along. Replaces grep -n followed by a sed range: one call, the whole definition, its line range in the note."},
 				},
 			},
 		},
@@ -430,6 +433,33 @@ var fileTools = []Tool{
 		path, err := a.resolvePath(sid, args.str("path"))
 		if err != nil {
 			return "error: " + err.Error(), false
+		}
+		if sym := strings.TrimSpace(args.str("symbol")); sym != "" {
+			content, err := fsRead(a, ctx, sid, path, nil, nil)
+			if err != nil {
+				return "error reading file: " + err.Error(), false
+			}
+			loc := locateSymbol(content, sym)
+			if loc.start == 0 {
+				msg := fmt.Sprintf("error: no definition of `%s` found in %s.", sym, path)
+				if len(loc.mentions) > 0 {
+					msg += fmt.Sprintf(" The name appears at lines %s; read one of those with line=, or pass the exact declared name.", joinInts(loc.mentions))
+				} else {
+					msg += " The name does not appear in this file at all; find the right file with `grep -rn` first."
+				}
+				return msg, true
+			}
+			n := loc.end - loc.start + 1
+			if n > maxReadLines {
+				n = maxReadLines
+			}
+			tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Reading: %s (%s)", path, sym), "read", []ToolCallLocation{{Path: path, Line: &loc.start}})
+			out, failed := a.serveRead(ctx, sid, path, loc.start, n, tcId)
+			head := fmt.Sprintf("[`%s`: lines %d-%d, block end found by %s", sym, loc.start, loc.end, loc.how)
+			if len(loc.others) > 0 {
+				head += fmt.Sprintf("; also declared at lines %s", joinInts(loc.others))
+			}
+			return head + "]\n" + out, failed
 		}
 		start := 1
 		line, haveLine := args.num("line")
@@ -543,14 +573,16 @@ var fileTools = []Tool{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "edit_file",
-			"description": "Replace one exact text snippet in an EXISTING file — always prefer this over write_file for changing a file that already exists. old_text must match the file byte-for-byte AND be unique; copy it from a fresh read_file and keep it small (a few lines, not a whole function). Change a large region as SEVERAL small edits. If old_text isn't found, the file differs from what you remember — read_file that region and retry on a small snippet; never rewrite the whole file. Errors (not found / not unique / unwritable) come back as messages — fix and retry.",
+			"description": "Change an EXISTING file — always prefer this over write_file for a file that already exists, and ALWAYS prefer it over a Python, sed or awk script through run_command: this edit is checked for uniqueness, shown to the user as a diff, and counted as an edit; a script is none of that, and a wrong anchor in it silently rewrites the wrong span. Two ways: (1) `old_text`: one exact snippet, unique, copied from a fresh read_file, small (a few lines); (2) `start` and `end`: to replace a whole BLOCK (a function body, a test, a match arm, a widget section), give a unique fragment of the block's first line as `start` and a fragment of its last line as `end` (the first line containing it at or after start); every line from start through end is replaced by new_text. Use (2) instead of copying forty lines into old_text. Errors (not found / not unique / unwritable) come back as messages — fix and retry.",
 			"parameters": map[string]any{
 				"type":     "object",
-				"required": []string{"path", "old_text", "new_text"},
+				"required": []string{"path", "new_text"},
 				"properties": map[string]any{
 					"path":     map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
-					"old_text": map[string]any{"type": "string", "description": "Exact text to find. MUST match the file byte-for-byte (whitespace, indentation, trailing newlines included) AND must be unique in the file — include enough surrounding context to disambiguate."},
-					"new_text": map[string]any{"type": "string", "description": "Replacement text. Pass an empty string to delete old_text."},
+					"old_text": map[string]any{"type": "string", "description": "Way (1): exact text to find. MUST match the file byte-for-byte (whitespace, indentation, trailing newlines included) AND must be unique in the file — include enough surrounding context to disambiguate."},
+					"start":    map[string]any{"type": "string", "description": "Way (2): a fragment of the block's FIRST line, unique in the file (for example `fn cut_form_column(`)."},
+					"end":      map[string]any{"type": "string", "description": "Way (2): a fragment of the block's LAST line; the first line at or after `start` that contains it ends the block (for example the closing `}` line's text, or a comment on it). Omit to replace the start line alone."},
+					"new_text": map[string]any{"type": "string", "description": "Replacement text: for (1) it replaces old_text, for (2) it replaces the lines from start through end, whole lines. Pass an empty string to delete."},
 				},
 			},
 		},
@@ -568,6 +600,10 @@ var fileTools = []Tool{
 		}
 		oldText := args.str("old_text")
 		newText := args.str("new_text")
+		startAnchor, endAnchor := args.str("start"), args.str("end")
+		if oldText == "" && startAnchor == "" {
+			return "error: give either `old_text` (an exact snippet) or `start` (and `end`) for a block; with neither there is nothing to replace.", true
+		}
 
 		tcId := a.StartToolCall(ctx, sid, "Editing: "+path, "edit", []ToolCallLocation{{Path: path}})
 
@@ -575,6 +611,21 @@ var fileTools = []Tool{
 		if err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
 			return "error reading file: " + err.Error(), false
+		}
+		if oldText == "" {
+			// Way (2): a block between two anchors, whole lines.
+			newContent, span, msg := replaceBlock(content, startAnchor, endAnchor, newText)
+			if msg != "" {
+				a.FailToolCall(ctx, sid, tcId, msg)
+				return "error: " + msg, true
+			}
+			newContent = a.formatGuarded(sid, path, content, newContent)
+			if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
+				a.FailToolCall(ctx, sid, tcId, err.Error())
+				return "error writing file: " + err.Error(), false
+			}
+			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
+			return fmt.Sprintf("file written successfully (lines %s replaced)", span), false
 		}
 		// Rides along on every outcome below. On a failed match it is the ANSWER:
 		// old_text was copied from a read that something else has since rewritten,
@@ -639,6 +690,228 @@ var fileTools = []Tool{
 
 		return okNote + drift, false
 	}},
+}
+
+// symbolLoc is where locateSymbol found a definition: its first line
+// (leading comments and attributes included) and last line, how the end was
+// found, other declarations of the same name, and, when there is none, the
+// lines that merely mention it.
+type symbolLoc struct {
+	start, end int
+	how        string
+	others     []int
+	mentions   []int
+}
+
+// symbolFallbackLines is how much a definition read serves when its block
+// end cannot be found (broken code, an unusual syntax).
+const symbolFallbackLines = 50
+
+// declKeywordRe: the words that introduce a definition across the common
+// languages, with the modifiers that may precede them. The name follows,
+// possibly after a Go method receiver or Rust generics.
+var declKeywordRe = regexp.MustCompile(`(?:^|[\s(])(?:fn|func|def|class|struct|enum|trait|impl|interface|type|mod|module|macro_rules!|function|union|record|object|protocol|extension|let|const|var|val)\s+(?:\([^)]*\)\s*)?(?:<[^>]*>\s*)?`)
+
+// locateSymbol finds the definition of symbol in content, for any language:
+// a declaration keyword before the name, then the block's end by braces,
+// by indentation for a line ending in ':', or a fixed fallback.
+func locateSymbol(content, symbol string) symbolLoc {
+	name := symbol
+	if f := strings.Fields(strings.TrimRight(strings.TrimSpace(symbol), "(){}:")); len(f) > 0 {
+		name = f[len(f)-1]
+	}
+	name = strings.TrimRight(name, "(){}:")
+	lines := strings.Split(content, "\n")
+	nameRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
+	var loc symbolLoc
+	var decls []int
+	for i, ln := range lines {
+		idx := nameRe.FindStringIndex(ln)
+		if idx == nil {
+			continue
+		}
+		before := ln[:idx[0]]
+		if m := declKeywordRe.FindAllStringIndex(before+" ", -1); len(m) > 0 && m[len(m)-1][1] >= len(before) {
+			decls = append(decls, i)
+		} else if len(loc.mentions) < 8 {
+			loc.mentions = append(loc.mentions, i+1)
+		}
+	}
+	if len(decls) == 0 {
+		return loc
+	}
+	d := decls[0]
+	for _, o := range decls[1:] {
+		if len(loc.others) < 5 {
+			loc.others = append(loc.others, o+1)
+		}
+	}
+	loc.mentions = nil
+	// Comments and attributes directly above belong to the definition.
+	top := d
+	for top > 0 && d-top < 20 {
+		t := strings.TrimSpace(lines[top-1])
+		if strings.HasPrefix(t, "//") || strings.HasPrefix(t, "#[") || strings.HasPrefix(t, "#!") || strings.HasPrefix(t, "@") ||
+			strings.HasPrefix(t, "/*") || strings.HasPrefix(t, "*") || strings.HasPrefix(t, "\"\"\"") || strings.HasPrefix(t, "--") {
+			top--
+			continue
+		}
+		break
+	}
+	loc.start = top + 1
+	if end, ok := braceBlockEnd(lines, d); ok {
+		loc.end, loc.how = end+1, "braces"
+		return loc
+	}
+	if strings.HasSuffix(strings.TrimSpace(stripLineComment(lines[d])), ":") {
+		loc.end, loc.how = indentBlockEnd(lines, d)+1, "indentation"
+		return loc
+	}
+	loc.end = d + symbolFallbackLines
+	if loc.end > len(lines) {
+		loc.end = len(lines)
+	}
+	loc.how = fmt.Sprintf("the %d-line fallback (no block end found)", symbolFallbackLines)
+	return loc
+}
+
+// braceBlockEnd scans from the declaration line for the brace block that
+// opens within its first few lines and returns the line where it closes. A
+// declaration that ends in ';' before any brace (a prototype, a trait
+// method) is its own block. Strings and line comments are skipped so a
+// brace inside them does not count; a block that never closes is not found.
+func braceBlockEnd(lines []string, d int) (int, bool) {
+	depth, opened := 0, false
+	for i := d; i < len(lines); i++ {
+		ln := stripLineComment(lines[i])
+		inStr := byte(0)
+		for j := 0; j < len(ln); j++ {
+			c := ln[j]
+			if inStr != 0 {
+				if c == '\\' {
+					j++
+				} else if c == inStr {
+					inStr = 0
+				}
+				continue
+			}
+			switch c {
+			case '"', '`':
+				inStr = c
+			case '{':
+				depth++
+				opened = true
+			case '}':
+				depth--
+				if opened && depth == 0 {
+					return i, true
+				}
+			case ';':
+				if !opened {
+					return i, true
+				}
+			}
+		}
+		if !opened && i-d >= 3 {
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
+// indentBlockEnd: the last line of an indentation block started by line d,
+// that is, the last non-blank line indented deeper than d.
+func indentBlockEnd(lines []string, d int) int {
+	base := len(leadingWS(lines[d]))
+	end := d
+	for i := d + 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "" {
+			continue
+		}
+		if len(leadingWS(lines[i])) <= base {
+			break
+		}
+		end = i
+	}
+	return end
+}
+
+// stripLineComment drops a `//` or `#` comment tail outside strings, well
+// enough for block scanning; it is not a parser.
+func stripLineComment(ln string) string {
+	inStr := byte(0)
+	for j := 0; j < len(ln); j++ {
+		c := ln[j]
+		if inStr != 0 {
+			if c == '\\' {
+				j++
+			} else if c == inStr {
+				inStr = 0
+			}
+			continue
+		}
+		switch {
+		case c == '"':
+			inStr = c
+		case c == '/' && j+1 < len(ln) && ln[j+1] == '/':
+			return ln[:j]
+		case c == '#' && (j == 0 || ln[j-1] == ' ' || ln[j-1] == '\t') && !(j+1 < len(ln) && ln[j+1] == '['):
+			return ln[:j]
+		}
+	}
+	return ln
+}
+
+// replaceBlock replaces whole lines from the unique line containing start
+// through the first line at or after it containing end (start's line alone
+// when end is empty) with newText. It returns the new content and the
+// replaced span, or a message saying why nothing was replaced.
+func replaceBlock(content, start, end, newText string) (string, string, string) {
+	lines := strings.Split(content, "\n")
+	var hits []int
+	for i, ln := range lines {
+		if strings.Contains(ln, start) {
+			hits = append(hits, i)
+		}
+	}
+	switch {
+	case len(hits) == 0:
+		return "", "", fmt.Sprintf("`start` %q is on no line of the file. Copy a fragment of the block's first line from a fresh read_file (read_file with `symbol` shows the whole block).", start)
+	case len(hits) > 1:
+		var at []int
+		for _, h := range hits {
+			at = append(at, h+1)
+		}
+		return "", "", fmt.Sprintf("`start` %q is on %d lines (%s); make it longer so it is on exactly one.", start, len(hits), joinInts(at))
+	}
+	s, e := hits[0], hits[0]
+	if end != "" {
+		e = -1
+		for i := s; i < len(lines); i++ {
+			if strings.Contains(lines[i], end) {
+				e = i
+				break
+			}
+		}
+		if e < 0 {
+			return "", "", fmt.Sprintf("`end` %q is on no line at or after line %d, where `start` is.", end, s+1)
+		}
+	}
+	repl := strings.Split(strings.TrimSuffix(newText, "\n"), "\n")
+	if newText == "" {
+		repl = nil
+	}
+	out := append(append(append([]string{}, lines[:s]...), repl...), lines[e+1:]...)
+	return strings.Join(out, "\n"), fmt.Sprintf("%d-%d", s+1, e+1), ""
+}
+
+// joinInts renders line numbers as "12, 40, 97".
+func joinInts(ns []int) string {
+	parts := make([]string, len(ns))
+	for i, n := range ns {
+		parts[i] = strconv.Itoa(n)
+	}
+	return strings.Join(parts, ", ")
 }
 
 // fsRead reads a text file. For top-level sessions known to the ACP client
