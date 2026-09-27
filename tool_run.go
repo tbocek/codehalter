@@ -285,7 +285,8 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 }
 
 // toolHints is the note a finished run_command result gets when the model
-// took a shell route that a file tool does better: the read_file symbol call
+// took a shell route that ONE file tool call does as well, and only then (a
+// line that also searches or builds is already one call): the read_file symbol call
 // for a grep that found a definition, the edit_file call for a script that
 // spliced a source file, the read_file call for a range read. A note, never
 // a refusal: the command ran. Every time, with the concrete call filled in,
@@ -295,7 +296,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 func (s *Session) toolHints(cmd, output string) (string, string) {
 	var out string
 	var seen []string
-	if path, name := grepDefinitionHit(cmd, output, s.Cwd); name != "" {
+	if path, name := grepDefinitionHit(cmd, output, s.Cwd); name != "" && grepsForDefinition(cmd, name) {
 		out += fmt.Sprintf("\n[codehalter: that hit is where `%s` is defined. To read the whole definition, read_file does it in one call, in any language: {\"path\": %q, \"symbol\": %q}%s; several at once as {\"reads\": [{\"path\": ..., \"symbol\": ...}, ...]}.]", name, path, name, symbolPreview(s.Cwd, path, name))
 		seen = append(seen, "read_file symbol="+name+" instead of grep")
 	}
@@ -304,7 +305,7 @@ func (s *Session) toolHints(cmd, output string) (string, string) {
 			" edit_file checks that old_text (or start) matches exactly one place, applies the change, shows the user a diff, and answers `file written successfully` or says exactly why not; a script does none of that. Use edit_file for the next change.]"
 		seen = append(seen, "edit_file instead of a script on "+target)
 	}
-	if h := rangeReadHint(cmd, s.Cwd); h != "" {
+	if h := rangeReadHint(cmd, s.Cwd); h != "" && onlyRangeReads(cmd) {
 		out += h
 		seen = append(seen, "read_file instead of sed/awk line ranges")
 	}
@@ -336,6 +337,32 @@ func symbolPreview(cwd, path, name string) string {
 		}
 	}
 	return fmt.Sprintf(", which returns lines %d-%d (%d lines, the whole block, found by %s), starting `%s`", loc.start, loc.end, loc.end-loc.start+1, loc.how, truncate(first, 100))
+}
+
+// grepsForDefinition: the grep's own pattern names the definition, keyword
+// and name (`grep -n "pub fn opens_gesture" -A 12`). Then the model knew
+// what it wanted to read, and read_file's symbol mode is the same in one
+// call. A broad search that happens to turn up a definition is a search,
+// which read_file cannot do, and gets no note.
+func grepsForDefinition(cmd, name string) bool {
+	re := regexp.MustCompile(`(?:fn|func|def|class|struct|enum|trait|impl|interface|type|function)\s+(?:\([^)]*\)\s*)?` + regexp.QuoteMeta(name) + `\b`)
+	return re.MatchString(cmd)
+}
+
+// onlyRangeReads: every part of the shell line is a line-range read (or a
+// cd, or an echo separator). A line that also searches, builds or tests is
+// already one call doing several things, and read_file could not replace it.
+func onlyRangeReads(cmd string) bool {
+	for _, part := range regexp.MustCompile(`&&|;|\n`).Split(cmd, -1) {
+		p := strings.TrimSpace(part)
+		if p == "" || strings.HasPrefix(p, "cd ") || strings.HasPrefix(p, "echo ") {
+			continue
+		}
+		if !sedRangeRe.MatchString(p) && !awkRangeRe.MatchString(p) {
+			return false
+		}
+	}
+	return true
 }
 
 // grepHitRe is one line of grep -n output: "path:line:text" when grep names

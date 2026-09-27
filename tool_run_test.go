@@ -312,11 +312,17 @@ func TestToolHints(t *testing.T) {
 		}
 	}
 	h := newTerminalHarness(t)
-	first, told := h.sess.toolHints(edit+"; sed -n '1,5p' src/a.rs", "")
-	if !strings.Contains(told, "edit_file instead of a script on tests/zoom_widgets.rs") || !strings.Contains(told, "read_file instead of sed/awk") {
+	first, told := h.sess.toolHints(edit, "")
+	if !strings.Contains(told, "edit_file instead of a script on tests/zoom_widgets.rs") {
 		t.Errorf("chat line = %q", told)
 	}
-	if !strings.Contains(first, "that script edited tests/zoom_widgets.rs") || !strings.Contains(first, "read_file does this without the shell") ||
+	if _, told := h.sess.toolHints("cd rust && sed -n '1,5p' src/a.rs; echo ===; sed -n '9,12p' src/b.rs", ""); !strings.Contains(told, "read_file instead of sed/awk") {
+		t.Errorf("a pure range-read line got no note: %q", told)
+	}
+	if note, _ := h.sess.toolHints("cd rust && grep -n foo src/a.rs; sed -n '1,5p' src/a.rs", ""); note != "" {
+		t.Errorf("a line that also searches got a note: %q", note)
+	}
+	if !strings.Contains(first, "that script edited tests/zoom_widgets.rs") ||
 		!strings.Contains(first, `Its replace is exactly this edit_file call: {"path": "tests/zoom_widgets.rs", "old_text": "a", "new_text": "b"}`) {
 		t.Errorf("first hints = %q", first)
 	}
@@ -330,7 +336,7 @@ func TestToolHints(t *testing.T) {
 	if got := scriptEditPreview(splice, "src/a.rs"); !strings.Contains(got, `"start": "<fragment of the block's first line>"`) {
 		t.Errorf("splice preview = %q", got)
 	}
-	if again, _ := h.sess.toolHints(edit+"; sed -n '1,5p' src/a.rs", ""); again == "" {
+	if again, _ := h.sess.toolHints(edit, ""); again == "" {
 		t.Error("the second occurrence got no hint; every occurrence gets one")
 	}
 }
@@ -394,11 +400,15 @@ func TestGrepDefinitionHint(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(h.sess.Cwd, "cmd", "run.go"), []byte("package cmd\n\n// Step runs one step.\nfunc (r *Runner) Step(n int) error {\n\treturn nil\n}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	first, _ := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:4:func (r *Runner) Step(n int) error {")
+	// A broad search that turns up the definition is a search: no note.
+	if note, _ := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:4:func (r *Runner) Step(n int) error {"); note != "" {
+		t.Errorf("a broad search got the definition note: %q", note)
+	}
+	first, _ := h.sess.toolHints(`grep -rn "func (r \*Runner) Step" -A 8 cmd`, "cmd/run.go:4:func (r *Runner) Step(n int) error {")
 	if !strings.Contains(first, `{"path": "cmd/run.go", "symbol": "Step"}, which returns lines 3-6 (4 lines, the whole block, found by braces), starting `+"`func (r *Runner) Step(n int) error {`") {
 		t.Errorf("first grep hint = %q", first)
 	}
-	if again, _ := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:4:func (r *Runner) Step(n int) error {"); again == "" {
+	if again, _ := h.sess.toolHints("grep -n 'fn Step' -A 8 cmd/run.go", "4:func (r *Runner) Step(n int) error {"); again == "" {
 		t.Error("the second grep got no hint; every occurrence gets one")
 	}
 }
