@@ -138,7 +138,7 @@ func isContextFull(err error) bool {
 }
 
 // The partial output is unusable (truncated tool-call JSON cannot be resumed);
-// the tool loop retries once with a nudge that names Cap.
+// the tool loop retries once with a nudge that names Cap, then once on 2*Cap.
 type capHitError struct {
 	Cap int
 	msg string

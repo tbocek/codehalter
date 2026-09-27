@@ -567,7 +567,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		// Tool-loop calls append to each other, which the rewind check relies on.
 		callConn := *conn
 		callConn.cacheLineage = true
-		capNudged := false // one be-concise nudge retry per round
+		capNudged, capDoubled := false, false // per round: one be-concise nudge, then one doubled cap
 		transientRetries := 0
 		for {
 			// Fresh sink per attempt: an aborted attempt's partial arguments must not carry over.
@@ -578,17 +578,28 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			}
 			var ce *capHitError
 			if errors.As(err, &ce) {
-				if capNudged {
-					return "", nil, messages, err
+				switch {
+				case !capNudged:
+					capNudged = true
+					a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
+					if sid != "" {
+						a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
+					}
+					messages = a.addCorrective(sid, messages, fmt.Sprintf(
+						"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
+					continue
+				case !capDoubled:
+					// A file that needs more than the cap cannot be made concise. The cap is
+					// a sampler setting, so the doubled retry keeps the prefix cache.
+					capDoubled = true
+					callConn = *callConn.withBody("max_tokens", 2*ce.Cap)
+					a.logSession(sid, "RECOVER", "still at the cap after the nudge: one retry with max_tokens=%d", 2*ce.Cap)
+					if sid != "" {
+						a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", 2*ce.Cap))
+					}
+					continue
 				}
-				capNudged = true
-				a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
-				if sid != "" {
-					a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
-				}
-				messages = a.addCorrective(sid, messages, fmt.Sprintf(
-					"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
-				continue
+				return "", nil, messages, err
 			}
 			if isTransientStreamError(err) {
 				if transientRetries >= maxTransientStreamRetries {

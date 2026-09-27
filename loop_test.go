@@ -196,10 +196,39 @@ func TestCapHitLadder(t *testing.T) {
 	}
 }
 
+// A reply that needs more than the cap (a large file) survives the nudge; one
+// retry on a doubled cap gets it through.
+func TestCapHitLadderDoubles(t *testing.T) {
+	mock := newMockLLM(t,
+		sseTruncatedContent("big file", 1000, defaultMaxTokens),
+		sseTruncatedContent("big file", 1000, defaultMaxTokens),
+		sseText("done"),
+	)
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.mainSlotTokens.Store(85248)
+
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
+	if err != nil {
+		t.Fatalf("the doubled cap should recover: %v", err)
+	}
+	if got := mock.callCount(); got != 3 || res.Text != "done" {
+		t.Fatalf("callCount = %d, text = %q; want 3 calls ending in the doubled retry's reply", got, res.Text)
+	}
+	if mt, _ := mock.request(2)["max_tokens"].(float64); int(mt) != 2*defaultMaxTokens {
+		t.Errorf("third request max_tokens = %v, want %d", mock.request(2)["max_tokens"], 2*defaultMaxTokens)
+	}
+	if mt, _ := mock.request(1)["max_tokens"].(float64); int(mt) != defaultMaxTokens {
+		t.Errorf("the nudged request max_tokens = %v, want the unchanged %d", mock.request(1)["max_tokens"], defaultMaxTokens)
+	}
+}
+
 func TestCapHitLadderExhausted(t *testing.T) {
 	mock := newMockLLM(t,
 		sseTruncatedContent("too long", 1000, defaultMaxTokens),
 		sseTruncatedContent("too long", 1000, defaultMaxTokens),
+		sseTruncatedContent("too long", 1000, 2*defaultMaxTokens),
 	)
 	defer mock.Close()
 	a, s := newTestAgent(t)
@@ -211,8 +240,8 @@ func TestCapHitLadderExhausted(t *testing.T) {
 	if !errors.As(err, &ce) {
 		t.Fatalf("exhausted ladder should surface the cap error, got: %v", err)
 	}
-	if got := mock.callCount(); got != 2 {
-		t.Errorf("callCount = %d, want 2 (no retries past the nudge)", got)
+	if got := mock.callCount(); got != 3 {
+		t.Errorf("callCount = %d, want 3 (cap, nudge, doubled cap, then give up)", got)
 	}
 }
 
