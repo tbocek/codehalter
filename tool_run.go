@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -236,7 +241,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 			Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),
 			Status:     "completed",
 		})
-		return fmt.Sprintf("exit %d\n\n%s", exitCode, boundedCapture(out)), false
+		return fmt.Sprintf("exit %d\n\n%s", exitCode, boundedCapture(out)) + sess.toolHints(cmdStr, out), false
 	case <-ctx.Done():
 		// The user hit Stop, or the turn was cancelled. Release kills the
 		// command; report what it managed to print.
@@ -273,4 +278,233 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 		"Do other work meanwhile if there is any; if not, call `respond` saying you are waiting for job %d: that parks the turn, it does not end it, and you continue here the moment the job reports. "+
 		"Never sleep or poll for it. Read its output any time with `run_command: cat %s`; stop it with `run_command: kill %d`. Output so far:\n\n%s",
 		waited, job.id, job.pid, wake, job.id, job.logPath, job.pid, readLogTail(job.logPath, bgLogTailCap)), false
+}
+
+// toolHints is what a finished run_command result gets appended once per
+// session: the edit_file call for a script that did what edit_file does, and
+// the read_file call for a shell range read. A note, never a refusal: the
+// command ran, and the next one may take the better route. Once, because the
+// point is to put one correct example into the conversation, not to repeat
+// it on every read.
+func (s *Session) toolHints(cmd, output string) string {
+	var out string
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	if !s.rt.hintedGrepDef {
+		if path, name := grepDefinitionHit(cmd, output, s.Cwd); name != "" {
+			s.rt.hintedGrepDef = true
+			out += fmt.Sprintf("\n[codehalter: that hit is where `%s` is defined. To read the whole definition, read_file does it in one call, in any language: {\"path\": %q, \"symbol\": %q}%s; several at once as {\"reads\": [{\"path\": ..., \"symbol\": ...}, ...]}.]", name, path, name, symbolPreview(s.Cwd, path, name))
+		}
+	}
+	if !s.rt.hintedScriptEdit {
+		if target, ok := scriptEditTarget(cmd); ok {
+			s.rt.hintedScriptEdit = true
+			out += "\n[codehalter: that script edited " + target + ". " + scriptEditPreview(cmd, target) +
+				" edit_file checks that old_text (or start) matches exactly one place, applies the change, shows the user a diff, and answers `file written successfully` or says exactly why not; a script does none of that. Use edit_file for the next change.]"
+		}
+	}
+	if !s.rt.hintedRangeRead {
+		if h := rangeReadHint(cmd, s.Cwd); h != "" {
+			s.rt.hintedRangeRead = true
+			out += h
+		}
+	}
+	return out
+}
+
+// symbolPreview says what a read_file symbol call would return, from the
+// file as it is now: the line range, its length and its first line, so the
+// note shows the result instead of describing it. Empty when the file cannot
+// be read or the definition not delimited.
+func symbolPreview(cwd, path, name string) string {
+	data, err := os.ReadFile(filepath.Join(cwd, path))
+	if err != nil {
+		return ""
+	}
+	loc := locateSymbol(string(data), name)
+	if loc.start == 0 {
+		return ""
+	}
+	lines := strings.Split(string(data), "\n")
+	first := ""
+	for i := loc.start - 1; i < loc.end && i < len(lines); i++ {
+		if t := strings.TrimSpace(lines[i]); t != "" && !strings.HasPrefix(t, "//") && !strings.HasPrefix(t, "#") && !strings.HasPrefix(t, "@") && !strings.HasPrefix(t, "*") && !strings.HasPrefix(t, "/*") {
+			first = t
+			break
+		}
+	}
+	return fmt.Sprintf(", which returns lines %d-%d (%d lines, the whole block, found by %s), starting `%s`", loc.start, loc.end, loc.end-loc.start+1, loc.how, truncate(first, 100))
+}
+
+// grepHitRe is one line of grep -n output: "path:line:text" when grep names
+// files, "line:text" for a single file (context lines use '-' and are not hits).
+var grepHitRe = regexp.MustCompile(`^(?:([^:\s][^:]*):)?(\d+):(.*)$`)
+
+// identRe is a name as most languages spell one.
+var identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)
+
+// grepDefinitionHit finds, in a grep's output, the first hit whose text
+// declares the name the grep searched for (declKeywordRe, the same detection
+// read_file's symbol mode uses), and returns its file relative to the
+// project and the declared name. A single-file grep's path is its last argument. Empty when the
+// command is not a grep or no hit declares anything.
+func grepDefinitionHit(cmd, output, cwd string) (string, string) {
+	if !regexp.MustCompile(`\b(grep|rg)\b`).MatchString(cmd) {
+		return "", ""
+	}
+	dir := ""
+	if m := cdPrefixRe.FindStringSubmatch(cmd); m != nil {
+		dir = m[1]
+	}
+	single := ""
+	if f := strings.Fields(regexp.MustCompile(`[;|&]`).Split(cmd[strings.LastIndex(cmd, "grep"):], 2)[0]); len(f) > 0 {
+		single = strings.Trim(f[len(f)-1], `'"`)
+	}
+	for _, ln := range strings.Split(output, "\n") {
+		m := grepHitRe.FindStringSubmatch(ln)
+		if m == nil {
+			continue
+		}
+		file, text := m[1], m[3]
+		if file == "" {
+			file = single
+		}
+		if file == "" || strings.HasPrefix(file, "-") {
+			continue
+		}
+		loc := declKeywordRe.FindStringIndex(text + " ")
+		if loc == nil {
+			continue
+		}
+		name := identRe.FindString(text[min(loc[1], len(text)):])
+		// The hit must declare what the model was looking for: `let col =
+		// cut_form_column(…)` declares col, which nobody grepped for.
+		if name == "" || len(name) < 3 || !regexp.MustCompile(`\b`+regexp.QuoteMeta(name)+`\b`).MatchString(cmd) {
+			continue
+		}
+		p := file
+		if dir != "" && !filepath.IsAbs(p) {
+			p = filepath.Join(dir, p)
+		}
+		if filepath.IsAbs(p) {
+			if rel, err := filepath.Rel(cwd, p); err == nil && !strings.HasPrefix(rel, "..") {
+				p = rel
+			}
+		}
+		return filepath.ToSlash(p), name
+	}
+	return "", ""
+}
+
+// pyReplaceRe finds a Python `.replace(A, B)` with two string literals:
+// triple-quoted, double- or single-quoted.
+var pyReplaceRe = regexp.MustCompile(`\.replace\(\s*(` + pyStr + `)\s*,\s*(` + pyStr + `)\s*[,)]`)
+
+const pyStr = `"""(?s:.*?)"""|'''(?s:.*?)'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'`
+
+// pyLiteral decodes a Python string literal well enough for a preview: the
+// quotes go, and in a plain literal the common escapes are resolved.
+func pyLiteral(lit string) string {
+	for _, q := range []string{`"""`, `'''`} {
+		if strings.HasPrefix(lit, q) && strings.HasSuffix(lit, q) && len(lit) >= 6 {
+			return lit[3 : len(lit)-3]
+		}
+	}
+	if len(lit) < 2 {
+		return lit
+	}
+	body := lit[1 : len(lit)-1]
+	return strings.NewReplacer(`\n`, "\n", `\t`, "\t", `\"`, `"`, `\'`, `'`, `\\`, `\`).Replace(body)
+}
+
+// scriptEditPreview spells out the edit_file call a splice script amounts
+// to: for a `.replace(A, B)` the exact old_text/new_text call (several become
+// one edits list), else the block form with the path filled in.
+func scriptEditPreview(cmd, target string) string {
+	ms := pyReplaceRe.FindAllStringSubmatch(cmd, -1)
+	if len(ms) == 0 {
+		return fmt.Sprintf("edit_file does the same as a block: {\"path\": %q, \"start\": \"<fragment of the block's first line>\", \"end\": \"<fragment of its last line>\", \"new_text\": \"<the new block>\"}, or several changes at once as {\"path\": %q, \"edits\": [...]}.", target, target)
+	}
+	quote := func(s string) string {
+		b, _ := json.Marshal(truncate(s, 160))
+		return string(b)
+	}
+	pair := fmt.Sprintf(`"old_text": %s, "new_text": %s`, quote(pyLiteral(ms[0][1])), quote(pyLiteral(ms[0][2])))
+	if len(ms) == 1 {
+		return fmt.Sprintf(`Its replace is exactly this edit_file call: {"path": %q, %s}.`, target, pair)
+	}
+	return fmt.Sprintf(`Its %d replaces are ONE edit_file call with an edits list: {"path": %q, "edits": [{%s}, ...the others likewise]}.`, len(ms), target, pair)
+}
+
+// scriptEditRe spots the script edits edit_file can do: a Python heredoc or
+// -c that reads a file, replaces text in it (str.replace, or slicing between
+// two index/find anchors) and writes it back. Other scripts, which compute,
+// convert or generate, are not edits of that kind and get no note.
+var (
+	scriptEditRe   = regexp.MustCompile(`python3?\s+(-\s*<<|-c\b)`)
+	scriptSpliceRe = regexp.MustCompile(`\.replace\(|\.index\(|\.find\(`)
+	scriptWriteRe  = regexp.MustCompile(`open\([^)]*['"][wa]\+?['"]|\.write_text\(`)
+	scriptPathRe   = regexp.MustCompile(`['"]([\w./-]+\.(rs|go|py|ts|tsx|js|jsx|c|cc|cpp|h|hpp|java|kt|swift|rb|vue|svelte|css|scss|html|toml|yaml|yml|md))['"]`)
+)
+
+// scriptEditTarget reports the source file a shell line rewrites the way
+// edit_file would, if it does: the first quoted path with a source extension.
+func scriptEditTarget(cmd string) (string, bool) {
+	// A Python script that both splices text and writes it back, in either
+	// order in its source.
+	if !scriptEditRe.MatchString(cmd) || !scriptSpliceRe.MatchString(cmd) || !scriptWriteRe.MatchString(cmd) {
+		return "", false
+	}
+	if m := scriptPathRe.FindStringSubmatch(cmd); m != nil {
+		return m[1], true
+	}
+	return "", false
+}
+
+// rangeReadRe matches the shell's line-range reads: `sed -n 'a,bp' file`
+// and `awk 'NR>=a && NR<=b ...' file`.
+var (
+	sedRangeRe = regexp.MustCompile(`sed -n '?(\d+),(\d+)p'? +([^\s;|&]+)`)
+	awkRangeRe = regexp.MustCompile(`awk '[^']*NR *>= *(\d+)[^']*NR *<= *(\d+)[^']*' +([^\s;|&]+)`)
+	cdPrefixRe = regexp.MustCompile(`^\s*cd +([^\s;&]+) *(&&|;)`)
+)
+
+// rangeReadHint: after a shell line that read files by line range, the
+// read_file call that does the same, spelled out (see toolHints for when).
+func rangeReadHint(cmd, cwd string) string {
+	dir := ""
+	if m := cdPrefixRe.FindStringSubmatch(cmd); m != nil {
+		dir = m[1]
+	}
+	var reads []string
+	add := func(from, to, file string) {
+		a, _ := strconv.Atoi(from)
+		b, _ := strconv.Atoi(to)
+		if b < a || len(reads) == maxReadsPerCall {
+			return
+		}
+		p := file
+		if dir != "" && !filepath.IsAbs(p) {
+			p = filepath.Join(dir, p)
+		}
+		if filepath.IsAbs(p) {
+			if rel, err := filepath.Rel(cwd, p); err == nil && !strings.HasPrefix(rel, "..") {
+				p = rel
+			}
+		}
+		reads = append(reads, fmt.Sprintf(`{"path": %q, "line": %d, "limit": %d}`, filepath.ToSlash(p), a, b-a+1))
+	}
+	for _, m := range sedRangeRe.FindAllStringSubmatch(cmd, -1) {
+		add(m[1], m[2], m[3])
+	}
+	for _, m := range awkRangeRe.FindAllStringSubmatch(cmd, -1) {
+		add(m[1], m[2], m[3])
+	}
+	switch len(reads) {
+	case 0:
+		return ""
+	case 1:
+		return "\n[codehalter: read_file does this without the shell: " + reads[0] + "; for a whole function use \"symbol\" instead of line numbers.]"
+	}
+	return "\n[codehalter: read_file does all of these in ONE call without the shell: {\"reads\": [" + strings.Join(reads, ", ") + "]}; for a whole function use \"symbol\" instead of line numbers.]"
 }

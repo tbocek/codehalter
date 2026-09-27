@@ -295,6 +295,32 @@ type sessionRuntime struct {
 	// user asked for the items to be found and rebuilt, so the planner's
 	// list is not put to them again as a question. Runtime-only.
 	specAudit bool
+	// hintedScriptEdit / hintedRangeRead: the one-time run_command notes
+	// (toolHints) were given. Runtime-only.
+	hintedScriptEdit bool
+	hintedRangeRead  bool
+	hintedGrepDef    bool
+	// prevCall is the last tool call, for the batching notes (batchHint);
+	// hintedBatchReads / hintedBatchEdits: those notes were given.
+	prevCall         toolCallBrief
+	hintedBatchReads bool
+	hintedBatchEdits bool
+	// replyStart: the next tool call is the first of a model reply. Calls
+	// later in the same reply were batched already and get no batching note.
+	replyStart bool
+}
+
+// markReplyStart is called by the tool loop before it runs a reply's calls.
+func (s *Session) markReplyStart() {
+	s.rt.mu.Lock()
+	s.rt.replyStart = true
+	s.rt.mu.Unlock()
+}
+
+// toolCallBrief is what batchHint needs of the previous call.
+type toolCallBrief struct {
+	name, args string
+	failed     bool
 }
 
 // startTurn gives the session a fresh turnState: nothing one turn saw (dedup,

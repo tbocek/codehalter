@@ -1254,6 +1254,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			stopWarm = a.keepWarm(sess, caller.conn, func() []llmMessage { return sent })
 		}
 
+		if sess := a.getSession(sid); sess != nil {
+			sess.markReplyStart()
+		}
 		for _, tc := range calls {
 			// Terminal tools are skipped because their payload is already
 			// rendered: submit_plan as the streamed table, respond as the turn's

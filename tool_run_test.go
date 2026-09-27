@@ -293,3 +293,106 @@ func TestRunCommandStallKillsHungJob(t *testing.T) {
 		t.Errorf("a suite writing into its file was not left alone: %q", n.full)
 	}
 }
+
+// TestToolHintsOnce: a script that does what edit_file does gets a note with
+// the edit_file call, once per session, and runs; a script that computes or
+// generates gets none. A range read gets the read_file call, once too.
+func TestToolHintsOnce(t *testing.T) {
+	edit := "cd rust && python3 - <<'PY'\np='tests/zoom_widgets.rs'\ns=open(p).read()\nopen(p,'w').write(s.replace('a','b'))\nPY"
+	if target, ok := scriptEditTarget(edit); !ok || target != "tests/zoom_widgets.rs" {
+		t.Errorf("heredoc edit = %q %v", target, ok)
+	}
+	for _, cmd := range []string{
+		"python3 - <<'PY'\nprint(open('src/a.rs').read().count('fn '))\nPY",
+		"python3 - <<'PY'\nimport json\njson.dump({'a': 1}, open('fixtures/demo.toml','w'))\nPY",
+		"cargo test",
+	} {
+		if target, ok := scriptEditTarget(cmd); ok {
+			t.Errorf("%q counted as an edit of %q", cmd, target)
+		}
+	}
+	h := newTerminalHarness(t)
+	first := h.sess.toolHints(edit+"; sed -n '1,5p' src/a.rs", "")
+	if !strings.Contains(first, "that script edited tests/zoom_widgets.rs") || !strings.Contains(first, "read_file does this without the shell") ||
+		!strings.Contains(first, `Its replace is exactly this edit_file call: {"path": "tests/zoom_widgets.rs", "old_text": "a", "new_text": "b"}`) {
+		t.Errorf("first hints = %q", first)
+	}
+	// Triple-quoted anchors, several replaces: one edits list.
+	multi := "python3 - <<'PY'\np='src/ui/window.rs'\ns=open(p).read()\ns=s.replace(\"\"\"let zoom = 1.0;\"\"\", \"\"\"let zoom = ZOOM;\"\"\")\ns=s.replace('old()', 'new()')\nopen(p,'w').write(s)\nPY"
+	if got := scriptEditPreview(multi, "src/ui/window.rs"); !strings.Contains(got, "Its 2 replaces are ONE edit_file call with an edits list") || !strings.Contains(got, `"old_text": "let zoom = 1.0;"`) {
+		t.Errorf("multi preview = %q", got)
+	}
+	// An index-anchored splice has no literal pair: the block form.
+	splice := "python3 - <<'PY'\np='src/a.rs'\ns=open(p).read()\ni=s.index('fn a(')\nopen(p,'w').write(s[:i])\nPY"
+	if got := scriptEditPreview(splice, "src/a.rs"); !strings.Contains(got, `"start": "<fragment of the block's first line>"`) {
+		t.Errorf("splice preview = %q", got)
+	}
+	if again := h.sess.toolHints(edit+"; sed -n '1,5p' src/a.rs", ""); again != "" {
+		t.Errorf("hints repeated: %q", again)
+	}
+}
+
+// TestRangeReadHint: a shell range read comes back with the read_file call
+// that does the same, paths resolved through a leading cd; one range gives
+// a single read, several a reads list, and other commands get nothing.
+func TestRangeReadHint(t *testing.T) {
+	cwd := "/workspaces/naivepost"
+	one := rangeReadHint("cd /workspaces/naivepost/rust && sed -n '96,104p' tests/settings.rs", cwd)
+	if !strings.Contains(one, `{"path": "rust/tests/settings.rs", "line": 96, "limit": 9}`) || strings.Contains(one, "reads") {
+		t.Errorf("one range = %q", one)
+	}
+	two := rangeReadHint("cd rust && grep -n foo src/a.rs; sed -n '10,20p' src/a.rs; awk 'NR>=5 && NR<=8 {print}' src/b.rs", cwd)
+	if !strings.Contains(two, `{"reads": [{"path": "rust/src/a.rs", "line": 10, "limit": 11}, {"path": "rust/src/b.rs", "line": 5, "limit": 4}]}`) {
+		t.Errorf("two ranges = %q", two)
+	}
+	if got := rangeReadHint("cargo build 2>&1 | grep error", cwd); got != "" {
+		t.Errorf("a build got a hint: %q", got)
+	}
+	h := newTerminalHarness(t)
+	if err := os.WriteFile(filepath.Join(h.sess.Cwd, "f.txt"), []byte("a\nb\nc\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sed -n '1,2p' f.txt"}`)
+	if !strings.Contains(res, "a\nb\n") || !strings.Contains(res, `read_file does this without the shell: {"path": "f.txt", "line": 1, "limit": 2}`) {
+		t.Errorf("run result = %q", res)
+	}
+	if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sed -n '2,3p' f.txt"}`); strings.Contains(res, "codehalter:") {
+		t.Errorf("the hint came twice: %q", res)
+	}
+}
+
+// TestGrepDefinitionHint: a grep hit that is a declaration, in any language,
+// names the read_file symbol call; a plain use of the name does not; the
+// note comes once.
+func TestGrepDefinitionHint(t *testing.T) {
+	cwd := "/workspaces/naivepost"
+	for _, c := range []struct{ cmd, out, path, name string }{
+		{"cd /workspaces/naivepost/rust && grep -rn -C3 'cut_form_column' src", "src/ui/window.rs-1455-// the form\nsrc/ui/window.rs:1457:pub fn cut_form_column(page: &Page) -> gtk::Box {", "rust/src/ui/window.rs", "cut_form_column"},
+		{"grep -n 'def load' tools/prep.py", "12:    def load(self, path):", "tools/prep.py", "load"},
+		{"grep -rn 'Step(' cmd", "cmd/run.go:40:func (r *Runner) Step(n int) error {", "cmd/run.go", "Step"},
+	} {
+		if path, name := grepDefinitionHit(c.cmd, c.out, cwd); path != c.path || name != c.name {
+			t.Errorf("%q -> %q %q, want %q %q", c.cmd, path, name, c.path, c.name)
+		}
+	}
+	if _, name := grepDefinitionHit("grep -rn cut_form_column src", "src/ui/window.rs:900:    let col = cut_form_column(&page);", cwd); name != "" {
+		t.Errorf("a call site was taken for a definition: %q", name)
+	}
+	if _, name := grepDefinitionHit("sed -n '1,3p' a.rs", "1:fn a() {}", cwd); name != "" {
+		t.Error("a non-grep command got a definition hint")
+	}
+	h := newTerminalHarness(t)
+	if err := os.MkdirAll(filepath.Join(h.sess.Cwd, "cmd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.sess.Cwd, "cmd", "run.go"), []byte("package cmd\n\n// Step runs one step.\nfunc (r *Runner) Step(n int) error {\n\treturn nil\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:4:func (r *Runner) Step(n int) error {")
+	if !strings.Contains(first, `{"path": "cmd/run.go", "symbol": "Step"}, which returns lines 3-6 (4 lines, the whole block, found by braces), starting `+"`func (r *Runner) Step(n int) error {`") {
+		t.Errorf("first grep hint = %q", first)
+	}
+	if again := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:40:func (r *Runner) Step(n int) error {"); again != "" {
+		t.Errorf("grep hint repeated: %q", again)
+	}
+}

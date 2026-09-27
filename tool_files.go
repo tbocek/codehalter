@@ -1131,3 +1131,53 @@ func directRead(path string, line, limit *int) (string, error) {
 	}
 	return strings.Join(lines[start:end], ""), nil
 }
+
+// batchHint is the note for a second single call in a row that could have
+// been one: two read_file reads (not already a `reads` list), or two edits
+// to the same file (not already an `edits` list). The example is the two
+// calls themselves, merged. Once each per session; never on a failed call,
+// where the second call is a correction, not a sequel.
+func (s *Session) batchHint(name, args string, failed bool) string {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	prev := s.rt.prevCall
+	s.rt.prevCall = toolCallBrief{name: name, args: args, failed: failed}
+	first := s.rt.replyStart
+	s.rt.replyStart = false
+	// Only a reply's first call is compared with the last call of the reply
+	// before: a second call in the SAME reply means the model batched.
+	if !first || failed || prev.failed || prev.name != name {
+		return ""
+	}
+	cur, before := parseArgs(args), parseArgs(prev.args)
+	keep := func(a toolArgs, keys ...string) string {
+		m := map[string]any{}
+		for _, k := range keys {
+			if v, ok := a[k]; ok && v != "" && v != nil {
+				if str, ok := v.(string); ok {
+					v = truncate(str, 80)
+				}
+				m[k] = v
+			}
+		}
+		b, _ := json.Marshal(m)
+		return string(b)
+	}
+	switch name {
+	case "read_file":
+		if s.rt.hintedBatchReads || cur.has("reads") || before.has("reads") {
+			return ""
+		}
+		s.rt.hintedBatchReads = true
+		return "\n[codehalter: that was your second read_file in a row, and each is a model call. Independent reads go in ONE call, like several commands in one shell line; these two as one: {\"reads\": [" +
+			keep(before, "path", "symbol", "line", "limit") + ", " + keep(cur, "path", "symbol", "line", "limit") + "]}. Up to 8 per call.]"
+	case "edit_file":
+		if s.rt.hintedBatchEdits || cur.has("edits") || before.has("edits") || cur.str("path") != before.str("path") || cur.str("path") == "" {
+			return ""
+		}
+		s.rt.hintedBatchEdits = true
+		return fmt.Sprintf("\n[codehalter: that was your second edit to %s in a row, and each is a model call. Several changes to one file go in ONE edit_file call, applied in order, all or none; these two as one: {\"path\": %q, \"edits\": [%s, %s]}.]",
+			cur.str("path"), cur.str("path"), keep(before, "old_text", "start", "end", "new_text"), keep(cur, "old_text", "start", "end", "new_text"))
+	}
+	return ""
+}
