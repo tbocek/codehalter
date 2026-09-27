@@ -1011,7 +1011,7 @@ func (a *agent) specFromPlan(ctx context.Context, sid string, sess *Session, p *
 
 // specRedoReason is what a round on a reopened item is told, in the place
 // where a failed round's reason goes.
-const specRedoReason = "The user sent this item back with /spec redo. It was implemented and its test passes, but what was built does not do what the spec says: a screen without its widgets, a button without its wire, a flow that cannot be reached from the UI. Rebuild it against the spec text below under the rules above. Keep and extend the existing code and tests where they are right. Where AGENT.md describes the old state as the design, correct it."
+const specRedoReason = "The user sent this item back with /spec redo. It was implemented and its test passes, but what was built does not do what the spec says: a screen without its widgets, a button without its wire, a flow that cannot be reached from the UI. Rebuild it against the spec text below under the rules above. Keep and extend the existing code and tests where they are right. Where AGENT.md describes the old state as the design, correct that line, in a line; do not add notes about what this round built."
 
 // specAuditPrompt renders SPEC-REDO.md: the round that finds which finished
 // items do not deliver, for a bare /spec redo.

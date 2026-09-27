@@ -1022,7 +1022,14 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	// every turn alongside the SKILL files. Stable across the session, so no
 	// mid-session cache churn.
 	if name, content := loadAgentsFile(sess.Cwd); content != "" {
-		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation. They are meant to hold across sessions, so when your work makes one of them wrong (the stack, the layout, how the project is built, run or tested), update %s in the same task: a line left stale here is believed by every session after this one.\n\n%s\n", name, name, content)
+		// A brief, not a log: one project's grew by 734 lines of per-round
+		// widget notes in two days, 81 KB riding in every session's prefix.
+		// Over budget, the header says so, with the number.
+		over := ""
+		if len(content) > agentsFileBudget {
+			over = fmt.Sprintf(" %s is %d KB now, over its %d KB budget: the next time you edit it, make it SHORTER, delete what the code, the tests and git already say.", name, len(content)/1024, agentsFileBudget/1024)
+		}
+		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation. They are meant to hold across sessions, so when your work makes one of them wrong (the stack, the layout, how the project is built, run or tested), fix that line in %s in the same task: a line left stale here is believed by every session after this one. It is a brief for the next agent, not a log of your work: change the line that became wrong, in as few words as it takes; never record what a task did, which widgets or constants it added, or what you measured (the code, the tests and git hold that). If you add a line, remove or shorten another; keep it under about 150 lines.%s\n\n%s\n", name, name, over, content)
 	}
 
 	// A project built from a spec says so in the prefix, so a request that is
@@ -1085,6 +1092,10 @@ func (a *agent) loadPromptFile(sid string, filename string) string {
 // convention plus the common casings. The first that exists and is non-empty
 // wins; subdirectory/nested files are NOT scanned — project root only.
 var agentsFileNames = []string{"AGENTS.md", "AGENT.md", "agents.md", "agent.md"}
+
+// agentsFileBudget is the size past which the project brief is flagged to
+// the model as too long (see the fold in systemPrompt).
+const agentsFileBudget = 12 * 1024
 
 // loadAgentsFile returns the filename and trimmed contents of the first
 // project-root agent-instruction file present (see agentsFileNames), or "", ""

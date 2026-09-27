@@ -227,6 +227,17 @@ func TestSystemPromptIncludesAgentsFile(t *testing.T) {
 	if !strings.Contains(sp, "## Project instructions (AGENTS.md)") || !strings.Contains(sp, "Always use tabs.") {
 		t.Errorf("system prompt should fold in AGENTS.md:\n%s", sp)
 	}
+	if !strings.Contains(sp, "not a log of your work") || strings.Contains(sp, "over its") {
+		t.Errorf("a short brief must carry the brief rule and no size flag:\n%s", sp)
+	}
+	// Over budget, the header says so with the number.
+	long := strings.Repeat("- a line of notes about what some round built\n", 400)
+	if err := os.WriteFile(filepath.Join(s.Cwd, "AGENTS.md"), []byte(long), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if sp, _ = a.systemPrompt(s.ID); !strings.Contains(sp, "KB now, over its 12 KB budget") {
+		t.Error("an oversized brief was not flagged")
+	}
 }
 
 // TestDeriveTitle pins the thread-naming rules: one line, whitespace collapsed,
