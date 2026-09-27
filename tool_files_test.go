@@ -626,3 +626,38 @@ func TestBatchHints(t *testing.T) {
 		t.Errorf("edit hint = %q / %q", got, told)
 	}
 }
+
+// TestReadFileNumbered: `numbered` puts `N|` before every served line, for a
+// line window, a symbol and a reads item; edit_file takes a snippet copied
+// with its numbers and strips them.
+func TestReadFileNumbered(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, "w.rs")
+	if err := os.WriteFile(path, []byte("fn a() {}\n\nfn target() {\n    one();\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run := func(name, args string) (string, bool) {
+		var tc toolCall
+		tc.Function.Name, tc.Function.Arguments = name, args
+		return a.executeTool(context.Background(), s.ID, tc)
+	}
+	if out, _ := run("read_file", fmt.Sprintf(`{"path":%q,"line":3,"limit":2,"numbered":true}`, path)); !strings.Contains(out, "3|fn target() {\n4|    one();\n") {
+		t.Errorf("numbered window:\n%s", out)
+	}
+	if out, _ := run("read_file", fmt.Sprintf(`{"path":%q,"symbol":"target","numbered":true}`, path)); !strings.Contains(out, "5|}") {
+		t.Errorf("numbered symbol:\n%s", out)
+	}
+	if out, _ := run("read_file", fmt.Sprintf(`{"reads":[{"path":%q,"line":1,"limit":1,"numbered":true}]}`, path)); !strings.Contains(out, "1|fn a() {}") {
+		t.Errorf("numbered reads item:\n%s", out)
+	}
+	out, failed := run("edit_file", fmt.Sprintf(`{"path":%q,"old_text":"4|    one();","new_text":"4|    two();"}`, path))
+	if failed || !strings.Contains(out, "line-number prefixes") {
+		t.Fatalf("numbered old_text = %v %s", failed, out)
+	}
+	if got, _ := os.ReadFile(path); !strings.Contains(string(got), "    two();") || strings.Contains(string(got), "4|") {
+		t.Errorf("file after the numbered edit:\n%s", got)
+	}
+	if _, ok := stripLineNumbers("let x = 1;\n2|y"); ok {
+		t.Error("stripped numbers from a snippet where not every line had one")
+	}
+}

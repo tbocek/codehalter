@@ -348,6 +348,9 @@ func TestRangeReadHint(t *testing.T) {
 	if !strings.Contains(two, `{"reads": [{"path": "rust/src/a.rs", "line": 10, "limit": 11}, {"path": "rust/src/b.rs", "line": 5, "limit": 4}]}`) {
 		t.Errorf("two ranges = %q", two)
 	}
+	if got := rangeReadHint(`cd rust && awk 'NR>=130 && NR<=205 {printf "%d|%s\n", NR, $0}' tests/speed.rs`, cwd); !strings.Contains(got, `{"path": "rust/tests/speed.rs", "line": 130, "limit": 76, "numbered": true}`) {
+		t.Errorf("numbered awk read = %q", got)
+	}
 	if got := rangeReadHint("cargo build 2>&1 | grep error", cwd); got != "" {
 		t.Errorf("a build got a hint: %q", got)
 	}

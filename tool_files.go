@@ -263,7 +263,7 @@ func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (stri
 			n = maxReadLines
 		}
 		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Reading: %s (%s)", path, sym), "read", []ToolCallLocation{{Path: path, Line: &loc.start}})
-		out, failed := a.serveRead(ctx, sid, path, loc.start, n, tcId)
+		out, failed := a.serveReadNumbered(ctx, sid, path, loc.start, n, tcId, args.flag("numbered"))
 		head := fmt.Sprintf("[`%s`: lines %d-%d, block end found by %s", sym, loc.start, loc.end, loc.how)
 		if len(loc.others) > 0 {
 			head += fmt.Sprintf("; also declared at lines %s", joinInts(loc.others))
@@ -287,10 +287,30 @@ func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (stri
 		title = fmt.Sprintf("Reading: %s:%d", path, line)
 	}
 	tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
-	return a.serveRead(ctx, sid, path, start, maxLines, tcId)
+	return a.serveReadNumbered(ctx, sid, path, start, maxLines, tcId, args.flag("numbered"))
 }
 
 func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines int, tcId string) (string, bool) {
+	return a.serveReadNumbered(ctx, sid, path, start, maxLines, tcId, false)
+}
+
+// numberLines prefixes each line of a served window with its line number,
+// "N|text", the shape the model builds with `awk '{printf "%d|%s\n", NR, $0}'`.
+func numberLines(content string, start int) string {
+	lines := strings.SplitAfter(content, "\n")
+	var b strings.Builder
+	for i, ln := range lines {
+		if ln == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "%d|%s", start+i, ln)
+	}
+	return b.String()
+}
+
+// serveReadNumbered is serveRead with optional line numbers on the served
+// text; everything else (cursor, dedup, notes) works on the plain bytes.
+func (a *agent) serveReadNumbered(ctx context.Context, sid, path string, start, maxLines int, tcId string, numbered bool) (string, bool) {
 	sess := a.getSession(sid)
 	// Key format is contractual: fsWrite busts entries by `path+"|"` prefix.
 	dedupKey := fmt.Sprintf("%s|%d|%d", path, start, maxLines)
@@ -403,6 +423,9 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	}
 
 	out := content
+	if numbered {
+		out = numberLines(content, start)
+	}
 	if byteNote != "" {
 		out += "\n" + byteNote
 	}
@@ -475,6 +498,7 @@ var fileTools = []Tool{
 			"description": fmt.Sprintf("Read files. THREE WAYS, pick one per call:\n"+
 				"(1) A line window: {\"path\": \"src/cut.rs\", \"line\": 120, \"limit\": 60}.\n"+
 				"(2) One definition by name, the whole function, type, class or test, in any language: {\"path\": \"src/ui/window.rs\", \"symbol\": \"cut_form_column\"}. Use this instead of `grep -n` followed by `sed -n`: one call, the whole block, its line range in the note.\n"+
+				"Add \"numbered\": true to any of them for `N|text` lines with line numbers, as the awk printf NR idiom gives.\n"+
 				"(3) SEVERAL reads at once, the way you put several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"src/fx_zoom.rs\", \"symbol\": \"zoom_at\"}, {\"path\": \"tests/zoom_widgets.rs\", \"line\": 1, \"limit\": 40}]}. Each comes back under its own \"=== read N of M ===\" header. When you know you need two or three things, ask for them in ONE call like this, not one call each.\n"+
 				"Details: up to %d lines per read. The text comes back PLAIN, exactly as in the file, with no line-number prefixes: a snippet can be copied straight into edit_file's old_text. The note under it states which lines were served (\"showing lines 120-165\"), so you know where you are without numbering anything yourself. Prefer this to `cat`, `sed -n` or `awk 'NR>=a && NR<=b'` through run_command for a region you already know: one call, no shell quoting, and edit_file needs the text, never the numbers. Use `grep -n` through run_command only to FIND a region, not to read one. If the file continues past that, the output is marked partial and ends with a pointer to call continue_read for the next chunk (it remembers where you left off, so no line math). When the output ends with an end-of-file marker you have the file through that point, so do not re-read. A repeat read whose exact content is still in this conversation is refused (scroll back to it, or call continue_read for the next part); once it has scrolled out of context it is re-served. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
 			"parameters": map[string]any{
@@ -487,17 +511,19 @@ var fileTools = []Tool{
 							"type":     "object",
 							"required": []string{"path"},
 							"properties": map[string]any{
-								"path":   map[string]any{"type": "string"},
-								"symbol": map[string]any{"type": "string"},
-								"line":   map[string]any{"type": "integer"},
-								"limit":  map[string]any{"type": "integer"},
+								"path":     map[string]any{"type": "string"},
+								"symbol":   map[string]any{"type": "string"},
+								"line":     map[string]any{"type": "integer"},
+								"limit":    map[string]any{"type": "integer"},
+								"numbered": map[string]any{"type": "boolean"},
 							},
 						},
 					},
-					"path":   map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
-					"line":   map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
-					"limit":  map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk, then use continue_read for more.", maxReadLines, readChunkLines)},
-					"symbol": map[string]any{"type": "string", "description": "Read one definition instead of a line range: a function, method, type, class, trait or impl by name (`cut_form_column`, or `fn cut_form_column`). Any language: the block ends where its braces close, or where the indentation returns (Python), or after 50 lines when neither can be found (broken code). Comments and attributes directly above it come along. Replaces grep -n followed by a sed range: one call, the whole definition, its line range in the note."},
+					"path":     map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
+					"line":     map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
+					"limit":    map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk, then use continue_read for more.", maxReadLines, readChunkLines)},
+					"numbered": map[string]any{"type": "boolean", "description": "true: every line comes back as `N|text` with its line number, like `awk '{printf \"%d|%s\\n\", NR, $0}'`. Works with line windows, symbol and each item of reads. For edit_file's old_text copy the text without the `N|` (edit_file strips it if you do not)."},
+					"symbol":   map[string]any{"type": "string", "description": "Read one definition instead of a line range: a function, method, type, class, trait or impl by name (`cut_form_column`, or `fn cut_form_column`). Any language: the block ends where its braces close, or where the indentation returns (Python), or after 50 lines when neither can be found (broken code). Comments and attributes directly above it come along. Replaces grep -n followed by a sed range: one call, the whole definition, its line range in the note."},
 				},
 			},
 		},
@@ -963,6 +989,18 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 	case n > 1:
 		return "", "", fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n), false
 	}
+	// A snippet copied from a numbered read still carries its `N|` prefixes:
+	// strip them from every line (and from new_text if it has them too) and
+	// try once more.
+	if stripped, ok := stripLineNumbers(oldText); ok {
+		nt := newText
+		if s2, ok := stripLineNumbers(newText); ok {
+			nt = s2
+		}
+		if next, note, msg, _ := applyEdit(path, content, stripped, "", "", nt); msg == "" {
+			return next, note + " (old_text matched after removing its line-number prefixes)", "", false
+		}
+	}
 	// Quote the region old_text was probably aiming at, when there is one:
 	// the model retries against text it can see instead of spending a read.
 	if line, snippet, found := nearMiss(content, oldText); found {
@@ -971,6 +1009,33 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 			path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap)), true
 	}
 	return "", "", "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file.", true
+}
+
+// lineNumberPrefixRe is the `N|` a numbered read puts before each line.
+var lineNumberPrefixRe = regexp.MustCompile(`^\s*\d+\|`)
+
+// stripLineNumbers removes `N|` from every line of s when every non-empty
+// line has one; ok is false otherwise, so real code starting with a number
+// and a pipe is never touched.
+func stripLineNumbers(s string) (string, bool) {
+	lines := strings.Split(s, "\n")
+	found := false
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		if !lineNumberPrefixRe.MatchString(ln) {
+			return s, false
+		}
+		found = true
+	}
+	if !found {
+		return s, false
+	}
+	for i, ln := range lines {
+		lines[i] = lineNumberPrefixRe.ReplaceAllString(ln, "")
+	}
+	return strings.Join(lines, "\n"), true
 }
 
 // replaceBlock replaces whole lines from the unique line containing start

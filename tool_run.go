@@ -479,7 +479,7 @@ func rangeReadHint(cmd, cwd string) string {
 		dir = m[1]
 	}
 	var reads []string
-	add := func(from, to, file string) {
+	add := func(from, to, file string, numbered bool) {
 		a, _ := strconv.Atoi(from)
 		b, _ := strconv.Atoi(to)
 		if b < a || len(reads) == maxReadsPerCall {
@@ -494,13 +494,18 @@ func rangeReadHint(cmd, cwd string) string {
 				p = rel
 			}
 		}
-		reads = append(reads, fmt.Sprintf(`{"path": %q, "line": %d, "limit": %d}`, filepath.ToSlash(p), a, b-a+1))
+		num := ""
+		if numbered {
+			num = `, "numbered": true`
+		}
+		reads = append(reads, fmt.Sprintf(`{"path": %q, "line": %d, "limit": %d%s}`, filepath.ToSlash(p), a, b-a+1, num))
 	}
 	for _, m := range sedRangeRe.FindAllStringSubmatch(cmd, -1) {
-		add(m[1], m[2], m[3])
+		add(m[1], m[2], m[3], false)
 	}
+	// An awk range that prints NR is a numbered read.
 	for _, m := range awkRangeRe.FindAllStringSubmatch(cmd, -1) {
-		add(m[1], m[2], m[3])
+		add(m[1], m[2], m[3], strings.Contains(m[0], "printf") && strings.Count(m[0], "NR") > 2)
 	}
 	switch len(reads) {
 	case 0:
