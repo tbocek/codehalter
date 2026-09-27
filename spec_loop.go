@@ -379,7 +379,13 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		r.say(ctx, fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
 		return end, nil
 	}
-	fromModel := false
+	// Items a planner named (specFromPlan) and the user agreed to: the loop
+	// reopens them first and then runs as on any /spec.
+	if cmd == "resume" {
+		if h := sess.takeSpecHandoff(); strings.HasPrefix(h, "redo ") {
+			cmd = h
+		}
+	}
 	if cmd == "redo" {
 		// No targets: the model audits the program against the spec and
 		// names the items that fall short (SPEC-REDO.md); its submit_plan
@@ -401,22 +407,16 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		}
 		handoff := sess.takeSpecHandoff()
 		if !strings.HasPrefix(handoff, "redo ") {
-			r.say(ctx, "Nothing was reopened. `/spec redo <item id or spec file>` names items directly.\n")
+			r.say(ctx, "Nothing was reopened: the audit found every finished item delivering.\n")
 			return end, nil
 		}
 		cmd = handoff
-		fromModel = true
 	}
 	if strings.HasPrefix(cmd, "redo ") {
+		// The ids come from the model: one it misremembered must not throw
+		// away the forty it got right.
 		ids, unknown := specRedoTargets(cfg, r.idx, strings.Fields(strings.TrimPrefix(cmd, "redo ")))
-		switch {
-		case len(unknown) > 0 && !fromModel:
-			// Typed by the user: a typo must not reopen half a list.
-			r.say(ctx, fmt.Sprintf("⚠ /spec redo: not in `%s/`: %s. Name an item id exactly as the spec writes it, or a spec file (`03-shell.md`). Nothing was reopened.\n", cfg.SpecDir, strings.Join(unknown, ", ")))
-			return end, nil
-		case len(unknown) > 0:
-			// Named by the model: one id it misremembered must not throw away
-			// the forty it got right.
+		if len(unknown) > 0 {
 			r.say(ctx, fmt.Sprintf("⚠ not in `%s/`, skipped: %s\n", cfg.SpecDir, strings.Join(unknown, ", ")))
 		}
 		if len(ids) == 0 {
@@ -546,16 +546,10 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 // config, or on a project's first /spec the setup dialog.
 func (a *agent) specResolve(ctx context.Context, sid string, sess *Session, args string) (cfg *specConfig, cmd string, ok bool) {
 	say := func(s string) { a.say(ctx, sid, s) }
-	cmd, targets, err := parseSpecArgs(args)
+	cmd, err := parseSpecArgs(args)
 	if err != nil {
 		say(err.Error() + "\n")
 		return nil, "", false
-	}
-	if cmd == "redo" {
-		// Carried to runSpec in the command itself; the targets are
-		// resolved there, against the scanned spec. Bare "redo" stays bare:
-		// the model finds what to redo.
-		cmd = strings.TrimSpace("redo " + strings.Join(targets, " "))
 	}
 	if cfg, err = loadSpecConfig(sess.Cwd); err != nil {
 		say("⚠ " + err.Error() + "\n")
@@ -967,7 +961,7 @@ func (a *agent) specFromPlan(ctx context.Context, sid string, sess *Session, p *
 		}
 		if !ok {
 			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Nothing reopened")})
-			a.say(ctx, sid, "Nothing reopened. `/spec redo "+ids+"` does it later.\n")
+			a.say(ctx, sid, "Nothing reopened. `/spec redo` finds and rebuilds them later.\n")
 			return toolLoopResult{Text: "not now"}, nil
 		}
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Handing over to /spec")})

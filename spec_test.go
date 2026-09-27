@@ -209,20 +209,17 @@ func TestGithubSlug(t *testing.T) {
 }
 
 func TestParseSpecArgs(t *testing.T) {
-	for args, want := range map[string]string{"": "resume", "  ": "resume", "status": "status", " stop ": "stop"} {
-		if cmd, _, err := parseSpecArgs(args); err != nil || cmd != want {
+	for args, want := range map[string]string{"": "resume", "  ": "resume", "status": "status", " stop ": "stop", "redo": "redo"} {
+		if cmd, err := parseSpecArgs(args); err != nil || cmd != want {
 			t.Errorf("parseSpecArgs(%q) = %q, %v; want %q", args, cmd, err, want)
 		}
 	}
-	if cmd, targets, err := parseSpecArgs(" redo 03-shell.md F2.3 "); err != nil || cmd != "redo" || strings.Join(targets, ",") != "03-shell.md,F2.3" {
-		t.Errorf("redo = %q %v %v", cmd, targets, err)
-	}
-	if cmd, targets, err := parseSpecArgs("redo"); err != nil || cmd != "redo" || len(targets) != 0 {
-		t.Errorf("bare redo = %q %v %v, want the audit form", cmd, targets, err)
-	}
-	// The positional form is gone: the first run asks, it does not parse paths.
-	if _, _, err := parseSpecArgs("spec/ rust/ use gtk4-rs"); err == nil {
-		t.Error("a positional spec-dir/out-dir form parsed")
+	// Nobody types item ids: /spec redo finds them. And the positional
+	// spec-dir/out-dir form is gone: the first run asks.
+	for _, args := range []string{"redo F2.3", "redo 03-shell.md", "spec/ rust/ use gtk4-rs"} {
+		if _, err := parseSpecArgs(args); err == nil {
+			t.Errorf("%q parsed", args)
+		}
 	}
 }
 

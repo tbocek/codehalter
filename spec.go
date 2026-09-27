@@ -255,25 +255,24 @@ func (c *specConfig) unblock(id string) {
 // loop (the first run asks its three questions), "status" reports, "stop" ends
 // a running loop at its next round boundary. There is no positional form: the
 // questions read their options off the project, which a typed path cannot.
-func parseSpecArgs(args string) (cmd string, targets []string, err error) {
-	fields := strings.Fields(args)
-	switch {
-	case len(fields) == 0:
-		return "resume", nil, nil
-	case len(fields) == 1 && fields[0] == "status":
-		return "status", nil, nil
-	case len(fields) == 1 && fields[0] == "stop":
-		return "stop", nil, nil
-	case fields[0] == "redo":
-		return "redo", fields[1:], nil
+func parseSpecArgs(args string) (cmd string, err error) {
+	switch strings.TrimSpace(args) {
+	case "":
+		return "resume", nil
+	case "status":
+		return "status", nil
+	case "stop":
+		return "stop", nil
+	case "redo":
+		return "redo", nil
 	}
-	return "", nil, fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop, /spec redo [item id or spec file...]")
+	return "", fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop, /spec redo")
 }
 
-// specRedoTargets resolves what the user named to item ids: an item id as is,
-// or a spec file (with or without the spec dir and the .md) meaning every
-// item it defines. Anything it cannot place comes back in unknown, and then
-// nothing should be reopened: a typo must not reopen half a list.
+// specRedoTargets resolves the ids the planner named to item ids: an item id
+// as is, a paraphrased section id by its number, or a spec file (with or
+// without the spec dir and the .md) meaning every item it defines. Anything
+// it cannot place comes back in unknown and is skipped by the caller.
 func specRedoTargets(cfg *specConfig, idx *specIndex, targets []string) (ids, unknown []string) {
 	seen := map[string]bool{}
 	add := func(id string) {

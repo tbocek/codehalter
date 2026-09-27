@@ -660,10 +660,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// been typed.
 	if sess := a.getSession(req.SessionId); sess != nil {
 		if cmd := sess.takeSpecHandoff(); cmd != "" {
-			if cmd == "resume" {
-				cmd = ""
+			// "resume", or "redo <ids>": the ids go back on the session for
+			// the loop to reopen; the command the loop sees is a plain /spec.
+			if strings.HasPrefix(cmd, "redo ") {
+				sess.setSpecHandoff(cmd)
 			}
-			return a.runSpec(ctx, req.SessionId, sess, cmd, nil)
+			return a.runSpec(ctx, req.SessionId, sess, "", nil)
 		}
 	}
 
