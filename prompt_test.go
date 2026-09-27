@@ -8,8 +8,6 @@ import (
 	"testing"
 )
 
-// TestParseLineRange covers the line-range encodings Zed may put in a
-// resource_link fragment.
 func TestParseLineRange(t *testing.T) {
 	cases := []struct {
 		frag             string
@@ -29,8 +27,6 @@ func TestParseLineRange(t *testing.T) {
 	}
 }
 
-// TestReadLinkedResource verifies a resource_link is inlined with its line
-// range, full-file when no range, and refused outside the workspace.
 func TestReadLinkedResource(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.go")
@@ -38,24 +34,19 @@ func TestReadLinkedResource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Line range 2-4 → "b\nc\nd".
 	if snip, label, ok := readLinkedResource(dir, "file://"+path+"#L2-4"); !ok || snip != "b\nc\nd" || label != "f.go:2-4" {
 		t.Errorf("range read = %q,%q,%v", snip, label, ok)
 	}
-	// No range → whole file, label is basename.
 	if snip, label, ok := readLinkedResource(dir, "file://"+path); !ok || snip != "a\nb\nc\nd\ne\n" || label != "f.go" {
 		t.Errorf("full read = %q,%q,%v", snip, label, ok)
 	}
-	// Outside cwd → refused.
 	if _, _, ok := readLinkedResource(dir, "file:///etc/passwd"); ok {
 		t.Errorf("expected refusal for path outside workspace")
 	}
-	// Missing file → refused.
 	if _, _, ok := readLinkedResource(dir, "file://"+filepath.Join(dir, "nope.go")); ok {
 		t.Errorf("expected refusal for missing file")
 	}
-	// A symlink inside the project pointing out of it passes a prefix test;
-	// the file tools refuse it, and an attachment must too.
+	// A symlink pointing out of the project passes a prefix test and must be refused.
 	outside := filepath.Join(t.TempDir(), "secret.txt")
 	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
 		t.Fatal(err)
@@ -69,10 +60,6 @@ func TestReadLinkedResource(t *testing.T) {
 	}
 }
 
-// TestParseResourceURI pins the URI → path mapping for attached resources:
-// file:// URIs collapse to their percent-decoded path with the fragment split
-// off (editors put a line range there), anything else passes through as its own
-// path so it can still be named.
 func TestParseResourceURI(t *testing.T) {
 	cases := map[string][2]string{
 		"file:///workspaces/codehalter/llm.go":          {"/workspaces/codehalter/llm.go", ""},
@@ -89,10 +76,7 @@ func TestParseResourceURI(t *testing.T) {
 	}
 }
 
-// TestPromptContent pins what the model is handed for a prompt with
-// attachments: an embedded selection is inlined under a header naming the file
-// and its line range, a linked file outside the project is named rather than
-// read, and an image becomes a content-addressed reference, not bytes.
+// Pins that an outside linked file is named, not read, and an image becomes a reference, not bytes.
 func TestPromptContent(t *testing.T) {
 	dir := t.TempDir()
 	text, images := promptContent(dir, []ContentBlock{
@@ -117,7 +101,6 @@ func TestPromptContent(t *testing.T) {
 	if len(images) != 1 || !strings.HasPrefix(images[0].ID, "img_") || images[0].MimeType != "image/png" {
 		t.Errorf("images = %+v, want one content-addressed png", images)
 	}
-	// Same bytes, same id: a re-pasted screenshot does not grow the store.
 	_, again := promptContent(dir, []ContentBlock{{Type: "image", MimeType: "image/png", Data: "aGVsbG8="}})
 	if len(again) != 1 || again[0].ID != images[0].ID {
 		t.Errorf("re-pasting the same image gave %+v, want id %s", again, images[0].ID)
@@ -146,16 +129,12 @@ func TestHumanFormatters(t *testing.T) {
 			t.Errorf("humanDuration(%d)=%q want %q", c.ms, got, c.want)
 		}
 	}
-	// 200 tokens in 500ms = 400/s
 	if got := humanRate(200, 500); got != "400" {
 		t.Errorf("humanRate(200,500)=%q want 400", got)
 	}
 }
 
-// TestSystemPromptCarriesPhaseGuidance pins that PLAN.md/EXECUTE.md live in the
-// system prompt (the stable, cached prefix) instead of being re-injected as a
-// per-turn user message — the fix for the primer bloat that stacked 7-8 KB
-// copies in the history each (re)plan and forced repeated compactions.
+// Phase guidance must live in the cached prefix, not be re-sent per turn.
 func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
 	a, s := newTestAgent(t)
 	dir := filepath.Join(s.Cwd, ".codehalter")
@@ -181,8 +160,7 @@ func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
 	}
 }
 
-// TestLoadAgentsFile pins the AGENTS.md scan: project-root only, priority order
-// (AGENTS.md first), trimmed, whitespace-only skipped.
+// Pins project-root only, AGENTS.md first, trimmed, whitespace-only skipped.
 func TestLoadAgentsFile(t *testing.T) {
 	dir := t.TempDir()
 	if name, content := loadAgentsFile(dir); name != "" || content != "" {
@@ -196,7 +174,6 @@ func TestLoadAgentsFile(t *testing.T) {
 		t.Errorf("agent.md should be found+trimmed, got %q / %q", name, content)
 	}
 
-	// AGENTS.md outranks the lowercase variant.
 	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("canonical conventions"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -213,8 +190,6 @@ func TestLoadAgentsFile(t *testing.T) {
 	}
 }
 
-// TestSystemPromptIncludesAgentsFile verifies the root AGENTS.md is folded into
-// the system prompt (the cached prefix) at build time.
 func TestSystemPromptIncludesAgentsFile(t *testing.T) {
 	a, s := newTestAgent(t)
 	if err := os.WriteFile(filepath.Join(s.Cwd, "AGENTS.md"), []byte("Always use tabs."), 0o644); err != nil {
@@ -230,7 +205,6 @@ func TestSystemPromptIncludesAgentsFile(t *testing.T) {
 	if !strings.Contains(sp, "not a log of your work") || strings.Contains(sp, "over its") {
 		t.Errorf("a short brief must carry the brief rule and no size flag:\n%s", sp)
 	}
-	// Over budget, the header says so with the number.
 	long := strings.Repeat("- a line of notes about what some round built\n", 400)
 	if err := os.WriteFile(filepath.Join(s.Cwd, "AGENTS.md"), []byte(long), 0o644); err != nil {
 		t.Fatal(err)
@@ -240,10 +214,6 @@ func TestSystemPromptIncludesAgentsFile(t *testing.T) {
 	}
 }
 
-// TestDeriveTitle pins the thread-naming rules: one line, whitespace collapsed,
-// cut on a word boundary. The title goes to the client as session_info_update
-// and is all the user sees in their thread list, so a mid-word cut or a title
-// containing half a pasted stack trace is the visible failure.
 func TestDeriveTitle(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -275,10 +245,6 @@ func TestDeriveTitle(t *testing.T) {
 	}
 }
 
-// TestSetSessionTitleAnnouncesOnce pins that the thread name reaches the client
-// as a session_info_update and is not re-sent when it hasn't changed — a
-// notification per turn would make the client re-render the thread list for
-// nothing.
 func TestSetSessionTitleAnnouncesOnce(t *testing.T) {
 	h := newTerminalHarness(t)
 
@@ -301,10 +267,6 @@ func TestSetSessionTitleAnnouncesOnce(t *testing.T) {
 	}
 }
 
-// TestSpecStopIsAnInstructionNotSteer: "/spec stop" typed while a /spec loop
-// holds the turn sets the loop's stop flag and is NOT queued as text for the
-// model; with no loop running it only says so. Anything else typed during a
-// turn still steers it.
 func TestSpecStopIsAnInstructionNotSteer(t *testing.T) {
 	a, s := newTestAgent(t)
 	ctx, release, ok := a.holdTurn(context.Background(), s, true)
@@ -324,7 +286,7 @@ func TestSpecStopIsAnInstructionNotSteer(t *testing.T) {
 	if s.takeSpecStop() {
 		t.Error("a stop was requested with no loop running")
 	}
-	if q := s.takeSteer(); len(q) != 0 {
+	if q := s.takePending(); len(q) != 0 {
 		t.Errorf("/spec stop was queued as steer text: %v", q)
 	}
 
@@ -334,11 +296,11 @@ func TestSpecStopIsAnInstructionNotSteer(t *testing.T) {
 	if !s.takeSpecStop() {
 		t.Error("the running loop did not get the stop request")
 	}
-	if q := s.takeSteer(); len(q) != 0 {
+	if q := s.takePending(); len(q) != 0 {
 		t.Errorf("/spec stop was queued as steer text: %v", q)
 	}
 	prompt("also update the README")
-	if q := s.takeSteer(); len(q) != 1 {
+	if q := s.takePending(); len(q) != 1 {
 		t.Errorf("an ordinary message during the loop must still steer: %v", q)
 	}
 }

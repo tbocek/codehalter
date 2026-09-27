@@ -10,7 +10,6 @@
                     # caches on its own and bills per request. Default 3m, stops 30min
                     # after the last real call.
 # update_check = false # never ask GitHub whether a newer release exists (default on, at most once a day)
-# format_config = false # stop offering to pin a formatter config for a project that deliberately has none (default on, asked once per session)
 
 [[llm]]
 server = "http://localhost:8080"  # host root only, no path

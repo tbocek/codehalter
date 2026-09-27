@@ -20,39 +20,16 @@ import (
 	"strings"
 )
 
-// ---------------------------------------------------------------------------
-// Starting the devcontainer for the standalone CLI.
-//
-// codehalter refuses to run outside a container. Zed reopens the project in
-// one; at a shell prompt nobody does, so --cli does it itself: it translates
-// .devcontainer/devcontainer.json into a generated compose file and runs
-//
-//	<runtime> compose up -d      then     <runtime> compose exec ... codehalter --cli
-//
-// Compose rather than `docker run`, because it already recreates the container
-// when its definition changes and gives the whole thing one name. "I edited the
-// Dockerfile and nothing happened" would otherwise be a frequent bug here.
-//
-// This is deliberately NOT a devcontainer implementation. Keys a compose file
-// cannot express (features, every lifecycle command) are refused BY NAME, with
-// the devcontainer CLI command to run instead: a container silently missing
-// half its setup is worse than a message saying so. Known differences from
-// `devcontainer up` (updateRemoteUserUID, userEnvProbe, ${devcontainerId},
-// shutdownAction defaulting to leave-running) are listed in the README.
-// ---------------------------------------------------------------------------
+// The launcher translates devcontainer.json into a compose file: compose recreates the container
+// when its definition changes, `docker run` would not. It is not a devcontainer implementation:
+// keys compose cannot express are refused by name rather than silently dropped.
 
-// launcherService is the service name in a generated compose file. Fixed,
-// because a generated project has exactly one service.
 const launcherService = "dev"
 
-// keepAlive is the entrypoint a generated service runs when overrideCommand is
-// on (the spec's default). The image's own CMD would exit immediately and take
-// the container with it. `sleep & wait` rather than a bare sleep so a TERM
-// during the sleep is acted on at once instead of ten seconds later, and sh
-// rather than `sleep infinity` because busybox sleep (Alpine) wants a number.
+// keepAlive replaces the image CMD, which would exit at once. `sleep & wait` acts on TERM
+// immediately, and busybox sleep (Alpine) has no `infinity`.
 var keepAlive = []string{"/bin/sh", "-c", `trap 'exit 0' TERM; while sleep 3600 & wait $!; do :; done`}
 
-// dcImplemented lists the devcontainer.json keys the launcher translates.
 var dcImplemented = map[string]bool{
 	"image": true, "build": true, "dockerFile": true, "context": true,
 	"runArgs": true, "containerEnv": true, "remoteEnv": true,
@@ -63,23 +40,18 @@ var dcImplemented = map[string]bool{
 	"dockerComposeFile": true, "service": true, "runServices": true,
 }
 
-// dcCosmetic lists keys that describe the editor's view of the container rather
-// than the container itself, so ignoring them changes nothing that runs.
 var dcCosmetic = map[string]bool{
 	"name": true, "customizations": true, "portsAttributes": true,
 	"otherPortsAttributes": true, "hostRequirements": true, "waitFor": true,
 }
 
-// dcNoted lists keys that DO change the container but that the launcher does
-// not implement. Each prints one line saying how the result will differ, rather
-// than refusing the file: both are spec defaults, so a config that names them
-// is usually just writing down what it was getting anyway.
+// dcNoted keys are warned about, not refused: both are spec defaults, so naming them rarely
+// changes anything.
 var dcNoted = map[string]string{
 	"updateRemoteUserUID": "the container user keeps the uid baked into the image, so files written in the workspace may not end up owned by you",
 	"userEnvProbe":        "commands run with the image's environment, not one probed from a login shell",
 }
 
-// devcontainerConfig is the subset of devcontainer.json the launcher models.
 // Every string in here has already been through variable substitution.
 type devcontainerConfig struct {
 	Image string `json:"image"`
@@ -89,8 +61,7 @@ type devcontainerConfig struct {
 		Target     string            `json:"target"`
 		Args       map[string]string `json:"args"`
 	} `json:"build"`
-	// Pre-spec spelling, still found in older configs and still accepted by
-	// the devcontainer CLI.
+	// Pre-spec spelling, still accepted by the devcontainer CLI.
 	DockerFile string `json:"dockerFile"`
 	Context    string `json:"context"`
 
@@ -110,20 +81,17 @@ type devcontainerConfig struct {
 	SecurityOpt     []string          `json:"securityOpt"`
 	ShutdownAction  string            `json:"shutdownAction"`
 
-	// Compose flavour: the user's own compose files are used as they are, so
-	// none of the fields above apply.
+	// Compose flavour: the user's compose files are used as they are, so none of the above apply.
 	ComposeFiles []string `json:"-"`
 	Service      string   `json:"service"`
 	RunServices  []string `json:"runServices"`
 
-	path      string   // the devcontainer.json we read
-	dir       string   // directory holding it, the base for relative paths
-	workspace string   // absolute host workspace folder
-	notes     []string // dcNoted lines to show once at startup
+	path      string
+	dir       string // base for relative paths
+	workspace string // absolute, on the host
+	notes     []string
 }
 
-// unsupportedConfig is the refusal: the named keys are real devcontainer
-// features that a generated compose file cannot express.
 type unsupportedConfig struct {
 	path string
 	keys []string
@@ -134,13 +102,10 @@ func (e *unsupportedConfig) Error() string {
 		e.path, strings.Join(e.keys, ", "))
 }
 
-// stripJSONC removes what devcontainer.json is allowed to contain and
-// encoding/json is not: // and /* */ comments, and a comma before a closing
-// brace or bracket. Two passes, because a trailing comma is only visible as one
-// once the comment that followed it is gone. Both passes track string literals,
-// which is the whole difficulty: a // inside a URL is not a comment.
+// stripJSONC removes comments and trailing commas. Two passes, because a trailing comma only
+// shows once the comment after it is gone; both track strings so a // inside a URL survives.
 func stripJSONC(src []byte) []byte {
-	src = bytes.TrimPrefix(src, []byte("\xef\xbb\xbf")) // a BOM, which some editors still write
+	src = bytes.TrimPrefix(src, []byte("\xef\xbb\xbf")) // UTF-8 BOM
 	out := make([]byte, 0, len(src))
 	inStr, esc := false, false
 	for i := 0; i < len(src); i++ {
@@ -211,11 +176,8 @@ func stripJSONC(src []byte) []byte {
 	return final
 }
 
-// expandVars replaces ${...} in the raw JSON text, before it is parsed, so one
-// pass covers every value in the document. Replacements are JSON-escaped
-// because they land inside string literals. An unknown variable is an error:
-// leaving it in place would produce a path or an image tag with a literal
-// ${...} in it, which fails later and further from the cause.
+// expandVars substitutes ${...} in raw JSON text, JSON-escaping values since they land inside
+// strings. Unknown variables are errors so they fail here, not later as a literal ${...}.
 func expandVars(src []byte, vars map[string]string) ([]byte, error) {
 	var out []byte
 	for i := 0; i < len(src); i++ {
@@ -232,10 +194,8 @@ func expandVars(src []byte, vars map[string]string) ([]byte, error) {
 		switch {
 		case ok:
 		case strings.HasPrefix(name, "containerEnv:"):
-			// The only variable whose value lives inside a container that does
-			// not exist yet. Left standing for resolveContainerEnv to fill in
-			// once `up` has run, which is why it is legal in remoteEnv and
-			// nowhere else.
+			// Its value lives in a container that does not exist yet: left for
+			// resolveContainerEnv, hence legal only in remoteEnv.
 			out = append(out, src[i:i+end+1]...)
 			i += end
 			continue
@@ -258,10 +218,6 @@ func expandVars(src []byte, vars map[string]string) ([]byte, error) {
 	return out, nil
 }
 
-// devcontainerPath finds the project's configuration file. The spec allows
-// three locations, and the third one, a folder per configuration under
-// .devcontainer/, can hold several: there is no way to say which of those is
-// meant, so that is named rather than guessed at.
 func devcontainerPath(workspace string) (string, error) {
 	for _, p := range []string{
 		filepath.Join(workspace, ".devcontainer", "devcontainer.json"),
@@ -290,10 +246,7 @@ func devcontainerPath(workspace string) (string, error) {
 		filepath.Join(workspace, ".devcontainer"), strings.Join(names, ", "))
 }
 
-// blank reports whether a key carries no instruction: an empty object, array or
-// string, or null. Templates leave "features": {} behind when the last feature
-// is deleted, and refusing a config over a key that asks for nothing would be
-// refusing it over punctuation.
+// blank keys ask for nothing (templates leave "features": {} behind), so they are never refused.
 func blank(raw json.RawMessage) bool {
 	switch strings.TrimSpace(string(raw)) {
 	case "{}", "[]", `""`, "null", "":
@@ -302,10 +255,7 @@ func blank(raw json.RawMessage) bool {
 	return false
 }
 
-// loadDevcontainerConfig reads and validates the project's devcontainer.json.
-// It returns os.ErrNotExist when the project has none, which is not a failure:
-// the CLI then runs on the host and the agent's own bootstrap offers to
-// scaffold one.
+// loadDevcontainerConfig returns os.ErrNotExist when the project has no devcontainer.json.
 func loadDevcontainerConfig(workspace string) (*devcontainerConfig, error) {
 	path, err := devcontainerPath(workspace)
 	if err != nil {
@@ -338,9 +288,7 @@ func loadDevcontainerConfig(workspace string) (*devcontainerConfig, error) {
 	}
 	sort.Strings(cfg.notes)
 
-	// containerWorkspaceFolder has to be resolved first: other values are
-	// written in terms of it (the .git mount codehalter scaffolds is), and it
-	// may itself be written in terms of the local ones.
+	// containerWorkspaceFolder is resolved first: other values use it, and it may use the local ones.
 	base := filepath.Base(workspace)
 	vars := map[string]string{
 		"localWorkspaceFolder":         workspace,
@@ -361,12 +309,8 @@ func loadDevcontainerConfig(workspace string) (*devcontainerConfig, error) {
 	vars["containerWorkspaceFolder"] = container
 	vars["containerWorkspaceFolderBasename"] = filepath.Base(container)
 
-	// Only the keys the launcher reads are expanded and parsed. customizations
-	// is the reason: it carries the editor's own settings, which have their own
-	// ${...} vocabulary (${workspaceFolder}, ${env:HOME}, ${config:...}), and
-	// failing on one of those would refuse a config over a value that nothing
-	// here ever looks at. remoteEnv is held back separately because it is the
-	// one place ${containerEnv:...} can be answered.
+	// Expand only keys the launcher reads: customizations carries editor settings with their own
+	// ${...} vocabulary. remoteEnv is held back as the one place ${containerEnv:...} resolves.
 	mine := map[string]json.RawMessage{}
 	for k, v := range keys {
 		if dcImplemented[k] {
@@ -390,6 +334,9 @@ func loadDevcontainerConfig(workspace string) (*devcontainerConfig, error) {
 	}
 	if err := json.Unmarshal(expanded, cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if cfg.Build.Dockerfile == "" && cfg.DockerFile != "" {
+		cfg.Build.Dockerfile, cfg.Build.Context = cfg.DockerFile, cfg.Context
 	}
 	if remote != nil {
 		expanded, err := expandVars(remote, vars)
@@ -416,23 +363,19 @@ func loadDevcontainerConfig(workspace string) (*devcontainerConfig, error) {
 		if cfg.Service == "" {
 			return nil, fmt.Errorf("%s: dockerComposeFile without service", path)
 		}
-		// The launcher writes no mount in this flavour, so the only thing that
-		// knows where the project ends up inside the container is the config.
-		// Guessing /workspaces/<name> would start the agent in an empty
-		// directory that docker helpfully creates for it.
+		// No mount is generated in this flavour, so guessing /workspaces/<name> would start
+		// the agent in an empty directory docker creates.
 		if !stated {
 			return nil, fmt.Errorf("%s: dockerComposeFile needs workspaceFolder as well, to say where "+
 				"%s mounts the project inside the container", path, filepath.Base(cfg.ComposeFiles[0]))
 		}
 	}
-	if cfg.ComposeFiles == nil && cfg.Image == "" && cfg.dockerfile() == "" {
+	if cfg.ComposeFiles == nil && cfg.Image == "" && cfg.Build.Dockerfile == "" {
 		return nil, fmt.Errorf("%s: needs one of image, build.dockerfile or dockerComposeFile", path)
 	}
 	return cfg, nil
 }
 
-// abs resolves a path written in devcontainer.json, which is relative to the
-// directory the file lives in.
 func (d *devcontainerConfig) abs(p string) string {
 	if filepath.IsAbs(p) {
 		return p
@@ -440,14 +383,6 @@ func (d *devcontainerConfig) abs(p string) string {
 	return filepath.Clean(filepath.Join(d.dir, p))
 }
 
-// dockerfile is the Dockerfile this config builds its image from, and "" when
-// it names a prebuilt image instead. The spec spells it build.dockerfile; the
-// pre-1.0 top-level dockerFile is still common in the wild, so both are read.
-func (d *devcontainerConfig) dockerfile() string {
-	return orElse(d.Build.Dockerfile, d.DockerFile)
-}
-
-// service returns the compose service name to exec into.
 func (d *devcontainerConfig) service() string {
 	if d.ComposeFiles != nil {
 		return d.Service
@@ -455,21 +390,13 @@ func (d *devcontainerConfig) service() string {
 	return launcherService
 }
 
-// composeFile renders the generated compose project. It is emitted as JSON,
-// which every YAML parser accepts, so encoding/json does the quoting instead of
-// a hand-written YAML writer. The one post-step is doubling every $: compose
-// interpolates ${...} and $VAR out of the host environment when it loads the
-// file, and every value here is already final. $ cannot appear in JSON outside
-// a string literal, so a blind replace is exact.
+// Emitted as JSON (valid YAML) so encoding/json does the quoting. Every $ is doubled because
+// compose interpolates the file and values here are final; in JSON $ only occurs inside strings.
 func (d *devcontainerConfig) composeFile() ([]byte, error) {
 	svc := map[string]any{"working_dir": d.WorkspaceFolder}
 	switch {
-	case d.Build.Dockerfile != "" || d.DockerFile != "":
-		dockerfile, context := d.Build.Dockerfile, d.Build.Context
-		if dockerfile == "" {
-			dockerfile, context = d.DockerFile, d.Context
-		}
-		build := map[string]any{"context": d.abs(orElse(context, ".")), "dockerfile": d.abs(dockerfile)}
+	case d.Build.Dockerfile != "":
+		build := map[string]any{"context": d.abs(orElse(d.Build.Context, ".")), "dockerfile": d.abs(d.Build.Dockerfile)}
 		if d.Build.Target != "" {
 			build["target"] = d.Build.Target
 		}
@@ -481,9 +408,6 @@ func (d *devcontainerConfig) composeFile() ([]byte, error) {
 		svc["image"] = d.Image
 	}
 
-	// The workspace mount is the whole point of the exercise: without it the
-	// container sees none of the project. The spec's default binds the
-	// workspace folder to containerWorkspaceFolder, read-write.
 	mounts := []map[string]any{{
 		"type": "bind", "source": d.workspace, "target": d.WorkspaceFolder,
 	}}
@@ -492,9 +416,7 @@ func (d *devcontainerConfig) composeFile() ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("workspaceMount: %w", err)
 		}
-		// A workspaceFolder outside the mount is the one misconfiguration that
-		// fails quietly: docker creates a missing working directory, so the
-		// container starts and the agent finds an empty project.
+		// docker creates a missing working dir, so a workspaceFolder outside the mount fails silently.
 		target, _ := m["target"].(string)
 		if rel, err := filepath.Rel(target, d.WorkspaceFolder); err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return nil, fmt.Errorf("workspaceMount puts the project at %s, but workspaceFolder says %s, "+
@@ -514,9 +436,7 @@ func (d *devcontainerConfig) composeFile() ([]byte, error) {
 		src, _ := m["source"].(string)
 		switch m["type"] {
 		case "bind":
-			// Relative is not a thing a bind source can be: compose resolves
-			// what it reads against the generated file's own directory, which
-			// is a cache directory nobody wrote that path against.
+			// Compose would resolve a relative source against the generated file's cache directory.
 			switch {
 			case src == "":
 				return nil, fmt.Errorf("the bind mount to %v needs a source", m["target"])
@@ -528,10 +448,7 @@ func (d *devcontainerConfig) composeFile() ([]byte, error) {
 			}
 		case "volume":
 			if src != "" {
-				// Pin the volume's real name: left to itself compose would
-				// prefix it with the project name, and the config asked for
-				// this one. A volume with no source is anonymous, which is
-				// exactly what compose does with it.
+				// Pin the name: compose would otherwise prefix it with the project name.
 				named[src] = map[string]any{"name": src}
 			}
 		}
@@ -563,16 +480,13 @@ func (d *devcontainerConfig) composeFile() ([]byte, error) {
 				"only the one: use a compose file of your own for that", p)
 		}
 		port := strconv.Itoa(int(n))
-		// Bound to the loopback address, which is what the editors do with a
-		// forwarded port: it is for the person at this keyboard, not for the
-		// network the laptop happens to be on.
+		// Loopback only, as editors do: a forwarded port is for this user, not the network.
 		svc["ports"] = append(strs(svc["ports"]), "127.0.0.1:"+port+":"+port)
 	}
 	if err := applyRunArgs(svc, d.RunArgs); err != nil {
 		return nil, err
 	}
-	// Host networking already puts every listening port on the host, and
-	// compose refuses a service that asks for both.
+	// compose refuses ports with host networking, which exposes them anyway.
 	if svc["network_mode"] == "host" {
 		delete(svc, "ports")
 	}
@@ -591,9 +505,6 @@ func (d *devcontainerConfig) composeFile() ([]byte, error) {
 	return []byte(strings.ReplaceAll(string(out), "$", "$$")), nil
 }
 
-// runArgsElsewhere names the devcontainer.json key that covers a docker flag
-// the launcher has no compose mapping for. Where it belongs is more use than
-// the bare news that it is not supported.
 var runArgsElsewhere = map[string]string{
 	"-v": "mounts", "--volume": "mounts", "--mount": "mounts",
 	"-p": "forwardPorts", "--publish": "forwardPorts",
@@ -601,9 +512,7 @@ var runArgsElsewhere = map[string]string{
 	"-w": "workspaceFolder", "--workdir": "workspaceFolder",
 }
 
-// applyRunArgs folds the docker-run flags a devcontainer.json may carry into
-// the compose service. Compose has no passthrough for raw docker flags, so
-// anything without a mapping is refused by name rather than dropped.
+// Compose has no passthrough for raw docker flags, so anything unmapped is refused by name.
 func applyRunArgs(svc map[string]any, args []string) error {
 	next := func(i *int) (string, error) {
 		if *i+1 >= len(args) {
@@ -676,8 +585,6 @@ func applyRunArgs(svc map[string]any, args []string) error {
 	return nil
 }
 
-// parseMountJSON takes one entry of the mounts array, which the spec allows to
-// be either the docker --mount string or an object with the same fields.
 func parseMountJSON(raw json.RawMessage) (map[string]any, error) {
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
@@ -743,9 +650,7 @@ func shortHash(s string) string {
 	return hex.EncodeToString(sum[:])[:12]
 }
 
-// composeProject is the -p name: compose wants lowercase alphanumerics, and two
-// projects that share a name share their containers, so the workspace path goes
-// in as a hash.
+// composeProject hashes the path in so same-named projects do not share containers.
 func composeProject(workspace string) string {
 	var b strings.Builder
 	for _, r := range strings.ToLower(filepath.Base(workspace)) {
@@ -762,9 +667,6 @@ func composeProject(workspace string) string {
 	return name + "-" + shortHash(workspace)[:6]
 }
 
-// containerTool finds the container runtime and its compose plugin. Both podman
-// and docker ship one and speak the same subcommands, so the only thing that
-// varies is argv[0].
 func containerTool() string {
 	for _, rt := range []string{"docker", "podman"} {
 		if _, err := exec.LookPath(rt); err != nil {
@@ -778,11 +680,8 @@ func containerTool() string {
 	return ""
 }
 
-// launchInDevcontainer runs the CLI inside the project's devcontainer and
-// reports whether it handled the run at all. Not handled means the caller
-// carries on in this process: no devcontainer.json to work from, or no
-// container runtime to work with, and in both cases the agent's own bootstrap
-// gives the better message.
+// launchInDevcontainer returns handled=false when the caller should run in-process (no
+// devcontainer.json, or no container runtime).
 func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, bool) {
 	cfg, err := loadDevcontainerConfig(workspace)
 	switch {
@@ -821,10 +720,7 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 			return 1, true
 		}
 		files = []string{path}
-		// Compose rebuilds nothing on its own once an image exists, so the
-		// Dockerfile is fingerprinted here instead. Without this an edited
-		// Dockerfile, which is a thing codehalter actively suggests, would
-		// silently keep the old image.
+		// Compose never rebuilds an existing image, so fingerprint the Dockerfile to catch edits.
 		rebuild = rebuild || stampChanged(filepath.Join(dir, "stamp"), body, cfg)
 	}
 
@@ -843,9 +739,6 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 	if rebuild {
 		up = append(up, "--build")
 	}
-	// runServices narrows what starts, and unset means all of them, which is
-	// what a plain `up` does. It only says anything for a config that brought
-	// its own compose files: the generated project has the one service.
 	if cfg.ComposeFiles != nil && len(cfg.RunServices) > 0 {
 		up = append(up, cfg.RunServices...)
 		if !slices.Contains(cfg.RunServices, cfg.Service) {
@@ -877,9 +770,6 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 	for _, k := range slices.Sorted(maps.Keys(cfg.RemoteEnv)) {
 		args = append(args, "-e", k+"="+cfg.RemoteEnv[k])
 	}
-	// What the host already worked out about updates: the resolved release tag
-	// and the answer the user gave to the question about it. Without these the
-	// copy inside the container spends its own API call and asks again.
 	for _, k := range []string{envLatest, envUpdate} {
 		if v := os.Getenv(k); v != "" {
 			args = append(args, "-e", k+"="+v)
@@ -887,10 +777,8 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 	}
 	args = append(args, cfg.service(), "codehalter", "--cli", "--cwd", cfg.WorkspaceFolder)
 
-	// Ctrl+C belongs to the CLI in the container, which cancels the turn with
-	// it. The signal reaches it over the exec's tty; ignoring it here keeps the
-	// launcher from dying underneath and leaving the child holding the
-	// terminal.
+	// Ctrl+C belongs to the CLI in the container (it arrives over the exec's tty); ignoring it
+	// here keeps the launcher from dying and leaving the child holding the terminal.
 	signal.Ignore(os.Interrupt)
 	code := 0
 	if err := compose(append(args, inner...)...).Run(); err != nil {
@@ -909,9 +797,7 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 	}
 	signal.Reset(os.Interrupt)
 
-	// shutdownAction is the config's own answer to "what happens when the
-	// client goes away". Anything but the two stop values leaves it running,
-	// which is also the default here because the next start is then instant.
+	// Only the two stop values stop it; the default leaves it running so the next start is instant.
 	if cfg.ShutdownAction == "stopContainer" || cfg.ShutdownAction == "stopCompose" {
 		if err := compose("stop").Run(); err != nil {
 			fmt.Fprintf(os.Stderr, "%s compose stop failed: %v\n", rt, err)
@@ -920,10 +806,7 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 	return code, true
 }
 
-// resolveContainerEnv fills in ${containerEnv:VAR} in remoteEnv, the one
-// substitution that cannot be done while reading the file: the answer lives in
-// a container that does not exist until `up` has run. read produces the output
-// of `env` in there, and is only called when something asks for it.
+// read runs `env` in the started container and is only called when a value needs it.
 func resolveContainerEnv(remoteEnv map[string]string, read func() ([]byte, error)) error {
 	const marker = "${containerEnv:"
 	need := false
@@ -964,10 +847,6 @@ func resolveContainerEnv(remoteEnv map[string]string, read func() ([]byte, error
 	return nil
 }
 
-// notice says what is about to happen before anything slow starts: which
-// runtime, that compose is driving it, and above all which host directory is
-// about to be mounted where. The mount is the part worth being sure about,
-// because everything the agent edits lands there.
 func notice(rt, project string, cfg *devcontainerConfig, building bool) {
 	bold, dim, reset := ansiBold, ansiDim, ansiReset
 	if !stdoutStyled() {
@@ -975,7 +854,7 @@ func notice(rt, project string, cfg *devcontainerConfig, building bool) {
 	}
 	from := cfg.Image
 	if from == "" {
-		from = filepath.Base(cfg.abs(cfg.dockerfile()))
+		from = filepath.Base(cfg.abs(cfg.Build.Dockerfile))
 	}
 	if cfg.ComposeFiles != nil {
 		from = filepath.Base(cfg.ComposeFiles[0]) + ", service " + cfg.Service
@@ -988,11 +867,8 @@ func notice(rt, project string, cfg *devcontainerConfig, building bool) {
 		fmt.Printf("%s  %s → %s  (bind mount, read-write: edits inside are edits here)%s\n",
 			dim, cfg.workspace, cfg.WorkspaceFolder, reset)
 	}
-	// Only for a config that actually has something to build. The first run of
-	// any project has no stamp to compare against, so it passes --build either
-	// way, and for an "image": ... config that is a no-op compose skips: saying
-	// "building the image" there promises a wait that never comes.
-	if building && cfg.dockerfile() != "" {
+	// First runs pass --build even for an image config, where compose skips it: promise no wait there.
+	if building && cfg.Build.Dockerfile != "" {
 		fmt.Printf("%s  building the image first, which takes a while; later runs reuse it%s\n", dim, reset)
 	}
 	for _, n := range cfg.notes {
@@ -1004,12 +880,11 @@ func notice(rt, project string, cfg *devcontainerConfig, building bool) {
 	}
 }
 
-// stampChanged reports whether the build inputs differ from the last run, and
-// records the current ones either way.
+// stampChanged records the current build inputs even when they match.
 func stampChanged(path string, compose []byte, cfg *devcontainerConfig) bool {
 	h := sha256.New()
 	h.Write(compose)
-	if df := cfg.dockerfile(); df != "" {
+	if df := cfg.Build.Dockerfile; df != "" {
 		body, err := os.ReadFile(cfg.abs(df))
 		if err != nil {
 			slog.Debug("launcher: cannot fingerprint dockerfile", "err", err)

@@ -6,19 +6,9 @@ import (
 	"log/slog"
 )
 
-// The terminal tools: the one call that ends a phase. submit_plan ends PLANNING,
-// respond ends execute runs. Neither has a side effect: what its
-// Execute returns is handed up by the tool loop as the phase's result.
+// Terminal tools end a phase without side effects: the tool loop hands up what
+// Execute returns as the phase's result (submit_plan's arguments ARE the plan).
 
-// submitPlanToolName is the terminal tool for the PLANNING phase — the planner's
-// counterpart to `respond` in execute. The planner calls it exactly once with
-// the structured plan (clarity, subtasks, report_only) as the tool arguments;
-// the loop unmarshals those arguments straight into planResult, so the plan
-// never has to be parsed out of free-text prose. Any user-facing answer the
-// planner has in hand (a pure-lookup result) it writes as normal message text,
-// which arrives separately as the loop's accumulated content — the two channels
-// (structured plan vs. prose answer) stay physically separate and can't be
-// mashed into one string the way the old "emit JSON as text" convention did.
 const submitPlanToolName = "submit_plan"
 
 var submitPlanTool = Tool{Def: map[string]any{
@@ -99,21 +89,11 @@ var submitPlanTool = Tool{Def: map[string]any{
 		},
 	},
 }, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-	// The arguments ARE the plan. Echo them back as the terminal output so
-	// runToolLoop hands them up as res.Text, where runPlanPhase unmarshals
-	// them into planResult. No work to do here — submit_plan has no side
-	// effects, it's purely the structured exit.
 	return rawArgs, false
 }}
 
-// respondToolName is the synthetic terminal tool that captures the model's
-// final user-facing message. Inspired by forge's respond_tool
-// (https://github.com/antoinezambelli/forge): exposing a `respond(message)`
-// tool keeps small local models inside the tool-calling grammar they're best
-// at, so the "should I emit prose or another tool call?" decision — which
-// 8B-class models reliably get wrong — never has to be made. The execute
-// phase includes it; plan/verify/document exclude it (they emit
-// structured JSON or are one-shot text).
+// respond keeps small models inside the tool-calling grammar, so they never
+// choose between prose and another tool call (after forge's respond_tool).
 const respondToolName = "respond"
 
 var respondTool = Tool{Def: map[string]any{
@@ -140,9 +120,7 @@ var respondTool = Tool{Def: map[string]any{
 		Message string `json:"message"`
 	}
 	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
-		// Malformed JSON from the model: fall back to the raw payload so
-		// the user still sees the model's final text instead of an empty
-		// reply, and don't drop the parse error silently.
+		// Fall back to the raw payload so the user still sees the final text.
 		slog.Debug("respond: arguments not valid JSON, using raw text", "err", err)
 		return rawArgs, false
 	}

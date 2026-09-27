@@ -15,9 +15,8 @@ import (
 	"testing"
 )
 
-// TestScreenshotRejectsBadPaths: the two ways a path argument can be wrong
-// (absent, or pointing outside the project) both fail with a message the model
-// can act on, and neither launches a browser.
+// Absent and outside-project paths fail with an actionable message and launch no
+// browser.
 func TestScreenshotRejectsBadPaths(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.imagesSupported = true
@@ -48,10 +47,7 @@ func TestScreenshotRejectsBadPaths(t *testing.T) {
 	}
 }
 
-// TestScreenshotNoVisionTellsTheUser: with an LLM that takes no images the
-// dispatcher never intercepts, so the call lands in the fallback. That path has
-// to say so in the TRANSCRIPT, because "your model has no vision" is a
-// settings.toml fact only the user can act on.
+// The fallback tells the user in the transcript: only they can fix settings.toml.
 func TestScreenshotNoVisionTellsTheUser(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.imagesSupported = false
@@ -60,7 +56,6 @@ func TestScreenshotNoVisionTellsTheUser(t *testing.T) {
 	if !failed {
 		t.Fatalf("failed=false, text=%q", text)
 	}
-	// The model is told what to do instead, not just that it went wrong.
 	if !strings.Contains(text, "NUMBER") {
 		t.Errorf("model-facing text should point at numeric verification, got %q", text)
 	}
@@ -69,9 +64,7 @@ func TestScreenshotNoVisionTellsTheUser(t *testing.T) {
 	}
 }
 
-// TestWriteInstrumentedInjects: the instrumented copy gets a <base> pointing at
-// the ORIGINAL directory (or its relative CSS breaks) and the probe script, and
-// the original file is left untouched.
+// <base> points at the ORIGINAL directory, and the original file is untouched.
 func TestWriteInstrumentedInjects(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "page.html")
 	original := `<html><head><title>t</title></head><body><p class="x">hi</p></body></html>`
@@ -116,8 +109,7 @@ func TestWriteInstrumentedInjects(t *testing.T) {
 	}
 }
 
-// TestWriteInstrumentedFragment: a file with no <head> and no </body> (a bare
-// SVG or an HTML fragment) still gets both injections, at the ends.
+// No <head> and no </body>: both injections still land, at the ends.
 func TestWriteInstrumentedFragment(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "frag.html")
 	if err := os.WriteFile(src, []byte(`<p class="x">hi</p>`), 0o600); err != nil {
@@ -140,9 +132,6 @@ func TestWriteInstrumentedFragment(t *testing.T) {
 	}
 }
 
-// TestSelectorNoteReportsAMiss: a selector that matched nothing is the trap
-// this note exists to close. Without it the model gets the top of the page and
-// no reason to doubt it's looking at what it asked for.
 func TestSelectorNoteReportsAMiss(t *testing.T) {
 	cases := []struct {
 		name, report, want string
@@ -164,9 +153,6 @@ func TestSelectorNoteReportsAMiss(t *testing.T) {
 	}
 }
 
-// TestClampDimension: absent/zero/negative fall back to the default, oversized
-// gets capped rather than rejected (a capped shot is still useful, and the
-// reply states the size actually used).
 func TestClampDimension(t *testing.T) {
 	cases := []struct {
 		args string
@@ -175,7 +161,7 @@ func TestClampDimension(t *testing.T) {
 		{`{}`, screenshotDefaultWidth},
 		{`{"width":0}`, screenshotDefaultWidth},
 		{`{"width":-5}`, screenshotDefaultWidth},
-		{`{"width":"nope"}`, screenshotDefaultWidth}, // junk → default, not a crash
+		{`{"width":"nope"}`, screenshotDefaultWidth},
 		{`{"width":800}`, 800},
 		{`{"width":"800"}`, 800}, // toolArgs.num takes a numeric string: models emit them
 		{`{"width":99999}`, screenshotMaxWidth},
@@ -188,8 +174,6 @@ func TestClampDimension(t *testing.T) {
 	}
 }
 
-// TestBeaconRoundTrip: the beacon is how a number leaves a headless Firefox
-// that has no --dump-dom. Anything that can GET the URL can report through it.
 func TestBeaconRoundTrip(t *testing.T) {
 	b, err := startBeacon()
 	if err != nil {
@@ -212,9 +196,6 @@ func TestBeaconRoundTrip(t *testing.T) {
 	}
 }
 
-// TestScreenshotEndToEnd drives the real browser: the only way to know the
-// flags still work and that the selector shift lands. Skipped where Firefox
-// isn't installed (CI, a slim container) rather than failing the suite.
 func TestScreenshotEndToEnd(t *testing.T) {
 	if _, err := findFirefox(); err != nil {
 		t.Skipf("no firefox: %v", err)
@@ -225,8 +206,7 @@ func TestScreenshotEndToEnd(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.imagesSupported = true
 	page := filepath.Join(s.Cwd, "page.html")
-	// A tall spacer so the target is well below the fold: without the
-	// translateY shift the capture would start at the top and miss it.
+	// Well below the fold: without the translateY shift the capture misses it.
 	body := `<html><head><style>body{margin:0}#pad{height:3000px;background:#eee}
 	  #target{height:200px;background:#f0f}</style></head>
 	  <body><div id="pad"></div><div id="target"></div></body></html>`
@@ -247,8 +227,7 @@ func TestScreenshotEndToEnd(t *testing.T) {
 	if !strings.Contains(text, "top=3000px") {
 		t.Errorf("selector note should carry the measured offset, got %q", text)
 	}
-	// The bytes must be in the store under the reported id, because that is
-	// the ONLY thing replay has: it never re-renders.
+	// The stored bytes are the ONLY thing replay has: it never re-renders.
 	data, mime, err := readImageFile(s.Cwd, id)
 	if err != nil {
 		t.Fatalf("readImageFile(%s): %v", id, err)
@@ -258,15 +237,11 @@ func TestScreenshotEndToEnd(t *testing.T) {
 	}
 }
 
-// TestScreenshotReplayUsesStoredBytes: replay must rebuild the parts from
-// ImageID, never by re-running the tool. Re-rendering a page that changed since
-// would put different bytes in the middle of the prompt and reprocess every
-// message behind them.
 func TestScreenshotReplayUsesStoredBytes(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.imagesSupported = true
-	id := "img_deadbeef"
-	if err := writeImageFile(s.Cwd, id, "image/png", []byte("stored pixels")); err != nil {
+	id, err := storeImage(s.Cwd, "image/png", []byte("stored pixels"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	tu := ToolUse{
@@ -282,13 +257,13 @@ func TestScreenshotReplayUsesStoredBytes(t *testing.T) {
 	if !ok {
 		t.Fatalf("replay returned %T, want multimodal parts", got)
 	}
-	// parts[0] is the STORED output verbatim, not a re-derived truncation
-	// hint: anything else changes wire bytes the model already saw.
+	// parts[0] is the stored output verbatim: anything else changes bytes the
+	// model already saw.
 	if want := imageParts(tu.Output, "image/png", []byte("stored pixels")); !reflect.DeepEqual(parts, want) {
 		t.Errorf("replayed parts differ from a live call:\ngot  %v\nwant %v", parts, want)
 	}
 
-	// Bytes deleted out from under us → fall back to text, don't fail the turn.
+	// Bytes gone from the store: fall back to text, do not fail the turn.
 	matches, err := filepath.Glob(filepath.Join(s.Cwd, ".codehalter", "images", id+".*"))
 	if err != nil || len(matches) == 0 {
 		t.Fatalf("glob stored image: %v %v", matches, err)
@@ -301,11 +276,7 @@ func TestScreenshotReplayUsesStoredBytes(t *testing.T) {
 	}
 }
 
-// TestScreenshotFallbackWhenModelIsBlind: with imagesSupported=false the
-// registered tool still exists (the tools array is a byte-identical superset
-// across phases), but dispatching it takes the fallback and fails loudly
-// instead of burning a browser launch to deliver something the model cannot
-// see. Goes through executeTool so the registration itself is covered.
+// Goes through runToolCall so the registration itself is covered.
 func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.imagesSupported = false
@@ -317,7 +288,8 @@ func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 	tc := toolCall{}
 	tc.Function.Name = "screenshot"
 	tc.Function.Arguments = `{"path":"page.html"}`
-	text, failed := a.executeTool(context.Background(), s.ID, tc)
+	tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+	text, failed := tu.Output, tu.Failed
 	if !failed {
 		t.Fatalf("failed=false, text=%q", text)
 	}
@@ -329,11 +301,7 @@ func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 	}
 }
 
-// TestRunCommandAttachesRenderedScreen: a command that renders a snapshot
-// and exits 0 comes back with the PNG it wrote attached to its result, under
-// the screenshot tool's own id scheme, and that counts as a look for the
-// spec loop's UI rule. A render that failed, or a command that is not a
-// render, attaches nothing.
+// A failed render, or a command that is not a render, attaches nothing.
 func TestRunCommandAttachesRenderedScreen(t *testing.T) {
 	h := newTerminalHarness(t)
 	h.agent.imagesSupported = true
@@ -369,9 +337,7 @@ func TestRunCommandAttachesRenderedScreen(t *testing.T) {
 	}
 }
 
-// TestDownscalePNG: a render over the limit comes back scaled by the
-// smallest whole factor that fits, a 2x render at exactly half, with each
-// box averaged; a small one and a non-PNG come back untouched.
+// A 2x render comes back at exactly half; a small image and a non-PNG untouched.
 func TestDownscalePNG(t *testing.T) {
 	img := image.NewRGBA(image.Rect(0, 0, 40, 30))
 	for y := 0; y < 30; y++ {
@@ -406,9 +372,7 @@ func TestDownscalePNG(t *testing.T) {
 	}
 }
 
-// TestScreenshotPictureRegion: a picture file is shown directly with its
-// size, and a region comes back enlarged by a whole factor; a region outside
-// the picture says how big it is.
+// A region outside the picture says how big the picture is.
 func TestScreenshotPictureRegion(t *testing.T) {
 	h := newTerminalHarness(t)
 	h.agent.imagesSupported = true

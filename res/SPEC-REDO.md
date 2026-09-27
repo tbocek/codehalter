@@ -21,4 +21,4 @@ Every item of the specification in `{{spec_dir}}/` is recorded as done: a test n
 
 ## Answer
 
-Call `submit_plan` with `redo` set to the list of item ids, nothing else: no subtasks, no answer. The user sees the list and confirms before anything is reopened. If everything delivers, call `submit_plan` with `report_only=true` and say so in `answer`.
+Call `submit_plan` with `redo` set to the list of item ids, nothing else: no subtasks, no answer. codehalter reopens the listed items and the loop starts on them at once; nobody confirms the list first. If everything delivers, call `submit_plan` with `report_only=true` and say so in `answer`.

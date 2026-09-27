@@ -5,8 +5,7 @@ import (
 	"unicode/utf8"
 )
 
-// TestClipUTF8 pins that truncation from either end snaps to a rune boundary so a multibyte
-// character at the cut is never split into a replacement char.
+// TestClipUTF8 also covers tailUTF8.
 func TestClipUTF8(t *testing.T) {
 	s := "hé llo" // é is 2 bytes (0xC3 0xA9): bytes are h, 0xC3, 0xA9, ' ', l, l, o
 	if got := clipUTF8(s, 2); got != "h" {
@@ -18,7 +17,6 @@ func TestClipUTF8(t *testing.T) {
 	if got := clipUTF8(s, 100); got != s {
 		t.Errorf("clipUTF8 past the end should return the whole string, got %q", got)
 	}
-	// Valid UTF-8 at EVERY byte cut, from either end.
 	for n := 0; n <= len(s); n++ {
 		if !utf8.ValidString(clipUTF8(s, n)) {
 			t.Errorf("clipUTF8(%q, %d) is not valid UTF-8: %q", s, n, clipUTF8(s, n))

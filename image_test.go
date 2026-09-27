@@ -6,10 +6,7 @@ import (
 	"testing"
 )
 
-// TestImageFileRoundTrip exercises the write/read pair across each supported
-// mime: the file lands at the right path with the right extension and the
-// readback recovers both bytes and mime from the extension alone (caller need
-// not remember the original mime).
+// Pins that readImageFile recovers the mime from the extension alone.
 func TestImageFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	cases := []struct {
@@ -24,9 +21,9 @@ func TestImageFileRoundTrip(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.ext, func(t *testing.T) {
 			payload := []byte("payload-" + c.ext)
-			id := "img_test_" + c.ext
-			if err := writeImageFile(dir, id, c.mime, payload); err != nil {
-				t.Fatalf("writeImageFile: %v", err)
+			id, err := storeImage(dir, c.mime, payload)
+			if err != nil {
+				t.Fatalf("storeImage: %v", err)
 			}
 			wantPath := filepath.Join(dir, ".codehalter", "images", id+"."+c.ext)
 			if _, err := os.Stat(wantPath); err != nil {
@@ -39,8 +36,7 @@ func TestImageFileRoundTrip(t *testing.T) {
 			if string(data) != string(payload) {
 				t.Errorf("bytes round-trip: got %q, want %q", data, payload)
 			}
-			// "bin" extension recovers as application/octet-stream — caller
-			// keeps the original mime from ImageData in that case.
+			// "bin" reads back as application/octet-stream.
 			if c.ext != "bin" && mime != c.mime {
 				t.Errorf("mime recovery: got %q, want %q", mime, c.mime)
 			}
@@ -48,8 +44,6 @@ func TestImageFileRoundTrip(t *testing.T) {
 	}
 }
 
-// TestImageFileNotFound: a hallucinated id surfaces a clean error, doesn't
-// panic, doesn't return zero-length bytes silently.
 func TestImageFileNotFound(t *testing.T) {
 	dir := t.TempDir()
 	_, _, err := readImageFile(dir, "img_doesnotexist")

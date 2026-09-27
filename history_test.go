@@ -14,13 +14,8 @@ import (
 	"unicode/utf8"
 )
 
-// TestCompressHistoryRecordsSummary is the headline history test: once the
-// server-reported prompt_tokens crosses the trigger, a boundary compaction
-// (midTurn=false) should rotate the session — freeze the pre-rotation state to
-// a "session_archive_*" file, fold the WHOLE shadow buffer into Summary, keep
-// NOTHING verbatim (start fresh), and persist everything. The mock LLM has zero
-// responses queued: folding pre-computed notes is fully local and any LLM call
-// would fail the test.
+// A boundary compaction archives the old state, folds the whole Shadow into
+// Summary, keeps nothing verbatim and persists, all without an LLM call.
 func TestCompressHistoryRecordsSummary(t *testing.T) {
 	mock := newMockLLM(t)
 	defer mock.Close()
@@ -31,8 +26,6 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		t.Fatalf("newSession: %v", err)
 	}
 
-	// Build 10 user+assistant pairs; a boundary compaction folds them all into
-	// the summary and keeps nothing verbatim.
 	filler := strings.Repeat("lorem ipsum ", 100)
 	for i := 0; i < 10; i++ {
 		s.AddUser(fmt.Sprintf("user msg %d %s", i, filler))
@@ -43,7 +36,6 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	}
 	originalMsgCount := len(s.Messages)
 
-	// Seed shadow with three completed-turn notes; all fold (no anchor held back).
 	s.appendShadow("Goal: ship feature\nProgress: scaffolded module")
 	s.appendShadow("Goal: ship feature\nProgress: wired up handler")
 	s.appendShadow("Goal: ship feature\nProgress: shipped it")
@@ -53,7 +45,6 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		settings: Settings{
 			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
-		mainSlotTokens: 90_000,
 	}
 
 	s.turnStartIdx = len(s.Messages) // all turns completed → foldHistory(len) folds them all via shadow
@@ -74,8 +65,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		t.Errorf("boundary compaction should keep nothing verbatim; got %d messages", len(s.Messages))
 	}
 
-	// An archive file should exist holding the pre-rotation full state, and
-	// the live session must keep its original ID + path.
+	// The live session keeps its ID and path; the archive holds the old state.
 	archives, err := filepath.Glob(filepath.Join(dir, sessionDir, "session_archive_*.toml"))
 	if err != nil {
 		t.Fatalf("glob archives: %v", err)
@@ -92,7 +82,6 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 		t.Errorf("archive Messages: got %d, want %d", len(archived.Messages), originalMsgCount)
 	}
 
-	// Persistence — the drained shadow must survive a reload.
 	loaded, err := loadSession(dir, s.ID)
 	if err != nil {
 		t.Fatalf("loadSession: %v", err)
@@ -106,25 +95,12 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	}
 }
 
-// TestPrefixStableAcrossTurns is the cache-correctness contract: a second
-// Prompt() turn must reproduce the previous turn's wire bytes byte-for-byte
-// for every message that's already on record. llama.cpp / vLLM / etc. only
-// reuse their KV cache when the leading tokens of the new request match the
-// leading tokens of the old one, so any drift in the prefix bytes silently
-// reprocesses the entire history each turn.
-//
-// The append-only transcript model makes this trivial: each phase pushes a
-// new user/assistant pair onto sess.Messages and never mutates earlier
-// entries, so buildLLMContext replays the same bytes. The test exercises the
-// load-bearing case — the first turn populates sess.SystemPrompt (skills +
-// project context), and that leading message must remain identical on later
-// turns so the LLM's prefix cache keeps hitting.
+// Every message already sent, the system prompt first, must replay byte-identically
+// on the next turn, or the server's KV prefix cache misses.
 func TestPrefixStableAcrossTurns(t *testing.T) {
 	dir := t.TempDir()
 
-	// Seed a SKILL file so loadSkills returns a non-empty system prompt —
-	// otherwise the bug (sysPrompt set turn 1, dropped turn 2) is invisible
-	// because sysPrompt is empty.
+	// A non-empty system prompt, or dropping it on turn 2 would go unnoticed.
 	cfgDir := filepath.Join(dir, ".codehalter")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -139,29 +115,17 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 	}
 	a := &agent{sessions: map[string]*Session{s.ID: s}}
 
-	// Sanity: systemPrompt must be non-empty so the bug we're guarding
-	// against (sysPrompt set turn 1, dropped turn 2) is observable.
 	sysPrompt, _ := a.systemPrompt(s.ID)
 	if sysPrompt == "" {
 		t.Fatal("expected non-empty systemPrompt — SKILL seed didn't take effect")
 	}
 
-	// --- Turn 1: first prompt of the session ---
-	// Prompt() sets sess.SystemPrompt (emitted by buildLLMContext as the
-	// leading user message); subsequent phases (PLAN/EXECUTE/VERIFY/
-	// DOCUMENT.md) get their own user turns appended to Messages.
 	s.SystemPrompt = sysPrompt
 	s.AddUser("first prompt")
 	msgs1 := a.buildLLMContext(s)
 
-	// Assistant replies (planner JSON, executor text, etc. — collapsed to
-	// one assistant message here since the test only cares about the
-	// user/assistant alternation that lands in history).
-	s.UpsertLastAssistant("done with turn 1")
+	s.AddAssistant("done with turn 1")
 
-	// --- Turn 2: a follow-up prompt ---
-	// Subsequent user turns store just the raw text — sysPrompt is already
-	// in sess.SystemPrompt from turn 1.
 	s.AddUser("second prompt")
 	msgs2 := a.buildLLMContext(s)
 
@@ -169,8 +133,6 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 		t.Fatalf("turn 2 should extend turn 1's history; got len1=%d len2=%d",
 			len(msgs1), len(msgs2))
 	}
-	// Every message turn 1 sent must reappear byte-identically as the prefix
-	// of turn 2's wire — this is exactly what the prefix cache keys on.
 	for i := range msgs1 {
 		b1, _ := json.Marshal(msgs1[i])
 		b2, _ := json.Marshal(msgs2[i])
@@ -181,9 +143,6 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 	}
 }
 
-// TestCompressHistoryNoopWhenBelowBudget verifies that sessions with a
-// prompt_tokens reading below the trigger don't call the LLM at all — no
-// summary.
 func TestFoldHistoryNoopWhenNothingToFold(t *testing.T) {
 	mock := newMockLLM(t) // zero responses queued → any call fails the test.
 	defer mock.Close()
@@ -201,10 +160,9 @@ func TestFoldHistoryNoopWhenNothingToFold(t *testing.T) {
 		settings: Settings{
 			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
-		mainSlotTokens: 90_000,
 	}
 
-	a.foldHistory(context.Background(), s, 0) // keepFrom=0 → nothing to fold
+	a.foldHistory(context.Background(), s, 0)
 
 	if s.Summary != "" {
 		t.Errorf("expected empty summary, got %q", s.Summary)
@@ -217,9 +175,7 @@ func TestFoldHistoryNoopWhenNothingToFold(t *testing.T) {
 	}
 }
 
-// TestCompressHistoryShadowFastPath verifies the background-summariser fast
-// path: when the shadow buffer already has structured notes (populated during
-// the turns), compaction folds the whole buffer into Summary with no LLM call.
+// Notes already in Shadow fold into Summary with no LLM call.
 func TestCompressHistoryShadowFastPath(t *testing.T) {
 	mock := newMockLLM(t) // zero responses queued → any call fails the test.
 	defer mock.Close()
@@ -248,13 +204,11 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 		settings: Settings{
 			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
-		mainSlotTokens: 90_000,
 	}
 
 	s.turnStartIdx = len(s.Messages)
 	a.foldHistory(context.Background(), s, len(s.Messages))
 
-	// Every note folds into Summary; no anchor is held back.
 	for _, want := range []string{"did thing", "refined thing", "finished thing"} {
 		if !strings.Contains(s.Summary, want) {
 			t.Errorf("expected Summary to contain folded shadow chunk %q, got %q", want, s.Summary)
@@ -263,14 +217,11 @@ func TestCompressHistoryShadowFastPath(t *testing.T) {
 	if mock.callCount() != 0 {
 		t.Errorf("LLM calls: got %d, want 0 (shadow fast path is fully local)", mock.callCount())
 	}
-	// The buffer is fully drained after a fold-all compaction.
 	if peek := s.peekShadow(); peek != "" {
 		t.Errorf("shadow buffer should be empty after compaction; got %q", peek)
 	}
 }
 
-// contentString asserts that an llmMessage carries a string payload and
-// returns it; it fails the test if the content was something else.
 func contentString(t *testing.T, m llmMessage) string {
 	t.Helper()
 	s, ok := m.Content.(string)
@@ -280,9 +231,7 @@ func contentString(t *testing.T, m llmMessage) string {
 	return s
 }
 
-// TestBuildLLMHistoryShape verifies the header injection when a summary
-// exists (one leading user message) and that stored messages follow in
-// order. The no-summary case verifies the header is omitted.
+// A Summary becomes one leading header message; without one there is no header.
 func TestBuildLLMHistoryShape(t *testing.T) {
 	a := &agent{}
 	s := &Session{
@@ -315,7 +264,6 @@ func TestBuildLLMHistoryShape(t *testing.T) {
 		t.Errorf("msgs[3]: got %q, want q2", got)
 	}
 
-	// No summary → no header; stored messages pass through unchanged.
 	s2 := &Session{Messages: []Message{
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},
@@ -332,12 +280,7 @@ func TestBuildLLMHistoryShape(t *testing.T) {
 	}
 }
 
-// TestBuildLLMHistoryToolUseProtocolShape verifies that a stored assistant
-// message with ToolUses is rebuilt in the OpenAI protocol shape — assistant
-// with ToolCalls field, followed by one tool-role message per call carrying
-// the (truncated) output and a ToolCallID pointer back. tu.ID is reused as
-// tool_call_id. Also covers the empty-assistant-content path (model emitted
-// only tool calls) and the long-output truncation path.
+// Also covers an assistant message with only tool calls and a truncated long output.
 func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 	long := strings.Repeat("X", truncateThreshold+500)
 
@@ -382,8 +325,6 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 	if msgs[2].Role != "tool" || msgs[2].ToolCallID != "tu_1" || contentString(t, msgs[2]) != "file content" {
 		t.Errorf("tool message [0] wrong: %+v", msgs[2])
 	}
-	// Long output runs through truncateForLLM — the wire copy is shorter than
-	// the stored Output and carries the "to see more" hint.
 	tool2Content := contentString(t, msgs[3])
 	if msgs[3].Role != "tool" || msgs[3].ToolCallID != "tu_2" {
 		t.Errorf("tool message [1] Role/ID wrong: %+v", msgs[3])
@@ -398,8 +339,6 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 	if msgs[4].Role != "user" || contentString(t, msgs[4]) != "thanks" {
 		t.Errorf("msgs[4] wrong: %+v", msgs[4])
 	}
-	// Empty-content assistant turn (model emitted only tool calls) still
-	// gets a properly-shaped assistant message.
 	if msgs[5].Role != "assistant" || contentString(t, msgs[5]) != "" || len(msgs[5].ToolCalls) != 1 {
 		t.Errorf("empty-content assistant wrong: %+v", msgs[5])
 	}
@@ -408,26 +347,22 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 	}
 }
 
-// TestBuildLLMHistoryImageHandling covers the imagesSupported branch and the
-// cache-consistency rule: every stored image gets its bytes inlined every turn
-// — there is no trailing-vs-older split. After compaction the image lives in
-// Summary as a reference and view_image fetches it on demand.
+// Every stored image is inlined every turn, so wire bytes stay identical until compaction.
 func TestBuildLLMHistoryImageHandling(t *testing.T) {
 	dir := t.TempDir()
 	bytes1 := []byte("pngbytes-1")
 	bytes2 := []byte("pngbytes-2-different")
-	id1 := "img_test_a"
-	id2 := "img_test_b"
-	if err := writeImageFile(dir, id1, "image/png", bytes1); err != nil {
-		t.Fatalf("writeImageFile id1: %v", err)
+	id1, err := storeImage(dir, "image/png", bytes1)
+	if err != nil {
+		t.Fatalf("storeImage id1: %v", err)
 	}
-	if err := writeImageFile(dir, id2, "image/png", bytes2); err != nil {
-		t.Fatalf("writeImageFile id2: %v", err)
+	id2, err := storeImage(dir, "image/png", bytes2)
+	if err != nil {
+		t.Fatalf("storeImage id2: %v", err)
 	}
 	img1 := ImageData{ID: id1, MimeType: "image/png"}
 	img2 := ImageData{ID: id2, MimeType: "image/png"}
 
-	// Images NOT supported → text fallback with per-image placeholders.
 	a := &agent{imagesSupported: false}
 	s := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "look at this", Images: []ImageData{img1, img2}}}}
 	out := a.buildLLMContext(s)
@@ -442,8 +377,6 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 		t.Errorf("expected view_image hints in %q", got)
 	}
 
-	// Images supported → []any with one text block + N image_url blocks
-	// containing the actual data: URLs read from disk.
 	a.imagesSupported = true
 	out = a.buildLLMContext(s)
 	parts, ok := out[0].Content.([]any)
@@ -468,9 +401,7 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 		}
 	}
 
-	// Cache-consistency: two messages with images both inline bytes every
-	// turn. No trailing/older split — the older image is NOT degraded to a
-	// text placeholder.
+	// The older image is NOT degraded to a text placeholder.
 	s4 := &Session{Cwd: dir, Messages: []Message{
 		{Role: "user", Content: "earlier", Images: []ImageData{img1}},
 		{Role: "user", Content: "now look at this one", Images: []ImageData{img2}},
@@ -492,7 +423,6 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 		t.Fatalf("trailing: expected []any of len 2, got %+v", out[1].Content)
 	}
 
-	// Wire bytes for the same stored message must be identical turn-over-turn.
 	first := a.buildLLMContext(s4)
 	second := a.buildLLMContext(s4)
 	firstJSON, err := json.Marshal(first)
@@ -507,8 +437,6 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 		t.Errorf("cache consistency: wire bytes differ between consecutive rebuilds\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
 	}
 
-	// Missing file on disk → text fallback for that image only, no panic and
-	// the rest of the request still goes through.
 	imgMissing := ImageData{ID: "img_deadbeef00000000", MimeType: "image/png"}
 	sMissing := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "missing", Images: []ImageData{imgMissing}}}}
 	outMissing := a.buildLLMContext(sMissing)
@@ -524,15 +452,11 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 		t.Errorf("missing image fallback missing id reference: %q", fallbackText)
 	}
 
-	// Message with no images → plain string, untouched.
 	s2 := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "no imgs"}}}
 	if got := contentString(t, a.buildLLMContext(s2)[0]); got != "no imgs" {
 		t.Errorf("plain: got %q, want 'no imgs'", got)
 	}
 
-	// Combined: tool uses + images on a message. The image is inlined as an
-	// image_url part; the tool use lives in ToolCalls on the assistant message
-	// and produces a follow-up tool-role message.
 	combined := Message{
 		Role:     "assistant",
 		Content:  "done",
@@ -561,11 +485,6 @@ func TestBuildLLMHistoryImageHandling(t *testing.T) {
 	}
 }
 
-// TestBackgroundSummariseAppendsImageRefsThroughCompaction is the end-to-end
-// post-compaction view_image story: a user turn with images + an assistant
-// turn → backgroundSummarise produces a shadow chunk that includes the
-// `Attached images:` ref block → foldHistory folds it into Session.Summary
-// so the handle survives even after the original message rotates out.
 func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 	mock := newMockLLM(t, sseText("Goal: inspect screenshot\nProgress: looked at it"))
 	defer mock.Close()
@@ -583,11 +502,11 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 		t.Fatalf("newSession: %v", err)
 	}
 	bytes := []byte("PNG screenshot bytes")
-	imgID := "img_test_compaction"
-	if err := writeImageFile(dir, imgID, "image/png", bytes); err != nil {
-		t.Fatalf("writeImageFile: %v", err)
+	imgID, err := storeImage(dir, "image/png", bytes)
+	if err != nil {
+		t.Fatalf("storeImage: %v", err)
 	}
-	s.AddUserWithImages("look at this", []ImageData{{ID: imgID, MimeType: "image/png"}})
+	s.AddUser("look at this", ImageData{ID: imgID, MimeType: "image/png"})
 	s.AddAssistant("I see a screenshot.")
 
 	a := &agent{
@@ -595,7 +514,6 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 		settings: Settings{
 			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
-		mainSlotTokens: 90_000,
 	}
 
 	a.backgroundSummarise(s)
@@ -619,8 +537,6 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 		t.Errorf("shadow chunk missing view_image handle %q: %q", imgID, peek)
 	}
 
-	// Drive a boundary compaction and confirm the image reference folds into
-	// Summary (a second note alongside it, both fold — no anchor held back).
 	s.appendShadow("Goal: follow-up\nProgress: follow-up turn")
 	s.turnStartIdx = len(s.Messages)
 	a.foldHistory(context.Background(), s, len(s.Messages))
@@ -630,11 +546,8 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 	}
 }
 
-// TestCompressHistoryShadowPreservesPriorSummary verifies that when the
-// shadow fast path runs and a previous Summary is already in place, the
-// previous Summary is kept and the shadow is appended after it.
 func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
-	mock := newMockLLM(t) // shadow fast path is fully local — no LLM calls expected.
+	mock := newMockLLM(t) // the shadow fast path is local: any LLM call fails the test.
 	defer mock.Close()
 
 	dir := t.TempDir()
@@ -658,7 +571,6 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 		settings: Settings{
 			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
 		},
-		mainSlotTokens: 90_000,
 	}
 
 	s.turnStartIdx = len(s.Messages)
@@ -672,9 +584,6 @@ func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
 	}
 }
 
-// TestShadowPersistsAcrossReload pins the persistence fix: turn notes live in
-// the Shadow field and must survive a Save/loadSession round-trip, so the notes
-// accumulated across turns are not lost when the process restarts.
 func TestShadowPersistsAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	s, err := newSession(dir)
@@ -700,9 +609,6 @@ func TestShadowPersistsAcrossReload(t *testing.T) {
 	}
 }
 
-// TestCompressHistoryMidTurnKeepsInFlightTurn covers the mid-turn policy: above
-// the 90% trigger, compaction keeps the in-flight turn (Messages[turnStart:])
-// verbatim and folds only the completed turns ahead of it into Summary.
 func TestCompressHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
 	mock := newMockLLM(t) // folding is local; any LLM call fails the test.
 	defer mock.Close()
@@ -714,21 +620,17 @@ func TestCompressHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
 	}
 
 	filler := strings.Repeat("lorem ipsum ", 100)
-	// Completed turn 1.
 	s.AddUser("turn1 user " + filler)
 	s.AddAssistant("turn1 asst " + filler)
-	// In-flight turn 2 begins at the next user message.
 	s.AddUser("turn2 user " + filler)
 	s.markTurnStart()
 	s.AddAssistant("turn2 asst step " + filler)
 
-	// One note for the completed turn 1 (the in-flight turn has none yet).
 	s.appendShadow("Goal: do\nProgress: finished turn 1")
 
 	a := &agent{
-		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
-		mainSlotTokens: 90_000,
+		sessions: map[string]*Session{s.ID: s},
+		settings: Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
 	}
 
 	if !a.foldHistory(context.Background(), s, s.turnStartIdx) {
@@ -754,9 +656,6 @@ func TestCompressHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
 	}
 }
 
-// TestBackgroundSummariseRendersWholeTurn verifies the summariser is fed the
-// ENTIRE turn — the user prompt plus every assistant step and its tool calls —
-// not just the last assistant message, so one note covers the whole turn.
 func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 	mock := newMockLLM(t, sseText("Goal: g\nProgress: did it"))
 	defer mock.Close()
@@ -775,13 +674,13 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 	}
 	s.AddUser("please do the thing")
 	s.markTurnStart()
-	s.AddAssistantWithTools("reading files", []ToolUse{{ID: "tu_1", Name: "read_file", Input: `{"path":"a.go"}`, Output: "package a"}})
+	s.AddAssistant("reading files")
+	s.AppendToolUse(ToolUse{ID: "tu_1", Name: "read_file", Input: `{"path":"a.go"}`, Output: "package a"})
 	s.AddAssistant("done with the thing")
 
 	a := &agent{
-		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
-		mainSlotTokens: 90_000,
+		sessions: map[string]*Session{s.ID: s},
+		settings: Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
 	}
 	a.backgroundSummarise(s)
 
@@ -793,10 +692,8 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Single [[llm]] entry → prefix-extension mode: the request replays the
-	// conversation itself (reusing the foreground KV cache) instead of pasting
-	// a transcript, with the SUMMARISE instruction as the FINAL message,
-	// anchored to the turn's opening user message.
+	// One [[llm]] entry means prefix-extension: the replayed conversation, then the
+	// instruction anchored to the turn's opening user message.
 	req := mock.request(0)
 	msgs, _ := req["messages"].([]any)
 	if len(msgs) < 2 {
@@ -808,9 +705,7 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 			t.Errorf("summariser request missing %q; got:\n%s", want, wire)
 		}
 	}
-	// Reasoning off: the closed think block follows the instruction, and the
-	// server continues it. A note written after 20 KB of reasoning missed the
-	// deadline on a 27B.
+	// Reasoning off: a closed think block follows the instruction.
 	prefill, _ := msgs[len(msgs)-1].(map[string]any)
 	if prefill["role"] != "assistant" || prefill["content"] != noThinkPrefillContent || req["continue_final_message"] != true {
 		t.Errorf("summariser should run with reasoning off (closed think block, continued), got last=%v continue=%v", prefill, req["continue_final_message"])
@@ -823,11 +718,7 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 	if !strings.Contains(instr, "please do the thing") {
 		t.Errorf("instruction should anchor the turn's opening user message, got:\n%s", instr)
 	}
-	// Prefix-extension MUST carry the foreground's tools array: the chat
-	// template renders tools into the head of the prompt, so a tools-less
-	// request diverges from the foreground prefix at the first token (cold
-	// re-eval + evicts the single slot's KV). tool_choice=none keeps the
-	// answer a note instead of a tool call.
+	// The template renders tools at the prompt head, so without them the prefix diverges.
 	if tools, _ := req["tools"].([]any); len(tools) == 0 {
 		t.Errorf("prefix-extension summarise request must carry the foreground tools array, got none")
 	}
@@ -836,10 +727,7 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 	}
 }
 
-// TestBuildContextUsesModelCallID pins the cache fix: a rebuilt context must use
-// the MODEL's tool_call id (CallID) on the wire — both the assistant tool call
-// and its tool result — so replaying from history is byte-identical to what was
-// sent live. The internal useID is only the fallback for a model that sends none.
+// Both the tool call and its result carry the model's id, so replay is byte-identical.
 func TestBuildContextUsesModelCallID(t *testing.T) {
 	a := &agent{}
 	s := &Session{}
@@ -860,29 +748,20 @@ func TestBuildContextUsesModelCallID(t *testing.T) {
 		t.Errorf("wire ids: tool_call=%q tool_call_id=%q, want both %q (model's id)", gotCall, gotResult, "call_abc")
 	}
 
-	// Fallback for an old session with no CallID → the useID.
 	if got := wireCallID(ToolUse{ID: "tu_9"}); got != "tu_9" {
 		t.Errorf("fallback: got %q, want tu_9", got)
 	}
 }
 
-// peekShadow joins every accumulated turn note without draining the buffer.
-// Test-only: the summariser tests poll it concurrently with the
-// backgroundSummarise goroutine, so it takes the same mu that guards Shadow.
+// Takes mu: tests poll it while the backgroundSummarise goroutine writes Shadow.
 func (s *Session) peekShadow() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return strings.Join(s.Shadow, "\n\n")
 }
 
-// TestSummarisePrefixIdentity pins the cache-consistency contract of the
-// prefix-extension summariser at the byte level: its request must render as
-// the foreground request EXTENDED — the exact same tools array, and the
-// foreground's messages as a byte-identical prefix — so the server reuses the
-// foreground's KV cache whole. Anything less (a missing tools array, a
-// re-rendered tool output) diverges the rendered prompt near token 0, which
-// on a single slot evicts the foreground cache AND makes the next user turn
-// re-evaluate cold (the 12k-uncached regression).
+// The summariser request must be the foreground request extended: same tools
+// array and a byte-identical message prefix, so the server reuses the whole cache.
 func TestSummarisePrefixIdentity(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText("did it"),                    // foreground call
@@ -902,9 +781,8 @@ func TestSummarisePrefixIdentity(t *testing.T) {
 		t.Fatalf("newSession: %v", err)
 	}
 	a := &agent{
-		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
-		mainSlotTokens: 90_000,
+		sessions: map[string]*Session{s.ID: s},
+		settings: Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
 	}
 
 	s.AddUser("do the thing")
@@ -944,16 +822,13 @@ func TestSummarisePrefixIdentity(t *testing.T) {
 	}
 }
 
-// TestReplayToolOutputViewImage pins the byte-for-byte replay of a view_image
-// tool result. The live call puts []any{text, image_url} on the wire but stores
-// only the text half in tu.Output, so rebuilding from tu.Output alone drops an
-// image out of the MIDDLE of the prompt and shifts every message behind it. A
-// real session paid 30035 re-evaluated tokens to save 431.
+// Only the text half is stored, so replay must re-render the image parts or the
+// prompt shifts from that message on.
 func TestReplayToolOutputViewImage(t *testing.T) {
 	dir := t.TempDir()
-	id := "img_00ff11ee22dd33cc"
-	if err := writeImageFile(dir, id, "image/png", []byte("PNG bytes here")); err != nil {
-		t.Fatalf("writeImageFile: %v", err)
+	id, err := storeImage(dir, "image/png", []byte("PNG bytes here"))
+	if err != nil {
+		t.Fatalf("storeImage: %v", err)
 	}
 	sess := &Session{Cwd: dir}
 	a := &agent{imagesSupported: true}
@@ -974,25 +849,20 @@ func TestReplayToolOutputViewImage(t *testing.T) {
 		t.Errorf("replay differs from the live wire:\n got %#v\nwant %#v", parts, live)
 	}
 
-	// A failed view_image never carried parts, so it must replay as text.
 	if bad := a.replayToolOutput(sess, ToolUse{ID: "tu_2", Name: "view_image", Failed: true,
 		Input: `{"id":"img_gone"}`, Output: "view_image: image not found"}); bad != "view_image: image not found" {
 		t.Errorf("failed view_image replayed as %#v, want the stored text", bad)
 	}
-	// A server without image support never carried parts either.
 	noImg := &agent{imagesSupported: false}
 	if bad := noImg.replayToolOutput(sess, tu); bad != text {
 		t.Errorf("images-off replay = %#v, want the stored text", bad)
 	}
-	// Any other tool is untouched.
 	if got := a.replayToolOutput(sess, ToolUse{ID: "tu_3", Name: "read_file", Output: "hello"}); got != "hello" {
 		t.Errorf("read_file replay = %#v, want %q", got, "hello")
 	}
 }
 
-// TestReplayToolOutputViewImageFileGone: the bytes vanished between the live
-// call and the rebuild. Nothing can make that replay identical, so it degrades
-// to the stored text instead of failing the turn.
+// Degrades to the stored text instead of failing the turn.
 func TestReplayToolOutputViewImageFileGone(t *testing.T) {
 	sess := &Session{Cwd: t.TempDir()}
 	a := &agent{imagesSupported: true}
@@ -1003,9 +873,6 @@ func TestReplayToolOutputViewImageFileGone(t *testing.T) {
 	}
 }
 
-// TestKeepImageRefs: the fold is told to copy image references through
-// verbatim, but a reference it paraphrases away is unrecoverable — nothing else
-// in the session ever names that id again. They are restored deterministically.
 func TestKeepImageRefs(t *testing.T) {
 	old := "Goal: one\n\nAttached images:\n" +
 		"- img_1111111111111111 (image/png) — call view_image id=img_1111111111111111 to view\n" +
@@ -1026,16 +893,12 @@ func TestKeepImageRefs(t *testing.T) {
 	if n := strings.Count(got, "id=img_1111111111111111 to view"); n != 1 {
 		t.Errorf("duplicate reference restored %d times, want 1:\n%s", n, got)
 	}
-	// Nothing missing: the fold is returned untouched.
 	folded := "Goal: merged\n" + old
 	if got := keepImageRefs(old, folded); got != folded {
 		t.Errorf("no-op case rewrote the fold:\n%s", got)
 	}
 }
 
-// TestBoundSummaryUnderBound: below maxSummaryBytes nothing is folded and no
-// LLM call is made — a.settings has no connection here, so a call would be
-// visible as an empty/failed result rather than the input coming back.
 func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
 	// Under the bound there is nothing to fold and nothing is queued.
 	a0, s0 := newTestAgent(t)
@@ -1046,9 +909,7 @@ func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
 	}
 
 	folded := "Goal: everything so far, in one line."
-	// Two responses: the fold, then the note for the in-flight slice the
-	// compaction below rotates out (SUMMARISE.md ships in the binary, so that
-	// summarise always has a prompt and always makes its call).
+	// The fold, then the note for the in-flight slice the compaction rotates out.
 	mock := newMockLLM(t, sseText(folded), sseText("Goal: the slice that rotated out"))
 	defer mock.Close()
 
@@ -1066,14 +927,11 @@ func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
 	big := strings.Repeat("Goal: big\n", maxSummaryBytes/10+64)
 	s.Summary = big
 	a := &agent{
-		sessions:       map[string]*Session{s.ID: s},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
-		mainSlotTokens: 90_000,
+		sessions: map[string]*Session{s.ID: s},
+		settings: Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
 	}
 
-	// Deferred: the call that schedules the fold returns before the LLM does,
-	// and Summary is untouched. Summary leads every request, so rewriting it
-	// here would re-prefill the whole prompt behind it.
+	// Deferred, Summary untouched: rewriting it would re-prefill the whole prompt.
 	a.scheduleSummaryFold(s, big)
 	s.waitSummarise()
 	if s.Summary != big {
@@ -1086,8 +944,6 @@ func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
 		t.Errorf("fold request did not carry RESUMMARISE.md: %v", req)
 	}
 
-	// The next compaction consumes it as the base, in place of the long
-	// Summary, and clears it. What matters here is the base, not the notes.
 	s.AddUser("next question")
 	s.markTurnStart()
 	s.AddAssistant("next answer")
@@ -1106,9 +962,6 @@ func TestSummaryFoldIsDeferredAndConsumedAtNextCompaction(t *testing.T) {
 	}
 }
 
-// TestSummaryFoldKeepsSummaryOnFailure pins the direction every failure falls
-// in: an unreachable or unhelpful summariser must leave the record alone rather
-// than replace it with something shorter and worse. Growing beats losing.
 func TestSummaryFoldKeepsSummaryOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, ".codehalter"), 0o755); err != nil {
@@ -1141,9 +994,8 @@ func TestSummaryFoldKeepsSummaryOnFailure(t *testing.T) {
 	}
 	s2.Summary = big
 	a2 := &agent{
-		sessions:       map[string]*Session{s2.ID: s2},
-		settings:       Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
-		mainSlotTokens: 90_000,
+		sessions: map[string]*Session{s2.ID: s2},
+		settings: Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}},
 	}
 	a2.scheduleSummaryFold(s2, big)
 	s2.waitSummarise()
@@ -1152,12 +1004,6 @@ func TestSummaryFoldKeepsSummaryOnFailure(t *testing.T) {
 	}
 }
 
-// TestPasteSummariseCarriesPriorSummary pins that a paste-mode note is written
-// with the rolling Summary in front of it. Prefix-extension mode replays the
-// real wire context, which already renders Summary; a paste sees only the turn
-// slice, so without this the first note after a compaction is written by
-// something that does not know the session's own goal, and it restates what is
-// already recorded directly above where the note will land.
 func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 	note := sseText("Goal: g\nProgress: did it")
 	mock := newMockLLM(t, note, note)
@@ -1182,13 +1028,11 @@ func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
-		// A dedicated summariser takes the paste branch: the conversation is not
-		// in that conn's cache, so prefix extension would not line up.
+		// A dedicated summariser takes the paste branch.
 		settings: Settings{LLM: []LLMConnection{
 			{Server: mock.ts.URL, Model: "m"},
 			{Server: mock.ts.URL, Model: "s", Purpose: purposeSummary},
 		}},
-		mainSlotTokens: 90_000,
 	}
 	a.buildConnSems()
 	a.backgroundSummarise(s)
@@ -1219,13 +1063,10 @@ func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 			t.Errorf("paste missing %q; got:\n%s", want, paste)
 		}
 	}
-	// Order matters: the recorded block is background for the turn, so it has to
-	// arrive before the transcript it is meant to contextualise.
 	if strings.Index(paste, "</already_recorded>") > strings.Index(paste, "kept going") {
 		t.Errorf("prior summary must precede the turn transcript; got:\n%s", paste)
 	}
 
-	// An empty Summary adds nothing: no stray tags, no wasted prompt tokens.
 	s2, err := newSession(dir)
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
@@ -1249,16 +1090,19 @@ func TestPasteSummariseCarriesPriorSummary(t *testing.T) {
 	}
 }
 
-// TestFallbackTurnNoteIsValidUTF8 pins the note that made a session
-// unloadable: a respond call whose input had a two-byte character exactly at
-// the 100-byte cut. The note went into Shadow, compaction folded it into
-// Summary, and the TOML decoder refused the whole file over that one byte.
+// A rune split at the clip makes the session TOML unloadable.
 func TestFallbackTurnNoteIsValidUTF8(t *testing.T) {
-	// fallbackTurnNote keeps the first 100 bytes of a tool input; ± (0xC2 0xB1,
-	// the same lead byte as the real file) starts at byte 99.
-	prefix := `{"message":"`
-	input := prefix + strings.Repeat("a", 99-len(prefix)) + "±" + strings.Repeat("x", 400) + `"}`
-	turn := []Message{{Role: "assistant", ToolUses: []ToolUse{{Name: "respond", Input: input}}}}
+	// clipBytes keeps a head and a tail of half the limit each: put a two-byte
+	// rune across both cuts of the tool input (200) and of the message (800).
+	straddle := func(prefix string, limit, total int) string {
+		half := limit / 2
+		head := prefix + strings.Repeat("a", half-1-len(prefix)) + "±"
+		tail := "±" + strings.Repeat("z", half-1)
+		return head + strings.Repeat("x", total-len(head)-len(tail)) + tail
+	}
+	input := straddle(`{"message":"`, 200, 600)
+	content := straddle("", 800, 2000)
+	turn := []Message{{Role: "assistant", Content: content, ToolUses: []ToolUse{{Name: "respond", Input: input}}}}
 	if note := fallbackTurnNote(turn); !utf8.ValidString(note) {
 		t.Errorf("note is not valid UTF-8: %q", note)
 	}

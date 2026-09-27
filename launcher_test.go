@@ -10,11 +10,7 @@ import (
 	"testing"
 )
 
-// scaffoldWorkspace writes the devcontainer.json codehalter itself scaffolds
-// (with every optional mount switched on, which is the widest config it ever
-// produces) into a temp workspace, plus every file those mounts bind. HOME and
-// SSH_AUTH_SOCK point at the temp tree so ${localEnv:...} resolves to something
-// that exists: composeFile refuses a bind whose source is missing.
+// HOME and SSH_AUTH_SOCK point into the temp tree: composeFile refuses a missing bind source.
 func scaffoldWorkspace(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -45,8 +41,6 @@ func scaffoldWorkspace(t *testing.T) string {
 	return ws
 }
 
-// writeConfig lays out a workspace from relative path to content and returns
-// it. Every test here starts by writing a devcontainer.json somewhere under it.
 func writeConfig(t *testing.T, files map[string]string) string {
 	t.Helper()
 	ws := t.TempDir()
@@ -62,8 +56,7 @@ func writeConfig(t *testing.T, files map[string]string) string {
 	return ws
 }
 
-// dig walks a decoded JSON document. Missing keys fail the test rather than
-// returning nil, so a renamed compose key shows up as the assertion it broke.
+// dig fails on a missing key, so a renamed compose key shows up as the assertion it broke.
 func dig(t *testing.T, doc any, path ...string) any {
 	t.Helper()
 	cur := doc
@@ -80,11 +73,7 @@ func dig(t *testing.T, doc any, path ...string) any {
 	return cur
 }
 
-// TestScaffoldConfigBecomesCompose is the end-to-end of the translation: the
-// devcontainer.json codehalter writes, through the parser and the compose
-// renderer, checked key by key. It pins the two substitutions that are easy to
-// get wrong (a mount written in terms of ${containerWorkspaceFolder}, which is
-// itself derived) and the compose escaping of $.
+// Pins the derived ${containerWorkspaceFolder} mount and the compose escaping of $.
 func TestScaffoldConfigBecomesCompose(t *testing.T) {
 	ws := scaffoldWorkspace(t)
 	cfg, err := loadDevcontainerConfig(ws)
@@ -122,15 +111,12 @@ func TestScaffoldConfigBecomesCompose(t *testing.T) {
 	if got := dig(t, svc, "build", "context"); got != filepath.Join(ws, ".devcontainer") {
 		t.Errorf("build.context: got %v", got)
 	}
-	// The keep-alive entrypoint holds a $! that compose would interpolate, so
-	// it has to arrive doubled and nothing else may.
+	// The entrypoint's $! must reach compose doubled.
 	if got := dig(t, svc, "entrypoint").([]any); !strings.Contains(got[2].(string), "$$!") {
 		t.Errorf("entrypoint not escaped for compose: %v", got)
 	}
 
-	// Mounts: the workspace bind comes first, then the four from the config.
-	// The .git one is the interesting one: it is written in terms of
-	// ${containerWorkspaceFolder}, which nothing in the file states.
+	// The .git mount is written in terms of ${containerWorkspaceFolder}, which the file never states.
 	vols := dig(t, svc, "volumes").([]any)
 	want := map[string]struct {
 		source string
@@ -165,9 +151,6 @@ func TestScaffoldConfigBecomesCompose(t *testing.T) {
 	}
 }
 
-// TestGeneratedComposeParses feeds the generated file to the real compose
-// parser. Emitting JSON and calling it YAML is the whole quoting strategy, so
-// it is worth one check against the thing that has to accept it.
 func TestGeneratedComposeParses(t *testing.T) {
 	rt := containerTool()
 	if rt == "" {
@@ -191,10 +174,7 @@ func TestGeneratedComposeParses(t *testing.T) {
 		t.Fatalf("%s compose config rejected the generated file: %v\n%s\n--- file ---\n%s", rt, err, out, body)
 	}
 
-	// And the escaping, which only the real parser can confirm: compose reads
-	// $VAR out of the host environment when it loads a file, so a value that
-	// survived to here unescaped would come back replaced. $HOME is the cheap
-	// probe because it is always set and never what the config meant.
+	// $HOME probes the escaping: compose would substitute it from the host if it were not doubled.
 	ws2 := writeConfig(t, map[string]string{
 		".devcontainer/devcontainer.json": `{"image": "alpine", "containerEnv": {"LITERAL": "$HOME/x"}}`,
 	})
@@ -219,10 +199,6 @@ func TestGeneratedComposeParses(t *testing.T) {
 	}
 }
 
-// TestRefusesWhatItCannotBuild pins the hand-off. features and the lifecycle
-// commands change what ends up inside the container, and a compose file cannot
-// express either, so a config using them must be named and refused rather than
-// half-built.
 func TestRefusesWhatItCannotBuild(t *testing.T) {
 	ws := writeConfig(t, map[string]string{".devcontainer/devcontainer.json": `{
 	  "image": "alpine",
@@ -239,9 +215,6 @@ func TestRefusesWhatItCannotBuild(t *testing.T) {
 	}
 }
 
-// TestNotesInsteadOfRefusing covers the other half of the policy: keys that are
-// spec defaults cannot be refused (every config has them, written down or not),
-// so they produce one line saying how the result differs.
 func TestNotesInsteadOfRefusing(t *testing.T) {
 	ws := writeConfig(t, map[string]string{
 		".devcontainer/devcontainer.json": `{"image": "alpine", "updateRemoteUserUID": true, "name": "whatever"}`,
@@ -255,8 +228,6 @@ func TestNotesInsteadOfRefusing(t *testing.T) {
 	}
 }
 
-// TestStripJSONC pins the comment and trailing-comma handling, including the
-// case that makes it more than a regex: a // inside a string literal.
 func TestStripJSONC(t *testing.T) {
 	for _, tc := range []struct{ name, in, want string }{
 		{"line comment", "{\n // hi\n \"a\": 1\n}", "{\n \n \"a\": 1\n}"},
@@ -280,9 +251,6 @@ func TestStripJSONC(t *testing.T) {
 	}
 }
 
-// TestMountForms covers the spellings a devcontainer.json may use for the same
-// mount: the docker --mount string with its aliases and bare readonly, and the
-// object form.
 func TestMountForms(t *testing.T) {
 	for _, tc := range []struct {
 		name, in string
@@ -314,25 +282,18 @@ func TestMountForms(t *testing.T) {
 	}
 }
 
-// TestRunArgsWithoutComposeEquivalent: compose has no passthrough for raw
-// docker flags, so an unmapped one has to be an error. Dropping it would start
-// a container quietly missing whatever the flag was for.
 func TestRunArgsWithoutComposeEquivalent(t *testing.T) {
 	err := applyRunArgs(map[string]any{}, []string{"--gpus", "all"})
 	if err == nil || !strings.Contains(err.Error(), "--gpus") {
 		t.Fatalf("got %v, want an error naming --gpus", err)
 	}
-	// One that does have a home in devcontainer.json: saying where it belongs
-	// beats the bare news that compose cannot take it.
 	err = applyRunArgs(map[string]any{}, []string{"-v", "/a:/b"})
 	if err == nil || !strings.Contains(err.Error(), "mounts") {
 		t.Fatalf("got %v, want an error pointing at the mounts key", err)
 	}
 }
 
-// TestRunArgsEnvPassthrough: docker reads a bare -e NAME out of the calling
-// environment, and a config that says it means the host's value, not an empty
-// one, which is what a plain Cut on = would have produced.
+// A bare -e NAME takes the host's value, as docker does.
 func TestRunArgsEnvPassthrough(t *testing.T) {
 	t.Setenv("CODEHALTER_PROBE", "from-the-host")
 	svc := map[string]any{}
@@ -345,15 +306,12 @@ func TestRunArgsEnvPassthrough(t *testing.T) {
 	}
 }
 
-// TestExpandVarsRejectsTheUnknown: a ${...} nobody resolved would travel on as
-// a literal into a path or an image tag and fail somewhere unrecognisable.
 func TestExpandVarsRejectsTheUnknown(t *testing.T) {
 	_, err := expandVars([]byte(`{"a": "${nonsense}"}`), map[string]string{})
 	if err == nil || !strings.Contains(err.Error(), "nonsense") {
 		t.Fatalf("got %v, want an error naming the variable", err)
 	}
-	// The one variable that is deliberately not resolved here: nothing knows
-	// the container's environment until the container is running.
+	// containerEnv is left for resolveContainerEnv.
 	kept, err := expandVars([]byte(`{"a": "${containerEnv:PATH}:/x"}`), map[string]string{})
 	if err != nil || string(kept) != `{"a": "${containerEnv:PATH}:/x"}` {
 		t.Fatalf("containerEnv: got %s, %v; want it left in place", kept, err)
@@ -367,11 +325,7 @@ func TestExpandVarsRejectsTheUnknown(t *testing.T) {
 	}
 }
 
-// TestConfigLocations: the spec allows three places, and a project keeping
-// several configurations side by side has no single answer, so that one is
-// named instead of guessed at. Missing the folder-per-config form would be
-// worse than an error: the CLI would run on the host and the agent would then
-// offer to scaffold a second devcontainer next to the one already there.
+// Several side-by-side configurations are named, not guessed.
 func TestConfigLocations(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -411,9 +365,6 @@ func TestConfigLocations(t *testing.T) {
 	}
 }
 
-// TestCosmeticKeysAreNotExpanded: customizations carries the editor's own
-// settings, which have their own ${...} vocabulary. Expanding those would
-// refuse a perfectly ordinary config over a value nothing here reads.
 func TestCosmeticKeysAreNotExpanded(t *testing.T) {
 	ws := writeConfig(t, map[string]string{".devcontainer/devcontainer.json": `{
 	  "image": "alpine",
@@ -428,9 +379,6 @@ func TestCosmeticKeysAreNotExpanded(t *testing.T) {
 	}
 }
 
-// TestBlankKeysAreNotRefused: a template that had its last feature deleted
-// keeps an empty "features": {}, which asks for nothing at all. Refusing that
-// would be refusing a config over punctuation.
 func TestBlankKeysAreNotRefused(t *testing.T) {
 	ws := writeConfig(t, map[string]string{
 		".devcontainer/devcontainer.json": `{"image":"alpine","features":{},"postCreateCommand":null,"initializeCommand":""}`,
@@ -440,10 +388,7 @@ func TestBlankKeysAreNotRefused(t *testing.T) {
 	}
 }
 
-// TestWorkspaceFolderMustBeReachable covers the two ways the agent could end up
-// in a directory that holds nothing. Docker creates a missing working
-// directory, so neither of these fails on its own: the container starts, and
-// the project is simply not in it.
+// Docker creates a missing working dir, so both cases would otherwise start in an empty directory.
 func TestWorkspaceFolderMustBeReachable(t *testing.T) {
 	ws := writeConfig(t, map[string]string{
 		".devcontainer/devcontainer.json": `{"dockerComposeFile":"compose.yml","service":"app"}`,
@@ -466,9 +411,6 @@ func TestWorkspaceFolderMustBeReachable(t *testing.T) {
 	}
 }
 
-// TestComposeFileCorners pins the translations that a wrong answer would hide
-// rather than announce: a port on the wrong interface, a mount compose would
-// resolve against its own directory, a volume that has no name to give.
 func TestComposeFileCorners(t *testing.T) {
 	svcOf := func(t *testing.T, config string) map[string]any {
 		t.Helper()
@@ -487,21 +429,15 @@ func TestComposeFileCorners(t *testing.T) {
 		return doc["services"]["dev"]
 	}
 
-	// A forwarded port is for the person at the keyboard. Published on every
-	// interface it would be for the coffee shop as well.
 	ports := svcOf(t, `{"image":"alpine","forwardPorts":[3000]}`)["ports"]
 	if got, ok := ports.([]any); !ok || len(got) != 1 || got[0] != "127.0.0.1:3000:3000" {
 		t.Errorf("forwardPorts: got %v, want it bound to the loopback address", ports)
 	}
 
-	// Host networking already puts every port on the host, and compose refuses
-	// a service that asks for both.
 	if got := svcOf(t, `{"image":"alpine","forwardPorts":[3000],"runArgs":["--network=host"]}`); got["ports"] != nil {
 		t.Errorf("network host: ports %v, want none", got["ports"])
 	}
 
-	// An anonymous volume has no name to pin, and asking for one refused a
-	// mount docker is perfectly happy with.
 	vols := svcOf(t, `{"image":"alpine","mounts":["target=/cache,type=volume"]}`)["volumes"].([]any)
 	if len(vols) != 2 || vols[1].(map[string]any)["source"] != nil {
 		t.Errorf("anonymous volume: got %v", vols)
@@ -514,17 +450,12 @@ func TestComposeFileCorners(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadDevcontainerConfig: %v", err)
 	}
-	// Compose resolves a relative source against the directory holding the file
-	// it read, which is a cache directory nobody wrote that path against.
 	if _, err := cfg.composeFile(); err == nil || !strings.Contains(err.Error(), "relative") {
 		t.Errorf("relative bind source: got %v, want it refused", err)
 	}
 }
 
-// TestRemoteEnvReadsTheContainer: "${containerEnv:PATH}:/opt/bin" is the
-// documented way to extend PATH for the tools a devcontainer installs, and the
-// value is only knowable once the container is up. Anywhere else it has to be
-// refused, because the answer would be needed before there is anything to ask.
+// ${containerEnv:...} is only knowable once the container is up, so it is refused outside remoteEnv.
 func TestRemoteEnvReadsTheContainer(t *testing.T) {
 	ws := writeConfig(t, map[string]string{".devcontainer/devcontainer.json": `{
 	  "image": "alpine",
@@ -551,8 +482,6 @@ func TestRemoteEnvReadsTheContainer(t *testing.T) {
 		t.Errorf("HOME: got %q, want the default for a variable the container does not set", got)
 	}
 
-	// Nothing to substitute means nothing to ask, so no container is started
-	// on account of remoteEnv alone.
 	calls = 0
 	plain := map[string]string{"A": "b"}
 	if err := resolveContainerEnv(plain, func() ([]byte, error) { calls++; return nil, nil }); err != nil || calls != 0 {

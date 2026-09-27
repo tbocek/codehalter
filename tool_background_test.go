@@ -4,14 +4,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-// TestRunBackgroundStaysRunning pins the core contract: a long-running command
-// returns promptly as a tracked "running" job (not waited on), its log exists,
-// and shutdownBackground reaps it and removes the scratch files.
+// Returns promptly as a tracked job with a log; shutdownBackground reaps it and
+// removes the scratch files.
 func TestRunBackgroundStaysRunning(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground() // leak guard if an assertion aborts early
@@ -40,16 +40,14 @@ func TestRunBackgroundStaysRunning(t *testing.T) {
 	if _, err := os.Stat(job.logPath); err != nil {
 		t.Fatalf("log file missing: %v", err)
 	}
-	// The pid is the whole point of the wrapper script: without it the model has
-	// no way to stop the job, since the client owns the process.
+	// Without the pid the model cannot stop the job: the client owns the process.
 	if job.pid <= 0 {
 		t.Errorf("job.pid = %d, want the pid the wrapper recorded", job.pid)
 	}
 	if !strings.Contains(res, fmt.Sprintf("kill %d", job.pid)) {
 		t.Errorf("result should tell the model how to stop it, got: %s", res)
 	}
-	// The terminal is deliberately NOT released while the job should live —
-	// releasing kills the process.
+	// Not released while the job should live: releasing kills the process.
 	if job.terminalId == "" {
 		t.Error("job has no terminal id")
 	}
@@ -75,9 +73,7 @@ func TestRunBackgroundStaysRunning(t *testing.T) {
 	}
 }
 
-// TestRunBackgroundImmediateExit pins that a command which exits during the
-// grace window is reported as a crash (with exit code + captured output) and is
-// not left in the job table.
+// Reported as a crash with exit code and output, and not left in the job table.
 func TestRunBackgroundImmediateExit(t *testing.T) {
 	h := newTerminalHarness(t)
 	old := bgJobGrace
@@ -102,10 +98,7 @@ func TestRunBackgroundImmediateExit(t *testing.T) {
 	}
 }
 
-// TestBackgroundLogIsReadableByRunCommand pins the assumption the whole design
-// rests on: the client's terminal and codehalter share a filesystem, so the log
-// path handed to the model is one a later `run_command: cat` can actually read.
-// If that ever stops holding, run_background silently loses its output channel.
+// The design rests on the client's terminal and codehalter sharing a filesystem.
 func TestBackgroundLogIsReadableByRunCommand(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
@@ -140,7 +133,6 @@ func TestRunBackgroundRequiresCommand(t *testing.T) {
 	}
 }
 
-// lastUserMessage returns the newest user message in the session, "" if none.
 func lastUserMessage(s *Session) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -152,16 +144,25 @@ func lastUserMessage(s *Session) string {
 	return ""
 }
 
-// TestBackgroundJobReportsWhenTurnEnds pins the no-interrupt rule: a job that
-// finishes while a turn is running changes nothing until that turn is over.
-// Then the result is stored for the model (exit code, log path, last output)
-// without any turn being started.
+// A job finishing mid-turn changes nothing until the turn ends; then its note
+// runs a follow-up turn.
 func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
 	old := bgJobGrace
 	bgJobGrace = 50 * time.Millisecond
 	defer func() { bgJobGrace = old }()
+	mock := newMockLLM(t, sseToolCall("p1", submitPlanToolName,
+		`{"clear":true,"report_only":true,"subtasks":[],"answer":"The experiment failed with code 4."}`))
+	defer mock.Close()
+	h.agent.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}, KeepWarm: "off"}
+	// An empty SUMMARISE.md keeps the turn's summariser off the mock.
+	if err := os.MkdirAll(filepath.Join(h.sess.Cwd, sessionDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.sess.Cwd, sessionDir, "SUMMARISE.md"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	h.sess.ctl.held.Lock() // a turn is running
 	res, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 0.3; echo experiment-done; exit 4"}`)
@@ -170,7 +171,7 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
-	for !h.sess.hasBgNotes() {
+	for !h.sess.hasPending() {
 		if time.Now().After(deadline) {
 			t.Fatal("the finished job never queued a note")
 		}
@@ -180,17 +181,25 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 		t.Fatalf("a message reached the session while the turn was still running: %q", got)
 	}
 
-	h.agent.flushBgNotes(context.Background(), h.sess) // what Prompt does as the turn ends
+	h.agent.drainSteer(context.Background(), h.sess) // what Prompt does as the turn ends
 	h.sess.ctl.held.Unlock()
 
-	got := lastUserMessage(h.sess)
-	for _, want := range []string{"background job", "exited with code 4", "experiment-done", "codehalter, not the user"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("stored note lacks %q: %q", want, got)
+	if mock.callCount() != 1 {
+		t.Fatalf("LLM calls = %d, want 1: the note should have run a turn", mock.callCount())
+	}
+	var prompt string
+	for _, m := range h.sess.Messages {
+		if m.Role == "user" && strings.Contains(m.Content, "exited with code 4") {
+			prompt = m.Content
 		}
 	}
-	if h.sess.hasBgNotes() {
-		t.Error("note still queued after the flush")
+	for _, want := range []string{"background job", "experiment-done", "codehalter, not the user", "Continue the work that was waiting on this result"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("the follow-up turn's prompt lacks %q: %q", want, prompt)
+		}
+	}
+	if h.sess.hasPending() {
+		t.Error("note still queued after the drain")
 	}
 	h.agent.bgMu.Lock()
 	left := len(h.agent.bgJobs)
@@ -200,9 +209,7 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	}
 }
 
-// TestTurnEndNamesRunningJobs: when a turn hands the prompt back with a new
-// job still running, the user is told which, once, and that the work resumes
-// on its own when it exits. With nothing new running the turn ends silently.
+// With nothing new running the turn ends silently.
 func TestTurnEndNamesRunningJobs(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
@@ -231,8 +238,7 @@ func TestTurnEndNamesRunningJobs(t *testing.T) {
 			t.Errorf("turn-end line lacks %q: %q", want, said)
 		}
 	}
-	// A job is named once: a dev server that lives for hours must not close
-	// every later turn with the same line.
+	// Named once, or a long-lived dev server would close every turn with it.
 	_, release, ok = h.agent.holdTurn(context.Background(), h.sess, false)
 	if !ok {
 		t.Fatal("could not hold the turn")
@@ -244,10 +250,8 @@ func TestTurnEndNamesRunningJobs(t *testing.T) {
 	}
 }
 
-// TestBackgroundJobWakeAfter: a job started with wake_after wakes the model
-// once at that age while it still runs, with the log tail and a note that it
-// is not the exit; the exit is reported on its own afterwards. A job that
-// exits before the age is reported once, at exit.
+// The wake says it is not the exit; a job exiting before the age is reported
+// once, at exit.
 func TestBackgroundJobWakeAfter(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
@@ -261,15 +265,15 @@ func TestBackgroundJobWakeAfter(t *testing.T) {
 	if !strings.Contains(res, "woken after 1.0s") {
 		t.Fatalf("launch did not confirm the wake: %q", res)
 	}
-	waitNote := func(what string) []bgNote {
+	waitNote := func(what string) []pendingInput {
 		deadline := time.Now().Add(5 * time.Second)
-		for !h.sess.hasBgNotes() {
+		for !h.sess.hasPending() {
 			if time.Now().After(deadline) {
 				t.Fatalf("no %s note", what)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		return h.sess.takeBgNotes()
+		return h.sess.takePending()
 	}
 	notes := waitNote("wake")
 	h.agent.bgMu.Lock()
@@ -279,13 +283,13 @@ func TestBackgroundJobWakeAfter(t *testing.T) {
 		t.Errorf("the job should still be running at the wake: %d tracked", still)
 	}
 	for _, want := range []string{"still running after", "wake_after you asked for, not its exit", "serving"} {
-		if !strings.Contains(notes[0].full, want) {
-			t.Errorf("wake note lacks %q: %q", want, notes[0].full)
+		if !strings.Contains(notes[0].note.full, want) {
+			t.Errorf("wake note lacks %q: %q", want, notes[0].note.full)
 		}
 	}
 	notes = waitNote("exit")
-	if !strings.Contains(notes[0].full, "exited with code 0") {
-		t.Errorf("exit note: %q", notes[0].full)
+	if !strings.Contains(notes[0].note.full, "exited with code 0") {
+		t.Errorf("exit note: %q", notes[0].note.full)
 	}
 
 	if res, _ = runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 3","wake_after":"soon"}`); !strings.Contains(res, "error: wake_after") {
@@ -295,11 +299,39 @@ func TestBackgroundJobWakeAfter(t *testing.T) {
 	if !strings.Contains(res, "woken after 1.0s") {
 		t.Fatalf("launch: %q", res)
 	}
-	if notes = waitNote("exit"); !strings.Contains(notes[0].full, "exited with code 0") {
-		t.Errorf("exit note: %q", notes[0].full)
+	if notes = waitNote("exit"); !strings.Contains(notes[0].note.full, "exited with code 0") {
+		t.Errorf("exit note: %q", notes[0].note.full)
 	}
 	time.Sleep(1200 * time.Millisecond)
-	if h.sess.hasBgNotes() {
+	if h.sess.hasPending() {
 		t.Error("a job that exited before its wake age was woken for anyway")
+	}
+}
+
+// TestStopKeepsQueuedNotesForNextPrompt: notes queued after a Stop start no
+// turn, a later one neither; they wait for the next prompt. A Stop while idle
+// holds nothing back.
+func TestStopKeepsQueuedNotesForNextPrompt(t *testing.T) {
+	h := newTerminalHarness(t)
+	_, release, ok := h.agent.holdTurn(context.Background(), h.sess, false)
+	if !ok {
+		t.Fatal("could not hold the turn")
+	}
+	h.sess.addBgNote(bgNote{line: "job 1 done", full: "[codehalter, not the user: job 1 done]"})
+	h.sess.cancelTurn()
+	release()
+
+	h.agent.deliverBgNotesWhenIdle(h.sess)
+	h.sess.addBgNote(bgNote{line: "job 2 done", full: "[codehalter, not the user: job 2 done]"})
+	h.agent.deliverBgNotesWhenIdle(h.sess)
+	if n := len(h.sess.takePending()); n != 2 {
+		t.Fatalf("%d notes left after a Stop, want both waiting for the next prompt", n)
+	}
+
+	_, release, _ = h.agent.holdTurn(context.Background(), h.sess, false)
+	release()
+	h.sess.cancelTurn()
+	if h.sess.stoppedIdle() {
+		t.Error("a Stop while idle held back the next note")
 	}
 }

@@ -48,7 +48,6 @@ func TestDetectStacksSingle(t *testing.T) {
 		{"cpp-source", []string{"main.cpp"}, "c"},
 		{"c-header-only", []string{"lib.h"}, "c"},
 		{"cmake", []string{"CMakeLists.txt"}, "c"},
-		{"bash", []string{"run.sh"}, "bash"},
 		{"css", []string{"layout.css"}, "css"},
 		{"css-html", []string{"index.html"}, "css"},
 	}
@@ -64,8 +63,6 @@ func TestDetectStacksSingle(t *testing.T) {
 	}
 }
 
-// TS wins over JS when both package.json and a .ts file are present —
-// otherwise polyglot TS projects would get the JS skill instead.
 func TestDetectStacksTSBeatsJS(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir, "package.json", "app.ts")
@@ -80,17 +77,18 @@ func TestDetectStacksTSBeatsJS(t *testing.T) {
 	}
 }
 
-func TestDetectStacksDevcontainerDir(t *testing.T) {
+func TestDetectStacksSkipsScaffolding(t *testing.T) {
 	dir := t.TempDir()
+	writeFiles(t, dir, "run.sh", "build.bash")
 	if err := os.MkdirAll(filepath.Join(dir, ".devcontainer"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if !contains(detectStacks(dir), "devcontainer") {
-		t.Errorf("want devcontainer detected when .devcontainer/ dir exists")
+	if got := detectStacks(dir); len(got) != 0 {
+		t.Errorf("scaffolding only: want no stacks, got %v", got)
 	}
 }
 
-// Polyglot project: every stack at once, in the documented stable order.
+// Pins the fixed stack order.
 func TestDetectStacksMulti(t *testing.T) {
 	dir := t.TempDir()
 	writeFiles(t, dir,
@@ -100,7 +98,7 @@ func TestDetectStacksMulti(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, ".devcontainer"), 0o755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	want := []string{"go", "ts", "css", "java", "rust", "zig", "c", "bash", "devcontainer"}
+	want := []string{"go", "ts", "css", "java", "rust", "zig", "c"}
 	got := detectStacks(dir)
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("multi: want %v, got %v", want, got)
@@ -136,8 +134,6 @@ func contains(xs []string, s string) bool {
 	return false
 }
 
-// devMounts unmarshals buildDevcontainerJSON output (it must stay valid plain
-// JSON) and returns the mounts list + containerEnv.
 func devMounts(t *testing.T, raw string) ([]string, map[string]any) {
 	t.Helper()
 	var m struct {
@@ -159,11 +155,7 @@ func anyHas(ss []string, sub string) bool {
 	return false
 }
 
-// TestBuildDevcontainerJSON pins the scaffold-time mount splicing: the base has
-// only the codehalter config mount; .git / .gitconfig / ssh are added only when
-// opted in, and ssh also sets the SSH_AUTH_SOCK env. Output stays valid JSON.
 func TestBuildDevcontainerJSON(t *testing.T) {
-	// Base: nothing opted in.
 	bm, benv := devMounts(t, buildDevcontainerJSON(false, false, false))
 	if len(bm) != 1 || !anyHas(bm, "/.config/codehalter") {
 		t.Errorf("base must be just the config mount, got %v", bm)
@@ -172,7 +164,6 @@ func TestBuildDevcontainerJSON(t *testing.T) {
 		t.Errorf("base must not set SSH_AUTH_SOCK env, got %v", benv)
 	}
 
-	// git writable, no gitconfig.
 	gm, _ := devMounts(t, buildDevcontainerJSON(true, false, false))
 	if !anyHas(gm, "containerWorkspaceFolder}/.git") {
 		t.Errorf("gitWritable must add the .git mount, got %v", gm)
@@ -181,13 +172,11 @@ func TestBuildDevcontainerJSON(t *testing.T) {
 		t.Errorf("git-only must not add gitconfig/ssh, got %v", gm)
 	}
 
-	// git + gitconfig.
 	gcm, _ := devMounts(t, buildDevcontainerJSON(true, true, false))
 	if !anyHas(gcm, "containerWorkspaceFolder}/.git") || !anyHas(gcm, "/.gitconfig") {
 		t.Errorf("git+gitconfig must add both, got %v", gcm)
 	}
 
-	// ssh only: socket mount + env, no git.
 	sm, senv := devMounts(t, buildDevcontainerJSON(false, false, true))
 	if !anyHas(sm, "ssh-agent") || anyHas(sm, "/.git,") {
 		t.Errorf("ssh-only mounts wrong, got %v", sm)
@@ -196,7 +185,6 @@ func TestBuildDevcontainerJSON(t *testing.T) {
 		t.Errorf("ssh must set SSH_AUTH_SOCK=/ssh-agent, got %v", senv)
 	}
 
-	// everything on → 4 mounts.
 	am, _ := devMounts(t, buildDevcontainerJSON(true, true, true))
 	if len(am) != 4 {
 		t.Errorf("all-on should have 4 mounts, got %v", am)
@@ -240,11 +228,7 @@ func TestLoadGlobalConfig(t *testing.T) {
 	}
 }
 
-// TestEnsureSettingsGitignored pins the secrets-file ignore: settings.toml is
-// added to .gitignore (created if the project is a git repo), idempotently, and
-// not at all in a non-git directory.
 func TestEnsureSettingsGitignored(t *testing.T) {
-	// No git, no .gitignore → no-op, no file created.
 	bare := t.TempDir()
 	if ensureSettingsGitignored(bare) {
 		t.Errorf("non-git dir with no .gitignore must not gitignore")
@@ -253,7 +237,6 @@ func TestEnsureSettingsGitignored(t *testing.T) {
 		t.Errorf("non-git dir: .gitignore must not be created")
 	}
 
-	// Git repo, no .gitignore → creates it with the entry; idempotent.
 	repo := t.TempDir()
 	if err := os.Mkdir(filepath.Join(repo, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -271,7 +254,6 @@ func TestEnsureSettingsGitignored(t *testing.T) {
 		t.Errorf("entry duplicated:\n%s", data2)
 	}
 
-	// Existing .gitignore without trailing newline → appends on a fresh line.
 	repo2 := t.TempDir()
 	if err := os.Mkdir(filepath.Join(repo2, ".git"), 0o755); err != nil {
 		t.Fatal(err)
@@ -283,5 +265,13 @@ func TestEnsureSettingsGitignored(t *testing.T) {
 	data3, _ := os.ReadFile(filepath.Join(repo2, ".gitignore"))
 	if !strings.Contains(string(data3), "node_modules\n"+gitignoreSettingsEntry) {
 		t.Errorf("must append on a fresh line:\n%q", string(data3))
+	}
+
+	worktree := t.TempDir()
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: /elsewhere/.git/worktrees/x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !ensureSettingsGitignored(worktree) {
+		t.Errorf("linked worktree: must gitignore settings.toml")
 	}
 }

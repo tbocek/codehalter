@@ -7,14 +7,13 @@ import (
 	"testing"
 )
 
-// TestDispatchViewImageHappyPath: a known image id returns the text receipt
-// and a 2-part multimodal slice (text + image_url data URL with correct mime).
+// Two parts: the text receipt and an image_url data URL with the right mime.
 func TestDispatchViewImageHappyPath(t *testing.T) {
 	dir := t.TempDir()
 	payload := []byte("PNG bytes here")
-	id := "img_test_happy"
-	if err := writeImageFile(dir, id, "image/png", payload); err != nil {
-		t.Fatalf("writeImageFile: %v", err)
+	id, err := storeImage(dir, "image/png", payload)
+	if err != nil {
+		t.Fatalf("storeImage: %v", err)
 	}
 	sess := &Session{Cwd: dir}
 
@@ -41,7 +40,6 @@ func TestDispatchViewImageHappyPath(t *testing.T) {
 	if !strings.HasPrefix(url["url"], wantPrefix) {
 		t.Errorf("url prefix: got %q, want prefix %q", url["url"], wantPrefix)
 	}
-	// Decode the embedded base64 and confirm bytes round-trip.
 	gotB64 := strings.TrimPrefix(url["url"], wantPrefix)
 	got, err := base64.StdEncoding.DecodeString(gotB64)
 	if err != nil {
@@ -52,8 +50,6 @@ func TestDispatchViewImageHappyPath(t *testing.T) {
 	}
 }
 
-// TestDispatchViewImageMissingID: a hallucinated id produces a clean,
-// model-readable error with no multimodal parts.
 func TestDispatchViewImageMissingID(t *testing.T) {
 	dir := t.TempDir()
 	sess := &Session{Cwd: dir}
@@ -70,8 +66,6 @@ func TestDispatchViewImageMissingID(t *testing.T) {
 	}
 }
 
-// TestDispatchViewImageBadArgs covers two argument failures: malformed JSON,
-// and an empty id. Both must fail loudly rather than silently doing nothing.
 func TestDispatchViewImageBadArgs(t *testing.T) {
 	sess := &Session{Cwd: t.TempDir()}
 
@@ -83,8 +77,6 @@ func TestDispatchViewImageBadArgs(t *testing.T) {
 	}
 }
 
-// TestDispatchViewImageNoSession: defensive — a nil session must fail cleanly,
-// not panic.
 func TestDispatchViewImageNoSession(t *testing.T) {
 	text, _, failed := dispatchViewImage(nil, `{"id":"img_anything"}`)
 	if !failed {

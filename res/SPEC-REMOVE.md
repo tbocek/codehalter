@@ -1,6 +1,6 @@
 # Spec removal: {{id}}
 
-`{{id}}` — {{title}} — was implemented earlier from the specification, and that section has since been DELETED from the spec. The spec is the master: the code follows it, so the implementation and its tests go too.
+`{{id}}` ({{title}}) was implemented earlier from the specification, and that section has since been DELETED from the spec. The spec is the master: the code follows it, so the implementation and its tests go too.
 
 {{previous}}
 

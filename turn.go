@@ -7,60 +7,40 @@ import (
 	"sync"
 )
 
-// One turn per session. Every way a turn starts goes through holdTurn, so
-// locking, cancellation and end-of-turn cleanup live in one place:
-//
-//   - a typed prompt and the fix cards at session open wait for the gate;
-//   - work codehalter starts itself (a background job's report) never waits,
-//     it runs only when no turn is running.
-//
-// Nothing replaces a running turn: typing steers it (Session.addSteer) and the
-// stop button cancels it. Inside a held turn, runPromptTurn runs each further
-// model turn: an accepted fix card, a /spec round, a queued follow-up.
+// One turn per session, always started via holdTurn. Nothing replaces a running
+// turn: typing steers it (Session.addSteer) and the stop button cancels it.
 
-// turnControl is a session's turn gate. held is taken for the whole turn; the
-// rest is guarded by mu.
+// held is taken for the whole turn; the other fields are guarded by mu.
 type turnControl struct {
-	held    sync.Mutex
-	mu      sync.Mutex
-	cancel  context.CancelFunc
-	running bool
-	// warmStop ends the keep-alive that runs between turns (keepWarm).
+	held     sync.Mutex
+	mu       sync.Mutex
+	cancel   context.CancelFunc
+	running  bool
 	warmStop func()
+	stopped  bool // the last turn ended by the user's Stop; queued input waits for the next prompt
 }
 
-// turnRunning reports whether a turn holds the gate right now. A prompt typed
-// then is steering, not a replacement, so Prompt queues it instead of waiting
-// for the gate.
 func (s *Session) turnRunning() bool {
 	s.ctl.mu.Lock()
 	defer s.ctl.mu.Unlock()
 	return s.ctl.running
 }
 
-// cancelTurn stops the turn in flight, if any. The caller does not wait for it
-// to unwind; holdTurn does.
+// Does not wait for the turn to unwind; holdTurn's release does.
 func (s *Session) cancelTurn() {
 	s.ctl.mu.Lock()
 	c := s.ctl.cancel
+	if s.ctl.running {
+		s.ctl.stopped = true
+	}
 	s.ctl.mu.Unlock()
 	if c != nil {
 		c()
 	}
 }
 
-// holdTurn makes the caller's turn the active one on sess and returns its ctx
-// and the release every exit path must call.
-//
-// wait blocks until the gate is free: two turns must never run side by side,
-// or they send divergent snapshots of the same session (one compacting while
-// the other re-sends the pre-compaction context). !wait returns ok=false when
-// a turn is running, and the caller tries again later.
-//
-// release closes the phase row, reports background jobs that finished during
-// the turn (at its end, never in the middle), cancels the ctx and frees the
-// turn, in that order. Background ctx for the reporting: the turn's own may be
-// cancelled already.
+// Two turns must never run side by side: they would send divergent snapshots of
+// one session. !wait returns ok=false instead of blocking. Every exit must call release.
 func (a *agent) holdTurn(parent context.Context, sess *Session, wait bool) (ctx context.Context, release func(), ok bool) {
 	if wait {
 		sess.ctl.held.Lock()
@@ -71,24 +51,33 @@ func (a *agent) holdTurn(parent context.Context, sess *Session, wait bool) (ctx 
 	sess.ctl.mu.Lock()
 	sess.ctl.cancel = cancel
 	sess.ctl.running = true
+	sess.ctl.stopped = false
 	if sess.ctl.warmStop != nil {
 		sess.ctl.warmStop() // this turn calls the model itself from here on
 		sess.ctl.warmStop = nil
 	}
 	sess.ctl.mu.Unlock()
 	release = func() {
-		a.finalizePlan(sess.ID)
-		a.flushBgNotes(context.Background(), sess)
+		// Background ctx: the turn's own may be cancelled already.
+		sess.phaseMu.Lock()
+		active, phase := sess.phaseActive, sess.phaseCurrent
+		sess.phaseActive = false
+		sess.phaseMu.Unlock()
+		if active {
+			a.sendUpdate(context.Background(), sess.ID, planUpdate{Kind: "plan", Entries: phaseEntries(phase, true, "")})
+		}
 		a.sayRunningBgJobs(sess)
-		// Between turns the conversation's prefix sits unused in the server's
-		// KV cache, where an idle slot is reclaimed and the next turn pays to
-		// re-read the whole prompt. Refresh it until the next turn starts, or
-		// until keepWarmFor says the session is over rather than idle.
+		// An idle server slot gets reclaimed and the next turn re-reads the whole
+		// prompt, so keep the prefix warm until the next turn starts.
 		warmConn := a.connFor("execute")
 		stop := a.keepWarm(sess, warmConn, func() []llmMessage { return a.buildLLMContext(sess) })
+		pending := sess.hasPending()
 		sess.ctl.mu.Lock()
 		sess.ctl.running = false
 		sess.ctl.warmStop = stop
+		if !pending {
+			sess.ctl.stopped = false // nothing was cut off; later notes report as usual
+		}
 		sess.ctl.mu.Unlock()
 		cancel()
 		sess.ctl.held.Unlock()
@@ -96,34 +85,73 @@ func (a *agent) holdTurn(parent context.Context, sess *Session, wait bool) (ctx 
 	return ctx, release, true
 }
 
-// maxSteerTurns bounds drainSteer: each turn it runs can leave more queued
-// behind it, and a user typing during those is steering THAT turn, not asking
-// for another. Three is enough for the race this covers (typed as the last
-// round ended) without turning a fast typist into an unbounded chain.
+// Text or a note arriving during a drained turn joins that turn, so a small cap
+// covers the arrived-as-the-round-ended race without an unbounded chain.
 const maxSteerTurns = 3
 
-// drainSteer runs what the user typed too late for any round to pick up. The
-// turn is over by then, so it becomes a turn of its own rather than being
-// dropped or silently stored where nothing would answer it.
+// Runs what arrived too late for any round to pick up (typed text, job notes) as
+// a turn of its own.
 func (a *agent) drainSteer(ctx context.Context, sess *Session) {
 	for range maxSteerTurns {
-		queued := sess.takeSteer()
-		if len(queued) == 0 {
+		items := sess.takePending()
+		if len(items) == 0 {
 			return
 		}
-		if err := a.runPromptTurn(ctx, sess, strings.Join(queued, "\n\n")); err != nil {
+		prompt, hasNote := a.sayPending(ctx, sess.ID, items, false)
+		if hasNote {
+			prompt += "\n\nContinue the work that was waiting on this result, if any was; otherwise tell the user what the result means. Do not start new work the user did not ask for."
+		}
+		err := a.runPromptTurn(ctx, sess, prompt)
+		if err == nil {
+			continue
+		}
+		if hasNote && !isCancelled(err) {
+			slog.Warn("background job report turn failed", "sid", sess.ID, "err", err)
+			a.say(context.Background(), sess.ID, "⚠ Could not report on the finished background job: "+err.Error()+"\n")
+		} else {
 			slog.Debug("drainSteer: the follow-up turn failed", "sid", sess.ID, "err", err)
-			return
 		}
+		return
 	}
 }
 
-// runPromptTurn stores text as a user message and runs one full turn on it,
-// inside a turn the caller already holds. It is the turn for everything that is
-// not a prompt the user typed: an accepted fix card, a /spec round, a
-// background job's report.
+// sayPending shows the user what was taken off the queue and returns it for the
+// model as one message, in arrival order. midTurn: the items join a running turn
+// rather than start one.
+func (a *agent) sayPending(ctx context.Context, sid string, items []pendingInput, midTurn bool) (text string, hasNote bool) {
+	noteEnd := "\n\n"
+	if midTurn {
+		noteEnd = "\n"
+	}
+	saidText := !midTurn // a turn started by the text itself needs no picked-up line
+	var parts []string
+	for _, it := range items {
+		if it.note != nil {
+			a.say(ctx, sid, "\n🔔 "+it.note.line+noteEnd)
+			parts = append(parts, it.note.full)
+			hasNote = true
+			continue
+		}
+		if !saidText {
+			a.say(ctx, sid, "\n↪ picked up: "+firstLine(it.text)+"\n")
+			saidText = true
+		}
+		parts = append(parts, it.text)
+	}
+	return strings.Join(parts, "\n\n"), hasNote
+}
+
+// The caller must already hold the turn.
 func (a *agent) runPromptTurn(ctx context.Context, sess *Session, text string) error {
 	sess.AddUser(text)
 	sess.saveOrLog()
 	return a.runTurn(ctx, sess.ID)
+}
+
+// stoppedIdle: the last turn was stopped with input still queued, which waits
+// for the next prompt.
+func (s *Session) stoppedIdle() bool {
+	s.ctl.mu.Lock()
+	defer s.ctl.mu.Unlock()
+	return s.ctl.stopped && !s.ctl.running
 }

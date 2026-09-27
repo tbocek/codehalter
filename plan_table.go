@@ -7,11 +7,8 @@ import (
 	"strings"
 )
 
-// repairJSON closes the strings, arrays and objects left open in a truncated
-// JSON prefix so encoding/json can parse what has arrived so far. It does not
-// try to be exhaustive: a prefix it can't rescue (a half-written \uXXXX escape,
-// a bare `tru`) simply fails to parse, and since the caller re-parses on every
-// delta the next few bytes fix it. Failing is a no-op, not a lost row.
+// repairJSON is deliberately not exhaustive: a prefix it can't rescue fails to parse, and
+// the caller re-parses on the next delta.
 func repairJSON(s string) string {
 	var stack []byte
 	inStr, esc := false, false
@@ -25,8 +22,7 @@ func repairJSON(s string) string {
 		case c == '"':
 			inStr = !inStr
 		case inStr:
-			// An ordinary character inside a string: brackets here are text, not
-			// structure, so they must not reach the stack.
+			// Brackets inside a string are text, not structure.
 		case c == '{' || c == '[':
 			stack = append(stack, c)
 		case c == '}' || c == ']':
@@ -43,9 +39,7 @@ func repairJSON(s string) string {
 		}
 		b.WriteByte('"')
 	} else {
-		// Outside a string the tail can sit on a separator whose next token hasn't
-		// arrived. Both land exactly at object boundaries, which is when a row
-		// becomes ready, so they're worth fixing rather than waiting out.
+		// A dangling , or : sits at an object boundary, exactly when a row becomes ready.
 		t := strings.TrimRight(s, " \t\r\n")
 		switch {
 		case strings.HasSuffix(t, ","):
@@ -65,20 +59,14 @@ func repairJSON(s string) string {
 	return b.String()
 }
 
-// planTable renders submit_plan's streaming arguments as a markdown table that
-// only grows: the transcript is append-only, so a row is emitted only once its
-// subtask object has CLOSED in the JSON (`verify` follows `description` and may
-// still be filling in). It carries no title: whether this is a plan, findings
-// or a replan depends on report_only, which the schema emits AFTER subtasks,
-// and a wrong label is worse than none. renderPlan prints the heading later.
+// planTable emits a row only once its subtask object has closed, since the transcript is
+// append-only. No title: report_only, which decides it, streams after subtasks.
 type planTable struct {
 	buf     strings.Builder
 	emitted int
 	header  bool
 }
 
-// feed appends one argument delta and emits whatever rows became final, using
-// `say` for each chunk.
 func (p *planTable) feed(delta string, say func(string)) {
 	p.buf.WriteString(delta)
 	raw := p.buf.String()
@@ -89,9 +77,7 @@ func (p *planTable) feed(delta string, say func(string)) {
 	if json.Unmarshal([]byte(repairJSON(raw)), &partial) != nil {
 		return
 	}
-	// A raw buffer that parses on its own needed no repair, so the array has
-	// closed and every element is final. Otherwise the last one is still in
-	// flight and must wait.
+	// Unless raw parses unrepaired, the last subtask is still in flight.
 	ready := len(partial.Subtasks)
 	if !json.Valid([]byte(raw)) {
 		ready--
@@ -105,11 +91,8 @@ func (p *planTable) feed(delta string, say func(string)) {
 	}
 }
 
-// planTableHead opens the table and planRow renders one subtask; the streamed
-// table and renderPlan share them, so a subtask looks the same either way. The
-// leading blank line is structural: without it a row after agent text is
-// swallowed as a continuation of that paragraph. No number column: Zed gives
-// every column an equal share, and the planner numbers its own subtasks.
+// Without the leading blank line a row after agent text is swallowed into that paragraph.
+// No number column: Zed gives every column an equal share.
 const planTableHead = "\n\n| Subtask | Verify |\n|---|---|\n"
 
 func planRow(st subtask) string {
@@ -117,36 +100,21 @@ func planRow(st subtask) string {
 		planCell(st.Description), planCell(strings.Join(st.Verify, "\n")))
 }
 
-// planCell makes arbitrary text safe in a table cell. A row is one physical
-// line, so an unescaped `|` (descriptions quote commands like `grep x | wc -l`)
-// splits it into phantom columns and a newline ends the table. Pipes are
-// escaped and newlines become <br>, which keeps a long multi-line instruction
-// readable. Zed prints the <br> literally, so it marks the break rather than
-// making it.
+// planCell keeps a cell on one physical line: a raw `|` adds columns and a newline ends the table.
 func planCell(s string) string {
 	lines := strings.Split(strings.ReplaceAll(s, "|", `\|`), "\n")
 	kept := lines[:0]
 	for _, ln := range lines {
 		indent := ln[:len(ln)-len(strings.TrimLeft(ln, " \t"))]
 		ln = strings.Join(strings.Fields(ln), " ")
-		// Collapse a run of blank lines to one gap, and drop it at the edges: the
-		// paragraph break is worth keeping, a heredoc's vertical whitespace is not.
 		if ln == "" && (len(kept) == 0 || kept[len(kept)-1] == "") {
 			continue
 		}
-		// Leading whitespace is re-emitted as plain spaces (a tab as four) so the
-		// Go source a heredoc carries doesn't render flat at column 0. Only the
-		// indent is rebuilt: runs inside the line are alignment padding at worst
-		// and collapse harmlessly. Plain spaces, not &nbsp;: Zed prints raw HTML
-		// as text, so the entity showed up literally and cost more than the indent
-		// it bought. Nothing here starts a line (the cell is one physical line),
-		// so a four-space run can't be read as an indented code block.
+		// Plain spaces, not &nbsp;: Zed prints raw HTML as text.
 		if ln != "" && indent != "" {
 			ln = strings.Repeat(" ", len(indent)+3*strings.Count(indent, "\t")) + ln
 		}
-		// A line ending in an odd number of backslashes is a shell continuation. It
-		// would escape the `<` of the <br> that follows and print the tag as text,
-		// so separate them; a trailing space costs nothing.
+		// An odd run of trailing backslashes would escape the `<` of the following <br>.
 		if n := len(ln) - len(strings.TrimRight(ln, `\`)); n%2 == 1 {
 			ln += " "
 		}
@@ -158,14 +126,8 @@ func planCell(s string) string {
 	return strings.Join(kept, "<br>")
 }
 
-// planTableSink builds the llmStream onArgs callback that streams submit_plan's
-// arguments into the transcript as a growing table, or nil when there is no
-// session to render into. Only submit_plan is rendered: every other tool's
-// arguments are machinery.
-//
-// The table is display-only. say goes through sendUpdate, which never touches
-// the LLM message list, so a partial or malformed table costs no prompt tokens
-// and cannot perturb the prefix cache.
+// planTableSink is display-only: say never touches the LLM message list, so a partial table
+// cannot perturb the prefix cache.
 func (a *agent) planTableSink(ctx context.Context, sid string) func(int, string, string) {
 	if sid == "" {
 		return nil
@@ -176,17 +138,16 @@ func (a *agent) planTableSink(ctx context.Context, sid string) func(int, string,
 		if name != submitPlanToolName {
 			return
 		}
-		if idx != call { // a different tool call in the same response: start over
+		if idx != call {
 			call, tbl, flagged = idx, &planTable{}, false
 		}
 		tbl.feed(delta, func(s string) { a.say(ctx, sid, s) })
 		if flagged || tbl.emitted == 0 {
 			return
 		}
-		flagged = true // once per table: this runs on every delta, hundreds of them
-		// Tell renderPlan the subtasks are on screen. Written from inside the SSE
-		// read loop, so it takes phaseMu (not sess.mu) for the same reason the
-		// phase fields do: session writers hold sess.mu across long operations.
+		flagged = true
+		// phaseMu, not sess.mu: this runs inside the SSE read loop and session
+		// writers hold sess.mu across long operations.
 		if sess := a.getSession(sid); sess != nil {
 			sess.phaseMu.Lock()
 			sess.planTableShown = true

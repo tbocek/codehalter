@@ -10,19 +10,15 @@ import (
 )
 
 func TestRenderMacro(t *testing.T) {
-	// {{}} + args → substituted.
 	if got, msg := renderMacro("grill", "do {{}} now", "the thing"); got != "do the thing now" || msg != "" {
 		t.Errorf("substitute: got %q msg %q", got, msg)
 	}
-	// {{}} + no args → user-facing stop message, nothing rendered.
 	if got, msg := renderMacro("grill", "do {{}} now", "   "); got != "" || msg == "" {
 		t.Errorf("missing-arg: got %q msg %q (want empty render + a message)", got, msg)
 	}
-	// no {{}} + args → appended.
 	if got, _ := renderMacro("grill", "fixed body", "extra"); got != "fixed body\n\nextra" {
 		t.Errorf("append: got %q", got)
 	}
-	// no {{}} + no args → as-is.
 	if got, _ := renderMacro("grill", "fixed body", ""); got != "fixed body" {
 		t.Errorf("as-is: got %q", got)
 	}
@@ -49,28 +45,21 @@ func TestHandleClean(t *testing.T) {
 	dir := t.TempDir()
 	ch := filepath.Join(dir, ".codehalter")
 	os.MkdirAll(ch, 0o755)
-	// Create some session files.
 	for _, f := range []string{"session_20260614.log", "session_20260614.toml", "session_20260615.log"} {
 		os.WriteFile(filepath.Join(ch, f), []byte("test"), 0o644)
 	}
-	// Create a non-session file that should not be deleted.
 	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("keep"), 0o644)
 
-	msg, handled := handleClean(dir)
-	if !handled {
-		t.Fatal("handleClean returned handled=false")
-	}
+	msg := handleClean(dir)
 	if !strings.Contains(msg, "Cleaned 3") {
 		t.Errorf("handleClean: got %q, want message mentioning 3 files", msg)
 	}
-	// Verify session files are gone.
 	entries, _ := os.ReadDir(ch)
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), "session_") {
 			t.Errorf("session file still present: %s", e.Name())
 		}
 	}
-	// PLAN.md should still exist.
 	if _, err := os.Stat(filepath.Join(ch, "PLAN.md")); os.IsNotExist(err) {
 		t.Error("PLAN.md was incorrectly deleted")
 	}
@@ -80,18 +69,13 @@ func TestHandleCleanNoFiles(t *testing.T) {
 	dir := t.TempDir()
 	ch := filepath.Join(dir, ".codehalter")
 	os.MkdirAll(ch, 0o755)
-	msg, handled := handleClean(dir)
-	if !handled {
-		t.Fatal("handleClean returned handled=false")
-	}
+	msg := handleClean(dir)
 	if !strings.Contains(msg, "No session") {
 		t.Errorf("handleClean: got %q, want message about no session files", msg)
 	}
 }
 
-// expandMacro on the real /grill-me template: it carries a {{}}, so no args
-// must stop with a message and args must land in the rendered prompt. Embed
-// fallback (empty temp cwd) so the shipped default is what's exercised.
+// The shipped /grill-me carries {{}}: no args stops with a message, args land in the prompt.
 func TestExpandMacroGrillMe(t *testing.T) {
 	dir := t.TempDir()
 	a, sess := newTestAgent(t)
@@ -104,10 +88,6 @@ func TestExpandMacroGrillMe(t *testing.T) {
 	}
 }
 
-// expandMacro on the real /commit template: it carries no placeholder, which
-// means a bare /commit RUNS (renders, no stop message) rather than being
-// rejected for a missing arg. Embed fallback (empty temp cwd) exercises the
-// shipped default.
 func TestExpandMacroCommitRunsBare(t *testing.T) {
 	dir := t.TempDir()
 	a, sess := newTestAgent(t)
@@ -117,10 +97,7 @@ func TestExpandMacroCommitRunsBare(t *testing.T) {
 	}
 }
 
-// TestTemplatesComeFromTheBinary: the shipped macros are in the slash menu with
-// nothing on disk, a file of the same name replaces one, and a file of a new
-// name adds a command. Retiring a macro is deleting its res/ file, because
-// nothing was ever copied into the project to outlive it.
+// A same-name file in .codehalter replaces a shipped macro; a new name adds a command.
 func TestTemplatesComeFromTheBinary(t *testing.T) {
 	dir := t.TempDir()
 	ch := filepath.Join(dir, ".codehalter")
@@ -156,10 +133,7 @@ func TestTemplatesComeFromTheBinary(t *testing.T) {
 	}
 }
 
-// TestExpandMacroSettingsIsCodeLevel: /settings must be handled without any
-// TEMPLATE-settings.md on disk (it is code, not a template) and must come back
-// with the LLM half of the report. With no [[llm]] configured that is the
-// "add one" warning, which is exactly the state a user runs /settings in.
+// With no [[llm]] configured the report must still carry the models half: the "add one" warning.
 func TestExpandMacroSettingsIsCodeLevel(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // no global settings.toml to find
 	a, sess := newTestAgent(t)
@@ -172,9 +146,7 @@ func TestExpandMacroSettingsIsCodeLevel(t *testing.T) {
 	}
 }
 
-// TestAvailableCommandsDescribeThemselves pins what the editor's slash menu
-// shows: a template's own first line (a heading counts, without its marks)
-// rather than a generic label.
+// The menu shows a template's first line, a heading without its marks.
 func TestAvailableCommandsDescribeThemselves(t *testing.T) {
 	if got := templateSummary("commit", "Commit my changes (do NOT push).\nMore text.\n"); got != "Commit my changes (do NOT push)." {
 		t.Errorf("summary should be the first line, got %q", got)

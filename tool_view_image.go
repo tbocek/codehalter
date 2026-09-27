@@ -6,14 +6,8 @@ import (
 	"fmt"
 )
 
-// view_image redelivers a previously-attached image to the model. The image
-// store is content-addressed at <cwd>/.codehalter/images/<id>.<ext>, so a
-// reference surviving in Summary (after compaction has rotated the owning
-// message out) is enough to fetch the bytes back. Dispatch is special-cased
-// in runToolLoop: instead of the usual text Role:"tool" message, the loop
-// appends a multimodal Role:"tool" message whose content is [text, image_url]
-// — that delivers the bytes within the current turn so the next llmStream
-// call sees the image as fresh context (NOT "next turn").
+// view_image re-fetches an image by id from the content-addressed store, so a
+// reference kept in Summary still works after compaction.
 
 var viewImageTool = Tool{
 	Def: map[string]any{
@@ -36,11 +30,7 @@ var viewImageTool = Tool{
 			},
 		},
 	},
-	// Execute is the fallback path: if a server is configured to disable
-	// the in-loop multimodal intercept (e.g. the LLM doesn't support image
-	// inputs), this returns a plain-text error rather than silently
-	// pretending the bytes were delivered. Real success goes through
-	// dispatchViewImage and never reaches here.
+	// Only a fallback: real success goes through dispatchViewImage.
 	Execute: viewImageExecuteFallback,
 }
 
@@ -48,16 +38,9 @@ func viewImageExecuteFallback(ctx context.Context, a *agent, sid string, rawArgs
 	if !a.imagesSupported {
 		return "view_image: this LLM doesn't support image inputs — call other tools (read_file, run_command) to inspect the attachment indirectly.", true
 	}
-	// imagesSupported and we reached the fallback? The dispatcher should have
-	// intercepted. Surface that so the bug isn't silent.
 	return "view_image: internal — dispatch missed the intercept. Try again.", true
 }
 
-// dispatchViewImage parses view_image arguments, reads the file from the
-// content-addressed store, and returns (textForToolUseOutput, multimodalParts,
-// failed). The caller wires multimodalParts as the Role:"tool" content. When
-// failed=true the multimodal parts slice is empty and textForToolUseOutput is
-// the plain-text error to feed back to the model.
 func dispatchViewImage(sess *Session, rawArgs string) (string, []any, bool) {
 	var args struct {
 		ID string `json:"id"`

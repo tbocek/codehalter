@@ -22,17 +22,13 @@ func hasFormatterNeed(needs []formatterNeed, bin string) bool {
 	return false
 }
 
-// TestCheckEnvInjectsMidSessionSkillNotPrompt pins the cache-safety rule: a
-// skill seeded mid-session is injected as a user message, NOT folded into the
-// system prompt (which would bust the KV prefix cache — only compaction may).
+// Changing the system prompt mid-session would bust the prefix cache.
 func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	a, s := newTestAgent(t)
 	cfgDir := filepath.Join(s.Cwd, ".codehalter")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Baseline: freeze the skills that already apply as "already in the prompt",
-	// so only a NEW skill counts as added mid-session.
 	const frozen = "EXISTING PROMPT — do not mutate"
 	s.SystemPrompt = frozen
 	s.promptSkills = skillSet(s.Cwd, nil)
@@ -59,15 +55,10 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	}
 }
 
-// TestCheckEnvSetupIsOneCard pins the one-card, one-turn rule. Every accepted
-// card dispatches a full plan/execute/document cycle, so every missing dev tool
-// is folded into a SINGLE fixProblem, with one PLAN ONLY directive. Two stacks
-// wanting two different formatters is the case that would otherwise be two
-// cards; a runner config (the justfile here) is deliberately not probed at all.
+// Two stacks wanting two formatters would otherwise be two cards; runner config is not probed.
 func TestCheckEnvSetupIsOneCard(t *testing.T) {
 	a, s := newTestAgent(t)
-	// Empty PATH so every probed binary reads as missing regardless of the
-	// developer's machine.
+	// Empty PATH so every probed binary reads as missing on any machine.
 	t.Setenv("PATH", "")
 	for name, body := range map[string]string{
 		"tsconfig.json": "{}\n",
@@ -92,9 +83,7 @@ func TestCheckEnvSetupIsOneCard(t *testing.T) {
 	}
 }
 
-// firstCard returns the one problem whose prompt carries want, failing when
-// none or several do. checkEnv answers with several unrelated cards in one
-// pass, and a test that indexed [0] would break whenever their order changed.
+// checkEnv returns several unrelated cards, so indexing [0] would depend on their order.
 func firstCard(t *testing.T, probs []fixProblem, want string) fixProblem {
 	t.Helper()
 	var found []fixProblem
@@ -109,15 +98,9 @@ func firstCard(t *testing.T, probs []fixProblem, want string) fixProblem {
 	return found[0]
 }
 
-// TestCheckEnvOneTimeCards pins that the two cards asking for work a project
-// only ever needs once are offered once per PROJECT, not once per session: the
-// mark lands in .codehalter/checks.done, so a second agent opening the same
-// directory (a restart, the ordinary case) stays quiet. Before that file
-// existed, declining meant being asked again at every session start.
+// Offered once per project (checks.done), so a restart stays quiet.
 func TestCheckEnvOneTimeCards(t *testing.T) {
 	a, s := newTestAgent(t)
-	// A ts project with a local prettier and no config: formatterConfigNeeds
-	// wants a .prettierrc, and there is no AGENT.md either.
 	bin := filepath.Join(s.Cwd, "node_modules", ".bin")
 	if err := os.MkdirAll(bin, 0o755); err != nil {
 		t.Fatal(err)
@@ -134,9 +117,7 @@ func TestCheckEnvOneTimeCards(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// One file to read: .git and node_modules are skipped by the walk. The
-	// formatter card fires, the AGENT.md card does not. A directory that is
-	// merely non-pristine has nothing for the card's "read the tree" step.
+	// One readable file (.git and node_modules are skipped): too little for the AGENT.md card.
 	probs := a.checkEnv(s, s.ID)
 	firstCard(t, probs, "no formatter config")
 	for _, p := range probs {
@@ -145,8 +126,7 @@ func TestCheckEnvOneTimeCards(t *testing.T) {
 		}
 	}
 
-	// Content is what flips it, and it is re-checked live, so a project that
-	// grows during the session is asked then rather than at the next one.
+	// Re-checked live: a project that grows mid-session is asked then.
 	for _, n := range []string{"a.ts", "b.ts", "c.ts", "d.ts", "README.md"} {
 		if err := os.WriteFile(filepath.Join(s.Cwd, n), []byte("x\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -158,7 +138,6 @@ func TestCheckEnvOneTimeCards(t *testing.T) {
 		t.Errorf("the AGENT.md card must confirm the facts with the user: %q", agents.prompt)
 	}
 
-	// Same session, and after a restart: neither comes back.
 	for _, again := range []func() []fixProblem{
 		func() []fixProblem { return a.checkEnv(s, s.ID) },
 		func() []fixProblem {
@@ -174,7 +153,6 @@ func TestCheckEnvOneTimeCards(t *testing.T) {
 		}
 	}
 
-	// A project that ships AGENT.md is never asked in the first place.
 	c, s3 := newTestAgent(t)
 	if err := os.WriteFile(filepath.Join(s3.Cwd, "AGENT.md"), []byte("# x\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -186,16 +164,7 @@ func TestCheckEnvOneTimeCards(t *testing.T) {
 	}
 }
 
-// TestDetectFormatters covers both drivers: detected stack (ts → prettier) and
-// formatter config files (.clang-format → clang-format, pyproject [tool.ruff] →
-// ruff), and that an empty project needs nothing.
-// TestPrepareChecksBannerAlwaysShowsOnce: the capabilities banner is all a
-// session open prints, so it must NOT be gated on something having changed
-// since the last run. A project whose settings, tools and MCP servers are
-// exactly as they were is the ordinary case, and gating on change left the
-// thread empty after the gitignore card with no way to tell setup from a
-// hang. First prepareChecks emits it; the second (settings hash unchanged,
-// probe short-circuited) adds nothing.
+// The banner must not be gated on change: an unchanged setup is the ordinary case.
 func TestPrepareChecksBannerAlwaysShowsOnce(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
@@ -207,9 +176,7 @@ func TestPrepareChecksBannerAlwaysShowsOnce(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// loadSettings prefers the project-local settings.toml over the global
-	// ~/.config/codehalter/settings.toml, so without an isolated HOME this
-	// test probes the developer's real LLM servers over the network.
+	// Isolate HOME, or the test probes the developer's real LLM servers.
 	t.Setenv("HOME", t.TempDir())
 
 	h := newTerminalHarness(t)
@@ -218,9 +185,7 @@ func TestPrepareChecksBannerAlwaysShowsOnce(t *testing.T) {
 	if err := os.MkdirAll(ch, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// A real settings file: ensureLLM reloads it each call, so the second call
-	// sees an unchanged hash plus a satisfied gate and skips the re-probe —
-	// the "nothing changed" state that used to suppress the banner entirely.
+	// The second call sees an unchanged hash and a satisfied gate, so it skips the re-probe.
 	cfg := fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"gpt-4o\"\nparallel = 1\ncontext_size = 128000\n", ts.URL)
 	if err := os.WriteFile(filepath.Join(ch, "settings.toml"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
@@ -274,16 +239,8 @@ func TestDetectFormatters(t *testing.T) {
 	}
 }
 
-// TestProbeAllLLMsConfigBeatsProbe asserts the precedence rule: explicit
-// context_size / image_support on the [[llm]] entry win over whatever the
-// probe discovered. This is the path OpenAI/Ollama/vLLM users rely on —
-// their /v1/models response carries no metadata, but the user declared the
-// values in settings.toml.
 func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
-	// Mock a metadata-bare /v1/models response (no status.args). Mirrors
-	// what OpenAI and Ollama return — the probe gleans model presence but
-	// nothing else, so any non-zero ContextSize / ImageSupport must come
-	// from config.
+	// Metadata-bare /v1/models, as OpenAI and Ollama return.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
 			http.NotFound(w, r)
@@ -308,18 +265,14 @@ func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
 	}
 	a.probeAllLLMs(context.Background())
 
-	if a.mainSlotTokens != 128000 {
-		t.Errorf("mainSlotTokens: got %d, want 128000 (from settings.toml context_size)", a.mainSlotTokens)
+	if a.mainSlotTokens.Load() != 128000 {
+		t.Errorf("mainSlotTokens: got %d, want 128000 (from settings.toml context_size)", a.mainSlotTokens.Load())
 	}
 	if !a.imagesSupported {
 		t.Errorf("imagesSupported: got false, want true (from settings.toml image_support)")
 	}
 }
 
-// TestProbeAllLLMsUndetectedFallsThroughToFalse covers the warn path: probe
-// finds no metadata AND config declares nothing — both signals end up at
-// their safe defaults (mainSlotTokens=0, imagesSupported=false) so the
-// renderLLMStatus banner can surface the "set this in settings.toml" hint.
 func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
@@ -342,25 +295,19 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 	}
 	a.probeAllLLMs(context.Background())
 
-	if a.mainSlotTokens != 0 {
-		t.Errorf("mainSlotTokens: got %d, want 0 (probe metadata-bare, no config override)", a.mainSlotTokens)
+	if a.mainSlotTokens.Load() != 0 {
+		t.Errorf("mainSlotTokens: got %d, want 0 (probe metadata-bare, no config override)", a.mainSlotTokens.Load())
 	}
 	if a.imagesSupported {
 		t.Errorf("imagesSupported: got true, want false (probe metadata-bare, no config override)")
 	}
 }
 
-// TestRenderLLMStatusWarnsModelNotInList pins the surfaced warning for the
-// silent failure mode behind "plan not valid JSON": the server is reachable and
-// /v1/models enumerates models, but the configured id isn't among them. The
-// gateway then routes the unknown name to an empty 200, which only surfaces
-// three layers down at plan time. probeLLM used to log loaded=false and move on
-// (bare ✅ in the banner); now renderLLMStatus names the mismatch and lists the
-// ids the server actually offers.
+// Gateways route an unknown model id to an empty 200, which otherwise surfaces only at plan time.
 func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
-			http.NotFound(w, r) // /props 404s — keeps the /v1/models result
+			http.NotFound(w, r) // /props 404s, so the /v1/models result stands
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -398,23 +345,12 @@ func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
 			t.Errorf("renderLLMStatus output missing %q.\nGot:\n%s", want, status)
 		}
 	}
-	// No bare ✅ connection line for a model we could not confirm.
 	if strings.Contains(status, "✅ llm[0]: qwopus3.6-27b") {
 		t.Errorf("renderLLMStatus showed a bare ✅ for an unconfirmed model:\n%s", status)
 	}
 }
 
-// TestRenderLLMStatusWarnsRoleRenderSplit pins the startup warning for the one
-// settings mistake that costs real time and produces no symptom at all: the two
-// roles asking the server for two different renderings of the same
-// conversation. Anything that is not a sampler is an argument to the chat
-// template, so the server keeps a prompt state per rendering and every plan <->
-// execute switch re-evaluates whatever the other role appended in between. One
-// 11.6h session paid 99582 tokens over two switches.
-//
-// The rewind detector already catches it, but only after the tokens are spent,
-// and prompt/cached alone never name the key at fault. This is the same
-// diagnosis for free, before the first call.
+// Non-sampler params differing per role re-evaluate the other role's appends at every phase switch.
 func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -432,9 +368,7 @@ func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 		return a.renderLLMStatus()
 	}
 
-	// Samplers may differ freely: they never reach the chat template, so the two
-	// roles still render identically. Warning here would be noise on a correct
-	// and quite common configuration.
+	// Samplers never reach the template, so differing ones must not warn.
 	quiet := status(t,
 		map[string]any{"temperature": 1.0, "top_p": 0.95},
 		map[string]any{"temperature": 0.6, "max_tokens": 8192})
@@ -442,7 +376,6 @@ func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 		t.Errorf("warned about a sampler-only difference:\n%s", quiet)
 	}
 
-	// A chat-template argument on one role only: the real shape of the fault.
 	loud := status(t,
 		map[string]any{"temperature": 1.0},
 		map[string]any{"temperature": 0.6, "chat_template_kwargs": map[string]any{"enable_thinking": false}})
@@ -453,12 +386,8 @@ func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 	}
 }
 
-// TestProbeAllLLMsExplicitFalseHonoured: a model that DOES auto-detect as
-// vision-capable but the user wants disabled via image_support = false must
-// stay disabled — *bool lets us distinguish "not set" from "explicitly off".
 func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
-	// Mock /v1/models with llama-swap-style status.args carrying --mmproj —
-	// the probe would normally detect vision support here.
+	// llama-swap-style status.args with --mmproj: the probe alone would detect vision.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
 			http.NotFound(w, r)
@@ -487,8 +416,7 @@ func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
 	}
 }
 
-// llamaCppServer mocks a llama.cpp endpoint: a bare /v1/models plus a /props
-// carrying a PER-SLOT n_ctx (default_generation_settings.n_ctx) and total_slots.
+// /props carries a per-slot n_ctx (default_generation_settings.n_ctx) and total_slots.
 func llamaCppServer(perSlotCtx, totalSlots int) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -503,9 +431,7 @@ func llamaCppServer(perSlotCtx, totalSlots int) *httptest.Server {
 	}))
 }
 
-// TestProbeAllLLMsAutoDetectsSlots: with `parallel` unset, the slot count is
-// back-filled from /props total_slots and the per-slot n_ctx is used directly
-// (no division), so the user no longer has to declare -np in settings.toml.
+// The per-slot n_ctx is used directly, not divided by the slot count.
 func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	ts := llamaCppServer(16384, 2)
 	defer ts.Close()
@@ -516,16 +442,13 @@ func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	if got := a.settings.LLM[0].Parallel; *got != 2 {
 		t.Errorf("Parallel: got %d, want 2 (auto-detected from /props total_slots)", *got)
 	}
-	if a.mainSlotTokens != 16384 {
-		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx used directly, no division)", a.mainSlotTokens)
+	if a.mainSlotTokens.Load() != 16384 {
+		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx used directly, no division)", a.mainSlotTokens.Load())
 	}
 }
 
-// TestProbeAllLLMsRouterModelProps pins the llama.cpp router-mode fix: bare /props
-// reports n_ctx=0 (role:"router"), and the real per-slot n_ctx is only returned
-// when the request is routed to the model via ?model=<id>. The id here carries a
-// space and a semicolon ("q3 (a; b)") to prove the query is encoded — a raw ';'
-// is a query separator that would truncate the name to "model not found".
+// Router mode: bare /props reports n_ctx=0; the model's comes from ?model=<id>. The id has a
+// space and a ';' to prove the query is encoded.
 func TestProbeAllLLMsRouterModelProps(t *testing.T) {
 	const modelID = "q3 (a; b)"
 	var gotModel atomic.Pointer[string] // written from the handler goroutine
@@ -556,13 +479,11 @@ func TestProbeAllLLMsRouterModelProps(t *testing.T) {
 	if got := a.settings.LLM[0].Parallel; *got != 2 {
 		t.Errorf("Parallel: got %d, want 2 (from ?model= /props total_slots)", *got)
 	}
-	if a.mainSlotTokens != 16384 {
-		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from ?model= /props)", a.mainSlotTokens)
+	if a.mainSlotTokens.Load() != 16384 {
+		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from ?model= /props)", a.mainSlotTokens.Load())
 	}
 }
 
-// TestProbeAllLLMsExplicitParallelWins: an explicit `parallel` is never
-// overwritten by the probed total_slots.
 func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 	ts := llamaCppServer(16384, 4)
 	defer ts.Close()
@@ -575,10 +496,6 @@ func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 	}
 }
 
-// TestScaffoldSettings pins that the skeleton settings.toml is written from the
-// embedded default when none exists, and that a second call is a no-op (never
-// clobbers an existing, possibly user-edited, file). This is the "if there is none,
-// create a skeleton" behavior the prepare phase relies on.
 func TestScaffoldSettings(t *testing.T) {
 	a, s := newTestAgent(t)
 	path := filepath.Join(s.Cwd, sessionDir, "settings.toml")
@@ -595,7 +512,7 @@ func TestScaffoldSettings(t *testing.T) {
 		t.Errorf("skeleton doesn't match the embedded default (%d bytes)", len(data))
 	}
 
-	// Idempotent: a second call must NOT clobber an existing file.
+	// A second call must not clobber an existing file.
 	os.WriteFile(path, []byte("# user edited\n"), 0o644)
 	a.scaffoldSettings(context.Background(), s.Cwd, s.ID)
 	if again, _ := os.ReadFile(path); string(again) != "# user edited\n" {
@@ -603,14 +520,9 @@ func TestScaffoldSettings(t *testing.T) {
 	}
 }
 
-// TestFormatterConfigNeeds pins who gets offered a formatter config and, more
-// importantly, who does not: a Go project has nothing to pin (gofmt exposes no
-// style options), and a project that already declares its style is left alone
-// rather than asked about at the start of every session.
+// Go needs no config (gofmt has no options), and an already-declared style is left alone.
 func TestFormatterConfigNeeds(t *testing.T) {
-	// proj builds a project dir carrying a local prettier (so the "formatter is
-	// installed" gate passes without depending on the host PATH) plus whatever
-	// config files the case declares.
+	// A local prettier makes the installed gate pass without depending on the host PATH.
 	proj := func(t *testing.T, files ...string) string {
 		t.Helper()
 		dir := t.TempDir()
@@ -651,14 +563,11 @@ func TestFormatterConfigNeeds(t *testing.T) {
 			files:  []string{".prettierrc"},
 		},
 		{
-			// prettier reads .editorconfig, so the style IS pinned.
 			name:   "editorconfig counts as pinned",
 			stacks: []string{"js"},
 			files:  []string{".editorconfig"},
 		},
 		{
-			// The whole point of the exclusion list: gofmt has no options, so
-			// there is no config to write and nothing to disagree about.
 			name:   "go project is already pinned by gofmt",
 			stacks: []string{"go"},
 		},
@@ -672,9 +581,7 @@ func TestFormatterConfigNeeds(t *testing.T) {
 		})
 	}
 
-	// An uninstalled formatter is the install card's business and comes first,
-	// so nothing is offered here. Skipped on a machine with a global prettier,
-	// where the gate legitimately passes.
+	// Skipped on a machine with a global prettier, where the gate legitimately passes.
 	t.Run("formatter not installed", func(t *testing.T) {
 		dir := t.TempDir()
 		if prettierBin(dir) != "" {
@@ -707,10 +614,7 @@ func TestFormatterConfigNeeds(t *testing.T) {
 	})
 }
 
-// TestEmptyProject covers the deferred-bootstrap path: a fresh directory
-// reads as empty, so initSession sets the flag whose hint asks the user what
-// language and runner to use. A populated one must not, and nothing is
-// scaffolded either way.
+// Nothing is scaffolded either way.
 func TestEmptyProject(t *testing.T) {
 	dir := t.TempDir()
 	if !isEmptyProject(dir) {
@@ -728,7 +632,6 @@ func TestEmptyProject(t *testing.T) {
 		t.Error("bootstrap must be deferred — no Makefile should be written")
 	}
 
-	// Non-empty project: isEmptyProject=false and flag stays off.
 	populated := t.TempDir()
 	if err := os.WriteFile(filepath.Join(populated, "main.go"), []byte("package main\n"), 0644); err != nil {
 		t.Fatalf("seed: %v", err)
@@ -738,10 +641,6 @@ func TestEmptyProject(t *testing.T) {
 	}
 }
 
-// TestRenderLLMStatusNamesPurpose: the banner says what each [[llm]] entry is
-// for, so a second entry is not a mystery: llm[0] carries the session and,
-// with nobody else designated, the summariser too; an entry with
-// purpose = "summary" takes the summariser off it; any other extra is idle.
 func TestRenderLLMStatusNamesPurpose(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -769,5 +668,38 @@ func TestRenderLLMStatusNamesPurpose(t *testing.T) {
 	}
 	if idle := status(base, base); !strings.Contains(idle, "llm[1]: m @ "+ts.URL+" (parallel=1) · unused: nothing routes here") {
 		t.Errorf("an extra with no purpose must say it is idle:\n%s", idle)
+	}
+}
+
+// Reloading an unchanged file would reset the back-filled parallel to unset.
+func TestEnsureLLMKeepsProbedParallel(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ts := llamaCppServer(65536, 2)
+	defer ts.Close()
+	a, s := newTestAgent(t)
+	if err := os.MkdirAll(filepath.Join(s.Cwd, ".codehalter"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"qwen\"\n", ts.URL)
+	if err := os.WriteFile(filepath.Join(s.Cwd, ".codehalter", "settings.toml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for turn := 1; turn <= 2; turn++ {
+		a.ensureLLM(context.Background(), s, s.ID)
+		if p := a.settings.LLM[0].Parallel; p == nil || *p != 2 {
+			t.Fatalf("turn %d: parallel = %v, want 2 from the probe", turn, p)
+		}
+	}
+	// Opening another thread reloads the settings file; the probe still holds.
+	other, err := newSession(s.Cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.initSession(s.Cwd, other, nil); err != nil {
+		t.Fatal(err)
+	}
+	a.ensureLLM(context.Background(), s, s.ID)
+	if p := a.settings.LLM[0].Parallel; p == nil || *p != 2 || cap(a.connSems[0]) != 2 {
+		t.Fatalf("after another session opened: parallel = %v, want 2 from the probe", p)
 	}
 }

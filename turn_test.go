@@ -2,15 +2,11 @@ package main
 
 import (
 	"context"
-	"strings"
 	"testing"
 	"time"
 )
 
-// TestHoldTurnWaitsItsTurn pins that nothing replaces a running turn any more:
-// a second holder waits for the gate, and the turn in flight is NOT cancelled.
-// Typing steers a turn (addSteer) and the stop button cancels it; holdTurn
-// itself only serialises, so two turns never send divergent snapshots.
+// A second holder waits for the gate; the turn in flight is NOT cancelled.
 func TestHoldTurnWaitsItsTurn(t *testing.T) {
 	a, s := newTestAgent(t)
 	firstCtx, firstRelease, ok := a.holdTurn(context.Background(), s, true)
@@ -47,8 +43,7 @@ func TestHoldTurnWaitsItsTurn(t *testing.T) {
 	}
 }
 
-// TestHoldTurnNeverInterrupts pins the rule for work codehalter starts on its
-// own: while a turn runs, it is refused and the running turn is untouched.
+// !wait is refused while a turn runs, and the running turn is untouched.
 func TestHoldTurnNeverInterrupts(t *testing.T) {
 	a, s := newTestAgent(t)
 	ctx, release, _ := a.holdTurn(context.Background(), s, true)
@@ -66,9 +61,8 @@ func TestHoldTurnNeverInterrupts(t *testing.T) {
 	release2()
 }
 
-// TestHoldTurnReleaseFinishes pins what every turn does on its way out, however
-// it started: the phase row is closed and finished background jobs are
-// reported (stored for the model), then the turn is free again.
+// release closes the phase row and frees the turn; a queued note is left for the
+// drain, which runs it as a turn rather than storing it silently.
 func TestHoldTurnReleaseFinishes(t *testing.T) {
 	a, s := newTestAgent(t)
 	_, release, _ := a.holdTurn(context.Background(), s, true)
@@ -85,11 +79,8 @@ func TestHoldTurnReleaseFinishes(t *testing.T) {
 	if active {
 		t.Error("the phase row is still open after release")
 	}
-	if s.hasBgNotes() {
-		t.Error("a finished job's note was not delivered at release")
-	}
-	if n := len(s.Messages); n == 0 || !strings.Contains(s.Messages[n-1].Content, "exited with code 0") {
-		t.Errorf("the note was not stored for the model: %+v", s.Messages)
+	if !s.hasPending() || len(s.Messages) != 0 {
+		t.Errorf("release consumed the note instead of leaving it for the drain: %+v", s.Messages)
 	}
 	if _, r, ok := a.holdTurn(context.Background(), s, false); !ok {
 		t.Error("the turn is still held after release")

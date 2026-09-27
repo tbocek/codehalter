@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,9 +12,7 @@ import (
 	"time"
 )
 
-// TestSpecDecide pins an item's fate after a round: done only when a test names
-// it AND the suite passes, one retry otherwise, then blocked. A question blocks
-// at once.
+// Done only when a test names the item and the suite passes; one retry, then blocked.
 func TestSpecDecide(t *testing.T) {
 	cfg := &specConfig{}
 	if done, block, _ := specDecide(cfg, "F0.1", specRoundResult{Covered: true, TestsPass: true}); !done || block {
@@ -61,8 +60,7 @@ func TestSpecPaths(t *testing.T) {
 	}
 }
 
-// TestSpecFence: while a loop runs, the file tools refuse the spec dir and
-// nothing else.
+// The file tools refuse the spec dir and nothing else.
 func TestSpecFence(t *testing.T) {
 	a, s := newTestAgent(t)
 	spec := filepath.Join(s.Cwd, "spec")
@@ -84,15 +82,14 @@ func TestSpecFence(t *testing.T) {
 	}
 }
 
-// TestSpecRoundPrompt renders both round prompts from the embedded defaults and
-// checks that every placeholder was filled and the item's facts are in it.
+// Both round prompts fill every placeholder and carry the item's facts.
 func TestSpecRoundPrompt(t *testing.T) {
 	a, s := newTestAgent(t)
 	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs libadwaita"}
+	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs libadwaita", Context: []string{"00-principles.md"}}
 
 	prompt, head := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.1", Reason: "no test names f0_1"}, map[string]string{"§01-files#1-layout": "tests/x.rs"}, "just test")
 	for _, want := range []string{"**F0.1**", "`f0_1`", "just test", "use gtk4-rs libadwaita", "rust/", "S1 Switch.",
@@ -117,28 +114,18 @@ func TestSpecRoundPrompt(t *testing.T) {
 	if !strings.Contains(answered, "keep or drop?") || !strings.Contains(answered, "keep it") {
 		t.Errorf("answered prompt lacks the question and answer:\n%s", answered)
 	}
-}
-
-func TestDedupeFixes(t *testing.T) {
-	got := dedupeFixes([]fixProblem{{desc: "a"}, {desc: "b"}, {desc: "a"}})
-	if len(got) != 2 || got[0].desc != "a" || got[1].desc != "b" {
-		t.Errorf("= %+v", got)
+	// A changed item that was blocked comes back with its answer; the diff fence must still close.
+	changed, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Mode: specModeChange, Note: "-old\n+new", Answer: "keep it"}, nil, "just test")
+	if !strings.Contains(changed, "+new\n```\n\n## Your earlier question was answered") {
+		t.Errorf("the answer runs into the diff fence:\n%s", changed)
+	}
+	// cfg.Context is saved to spec.toml: rendering must not rewrite it.
+	if cfg.Context[0] != "00-principles.md" {
+		t.Errorf("rendering rewrote cfg.Context: %v", cfg.Context)
 	}
 }
 
-func TestSpecModuleNames(t *testing.T) {
-	idx := &specIndex{docs: []specDoc{{rel: "README.md"}, {rel: "05-cut.md"}, {rel: "09-llm-and-tools.md"}, {rel: "inventory/cut.md"}}}
-	got := specModuleNames(idx)
-	want := []string{"cut", "llm_and_tools", "llm"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("= %v, want %v", got, want)
-	}
-}
-
-// TestSpecIgnoredProbes reproduces the gitignore that motivated the check: the
-// old code's unanchored output-folder rules, which also hide the rewrite's
-// modules and tests of the same name. Each offending rule is named once; the
-// anchored version of the same file is clean.
+// Each unanchored rule is named once; the anchored version of the same file is clean.
 func TestSpecIgnoredProbes(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("no git")
@@ -147,13 +134,14 @@ func TestSpecIgnoredProbes(t *testing.T) {
 	if out, err := exec.Command("git", "-C", cwd, "init", "-q").CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v %s", err, out)
 	}
-	idx := &specIndex{docs: []specDoc{{rel: "05-cut.md"}, {rel: "07-narrate.md"}}}
+	idx := &specIndex{docs: []specDoc{{rel: "05-cut.md"}, {rel: "07-narrate.md"}, {rel: "09-llm-and-tools.md"}}}
 	gi := filepath.Join(cwd, ".gitignore")
 
-	os.WriteFile(gi, []byte("cut/\n*.json\ntest*\nout/\n"), 0o644)
+	// llm/ hides the module named after the chapter's first word.
+	os.WriteFile(gi, []byte("cut/\n*.json\ntest*\nout/\nllm/\n"), 0o644)
 	got := specIgnoredProbes(t.Context(), cwd, "rust", idx)
 	joined := strings.Join(got, "\n")
-	for _, rule := range []string{"`cut/`", "`*.json`", "`test*`"} {
+	for _, rule := range []string{"`cut/`", "`*.json`", "`test*`", "`llm/`"} {
 		if strings.Count(joined, rule) != 1 {
 			t.Errorf("rule %s reported %d times, want once:\n%s", rule, strings.Count(joined, rule), joined)
 		}
@@ -162,19 +150,14 @@ func TestSpecIgnoredProbes(t *testing.T) {
 		t.Errorf("a rule that hides nothing under rust/ was reported:\n%s", joined)
 	}
 
-	os.WriteFile(gi, []byte("/cut/\n/*.json\n/test*\n/out/\n"), 0o644)
+	os.WriteFile(gi, []byte("/cut/\n/*.json\n/test*\n/out/\n/llm/\n"), 0o644)
 	if got := specIgnoredProbes(t.Context(), cwd, "rust", idx); len(got) != 0 {
 		t.Errorf("anchored rules still reported: %v", got)
 	}
 }
 
-// TestSpecDecideChangeAndRemove pins the two round kinds whose done rule is not
-// "a test names it and the suite passes".
-//
-// A changed item is still covered by the test written for the OLD spec text, so
-// coverage alone would declare it done before the model touched anything: the
-// commit is the evidence. A removal is the inverse: it is done when no test
-// names the item any more.
+// A change round needs a commit, since the old test still covers it; a removal is done when no
+// test names the item.
 func TestSpecDecideChangeAndRemove(t *testing.T) {
 	cfg := &specConfig{}
 	done, _, reason := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true})
@@ -198,9 +181,18 @@ func TestSpecDecideChangeAndRemove(t *testing.T) {
 	}
 }
 
-// TestSpecFinalPrompt: the round after the last item gets the whole picture:
-// target, every spec file, the test command, the counts and the blocked list,
-// with no placeholder left.
+func TestSpecDecideRedoNeedsACommit(t *testing.T) {
+	cfg := &specConfig{}
+	done, _, reason := specDecide(cfg, "F0.1", specRoundResult{Redo: true, Covered: true, TestsPass: true})
+	if done || !strings.Contains(reason, "/spec redo") {
+		t.Errorf("a redo round that wrote nothing: done=%v reason=%q", done, reason)
+	}
+	if done, _, _ := specDecide(cfg, "F0.1", specRoundResult{Redo: true, Covered: true, TestsPass: true, Committed: true}); !done {
+		t.Error("a redo round that committed should be done")
+	}
+}
+
+// Target, spec files, test command, counts and blocked list are in, no placeholder left.
 func TestSpecFinalPrompt(t *testing.T) {
 	a, s := newTestAgent(t)
 	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
@@ -225,9 +217,6 @@ func TestSpecFinalPrompt(t *testing.T) {
 	}
 }
 
-// TestRunSpecTestsTailCarriesExitStatus: a test command that dies before
-// printing anything still tells why; an empty "end of its output" helped
-// nobody.
 func TestRunSpecTestsTailCarriesExitStatus(t *testing.T) {
 	h := newTerminalHarness(t)
 	pass, tail := h.agent.runSpecTests(context.Background(), h.sess.ID, t.TempDir(), "rust", "exit 3")
@@ -240,9 +229,7 @@ func TestRunSpecTestsTailCarriesExitStatus(t *testing.T) {
 	}
 }
 
-// TestSpecRoundOwnGreenRun: the round's last plain run of the test command,
-// exit 0 from the terminal, in the output directory, with nothing written
-// since, is the check; anything less means codehalter runs the suite itself.
+// Only a bare run in the output dir, exit 0 per the terminal, nothing written since, counts.
 func TestSpecRoundOwnGreenRun(t *testing.T) {
 	a, sess := newTestAgent(t)
 	out := filepath.Join(sess.Cwd, "rust")
@@ -283,9 +270,7 @@ func TestSpecRoundOwnGreenRun(t *testing.T) {
 	}
 }
 
-// TestSpecUIChangeNeedsALook: a round that edits a file importing a UI
-// toolkit without one screenshot call is not done, with the reason; a round
-// that looked, or one that touched no UI file, is unaffected.
+// A round that looked, or touched no UI file, is unaffected.
 func TestSpecUIChangeNeedsALook(t *testing.T) {
 	_, sess := newTestAgent(t)
 	ui := filepath.Join(sess.Cwd, "rust", "src", "ui.rs")
@@ -293,11 +278,22 @@ func TestSpecUIChangeNeedsALook(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(ui), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(ui, []byte("use gtk::prelude::*;\n"), 0o644); err != nil {
+	if err := os.WriteFile(ui, []byte("use gtk::prelude::*;\n#[cfg(test)]\nmod tests {}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(plain, []byte("pub fn floor() -> f64 { 0.1 }\n"), 0o644); err != nil {
+	// Test code imports the toolkit too: an inline test module or a test file is not a screen.
+	if err := os.WriteFile(plain, []byte("pub fn floor() -> f64 { 0.1 }\n#[cfg(test)]\nmod tests { use gtk::prelude::*; }\n"), 0o644); err != nil {
 		t.Fatal(err)
+	}
+	uiTest := filepath.Join(sess.Cwd, "rust", "tests", "window.rs")
+	if err := os.MkdirAll(filepath.Dir(uiTest), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(uiTest, []byte("use gtk::prelude::*;\n#[test]\nfn f1_1_click() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := uiEditedUnseen([]ToolUse{{Name: "write_file", Input: `{"path":"rust/tests/window.rs"}`}}, sess.Cwd); got != nil {
+		t.Errorf("a test file edit demanded a look: %v", got)
 	}
 	editUI := ToolUse{Name: "edit_file", Input: `{"path":"rust/src/ui.rs"}`}
 	editPlain := ToolUse{Name: "write_file", Input: `{"path":"rust/src/rules.rs"}`}
@@ -327,8 +323,7 @@ func TestSpecUIChangeNeedsALook(t *testing.T) {
 	}
 }
 
-// TestSpecAuditPrompt: a bare /spec redo asks the model which finished items
-// fall short; the prompt names the spec files and the way to answer.
+// The audit prompt names the spec files and the way to answer.
 func TestSpecAuditPrompt(t *testing.T) {
 	a, s := newTestAgent(t)
 	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
@@ -343,5 +338,104 @@ func TestSpecAuditPrompt(t *testing.T) {
 	}
 	if strings.Contains(prompt, "{{") {
 		t.Errorf("unfilled placeholder:\n%s", prompt)
+	}
+}
+
+// A deleted section is removed without a card, a mass disappearance removes nothing, and a
+// moved section keeps its record.
+func TestSpecPickWorkRemovals(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every live item is built, so only the ledger's gone entries can make work.
+	built := func(extra map[string]specLedger) map[string]specLedger {
+		items := map[string]specLedger{}
+		for _, id := range idx.order {
+			items[id] = specLedger{Hash: specItemHash(idx, id), Title: idx.items[id].Title}
+		}
+		for id, led := range extra {
+			items[id] = led
+		}
+		return items
+	}
+	pick := func(items map[string]specLedger) (specWork, *specRun, string) {
+		t.Helper()
+		h := newTerminalHarness(t)
+		r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, idx: idx, reasons: map[string]string{},
+			cfg: &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "just test", Items: items}}
+		w := r.pickWork(t.Context(), nil, 1)
+		if m := h.sentMethods(); len(m) != 0 {
+			t.Errorf("pickWork asked the client %v, want no card", m)
+		}
+		log, err := os.ReadFile(sessionPath(h.sess.Cwd, h.sess.ID, "log"))
+		if err != nil {
+			t.Fatalf("no session log: %v", err)
+		}
+		return w, r, string(log)
+	}
+
+	const dropped = "§99-old#1-dropped"
+	w, r, log := pick(built(map[string]specLedger{dropped: {Hash: "whatever", Title: "1. Dropped"}}))
+	if w.Item != dropped || w.Mode != specModeRemove {
+		t.Errorf("work = %+v, want a removal round for %s", w, dropped)
+	}
+	if _, ok := r.cfg.Items[dropped]; !ok || r.vanished {
+		t.Errorf("the item must stay in the ledger until its removal round passes (vanished=%v)", r.vanished)
+	}
+	if !strings.Contains(log, "removed first: "+dropped) {
+		t.Errorf("the change report does not announce the removal:\n%s", log)
+	}
+
+	// More gone entries than live ones: the spec looks missing, not edited.
+	gone := map[string]specLedger{}
+	for i := range len(idx.order) + 1 {
+		gone[fmt.Sprintf("§99-old#%d-dropped", i)] = specLedger{Hash: "gone", Title: fmt.Sprintf("%d. Dropped", i)}
+	}
+	w, r, log = pick(built(gone))
+	if w.Item != "" || !r.vanished {
+		t.Errorf("work = %+v vanished=%v, want nothing scheduled", w, r.vanished)
+	}
+	for id := range gone {
+		if _, ok := r.cfg.Items[id]; !ok {
+			t.Errorf("%s left the ledger, want nothing forgotten", id)
+		}
+	}
+	if !strings.Contains(log, "looks missing or unreadable") || !strings.Contains(log, "nothing is deleted") {
+		t.Errorf("no warning line:\n%s", log)
+	}
+	// The remaining work still runs.
+	items := built(gone)
+	delete(items, idx.order[0])
+	if w, _, _ := pick(items); w.Item != idx.order[0] || w.Mode != specModeItem {
+		t.Errorf("work = %+v, want %s built while the removals are held", w, idx.order[0])
+	}
+
+	// A blocked removal waits for its answer instead of being picked every round.
+	blockedPick := func(answer string) specWork {
+		t.Helper()
+		h := newTerminalHarness(t)
+		r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, idx: idx, reasons: map[string]string{},
+			cfg: &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "just test",
+				Items:   built(map[string]specLedger{dropped: {Hash: "whatever", Title: "1. Dropped"}}),
+				Blocked: []specBlock{{ID: dropped, Reason: "stuck", Answer: answer}}}}
+		return r.pickWork(t.Context(), nil, 1)
+	}
+	if w := blockedPick(""); w.Item != "" {
+		t.Errorf("work = %+v, want the unanswered blocked removal skipped", w)
+	}
+	if w := blockedPick("keep the helper"); w.Item != dropped || w.Mode != specModeRemove || w.Answer != "keep the helper" {
+		t.Errorf("work = %+v, want the answered removal picked with its answer", w)
+	}
+
+	const moved, now = "§98-moved#1-screen", "§03-shell#1-screen"
+	items = built(map[string]specLedger{moved: {Hash: "moved", Title: idx.items[now].Title}})
+	delete(items, now)
+	w, r, _ = pick(items)
+	if w.Item != "" {
+		t.Errorf("work = %+v, want nothing: a moved section is not a removal", w)
+	}
+	if _, ok := r.cfg.Items[now]; !ok {
+		t.Errorf("the record did not follow the moved section to %s", now)
 	}
 }

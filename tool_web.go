@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
-	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,24 +18,17 @@ import (
 	"github.com/coder/websocket"
 )
 
-// ---------------------------------------------------------------------------
-// Browser client (WebDriver BiDi over WebSocket → headless Firefox)
-// ---------------------------------------------------------------------------
-
-// Browser manages a Firefox instance controlled via WebDriver BiDi.
 type Browser struct {
 	cmd        *exec.Cmd
 	profileDir string
 	conn       *websocket.Conn
 	port       int
-	initialTab string // context ID of the tab Firefox opened with
+	initialTab string
 
 	mu      sync.Mutex
 	nextID  atomic.Int64
 	pending map[int64]chan json.RawMessage
 }
-
-// BiDi message types per W3C spec.
 
 type bidiRequest struct {
 	ID     int64  `json:"id"`
@@ -52,8 +44,6 @@ type bidiResponse struct {
 	Message string          `json:"message,omitempty"`
 }
 
-// StartBrowser launches Firefox in private mode with BiDi enabled.
-// initialURL is opened in the first tab (use "about:blank" if none).
 func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, error) {
 	firefoxPath, err := findFirefox()
 	if err != nil {
@@ -65,10 +55,8 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 		return nil, fmt.Errorf("creating temp profile: %w", err)
 	}
 
-	// Start on about:blank, not initialURL: the CLI-driven load gives us no
-	// "load complete" signal, so PageText races the renderer and snapshots an
-	// empty body on fast servers. We Navigate() to initialURL below with
-	// wait:"complete" once BiDi is up.
+	// Start on about:blank: a CLI-driven load has no load-complete signal, so the
+	// real navigation goes through BiDi with wait:"complete" below.
 	cmd := exec.CommandContext(ctx, firefoxPath,
 		"-headless",
 		"--private-window",
@@ -94,26 +82,22 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 		pending:    make(map[int64]chan json.RawMessage),
 	}
 
-	// Wait for Firefox to accept connections.
 	if err := b.waitReady(ctx); err != nil {
 		b.Close()
 		return nil, err
 	}
 
-	// Connect WebSocket to BiDi endpoint.
 	wsURL := fmt.Sprintf("ws://127.0.0.1:%d/session", port)
 	conn, _, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
 		b.Close()
 		return nil, fmt.Errorf("connecting websocket to %s: %w", wsURL, err)
 	}
-	conn.SetReadLimit(10 * 1024 * 1024) // 10MB
+	conn.SetReadLimit(10 * 1024 * 1024)
 	b.conn = conn
 
-	// Start reading messages.
 	go b.readLoop()
 
-	// Create a BiDi session.
 	result, err := b.Send(ctx, "session.new", map[string]any{
 		"capabilities": map[string]any{},
 	})
@@ -123,7 +107,6 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 	}
 	slog.Info("bidi session created", "result", string(result))
 
-	// Get the initial tab's context ID (Firefox opened on about:blank).
 	treeResult, err := b.Send(ctx, "browsingContext.getTree", map[string]any{})
 	if err == nil {
 		var tree struct {
@@ -140,14 +123,15 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 		}
 	}
 
-	// Drive the real navigation through BiDi so we get a load-complete barrier.
-	// Cap at 10s: wait:"complete" can hang on pages that never fire the load
-	// event (long-poll chats, sites that keep streaming). On timeout we ignore
-	// the error and continue — PageText on a partially-loaded body still beats
-	// failing the tool call.
+	// Capped: wait:"complete" can hang on pages that never fire load (long-poll,
+	// streaming). On timeout the partially loaded body still beats failing.
 	if b.initialTab != "" && initialURL != "" {
 		navCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := b.Navigate(navCtx, b.initialTab, initialURL)
+		_, err := b.Send(navCtx, "browsingContext.navigate", map[string]any{
+			"context": b.initialTab,
+			"url":     initialURL,
+			"wait":    "complete",
+		})
 		cancel()
 		if err != nil && navCtx.Err() == nil {
 			b.Close()
@@ -158,7 +142,6 @@ func StartBrowser(ctx context.Context, port int, initialURL string) (*Browser, e
 	return b, nil
 }
 
-// Send sends a BiDi command and waits for the response.
 func (b *Browser) Send(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	id := b.nextID.Add(1)
 
@@ -196,31 +179,6 @@ func (b *Browser) Send(ctx context.Context, method string, params any) (json.Raw
 	}
 }
 
-// Navigate navigates a tab to the given URL and waits for load.
-func (b *Browser) Navigate(ctx context.Context, contextID, url string) error {
-	_, err := b.Send(ctx, "browsingContext.navigate", map[string]any{
-		"context": contextID,
-		"url":     url,
-		"wait":    "complete",
-	})
-	return err
-}
-
-// CloseTab closes a browsing context.
-func (b *Browser) CloseTab(ctx context.Context, contextID string) {
-	if _, err := b.Send(ctx, "browsingContext.close", map[string]any{
-		"context": contextID,
-	}); err != nil {
-		slog.Debug("CloseTab failed", "context", contextID, "err", err)
-	}
-}
-
-// PageText returns the visible text content of a tab.
-func (b *Browser) PageText(ctx context.Context, contextID string) (string, error) {
-	return b.EvalJS(ctx, contextID, "document.body.innerText")
-}
-
-// EvalJS runs JavaScript in a tab and returns the string result.
 func (b *Browser) EvalJS(ctx context.Context, contextID, script string) (string, error) {
 	result, err := b.Send(ctx, "script.evaluate", map[string]any{
 		"expression":   script,
@@ -242,7 +200,6 @@ func (b *Browser) EvalJS(ctx context.Context, contextID, script string) (string,
 	return evalResult.Result.Value, nil
 }
 
-// Close shuts down the browser.
 func (b *Browser) Close() {
 	if b.conn != nil {
 		b.conn.Close(websocket.StatusNormalClosure, "shutdown")
@@ -271,7 +228,6 @@ func (b *Browser) readLoop() {
 			continue
 		}
 
-		// Dispatch responses (have an ID) to pending callers.
 		if resp.ID > 0 {
 			b.mu.Lock()
 			ch, ok := b.pending[resp.ID]
@@ -280,11 +236,9 @@ func (b *Browser) readLoop() {
 				ch <- data
 			}
 		}
-		// Events (no ID) are ignored for now.
 	}
 }
 
-// waitReady polls the TCP port until Firefox accepts connections.
 func (b *Browser) waitReady(ctx context.Context) error {
 	addr := fmt.Sprintf("127.0.0.1:%d", b.port)
 	for range 30 {
@@ -304,10 +258,6 @@ func (b *Browser) waitReady(ctx context.Context) error {
 	return fmt.Errorf("firefox did not become ready on port %d after 15s", b.port)
 }
 
-// findFirefox locates the browser for both users of it, the web tools and
-// screenshot. FIREFOX_PATH wins; then the names it ships under across distros
-// (Debian and Ubuntu package the ESR line as firefox-esr, some tarball installs
-// land as firefox-bin); then the fixed paths a PATH-less launch still finds.
 func findFirefox() (string, error) {
 	if p := os.Getenv("FIREFOX_PATH"); p != "" {
 		return p, nil
@@ -317,7 +267,6 @@ func findFirefox() (string, error) {
 			return p, nil
 		}
 	}
-	// Common paths.
 	for _, p := range []string{
 		"/usr/bin/firefox",
 		"/usr/bin/firefox-esr",
@@ -331,16 +280,10 @@ func findFirefox() (string, error) {
 	return "", fmt.Errorf("no Firefox found (tried firefox, firefox-esr, firefox-bin on PATH and the usual install paths); set FIREFOX_PATH")
 }
 
-// ---------------------------------------------------------------------------
-// Tool wrappers
-// ---------------------------------------------------------------------------
-
 const maxWebSearchResults = 10
 
 var browserPortCounter atomic.Int32
 
-// nextBrowserPort hands each headless Firefox its own remote-debugging port,
-// counting up from 9223.
 func nextBrowserPort() int {
 	return 9222 + int(browserPortCounter.Add(1))
 }
@@ -375,7 +318,6 @@ var webTools = []Tool{
 
 		searchURL := "https://duckduckgo.com/?q=" + url.QueryEscape(query)
 
-		// Each search gets its own browser instance.
 		port := nextBrowserPort()
 		browser, err := StartBrowser(ctx, port, searchURL)
 		if err != nil {
@@ -385,10 +327,8 @@ var webTools = []Tool{
 		defer browser.Close()
 		searchTab := browser.initialTab
 
-		// Wait for DDG results to render. Per-iteration errors are transient
-		// (page not rendered yet), so we keep polling — but remember the last
-		// one so a consistent failure (browser/JS error) surfaces in the result
-		// instead of being indistinguishable from "DDG returned nothing".
+		// Polling errors are transient, but the last one is kept so a consistent
+		// failure is not reported as "DDG returned nothing".
 		var results []ddgResult
 		var extractErr error
 	poll:
@@ -399,14 +339,11 @@ var webTools = []Tool{
 			}
 			select {
 			case <-ctx.Done():
-				// A user Stop kills Firefox immediately; don't burn the remaining
-				// 15s of sleeps before unwinding.
 				extractErr = ctx.Err()
 				break poll
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
-		browser.CloseTab(ctx, searchTab)
 		if len(results) == 0 {
 			msg := "no search results found"
 			if extractErr != nil {
@@ -424,26 +361,18 @@ var webTools = []Tool{
 		a.CompleteToolCallTitled(ctx, sid, tcId,
 			fmt.Sprintf("DuckDuckGo: %s (%d results)", query, len(results)),
 			[]ToolCallContent{TextContent(formatted)})
-		// Surface the list inline in the chat too, so the user can see the
-		// URLs and snippets without expanding the tool card.
 		a.say(ctx, sid, "\n"+formatted+"\n")
 		a.logSession(sid, "WEB", "results (%d):\n%s", len(results), formatted)
 		return formatted, false
 	}},
 
-	{Def: webReadDef(), Execute: webReadExecute},
-}
-
-// webReadDef builds web_read's schema: the page's extracted text, paged with
-// offset/limit from a cached body. There is no "answer my question" mode: the
-// model reads the text itself, which it does as well as a second reader would
-// and without the extra round trip.
-func webReadDef() map[string]any {
-	def := map[string]any{
+	// Deliberately no "answer my question" mode: the model reads the text
+	// itself, without the extra round trip.
+	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "web_read",
-			"description": fmt.Sprintf("Open a URL in Firefox and return the page's extracted text, truncated at %d characters. The full body is cached for this session, so `offset`/`limit` read a deeper region without re-fetching. Read it yourself: quote exact versions, names, commands and URLs from it. The user will review the page before the result is returned.", maxRawPageChars),
+			"description": fmt.Sprintf("Open a URL in Firefox and return the page's extracted text, truncated at %d characters. The full body is cached for this session, so `offset`/`limit` read a deeper region without re-fetching. Read it yourself: quote exact versions, names, commands and URLs from it.", maxRawPageChars),
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"url"},
@@ -463,22 +392,14 @@ func webReadDef() map[string]any {
 				},
 			},
 		},
-	}
-	return def
+	}, Execute: webReadExecute},
 }
 
 const (
-	// maxRawPageChars caps the bytes web_read returns on the FIRST fetch (before
-	// truncateForLLM further compresses for the model). Full body is still
-	// cached so range reads can dip past this.
-	maxRawPageChars = 30000
-	// maxWebRangeChars caps a single offset/limit slice from the cached body
-	// so a "view more" can't dump megabytes back into the prefix at once.
+	maxRawPageChars  = 30000
 	maxWebRangeChars = 8000
 )
 
-// webReadExecute fetches a page in Firefox and returns its text, truncated, or
-// a slice of the cached body when offset/limit ask for one.
 func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 	args := parseArgs(rawArgs)
 	targetURL := args.str("url")
@@ -493,42 +414,28 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 	if limit <= 0 || limit > maxWebRangeChars {
 		limit = maxWebRangeChars
 	}
-	// Any supplied `limit` means the model wants a slice, even one we then
-	// clamp — presence is the signal, not the value.
+	// Any supplied `limit` means a slice, even one clamped: presence is the signal.
 	rangeRequest := offset > 0 || args.has("limit")
-	resultKey := targetURL
 
-	// Range request hits the cache first — no second HTTP round-trip when
-	// the page was fetched earlier in this session. Cache miss falls
-	// through to the regular fetch path so the model can still get a slice
-	// (it just costs the fetch the first time).
-	if rangeRequest {
-		if sess := a.getSession(sid); sess != nil {
-			if body, ok := sess.recallWebBody(targetURL); ok {
+	// A cached body skips a second Firefox launch; a repeat without a range gets
+	// the same bytes the first call returned.
+	if sess := a.getSession(sid); sess != nil {
+		if body, ok := sess.recallWebBody(targetURL); ok {
+			tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
+			if rangeRequest {
 				slice := sliceWebBody(body, offset, limit)
-				tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
 				a.CompleteToolCallTitled(ctx, sid, tcId,
 					fmt.Sprintf("Web Read (cached): %s [%d:%d of %d]", targetURL, offset, offset+len(slice), len(body)),
 					[]ToolCallContent{TextContent(fmt.Sprintf("returned %d chars from cache (offset %d, body %d)", len(slice), offset, len(body)))})
 				a.logSession(sid, "WEB", "range from cache: url=%s offset=%d limit=%d returned=%d body=%d", targetURL, offset, limit, len(slice), len(body))
 				return slice, false
 			}
-		}
-	} else {
-		// No-range repeat on the same URL: return the previously-rendered output
-		// verbatim. Small models often re-ask for the same URL within one phase
-		// (or across plan→execute); skipping the fetch saves the dominant cost
-		// (Firefox launch + page load is 30-60s). Identical bytes are also nice
-		// to the prefix cache if the second call shows up in the same prompt.
-		if sess := a.getSession(sid); sess != nil {
-			if cached, ok := sess.recallWebResult(resultKey); ok {
-				tcId := a.StartToolCall(ctx, sid, "Web Read (cached): "+targetURL, "search", nil)
-				a.CompleteToolCallTitled(ctx, sid, tcId,
-					"Web Read (cached): "+targetURL,
-					[]ToolCallContent{TextContent(fmt.Sprintf("returned cached result (%d chars, no re-fetch)", len(cached)))})
-				a.logSession(sid, "WEB", "result from cache: url=%s returned=%d", targetURL, len(cached))
-				return cached, false
-			}
+			out := firstPage(body)
+			a.CompleteToolCallTitled(ctx, sid, tcId,
+				"Web Read (cached): "+targetURL,
+				[]ToolCallContent{TextContent(fmt.Sprintf("returned cached result (%d chars, no re-fetch)", len(out)))})
+			a.logSession(sid, "WEB", "result from cache: url=%s returned=%d", targetURL, len(out))
+			return out, false
 		}
 	}
 
@@ -545,25 +452,20 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 	defer browser.Close()
 	tabID := browser.initialTab
 
-	text, err := browser.PageText(ctx, tabID)
+	text, err := browser.EvalJS(ctx, tabID, "document.body.innerText")
 	if err != nil {
 		a.logSession(sid, "WEB", "page text error: %s", err.Error())
 		a.FailToolCall(ctx, sid, tcId, "page text error: "+err.Error())
 		return "error getting page text: " + err.Error(), false
 	}
 
-	// Cache the full extracted text BEFORE truncation: later offset/limit
-	// calls slice from this and can reach past the raw cap.
+	// Cache the full text BEFORE truncation, so range reads can reach past the cap.
 	if sess := a.getSession(sid); sess != nil {
 		sess.rememberWebBody(targetURL, text)
 	}
 
-	// Binary success/failure marker after the URL: ✅ when the body looks
-	// like real content, ❌ when pageIssue flags a load failure, bot wall,
-	// or content too thin to use. The card itself is still marked
-	// completed (not failed) because the model can decide to retry or fall
-	// back to web_search; we don't want Zed to bury
-	// the result in a red-collapsed card.
+	// The card is completed, not failed, even on ❌: the model may retry, and Zed
+	// would bury a failed card collapsed in red.
 	icon, msg := "✅", "Page loaded"
 	if issue := pageIssue(text); issue != "" {
 		icon, msg = "❌", issue
@@ -571,32 +473,21 @@ func webReadExecute(ctx context.Context, a *agent, sid string, rawArgs string) (
 	a.CompleteToolCallTitled(ctx, sid, tcId, "Web Read: "+targetURL+" "+icon,
 		[]ToolCallContent{TextContent(icon + " " + msg)})
 
-	a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), stripHTMLAttrs(text))
+	a.logSession(sid, "WEB", "page text (%d chars):\n%s", len(text), text)
 
-	// A range request that fell through (cache miss) returns a slice of
-	// the freshly-fetched body — honor offset/limit even on the first
-	// call so the model gets exactly what it asked for. Range slices are
-	// NOT memoized in webResults (offset/limit vary), but the underlying
-	// body is in webBodies so the next range call is still free.
 	if rangeRequest {
 		return sliceWebBody(text, offset, limit), false
 	}
-	out := text
-	if len(out) > maxRawPageChars {
-		out = clipUTF8(out, maxRawPageChars) + "\n... (truncated)"
-	}
-	if sess := a.getSession(sid); sess != nil {
-		sess.rememberWebResult(resultKey, out)
-	}
-	return out, false
+	return firstPage(text), false
 }
 
-// sliceWebBody returns up to `limit` bytes of `body` starting at `offset`,
-// clamping both ends so out-of-range arguments produce a sensible empty/last
-// slice instead of a panic. The model can pass offset past the end (e.g. when
-// it doesn't know the exact length) — we return "" rather than erroring so the
-// model can correct on the next call. offset/limit snap to rune boundaries so a
-// range read never splits a multibyte character.
+func firstPage(body string) string {
+	if len(body) > maxRawPageChars {
+		return clipUTF8(body, maxRawPageChars) + "\n... (truncated)"
+	}
+	return body
+}
+
 func sliceWebBody(body string, offset, limit int) string {
 	if offset >= len(body) {
 		return ""
@@ -607,69 +498,6 @@ func sliceWebBody(body string, offset, limit int) string {
 	return clipUTF8(body[offset:], limit)
 }
 
-// HTML log cleanup: keep semantic structure (headings, lists, tables, code,
-// anchors), drop layout chrome and binary blobs. Regex-based; not an HTML
-// parser — good enough for log readability, not for security-sensitive use.
-
-// dropBlockTags removes the opening tag, all content, and the closing tag.
-// Used for elements whose body is non-text (CSS, JS, vector graphics) or
-// universally noisy (forms aren't here because we unwrap them).
-var dropBlockTags = []string{"script", "style", "svg", "noscript", "iframe", "canvas", "head"}
-
-// dropVoidTags are self-closing or contentless tags we erase entirely.
-var dropVoidTags = map[string]bool{
-	"img": true, "br": true, "hr": true, "meta": true, "link": true,
-	"base": true, "input": true, "source": true, "track": true, "area": true,
-}
-
-// unwrapTags lose their open/close markers but keep inner text.
-var unwrapTags = map[string]bool{
-	"div": true, "span": true, "nav": true, "header": true, "footer": true,
-	"aside": true, "section": true, "article": true, "main": true,
-	"body": true, "html": true, "figure": true, "figcaption": true,
-	"picture": true, "label": true, "button": true, "form": true,
-	"fieldset": true, "legend": true,
-}
-
-// dropBlockRes matches each noise-block element (one regex per tag, since
-// RE2 has no backreferences). `(?is)` = case-insensitive + dotall.
-var dropBlockRes = func() []*regexp.Regexp {
-	out := make([]*regexp.Regexp, len(dropBlockTags))
-	for i, t := range dropBlockTags {
-		out[i] = regexp.MustCompile(`(?is)<` + t + `\b[^>]*>.*?</` + t + `\s*>`)
-	}
-	return out
-}()
-
-var tagRe = regexp.MustCompile(`(?i)<(/?)([a-zA-Z][a-zA-Z0-9]*)([^>]*)>`)
-var hrefRe = regexp.MustCompile(`(?i)\shref\s*=\s*("[^"]*"|'[^']*'|\S+)`)
-
-// stripHTMLAttrs collapses HTML to its skeleton: noise blocks gone, layout
-// wrappers unwrapped, attributes dropped (except href on anchors). Aimed at
-// keeping the per-session log readable when we eventually capture raw HTML.
-func stripHTMLAttrs(s string) string {
-	for _, re := range dropBlockRes {
-		s = re.ReplaceAllString(s, "")
-	}
-	return tagRe.ReplaceAllStringFunc(s, func(match string) string {
-		sub := tagRe.FindStringSubmatch(match)
-		closing, tag, attrs := sub[1], strings.ToLower(sub[2]), sub[3]
-		if dropVoidTags[tag] || unwrapTags[tag] {
-			return ""
-		}
-		if tag == "a" && closing == "" {
-			if href := hrefRe.FindString(attrs); href != "" {
-				return "<a" + href + ">"
-			}
-		}
-		return "<" + closing + tag + ">"
-	})
-}
-
-// botWallPatterns are case-insensitive substrings that strongly suggest a
-// page is a Cloudflare interstitial, captcha challenge, access denial, or
-// rate-limit wall rather than the content the agent asked for. Matched by
-// pageIssue against the rendered body text.
 var botWallPatterns = []struct {
 	needle string
 	label  string
@@ -687,10 +515,6 @@ var botWallPatterns = []struct {
 	{"too many requests", "rate limited"},
 }
 
-// pageIssue returns a short label when the rendered body looks like a bot
-// wall, captcha, access denial, or failed load. Empty string means the page
-// looks normal. Text-heuristic only; misses sophisticated walls, but catches
-// the common Cloudflare/captcha/403 patterns that derail web_search runs.
 func pageIssue(text string) string {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
@@ -708,17 +532,14 @@ func pageIssue(text string) string {
 	return ""
 }
 
-// ddgResult is one row from a DuckDuckGo SERP.
 type ddgResult struct {
 	Title   string `json:"title"`
 	URL     string `json:"url"`
 	Snippet string `json:"snippet"`
 }
 
-// extractDDGResults pulls title/URL/snippet for each result on a DDG SERP and
-// drops duplicate URLs. DDG renders the same anchor in multiple sections
-// (organic + "people also viewed" + mobile carousel) so the raw query returns
-// the same href several times; we keep first-occurrence order.
+// extractDDGResults drops duplicate URLs: DDG renders the same anchor in several
+// sections (organic, "people also viewed", mobile carousel).
 func extractDDGResults(ctx context.Context, b *Browser, contextID string) ([]ddgResult, error) {
 	js := `JSON.stringify(
 		Array.from(document.querySelectorAll('a[data-testid="result-title-a"]')).map(a => {
@@ -755,9 +576,6 @@ func extractDDGResults(ctx context.Context, b *Browser, contextID string) ([]ddg
 	return out, nil
 }
 
-// formatDDGResults renders the result list as a compact numbered text block
-// for the LLM (and the chat panel) — title on one line, URL on the next,
-// snippet (when present) indented underneath.
 func formatDDGResults(rs []ddgResult) string {
 	var b strings.Builder
 	for i, r := range rs {

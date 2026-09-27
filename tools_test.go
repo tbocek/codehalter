@@ -8,13 +8,12 @@ import (
 	"testing"
 )
 
-// TestResolvePathSymlinkEscape pins the symlink-aware sandbox: a symlink living
-// under cwd but TARGETING outside it must be rejected (a plain string-prefix check
-// would pass it), while plain in-tree files and in-tree symlinks still resolve.
+// An in-tree symlink to an out-of-tree target is rejected; in-tree files and
+// in-tree symlinks still resolve.
 func TestResolvePathSymlinkEscape(t *testing.T) {
 	a, s := newTestAgent(t)
 
-	outside := t.TempDir() // a directory OUTSIDE the session cwd
+	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +24,6 @@ func TestResolvePathSymlinkEscape(t *testing.T) {
 		t.Error("resolvePath followed a symlink out of cwd (sandbox escape)")
 	}
 
-	// A plain in-tree file resolves.
 	if err := os.WriteFile(filepath.Join(s.Cwd, "ok.txt"), []byte("y"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +31,6 @@ func TestResolvePathSymlinkEscape(t *testing.T) {
 		t.Errorf("in-tree file rejected: %v", err)
 	}
 
-	// An in-tree symlink to another in-tree path still works.
 	if err := os.MkdirAll(filepath.Join(s.Cwd, "real"), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -46,24 +43,21 @@ func TestResolvePathSymlinkEscape(t *testing.T) {
 	}
 }
 
-// TestArgsWrongType pins the guard that stops a non-string tool argument from
-// clobbering a file: a real string (incl. the empty string) passes, every
-// non-string JSON value is flagged so write_file/edit_file can reject the call
-// instead of writing "".
+// A string, even "", passes; every non-string JSON value is flagged.
 func TestArgsWrongType(t *testing.T) {
 	cases := []struct {
 		raw  string
 		want bool
 	}{
-		{`{"content":"hi"}`, false},   // string
-		{`{"content":""}`, false},     // empty string is STILL a string
-		{`{"content":123}`, true},     // number
-		{`{"content":null}`, true},    // null
-		{`{"content":{"a":1}}`, true}, // object
-		{`{"content":["x"]}`, true},   // array
-		{`{"content":true}`, true},    // bool
-		{`{"path":"x"}`, false},       // key absent
-		{`not json`, false},           // not a JSON object
+		{`{"content":"hi"}`, false},
+		{`{"content":""}`, false},
+		{`{"content":123}`, true},
+		{`{"content":null}`, true},
+		{`{"content":{"a":1}}`, true},
+		{`{"content":["x"]}`, true},
+		{`{"content":true}`, true},
+		{`{"path":"x"}`, false},
+		{`not json`, false},
 	}
 	for _, c := range cases {
 		if got := parseArgs(c.raw).wrongType("content"); got != c.want {
@@ -72,12 +66,7 @@ func TestArgsWrongType(t *testing.T) {
 	}
 }
 
-// TestArgsTypedAccessors pins the bug this type exists to prevent: our own tool
-// schemas declare `line`/`limit` as integers and `regex` as a boolean, so a
-// schema-obedient model sends JSON numbers and booleans. Decoding those into
-// map[string]string dropped them to "" and the tool ran with its defaults while
-// reporting success — read_file silently read from line 1. Both the
-// schema-correct form and the quoted form a sloppier model emits must work.
+// Schema-correct JSON numbers and bools decode, and so do the quoted forms.
 func TestArgsTypedAccessors(t *testing.T) {
 	t.Run("num from JSON number", func(t *testing.T) {
 		a := parseArgs(`{"path":"x.go","line":42,"limit":10}`)
@@ -133,7 +122,6 @@ func TestArgsTypedAccessors(t *testing.T) {
 		}
 	})
 	t.Run("one bad key does not drop the others", func(t *testing.T) {
-		// The original failure mode: a type error aborted the whole decode.
 		a := parseArgs(`{"path":"x.go","line":42}`)
 		if a.str("path") != "x.go" {
 			t.Errorf("str(path) = %q, want x.go", a.str("path"))
@@ -141,10 +129,7 @@ func TestArgsTypedAccessors(t *testing.T) {
 	})
 }
 
-// TestLiveToolOutput pins the size policy used in BOTH the live call and the
-// history re-render (identical now → a replay is byte-faithful → cache stays
-// warm): content-retrieval tools pass through whole, every other tool gets the
-// head/tail clip. truncateForLLM is that clip, exercised directly below.
+// Content-retrieval tools pass through whole; every other tool gets the clip.
 func TestLiveToolOutput(t *testing.T) {
 	big := strings.Repeat("x", truncateThreshold*3)
 
@@ -164,13 +149,10 @@ func TestLiveToolOutput(t *testing.T) {
 	}
 }
 
-// TestLiveExemptCap pins the per-call byte ceiling on the content tools: even
-// the "pass through whole" tools can't blow n_ctx in one call — an oversized
-// output is clipped at a line boundary, reports how much was omitted, and the
-// kept span ends on a newline (no mid-line cut).
+// An oversized exempt output is clipped at a line boundary, never mid-line.
 func TestLiveExemptCap(t *testing.T) {
 	line := strings.Repeat("a", 80) + "\n"
-	huge := strings.Repeat(line, liveExemptCap/len(line)+50) // comfortably over the cap
+	huge := strings.Repeat(line, liveExemptCap/len(line)+50)
 
 	got := liveToolOutput("read_file", "{}", huge)
 	if got == huge {
@@ -188,9 +170,6 @@ func TestLiveExemptCap(t *testing.T) {
 	}
 }
 
-// TestWebSearchRefineHint pins that web_search overflow steers the model to
-// refine the query — the "ask to refine" half of the
-// truncation contract.
 func TestWebSearchRefineHint(t *testing.T) {
 	hint := truncationHint("web_search", `{"query":"x"}`)
 	if !strings.Contains(hint, "refine the query") {
@@ -218,9 +197,7 @@ func toolNames(defs []map[string]any) []string {
 	return names
 }
 
-// TestResolvePath covers the sandbox boundary: relative paths are joined to
-// sess.Cwd; absolute paths must already live inside it; `..` that would escape
-// the root is rejected.
+// Relative paths join cwd, absolute ones must be inside it, and `..` escapes fail.
 func TestResolvePath(t *testing.T) {
 	a, s := newTestAgent(t)
 	cwd := s.Cwd
@@ -263,29 +240,13 @@ func TestResolvePath(t *testing.T) {
 	}
 }
 
-// TestAllToolDefinitions pins the cache invariant that replaced per-phase
-// pruning: toolRegistry.defs returns EVERY tool, sorted by name
-// (NOT registration order), so the rendered `tools` block is byte-identical
-// across phases and turns. (Registered out of order on purpose.)
+// defs is sorted by name, not registration order (registered out of order here).
 func TestAllToolDefinitions(t *testing.T) {
 	a := &agent{}
 	withTools(a, Tool{Def: toolDef("read")}, Tool{Def: toolDef("write")}, Tool{Def: toolDef("other")})
 
 	if got, want := toolNames(a.tools.defs()), []string{"other", "read", "write"}; !slices.Equal(got, want) {
 		t.Errorf("got %v, want %v (all tools, sorted)", got, want)
-	}
-}
-
-// TestTerminalList pins how a phase's terminal tools are named in a nudge:
-// sorted, so the message is stable. (The gate itself is covered by
-// TestRunToolLoopDenyGate.)
-func TestTerminalList(t *testing.T) {
-	p := phasePolicy{
-		deny:      map[string]bool{"edit_file": true},
-		terminals: map[string]bool{"respond": true, "submit_plan": true},
-	}
-	if got := terminalList(p); got != "`respond` or `submit_plan`" {
-		t.Errorf("terminalList: %q", got)
 	}
 }
 

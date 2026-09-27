@@ -8,66 +8,10 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 )
 
-// TestBoundedOutput pins the head+tail capture: small streams come back verbatim,
-// streams up to headCap+tailCap stitch without duplicating or dropping the
-// overlap, and larger streams keep the head and the last tailCap with an elision
-// marker for the middle.
-func TestBoundedOutput(t *testing.T) {
-	// cap 16 → headCap 4, tailCap 12.
-
-	// Fits entirely (<= tailCap): verbatim, not truncated.
-	b := newBoundedOutput(16)
-	b.Write([]byte("abcdefghij")) // 10
-	if got := b.String(); got != "abcdefghij" {
-		t.Errorf("fit: got %q", got)
-	}
-	// tailCap < total <= headCap+tailCap: head+tail stitched, no marker, no dup/gap.
-	b = newBoundedOutput(16)
-	b.Write([]byte("abcdefghijklmn")) // 14
-	if got := b.String(); got != "abcdefghijklmn" {
-		t.Errorf("stitch: got %q (want full 14, no marker)", got)
-	}
-	// Past the cap: head + marker + last tailCap, middle elided.
-	b = newBoundedOutput(16)
-	b.Write([]byte("abcdefghijklmnopqrst")) // 20
-	if got := b.String(); got != "abcd\n[... 4 bytes omitted ...]\nijklmnopqrst" {
-		t.Errorf("over: got %q", got)
-	}
-	// Byte-at-a-time matches one-shot, and the ring keeps exactly the last tailCap
-	// even after crossing the 2*tailCap trim point.
-	b = newBoundedOutput(16)
-	for _, c := range "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" { // 36 bytes
-		b.Write([]byte{byte(c)})
-	}
-	got := b.String()
-	if !strings.HasPrefix(got, "0123") || !strings.HasSuffix(got, "OPQRSTUVWXYZ") {
-		t.Errorf("ring: got %q (want head 0123… tail …OPQRSTUVWXYZ)", got)
-	}
-	if !strings.Contains(got, "bytes omitted") {
-		t.Errorf("ring: missing elision marker: %q", got)
-	}
-}
-
-// TestBoundedOutputKeepsUTF8 pins that eliding the middle never splits a
-// character at either cut: the output is stored in the session file, where one
-// invalid byte made the whole session unloadable.
-func TestBoundedOutputKeepsUTF8(t *testing.T) {
-	for shift := 0; shift < 3; shift++ {
-		b := newBoundedOutput(16)
-		b.Write([]byte(strings.Repeat("x", shift) + strings.Repeat("→", 20)))
-		if out := b.String(); !utf8.ValidString(out) {
-			t.Errorf("shift %d: invalid UTF-8: %q", shift, out)
-		}
-	}
-}
-
-// TestRunCommandEndToEnd pins what run_command hands back and what it leaves in
-// the card: the exit code leads the result (a probe exiting non-zero is data,
-// not a failure), the output is there, and the card keeps the live terminal
-// instead of a static text copy of it.
+// The exit code leads the result (non-zero is data) and the card keeps the live
+// terminal rather than a text copy.
 func TestRunCommandEndToEnd(t *testing.T) {
 	h := newTerminalHarness(t)
 
@@ -97,9 +41,7 @@ func TestRunCommandEndToEnd(t *testing.T) {
 	}
 }
 
-// TestRunCommandIsAShellLine pins that the model's command keeps shell
-// semantics. terminal/create takes an argv, so run_command has to wrap it in
-// bash -c; without that, every pipe, redirect and `&&` would break.
+// terminal/create takes an argv, so run_command must wrap the line in bash -c.
 func TestRunCommandIsAShellLine(t *testing.T) {
 	h := newTerminalHarness(t)
 
@@ -110,10 +52,8 @@ func TestRunCommandIsAShellLine(t *testing.T) {
 	}
 }
 
-// TestRunCommandCapsHugeOutput pins the total-output cap: a command that prints
-// far more than cmdOutputCap comes back as a bounded head+tail with an elision
-// marker, so it can't poison a small-context model — while still running to
-// completion, with both its first and last lines intact.
+// Output past cmdOutputCap comes back as head+tail with a marker, the command
+// still running to completion.
 func TestRunCommandCapsHugeOutput(t *testing.T) {
 	h := newTerminalHarness(t)
 	saved := cmdOutputCap
@@ -141,8 +81,6 @@ func TestRunCommandCapsHugeOutput(t *testing.T) {
 	}
 }
 
-// TestRunCommandRequiresCommand pins the empty-args guard, which the local
-// models hit often enough to matter.
 func TestRunCommandRequiresCommand(t *testing.T) {
 	h := newTerminalHarness(t)
 	res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{}`)
@@ -151,10 +89,8 @@ func TestRunCommandRequiresCommand(t *testing.T) {
 	}
 }
 
-// TestRunCommandRefusesSleepForBackgroundJob: a foreground sleep while one of
-// the session's jobs runs is a guessed wait for it; the job wakes the model on
-// its own, so the sleep is refused and names the job. With no job running a
-// sleep is an ordinary command, and a sleep inside other work is not a wait.
+// With no job running a sleep is ordinary, and a sleep inside other work is not
+// a wait.
 func TestRunCommandRefusesSleepForBackgroundJob(t *testing.T) {
 	h := newTerminalHarness(t)
 	res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 0.01"}`)
@@ -176,9 +112,7 @@ func TestRunCommandRefusesSleepForBackgroundJob(t *testing.T) {
 	}
 }
 
-// TestRunCommandSignalExit pins that a signal death is not read as success:
-// the wrapper reports the command's status through pipefail, so a SIGKILL
-// comes back as 137, never as a zero-value 0.
+// A SIGKILL comes back as 137 through pipefail, never as a zero-value 0.
 func TestRunCommandSignalExit(t *testing.T) {
 	h := newTerminalHarness(t)
 	result, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"kill -9 $$"}`)
@@ -190,8 +124,7 @@ func TestRunCommandSignalExit(t *testing.T) {
 	}
 }
 
-// TestRunCommandCancelReportsPartialOutput pins that a cancelled turn still
-// hands back what the command printed, kills it, and leaves no job behind.
+// The command is also killed and leaves no job behind.
 func TestRunCommandCancelReportsPartialOutput(t *testing.T) {
 	h := newTerminalHarness(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -203,15 +136,13 @@ func TestRunCommandCancelReportsPartialOutput(t *testing.T) {
 	if !strings.Contains(result, "early") || !strings.Contains(result, "terminal error") {
 		t.Errorf("result = %q, want the output produced before the cancel and the error", result)
 	}
-	if left := h.agent.runningBgJobs(h.sess.ID); left != "" {
+	if left := h.agent.runningBgJobs(h.sess.ID, nil); left != "" {
 		t.Errorf("a cancelled command stayed tracked: %s", left)
 	}
 }
 
-// TestRunCommandHandsOverAfterWait is the point of launching every command as
-// a job: one that outlives the wait is not killed. The model gets what it
-// printed so far and a job id, the card says so, and the exit later arrives
-// as a note with the exit code and the log tail, exactly as for run_background.
+// The command is not killed; its exit later arrives as a note with the code and
+// log tail, as for run_background.
 func TestRunCommandHandsOverAfterWait(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
@@ -238,14 +169,15 @@ func TestRunCommandHandsOverAfterWait(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(5 * time.Second)
-	for !h.sess.hasBgNotes() {
+	for !h.sess.hasPending() {
 		if time.Now().After(deadline) {
 			t.Fatal("the job never reported its exit")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	note := h.sess.takeBgNotes()[0]
-	for _, want := range []string{"exited with code 3", "finished", "codehalter-job-1.log"} {
+	note := h.sess.takePending()[0].note
+	logName := "codehalter-" + strconv.Itoa(os.Getpid()) + "-job-1.log"
+	for _, want := range []string{"exited with code 3", "finished", logName} {
 		if !strings.Contains(note.full, want) {
 			t.Errorf("exit note lacks %q: %q", want, note.full)
 		}
@@ -253,16 +185,13 @@ func TestRunCommandHandsOverAfterWait(t *testing.T) {
 	if jobs := h.agent.parkableJobs(h.sess.ID, time.Time{}); jobs != "" {
 		t.Errorf("finished job still parkable: %s", jobs)
 	}
-	if b, err := os.ReadFile(filepath.Join(os.TempDir(), "codehalter-job-1.log")); err != nil || !strings.Contains(string(b), "finished") {
+	if b, err := os.ReadFile(filepath.Join(os.TempDir(), logName)); err != nil || !strings.Contains(string(b), "finished") {
 		t.Errorf("the log the model is pointed at is not there or incomplete: %v %q", err, b)
 	}
 }
 
-// TestRunCommandStallKillsHungJob: a handed-over command that shows no
-// progress at all (nothing on the terminal, no growth of its log or of a file
-// it redirects into) is killed after bgStallTimeout and reported as such; one
-// that keeps writing into a redirect file is never touched, however quiet the
-// terminal is.
+// A command writing into a redirect file is never killed, however quiet its
+// terminal.
 func TestRunCommandStallKillsHungJob(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
@@ -273,13 +202,13 @@ func TestRunCommandStallKillsHungJob(t *testing.T) {
 	defer h.sess.ctl.held.Unlock()
 	waitNote := func() bgNote {
 		deadline := time.Now().Add(5 * time.Second)
-		for !h.sess.hasBgNotes() {
+		for !h.sess.hasPending() {
 			if time.Now().After(deadline) {
 				t.Fatal("no note")
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		return h.sess.takeBgNotes()[0]
+		return *h.sess.takePending()[0].note
 	}
 
 	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo start; sleep 30"}`)
@@ -294,9 +223,7 @@ func TestRunCommandStallKillsHungJob(t *testing.T) {
 	}
 }
 
-// TestToolHints: a Python script that splices a source file gets a note with
-// the edit_file call it amounts to, every time, and a chat line; scripts
-// that compute or generate, reads and builds get none.
+// Scripts that compute or generate, reads and builds get no note.
 func TestToolHints(t *testing.T) {
 	edit := "cd rust && python3 - <<'PY'\np='tests/zoom_widgets.rs'\ns=open(p).read()\nopen(p,'w').write(s.replace('a','b'))\nPY"
 	if target, ok := scriptEditTarget(edit); !ok || target != "tests/zoom_widgets.rs" {
@@ -308,16 +235,15 @@ func TestToolHints(t *testing.T) {
 		"cargo test",
 		"cd rust && sed -n '1,5p' src/a.rs; grep -n 'fn a' -A 8 src/a.rs",
 	} {
-		if note, _ := (&Session{}).toolHints(cmd); note != "" {
+		if note, _ := toolHints(cmd); note != "" {
 			t.Errorf("%q got a note: %q", cmd, note)
 		}
 	}
-	h := newTerminalHarness(t)
-	first, told := h.sess.toolHints(edit)
+	first, told := toolHints(edit)
 	if !strings.Contains(first, `Its replace is exactly this edit_file call: {"path": "tests/zoom_widgets.rs", "old_text": "a", "new_text": "b"}`) || !strings.Contains(told, "edit_file instead of a script on tests/zoom_widgets.rs") {
 		t.Errorf("hint = %q / %q", first, told)
 	}
-	if again, _ := h.sess.toolHints(edit); again == "" {
+	if again, _ := toolHints(edit); again == "" {
 		t.Error("the second occurrence got no hint; every occurrence gets one")
 	}
 	multi := "python3 - <<'PY'\np='src/ui/window.rs'\ns=open(p).read()\ns=s.replace(\"\"\"let zoom = 1.0;\"\"\", \"\"\"let zoom = ZOOM;\"\"\")\ns=s.replace('old()', 'new()')\nopen(p,'w').write(s)\nPY"
@@ -330,8 +256,6 @@ func TestToolHints(t *testing.T) {
 	}
 }
 
-// TestRunCommandNamesTheToolItWasMeantFor: read_file's or edit_file's
-// arguments sent to run_command get told which tool takes them.
 func TestRunCommandNamesTheToolItWasMeantFor(t *testing.T) {
 	h := newTerminalHarness(t)
 	res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"reads":[{"path":"a.rs","line":1,"limit":5}]}`)
@@ -347,9 +271,7 @@ func TestRunCommandNamesTheToolItWasMeantFor(t *testing.T) {
 	}
 }
 
-// TestBgSleepHint: a command put in the background with `&` and waited for
-// with sleep gets the run_background call it amounts to; a plain sleep, a
-// plain background start and ordinary lines get nothing.
+// A plain sleep, a plain background start and ordinary lines get nothing.
 func TestBgSleepHint(t *testing.T) {
 	cmd := `ps aux | grep -c x; cd rust && (xvfb-run -a cargo test --test deco > /tmp/d.log 2>&1; echo "exit=$?" >> /tmp/d.log) & sleep 45; tail -6 /tmp/d.log`
 	note, told := bgSleepHint(cmd)

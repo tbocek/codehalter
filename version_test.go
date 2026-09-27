@@ -13,11 +13,7 @@ import (
 	"time"
 )
 
-// isolateUpdate points the update machinery at a private cache directory and
-// clears the two env vars, so a test never reads the developer's real cache,
-// never writes to it, and never inherits a decision from the environment it
-// runs in. XDG_CACHE_HOME covers Linux, HOME covers macOS (os.UserCacheDir
-// reads a different variable on each).
+// XDG_CACHE_HOME covers Linux, HOME covers macOS: os.UserCacheDir reads a different variable on each.
 func isolateUpdate(t *testing.T) {
 	t.Helper()
 	dir := t.TempDir()
@@ -29,16 +25,12 @@ func isolateUpdate(t *testing.T) {
 	t.Cleanup(func() { version = old })
 }
 
-// releaseServer serves the GitHub endpoints: the latest-release JSON, and the
-// per-platform asset, whose body is whatever the test wants the "binary" to be.
-// It counts API calls so a test can prove the cache prevented one.
+// The returned counter counts latest-release API calls.
 func releaseServer(t *testing.T, tag, asset string) (*httptest.Server, *int) {
 	t.Helper()
 	calls := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
-			// Conditional like GitHub: the ETag is the tag, and a matching
-			// If-None-Match is a 304 that GitHub does not count.
 			etag := fmt.Sprintf("%q", tag)
 			if r.Header.Get("If-None-Match") == etag {
 				w.WriteHeader(http.StatusNotModified)
@@ -60,9 +52,6 @@ func releaseServer(t *testing.T, tag, asset string) (*httptest.Server, *int) {
 	return srv, &calls
 }
 
-// fakeBinary is a runnable stand-in for a downloaded release: a shell script
-// that answers --version like the real one, padded past updateMinBytes so it
-// gets through the "too small to be the binary" gate.
 func fakeBinary(reports string, size int) string {
 	s := "#!/bin/sh\necho '" + reports + "'\n#"
 	return s + strings.Repeat("x", max(0, size-len(s)))
@@ -90,12 +79,7 @@ func TestReleaseNum(t *testing.T) {
 	}
 }
 
-// TestLatestReleaseSources: the environment is what the launcher fills in for
-// the container and costs nothing; otherwise GitHub is asked every time, with
-// the cached ETag so an unchanged answer is an uncounted 304. A cache that
-// merely said "nothing newer" must NOT stand in for the check: trusting one for
-// a day is how a restarted container missed a release for sixteen hours. The
-// cache does answer when GitHub cannot be reached, and only while it is young.
+// A young cache must not stand in for the check; it answers only when GitHub is unreachable.
 func TestLatestReleaseSources(t *testing.T) {
 	isolateUpdate(t)
 	srv, calls := releaseServer(t, "v42", "")
@@ -109,8 +93,6 @@ func TestLatestReleaseSources(t *testing.T) {
 	}
 	t.Setenv(envLatest, "")
 
-	// A young cache saying v7 is not believed: GitHub says v42, and that is
-	// what comes back, cached with its ETag.
 	if err := os.MkdirAll(cacheDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -133,8 +115,6 @@ func TestLatestReleaseSources(t *testing.T) {
 		t.Errorf("the fresh answer and its ETag were not cached: %+v, %v", back, err)
 	}
 
-	// Unchanged upstream: the conditional request is a 304, which GitHub does
-	// not count, and the cached tag is the answer.
 	if tag, err := latestRelease(context.Background()); err != nil || tag != "v42" {
 		t.Fatalf("after a 304: got %q, %v; want v42", tag, err)
 	}
@@ -142,7 +122,6 @@ func TestLatestReleaseSources(t *testing.T) {
 		t.Errorf("a 304 was counted: %d calls", *calls)
 	}
 
-	// GitHub unreachable: a young cache stands in, a stale one does not.
 	srv.Close()
 	if tag, err := latestRelease(context.Background()); err != nil || tag != "v42" {
 		t.Fatalf("unreachable with a young cache: got %q, %v; want v42", tag, err)
@@ -156,9 +135,7 @@ func TestLatestReleaseSources(t *testing.T) {
 	}
 }
 
-// TestNewerReleaseGates covers every way the check declines to nag, plus the
-// one way it speaks up. The tag it resolved is published to the environment
-// either way, because the container started next should not re-resolve it.
+// The resolved tag is published to the environment even when no update is offered.
 func TestNewerReleaseGates(t *testing.T) {
 	cwd := t.TempDir()
 
@@ -233,9 +210,7 @@ func TestNewerReleaseGates(t *testing.T) {
 	})
 }
 
-// TestSelfUpdateReplacesTheBinary: the happy path, and the two ways a download
-// is rejected. Both rejections must leave the installed binary untouched: this
-// is the one operation in codehalter that can destroy the program itself.
+// Every rejection must leave the installed binary untouched.
 func TestSelfUpdateReplacesTheBinary(t *testing.T) {
 	install := func(t *testing.T) string {
 		t.Helper()
@@ -271,9 +246,7 @@ func TestSelfUpdateReplacesTheBinary(t *testing.T) {
 	t.Run("installs and reports the path", func(t *testing.T) {
 		isolateUpdate(t)
 		self := install(t)
-		// Older updaters compare the whole --version output, so a release must
-		// print exactly one line; this one still tolerates more, for the
-		// releases that printed a stamp under it.
+		// Older releases printed a build stamp on a second --version line; it must be tolerated.
 		releaseServer(t, "v42", fakeBinary(versionLine("v42")+"\nbuilt 2026-09-24, abc1234", updateMinBytes+1))
 		got, err := selfUpdate(context.Background(), "v42")
 		if err != nil {
@@ -301,10 +274,7 @@ func TestSelfUpdateReplacesTheBinary(t *testing.T) {
 		unchanged(t, self)
 	})
 
-	// The Alpine incident: gcompat re-executes a glibc binary through the musl
-	// loader, so the process's "executable" is /lib/ld-musl-x86_64.so.1. Nothing
-	// that fails to print this program's version line may be replaced, however
-	// the path was arrived at.
+	// Under Alpine gcompat the process's executable is the musl loader.
 	t.Run("refuses to replace a file that is not this program", func(t *testing.T) {
 		isolateUpdate(t)
 		self := install(t)
@@ -329,8 +299,7 @@ func TestSelfUpdateReplacesTheBinary(t *testing.T) {
 	t.Run("refuses a binary reporting another version", func(t *testing.T) {
 		isolateUpdate(t)
 		self := install(t)
-		// The stamp is what stops a re-exec loop: a binary that does not
-		// report the tag that was asked for never gets to replace anything.
+		// Otherwise an update that does not change the version would re-exec forever.
 		releaseServer(t, "v42", fakeBinary(versionLine("dev"), updateMinBytes+1))
 		if _, err := selfUpdate(context.Background(), "v42"); err == nil {
 			t.Fatal("selfUpdate accepted a binary reporting a different version")

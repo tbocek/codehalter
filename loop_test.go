@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,8 +13,6 @@ import (
 	"time"
 )
 
-// meterCall builds the one tool call shape startToolMeter reads: a name and a
-// raw JSON argument string.
 func meterCall(name, args string) toolCall {
 	tc := toolCall{ID: "tc1"}
 	tc.Function.Name = name
@@ -21,14 +20,10 @@ func meterCall(name, args string) toolCall {
 	return tc
 }
 
-// TestStartToolMeter pins the tool status meter's lifecycle: stop() halts the
-// ticker and joins its goroutine promptly (no deadlock, no leak), and a cancelled
-// ctx also lets stop() return. It does not assert the 1s-tick text: that is
-// startStatusMeter's, and it is time-based.
+// stop() joins the ticker goroutine promptly, also after a ctx cancel.
 func TestStartToolMeter(t *testing.T) {
 	a, s := newTestAgent(t)
 
-	// Normal stop joins quickly.
 	stop := a.startToolMeter(context.Background(), s.ID, meterCall("web_search", `{"query":"goldmark tables"}`))
 	if stop == nil {
 		t.Fatal("startToolMeter returned a nil stop")
@@ -54,10 +49,6 @@ func TestStartToolMeter(t *testing.T) {
 	}
 }
 
-// TestThrottledStream pins the token batcher that keeps per-token streaming from
-// flooding the editor at high tg/s: the first token emits immediately, tokens
-// within the interval batch into one emit, and flush drains the tail (and is a
-// no-op when nothing is buffered).
 func TestThrottledStream(t *testing.T) {
 	var emits []string
 	sink, flush := throttledStream(func(chunk string) { emits = append(emits, chunk) })
@@ -81,10 +72,7 @@ func TestThrottledStream(t *testing.T) {
 	}
 }
 
-// TestPlanResultSubtasksDeserialize ensures the planner's JSON output (an
-// array of `{description, verify}` objects under `subtasks`) round-trips into
-// the planResult / subtask structs the orchestrator consumes. This is the
-// contract between PLAN.md and runExecutePhase.
+// The contract between PLAN.md and runExecutePhase.
 func TestPlanResultSubtasksDeserialize(t *testing.T) {
 	raw := `{
 		"clear": true,
@@ -122,20 +110,15 @@ func TestPlanResultSubtasksDeserialize(t *testing.T) {
 	}
 }
 
-// TestIssueBagTokenisation pins the bag-of-words tokeniser used for fuzzy
-// failure matching: lowercase, punctuation-stripped, order-independent. The
-// reworded-near-duplicate case ("missing import" vs "import is missing") is
-// the one that motivates the fuzzy approach over exact key matching.
+// Lowercase, punctuation-stripped, order-independent, so rewordings match.
 func TestIssueBagTokenisation(t *testing.T) {
-	// Casing, punctuation and word order are all discarded.
 	a := issueBag([]string{"Missing import!", "Syntax error."})
 	b := issueBag([]string{"syntax  ERROR", "missing\timport"})
 	if !slices.Equal(sortedKeys(a), sortedKeys(b)) {
 		t.Errorf("expected equivalent bags, got %v vs %v", sortedKeys(a), sortedKeys(b))
 	}
 
-	// Adjacent non-alphanumeric runs collapse to a single separator (no empty
-	// tokens leak into the bag).
+	// No empty tokens from adjacent separators.
 	bag := issueBag([]string{"foo--bar...baz"})
 	want := []string{"bar", "baz", "foo"}
 	if !slices.Equal(sortedKeys(bag), want) {
@@ -152,65 +135,53 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// TestJaccardSimilarity covers the failure-loop bail decision. The reworded
-// near-duplicate must score above the configured threshold so the retry
-// loop bails; unrelated failures must stay below.
+// A reworded near-duplicate scores above the threshold, unrelated failures below.
 func TestJaccardSimilarity(t *testing.T) {
 	// Two empty bags are treated as identical (degenerate but well-defined).
 	if got := jaccard(map[string]bool{}, map[string]bool{}); got != 1 {
 		t.Errorf("empty/empty: got %v, want 1", got)
 	}
 
-	// Reworded duplicate: {"missing","import"} vs {"import","is","missing"}.
-	// |∩|=2, |∪|=3 → 0.666… → must exceed the threshold so a retry bails.
+	// |∩|=2, |∪|=3: 0.67, above the threshold.
 	a := issueBag([]string{"missing import"})
 	b := issueBag([]string{"import is missing"})
 	if s := jaccard(a, b); s < failureSimilarityThreshold {
 		t.Errorf("reworded duplicate: got %v, want >= %v", s, failureSimilarityThreshold)
 	}
 
-	// Unrelated failures must NOT collapse — exact wording chosen so the
-	// Jaccard score is comfortably under the threshold.
 	c := issueBag([]string{"missing import in foo.go"})
 	d := issueBag([]string{"unused variable x"})
 	if s := jaccard(c, d); s >= failureSimilarityThreshold {
 		t.Errorf("disjoint issues: got %v, want < %v", s, failureSimilarityThreshold)
 	}
 
-	// Symmetric.
 	if jaccard(a, b) != jaccard(b, a) {
 		t.Errorf("expected jaccard to be symmetric")
 	}
 }
 
-// TestCapHitLadder pins the cap-hit recovery in runToolLoopSeeded: a generation
-// truncated AT max_tokens first retries with a be-concise nudge appended to the
-// wire context, then once more on a doubled cap, and a response that then
-// succeeds ends the loop normally. Discarded partials never reach the result.
+// A cap hit retries with a be-concise nudge; the discarded partial never reaches the result.
 func TestCapHitLadder(t *testing.T) {
 	mock := newMockLLM(t,
 		sseTruncatedContent("way too long", 1000, defaultMaxTokens),
-		sseTruncatedContent("still too long", 1000, defaultMaxTokens),
 		sseText("done"),
 	)
 	defer mock.Close()
 	a, s := newTestAgent(t)
-	a.mainSlotTokens = 85248 // ample n_ctx room: these are cap hits, not the ceiling
+	a.mainSlotTokens.Store(85248) // ample n_ctx room: these are cap hits, not the ceiling
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
 	if err != nil {
 		t.Fatalf("ladder should recover: %v", err)
 	}
-	if got := mock.callCount(); got != 3 {
-		t.Fatalf("callCount = %d, want 3 (cap, nudged cap, success)", got)
+	if got := mock.callCount(); got != 2 {
+		t.Fatalf("callCount = %d, want 2 (cap, nudged success)", got)
 	}
 	if res.Text != "done" {
 		t.Errorf("res.Text = %q, want the successful reply only (partials discarded)", res.Text)
 	}
 
-	// Rung 1: the second request must carry the be-concise nudge as the
-	// trailing user message.
 	req2 := mock.request(1)
 	msgs, _ := req2["messages"].([]any)
 	if len(msgs) == 0 {
@@ -223,42 +194,29 @@ func TestCapHitLadder(t *testing.T) {
 	if mt, ok := req2["max_tokens"].(float64); !ok || int(mt) != defaultMaxTokens {
 		t.Errorf("second request max_tokens = %v, want unchanged %d", req2["max_tokens"], defaultMaxTokens)
 	}
-
-	// Rung 2: the third request runs on the doubled cap.
-	req3 := mock.request(2)
-	if mt, ok := req3["max_tokens"].(float64); !ok || int(mt) != 2*defaultMaxTokens {
-		t.Errorf("third request max_tokens = %v, want doubled %d", req3["max_tokens"], 2*defaultMaxTokens)
-	}
 }
 
-// TestCapHitLadderExhausted pins the ladder's exit: a third consecutive cap hit
-// stops retrying and surfaces the cap error into the normal failure path
-// (replan), instead of doubling forever.
 func TestCapHitLadderExhausted(t *testing.T) {
 	mock := newMockLLM(t,
 		sseTruncatedContent("too long", 1000, defaultMaxTokens),
 		sseTruncatedContent("too long", 1000, defaultMaxTokens),
-		sseTruncatedContent("too long", 1000, 2*defaultMaxTokens),
 	)
 	defer mock.Close()
 	a, s := newTestAgent(t)
-	a.mainSlotTokens = 85248
+	a.mainSlotTokens.Store(85248)
 
 	_, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
-	if asCapHit(err) == nil {
+	var ce *capHitError
+	if !errors.As(err, &ce) {
 		t.Fatalf("exhausted ladder should surface the cap error, got: %v", err)
 	}
-	if got := mock.callCount(); got != 3 {
-		t.Errorf("callCount = %d, want 3 (no retries past the ladder)", got)
+	if got := mock.callCount(); got != 2 {
+		t.Errorf("callCount = %d, want 2 (no retries past the nudge)", got)
 	}
 }
 
-// TestStuckLadderFuzzyOutput pins the Jaccard extension of the repetition
-// ladder: a re-issued identical call whose output differs only in noise (an
-// elapsed-time / attempt counter, i.e. a timestamped failing build) counts as
-// reproduced, so the loop bails at stuckBailRounds instead of spinning while
-// the exact output hash keeps changing.
+// Output differing only in noise (a timestamped failing build) counts as reproduced.
 func TestStuckLadderFuzzyOutput(t *testing.T) {
 	const toolName = "noisy_probe_test_tool"
 	attempt := 0
@@ -272,9 +230,7 @@ func TestStuckLadderFuzzyOutput(t *testing.T) {
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		attempt++
-		// Long fixed error text + two noise tokens (elapsed, attempt) → Jaccard
-		// ≈ 0.93 between consecutive outputs: above stuckOutputSimilarity while
-		// the fnv hash differs every time.
+		// Jaccard ≈ 0.93 between outputs: above stuckOutputSimilarity, a new hash every time.
 		return fmt.Sprintf("build FAILED: cannot load package example.com/foo/bar: import cycle not allowed in dependency graph involving widget factory manager controller service repository handler adapter transport codec parser lexer scanner tokenizer emitter renderer scheduler dispatcher broker queue worker pool cache index shard replica leader follower quorum consensus journal snapshot compaction segment (elapsed %dms, attempt %d)", 1200+attempt*7, attempt), true
 	}})
 
@@ -287,26 +243,22 @@ func TestStuckLadderFuzzyOutput(t *testing.T) {
 	defer mock.Close()
 	a, s := newTestAgent(t)
 	a.tools.add(testTools...)
-	a.mainSlotTokens = 85248
+	a.mainSlotTokens.Store(85248)
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
 	if err != nil {
 		t.Fatalf("stuck bail is a graceful exit, got error: %v", err)
 	}
-	if res.RespondCalled {
+	if res.Terminal != "" {
 		t.Errorf("bail must not report a terminal exit")
 	}
-	// Round 1 registers the first output; rounds 2-6 are fuzzy-reproduced stuck
-	// rounds, and the ladder bails at stuckBailRounds — 6 calls total.
+	// Round 1 is new output; rounds 2-6 are stuck, and the ladder bails.
 	if got := mock.callCount(); got != 1+stuckBailRounds {
 		t.Errorf("callCount = %d, want %d (bail at stuckBailRounds via fuzzy match)", got, 1+stuckBailRounds)
 	}
 }
 
-// TestToolMeterShowsTheArgument pins what the status row is FOR: "run_command"
-// sitting at 77s says something is slow but not what, and the arguments have
-// scrolled away in the transcript by then. The row carries the command itself.
 func TestToolMeterShowsTheArgument(t *testing.T) {
 	h := newTerminalHarness(t)
 	a, s := h.agent, h.sess
@@ -348,10 +300,7 @@ func TestToolMeterShowsTheArgument(t *testing.T) {
 	}
 }
 
-// TestAddCorrectiveSurvivesRebuild pins the invariant that cost one turn 9998 of
-// 15346 re-evaluated tokens: a corrective turn appended to the wire only is
-// gone from the next runToolLoop rebuild, which drops it out of the MIDDLE of
-// history and shifts everything after it. The wire and a rebuild must agree.
+// A wire-only corrective would drop out of the MIDDLE of history on the next rebuild.
 func TestAddCorrectiveSurvivesRebuild(t *testing.T) {
 	a, s := newTestAgent(t)
 	s.AddUser("do the thing")
@@ -371,28 +320,13 @@ func TestAddCorrectiveSurvivesRebuild(t *testing.T) {
 	}
 }
 
-// TestPlanRecoversFromMalformedSubmitPlanArguments pins the recovery hole: a
-// planner that CALLS submit_plan but writes arguments which aren't valid JSON
-// used to skip the corrective retry entirely (the guard also demanded
-// !RespondCalled) and fail the whole turn on the first malformed argument list.
 func TestPlanRecoversFromMalformedSubmitPlanArguments(t *testing.T) {
 	broken := sseToolCall("c1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do the thing"`)
 	fixed := sseToolCall("c2", submitPlanToolName,
 		`{"clear":true,"subtasks":[{"description":"do the thing","verify":["go build ./..."]}],"report_only":false}`)
-	mock := newMockLLM(t, broken, fixed)
-	defer mock.Close()
-	a, s := newTestAgent(t)
-	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-	// An empty PLAN.md disables planning outright, so seed one: the content is
-	// irrelevant here, only its presence gates the phase.
-	if err := os.MkdirAll(filepath.Join(s.Cwd, ".codehalter"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(s.Cwd, ".codehalter", "PLAN.md"), []byte("plan things"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	a, s, _ := planPhaseAgent(t, broken, fixed)
 
-	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil {
 		t.Fatalf("malformed arguments should recover via the corrective retry, got: %v", err)
 	}
@@ -401,39 +335,23 @@ func TestPlanRecoversFromMalformedSubmitPlanArguments(t *testing.T) {
 	}
 }
 
-// planPhaseAgent wires a mock LLM to a session and seeds a PLAN.md, the two
-// things runPlanPhase needs before it will run at all: no [[llm]] is an error
-// and an empty PLAN.md disables planning outright. The PLAN.md content is
-// irrelevant to these tests, only its presence gates the phase.
 func planPhaseAgent(t *testing.T, responses ...string) (*agent, *Session, *mockLLM) {
 	t.Helper()
 	mock := newMockLLM(t, responses...)
 	t.Cleanup(mock.Close)
 	a, s := newTestAgent(t)
 	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-	if err := os.MkdirAll(filepath.Join(s.Cwd, ".codehalter"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(s.Cwd, ".codehalter", "PLAN.md"), []byte("plan things"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	return a, s, mock
 }
 
-// TestPlanPreambleIsNotAnAnswer pins the detector's good path: prose written
-// alongside subtasks with report_only=false is a PREAMBLE, and preambles cost
-// nothing. orchestrate already drops that prose (it surfaces answer only when
-// there are no subtasks), so there is nothing to pick between and no reason to
-// spend a corrective round trip asking. Measured on two real sessions: 10 of 35
-// plan submissions looked exactly like this one, every one report_only=false,
-// every one nudged for a plan it had already submitted.
+// Prose beside subtasks is a preamble and costs no corrective round trip.
 func TestPlanPreambleIsNotAnAnswer(t *testing.T) {
 	args := `{"clear":true,"report_only":false,"subtasks":[{"description":"delete out/test and rebuild","verify":["go build ./..."]}]}`
 	a, s, mock := planPhaseAgent(t, sseContentThenToolCall(
 		"The request is clear: delete the out/test build output and recompile the site.",
 		"p1", submitPlanToolName, args))
 
-	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil {
 		t.Fatalf("runPlanPhase: %v", err)
 	}
@@ -445,42 +363,7 @@ func TestPlanPreambleIsNotAnAnswer(t *testing.T) {
 	}
 }
 
-// TestPlanReportOnlyProseStillNudges pins the other side: report_only=true IS
-// the real fork. Those subtasks only relay findings, so prose alongside them
-// may already have delivered the answer the subtasks would go re-derive. The
-// planner has to pick, and the corrective round is what makes it.
-func TestPlanReportOnlyProseStillNudges(t *testing.T) {
-	ambiguous := sseContentThenToolCall(
-		"The three helpers live in a.go, b.go and c.go.",
-		"p1", submitPlanToolName,
-		`{"clear":true,"report_only":true,"subtasks":[{"description":"list the helpers","verify":["ls"]}]}`)
-	picked := sseContentThenToolCall(
-		"The three helpers live in a.go, b.go and c.go.",
-		"p2", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[]}`)
-	a, s, mock := planPhaseAgent(t, ambiguous, picked)
-
-	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
-	if err != nil {
-		t.Fatalf("runPlanPhase: %v", err)
-	}
-	if got := mock.callCount(); got != 2 {
-		t.Errorf("an answer + report_only subtasks cost %d LLM calls, want 2 (the nudge)", got)
-	}
-	if plan == nil || len(plan.Subtasks) != 0 {
-		t.Fatalf("plan = %+v, want the corrected answer-only submission", plan)
-	}
-}
-
-// TestExecutePhaseTurnsReasoningOff pins how the execute role stops reasoning:
-// the connection carries the closed-<think> prefill, so the wire ends in an
-// assistant message the server is told to continue, and every earlier token is
-// untouched.
-//
-// It used to be a "/no_think" suffix glued onto the STORED subtask prompt. That
-// bought nothing twice over: 237 of 388 execute responses carrying it reasoned
-// anyway over one 11.6h session, and the suffix then rode the history for the
-// rest of it. So the stored turn is asserted too — it must be the prompt and
-// nothing else.
+// Via the closed-think prefill on the wire; the stored turn is the prompt and nothing else.
 func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	mock := newMockLLM(t, sseToolCall("r1", respondToolName, `{"message":"done"}`))
 	defer mock.Close()
@@ -502,9 +385,7 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	if _, set := body["chat_template_kwargs"]; set {
 		t.Errorf("execute re-rendered the prompt instead of appending: %v", body["chat_template_kwargs"])
 	}
-	// This phase ends only on a terminal tool, so prose is always a slip: the
-	// server is told to answer with a tool call rather than being nudged into
-	// one afterwards. A grammar, not a re-render, so the prefix is untouched.
+	// A grammar, not a re-render, so the prefix is untouched.
 	if body["tool_choice"] != "required" {
 		t.Errorf("execute call tool_choice = %v, want required", body["tool_choice"])
 	}
@@ -531,16 +412,8 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	}
 }
 
-// TestToolLoopRecordsToolUses verifies that when the LLM returns a tool call,
-// the tool loop executes it, appends the ToolUse to the session, and persists
-// to disk — before the second LLM turn produces the final text.
 func TestToolLoopRecordsToolUses(t *testing.T) {
-	// Isolate from the package-level registry so the synthetic `respond` tool
-	// (registered in tool_phase_end.go init) isn't in scope — its presence would
-	// flip the loop's empty-tool-call branch from "exit with allText" to a
-	// nudge, which is a different code path tested elsewhere.
 	var testTools []Tool
-	// A stub tool, so we don't depend on the filesystem tool implementations.
 	const testToolName = "test_echo_tool_9d7f"
 	testTools = append(testTools, Tool{
 		Def: map[string]any{
@@ -561,9 +434,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	})
 
 	mock := newMockLLM(t,
-		// Turn 1: LLM asks to call the stub tool.
 		sseToolCall("call_1", testToolName, `{"msg":"hello"}`),
-		// Turn 2: LLM produces the final assistant text.
 		sseText("All done."),
 	)
 	defer mock.Close()
@@ -599,10 +470,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 		t.Errorf("ToolUse output: got %q", res.ToolUses[0].Output)
 	}
 
-	// The loop now stores each assistant turn VERBATIM (cache-faithful replay):
-	// [user, assistant{tool turn: echo}, assistant{text turn: "All done."}].
-	// The tool turn carries the tool use; the final text turn carries the text —
-	// no merge, no post-hoc patch.
+	// Each assistant turn is stored verbatim, never merged: user, tool turn, text turn.
 	if got := len(s.Messages); got != 3 {
 		t.Fatalf("session messages: got %d, want 3", got)
 	}
@@ -613,7 +481,6 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 		t.Errorf("msg[2]: want assistant content %q, got role=%q content=%q", "All done.", s.Messages[2].Role, s.Messages[2].Content)
 	}
 
-	// Persistence: the turns are on disk from the incremental Save in the loop.
 	loaded, err := loadSession(dir, s.ID)
 	if err != nil {
 		t.Fatalf("loadSession: %v", err)
@@ -633,14 +500,8 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 }
 
-// TestToolLoopRespondExits verifies that when the model calls the synthetic
-// `respond` terminal tool, the loop exits with the message arg as res.Text on
-// the same iteration — no second LLM round-trip to "produce final text".
-// This is the post-respond exit semantic (vs the legacy "empty tool_calls
-// means done" path covered by TestToolLoopRecordsToolUses with a fresh
-// registry).
+// respond exits on the same iteration, with no second round trip.
 func TestToolLoopRespondExits(t *testing.T) {
-	// The agent's own tools, so respond is in scope.
 	mock := newMockLLM(t,
 		sseToolCall("call_1", respondToolName, `{"message":"final answer"}`),
 	)
@@ -675,10 +536,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 	}
 }
 
-// TestRunToolLoopDenyGate pins the dispatch gate that replaced array pruning: a
-// tool the phase policy denies is REJECTED without executing, recorded as a
-// failed tool use with a teaching message, and the loop continues so the model
-// can correct. (The tool is still in the array — only dispatch blocks it.)
+// A denied tool stays in the array; dispatch rejects it and the loop continues.
 func TestRunToolLoopDenyGate(t *testing.T) {
 	var testTools []Tool
 	var execs int
@@ -715,10 +573,6 @@ func TestRunToolLoopDenyGate(t *testing.T) {
 	}
 }
 
-// TestRunToolLoopMultiTerminalUpsert pins multi-terminal exit: in an execute
-// loop exposing BOTH respond and submit_plan, calling submit_plan ends the loop
-// with Terminal=submit_plan and the plan JSON in res.Text — the signal the
-// orchestrator reads as a plan-upsert.
 func TestRunToolLoopMultiTerminalUpsert(t *testing.T) {
 	planArgs := `{"clear":true,"subtasks":[{"description":"do y"}]}`
 	mock := newMockLLM(t, sseToolCall("c1", submitPlanToolName, planArgs))
@@ -739,10 +593,6 @@ func TestRunToolLoopMultiTerminalUpsert(t *testing.T) {
 	}
 }
 
-// TestToolLoopNoTerminalKeepsTextExit verifies that a policy with NO terminals
-// keeps the legacy text-only exit: a no-tool-calls turn returns immediately
-// instead of nudging. (Phases set their terminals explicitly now; an empty
-// phasePolicy is the no-terminal case.)
 func TestToolLoopNoTerminalKeepsTextExit(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText(`{"clear": true, "steps": ["do x"]}`),
@@ -775,11 +625,7 @@ func TestToolLoopNoTerminalKeepsTextExit(t *testing.T) {
 	}
 }
 
-// TestPlanSubmitPlanSeparatesAnswer verifies the plan phase's terminal split:
-// when the planner writes a direct answer AND calls submit_plan, the structured
-// plan lands in res.Text (submit_plan's echoed args) while the user-facing prose
-// lands in res.Content — the two channels never mix, so the old "answer mashed
-// into the plan JSON" bug can't recur.
+// The plan lands in res.Text, the prose beside it in res.Content.
 func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 	planArgs := `{"clear":true,"subtasks":[],"report_only":true}`
 	mock := newMockLLM(t, sseContentThenToolCall("Active servers: gopls.", "tc1", submitPlanToolName, planArgs))
@@ -798,8 +644,8 @@ func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
-	if !res.RespondCalled {
-		t.Errorf("RespondCalled: got false, want true (submit_plan is the plan terminal)")
+	if res.Terminal != submitPlanToolName {
+		t.Errorf("Terminal: got %q, want submit_plan (the plan terminal)", res.Terminal)
 	}
 	if !strings.Contains(res.Text, `"report_only":true`) {
 		t.Errorf("res.Text should carry the submit_plan args (the plan JSON): got %q", res.Text)
@@ -809,12 +655,7 @@ func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 	}
 }
 
-// TestToolLoopNoDedup verifies that identical tool calls in the same tool
-// loop each execute the underlying tool. The dedup cache used to suppress
-// the second call, which broke read-after-write: a mutator (sed via
-// run_command) would change state, then a re-issued read returned the
-// pre-mutation cached value and the model concluded the mutation failed.
-// Now every call executes; the model gets a fresh result every time.
+// Identical calls each execute: a cached read after a mutating command would be stale.
 func TestToolLoopNoDedup(t *testing.T) {
 	var testTools []Tool
 	const readName = "test_read"
@@ -879,17 +720,8 @@ func TestToolLoopNoDedup(t *testing.T) {
 	}
 }
 
-// TestToolLoopRepeatNudgeAndBail covers the repetition recovery path: the
-// second consecutive identical tool call still executes (read-after-write
-// must keep working) but appends a user-role nudge; the third identical
-// call bails before executing. ~3 iterations of stuck behavior fails
-// fast instead of waiting for the 50-iter cap.
-// TestToolLoopRepetitionLadder exercises the unified repeat ladder end to end: a
-// tool that returns identical output every call makes no progress, so consecutive
-// rounds climb ONE ladder — a corrective nudge each stuck round, a one-shot swap
-// to the thinking sampler at stuckEscalateRounds, then a GRACEFUL bail (nil error,
-// RespondCalled=false) at stuckBailRounds. Replaces the old separate
-// signature-nudge/bail and per-name-escalation guards.
+// A nudge each stuck round, a swap to the thinking sampler (keeping a forced
+// tool_choice) at stuckEscalateRounds, a graceful bail at stuckBailRounds.
 func TestToolLoopRepetitionLadder(t *testing.T) {
 	var testTools []Tool
 	const toolName = "test_probe_a3f"
@@ -908,8 +740,6 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 		},
 	})
 
-	// Identical call every round → identical output → stuck from round 2 on.
-	// 8 queued is more than enough; the loop bails at round 6 (stuckBailRounds).
 	var resp []string
 	for i := 0; i < 8; i++ {
 		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), toolName, `{}`))
@@ -931,24 +761,23 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 	if conn == nil {
 		t.Fatalf("connFor(execute) returned nil")
 	}
+	conn = conn.withBody("tool_choice", "required")
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: want graceful nil error, got %v", err)
 	}
-	if res.RespondCalled {
-		t.Errorf("RespondCalled: got true, want false (the loop bailed, never called respond)")
+	if res.Terminal != "" {
+		t.Errorf("Terminal: got %q, want none (the loop bailed, never called respond)", res.Terminal)
 	}
-	// round 1 is productive (first output); rounds 2-6 are stuck; the 5th stuck
-	// round (round 6) hits stuckBailRounds and bails after executing.
+	// Round 1 is productive; the 5th stuck round (round 6) bails.
 	if mock.callCount() != 6 {
 		t.Errorf("LLM calls: got %d, want 6 (bail at stuckBailRounds)", mock.callCount())
 	}
 	if execs != 6 {
 		t.Errorf("tool execs: got %d, want 6", execs)
 	}
-	// Corrective shows up once a round goes stuck (request index 2 onward).
 	var found bool
 	for i := 2; i < mock.callCount(); i++ {
 		msgs, _ := mock.request(i)["messages"].([]any)
@@ -964,8 +793,7 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 	if !found {
 		t.Errorf("no repeat-corrective user message found in the stuck rounds")
 	}
-	// stuckEscalateRounds=3: the swap fires at the END of round 4 (stuckRounds
-	// hits 3), so requests 0-3 use the execute sampler (0.3), 4-5 use thinking (1.0).
+	// The swap fires at the END of round 4 (stuckRounds reaches 3).
 	for i := 0; i < 4; i++ {
 		if temp, _ := mock.request(i)["temperature"].(float64); temp != 0.3 {
 			t.Errorf("request %d temperature: got %v, want 0.3 (pre-escalation)", i, temp)
@@ -976,14 +804,14 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 			t.Errorf("request %d temperature: got %v, want 1.0 (post-escalation)", i, temp)
 		}
 	}
+	for i := 0; i < 6; i++ {
+		if tc := mock.request(i)["tool_choice"]; tc != "required" {
+			t.Errorf("request %d tool_choice: got %v, want required on both sides of the swap", i, tc)
+		}
+	}
 }
 
-// TestRepetitionLadderExemptsSuccessfulRunCommand pins the build/test
-// re-verify carve-out: re-running run_command with identical SUCCESSFUL output
-// (`just build` green again after an edit) is NOT counted as no-progress, so
-// the loop never nudges or bails on it. The edit in between is what makes it
-// a re-verify; the same command straight after itself is a spin
-// (TestStuckLadderCatchesSuccessfulCommandSpin).
+// A green re-run after an edit is a re-verify, never a repeat.
 func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 	var testTools []Tool
 	var execs int
@@ -1012,8 +840,6 @@ func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 		},
 	})
 
-	// Six identical successful run_command calls, each after an edit, then a
-	// plain-text exit.
 	var resp []string
 	for i := 0; i < 6; i++ {
 		resp = append(resp, sseToolCall(fmt.Sprintf("e%d", i), "edit_file", fmt.Sprintf(`{"path":"a.go","old_text":"%d","new_text":"%d"}`, i, i+1)))
@@ -1049,11 +875,7 @@ func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 	}
 }
 
-// TestToolLoopDoesNotEscalateOnDistinctArgs verifies that legitimate fan-out
-// across distinct arguments (e.g. read_file on go.mod, examples/go.mod, …
-// when surveying a multi-module repo) never climbs the repetition ladder: each
-// call returns NEW output, so no round is "stuck", the sampler stays on the
-// execute role, and the loop never bails.
+// Fan-out over distinct arguments returns new output each call, so no round is stuck.
 func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	var testTools []Tool
 	const toolName = "test_grep_q9z"
@@ -1072,9 +894,6 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		},
 	})
 
-	// 5 tool calls with *different* args (the surveying-pattern that used
-	// to trip the old per-name counter). With distinct-args counting, none
-	// of these count as redundant, so no escalation should fire.
 	mock := newMockLLM(t,
 		sseToolCall("c1", toolName, `{"q":"x1"}`),
 		sseToolCall("c2", toolName, `{"q":"x2"}`),
@@ -1113,7 +932,6 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		t.Errorf("LLM calls: got %d, want 6", mock.callCount())
 	}
 
-	// Every call must still use the execute sampler — no escalation.
 	for i := 0; i < mock.callCount(); i++ {
 		req := mock.request(i)
 		if req == nil {
@@ -1126,91 +944,53 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	}
 }
 
-// TestToolLoopNudgesReasonedButEmpty pins the "calculated a lot, then nothing"
-// guard: a turn with a big reasoning block but EMPTY visible content (no tool
-// call) is nudged to write the answer as plain text, not silently accepted as an
-// empty result. After the nudge the model writes the answer and it's returned.
-func TestToolLoopNudgesReasonedButEmpty(t *testing.T) {
-	mock := newMockLLM(t,
-		sseReasoning(strings.Repeat("thinking hard. ", 80)), // ~1.1 KB reasoning, empty content, no calls
-		sseText("here is the answer"),                       // after the nudge, the visible answer
-	)
-	defer mock.Close()
+// The phase contract: prose is an exit only where the phase allows it
+// (the documenter); elsewhere it gets one nudge naming the terminal, and a
+// second prose reply in a row ends the loop without a Terminal.
+func TestPhaseContractNudge(t *testing.T) {
+	run := func(t *testing.T, policy phasePolicy, responses ...string) (toolLoopResult, *mockLLM, *Session) {
+		t.Helper()
+		mock := newMockLLM(t, responses...)
+		t.Cleanup(mock.Close)
+		a, s := newTestAgent(t)
+		res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "go"}}, policy, "execute", true, 0)
+		if err != nil {
+			t.Fatalf("runToolLoop: %v", err)
+		}
+		return res, mock, s
+	}
+	execPolicy := phasePolicy{terminals: map[string]bool{respondToolName: true}}
 
-	a, s := newTestAgent(t)
-	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
-	if err != nil {
-		t.Fatalf("runToolLoop: %v", err)
-	}
-	if mock.callCount() != 2 {
-		t.Errorf("calls: got %d, want 2 (reasoned-but-empty must be nudged, not accepted)", mock.callCount())
-	}
-	if res.Text != "here is the answer" {
-		t.Errorf("res.Text: got %q, want the post-nudge answer", res.Text)
-	}
+	t.Run("documenter prose ends the loop", func(t *testing.T) {
+		res, mock, _ := run(t, phasePolicy{terminals: map[string]bool{respondToolName: true}, proseEnds: true},
+			sseText("No documentation change needed."))
+		if mock.callCount() != 1 || res.Text != "No documentation change needed." {
+			t.Errorf("calls %d, res %+v: want one call and the prose", mock.callCount(), res)
+		}
+	})
+	t.Run("prose then respond", func(t *testing.T) {
+		res, mock, s := run(t, execPolicy,
+			sseText("Done, the file is fixed."),
+			sseToolCall("c1", respondToolName, `{"message":"Done."}`))
+		if mock.callCount() != 2 || res.Terminal != respondToolName {
+			t.Fatalf("calls %d, terminal %q: want the nudge and then respond", mock.callCount(), res.Terminal)
+		}
+		if got := lastUserMessage(s); !strings.Contains(got, "Call `respond` if the step is done") {
+			t.Errorf("stored nudge = %q", got)
+		}
+	})
+	t.Run("prose twice ends the loop", func(t *testing.T) {
+		res, mock, _ := run(t, execPolicy, sseText("one"), sseText("two"))
+		if mock.callCount() != 2 || res.Terminal != "" {
+			t.Errorf("calls %d, terminal %q: want one nudge only, then the loop ends", mock.callCount(), res.Terminal)
+		}
+	})
 }
 
-// TestNoToolCallNudgesEscalate pins the ladder for a model that answers in
-// prose in a phase that only ends on a terminal tool: three re-asks whose
-// wording escalates, then the text exit so it cannot spin forever. One polite
-// nudge used to be the whole budget, and the weaker models answered in prose
-// again on the next round, ending the turn with the work unfinished.
-func TestNoToolCallNudgesEscalate(t *testing.T) {
-	mock := newMockLLM(t,
-		sseText("I will now do the thing"),
-		sseText("I am doing the thing"),
-		sseText("still prose"),
-		sseText("final prose"),
-	)
-	defer mock.Close()
-
-	a, s := newTestAgent(t)
-	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}},
-		phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
-	if err != nil {
-		t.Fatalf("runToolLoop: %v", err)
-	}
-	if mock.callCount() != noCallNudges+1 {
-		t.Fatalf("LLM calls: got %d, want %d (one per nudge plus the accepted text exit)", mock.callCount(), noCallNudges+1)
-	}
-
-	// Each re-ask carries its own wording, and the last one is the imperative.
-	var nudges []string
-	for i := 1; i < mock.callCount(); i++ {
-		msgs, _ := mock.request(i)["messages"].([]any)
-		last, _ := msgs[len(msgs)-1].(map[string]any)
-		nudges = append(nudges, last["content"].(string))
-	}
-	for _, want := range []string{"no tool call", "Prose again", "STOP. You MUST call"} {
-		found := false
-		for _, n := range nudges {
-			found = found || strings.Contains(n, want)
-		}
-		if !found {
-			t.Errorf("no nudge contained %q; got %q", want, nudges)
-		}
-	}
-	if nudges[0] == nudges[1] || nudges[1] == nudges[2] {
-		t.Errorf("the wording must change with each re-ask, got %q", nudges)
-	}
-	if res.RespondCalled {
-		t.Error("the model never called respond; the loop must not report one")
-	}
-	if !strings.Contains(res.Text, "final prose") {
-		t.Errorf("the accepted text exit should carry the prose, got %q", res.Text)
-	}
-}
-
-// TestSteeringLandsBetweenRounds pins what a prompt typed mid-turn does: it is
-// queued, the running turn picks it up before its next model call, and it
-// arrives as an ordinary user message (an append, so the prefix cache holds).
-// Before this, typing cancelled the turn in flight and started a new one, which
-// during a long /spec round threw away the whole round.
+// Picked up before the next model call as an ordinary, stored user message.
 func TestSteeringLandsBetweenRounds(t *testing.T) {
 	a, s := newTestAgent(t)
-	// The user types while the tool runs, which is when they actually do.
 	testTools := []Tool{{
 		Def: map[string]any{"type": "function", "function": map[string]any{
 			"name": "probe", "description": "x", "parameters": map[string]any{"type": "object"}}},
@@ -1232,7 +1012,7 @@ func TestSteeringLandsBetweenRounds(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
-	if !res.RespondCalled {
+	if res.Terminal != respondToolName {
 		t.Fatalf("the loop did not finish: %+v", res)
 	}
 	if mock.callCount() != 2 {
@@ -1244,7 +1024,6 @@ func TestSteeringLandsBetweenRounds(t *testing.T) {
 	if last["role"] != "user" || last["content"] != "also update the README" {
 		t.Errorf("the steer should be the last message of the next round, got %v", last)
 	}
-	// It is part of the conversation, not a one-off: the session keeps it.
 	found := false
 	for _, m := range s.Messages {
 		found = found || (m.Role == "user" && m.Content == "also update the README")
@@ -1252,15 +1031,11 @@ func TestSteeringLandsBetweenRounds(t *testing.T) {
 	if !found {
 		t.Error("the steer was not stored in the session")
 	}
-	if q := s.takeSteer(); len(q) != 0 {
+	if q := s.takePending(); len(q) != 0 {
 		t.Errorf("the queue should be empty after it was picked up, got %v", q)
 	}
 }
 
-// TestBackgroundNoteReachesTheLoopMidTurn: a run_background job that exits
-// while the tool loop is still running is handed to the model before its next
-// call, as a user message carrying the job's note. Before this the note waited
-// for the turn to end, and a model that needed the result polled with `sleep`.
 func TestBackgroundNoteReachesTheLoopMidTurn(t *testing.T) {
 	a, s := newTestAgent(t)
 	withTools(a, Tool{
@@ -1289,14 +1064,62 @@ func TestBackgroundNoteReachesTheLoopMidTurn(t *testing.T) {
 	if c, _ := last["content"].(string); last["role"] != "user" || !strings.Contains(c, "12 passed") {
 		t.Fatalf("the finished job's note did not reach the model before its next call; last message: %v", last)
 	}
-	if s.hasBgNotes() {
+	if s.hasPending() {
 		t.Error("the note was delivered but left queued, so the turn end would deliver it again")
 	}
 }
 
-// TestPlanRoundNudgeAsksToSubmit: a planner still gathering at planRoundNudge
-// rounds gets told to submit with what it has, once, as a user message before
-// its next call; the execute phase never sees it.
+// The note came first, so it leads: arrival order, not one kind before the other.
+func TestSteerAndNoteShareOneMessage(t *testing.T) {
+	a, s := newTestAgent(t)
+	note := bgNote{line: "background job 7 `just test` exited with code 0 after 2m20s",
+		full: "[codehalter, not the user: background job 7 `just test` exited with code 0 after 2m20s. Last output:]\n\ntest result: ok. 12 passed"}
+	withTools(a, Tool{
+		Def: map[string]any{"type": "function", "function": map[string]any{
+			"name": "probe", "description": "x", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, raw string) (string, bool) {
+			s.addBgNote(note)
+			s.addSteer("also update the README")
+			return "probed", false
+		},
+	}, respondTool)
+	mock := newMockLLM(t,
+		sseToolCall("c1", "probe", `{}`),
+		sseToolCall("c2", respondToolName, `{"message":"done"}`),
+	)
+	defer mock.Close()
+
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}},
+		phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0); err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if mock.callCount() != 2 {
+		t.Fatalf("LLM calls: got %d, want 2", mock.callCount())
+	}
+
+	want := note.full + "\n\nalso update the README"
+	msgs, _ := mock.request(1)["messages"].([]any)
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	prev, _ := msgs[len(msgs)-2].(map[string]any)
+	if last["role"] != "user" || last["content"] != want {
+		t.Errorf("the next round should end on one user message, note then steer; got %v", last)
+	}
+	if prev["role"] != "tool" {
+		t.Errorf("the note and the steer reached the model as separate messages; before the last: %v", prev)
+	}
+	stored := 0
+	for _, m := range s.Messages {
+		if m.Role == "user" && m.Content == want {
+			stored++
+		}
+	}
+	if stored != 1 {
+		t.Errorf("the joined message was stored %d times, want 1", stored)
+	}
+}
+
+// Once, as a user message; the execute phase never sees it.
 func TestPlanRoundNudgeAsksToSubmit(t *testing.T) {
 	a, s := newTestAgent(t)
 	withTools(a, Tool{
@@ -1333,9 +1156,7 @@ func TestPlanRoundNudgeAsksToSubmit(t *testing.T) {
 	}
 }
 
-// TestPlanResultAcceptsStringifiedSubtasks: the planner sometimes serialises
-// the subtasks array into a string; both shapes must parse to the same plan,
-// and a string that is not an array is still an error.
+// A string that is not an array is still an error.
 func TestPlanResultAcceptsStringifiedSubtasks(t *testing.T) {
 	var direct, quoted planResult
 	if err := json.Unmarshal([]byte(`{"clear":true,"subtasks":[{"description":"do x","verify":["run just test via run_command"]}]}`), &direct); err != nil {
@@ -1357,12 +1178,8 @@ func TestPlanResultAcceptsStringifiedSubtasks(t *testing.T) {
 	}
 }
 
-// TestToolLoopParksOnRespondWhileJobRuns pins what "the subtask never ends, it
-// only gives control back" means: a respond while a command this loop handed
-// to the background is still running does not end the turn. The loop waits;
-// something the user types meanwhile resumes it (and parks it again if the
-// model has still nothing to do); the job's exit resumes it with the result,
-// and only then does a respond end the turn.
+// User input resumes the parked loop, which may park again; only after the job
+// exits does a respond end the turn.
 func TestToolLoopParksOnRespondWhileJobRuns(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
@@ -1421,14 +1238,11 @@ func TestToolLoopParksOnRespondWhileJobRuns(t *testing.T) {
 	}
 }
 
-// TestPlanAnswerInArgument: the answer to a lookup travels in submit_plan's
-// `answer` argument and needs no message text. A server that forces the tool
-// call returns none, and a planner that wrote its audit "as message text"
-// twice delivered nothing but its reasoning.
+// Needs no message text: a server that forces the tool call returns none.
 func TestPlanAnswerInArgument(t *testing.T) {
 	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
 		`{"clear":true,"report_only":true,"subtasks":[],"answer":"Only the Prepare page builds widgets; Cut, Narrate and Produce are bare."}`))
-	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil {
 		t.Fatalf("runPlanPhase: %v", err)
 	}
@@ -1440,13 +1254,10 @@ func TestPlanAnswerInArgument(t *testing.T) {
 	}
 }
 
-// TestPlanRedoIsAPlan: the planner's third exit, spec items to reopen or a
-// spec to write, counts as a plan: no "neither answer nor plan" nudge, and
-// the ids come through.
 func TestPlanRedoIsAPlan(t *testing.T) {
 	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
 		`{"clear":true,"report_only":false,"subtasks":[],"redo":["F0.9","§03-shell#1-screen"]}`))
-	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil {
 		t.Fatalf("runPlanPhase: %v", err)
 	}
@@ -1458,9 +1269,6 @@ func TestPlanRedoIsAPlan(t *testing.T) {
 	}
 }
 
-// TestPlanStringifiedSubtasksWithStrayBrace: a stringified subtask array
-// with one brace too many inside the string still parses; the balanced
-// array is what counts.
 func TestPlanStringifiedSubtasksWithStrayBrace(t *testing.T) {
 	var p planResult
 	raw := `{"clear": true, "report_only": false, "subtasks": "[{\"description\": \"look\", \"verify\": [\"a\"]}]}"}`
@@ -1472,11 +1280,32 @@ func TestPlanStringifiedSubtasksWithStrayBrace(t *testing.T) {
 	}
 }
 
-// TestStuckLadderCatchesSuccessfulCommandSpin: a successful run_command
-// re-run counts as progress only when something happened in between (a
-// re-verify after an edit). The same command straight after itself, exit 0
-// and the same output, is a spin the ladder must bail on; one executor ran
-// one `ls; grep` line 75 times that way.
+// read A, read B, read B: the first B carries a batching note the second does
+// not, and the second must still count as a repeat.
+func TestStuckLadderSeesRepeatPastBatchNote(t *testing.T) {
+	a, s := newTestAgent(t)
+	rt := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
+	for _, name := range []string{"a.toml", "b.toml"} {
+		if err := os.WriteFile(filepath.Join(s.Cwd, name), []byte("k = 1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(path string) bool {
+		s.markReplyStart()
+		var tc toolCall
+		tc.Function.Name = "read_file"
+		tc.Function.Arguments = fmt.Sprintf(`{"path":%q}`, path)
+		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+		return rt.sawAgain(tc, tu)
+	}
+	read("a.toml")
+	read("b.toml")
+	if !read("b.toml") {
+		t.Error("the first identical re-read after a batching note did not count as a repeat")
+	}
+}
+
+// The same command straight after itself, exit 0 and the same output, is a spin.
 func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
 	rt := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
 	mk := func(id, name, args string) toolCall {
@@ -1517,8 +1346,7 @@ func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
 	if rt.sawAgain(probe, out) {
 		t.Error("a re-run after a Python heredoc edit is a re-verify, not a repeat")
 	}
-	// A counter bumped into the command to make each call look new (`echo
-	// READY79`, READY80, …) changes neither the key nor the answer.
+	// A counter bumped into the command changes neither the key nor the answer.
 	for i := 1; i <= 3; i++ {
 		poll := mk("r", "run_command", fmt.Sprintf(`{"command":"ls -l shotview/cut.png | cut -c1-70; echo READY%d"}`, i))
 		pollOut := ToolUse{Name: "run_command", Output: fmt.Sprintf("exit 0\n\n-rw-r--r-- 1 dev dev 115300 Sep 26 22:20 shotview/cut.\nREADY%d\n", i)}
@@ -1526,8 +1354,7 @@ func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
 			t.Errorf("poll %d: repeat = %v, want %v", i, got, i > 1)
 		}
 	}
-	// A redirect to a log is not a change to the tree: rendering the same
-	// screen into /tmp again and again is a spin.
+	// A redirect to a log is not a change to the tree.
 	snap := mk("n", "run_command", `{"command":"cd rust && just snapshot 04-prepare > /tmp/snap.log 2>&1"}`)
 	snapOut := ToolUse{Name: "run_command", Output: "exit 0\n\n-> shots/04-prepare.png\n"}
 	rt.sawAgain(snap, snapOut)
@@ -1535,11 +1362,28 @@ func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
 		t.Error("a repeated snapshot render with only a log redirect did not count as a repeat")
 	}
 	if !rt.sawAgain(probe, ToolUse{Name: "run_command", Output: "exit 1\n\nboom", Failed: true}) {
-		// A different output than before: new information, so this one is not
-		// a repeat either; the next identical failure is.
+		// New output is not a repeat; the next identical failure is.
 		t.Log("first failure is new output")
 	}
 	if !rt.sawAgain(probe, ToolUse{Name: "run_command", Output: "exit 1\n\nboom", Failed: true}) {
 		t.Error("a repeated failure did not count")
+	}
+}
+
+// A clear submit_plan with neither an answer nor any work gets the one
+// planner retry, and the retry's plan is taken.
+func TestPlanNeitherAnswerNorWorkRetries(t *testing.T) {
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"report_only":false,"subtasks":[]}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear":true,"report_only":false,"subtasks":[{"description":"fix it","verify":["go test ./..."]}]}`))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if mock.callCount() != 2 || plan == nil || len(plan.Subtasks) != 1 {
+		t.Fatalf("calls %d, plan %+v: want the retry's subtask", mock.callCount(), plan)
+	}
+	if got := lastUserMessage(s); !strings.Contains(got, "neither an answer nor subtasks") {
+		t.Errorf("stored corrective = %q", got)
 	}
 }

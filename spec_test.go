@@ -5,14 +5,13 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
 
-// writeSpecFixture lays out a miniature spec shaped like the one /spec was built
-// against: numbered chapters with navigation bars, flows as headings, prose
-// sections with no id, a parameter table, an index, a raw inventory repeating a
-// flow id, and a heading that only mentions an id in parentheses.
+// writeSpecFixture has nav bars, heading flows, id-less prose sections, a parameter table, an
+// index, an inventory repeating a flow id, and a heading naming an id only in parentheses.
 func writeSpecFixture(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
@@ -44,8 +43,7 @@ func writeSpecFixture(t *testing.T) string {
 	return root
 }
 
-// TestScanSpecLedger pins what becomes an item, where each item is defined, and
-// the order the loop takes them in.
+// What becomes an item, where each is defined, and the order the loop takes them in.
 func TestScanSpecLedger(t *testing.T) {
 	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
 	if err != nil {
@@ -64,13 +62,11 @@ func TestScanSpecLedger(t *testing.T) {
 	if rel, kind := where("F0.1"); rel != "03-shell.md" || kind != specDefHeading {
 		t.Errorf("F0.1 defined at %s kind %d, want the chapter heading", rel, kind)
 	}
-	// A heading that only names an id in parentheses is still the section about
-	// it when no heading opens with it, and it beats the index row.
+	// A heading naming an id in parentheses beats the index row when no heading opens with it.
 	if rel, kind := where("F6.1"); rel != "09-llm.md" || kind != specDefHeading {
 		t.Errorf("F6.1 defined at %s kind %d, want 09's heading over the index row", rel, kind)
 	}
-	// "### 3.1 Derivation (F0.1, …)" mentions F0.1 and the parameter; neither
-	// moves there, and the parameter stays defined by its table row.
+	// A heading naming several ids moves neither; the parameter stays defined by its table row.
 	if rel, kind := where("P.policy.padSeconds"); rel != "10-parameters.md" || kind != specDefTableRow {
 		t.Errorf("P.policy.padSeconds defined at %s kind %d, want the parameter table row", rel, kind)
 	}
@@ -104,9 +100,7 @@ func TestScanSpecLedger(t *testing.T) {
 	}
 }
 
-// TestSpecSlice pins what one round is shown: its own section without the
-// navigation bar, the rows of the parameters it cites, the section it links to,
-// and a pointer (not a copy) to another flow.
+// Own section without nav, cited parameter rows, the linked section, only a pointer to another flow.
 func TestSpecSlice(t *testing.T) {
 	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
 	if err != nil {
@@ -139,7 +133,6 @@ func TestSpecSlice(t *testing.T) {
 	}
 }
 
-// TestSpecCoverage pins what counts as a test naming an id, and what doesn't.
 func TestSpecCoverage(t *testing.T) {
 	out := t.TempDir()
 	write := func(rel, body string) {
@@ -153,8 +146,7 @@ func TestSpecCoverage(t *testing.T) {
 		}
 	}
 	write("tests/shell.rs", "#[test]\nfn f0_1_s1_switches() {}\n#[test]\nfn f0_10_other() {}\n")
-	// Production code naming an id in a doc comment is not a test; its inline
-	// test module is.
+	// An id in a production doc comment is not a test; the inline test module is.
 	write("src/lib.rs", "//! F0.2 lives here\npub fn press() {}\n#[cfg(test)]\nmod tests {\n    // P.policy.padSeconds\n    #[test] fn pad() {}\n}\n")
 	write("src/cut.rs", "// §01-files#2-cutjson\npub fn load() {}\n")
 	write("tests/files.rs", "#[test] fn sec_01_files_2_cutjson_round_trips() {}\n")
@@ -193,7 +185,6 @@ func TestSpecTestToken(t *testing.T) {
 	}
 }
 
-// TestGithubSlug pins the anchors the spec's own links are written against.
 func TestGithubSlug(t *testing.T) {
 	for title, want := range map[string]string{
 		"F0.2 Press ▶":                        "f02-press-",
@@ -214,8 +205,7 @@ func TestParseSpecArgs(t *testing.T) {
 			t.Errorf("parseSpecArgs(%q) = %q, %v; want %q", args, cmd, err, want)
 		}
 	}
-	// Nobody types item ids: /spec redo finds them. And the positional
-	// spec-dir/out-dir form is gone: the first run asks.
+	// Item ids and the positional spec-dir/out-dir form are refused.
 	for _, args := range []string{"redo F2.3", "redo 03-shell.md", "spec/ rust/ use gtk4-rs"} {
 		if _, err := parseSpecArgs(args); err == nil {
 			t.Errorf("%q parsed", args)
@@ -223,9 +213,7 @@ func TestParseSpecArgs(t *testing.T) {
 	}
 }
 
-// TestSpecRedoReopens: /spec redo takes finished items out of the ledger and
-// keeps them open although their tests still name them, by id or by file; a
-// target it cannot place reopens nothing.
+// Reopened items stay open though their tests name them, by id or file; an unknown target reopens nothing.
 func TestSpecRedoReopens(t *testing.T) {
 	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
 	if err != nil {
@@ -245,8 +233,7 @@ func TestSpecRedoReopens(t *testing.T) {
 	if _, unknown := specRedoTargets(cfg, idx, []string{"F9.9", byFile}); len(unknown) != 1 || unknown[0] != "F9.9" {
 		t.Errorf("unknown = %v, want the typo alone", unknown)
 	}
-	// A section named by file and number with a paraphrased slug resolves to
-	// the real section; a number the file does not have does not.
+	// A paraphrased slug resolves by its number; a number the file lacks does not.
 	var section string
 	for _, id := range idx.order {
 		if strings.HasPrefix(id, "§") && strings.Contains(id, "#") {
@@ -266,7 +253,7 @@ func TestSpecRedoReopens(t *testing.T) {
 		}
 	}
 
-	cfg.reopen(ids, "sent back")
+	cfg.reopen(ids)
 	for _, id := range ids {
 		if _, known := cfg.Items[id]; known {
 			t.Errorf("%s still in the ledger", id)
@@ -278,8 +265,8 @@ func TestSpecRedoReopens(t *testing.T) {
 	if next, _ := nextSpecItem(idx, covered, cfg); next != ids[0] {
 		t.Errorf("next = %q, want the first reopened item %q", next, ids[0])
 	}
-	if cfg.Redo[ids[0]] != "sent back" {
-		t.Error("the reason did not stick")
+	if cfg.Redo[ids[0]] == "" {
+		t.Error("the redo mark did not stick")
 	}
 	// Status counts a reopened item as open although its test still names it.
 	status := renderSpecStatus(cfg, idx, covered, 1, "just test")
@@ -309,8 +296,7 @@ func countKindIn(idx *specIndex, ids []string, kind int) int {
 	return n
 }
 
-// TestDetectSpecTestCmd: a justfile test recipe wins, since that is where a
-// project puts what the bare toolchain command doesn't know.
+// A justfile test recipe wins over the bare toolchain command.
 func TestDetectSpecTestCmd(t *testing.T) {
 	dir := t.TempDir()
 	if got := detectSpecTestCmd(dir); got != "" {
@@ -333,7 +319,7 @@ func TestNextSpecItem(t *testing.T) {
 	if id, ans := nextSpecItem(idx, covered, cfg); id != "c" || ans != "use SQLite" {
 		t.Errorf("next = %q %q, want the answered block c before d", id, ans)
 	}
-	cfg.unblock("c")
+	cfg.Blocked = cfg.Blocked[:1] // c was picked with its answer
 	covered["c"] = "tests/c.rs"
 	if id, _ := nextSpecItem(idx, covered, cfg); id != "d" {
 		t.Errorf("next = %q, want d (b stays blocked without an answer)", id)
@@ -353,6 +339,18 @@ func TestSpecOpenMarkers(t *testing.T) {
 	// "REVIEW:" counts, "PREVIEWING" does not.
 	if len(got) != 1 || !strings.HasPrefix(got[0], "spec/03-shell.md:") {
 		t.Errorf("markers = %v, want exactly the one REVIEW line in 03-shell.md", got)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("# A\n\nTODO: decide\nsee [open] here\nxTODO: not a marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if idx, err = scanSpec(dir, defaultSpecIDPatterns, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Markers may start or end with punctuation.
+	if got := idx.openMarkers([]string{"TODO:", "[open]"}, "spec"); !slices.Equal(got, []string{"spec/a.md:3", "spec/a.md:4"}) {
+		t.Errorf("punctuated markers = %v, want lines 3 and 4", got)
 	}
 }
 
@@ -375,9 +373,7 @@ func TestSpecConfigRoundTrip(t *testing.T) {
 	}
 }
 
-// TestSpecItemHashIgnoresFormatting pins what counts as a spec change: the
-// words, not the layout. Reflowing a paragraph or reindenting a list must not
-// re-open a finished item, while rewording it must.
+// Rewording must still re-open an item.
 func TestSpecItemHashIgnoresFormatting(t *testing.T) {
 	root := writeSpecFixture(t)
 	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
@@ -417,10 +413,7 @@ func TestSpecItemHashIgnoresFormatting(t *testing.T) {
 	}
 }
 
-// TestSpecReconcile pins the four cases a later run has to tell apart, and that
-// the config comes back describing the spec as it is NOW: a rename carries its
-// record to the new id, and covered work that predates the ledger is adopted
-// rather than reported as changed.
+// A rename carries its record to the new id; covered work predating the ledger is adopted, not changed.
 func TestSpecReconcile(t *testing.T) {
 	root := writeSpecFixture(t)
 	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
@@ -439,8 +432,7 @@ func TestSpecReconcile(t *testing.T) {
 		// Same heading, different file: a section that moved.
 		"§98-moved#1-screen": {Hash: "moved", Title: idx.items["§03-shell#1-screen"].Title},
 	}}
-	// An item covered by a test but absent from the ledger: work that predates
-	// it, which must be adopted rather than reported as changed forever.
+	// Covered but absent from the ledger: must be adopted, not reported as changed forever.
 	adoptable := ""
 	for _, id := range idx.order {
 		if _, known := cfg.Items[id]; !known && id != "§03-shell#1-screen" {
@@ -475,9 +467,7 @@ func TestSpecReconcile(t *testing.T) {
 	if e := cfg.Items[adoptable]; e.At.IsZero() || e.Version == "" || e.Commit != "" {
 		t.Errorf("an adopted entry must say when and by which codehalter it was recorded, and carry no commit: %+v", e)
 	}
-	// A second pass adopts nothing new and finds no further renames: the item
-	// still to redo and the one still to delete keep being reported, because
-	// nothing has acted on them yet.
+	// A second pass adopts and renames nothing; the redo and the delete stay reported until acted on.
 	d2 := specReconcile(cfg, idx, covered)
 	if d2.Adopted != 0 || len(d2.Renamed) != 0 {
 		t.Errorf("a second pass must be quiet about renames and adoptions, got %+v", d2)
@@ -487,8 +477,7 @@ func TestSpecReconcile(t *testing.T) {
 	}
 }
 
-// TestSpecSetupDetection pins the first-run guesses: which directory holds the
-// spec, which page a reader opens first, and what stack that page asks for.
+// Which directory holds the spec, which page is read first, and what stack it asks for.
 func TestSpecSetupDetection(t *testing.T) {
 	root := t.TempDir()
 	for path, body := range map[string]string{
@@ -533,8 +522,7 @@ func TestSpecSetupDetection(t *testing.T) {
 	}
 }
 
-// TestSpecSectionFromText pins recovering a deleted item's text from an old
-// copy of its file: the section stops at the next heading of its level or above.
+// The section stops at the next heading of its level or above.
 func TestSpecSectionFromText(t *testing.T) {
 	doc := "# 01 Files\n\n## 1. Layout\n\nThe folder.\n\n### 1.1 Detail\n\nMore.\n\n## 2. cut.json\n\nThe format.\n"
 	got := specSectionFromText(doc, "§01-files#1-layout")
@@ -549,10 +537,8 @@ func TestSpecSectionFromText(t *testing.T) {
 	}
 }
 
-// TestSpecSetupOptions pins where the three setup cards get their options:
-// out-dir from the page's suggestion first, then directories holding a
-// manifest (never the spec dir, never build output); target from the page's
-// answer, then what the chosen directory already is, read off its manifest.
+// Out-dir: the page's suggestion, then manifest dirs (never the spec dir or build output).
+// Target: the page's answer, then what the chosen directory's manifest says.
 func TestSpecSetupOptions(t *testing.T) {
 	root := t.TempDir()
 	for path, body := range map[string]string{
@@ -600,10 +586,7 @@ func TestSpecSetupOptions(t *testing.T) {
 	}
 }
 
-// TestSpecFailedRoundStaysOpen: a test that names an item counts as done only
-// while no round on it has failed. After a failed round the test is there but
-// the suite did not pass; adopting it then ended a run with the item
-// unfinished and /spec reporting itself finished.
+// After a failed round the test exists but the suite did not pass, so it must not be adopted.
 func TestSpecFailedRoundStaysOpen(t *testing.T) {
 	root := writeSpecFixture(t)
 	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
@@ -624,11 +607,24 @@ func TestSpecFailedRoundStaysOpen(t *testing.T) {
 		t.Errorf("next = %q, want %q picked again", id, item)
 	}
 
-	// An item already in the ledger is done whatever its attempt count says
-	// (a ledger written before this rule may carry a stale count).
+	// A ledgered item is done whatever a stale attempt count says, and reconciling drops it.
 	cfg.Items[item] = specLedger{Hash: specItemHash(idx, item)}
 	if id, _ := nextSpecItem(idx, covered, cfg); id == item {
 		t.Error("a ledgered item was picked again because of a stale attempt count")
+	}
+	if !strings.Contains(renderSpecStatus(cfg, idx, covered, 1, "just test"), "| 01-files.md | 1 |") {
+		t.Error("status does not count a ledgered item with a stale attempt count as covered")
+	}
+	specReconcile(cfg, idx, covered)
+	if cfg.Attempts[item] != 0 {
+		t.Errorf("attempts = %d after reconcile, want the stale count dropped", cfg.Attempts[item])
+	}
+	// A changed item keeps its count: its change rounds are counted there.
+	cfg.Items[item] = specLedger{Hash: "stale"}
+	cfg.Attempts[item] = 1
+	specReconcile(cfg, idx, covered)
+	if cfg.Attempts[item] != 1 {
+		t.Error("reconcile dropped the attempt count of a changed item")
 	}
 	delete(cfg.Items, item)
 
@@ -641,9 +637,7 @@ func TestSpecFailedRoundStaysOpen(t *testing.T) {
 	}
 }
 
-// TestWriteSpecFiles: the planner's spec lands under the spec dir as new
-// files only; an existing file is never overwritten and a path that leaves
-// the directory is refused.
+// An existing file is never overwritten and a path that leaves the directory is refused.
 func TestWriteSpecFiles(t *testing.T) {
 	cwd := t.TempDir()
 	written, err := writeSpecFiles(cwd, "spec", []specFile{{Path: "01-files.md", Content: "# Files\n\n## 1. Layout\n\nF1.1 the layout"}, {Path: "spec/02-ui.md", Content: "# UI"}})
@@ -658,5 +652,31 @@ func TestWriteSpecFiles(t *testing.T) {
 	}
 	if _, err := writeSpecFiles(cwd, "spec", []specFile{{Path: "../evil.md", Content: "x"}}); err == nil {
 		t.Error("a path outside the spec dir was written")
+	}
+}
+
+// More than half of the ledger gone at once, or all of a ledger under 4, reads as a missing spec.
+func TestSpecReconcileVanished(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		live, gone int
+		want       bool
+	}{
+		{3, 2, false}, {2, 2, false}, {2, 3, true}, // half is not more than half
+		{1, 2, false}, {0, 3, true}, {0, 1, true}, // under 4, only all of it
+	} {
+		cfg := &specConfig{Items: map[string]specLedger{}}
+		for _, id := range idx.order[:tc.live] {
+			cfg.Items[id] = specLedger{Hash: specItemHash(idx, id)}
+		}
+		for i := range tc.gone {
+			cfg.Items[fmt.Sprintf("§99-old#%d-dropped", i)] = specLedger{Hash: "gone"}
+		}
+		if d := specReconcile(cfg, idx, nil); d.Vanished != tc.want || len(d.Removed) != tc.gone {
+			t.Errorf("%d live, %d gone: vanished=%v removed=%v, want vanished=%v", tc.live, tc.gone, d.Vanished, d.Removed, tc.want)
+		}
 	}
 }

@@ -20,27 +20,9 @@ import (
 	"time"
 )
 
-// ---------------------------------------------------------------------------
-// Standalone CLI client.
-//
-// codehalter is an ACP agent and normally sits behind an editor. --cli supplies
-// the client half itself: the same agent in-process, joined to it by a pair of
-// pipes, driven from a terminal. Nothing in the agent is special-cased for it.
-// The pipes look redundant in one process, and they are the point: every byte
-// is real ACP on a real wire, so a framing, ordering or capability bug shows up
-// here instead of hiding behind an in-process shortcut.
-//
-// Two capabilities are required: terminal (ensureTerminals aborts a session
-// without it, and the agent has no exec fallback, so the CLI implements real
-// terminals over os/exec) and elicitation.form (ask_user's free text has no
-// permission-dialog equivalent). fs is NOT advertised: it exists to serve
-// unsaved editor buffers, and the CLI has none.
-//
-// Like every way of running codehalter, this runs INSIDE the devcontainer, so
-// the terminals below spawn processes in the container, exactly as under Zed.
-// ---------------------------------------------------------------------------
+// The standalone CLI talks real ACP to the in-process agent over pipes, so framing and
+// ordering bugs show up here too. fs is not advertised: the CLI has no unsaved buffers.
 
-// cliUsage is printed for --help and for a flag we don't know.
 const cliUsage = `usage: codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT]
 
   --cli               run the standalone terminal client instead of an ACP server
@@ -104,19 +86,11 @@ func runCLI(argv []string) int {
 	}
 	cwd = abs
 
-	// Before anything is opened: an update installed here replaces this binary
-	// and re-executes, and there is no session, log or container yet to lose.
-	// A one-shot or a piped stdin is told, not asked, because there is nobody
-	// at the keyboard to answer. The decision (and the release tag) then travel
-	// into the container through the environment, so the copy in there does not
-	// repeat the question or the API call.
+	// Before anything is opened: an update re-execs this binary, and nothing exists yet to lose.
 	offerUpdate(context.Background(), cwd, stdinIsTTY() && !oneshot)
 
-	// On the host, with a devcontainer to work from, this process is only a
-	// launcher: it starts the container and runs the real CLI inside it, then
-	// reports that run's exit status. Everything below is the in-container
-	// path, which is also what a project with no devcontainer.json gets (the
-	// agent's own bootstrap then offers to scaffold one).
+	// On the host this process is only a launcher. Without a devcontainer.json it falls
+	// through and the agent offers to scaffold one.
 	if containerKind() == "" {
 		var inner []string
 		if resume {
@@ -133,12 +107,8 @@ func runCLI(argv []string) int {
 		}
 	}
 
-	// The agent logs at debug on every turn. On stderr that is a wall of text
-	// straight through the TUI, so both slog AND os.Stderr are redirected to a
-	// file for the whole run: os.Stderr as well because tool_web hands firefox's
-	// output to it directly, and a child process writing over the live region
-	// would desync the cursor arithmetic. Runtime panics still reach fd 2 and
-	// the real terminal, which is where a panic belongs.
+	// Debug logs and child stderr (tool_web hands firefox's output to os.Stderr) would write
+	// through the TUI and desync the live region, so both go to a file. Panics still reach fd 2.
 	if logf := openCLILog(cwd); logf != nil {
 		defer logf.Close()
 		slog.SetDefault(slog.New(slog.NewTextHandler(logf, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -147,8 +117,6 @@ func runCLI(argv []string) int {
 		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	}
 
-	// Two pipes, one per direction: the agent reads what the client writes and
-	// the client reads what the agent writes.
 	agentIn, clientOut := io.Pipe()
 	clientIn, agentOut := io.Pipe()
 
@@ -165,13 +133,10 @@ func runCLI(argv []string) int {
 	}
 	c.conn = newCLIConn(clientOut, clientIn, c)
 
-	// One shutdown for both ways out: the normal return below, and the hard exit
-	// a second Ctrl+C takes. That one cannot unwind the stack, because the repl
-	// is parked in a read on stdin that no signal interrupts, so it has to run
-	// the same teardown from the signal goroutine instead of returning.
+	// Shared with hardQuit: a second Ctrl+C cannot unwind the stack while the repl is parked
+	// in a stdin read, so it runs this teardown from the signal goroutine.
 	shutdown := func() {
-		// Close our end first: that EOFs the agent's reader and ends its serve
-		// loop, which is the same shutdown path a departing editor triggers.
+		// EOF on the agent's reader ends its serve loop, the same path a departing editor takes.
 		clientOut.Close()
 		select {
 		case <-acp.Done():
@@ -192,22 +157,12 @@ func runCLI(argv []string) int {
 	return code
 }
 
-// stdinIsTTY reports whether input comes from a terminal rather than a pipe or
-// a file. Two things turn on it: the UI echoes submitted lines itself when
-// nothing else will, and only a terminal's input is joined on paste, because
-// piped lines arrive in one chunk too and are meant to stay separate prompts.
 func stdinIsTTY() bool {
 	fi, err := os.Stdin.Stat()
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
-// openCLILog opens .codehalter/cli.log, creating the directory if the project
-// hasn't been used yet. Returns nil (and the caller discards logs) rather than
-// failing the run: a read-only project directory is a reason to lose the log,
-// not a reason to refuse to work.
-//
-// Truncated per run rather than appended: this is debug-level output for the
-// session you are in, it grows by megabytes an hour, and nothing collects it.
+// openCLILog returns nil on failure: a read-only project should lose the log, not the run.
 func openCLILog(cwd string) *os.File {
 	dir := filepath.Join(cwd, ".codehalter")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -220,45 +175,31 @@ func openCLILog(cwd string) *os.File {
 	return f
 }
 
-// ---------------------------------------------------------------------------
-// cliClient — the ACP client half
-// ---------------------------------------------------------------------------
-
 type cliClient struct {
 	ui   *cliUI
 	conn *cliConn
 	in   *bufio.Reader
 	cwd  string
 
-	// interactive is stdin-is-a-terminal, which is what decides whether a
-	// second line arriving with the first is a paste or just the next command.
 	interactive bool
 
-	// hardQuit tears down the agent and exits, for the one exit that cannot
-	// return through runCLI. Tests leave it nil and get the hint instead.
+	// hardQuit is nil in tests, which then only get the hint.
 	hardQuit func()
 
-	// sid is swapped by /new and /resume on the input goroutine and read by the
-	// signal goroutine, so it goes through sessionID/setSessionID.
+	// sid is written by the input goroutine and read by the signal goroutine.
 	sidMu sync.Mutex
 	sid   string
 
 	modes []string
 
-	// commands is what the agent advertised through available_commands_update,
-	// shown by /help next to the client's own commands.
 	cmdMu    sync.Mutex
 	commands []availableCommand
 
-	// turnActive is read by the signal handler to decide whether Ctrl+C cancels
-	// a turn or just prints a hint, so it can't take the UI lock.
+	// turnActive is read by the signal handler, which must not take the UI lock.
 	turnActive atomic.Bool
 
-	// askMu is the stdin token. Exactly one goroutine may read at a time: the
-	// input loop when idle, or one inline question during a turn. The agent can
-	// have two tool calls waiting on the user at once (parallel tool dispatch),
-	// and a cancelled turn returns while its question is still parked in a read,
-	// so "no turn is running" is not enough to make the loop safe on its own.
+	// askMu is the stdin token: parallel tool calls can both ask the user, and a cancelled
+	// turn returns while its question is still parked in a read.
 	askMu sync.Mutex
 
 	termMu  sync.Mutex
@@ -297,8 +238,6 @@ func (c *cliClient) run(resume bool, resumeID, prompt string, oneshot bool) int 
 	}
 	c.installSignals()
 
-	// One-shot prints no banner and opens no prompt row: the output is the turn
-	// and nothing else, so the run reads as a command rather than as a session.
 	if oneshot {
 		if c.turn(prompt) {
 			return 0
@@ -313,9 +252,6 @@ func (c *cliClient) run(resume bool, resumeID, prompt string, oneshot bool) int 
 	return c.repl()
 }
 
-// openSession picks up an existing session or starts a new one. A --resume with
-// no id takes the most recently updated session for this directory, which is
-// what "carry on where I left off" means at a shell prompt.
 func (c *cliClient) openSession(resume bool, resumeID string) error {
 	if resume && resumeID == "" {
 		sessions, err := c.storedSessions()
@@ -330,7 +266,10 @@ func (c *cliClient) openSession(resume bool, resumeID string) error {
 	if resumeID != "" {
 		return c.loadSession(resumeID)
 	}
+	return c.startSession()
+}
 
+func (c *cliClient) startSession() error {
 	raw, err := c.conn.request("session/new", NewSessionRequest{Cwd: c.cwd})
 	if err != nil {
 		return fmt.Errorf("session/new failed: %w", err)
@@ -346,7 +285,6 @@ func (c *cliClient) openSession(resume bool, resumeID string) error {
 	return nil
 }
 
-// loadSession resumes a stored session by id.
 func (c *cliClient) loadSession(id string) error {
 	raw, err := c.conn.request("session/load", LoadSessionRequest{SessionId: id, Cwd: c.cwd})
 	if err != nil {
@@ -356,8 +294,7 @@ func (c *cliClient) loadSession(id string) error {
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("session/load returned nonsense: %w", err)
 	}
-	// The response may echo the id back or leave it out, meaning "the one you
-	// asked for".
+	// The response may omit the id, meaning the one requested.
 	if res.SessionId != "" {
 		id = res.SessionId
 	}
@@ -365,10 +302,7 @@ func (c *cliClient) loadSession(id string) error {
 	return nil
 }
 
-// storedSessions lists this directory's sessions, newest first. UpdatedAt is
-// ISO 8601, so lexical order is chronological order. The agent already sorts,
-// but a client that relies on that is a client that breaks quietly the day it
-// stops being true.
+// UpdatedAt is ISO 8601, so string order is time order. Re-sorted rather than trusting the agent.
 func (c *cliClient) storedSessions() ([]SessionInfo, error) {
 	raw, err := c.conn.request("session/list", ListSessionsRequest{Cwd: c.cwd})
 	if err != nil {
@@ -384,9 +318,6 @@ func (c *cliClient) storedSessions() ([]SessionInfo, error) {
 	return list.Sessions, nil
 }
 
-// adopt switches to a session the agent just handed us. The context meter is
-// zeroed because it describes the conversation we just left; the agent sends a
-// usage_update for the new one on its first turn.
 func (c *cliClient) adopt(sid string, modes *SessionModeState) {
 	c.setSessionID(sid)
 	c.modes = nil
@@ -399,12 +330,8 @@ func (c *cliClient) adopt(sid string, modes *SessionModeState) {
 	c.ui.Usage(0, 0)
 }
 
-// installSignals makes Ctrl+C interrupt the turn rather than the process. A
-// blocking read on stdin is restarted by the Go runtime after a signal, so
-// Ctrl+C at an idle prompt cannot unblock the reader: the first one says how to
-// leave, and a second one within two seconds is taken as meaning it. That exit
-// can't unwind the stack (the read is still parked), so it goes through
-// hardQuit, which runs the same teardown the normal path does.
+// A stdin read is not interrupted by a signal, so Ctrl+C at an idle prompt only hints; a
+// second one within two seconds exits through hardQuit.
 func (c *cliClient) installSignals() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt)
@@ -428,13 +355,10 @@ func (c *cliClient) installSignals() {
 	}()
 }
 
-// repl is the input loop.
 func (c *cliClient) repl() int {
 	for {
-		// askMu, not just "no turn is running": a cancelled turn returns while
-		// its question is still parked in a read on the same bufio.Reader, and
-		// two readers on one of those is a data race, not merely a confusing
-		// prompt. Held across the echo so the prompt row has one owner too.
+		// askMu, not "no turn running": a cancelled turn's question may still be reading this
+		// bufio.Reader. Held across the echo so the prompt row has one owner.
 		c.askMu.Lock()
 		c.ui.Prompt("\n❯ ")
 		text, err := c.readPrompt()
@@ -461,13 +385,8 @@ func (c *cliClient) repl() int {
 	}
 }
 
-// readPrompt reads one prompt. A paste is several lines that arrive in a single
-// chunk, so anything still buffered the instant the first line ends came in with
-// it and belongs to the same prompt: without this, pasting a stack trace runs
-// one turn per line. Typing can't trip it, since a human leaves the reader idle
-// between lines. Only for a terminal: piped input is buffered the same way, but
-// there each line is meant to be its own prompt. A paste larger than bufio's
-// buffer splits at that boundary, which is what every line did before.
+// On a terminal, input already buffered when the first line ends is a paste and joins the
+// same prompt. Piped input is buffered too, but there each line is its own prompt.
 func (c *cliClient) readPrompt() (string, error) {
 	line, err := c.in.ReadString('\n')
 	for err == nil && c.interactive && c.in.Buffered() > 0 {
@@ -478,10 +397,8 @@ func (c *cliClient) readPrompt() (string, error) {
 	return strings.TrimSpace(line), err
 }
 
-// command handles the commands the CLIENT owns. Everything else beginning with
-// a slash is passed through untouched: the agent parses "/name args" itself
-// (see splitMacro) for /clean, /settings and every TEMPLATE-*.md macro, so the
-// client must not swallow names it doesn't recognise.
+// command handles client-owned commands only. Other slash commands pass through: the agent
+// parses "/name args" itself (splitMacro).
 func (c *cliClient) command(text string) (handled, quit bool) {
 	name, rest, _ := strings.Cut(text, " ")
 	rest = strings.TrimSpace(rest)
@@ -571,27 +488,14 @@ func (c *cliClient) printSessions() {
 	c.ui.Note(ansiDim, "  switch with /resume <id>")
 }
 
-// newSession starts a fresh conversation without leaving the CLI. The old one
-// is not closed: it stays on disk and /resume brings it back, exactly like
-// opening a second thread in an editor.
 func (c *cliClient) newSession() {
-	raw, err := c.conn.request("session/new", NewSessionRequest{Cwd: c.cwd})
-	if err != nil {
-		c.ui.Note(ansiRed, "  session/new: "+err.Error())
+	if err := c.startSession(); err != nil {
+		c.ui.Note(ansiRed, "  "+err.Error())
 		return
 	}
-	var res NewSessionResponse
-	if err := json.Unmarshal(raw, &res); err != nil || res.SessionId == "" {
-		c.ui.Note(ansiRed, "  session/new returned no session id")
-		return
-	}
-	c.adopt(res.SessionId, res.Modes)
-	c.ui.Note(ansiDim, "  session "+res.SessionId)
+	c.ui.Note(ansiDim, "  session "+c.sessionID())
 }
 
-// resumeSession switches to a stored session. With no id it offers the list,
-// which is the only way to pick one without first running /sessions and copying
-// a timestamp by hand.
 func (c *cliClient) resumeSession(id string) {
 	if id == "" {
 		sessions, err := c.storedSessions()
@@ -620,10 +524,6 @@ func (c *cliClient) resumeSession(id string) {
 	c.ui.Note(ansiDim, "  session "+c.sessionID())
 }
 
-// turn sends one prompt and blocks until the agent reports a stop reason. It
-// reports whether the turn finished normally, which is what -p exits on. The
-// render ticker runs only for the duration of the turn: with nothing in flight
-// there is nothing to animate, so an idle CLI wakes up zero times a second.
 func (c *cliClient) turn(text string) bool {
 	c.turnActive.Store(true)
 	c.ui.Begin()
@@ -647,8 +547,6 @@ func (c *cliClient) turn(text string) bool {
 		c.ui.Note(ansiRed, "  turn returned nonsense: "+err.Error())
 		return false
 	}
-	// end_turn is the normal case and needs no announcement; the others explain
-	// why the agent stopped short.
 	switch res.StopReason {
 	case "", "end_turn":
 		return true
@@ -678,10 +576,7 @@ func (c *cliClient) startTicker() func() {
 	return func() { close(stop) }
 }
 
-// pumpTails publishes the tail of every running command to the UI. It is a pull
-// on the render tick rather than a push from the pipe reader on purpose: a
-// chatty build writes thousands of times a second and each push would be a full
-// redraw.
+// Pulled on the render tick, not pushed per write: a chatty build would force thousands of redraws a second.
 func (c *cliClient) pumpTails() {
 	c.termMu.Lock()
 	terms := make([]*cliTerminal, 0, len(c.terms))
@@ -693,10 +588,6 @@ func (c *cliClient) pumpTails() {
 		c.ui.TerminalTail(t.id, t.tail(cliTermTail))
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Inbound: session/update
-// ---------------------------------------------------------------------------
 
 func (c *cliClient) sessionUpdate(params json.RawMessage) {
 	var p struct {
@@ -776,9 +667,6 @@ func (c *cliClient) sessionUpdate(params json.RawMessage) {
 	}
 }
 
-// blockText renders one content block as terminal text. Images are named rather
-// than drawn: the CLI has no way to show one, and silently dropping the block
-// would make a screenshot look like it produced nothing.
 func blockText(b ContentBlock) string {
 	switch b.Type {
 	case "text":
@@ -795,13 +683,6 @@ func blockText(b ContentBlock) string {
 	return b.Text
 }
 
-// ---------------------------------------------------------------------------
-// Inbound: asking the user
-// ---------------------------------------------------------------------------
-
-// requestPermission renders the button-only form: N options, pick one by
-// number. Empty input dismisses, which the agent reads as "cancelled" and is
-// how you back out without choosing.
 func (c *cliClient) requestPermission(params json.RawMessage) (any, error) {
 	var p permissionRequest
 	if err := json.Unmarshal(params, &p); err != nil {
@@ -826,11 +707,8 @@ func (c *cliClient) requestPermission(params json.RawMessage) (any, error) {
 	return resp, nil
 }
 
-// elicit renders elicitation/create. Only "form" mode is implemented, with the
-// two fields codehalter actually asks for: a single-select enum (choice) and a
-// free-text box (text). Anything else in the schema is ignored rather than
-// guessed at, and an unfillable form is declined so the agent gets an answer
-// instead of a hang.
+// Only the choice and text fields codehalter sends are supported; any other form is declined
+// so the agent gets an answer instead of a hang.
 func (c *cliClient) elicit(params json.RawMessage) (any, error) {
 	var p struct {
 		Message         string `json:"message"`
@@ -873,16 +751,8 @@ func (c *cliClient) elicit(params json.RawMessage) (any, error) {
 	return map[string]any{"action": "accept", "content": content}, nil
 }
 
-// askChoiceOrText is the one place that reads stdin during a turn. It suspends
-// the live region first: the region is rewritten by the render ticker, and
-// anything the user types into rows that get redrawn is erased under them.
-//
-// It does not take a context. The agent cancels an open dialog with
-// $/cancel_request when a turn is interrupted, but a read already blocked on
-// stdin cannot be abandoned safely: the line the user is halfway through typing
-// would be delivered to whoever reads next, i.e. it would become their next
-// prompt. So a cancelled question stays on screen and Enter dismisses it, which
-// loses nothing (the agent has already stopped waiting for the answer).
+// No context: a blocked stdin read cannot be abandoned without handing the half-typed line to
+// the next reader, so a cancelled question stays until Enter (the agent has stopped waiting).
 func (c *cliClient) askChoiceOrText(question string, labels []string, allowText bool) (int, string) {
 	c.askMu.Lock()
 	defer c.askMu.Unlock()
@@ -924,12 +794,6 @@ func (c *cliClient) askChoiceOrText(question string, labels []string, allowText 
 	return -1, ""
 }
 
-// ---------------------------------------------------------------------------
-// Inbound: terminals
-// ---------------------------------------------------------------------------
-
-// cliTerminal is one command the agent asked us to run. The client owns the
-// process; the agent only ever names it by id.
 type cliTerminal struct {
 	id    string
 	cmd   *exec.Cmd
@@ -943,10 +807,8 @@ type cliTerminal struct {
 	done chan struct{}
 }
 
-// Write is stdout and stderr both, interleaved in arrival order the way a real
-// terminal shows them. Over the limit, the FRONT is dropped: the agent asks for
-// 4 MiB and does its own head+tail elision (see terminalOutputLimit), so the
-// tail is the half worth keeping here.
+// Over the limit the front is dropped: the agent does its own head+tail elision
+// (terminalOutputLimit), so the tail is what matters here.
 func (t *cliTerminal) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -964,7 +826,6 @@ func (t *cliTerminal) snapshot() (string, bool, *terminalExit) {
 	return string(t.buf), t.truncated, t.exit
 }
 
-// tail returns the last n non-empty lines, for the live region under the card.
 func (t *cliTerminal) tail(n int) []string {
 	t.mu.Lock()
 	out := string(t.buf)
@@ -1002,9 +863,7 @@ func (c *cliClient) terminalCreate(params json.RawMessage) (any, error) {
 	if cmd.Dir == "" {
 		cmd.Dir = c.cwd
 	}
-	// nil stdin is /dev/null. It must NOT be os.Stdin: a command that reads
-	// would eat the keystrokes meant for the prompt, and the agent's contract
-	// is non-interactive commands anyway.
+	// nil stdin is /dev/null; os.Stdin would steal the prompt's keystrokes.
 	cmd.Stdin = nil
 
 	c.termMu.Lock()
@@ -1027,9 +886,7 @@ func (c *cliClient) terminalCreate(params json.RawMessage) (any, error) {
 		t.mu.Lock()
 		code := cmd.ProcessState.ExitCode()
 		if code < 0 {
-			// Killed by a signal. Without importing syscall for WaitStatus the
-			// name has to come from the formatted state ("signal: killed"),
-			// which is exactly what an ACP client reports here anyway.
+			// Killed by a signal: the name comes from the formatted state ("signal: killed").
 			sig := "unknown"
 			if err != nil {
 				sig = strings.TrimPrefix(err.Error(), "signal: ")
@@ -1083,11 +940,8 @@ func (c *cliClient) terminalWait(ctx context.Context, params json.RawMessage) (a
 	return exit, nil
 }
 
-// terminalKill stops the command but keeps its output readable, which is the
-// contract run_command's idle watchdog relies on. Only the direct child is
-// killed: putting it in its own process group would mean importing syscall for
-// SysProcAttr, and a shell that spawned background children leaves them behind
-// exactly as it does under any other ACP client.
+// terminalKill keeps the output readable (run_command's idle watchdog relies on that). Only
+// the direct child is killed, as under any other ACP client.
 func (c *cliClient) terminalKill(params json.RawMessage) (any, error) {
 	t, err := c.terminal(params)
 	if err != nil {
@@ -1108,8 +962,7 @@ func (t *cliTerminal) kill() {
 func (c *cliClient) terminalRelease(params json.RawMessage) (any, error) {
 	t, err := c.terminal(params)
 	if err != nil {
-		// Releasing something already gone is not an error worth failing a turn
-		// over: release is a deferred cleanup on the agent side.
+		// Release is a deferred cleanup on the agent side; an unknown id must not fail a turn.
 		return struct{}{}, nil
 	}
 	t.kill()
@@ -1119,8 +972,6 @@ func (c *cliClient) terminalRelease(params json.RawMessage) (any, error) {
 	return struct{}{}, nil
 }
 
-// releaseAll kills anything still running at exit. The agent releases its own
-// terminals, so this only catches commands abandoned by a crash or a hard quit.
 func (c *cliClient) releaseAll() {
 	c.termMu.Lock()
 	terms := c.terms
@@ -1131,215 +982,51 @@ func (c *cliClient) releaseAll() {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// cliConn — the client half of the JSON-RPC framing.
-//
-// A deliberate mirror of AgentSideConnection rather than a refactor of it into
-// a shared peer type: that code is load-bearing and stable, and a client whose
-// framing is written independently is a second implementation that can disagree
-// with the first, which is how framing bugs get caught instead of shared.
-// ---------------------------------------------------------------------------
-
+// cliConn shares rpcPeer with the agent: wire-shape tests on both ends, not a second copy, catch framing bugs.
 type cliConn struct {
-	w       io.Writer
-	writeMu sync.Mutex
-	client  *cliClient
-
-	nextID    atomic.Uint64
-	pendingMu sync.Mutex
-	pending   map[string]chan json.RawMessage
-
-	inflightMu sync.Mutex
-	inflight   map[string]context.CancelFunc
-
-	done chan struct{}
+	*rpcPeer
+	client *cliClient
 }
 
 func newCLIConn(w io.Writer, r io.Reader, client *cliClient) *cliConn {
-	c := &cliConn{
-		w:        w,
-		client:   client,
-		pending:  map[string]chan json.RawMessage{},
-		inflight: map[string]context.CancelFunc{},
-		done:     make(chan struct{}),
-	}
-	go c.serve(r)
+	c := &cliConn{rpcPeer: newRPCPeer(w, "cli: ", false), client: client}
+	go c.serve(r, c.dispatch)
 	return c
 }
 
-func (c *cliConn) write(msg any) error {
-	b, err := json.Marshal(msg)
-	if err != nil {
-		return err
-	}
-	b = append(b, '\n')
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	_, err = c.w.Write(b)
-	return err
-}
-
-func (c *cliConn) notify(method string, params any) error {
-	raw, err := json.Marshal(params)
-	if err != nil {
-		return err
-	}
-	return c.write(jsonrpcRequest{JSONRPC: "2.0", Method: method, Params: raw})
-}
-
-// request sends one client->agent call and waits for its reply. It takes no
-// context: nothing on this side ever cancels an outbound request (an
-// interrupted turn travels as a session/cancel notification, so the agent can
-// finish the turn properly and answer with a stop reason), and the only other
-// way out is the connection closing, which c.done already covers.
+// No ctx: a turn is interrupted by session/cancel. A person reads the errors, so the RPC code is dropped.
 func (c *cliConn) request(method string, params any) (json.RawMessage, error) {
-	id := strconv.FormatUint(c.nextID.Add(1), 10)
-	idRaw := json.RawMessage(`"` + id + `"`)
-
-	ch := make(chan json.RawMessage, 1)
-	c.pendingMu.Lock()
-	c.pending[id] = ch
-	c.pendingMu.Unlock()
-	defer func() {
-		c.pendingMu.Lock()
-		delete(c.pending, id)
-		c.pendingMu.Unlock()
-	}()
-
-	var raw json.RawMessage
-	if params != nil {
-		b, err := json.Marshal(params)
-		if err != nil {
-			return nil, err
+	raw, err := c.sendRequest(context.Background(), method, params)
+	var rerr *rpcError
+	switch {
+	case errors.As(err, &rerr):
+		if rerr.Data != "" {
+			return nil, fmt.Errorf("%s: %s", rerr.Message, rerr.Data)
 		}
-		raw = b
-	}
-	if err := c.write(jsonrpcRequest{JSONRPC: "2.0", ID: &idRaw, Method: method, Params: raw}); err != nil {
-		return nil, err
-	}
-
-	select {
-	case <-c.done:
+		return nil, errors.New(rerr.Message)
+	case errors.Is(err, errRPCClosed):
 		return nil, errors.New("agent connection closed")
-	case line := <-ch:
-		var resp struct {
-			Result json.RawMessage `json:"result"`
-			Error  *struct {
-				Code    int    `json:"code"`
-				Message string `json:"message"`
-				Data    string `json:"data,omitempty"`
-			} `json:"error"`
-		}
-		if err := json.Unmarshal(line, &resp); err != nil {
-			return nil, err
-		}
-		if resp.Error != nil {
-			if resp.Error.Data != "" {
-				return nil, fmt.Errorf("%s: %s", resp.Error.Message, resp.Error.Data)
-			}
-			return nil, errors.New(resp.Error.Message)
-		}
-		return resp.Result, nil
+	}
+	return raw, err
+}
+
+func (c *cliConn) dispatch(req *jsonrpcRequest) {
+	// session/update runs on the read loop so streamed chunks render in order; it never
+	// blocks (buffered stdout).
+	switch req.Method {
+	case "session/update":
+		c.client.sessionUpdate(req.Params)
+	case "$/cancel_request":
+		// Only the ctx: the handler's own error reply answers the request.
+		c.cancelInflight(req.Params)
+	default:
+		go c.handle(req)
 	}
 }
 
-func (c *cliConn) serve(r io.Reader) {
-	defer close(c.done)
-	br := bufio.NewReader(r)
-	for {
-		s, err := br.ReadString('\n')
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				slog.Debug("cli: read error", "err", err)
-			}
-			return
-		}
-		s = strings.TrimRight(s, "\r\n")
-		if s == "" {
-			continue
-		}
-		line := []byte(s)
-
-		var probe struct {
-			ID     *json.RawMessage `json:"id"`
-			Method string           `json:"method"`
-		}
-		if err := json.Unmarshal(line, &probe); err != nil {
-			slog.Warn("cli: unparseable message", "err", err)
-			continue
-		}
-
-		if probe.Method == "" && probe.ID != nil {
-			id := strings.Trim(string(*probe.ID), `"`)
-			c.pendingMu.Lock()
-			ch, ok := c.pending[id]
-			if ok {
-				delete(c.pending, id)
-			}
-			c.pendingMu.Unlock()
-			if ok {
-				ch <- line
-			}
-			continue
-		}
-
-		var req jsonrpcRequest
-		if err := json.Unmarshal(line, &req); err != nil {
-			slog.Warn("cli: unparseable request", "err", err)
-			continue
-		}
-
-		// session/update is handled ON the read loop, not in a goroutine: it
-		// carries the streamed message in chunks, and dispatching those
-		// concurrently would render them in whatever order the scheduler felt
-		// like. It never blocks (the UI writes to a buffered stdout), so it
-		// cannot stall the loop the way a request handler would.
-		switch req.Method {
-		case "session/update":
-			c.client.sessionUpdate(req.Params)
-			continue
-		case "$/cancel_request":
-			c.cancelInflight(req.Params)
-			continue
-		}
-		go c.handle(&req)
-	}
-}
-
-func (c *cliConn) cancelInflight(params json.RawMessage) {
-	var p struct {
-		RequestId json.RawMessage `json:"requestId"`
-	}
-	if json.Unmarshal(params, &p) != nil || len(p.RequestId) == 0 {
-		return
-	}
-	c.inflightMu.Lock()
-	cancel := c.inflight[string(p.RequestId)]
-	c.inflightMu.Unlock()
-	if cancel != nil {
-		cancel()
-	}
-}
-
-// handle runs one agent->client request or notification. Handlers that can
-// block on something other than the user take a context so $/cancel_request can
-// reach them; see askChoiceOrText for why the ones blocked on stdin don't.
 func (c *cliConn) handle(req *jsonrpcRequest) {
-	ctx := context.Background()
-	if req.ID != nil {
-		key := string(*req.ID)
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithCancel(ctx)
-		defer cancel()
-		c.inflightMu.Lock()
-		c.inflight[key] = cancel
-		c.inflightMu.Unlock()
-		defer func() {
-			c.inflightMu.Lock()
-			delete(c.inflight, key)
-			c.inflightMu.Unlock()
-		}()
-	}
+	ctx, untrack := c.track(context.Background(), req.ID)
+	defer untrack()
 
 	var res any
 	var err error
@@ -1360,7 +1047,7 @@ func (c *cliConn) handle(req *jsonrpcRequest) {
 		res, err = c.client.terminalRelease(req.Params)
 	default:
 		if req.ID != nil {
-			c.replyError(req.ID, -32601, "method not found: "+req.Method)
+			c.writeError(req.ID, -32601, "method not found: "+req.Method)
 		}
 		return
 	}
@@ -1368,21 +1055,8 @@ func (c *cliConn) handle(req *jsonrpcRequest) {
 		return
 	}
 	if err != nil {
-		c.replyError(req.ID, -32603, err.Error())
+		c.writeError(req.ID, -32603, err.Error())
 		return
 	}
-	if writeErr := c.write(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: res}); writeErr != nil {
-		slog.Debug("cli: reply failed", "method", req.Method, "err", writeErr)
-	}
-}
-
-func (c *cliConn) replyError(id *json.RawMessage, code int, msg string) {
-	resp := jsonrpcResponse{JSONRPC: "2.0", ID: id}
-	resp.Error = &struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	}{code, msg}
-	if err := c.write(resp); err != nil {
-		slog.Debug("cli: error reply failed", "err", err)
-	}
+	c.writeResult(req.ID, res)
 }

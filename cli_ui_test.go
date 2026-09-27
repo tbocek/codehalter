@@ -9,8 +9,6 @@ import (
 	"time"
 )
 
-// uiFor builds a renderer writing into a buffer at a known geometry. Tests are
-// in-package, so pointing the fields at a buffer is the whole seam needed.
 func uiFor(tty bool, cols, rows int) (*cliUI, *bytes.Buffer) {
 	u := newCLIUI()
 	var buf bytes.Buffer
@@ -29,8 +27,7 @@ func TestBreakRow(t *testing.T) {
 	}{
 		{"the quick brown fox ", 19, "the quick brown", "fox "},
 		{"hello world", 8, "hello", "world"},
-		// No space to break at: a long path is cut rather than pushed past the
-		// edge, because one over-long row desyncs the live region for good.
+		// No space to break at: cut hard.
 		{"/very/long/path/without/spaces", 10, "/very/long", "/path/without/spaces"},
 		{"a b", 2, "a", "b"},
 	}
@@ -61,8 +58,6 @@ func TestStreamKeepsBlankLines(t *testing.T) {
 	}
 }
 
-// A partial row is held back so more of that sentence can still arrive; flushUI
-// is what commits it.
 func TestStreamHoldsPartialRow(t *testing.T) {
 	u, buf := uiFor(false, 40, 24)
 	u.Stream("", "", "half a sentence")
@@ -75,8 +70,6 @@ func TestStreamHoldsPartialRow(t *testing.T) {
 	}
 }
 
-// Switching between message and thought must break the row: the two are styled
-// differently, and one row can only carry one style.
 func TestStreamStyleChangeFlushes(t *testing.T) {
 	u, buf := uiFor(false, 40, 24)
 	u.Stream("", "", "visible")
@@ -95,8 +88,6 @@ func TestClipCountsRunesNotBytes(t *testing.T) {
 	}
 }
 
-// Escapes are zero-width and must survive clipping, or a truncated colour code
-// leaks into the rest of the screen.
 func TestClipKeepsEscapes(t *testing.T) {
 	u, _ := uiFor(true, 8, 24) // limit 7
 	got := u.clip(ansiRed + "abcdefghij" + ansiReset)
@@ -131,8 +122,7 @@ func stripANSI(s string) string {
 	return b.String()
 }
 
-// The live region is erased by moving up exactly as many rows as were drawn.
-// Off by one here eats a transcript row on every redraw.
+// Erase must move up exactly as many rows as were drawn.
 func TestLiveRegionRowAccounting(t *testing.T) {
 	u, buf := uiFor(true, 60, 24)
 	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "run tests", Status: "in_progress"})
@@ -163,8 +153,6 @@ func TestLiveRegionFitsScreen(t *testing.T) {
 	}
 }
 
-// Every live row must be at most cols-1 columns wide, or the terminal wraps it
-// and the erase arithmetic is wrong from then on.
 func TestLiveRowsFitWidth(t *testing.T) {
 	u, _ := uiFor(true, 30, 24)
 	u.Begin()
@@ -213,8 +201,6 @@ func TestFailedCardIsMarked(t *testing.T) {
 	}
 }
 
-// A card that was announced and never finished has to reach the transcript
-// anyway: End erases the live region, and anything left only there is lost.
 func TestEndCommitsInterruptedCards(t *testing.T) {
 	u, buf := uiFor(false, 80, 24)
 	u.Begin()
@@ -228,8 +214,7 @@ func TestEndCommitsInterruptedCards(t *testing.T) {
 	}
 }
 
-// A terminal tail is keyed by terminal id, not tool-call id: dropping the card
-// must drop the right map entry or the tails accumulate for the whole session.
+// Tails are keyed by terminal id, not tool-call id.
 func TestCardDropsItsTerminalTail(t *testing.T) {
 	u, _ := uiFor(false, 80, 24)
 	u.Card(toolCallUpdate{
@@ -243,9 +228,6 @@ func TestCardDropsItsTerminalTail(t *testing.T) {
 	}
 }
 
-// An update arriving while the cursor sits on an input prompt must break the
-// prompt row first, then put the prompt back, or it lands inside what the user
-// is typing.
 func TestPromptRowSurvivesAnUpdate(t *testing.T) {
 	u, buf := uiFor(true, 60, 24)
 	u.Prompt("> ")
@@ -271,8 +253,6 @@ func TestSubmittedClearsPrompt(t *testing.T) {
 	}
 }
 
-// Piped in, nothing echoes the user's typing, so the CLI writes the submitted
-// line itself and a redirected run reads back as a conversation.
 func TestSubmittedEchoesWhenNothingElseWill(t *testing.T) {
 	u, buf := uiFor(false, 60, 24)
 	u.echoInput = true
@@ -287,7 +267,7 @@ func TestSubmittedEchoesWhenNothingElseWill(t *testing.T) {
 func TestDiffLinesTrimsCommonContext(t *testing.T) {
 	old := "a\nb\nc\nd\n"
 	nw := "a\nB\nc\nd\n"
-	got := diffLines("f.txt", &old, nw, false)
+	got := (&cliUI{}).diffLines("f.txt", &old, nw)
 	want := []string{"  f.txt +1 -1", "  - b", "  + B"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("diffLines = %#v, want %#v", got, want)
@@ -295,7 +275,7 @@ func TestDiffLinesTrimsCommonContext(t *testing.T) {
 }
 
 func TestDiffLinesNewFile(t *testing.T) {
-	got := diffLines("new.txt", nil, "one\ntwo", false)
+	got := (&cliUI{}).diffLines("new.txt", nil, "one\ntwo")
 	want := []string{"  new.txt +2 -0", "  + one", "  + two"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("diffLines = %#v, want %#v", got, want)
@@ -305,7 +285,7 @@ func TestDiffLinesNewFile(t *testing.T) {
 func TestDiffLinesCapsLongHunks(t *testing.T) {
 	old := ""
 	nw := strings.TrimRight(strings.Repeat("line\n", 40), "\n")
-	got := diffLines("big.txt", &old, nw, false)
+	got := (&cliUI{}).diffLines("big.txt", &old, nw)
 	if len(got) != 1+cliDiffLines+1 {
 		t.Fatalf("uncapped hunk: %d rows", len(got))
 	}
@@ -333,8 +313,6 @@ func TestShortAndElapsed(t *testing.T) {
 	}
 }
 
-// With no tty there are no escapes at all, so piping the CLI to a file gives a
-// readable log rather than a pile of cursor moves.
 func TestNonTTYEmitsNoEscapes(t *testing.T) {
 	u, buf := uiFor(false, 80, 24)
 	u.Begin()
@@ -349,9 +327,6 @@ func TestNonTTYEmitsNoEscapes(t *testing.T) {
 	}
 }
 
-// An ESC that reaches the terminal moves the cursor, and every row the live
-// region thinks it owns is then off by however far it moved. Model text and
-// tool output are printed verbatim, so they are the ones that have to be clean.
 func TestSanitizeRemovesCursorMoves(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain", "plain"},
@@ -372,7 +347,6 @@ func TestStreamStripsEscapes(t *testing.T) {
 	u, buf := uiFor(true, 80, 24)
 	u.Stream("", "", "before \x1b[10Aafter\n")
 	flushUI(u)
-	// The ESC is gone, so what was a cursor move is now just text.
 	if strings.Contains(buf.String(), "\x1b[10A") {
 		t.Errorf("model escape reached the terminal: %q", buf.String())
 	}
@@ -381,8 +355,6 @@ func TestStreamStripsEscapes(t *testing.T) {
 	}
 }
 
-// A tab counts as one rune and draws as up to eight columns, so a live row
-// holding one wraps and throws the row count off for the rest of the session.
 func TestTerminalTailExpandsTabs(t *testing.T) {
 	u, _ := uiFor(true, 80, 24)
 	u.TerminalTail("t1", []string{"ok\tPASS\tmain"})
@@ -399,8 +371,6 @@ func TestCardTitleIsSanitized(t *testing.T) {
 	}
 }
 
-// flushUI ends the current paragraph the way every non-streamed print does
-// internally (flushRow under the lock), so a test can look at a held-back row.
 func flushUI(u *cliUI) {
 	u.mu.Lock()
 	defer u.mu.Unlock()

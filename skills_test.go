@@ -8,10 +8,6 @@ import (
 	"testing"
 )
 
-// TestSkillSetNeedsNothingOnDisk is the point of reading skills out of the
-// binary: a project with an empty .codehalter still gets the shipped text, so a
-// skill edited in res/ reaches every project on its next session. Copying the
-// skills out used to pin a project to the release that created it.
 func TestSkillSetNeedsNothingOnDisk(t *testing.T) {
 	cwd := t.TempDir()
 	names := skillSet(cwd, nil)
@@ -27,8 +23,7 @@ func TestSkillSetNeedsNothingOnDisk(t *testing.T) {
 	}
 }
 
-// TestSkillSetApplicability: what applies is read off the tree and the
-// container, not off what happens to be on disk.
+// Applicability is read off the tree and the container, not off what is installed.
 func TestSkillSetApplicability(t *testing.T) {
 	cwd := t.TempDir()
 	if slices.Contains(skillSet(cwd, nil), "SKILL-justfile.md") {
@@ -48,9 +43,7 @@ func TestSkillSetApplicability(t *testing.T) {
 	}
 }
 
-// TestSkillOverrideAndOwnSkills pins the only two reasons a SKILL file exists
-// in .codehalter: it replaces shipped text of the same name, or it is the
-// user's own skill and joins the set. Deleting either goes back to the default.
+// Deleting either file goes back to the default.
 func TestSkillOverrideAndOwnSkills(t *testing.T) {
 	cwd := t.TempDir()
 	dir := filepath.Join(cwd, ".codehalter")
@@ -94,8 +87,7 @@ func TestSkillOverrideAndOwnSkills(t *testing.T) {
 	}
 }
 
-// TestOverriddenBuiltins: only files that carry a shipped name count, across
-// all three kinds; a skill of the user's own and the config files do not.
+// Only shipped names count, across all three kinds; own skills and config files do not.
 func TestOverriddenBuiltins(t *testing.T) {
 	cwd := t.TempDir()
 	dir := filepath.Join(cwd, ".codehalter")
@@ -117,11 +109,7 @@ func TestOverriddenBuiltins(t *testing.T) {
 	}
 }
 
-// TestExpandCmdPlaceholders pins the {{cmd:...}} templating: stdout is spliced
-// in trimmed, several placeholders on one line all expand, a failing command
-// leaves its placeholder verbatim (visible in the prompt instead of baking a
-// silent empty string), and the justfile skill's literal {{var}} examples and
-// the os-release keys don't match.
+// A failing command stays verbatim; literal {{var}} examples and os-release keys don't match.
 func TestExpandCmdPlaceholders(t *testing.T) {
 	got := expandCmdPlaceholders("v={{cmd:echo  1.2.3 }} on {{cmd:echo alpine}}!")
 	if got != "v=1.2.3 on alpine!" {
@@ -137,30 +125,28 @@ func TestExpandCmdPlaceholders(t *testing.T) {
 	}
 }
 
-// TestSkillCmdExpandsAtLoad: the command runs when the skill is read, not when
-// it is stored, so a skill's live facts (the date, a tool version) are current
-// every session. An override keeps that property.
+// An override expands at load too.
 func TestSkillCmdExpandsAtLoad(t *testing.T) {
 	cwd := t.TempDir()
-	orig := osSkills["alpine"]
-	osSkills["alpine"] = "# Alpine skill\nBase: {{cmd:echo Alpine Test}}, {{cmd:echo apk-tools 9.9}}.\n"
-	shippedSkills["SKILL-alpine.md"] = osSkills["alpine"]
-	defer func() {
-		osSkills["alpine"] = orig
-		shippedSkills["SKILL-alpine.md"] = orig
-	}()
+	dir := filepath.Join(cwd, ".codehalter")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := "# Alpine skill\nBase: {{cmd:echo Alpine Test}}, {{cmd:echo apk-tools 9.9}}.\n"
+	if err := os.WriteFile(filepath.Join(dir, "SKILL-alpine.md"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	want := "Base: Alpine Test, apk-tools 9.9."
 	if body := skillBody(cwd, "SKILL-alpine.md"); !strings.Contains(body, want) {
-		t.Errorf("shipped skill did not expand:\n%s", body)
+		t.Errorf("overridden skill did not expand:\n%s", body)
 	}
 	if all := loadSkills(cwd, []string{"SKILL-alpine.md"}); !strings.Contains(all, want) {
 		t.Errorf("loadSkills did not expand:\n%s", all)
 	}
 }
 
-// TestLoadSkillsDeterministic verifies the concatenation is byte-stable across
-// calls: a moving skill order would invalidate the prompt cache every session.
+// A moving skill order would invalidate the prompt cache every session.
 func TestLoadSkillsDeterministic(t *testing.T) {
 	cwd := t.TempDir()
 	dir := filepath.Join(cwd, ".codehalter")

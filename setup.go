@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,107 +14,59 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// runSetup runs an interactive terminal flow that configures the LLM
-// connection and writes ~/.config/codehalter/settings.toml.
-// It exits the process on completion (os.Exit(0) on success, os.Exit(1) on error).
+// runSetup exits the process with status 1 on any error.
 func runSetup() {
 	fmt.Println("=== codehalter LLM Setup ===")
 	fmt.Println()
 
 	reader := bufio.NewReader(os.Stdin)
+	// required, if non-empty, is printed before exiting on an empty answer.
+	ask := func(prompt, required string) string {
+		fmt.Print(prompt)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
+			os.Exit(1)
+		}
+		line = strings.TrimSpace(line)
+		if line == "" && required != "" {
+			fmt.Fprintln(os.Stderr, required)
+			os.Exit(1)
+		}
+		return line
+	}
+	server := ask("LLM server URL (e.g. http://localhost:8080): ", "Server URL is required.")
+	apiKey := ask("API key (optional, press Enter to skip): ", "")
+	model := ask("Model name (e.g. llama-3.1-8b): ", "Model name is required.")
 
-	// Prompt for server URL
-	fmt.Print("LLM server URL (e.g. http://localhost:8080): ")
-	server, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
-		os.Exit(1)
-	}
-	server = strings.TrimSpace(server)
-	if server == "" {
-		fmt.Fprintln(os.Stderr, "Server URL is required.")
-		os.Exit(1)
-	}
-
-	// Prompt for API key (optional)
-	fmt.Print("API key (optional, press Enter to skip): ")
-	apiKey, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
-		os.Exit(1)
-	}
-	apiKey = strings.TrimSpace(apiKey)
-
-	// Prompt for model name
-	fmt.Print("Model name (e.g. llama-3.1-8b): ")
-	model, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
-		os.Exit(1)
-	}
-	model = strings.TrimSpace(model)
-	if model == "" {
-		fmt.Fprintln(os.Stderr, "Model name is required.")
-		os.Exit(1)
-	}
-
-	// Build a temporary settings object and validate the connection
 	settings := Settings{
 		LLM: []LLMConnection{{
 			Server: server,
+			APIKey: apiKey,
 			Model:  model,
 		}},
-	}
-	if apiKey != "" {
-		settings.LLM[0].APIKey = apiKey
 	}
 
 	fmt.Println()
 	fmt.Println("Testing connection...")
 
-	conn := settings.MainLLM("execute")
-	if conn == nil {
-		fmt.Fprintln(os.Stderr, "Failed to build LLM connection.")
+	// probeLLM already logs the failure reason to stderr via slog.
+	result := probeLLM(context.Background(), &settings.LLM[0])
+	switch {
+	case !result.Reachable:
+		c := &settings.LLM[0]
+		fmt.Fprintf(os.Stderr, "Connection failed: neither %s nor %s answered with 200. Check the URL and the API key.\n", c.endpoint("/v1/models"), c.endpoint("/props"))
 		os.Exit(1)
-	}
-
-	result := probeLLM(context.Background(), conn)
-	if !result.ModelKnown {
-		// Try a simple HTTP check to distinguish network vs model issues
-		endpoint := conn.endpoint("/v1/models")
-		// Bounded: this request had no context and no timeout at all, so a
-		// server that accepts the connection and never answers hung setup.
-		checkCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		req, err := http.NewRequestWithContext(checkCtx, "GET", endpoint, nil)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Invalid server URL %q: %v\n", endpoint, err)
-			os.Exit(1)
-		}
-		if apiKey != "" {
-			req.Header.Set("Authorization", "Bearer "+apiKey)
-		}
-		resp, httpErr := metaHTTPClient.Do(req)
-		if httpErr != nil {
-			fmt.Fprintf(os.Stderr, "Connection failed: %v\n", httpErr)
-			os.Exit(1)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != 200 {
-			fmt.Fprintf(os.Stderr, "Connection failed: server returned HTTP %d\n", resp.StatusCode)
-			os.Exit(1)
-		}
-		// Server is reachable but model not found — still useful, warn
+	case !result.ModelKnown:
 		fmt.Println("Server is reachable, but model not found in /v1/models list.")
 		fmt.Println("You may still be able to use it — double-check the model name.")
-	} else {
+	default:
 		fmt.Println("Connection successful!")
 		if result.ModelLoaded {
 			fmt.Println("Model is loaded and ready.")
 		}
 	}
 
-	// Write settings.toml to ~/.config/codehalter/settings.toml
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Could not determine home directory: %v\n", err)
@@ -128,7 +79,6 @@ func runSetup() {
 	}
 	configPath := filepath.Join(configDir, "settings.toml")
 
-	// Backup existing settings.toml before overwriting
 	if _, err := os.Stat(configPath); err == nil {
 		old, readErr := os.ReadFile(configPath)
 		if readErr == nil {

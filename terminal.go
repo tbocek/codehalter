@@ -13,37 +13,18 @@ import (
 	"time"
 )
 
-// ACP terminals are how codehalter runs commands: the client starts the process
-// and owns it, and we drive it by id. There is no in-process exec path; a
-// client without clientCapabilities.terminal is refused at bootstrap.
-//
-// This is not a sandbox escape: Zed's remote server runs INSIDE the container
-// and spawns codehalter there, so its terminals share our container and
-// filesystem (run_background relies on reading a terminal's log file here).
-//
-// Two things differ from running the process ourselves. We never see a pid, so
-// a child a command leaves behind (`npm run dev &`) is out of run_command's
-// contract: never-exiting processes belong in run_background, and the deferred
-// terminal/release kills whatever remains. And the idle watchdog is a poll:
-// there is no output stream, so silence is detected by re-reading
-// terminal/output on a timer, and kill latency is bounded by that interval.
+// Zed's remote server spawns codehalter inside the container, so the client's
+// ACP terminals share our filesystem; they expose no pid and no output stream.
 
-// terminalOutputLimit is the byte cap we ask the client to enforce. The client
-// truncates from the FRONT (it keeps the tail), which loses the head of a long
-// build — so we set it well above cmdOutputCap and let boundedOutput do the
-// head+tail elision on the result instead. Only a command that outputs this
-// much loses its opening lines.
+// terminalOutputLimit: the client truncates from the FRONT, so this sits far
+// above cmdOutputCap and boundedCapture does the head+tail elision instead.
 const terminalOutputLimit = 4 * 1024 * 1024
 
-// terminalExit is the exit status of a finished terminal. ExitCode is nil when
-// the command was killed by a signal, which is why this isn't a bare int.
 type terminalExit struct {
 	ExitCode *int   `json:"exitCode"`
 	Signal   string `json:"signal"`
 }
 
-// code flattens an exit status the way run_command reports it: the real code,
-// or -1 for a signal death (which is also what a failure to exec reported).
 func (e terminalExit) code() int {
 	if e.ExitCode != nil {
 		return *e.ExitCode
@@ -51,14 +32,9 @@ func (e terminalExit) code() int {
 	return -1
 }
 
-// terminalCreate starts command+args in a client terminal and returns its id.
-// terminal/create takes an argv, not a shell line, so a caller with a shell
-// line passes ("bash", []string{"-c", line}) — that's what keeps pipes,
-// redirects and `&&` working.
+// terminal/create takes an argv, not a shell line; pass ("bash", {"-c", line})
+// for pipes, redirects and `&&`.
 func (a *agent) terminalCreate(ctx context.Context, sid, command string, args []string, cwd string) (string, error) {
-	if args == nil {
-		args = []string{}
-	}
 	raw, err := a.conn.sendRequest(ctx, "terminal/create", map[string]any{
 		"sessionId":       sid,
 		"command":         command,
@@ -81,52 +57,31 @@ func (a *agent) terminalCreate(ctx context.Context, sid, command string, args []
 	return resp.TerminalId, nil
 }
 
-// terminalOutput fetches everything the terminal has produced so far. exit is
-// nil while the command is still running.
-func (a *agent) terminalOutput(ctx context.Context, sid, tid string) (out string, truncated bool, exit *terminalExit, err error) {
+func (a *agent) terminalOutput(ctx context.Context, sid, tid string) (string, error) {
 	raw, err := a.conn.sendRequest(ctx, "terminal/output", map[string]any{"sessionId": sid, "terminalId": tid})
 	if err != nil {
-		return "", false, nil, err
+		return "", err
 	}
 	var resp struct {
-		Output     string        `json:"output"`
-		Truncated  bool          `json:"truncated"`
-		ExitStatus *terminalExit `json:"exitStatus"`
+		Output string `json:"output"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", false, nil, err
+		return "", err
 	}
-	return resp.Output, resp.Truncated, resp.ExitStatus, nil
+	return resp.Output, nil
 }
 
-// terminalWaitForExit blocks until the command finishes.
-func (a *agent) terminalWaitForExit(ctx context.Context, sid, tid string) (terminalExit, error) {
-	raw, err := a.conn.sendRequest(ctx, "terminal/wait_for_exit", map[string]any{"sessionId": sid, "terminalId": tid})
-	if err != nil {
-		return terminalExit{}, err
-	}
-	var exit terminalExit
-	if err := json.Unmarshal(raw, &exit); err != nil {
-		return terminalExit{}, err
-	}
-	return exit, nil
-}
-
-// terminalKill kills the command but keeps the terminal id valid, so output
-// produced before the kill can still be read.
+// terminalKill keeps the terminal id valid, so output from before the kill can
+// still be read.
 func (a *agent) terminalKill(ctx context.Context, sid, tid string) error {
 	_, err := a.conn.sendRequest(ctx, "terminal/kill", map[string]any{"sessionId": sid, "terminalId": tid})
 	return err
 }
 
-// terminalRelease kills the command if it is still running and invalidates the
-// id — which is why a background job's terminal is held until shutdown and
-// released only there. Best-effort by design: it runs on the way out of a tool
-// call, including paths where the turn is already being torn down, and there is
-// nothing useful to do with a failure beyond logging it.
+// terminalRelease kills a still-running command and invalidates the id.
+// Best-effort: a failure is only logged.
 func (a *agent) terminalRelease(sid, tid string) {
-	// Deliberately not the caller's ctx: release is the cleanup for a cancelled
-	// context, so reusing it would skip the kill exactly when it matters most.
+	// Not the caller's ctx: release is the cleanup for a cancelled context.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := a.conn.sendRequest(ctx, "terminal/release", map[string]any{"sessionId": sid, "terminalId": tid}); err != nil {
@@ -134,20 +89,14 @@ func (a *agent) terminalRelease(sid, tid string) {
 	}
 }
 
-// redirectRe finds the files a shell line writes into: `> f`, `>> f`, `&> f`,
-// with an optional descriptor in front (`2> f`). `2>&1` names no file.
+// redirectRe: `> f`, `>> f`, `&> f`, `2> f`; `2>&1` names no file.
 var redirectRe = regexp.MustCompile(`(?:^|[^&])(?:\d?>>?|&>)\s*([^\s;&|()<>]+)`)
 
-// redirectTargets returns the files a `bash -c` command redirects into,
-// resolved against cwd, so the watchdog can watch them grow. Anything that is
-// not a plain path (a `$var`, a quote) is skipped: a wrong guess only means
-// the file is not watched, which is where every command was before.
-func redirectTargets(command string, args []string, cwd string) []string {
-	if command != "bash" || len(args) != 2 || args[0] != "-c" {
-		return nil
-	}
+// redirectTargets skips anything that is not a plain path (a `$var`, a quote):
+// a missed file is only not watched.
+func redirectTargets(line, cwd string) []string {
 	var files []string
-	for _, m := range redirectRe.FindAllStringSubmatch(args[1], -1) {
+	for _, m := range redirectRe.FindAllStringSubmatch(line, -1) {
 		f := m[1]
 		if strings.ContainsAny(f, "$\"'`*") || f == "/dev/null" {
 			continue
@@ -160,11 +109,8 @@ func redirectTargets(command string, args []string, cwd string) []string {
 	return files
 }
 
-// progressSignature is what the watchdog compares between polls: the
-// terminal's output, and the size of every file the command redirects into.
-func progressSignature(out string, files []string) uint64 {
+func progressSignature(files []string) uint64 {
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(out))
 	for _, f := range files {
 		size := int64(-1)
 		if st, err := os.Stat(f); err == nil {

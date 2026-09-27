@@ -42,29 +42,14 @@ func parallel(n, cap int, fn func(i int)) {
 	wg.Wait()
 }
 
-// failureSimilarityThreshold is the Jaccard ratio above which two failed-
-// subtask reason bags are considered "the same problem." Tuned empirically
-// for short LLM-generated strings: 0.6 catches "missing import" /
-// "import is missing" (Jaccard 0.67) without collapsing genuinely different
-// files. The orchestrator uses this to escalate the replan context — same
-// failure recurring N times tells the planner the prior fix didn't work
-// and a structurally different approach is needed.
+// 0.6 catches rephrasings of short reasons ("missing import" / "import is
+// missing" = 0.67) without merging genuinely different failures.
 const failureSimilarityThreshold = 0.6
 
-// stuckOutputSimilarity is the Jaccard ratio above which a re-issued call's
-// output counts as "reproduced" for the repetition ladder even when it isn't
-// byte-identical. Catches the loops the exact hash misses: a re-run failing
-// build whose output embeds a timestamp or duration, a retried command with a
-// changing pid/port in its message. Deliberately much higher than
-// failureSimilarityThreshold: these are full tool outputs, not short reason
-// strings, and long texts share vocabulary easily — only near-identical
-// output should count as no-progress.
+// Catches reruns whose output differs only by a timestamp or pid. Much higher than
+// failureSimilarityThreshold because long tool outputs share vocabulary easily.
 const stuckOutputSimilarity = 0.9
 
-// issueBag tokenises a list of issue strings into a single set of distinct
-// lowercase alphanumeric words. Punctuation, casing and ordering are all
-// discarded so two attempts reporting the same root cause in different
-// phrasing collapse to comparable bags.
 func issueBag(issues []string) map[string]bool {
 	bag := make(map[string]bool)
 	var cur strings.Builder
@@ -88,8 +73,6 @@ func issueBag(issues []string) map[string]bool {
 	return bag
 }
 
-// jaccard returns |A ∩ B| / |A ∪ B| for two word sets. 1.0 = identical,
-// 0.0 = disjoint. Two empty bags are treated as identical.
 func jaccard(a, b map[string]bool) float64 {
 	if len(a) == 0 && len(b) == 0 {
 		return 1
@@ -107,17 +90,10 @@ func jaccard(a, b map[string]bool) float64 {
 	return float64(inter) / float64(union)
 }
 
-// trimJSON extracts a JSON object from an LLM response. Small models often
-// wrap the JSON in prose ("Sure, here's the JSON: { … } Let me know!") or
-// markdown fences; we just locate the first `{` and the matching `}` and
-// keep that slice. Brace counting respects strings + escapes so braces inside
-// string values don't confuse the scan. Returns the trimmed input unchanged
-// if no balanced object is found — caller surfaces the parse error.
+// trimJSON extracts the first balanced JSON object: models wrap JSON in prose or
+// fences. Without one it returns s trimmed and the caller reports the parse error.
 func trimJSON(s string) string { return trimBalanced(s, '{', '}') }
 
-// trimJSONArray is trimJSON for an array: the first `[` to its matching `]`.
-// A stringified subtask list once arrived as `[{…}]}`, one brace too many
-// inside the string, and the whole plan was rejected for it.
 func trimJSONArray(s string) string { return trimBalanced(s, '[', ']') }
 
 func trimBalanced(s string, open, close byte) string {
@@ -157,12 +133,8 @@ func trimBalanced(s string, open, close byte) string {
 	return s
 }
 
-// cwdOrDefault resolves the session's working directory to a clean absolute
-// path. A client may pass "." or any other relative path; resolvePath
-// then prefix-checks against sess.Cwd, and the check breaks when Cwd isn't
-// absolute because filepath.Clean drops the leading "./" — read_file("go.mod")
-// would resolve to "go.mod" and fail the "outside project directory" check
-// even though it's inside the project.
+// Must return an absolute path: resolvePath prefix-checks against sess.Cwd, which
+// breaks for a relative root like "." because filepath.Clean drops the "./".
 func cwdOrDefault(cwd string) string {
 	if cwd == "" {
 		cwd, _ = os.Getwd()
@@ -173,14 +145,6 @@ func cwdOrDefault(cwd string) string {
 	return cwd
 }
 
-// cwdAvailable reports whether the client-supplied workspace root actually
-// exists as a directory in this environment. Zed restores agent threads with
-// the cwd they were created under; when that workspace isn't mounted here
-// (e.g. a thread from another project's devcontainer), every later step —
-// scaffolding .codehalter, reading the session .toml — fails with a confusing
-// low-level mkdir/permission error against a path the user never chose. Gate
-// session/new and session/load on this up front so they refuse with a clear
-// message instead of trying to create .codehalter under an unavailable root.
 func cwdAvailable(cwd string) error {
 	info, err := os.Stat(cwd)
 	if err != nil {
@@ -195,16 +159,8 @@ func cwdAvailable(cwd string) error {
 	return nil
 }
 
-// usableCwd resolves the client-supplied req.Cwd to an absolute workspace root
-// that actually exists in this environment. It prefers the requested path, but
-// when that isn't mounted here (e.g. Zed restoring a thread created under
-// another project's devcontainer — /workspaces/codehalter while the user has
-// since switched to preveltekit) it falls back to the directory the agent
-// process was launched in rather than refusing to start. The substitution is
-// logged for diagnosis. The bool is true when a fallback was substituted, so
-// the caller can tell the user this is a fresh session rather than a restored
-// one. Returns an error only when neither the requested cwd nor the process cwd
-// is a usable directory.
+// usableCwd falls back to the process cwd when the requested root isn't mounted
+// here (Zed restores threads from other devcontainers); the bool reports a fallback.
 func usableCwd(reqCwd string) (string, bool, error) {
 	cwd := cwdOrDefault(reqCwd)
 	err := cwdAvailable(cwd)
@@ -220,8 +176,6 @@ func usableCwd(reqCwd string) (string, bool, error) {
 	return fallback, true, nil
 }
 
-// truncate shortens s to at most maxLen bytes with an ellipsis suffix when it
-// overflows; shorter strings pass through unchanged.
 func truncate(s string, maxLen int) string {
 	if len(s) > maxLen {
 		return clipUTF8(s, maxLen) + "..."
@@ -229,8 +183,14 @@ func truncate(s string, maxLen int) string {
 	return s
 }
 
-// clipUTF8 truncates s to at most n bytes, snapped back to a rune boundary so a
-// multibyte character straddling the cut isn't split into a � replacement.
+func firstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return s
+}
+
 func clipUTF8(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -241,12 +201,8 @@ func clipUTF8(s string, n int) string {
 	return s[:n]
 }
 
-// tailUTF8 is clipUTF8 from the other end: the last at most n bytes of s,
-// starting on a rune boundary.
-//
-// Every cut of text that can end up in the session file goes through one of
-// these two. A cut through a multibyte character leaves invalid UTF-8, and one
-// such byte in a Summary made a whole session unloadable (see loadSession).
+// Every cut of text that can reach the session file must use clipUTF8 or tailUTF8:
+// invalid UTF-8 in it makes the session unloadable (see loadSession).
 func tailUTF8(s string, n int) string {
 	if len(s) <= n {
 		return s
@@ -258,18 +214,10 @@ func tailUTF8(s string, n int) string {
 	return s[i:]
 }
 
-// maxLLMInputBytes caps the bytes of any single text payload handed to an LLM
-// outside the main tool loop: a clipped per-turn summary for a background call
-// (backgroundSummarise, via clipBytes), or a whole-file attachment inlined
-// into the foreground prompt (readLinkedResource).
-// Without it a megabyte blob — a huge run_command dump, a giant attached file —
-// would blow through the LLM's context window.
+// maxLLMInputBytes caps a single payload sent to an LLM outside the main tool loop.
 const maxLLMInputBytes = 20 * 1024
 
-// clipBytes truncates s to at most max bytes, leaving a marker in the middle
-// when it had to cut. Used to bound any single payload's contribution to a
-// background LLM call (turn summaries via backgroundSummarise) so one giant
-// tool output can't blow the summariser's own context window.
+// clipBytes keeps the head and tail halves with a truncation marker between.
 func clipBytes(s string, max int) string {
 	if len(s) <= max {
 		return s

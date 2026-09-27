@@ -10,17 +10,9 @@ import (
 	"time"
 )
 
-// discoverSandbox registers `run_command` whenever we're inside a container.
-// The container itself is the sandbox: it's throwaway, the host workspace is
-// bind-mounted (the LLM can already write to those files via edit_file), and
-// apt-get/dpkg/pip writes are scoped to the container's lifetime. Devcontainers
-// are expected to bind-mount `.git` read-only, so destructive git commands fail
-// at the OS layer.
+// discoverSandbox registers run_command only inside a container, which is the
+// sandbox; devcontainers are expected to bind-mount .git read-only.
 func (a *agent) discoverSandbox() {
-	// Only register run_command inside a container — the container IS the
-	// sandbox. Outside one, ensureDevcontainer aborts the session before any
-	// prompt runs, so there is no "running on host with run_command disabled"
-	// state to report; just skip registration.
 	if containerKind() == "" {
 		slog.Info("run_command: not registered (not inside a container)")
 		return
@@ -73,10 +65,8 @@ func (a *agent) discoverSandbox() {
 	}, Execute: runBackgroundExecute})
 }
 
-// isSleepCmd reports a command whose only point is to pass time: `sleep N`,
-// possibly followed by more (`sleep 90 && tail /tmp/t.log`), or `sleep` after a
-// `cd`. A `sleep` inside a for-loop or after another command is not a wait
-// for a job and passes.
+// isSleepCmd matches a line that starts with `sleep` (optionally after `cd`); a
+// sleep later in the line is not a wait for a job.
 func isSleepCmd(cmd string) bool {
 	first := strings.TrimSpace(cmd)
 	if i := strings.IndexAny(first, ";&|\n"); i >= 0 {
@@ -89,209 +79,83 @@ func isSleepCmd(cmd string) bool {
 	return first == "sleep" || strings.HasPrefix(first, "sleep ")
 }
 
-// cmdOutputCap bounds how many bytes of a command's output we hand the model.
-// The idle watchdog only fires on SILENCE, so a steadily-printing command
-// (`find /`, a chatty build, `journalctl`) would otherwise dump megabytes into a
-// weak, small-context model. We keep a head + tail window and elide the middle,
-// so a long run's start AND its trailing error both survive. A var so tests can
-// shrink it.
+// cmdOutputCap: the idle watchdog fires only on silence, so a steadily printing
+// command needs a byte cap. A var so tests can shrink it.
 var cmdOutputCap = 64 * 1024
 
-// boundedOutput captures a byte stream in at most headCap+tailCap bytes: the
-// first headCap as a frozen head, the most recent tailCap as a ring tail, the
-// middle elided. It bounds memory for an unbounded command while keeping both
-// ends (head shows how the run started; tail preserves the error verify reads).
-// Not safe for concurrent use.
-type boundedOutput struct {
-	headCap, tailCap int
-	head, tail       []byte
-	total            int
-}
-
-func newBoundedOutput(capBytes int) *boundedOutput {
-	h := capBytes / 4
-	return &boundedOutput{headCap: h, tailCap: capBytes - h}
-}
-
-// Write appends p, freezing the head once full and holding the tail to at most
-// 2*tailCap (trimmed back to tailCap when it crosses, so it's an amortised
-// O(1)/byte ring); String trims the residual to exactly the last tailCap bytes.
-func (b *boundedOutput) Write(p []byte) {
-	b.total += len(p)
-	if len(b.head) < b.headCap {
-		n := b.headCap - len(b.head)
-		if n > len(p) {
-			n = len(p)
-		}
-		b.head = append(b.head, p[:n]...)
-	}
-	b.tail = append(b.tail, p...)
-	if len(b.tail) > 2*b.tailCap {
-		b.tail = append(b.tail[:0], b.tail[len(b.tail)-b.tailCap:]...)
-	}
-}
-
-// String reassembles the captured window: the whole stream when it fit, else
-// head + an "[... N bytes omitted ...]" marker + the last tailCap bytes, stitched
-// so the overlap case neither duplicates nor drops bytes.
-func (b *boundedOutput) String() string {
-	tail := b.tail
-	if len(tail) > b.tailCap {
-		tail = tail[len(tail)-b.tailCap:]
-	}
-	switch {
-	case b.total <= b.tailCap:
-		return string(tail) // everything fit in the tail
-	case b.total <= b.headCap+b.tailCap:
-		overlap := b.headCap + b.tailCap - b.total // bytes head and tail share
-		return string(b.head) + string(tail[overlap:])
-	default:
-		// Both cuts are byte offsets and may split a character; drop the halves,
-		// which would otherwise be invalid UTF-8 in the session file.
-		omitted := b.total - b.headCap - b.tailCap
-		head := strings.ToValidUTF8(string(b.head), "")
-		return head + fmt.Sprintf("\n[... %d bytes omitted ...]\n", omitted) + strings.ToValidUTF8(string(tail), "")
-	}
-}
-
-// cmdHandoverWait is how long run_command stays with a command before handing
-// it to the background. Nothing is killed at this point: the command keeps
-// running as a job, the model gets what it printed so far and is woken when
-// it exits (or at its wake_after), and a turn that ends on `respond`
-// meanwhile is parked, not finished. Two minutes because that is what a probe,
-// a build or a short suite needs, and past it the model is better off doing
-// something else. A var so tests can shorten it.
+// cmdHandoverWait is when run_command hands a still-running command to the
+// background; nothing is killed. A var so tests can shorten it.
 var cmdHandoverWait = 120 * time.Second
 
-// boundedCapture puts a finished terminal's output through the head+tail window
-// that bounds what any command can hand a small-context model.
+// boundedCapture keeps the first quarter and the last three quarters; the byte
+// cuts may split a rune, which ToValidUTF8 drops.
 func boundedCapture(out string) string {
-	b := newBoundedOutput(cmdOutputCap)
-	b.Write([]byte(out))
-	return b.String()
+	if len(out) <= cmdOutputCap {
+		return out
+	}
+	head := cmdOutputCap / 4
+	tail := cmdOutputCap - head
+	return strings.ToValidUTF8(out[:head], "") +
+		fmt.Sprintf("\n[... %d bytes omitted ...]\n", len(out)-head-tail) +
+		strings.ToValidUTF8(out[len(out)-tail:], "")
 }
 
 func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-	args := parseArgs(rawArgs)
-	cmdStr := args.str("command")
-	if cmdStr == "" {
-		return "error: command is required" + wrongToolHint(args), false
+	job, refusal := a.launchJob(ctx, sid, rawArgs, true)
+	if job == nil {
+		return refusal, false
 	}
-	sess := a.getSession(sid)
-	if sess == nil {
-		return "error: no session", false
-	}
-	wakeAfter, werr := wakeAfterArg(args)
-	if werr != "" {
-		return werr, false
-	}
-	// A foreground sleep while one of this session's background jobs runs is
-	// the model waiting for that job by guessing a number: in one afternoon 10
-	// of 22 background suites were followed by a 90-150 s sleep, and one of them
-	// idled 36 s past the job's exit because a running shell cannot be
-	// interrupted with the note. The job wakes the model on its own, so the
-	// sleep is refused with the reason, and the turn either does other work or
-	// parks on `respond` until the job reports (Claude Code refuses a
-	// foreground sleep for the same reason).
-	if isSleepCmd(cmdStr) {
-		if jobs := a.runningBgJobs(sid); len(jobs) > 0 {
-			return fmt.Sprintf("refused: do not sleep for a background job. %s still running; the moment it exits codehalter hands you its exit code and last output on its own. "+
-				"Continue with other work, or call `respond` saying you are waiting: the turn is parked, not ended, and continues here when the job reports. "+
-				"For a look at a job before it exits, give `wake_after` when you start it.", jobs), false
+	hint := func() string {
+		note, told := toolHints(job.cmdStr)
+		if told != "" {
+			a.say(ctx, sid, told+"\n")
 		}
-	}
-
-	tcId := a.StartToolCall(ctx, sid, "Run: "+cmdStr, "execute", nil)
-	job, err := a.launchJob(ctx, sid, tcId, cmdStr, sess.Cwd, wakeAfter, true)
-	if err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return "error starting terminal: " + err.Error(), false
+		return note
 	}
 
 	select {
 	case res := <-job.exited:
-		out, _, _, oerr := a.terminalOutput(ctx, sid, job.terminalId)
+		out, oerr := a.terminalOutput(ctx, sid, job.terminalId)
 		a.terminalRelease(sid, job.terminalId)
 		a.forgetBgJob(job)
 		if res.err != nil {
-			// The client broke mid-command. -1 plus the error text lets the
-			// model tell "the command exited 1" apart from "the command never
-			// got to finish".
-			a.FailToolCall(ctx, sid, tcId, res.err.Error())
+			// -1 tells "never got to finish" apart from a real exit 1.
+			a.FailToolCall(ctx, sid, job.tcId, res.err.Error())
 			return fmt.Sprintf("exit -1\n\n%s\n[terminal error: %s]\n", boundedCapture(out), res.err), false
 		}
 		if oerr != nil {
 			slog.Debug("run_command: output read failed", "job", job.id, "err", oerr)
 		}
-		// Always surface the exit code. run_command is a probe: non-zero is
-		// data, not failure. Title and result both carry "(exit N)" so the
-		// model can read either and act on it. Failed is always false here: a
-		// probe exiting non-zero shouldn't fail the turn.
+		// A non-zero exit is data, not failure, so failed stays false.
 		exitCode := res.exit.code()
-		// The card already holds the terminal, which the client keeps rendering
-		// after release. Sending text content here would replace that live
-		// view with a static copy, so retitle only.
-		a.sendUpdate(ctx, sid, toolCallUpdate{
-			Kind:       "tool_call_update",
-			ToolCallId: tcId,
-			Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),
-			Status:     "completed",
-		})
-		note, told := sess.toolHints(cmdStr)
-		if told != "" {
-			a.say(ctx, sid, told+"\n")
-		}
-		return fmt.Sprintf("exit %d\n\n%s", exitCode, boundedCapture(out)) + note, false
+		a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Run: %s (exit %d)", job.cmdStr, exitCode), "completed")
+		return fmt.Sprintf("exit %d\n\n%s", exitCode, boundedCapture(out)) + hint(), false
 	case <-ctx.Done():
-		// The user hit Stop, or the turn was cancelled. Release kills the
-		// command; report what it managed to print.
-		out, _, _, _ := a.terminalOutput(context.Background(), sid, job.terminalId)
+		out, oerr := a.terminalOutput(context.Background(), sid, job.terminalId)
+		if oerr != nil {
+			slog.Debug("run_command: output read after cancel failed", "job", job.id, "err", oerr)
+		}
 		a.killJob(job)
 		a.terminalRelease(sid, job.terminalId)
 		a.forgetBgJob(job)
-		a.FailToolCall(ctx, sid, tcId, ctx.Err().Error())
+		a.FailToolCall(ctx, sid, job.tcId, ctx.Err().Error())
 		return fmt.Sprintf("exit -1\n\n%s\n[terminal error: %s]\n", boundedCapture(out), ctx.Err()), false
 	case <-time.After(cmdHandoverWait):
 	}
 
-	// Still running: it becomes a background job. Nothing is lost, the model
-	// gets what it has so far, and the exit finds it wherever it is: before
-	// its next step, parked on `respond`, or idle between turns.
-	job.pid = readPidFile(job.pidPath)
-	go a.watchBgJob(job)
-	if wakeAfter > 0 {
-		go a.wakeForBgJob(job)
-	}
+	wake := a.handOver(job)
 	waited := humanDuration(cmdHandoverWait.Milliseconds())
-	wake := ""
-	if wakeAfter > 0 {
-		wake = fmt.Sprintf(" You asked to be woken after %s if it is still running by then.", humanDuration(wakeAfter.Milliseconds()))
-	}
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: tcId,
-		Title:      fmt.Sprintf("Run: %s (still running after %s, continues as job %d)", cmdStr, waited, job.id),
-		Status:     "in_progress",
-	})
-	note, told := sess.toolHints(cmdStr)
-	if told != "" {
-		a.say(ctx, sid, told+"\n")
-	}
-	return note + "\n" + fmt.Sprintf("still running after %s: it continues as background job %d (pid %d), nothing was killed. "+
+	a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Run: %s (still running after %s, continues as job %d)", job.cmdStr, waited, job.id), "in_progress")
+	return hint() + "\n" + fmt.Sprintf("still running after %s: it continues as background job %d (pid %d), nothing was killed. "+
 		"When it exits, codehalter hands you its exit code and last output by itself, before your next step.%s "+
 		"Do other work meanwhile if there is any; if not, call `respond` saying you are waiting for job %d: that parks the turn, it does not end it, and you continue here the moment the job reports. "+
 		"Never sleep or poll for it. Read its output any time with `run_command: cat %s`; stop it with `run_command: kill %d`. Output so far:\n\n%s",
 		waited, job.id, job.pid, wake, job.id, job.logPath, job.pid, readLogTail(job.logPath, bgLogTailCap)), false
 }
 
-// toolHints is the note a finished run_command result gets for a shell
-// habit a tool does properly: a `& sleep N` wait (run_background), or a
-// Python script that spliced a source file (the edit_file call it amounts
-// to). A note,
-// never a refusal. (Notes after grep and sed reads were tried and dropped:
-// the executor, running without reasoning, followed 0 of 154.) The second
-// return is the line the user sees in the chat.
-func (s *Session) toolHints(cmd string) (string, string) {
+// toolHints returns (note for the model, chat line for the user). There are
+// deliberately no notes after grep or sed reads: the executor ignored them.
+func toolHints(cmd string) (string, string) {
 	if note, told := bgSleepHint(cmd); note != "" {
 		return note, told
 	}
@@ -304,50 +168,36 @@ func (s *Session) toolHints(cmd string) (string, string) {
 		"💡 told the model: edit_file instead of a script on " + target
 }
 
-// pyReplaceRe finds a Python `.replace(A, B)` with two string literals:
-// triple-quoted, double- or single-quoted.
 var pyReplaceRe = regexp.MustCompile(`\.replace\(\s*(` + pyStr + `)\s*,\s*(` + pyStr + `)\s*[,)]`)
 
 const pyStr = `"""(?s:.*?)"""|'''(?s:.*?)'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'`
 
-// pyLiteral decodes a Python string literal well enough for a preview: the
-// quotes go, and in a plain literal the common escapes are resolved.
-func pyLiteral(lit string) string {
-	for _, q := range []string{`"""`, `'''`} {
-		if strings.HasPrefix(lit, q) && strings.HasSuffix(lit, q) && len(lit) >= 6 {
-			return lit[3 : len(lit)-3]
-		}
-	}
-	if len(lit) < 2 {
-		return lit
-	}
-	body := lit[1 : len(lit)-1]
-	return strings.NewReplacer(`\n`, "\n", `\t`, "\t", `\"`, `"`, `\'`, `'`, `\\`, `\`).Replace(body)
-}
-
-// scriptEditPreview spells out the edit_file call a splice script amounts
-// to: for a `.replace(A, B)` the exact old_text/new_text call (several become
-// one edits list), else the block form with the path filled in.
 func scriptEditPreview(cmd, target string) string {
 	ms := pyReplaceRe.FindAllStringSubmatch(cmd, -1)
 	if len(ms) == 0 {
 		return fmt.Sprintf("edit_file does the same as a block: {\"path\": %q, \"start\": \"<fragment of the block's first line>\", \"end\": \"<fragment of its last line>\", \"new_text\": \"<the new block>\"}, or several changes at once as {\"path\": %q, \"edits\": [...]}.", target, target)
 	}
-	quote := func(s string) string {
+	// quote decodes a Python literal well enough for a preview, not exactly.
+	quote := func(lit string) string {
+		s := lit
+		switch {
+		case len(lit) >= 6 && (strings.HasPrefix(lit, `"""`) && strings.HasSuffix(lit, `"""`) || strings.HasPrefix(lit, `'''`) && strings.HasSuffix(lit, `'''`)):
+			s = lit[3 : len(lit)-3]
+		case len(lit) >= 2:
+			s = strings.NewReplacer(`\n`, "\n", `\t`, "\t", `\"`, `"`, `\'`, `'`, `\\`, `\`).Replace(lit[1 : len(lit)-1])
+		}
 		b, _ := json.Marshal(truncate(s, 160))
 		return string(b)
 	}
-	pair := fmt.Sprintf(`"old_text": %s, "new_text": %s`, quote(pyLiteral(ms[0][1])), quote(pyLiteral(ms[0][2])))
+	pair := fmt.Sprintf(`"old_text": %s, "new_text": %s`, quote(ms[0][1]), quote(ms[0][2]))
 	if len(ms) == 1 {
 		return fmt.Sprintf(`Its replace is exactly this edit_file call: {"path": %q, %s}.`, target, pair)
 	}
 	return fmt.Sprintf(`Its %d replaces are ONE edit_file call with an edits list: {"path": %q, "edits": [{%s}, ...the others likewise]}.`, len(ms), target, pair)
 }
 
-// scriptEditRe spots the script edits edit_file can do: a Python heredoc or
-// -c that reads a file, replaces text in it (str.replace, or slicing between
-// two index/find anchors) and writes it back. Other scripts, which compute,
-// convert or generate, are not edits of that kind and get no note.
+// A Python heredoc or -c that splices a file and writes it back. Scripts that
+// only compute or generate get no note.
 var (
 	scriptEditRe   = regexp.MustCompile(`python3?\s+(-\s*<<|-c\b)`)
 	scriptSpliceRe = regexp.MustCompile(`\.replace\(|\.index\(|\.find\(`)
@@ -355,11 +205,7 @@ var (
 	scriptPathRe   = regexp.MustCompile(`['"]([\w./-]+\.(rs|go|py|ts|tsx|js|jsx|c|cc|cpp|h|hpp|java|kt|swift|rb|vue|svelte|css|scss|html|toml|yaml|yml|md))['"]`)
 )
 
-// scriptEditTarget reports the source file a shell line rewrites the way
-// edit_file would, if it does: the first quoted path with a source extension.
 func scriptEditTarget(cmd string) (string, bool) {
-	// A Python script that both splices text and writes it back, in either
-	// order in its source.
 	if !scriptEditRe.MatchString(cmd) || !scriptSpliceRe.MatchString(cmd) || !scriptWriteRe.MatchString(cmd) {
 		return "", false
 	}
@@ -369,10 +215,6 @@ func scriptEditTarget(cmd string) (string, bool) {
 	return "", false
 }
 
-// wrongToolHint names the tool a run_command call without a command was
-// meant for, from the arguments it carried: a model that has just learned
-// read_file's `reads` list sent it to run_command once, and "command is
-// required" alone did not say what went wrong.
 func wrongToolHint(args toolArgs) string {
 	switch {
 	case args.has("reads") || args.has("symbol") || (args.has("path") && (args.has("line") || args.has("limit"))):
@@ -383,14 +225,10 @@ func wrongToolHint(args toolArgs) string {
 	return ""
 }
 
-// bgSleepRe spots a shell line that starts something in the background with
-// `&` and then sleeps to wait for it: `(cargo test > log) & sleep 45; tail
-// log`. The sleep rule only sees a line that starts with sleep; this is the
-// same wait, spelled inside a longer line. Group 1 is what was backgrounded
-// when it is a (subshell), group 2 the seconds.
+// bgSleepRe finds `cmd & sleep N` inside a longer line, which isSleepCmd does
+// not see. Group 1 is a backgrounded (subshell), group 2 the seconds.
 var bgSleepRe = regexp.MustCompile(`(?:\(([^()]*)\)\s*&|(?:^|[^&])&)\s*(?:;\s*)?sleep\s+(\d+)`)
 
-// bgSleepHint: the run_background call a hand-rolled `& sleep N` amounts to.
 func bgSleepHint(cmd string) (string, string) {
 	m := bgSleepRe.FindStringSubmatch(cmd)
 	if m == nil {
