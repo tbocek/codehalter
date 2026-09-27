@@ -61,6 +61,16 @@ type jobExit struct {
 // escaping beyond the quote itself.
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
+// wakeAfterArg reads the optional `wake_after` seconds both command tools
+// take; the second return is the error to hand back, "" when fine.
+func wakeAfterArg(args toolArgs) (time.Duration, string) {
+	secs, ok := args.num("wake_after")
+	if args.has("wake_after") && (!ok || secs < 0) {
+		return 0, "error: wake_after must be a number of seconds, 0 or absent for none"
+	}
+	return time.Duration(secs) * time.Second, ""
+}
+
 // launchJob starts cmdStr in a client terminal with the two handles the model
 // knows how to use, a log file it reads with `cat` and a pid it stops with
 // `kill`, embeds the live terminal in the tool call's card, and starts the one
@@ -296,11 +306,10 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	if sess == nil {
 		return "error: no session", false
 	}
-	secs, ok := args.num("wake_after")
-	if args.has("wake_after") && (!ok || secs < 0) {
-		return "error: wake_after must be a number of seconds, 0 or absent for none", false
+	wakeAfter, werr := wakeAfterArg(args)
+	if werr != "" {
+		return werr, false
 	}
-	wakeAfter := time.Duration(secs) * time.Second
 
 	tcId := a.StartToolCall(ctx, sid, "Background: "+cmdStr, "execute", nil)
 	job, err := a.launchJob(ctx, sid, tcId, cmdStr, sess.Cwd, wakeAfter, false)

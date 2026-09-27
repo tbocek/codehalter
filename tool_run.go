@@ -184,11 +184,10 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	if sess == nil {
 		return "error: no session", false
 	}
-	secs, ok := args.num("wake_after")
-	if args.has("wake_after") && (!ok || secs < 0) {
-		return "error: wake_after must be a number of seconds, 0 or absent for none", false
+	wakeAfter, werr := wakeAfterArg(args)
+	if werr != "" {
+		return werr, false
 	}
-	wakeAfter := time.Duration(secs) * time.Second
 	// A foreground sleep while one of this session's background jobs runs is
 	// the model waiting for that job by guessing a number: in one afternoon 10
 	// of 22 background suites were followed by a 90-150 s sleep, and one of them
@@ -353,7 +352,7 @@ func grepsForDefinition(cmd, name string) bool {
 // cd, or an echo separator). A line that also searches, builds or tests is
 // already one call doing several things, and read_file could not replace it.
 func onlyRangeReads(cmd string) bool {
-	for _, part := range regexp.MustCompile(`&&|;|\n`).Split(cmd, -1) {
+	for _, part := range shellSepRe.Split(cmd, -1) {
 		p := strings.TrimSpace(part)
 		if p == "" || strings.HasPrefix(p, "cd ") || strings.HasPrefix(p, "echo ") {
 			continue
@@ -378,15 +377,11 @@ var identRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*`)
 // project and the declared name. A single-file grep's path is its last argument. Empty when the
 // command is not a grep or no hit declares anything.
 func grepDefinitionHit(cmd, output, cwd string) (string, string) {
-	if !regexp.MustCompile(`\b(grep|rg)\b`).MatchString(cmd) {
+	if !grepCmdRe.MatchString(cmd) {
 		return "", ""
 	}
-	dir := ""
-	if m := cdPrefixRe.FindStringSubmatch(cmd); m != nil {
-		dir = m[1]
-	}
 	single := ""
-	if f := strings.Fields(regexp.MustCompile(`[;|&]`).Split(cmd[strings.LastIndex(cmd, "grep"):], 2)[0]); len(f) > 0 {
+	if f := strings.Fields(pipeSepRe.Split(cmd[strings.LastIndex(cmd, "grep"):], 2)[0]); len(f) > 0 {
 		single = strings.Trim(f[len(f)-1], `'"`)
 	}
 	for _, ln := range strings.Split(output, "\n") {
@@ -411,16 +406,7 @@ func grepDefinitionHit(cmd, output, cwd string) (string, string) {
 		if name == "" || len(name) < 3 || !regexp.MustCompile(`\b`+regexp.QuoteMeta(name)+`\b`).MatchString(cmd) {
 			continue
 		}
-		p := file
-		if dir != "" && !filepath.IsAbs(p) {
-			p = filepath.Join(dir, p)
-		}
-		if filepath.IsAbs(p) {
-			if rel, err := filepath.Rel(cwd, p); err == nil && !strings.HasPrefix(rel, "..") {
-				p = rel
-			}
-		}
-		return filepath.ToSlash(p), name
+		return shellPath(cmd, file, cwd), name
 	}
 	return "", ""
 }
@@ -496,15 +482,30 @@ var (
 	sedRangeRe = regexp.MustCompile(`sed -n '?(\d+),(\d+)p'? +([^\s;|&]+)`)
 	awkRangeRe = regexp.MustCompile(`awk '[^']*NR *>= *(\d+)[^']*NR *<= *(\d+)[^']*' +([^\s;|&]+)`)
 	cdPrefixRe = regexp.MustCompile(`^\s*cd +([^\s;&]+) *(&&|;)`)
+	shellSepRe = regexp.MustCompile(`&&|;|\n`)
+	grepCmdRe  = regexp.MustCompile(`\b(grep|rg)\b`)
+	pipeSepRe  = regexp.MustCompile(`[;|&]`)
 )
+
+// shellPath resolves a file a shell line names to a project-relative path:
+// through the line's leading `cd`, then relative to the project root when it
+// lies inside it.
+func shellPath(cmd, file, cwd string) string {
+	p := file
+	if m := cdPrefixRe.FindStringSubmatch(cmd); m != nil && !filepath.IsAbs(p) {
+		p = filepath.Join(m[1], p)
+	}
+	if filepath.IsAbs(p) {
+		if rel, err := filepath.Rel(cwd, p); err == nil && !strings.HasPrefix(rel, "..") {
+			p = rel
+		}
+	}
+	return filepath.ToSlash(p)
+}
 
 // rangeReadHint: after a shell line that read files by line range, the
 // read_file call that does the same, spelled out (see toolHints for when).
 func rangeReadHint(cmd, cwd string) string {
-	dir := ""
-	if m := cdPrefixRe.FindStringSubmatch(cmd); m != nil {
-		dir = m[1]
-	}
 	var reads []string
 	add := func(from, to, file string, numbered bool) {
 		a, _ := strconv.Atoi(from)
@@ -512,20 +513,11 @@ func rangeReadHint(cmd, cwd string) string {
 		if b < a || len(reads) == maxReadsPerCall {
 			return
 		}
-		p := file
-		if dir != "" && !filepath.IsAbs(p) {
-			p = filepath.Join(dir, p)
-		}
-		if filepath.IsAbs(p) {
-			if rel, err := filepath.Rel(cwd, p); err == nil && !strings.HasPrefix(rel, "..") {
-				p = rel
-			}
-		}
 		num := ""
 		if numbered {
 			num = `, "numbered": true`
 		}
-		reads = append(reads, fmt.Sprintf(`{"path": %q, "start_line": %d, "end_line": %d%s}`, filepath.ToSlash(p), a, b, num))
+		reads = append(reads, fmt.Sprintf(`{"path": %q, "start_line": %d, "end_line": %d%s}`, shellPath(cmd, file, cwd), a, b, num))
 	}
 	for _, m := range sedRangeRe.FindAllStringSubmatch(cmd, -1) {
 		add(m[1], m[2], m[3], false)

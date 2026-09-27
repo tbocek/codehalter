@@ -690,25 +690,38 @@ func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testF
 	return w
 }
 
-// specFinalPrompt renders SPEC-FINAL.md: the whole-program round after the
-// last item, with the target, the standing rules, every spec file, the test
-// command and the blocked list filled in.
-func (a *agent) specFinalPrompt(sid string, cfg *specConfig, idx *specIndex, testCmd string) string {
+// specBaseVars are the placeholders every spec prompt shares: the two
+// directories, the target (noTarget when the user gave none), the test
+// command, the standing rules (contextLead before the list, contextTail
+// after it) and every spec file.
+func specBaseVars(cfg *specConfig, idx *specIndex, testCmd, noTarget, contextLead, contextTail string) []string {
 	target := cfg.Target
 	if target == "" {
-		target = "No technology was given with /spec; the project in the output directory is what it is."
+		target = noTarget
 	}
 	context := ""
 	if files := cfg.context(idx); len(files) > 0 {
 		for i, f := range files {
 			files[i] = "`" + cfg.SpecDir + "/" + f + "`"
 		}
-		context = "Standing rules: " + strings.Join(files, ", ") + "."
+		context = contextLead + strings.Join(files, ", ") + contextTail
 	}
 	var docs []string
 	for _, d := range idx.docs {
 		docs = append(docs, "`"+cfg.SpecDir+"/"+d.rel+"`")
 	}
+	return []string{"{{spec_dir}}", cfg.SpecDir, "{{out_dir}}", cfg.OutDir, "{{target}}", target,
+		"{{test_cmd}}", testCmd, "{{context}}", context, "{{files}}", strings.Join(docs, ", ")}
+}
+
+// specNoTargetBuilt is the target line of a prompt about a program already
+// built (final pass, audit): what is there is what it is.
+const specNoTargetBuilt = "No technology was given with /spec; the project in the output directory is what it is."
+
+// specFinalPrompt renders SPEC-FINAL.md: the whole-program round after the
+// last item, with the target, the standing rules, every spec file, the test
+// command and the blocked list filled in.
+func (a *agent) specFinalPrompt(sid string, cfg *specConfig, idx *specIndex, testCmd string) string {
 	blocked := "none"
 	if len(cfg.Blocked) > 0 {
 		var lines []string
@@ -717,13 +730,9 @@ func (a *agent) specFinalPrompt(sid string, cfg *specConfig, idx *specIndex, tes
 		}
 		blocked = strings.Join(lines, "\n")
 	}
-	rep := strings.NewReplacer(
-		"{{spec_dir}}", cfg.SpecDir, "{{out_dir}}", cfg.OutDir, "{{target}}", target,
-		"{{test_cmd}}", testCmd, "{{items}}", strconv.Itoa(len(cfg.Items)),
-		"{{blocked_count}}", strconv.Itoa(len(cfg.Blocked)), "{{blocked}}", blocked,
-		"{{context}}", context, "{{files}}", strings.Join(docs, ", "),
-	)
-	return collapseBlankLines(rep.Replace(a.loadPromptFile(sid, "SPEC-FINAL.md")))
+	vars := append(specBaseVars(cfg, idx, testCmd, specNoTargetBuilt, "Standing rules: ", "."),
+		"{{items}}", strconv.Itoa(len(cfg.Items)), "{{blocked_count}}", strconv.Itoa(len(cfg.Blocked)), "{{blocked}}", blocked)
+	return collapseBlankLines(strings.NewReplacer(vars...).Replace(a.loadPromptFile(sid, "SPEC-FINAL.md")))
 }
 
 // roundToolUses flattens the tool calls a round made, in order: everything
@@ -818,7 +827,7 @@ func writtenSince(root string, t time.Time) bool {
 		}
 		if d.IsDir() {
 			name := d.Name()
-			if path != root && (strings.HasPrefix(name, ".") || name == "target" || name == "node_modules" || name == "shots" || name == "dist" || name == "build") {
+			if path != root && (skipWalkDir(name) || name == "shots") {
 				return filepath.SkipDir
 			}
 			return nil
@@ -1016,21 +1025,6 @@ const specRedoReason = "The user sent this item back with /spec redo. It was imp
 // specAuditPrompt renders SPEC-REDO.md: the round that finds which finished
 // items do not deliver, for a bare /spec redo.
 func (a *agent) specAuditPrompt(sid string, cfg *specConfig, idx *specIndex, testCmd string) string {
-	target := cfg.Target
-	if target == "" {
-		target = "No technology was given with /spec; the project in the output directory is what it is."
-	}
-	context := ""
-	if files := cfg.context(idx); len(files) > 0 {
-		for i, f := range files {
-			files[i] = "`" + cfg.SpecDir + "/" + f + "`"
-		}
-		context = "Standing rules: " + strings.Join(files, ", ") + "."
-	}
-	var docs []string
-	for _, d := range idx.docs {
-		docs = append(docs, "`"+cfg.SpecDir+"/"+d.rel+"`")
-	}
 	// Every id, by file, exactly as the ledger spells it: an audit that has
 	// to name forty of them from memory invented one from an example.
 	var ids strings.Builder
@@ -1045,12 +1039,9 @@ func (a *agent) specAuditPrompt(sid string, cfg *specConfig, idx *specIndex, tes
 			fmt.Fprintf(&ids, "- `%s`: %s\n", doc.rel, strings.Join(in, ", "))
 		}
 	}
-	rep := strings.NewReplacer(
-		"{{spec_dir}}", cfg.SpecDir, "{{out_dir}}", cfg.OutDir, "{{target}}", target,
-		"{{test_cmd}}", testCmd, "{{context}}", context, "{{files}}", strings.Join(docs, ", "),
-		"{{ids}}", strings.TrimRight(ids.String(), "\n"),
-	)
-	return collapseBlankLines(rep.Replace(a.loadPromptFile(sid, "SPEC-REDO.md")))
+	vars := append(specBaseVars(cfg, idx, testCmd, specNoTargetBuilt, "Standing rules: ", "."),
+		"{{ids}}", strings.TrimRight(ids.String(), "\n"))
+	return collapseBlankLines(strings.NewReplacer(vars...).Replace(a.loadPromptFile(sid, "SPEC-REDO.md")))
 }
 
 // needsFinalPass: the final pass runs once every item is done, and again when

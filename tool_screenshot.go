@@ -486,7 +486,7 @@ func newestPNGSince(root string, t time.Time) string {
 		}
 		if d.IsDir() {
 			name := d.Name()
-			if path != root && (strings.HasPrefix(name, ".") || name == "target" || name == "node_modules" || name == "dist" || name == "build" || name == "vendor") {
+			if path != root && skipWalkDir(name) {
 				return filepath.SkipDir
 			}
 			return nil

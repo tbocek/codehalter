@@ -1122,6 +1122,10 @@ var specSkipDirs = map[string]bool{
 	"dist": true, "build": true, ".venv": true, "__pycache__": true,
 }
 
+// skipWalkDir is the one rule for which directories a project walk skips:
+// build output, dependencies and anything hidden.
+func skipWalkDir(name string) bool { return specSkipDirs[name] || strings.HasPrefix(name, ".") }
+
 // testSourceText returns the part of a file that is test code, or "" when the
 // file is not a test source. A dedicated test file counts whole. A file that is
 // only a test file because it carries an inline Rust test module counts from
@@ -1163,7 +1167,7 @@ func specCoverage(outAbs string, ids []string) (covered map[string]string, testF
 			return err
 		}
 		if d.IsDir() {
-			if path != outAbs && (specSkipDirs[d.Name()] || strings.HasPrefix(d.Name(), ".")) {
+			if path != outAbs && skipWalkDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -1367,7 +1371,7 @@ func specDirCandidates(cwd string) []string {
 		return nil
 	}
 	for _, e := range top {
-		if !e.IsDir() || specSkipDirs[e.Name()] || strings.HasPrefix(e.Name(), ".") {
+		if !e.IsDir() || skipWalkDir(e.Name()) {
 			continue
 		}
 		consider(e.Name(), 1)
@@ -1376,7 +1380,7 @@ func specDirCandidates(cwd string) []string {
 			continue
 		}
 		for _, s := range sub {
-			if s.IsDir() && !specSkipDirs[s.Name()] && !strings.HasPrefix(s.Name(), ".") {
+			if s.IsDir() && !skipWalkDir(s.Name()) {
 				consider(filepath.ToSlash(filepath.Join(e.Name(), s.Name())), 2)
 			}
 		}
@@ -1460,7 +1464,7 @@ func specOutDirOptions(cwd, specDir, suggested string) []string {
 	add(suggested)
 	entries, _ := os.ReadDir(cwd)
 	for _, e := range entries {
-		if !e.IsDir() || specSkipDirs[e.Name()] || strings.HasPrefix(e.Name(), ".") {
+		if !e.IsDir() || skipWalkDir(e.Name()) {
 			continue
 		}
 		if lang, _ := manifestStack(filepath.Join(cwd, e.Name())); lang != "" {
