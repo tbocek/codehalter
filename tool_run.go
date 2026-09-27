@@ -241,7 +241,11 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 			Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),
 			Status:     "completed",
 		})
-		return fmt.Sprintf("exit %d\n\n%s", exitCode, boundedCapture(out)) + sess.toolHints(cmdStr, out), false
+		note, told := sess.toolHints(cmdStr, out)
+		if told != "" {
+			a.say(ctx, sid, told+"\n")
+		}
+		return fmt.Sprintf("exit %d\n\n%s", exitCode, boundedCapture(out)) + note, false
 	case <-ctx.Done():
 		// The user hit Stop, or the turn was cancelled. Release kills the
 		// command; report what it managed to print.
@@ -280,36 +284,34 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 		waited, job.id, job.pid, wake, job.id, job.logPath, job.pid, readLogTail(job.logPath, bgLogTailCap)), false
 }
 
-// toolHints is what a finished run_command result gets appended once per
-// session: the edit_file call for a script that did what edit_file does, and
-// the read_file call for a shell range read. A note, never a refusal: the
-// command ran, and the next one may take the better route. Once, because the
-// point is to put one correct example into the conversation, not to repeat
-// it on every read.
-func (s *Session) toolHints(cmd, output string) string {
+// toolHints is the note a finished run_command result gets when the model
+// took a shell route that a file tool does better: the read_file symbol call
+// for a grep that found a definition, the edit_file call for a script that
+// spliced a source file, the read_file call for a range read. A note, never
+// a refusal: the command ran. Every time, with the concrete call filled in,
+// because once per session did not move this model: after the first note it
+// made 17 more range reads. The second return is the line the user sees in
+// the chat, so a nudge is never invisible.
+func (s *Session) toolHints(cmd, output string) (string, string) {
 	var out string
-	s.rt.mu.Lock()
-	defer s.rt.mu.Unlock()
-	if !s.rt.hintedGrepDef {
-		if path, name := grepDefinitionHit(cmd, output, s.Cwd); name != "" {
-			s.rt.hintedGrepDef = true
-			out += fmt.Sprintf("\n[codehalter: that hit is where `%s` is defined. To read the whole definition, read_file does it in one call, in any language: {\"path\": %q, \"symbol\": %q}%s; several at once as {\"reads\": [{\"path\": ..., \"symbol\": ...}, ...]}.]", name, path, name, symbolPreview(s.Cwd, path, name))
-		}
+	var seen []string
+	if path, name := grepDefinitionHit(cmd, output, s.Cwd); name != "" {
+		out += fmt.Sprintf("\n[codehalter: that hit is where `%s` is defined. To read the whole definition, read_file does it in one call, in any language: {\"path\": %q, \"symbol\": %q}%s; several at once as {\"reads\": [{\"path\": ..., \"symbol\": ...}, ...]}.]", name, path, name, symbolPreview(s.Cwd, path, name))
+		seen = append(seen, "read_file symbol="+name+" instead of grep")
 	}
-	if !s.rt.hintedScriptEdit {
-		if target, ok := scriptEditTarget(cmd); ok {
-			s.rt.hintedScriptEdit = true
-			out += "\n[codehalter: that script edited " + target + ". " + scriptEditPreview(cmd, target) +
-				" edit_file checks that old_text (or start) matches exactly one place, applies the change, shows the user a diff, and answers `file written successfully` or says exactly why not; a script does none of that. Use edit_file for the next change.]"
-		}
+	if target, ok := scriptEditTarget(cmd); ok {
+		out += "\n[codehalter: that script edited " + target + ". " + scriptEditPreview(cmd, target) +
+			" edit_file checks that old_text (or start) matches exactly one place, applies the change, shows the user a diff, and answers `file written successfully` or says exactly why not; a script does none of that. Use edit_file for the next change.]"
+		seen = append(seen, "edit_file instead of a script on "+target)
 	}
-	if !s.rt.hintedRangeRead {
-		if h := rangeReadHint(cmd, s.Cwd); h != "" {
-			s.rt.hintedRangeRead = true
-			out += h
-		}
+	if h := rangeReadHint(cmd, s.Cwd); h != "" {
+		out += h
+		seen = append(seen, "read_file instead of sed/awk line ranges")
 	}
-	return out
+	if len(seen) == 0 {
+		return "", ""
+	}
+	return out, "💡 told the model: " + strings.Join(seen, "; ")
 }
 
 // symbolPreview says what a read_file symbol call would return, from the

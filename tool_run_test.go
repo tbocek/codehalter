@@ -294,10 +294,10 @@ func TestRunCommandStallKillsHungJob(t *testing.T) {
 	}
 }
 
-// TestToolHintsOnce: a script that does what edit_file does gets a note with
+// TestToolHints: a script that does what edit_file does gets a note with
 // the edit_file call, once per session, and runs; a script that computes or
 // generates gets none. A range read gets the read_file call, once too.
-func TestToolHintsOnce(t *testing.T) {
+func TestToolHints(t *testing.T) {
 	edit := "cd rust && python3 - <<'PY'\np='tests/zoom_widgets.rs'\ns=open(p).read()\nopen(p,'w').write(s.replace('a','b'))\nPY"
 	if target, ok := scriptEditTarget(edit); !ok || target != "tests/zoom_widgets.rs" {
 		t.Errorf("heredoc edit = %q %v", target, ok)
@@ -312,7 +312,10 @@ func TestToolHintsOnce(t *testing.T) {
 		}
 	}
 	h := newTerminalHarness(t)
-	first := h.sess.toolHints(edit+"; sed -n '1,5p' src/a.rs", "")
+	first, told := h.sess.toolHints(edit+"; sed -n '1,5p' src/a.rs", "")
+	if !strings.Contains(told, "edit_file instead of a script on tests/zoom_widgets.rs") || !strings.Contains(told, "read_file instead of sed/awk") {
+		t.Errorf("chat line = %q", told)
+	}
 	if !strings.Contains(first, "that script edited tests/zoom_widgets.rs") || !strings.Contains(first, "read_file does this without the shell") ||
 		!strings.Contains(first, `Its replace is exactly this edit_file call: {"path": "tests/zoom_widgets.rs", "old_text": "a", "new_text": "b"}`) {
 		t.Errorf("first hints = %q", first)
@@ -327,8 +330,8 @@ func TestToolHintsOnce(t *testing.T) {
 	if got := scriptEditPreview(splice, "src/a.rs"); !strings.Contains(got, `"start": "<fragment of the block's first line>"`) {
 		t.Errorf("splice preview = %q", got)
 	}
-	if again := h.sess.toolHints(edit+"; sed -n '1,5p' src/a.rs", ""); again != "" {
-		t.Errorf("hints repeated: %q", again)
+	if again, _ := h.sess.toolHints(edit+"; sed -n '1,5p' src/a.rs", ""); again == "" {
+		t.Error("the second occurrence got no hint; every occurrence gets one")
 	}
 }
 
@@ -356,8 +359,8 @@ func TestRangeReadHint(t *testing.T) {
 	if !strings.Contains(res, "a\nb\n") || !strings.Contains(res, `read_file does this without the shell: {"path": "f.txt", "line": 1, "limit": 2}`) {
 		t.Errorf("run result = %q", res)
 	}
-	if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sed -n '2,3p' f.txt"}`); strings.Contains(res, "codehalter:") {
-		t.Errorf("the hint came twice: %q", res)
+	if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sed -n '2,3p' f.txt"}`); !strings.Contains(res, "codehalter:") {
+		t.Errorf("the second range read got no hint: %q", res)
 	}
 }
 
@@ -388,11 +391,11 @@ func TestGrepDefinitionHint(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(h.sess.Cwd, "cmd", "run.go"), []byte("package cmd\n\n// Step runs one step.\nfunc (r *Runner) Step(n int) error {\n\treturn nil\n}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	first := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:4:func (r *Runner) Step(n int) error {")
+	first, _ := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:4:func (r *Runner) Step(n int) error {")
 	if !strings.Contains(first, `{"path": "cmd/run.go", "symbol": "Step"}, which returns lines 3-6 (4 lines, the whole block, found by braces), starting `+"`func (r *Runner) Step(n int) error {`") {
 		t.Errorf("first grep hint = %q", first)
 	}
-	if again := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:40:func (r *Runner) Step(n int) error {"); again != "" {
-		t.Errorf("grep hint repeated: %q", again)
+	if again, _ := h.sess.toolHints("grep -rn 'Step(' cmd", "cmd/run.go:4:func (r *Runner) Step(n int) error {"); again == "" {
+		t.Error("the second grep got no hint; every occurrence gets one")
 	}
 }

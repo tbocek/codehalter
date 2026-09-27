@@ -295,16 +295,8 @@ type sessionRuntime struct {
 	// user asked for the items to be found and rebuilt, so the planner's
 	// list is not put to them again as a question. Runtime-only.
 	specAudit bool
-	// hintedScriptEdit / hintedRangeRead: the one-time run_command notes
-	// (toolHints) were given. Runtime-only.
-	hintedScriptEdit bool
-	hintedRangeRead  bool
-	hintedGrepDef    bool
-	// prevCall is the last tool call, for the batching notes (batchHint);
-	// hintedBatchReads / hintedBatchEdits: those notes were given.
-	prevCall         toolCallBrief
-	hintedBatchReads bool
-	hintedBatchEdits bool
+	// prevCall is the last tool call, for the batching notes (batchHint).
+	prevCall toolCallBrief
 	// replyStart: the next tool call is the first of a model reply. Calls
 	// later in the same reply were batched already and get no batching note.
 	replyStart bool

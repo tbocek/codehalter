@@ -581,47 +581,48 @@ func TestEditFileSeveralEdits(t *testing.T) {
 }
 
 // TestBatchHints: a second read_file in a row, or a second edit to the same
-// file in a row, gets the two calls merged into one as the example, once
-// per session; a different tool in between, a different file, a failed
-// call or an existing list gets nothing.
+// file in a row, gets the two calls merged into one as the example, every
+// time, with a chat line for the user; calls batched in one reply, a
+// different tool in between, a different file, a failed call or an existing
+// list get nothing.
 func TestBatchHints(t *testing.T) {
 	_, s := newTestAgent(t)
-	call := func(name, args string, failed bool) string {
+	call := func(name, args string, failed bool) (string, string) {
 		s.markReplyStart() // one call per reply, the unbatched case
 		return s.batchHint(name, args, failed)
 	}
 	// Two reads in ONE reply were batched: no note.
 	s.markReplyStart()
 	s.batchHint("read_file", `{"path":"x.rs","symbol":"p"}`, false)
-	if got := s.batchHint("read_file", `{"path":"y.rs","symbol":"q"}`, false); got != "" {
+	if got, _ := s.batchHint("read_file", `{"path":"y.rs","symbol":"q"}`, false); got != "" {
 		t.Errorf("a batched second read got a note: %q", got)
 	}
 	s.batchHint("run_command", `{"command":"ls"}`, false)
 
-	if got := call("read_file", `{"path":"a.rs","symbol":"f"}`, false); got != "" {
+	if got, _ := call("read_file", `{"path":"a.rs","symbol":"f"}`, false); got != "" {
 		t.Errorf("first read got a hint: %q", got)
 	}
-	got := call("read_file", `{"path":"b.rs","line":10,"limit":20}`, false)
-	if !strings.Contains(got, `{"reads": [{"path":"a.rs","symbol":"f"}, {"limit":20,"line":10,"path":"b.rs"}]}`) {
-		t.Errorf("read hint = %q", got)
+	got, told := call("read_file", `{"path":"b.rs","line":10,"limit":20}`, false)
+	if !strings.Contains(got, `{"reads": [{"path":"a.rs","symbol":"f"}, {"limit":20,"line":10,"path":"b.rs"}]}`) || !strings.HasPrefix(told, "💡 told the model:") {
+		t.Errorf("read hint = %q / %q", got, told)
 	}
-	if got := call("read_file", `{"path":"c.rs","symbol":"g"}`, false); got != "" {
-		t.Errorf("read hint repeated: %q", got)
+	if got, _ := call("read_file", `{"path":"c.rs","symbol":"g"}`, false); got == "" {
+		t.Error("the third read in a row got no hint; every occurrence gets one")
 	}
 
 	call("run_command", `{"command":"ls"}`, false)
-	if got := call("edit_file", `{"path":"w.rs","old_text":"a","new_text":"b"}`, false); got != "" {
+	if got, _ := call("edit_file", `{"path":"w.rs","old_text":"a","new_text":"b"}`, false); got != "" {
 		t.Errorf("first edit got a hint: %q", got)
 	}
-	if got := call("edit_file", `{"path":"other.rs","old_text":"c","new_text":"d"}`, false); got != "" {
+	if got, _ := call("edit_file", `{"path":"other.rs","old_text":"c","new_text":"d"}`, false); got != "" {
 		t.Errorf("edits to two files got a hint: %q", got)
 	}
-	if got := call("edit_file", `{"path":"other.rs","old_text":"x","new_text":"y"}`, true); got != "" {
+	if got, _ := call("edit_file", `{"path":"other.rs","old_text":"x","new_text":"y"}`, true); got != "" {
 		t.Errorf("a failed edit got a hint: %q", got)
 	}
 	call("edit_file", `{"path":"w.rs","old_text":"a","new_text":"b"}`, false)
-	got = call("edit_file", `{"path":"w.rs","start":"fn z(","end":"} // z","new_text":"fn z() {}"}`, false)
-	if !strings.Contains(got, `{"path": "w.rs", "edits": [{"new_text":"b","old_text":"a"}, {"end":"} // z","new_text":"fn z() {}","start":"fn z("}]}`) {
-		t.Errorf("edit hint = %q", got)
+	got, told = call("edit_file", `{"path":"w.rs","start":"fn z(","end":"} // z","new_text":"fn z() {}"}`, false)
+	if !strings.Contains(got, `{"path": "w.rs", "edits": [{"new_text":"b","old_text":"a"}, {"end":"} // z","new_text":"fn z() {}","start":"fn z("}]}`) || !strings.Contains(told, "several edits to w.rs") {
+		t.Errorf("edit hint = %q / %q", got, told)
 	}
 }

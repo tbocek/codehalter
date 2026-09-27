@@ -361,11 +361,15 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	}
 
 	// The two batching notes: a second read_file in a row, or a second
-	// edit_file to the same file in a row, gets once per session the two
-	// calls it just made merged into one, as the example.
+	// edit_file to the same file in a row, gets the two calls it just made
+	// merged into one, as the example.
 	if multimodal == nil {
 		if sess := a.getSession(sid); sess != nil {
-			result += sess.batchHint(tc.Function.Name, tc.Function.Arguments, failed)
+			note, told := sess.batchHint(tc.Function.Name, tc.Function.Arguments, failed)
+			if told != "" {
+				result += note
+				a.say(ctx, sid, told+"\n")
+			}
 		}
 	}
 
