@@ -6,6 +6,9 @@ User=non-root `dev`, sudo NOPASSWD. Write ops (add/del/update) need sudo. Read p
 - apk list -I → all installed (long → grep).
 - apk info <pkg> → version + desc.
 
+## grep is BusyBox
+`grep` here is BusyBox: short options work (`-rn -C3 -F -E -i -w -l`), the long ones do NOT (`--include`, `--exclude`, `--exclude-dir` print its usage). Name the directories to search instead of excluding, or `sudo apk add grep` for GNU grep (persist it in `.devcontainer/Dockerfile` if the project keeps needing it).
+
 ## Search / install
 Order: 1) apk 2) upstream site / custom repo (below) 3) lang installer.
 - sudo apk update → refresh index (cheap; do before search/install).
