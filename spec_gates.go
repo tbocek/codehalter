@@ -638,8 +638,9 @@ func specUnreachable(outAbs string, ch specChanges, prog *specProgram) []string 
 
 var (
 	// forTestCallRe: a call of a helper named for tests, the naming rule the round prompt sets.
-	forTestCallRe  = regexp.MustCompile(`\b([A-Za-z_]\w*(?:_for_tests?|_for_testing|ForTests?|ForTesting))\s*\(`)
-	notBuiltCodeRe = regexp.MustCompile(`\b(?:todo|unimplemented)!\s*[(\[{]|\bNotImplemented(?:Error|Exception)?\b`)
+	forTestCallRe = regexp.MustCompile(`\b([A-Za-z_]\w*(?:_for_tests?|_for_testing|ForTests?|ForTesting))\s*\(`)
+	// Rust's macros, Kotlin's TODO(), Python's, .NET's and Java-land's not-implemented errors.
+	notBuiltCodeRe = regexp.MustCompile(`\b(?:todo|unimplemented)!\s*[(\[{]|\bTODO\s*\(|\bNotImplemented(?:Error|Exception)?\b`)
 	// notBuiltTextRe runs on code with its strings kept, comments gone: a message, not a remark.
 	notBuiltTextRe = regexp.MustCompile(`(?i)\bnot (?:yet )?implemented\b|\bunimplemented\b|\bstub(?:bed)?\b`)
 )

@@ -183,6 +183,7 @@ func TestSpecStandIns(t *testing.T) {
 			"#[cfg(test)]\nmod tests {\n    fn t() { super::reply_for_test(); todo!() }\n}\n",
 		"out/go/svc.go":   "package svc\n\nfunc Ask() error { return errors.New(\"not yet implemented\") }\n\nfunc Live() string { return clientForTest().Get() }\n",
 		"out/py/tts.py":   "def speak(line):\n    raise NotImplementedError\n",
+		"out/kt/Tts.kt":   "fun speak(line: String): Unit = TODO(\"speech\")\n",
 		"out/web/draw.js": "export function draw() { return 'stub' }\n",
 		"out/tests/t.rs":  "#[test]\nfn f1_1() { naivepost::upload::reply_for_test(); unimplemented!() }\n",
 	})
@@ -190,7 +191,7 @@ func TestSpecStandIns(t *testing.T) {
 	got := strings.Join(specStandIns(filepath.Join(cwd, "out"), ch), "\n")
 	for _, want := range []string{"`reply_for_test` (src/upload.rs:9): the program asks a helper that exists for tests",
 		"src/upload.rs:15: `pub fn speak() { todo!() }`", "go/svc.go:3: `func Ask() error { return errors.New(\"not yet implemented\") }`",
-		"`clientForTest` (go/svc.go:5)", "py/tts.py:2: `raise NotImplementedError`", "web/draw.js:1:"} {
+		"`clientForTest` (go/svc.go:5)", "py/tts.py:2: `raise NotImplementedError`", "web/draw.js:1:", "kt/Tts.kt:1:"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("missing %q in:\n%s", want, got)
 		}

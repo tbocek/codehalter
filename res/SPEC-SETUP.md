@@ -24,6 +24,7 @@ The spec is READ-ONLY: codehalter refuses edits under `{{spec_dir}}/`. Read it f
    - Add a snapshot entry point to the app: `--snapshot <screen> --project <fixture dir> --out <file.png>` builds the window in that screen's state from a fixture project, waits for the first frame, renders the window with the toolkit's own API (GTK 4: a `gtk::WidgetPaintable` of the window, rendered with its renderer's `render_texture`, then `save_to_png`), and exits. It takes an optional `--do <widget-name>` that fires that widget's action before rendering, so a screen can be looked at after a click, not only at rest. Name the screens after the spec's image files (`03-window`, `05-cut`, ...), so each image in the spec has a reproducible counterpart.
    - Add a `snapshot` recipe to the `justfile` that runs it under `xvfb-run -a` with `GSK_RENDERER=cairo` and writes to `{{out_dir}}/shots/<screen>.png`.
    - Prove it: render one screen, even if it is still empty, and look at it with `screenshot path={{out_dir}}/shots/<screen>.png`.
+8. If the target is a web page or web app, make its pages visible the same way: add a `snapshot` recipe that starts the app (or serves the built files), opens `<screen>`'s page in a headless browser (`firefox --headless --screenshot {{out_dir}}/shots/<screen>.png <url>`, or Playwright's `page.screenshot`), writes `{{out_dir}}/shots/<screen>.png`, and stops the app again. Name the screens after the spec's image files, as above, and prove it the same way.
 
 ## When this round counts as done
 
