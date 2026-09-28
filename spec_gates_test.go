@@ -189,9 +189,9 @@ func TestSpecLint(t *testing.T) {
 	out := t.TempDir()
 	ch := specChanges{added: map[string][]int{"src/a.rs": {3}, "b.go": {9}}, ok: true}
 	cmd := `printf 'warning: unused variable x\n  --> src/a.rs:3:9\nwarning: old\n  --> src/a.rs:40:1\n./b.go:9:2: printf format %%d has arg of wrong type\n'; exit 1`
-	findings, ran := specLint(t.Context(), out, cmd, ch)
-	if !ran || len(findings) != 2 {
-		t.Fatalf("ran=%v findings=%q, want the two in written lines", ran, findings)
+	findings, missing := specLint(t.Context(), out, cmd, ch)
+	if missing != "" || len(findings) != 2 {
+		t.Fatalf("missing=%q findings=%q, want the two in written lines", missing, findings)
 	}
 	if !strings.Contains(findings[0], "unused variable x") || !strings.Contains(findings[1], "b.go:9:2: printf format") {
 		t.Errorf("findings = %q", findings)
@@ -212,8 +212,8 @@ func TestSpecLint(t *testing.T) {
 	if len(findings) != 1 || !strings.Contains(findings[0], "app/(shop)/cart/page.tsx:2") {
 		t.Errorf("route-group findings = %q, want only page.tsx:2", findings)
 	}
-	if _, ran := specLint(t.Context(), out, "no-such-linter-xyz --check", ch); ran {
-		t.Error("a missing linter counted as having run")
+	if _, missing := specLint(t.Context(), out, "no-such-linter-xyz --check", ch); !strings.Contains(missing, "no-such-linter-xyz") {
+		t.Errorf("a missing linter: missing=%q, want the shell's own line naming it", missing)
 	}
 }
 

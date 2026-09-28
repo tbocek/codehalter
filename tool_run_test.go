@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -365,5 +366,28 @@ func TestLiveToolOutputServesShellReadsWhole(t *testing.T) {
 	got := liveToolOutput("run_command", `{"command":"cat /tmp/job.log"}`, log)
 	if len(got) > liveExemptCap+1024 || !strings.HasSuffix(got, "3 failed\n") || !strings.HasPrefix(got, "running a test") {
 		t.Errorf("an oversized shell read: %d chars, start or end lost", len(got))
+	}
+}
+
+// An inline script or an image tool on a picture is refused with the way to
+// look at it; a project's own script and a plain listing are not.
+func TestRunCommandRefusesPictureScripts(t *testing.T) {
+	h := newTerminalHarness(t)
+	for _, cmd := range []string{
+		"cd rust && python3 -c \"from PIL import Image\nim = Image.open('shots/08-produce.png')\"",
+		"python3 - <<'PY'\nfrom PIL import Image\nImage.open('a.png').crop((0,0,9,9)).save('/tmp/c.png')\nPY",
+		"convert shots/a.png -crop 800x400+0+0 /tmp/b.png",
+	} {
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, string(b))
+		if !strings.HasPrefix(res, "refused:") || !strings.Contains(res, `"region"`) {
+			t.Errorf("%q: %q, want the refusal naming screenshot's region", cmd, res)
+		}
+	}
+	for _, cmd := range []string{"ls -l shots/a.png", "python3 tools/icons.py assets/a.png"} {
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, string(b)); strings.HasPrefix(res, "refused:") {
+			t.Errorf("%q was refused: %q", cmd, res)
+		}
 	}
 }

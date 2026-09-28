@@ -717,9 +717,9 @@ var (
 )
 
 // specLint runs the linter and keeps what it reports in the lines this round
-// wrote: the code before the round is not the round's to fix. ran is false when
-// the linter is missing, which is no reason to fail a round.
-func specLint(ctx context.Context, outAbs, cmd string, ch specChanges) (findings []string, ran bool) {
+// wrote: the code before the round is not the round's to fix. missing is why the
+// linter did not run (not installed), which is no reason to fail a round.
+func specLint(ctx context.Context, outAbs, cmd string, ch specChanges) (findings []string, missing string) {
 	tctx, cancel := context.WithTimeout(ctx, specTestTimeout)
 	defer cancel()
 	c := exec.CommandContext(tctx, specShell(), "-lc", cmd)
@@ -728,8 +728,15 @@ func specLint(ctx context.Context, outAbs, cmd string, ch specChanges) (findings
 	out := string(raw)
 	var ee *exec.ExitError
 	if tctx.Err() != nil || err != nil && !errors.As(err, &ee) || ee != nil && ee.ExitCode() == 127 ||
-		strings.Contains(out, "no such command") || strings.Contains(out, "command not found") {
-		return nil, false
+		strings.Contains(out, "no such command") || strings.Contains(out, "command not found") || strings.Contains(out, "is not installed") {
+		why := "it did not finish"
+		for _, l := range strings.Split(out, "\n") {
+			if l = strings.TrimSpace(l); l != "" {
+				why = truncate(l, 200)
+				break
+			}
+		}
+		return nil, why
 	}
 	lines := strings.Split(out, "\n")
 	seen := map[string]bool{}
@@ -783,7 +790,7 @@ func specLint(ctx context.Context, outAbs, cmd string, ch specChanges) (findings
 			break
 		}
 	}
-	return findings, true
+	return findings, ""
 }
 
 // specDebt is what a refactor round must shrink: lines over the size budget,

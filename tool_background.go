@@ -70,6 +70,13 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 	if args.has("wake_after") && (!ok || secs < 0) {
 		return nil, "error: wake_after must be a number of seconds, 0 or absent for none"
 	}
+	// An inline script on a picture file shows the model nothing: one step wrote 40
+	// PIL crops of a snapshot and never looked at one.
+	if pic := pictureRe.FindString(cmdStr); pic != "" && pictureScriptRe.MatchString(cmdStr) {
+		return nil, fmt.Sprintf("refused: this works on a picture with a script, and a script cannot show it to you: only `screenshot` puts a picture in front of you. "+
+			"Look at it with `screenshot` on the file; for a close look at one part, give `region` [x, y, width, height] in its pixels and that part comes back enlarged: "+
+			`{"path": %q, "region": [0, 0, 800, 400]}. The reply for the whole picture states its size.`, strings.Trim(pic, `'" `))
+	}
 	// A foreground sleep while a job runs is a guessed wait: the job wakes the
 	// model itself, and a running shell cannot be interrupted with the note.
 	if expectExit && isSleepCmd(cmdStr) {
@@ -192,6 +199,14 @@ func (a *agent) sayRunningBgJobs(sess *Session) {
 
 // A run_background gate ended the subtask on its "waiting" respond 13 times in
 // the logs, and the result arrived in another subtask's context.
+// A picture file, and an inline script or an image tool that would crop or
+// measure it. A project's own script file (`python3 tools/icons.py a.png`) is not
+// inline and stays allowed.
+var (
+	pictureRe       = regexp.MustCompile(`[\w./-]+\.(?i:png|jpe?g|webp|gif|bmp)\b`)
+	pictureScriptRe = regexp.MustCompile(`\b(?:python3?|node|perl|ruby)\s+(?:-c\b|-e\b|-\s*<<)|\b(?:convert|magick|mogrify|pngtopnm|pnmcut|ffmpeg)\s`)
+)
+
 // A finite run is a test, build or lint tool, by its command and subcommand
 // (after a wrapper like xvfb-run): a word in a path or a flag (`--build`,
 // `build/libs/app.jar`) says nothing.

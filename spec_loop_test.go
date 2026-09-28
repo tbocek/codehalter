@@ -157,6 +157,12 @@ func TestSpecRoundPrompt(t *testing.T) {
 		t.Errorf("heading = %q", head)
 	}
 
+	// A linter that did not run last round is this round's to install.
+	install, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.1", LintMissing: "error: no such command: `clippy`"}, "just test", "cargo clippy --all-targets --quiet")
+	if !strings.Contains(install, "It does not run in this container yet (error: no such command: `clippy`): install it first") {
+		t.Errorf("the item prompt does not ask for the missing linter:\n%s", install)
+	}
+
 	refactor, head := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: specRefactorID, Mode: specModeRefactor,
 		Debt: specDebt{overLines: 900, targets: "- `src/ui/window.rs`: 2400 lines\n"}}, "just test", "")
 	if strings.Contains(refactor, "{{") || !strings.Contains(refactor, "`src/ui/window.rs`: 2400 lines") || !strings.Contains(head, "lines over the size budget 900") {

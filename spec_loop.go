@@ -316,7 +316,7 @@ type specRun struct {
 	reasons     map[string]string // why the last round on an item did not count
 	lastDelta   string            // the change report already shown
 	vanished    bool              // the last scan lost most of the ledger at once
-	lintMissing bool              // the linter did not run once; said, and not again
+	lintMissing string            // why the linter did not run: the next round installs it
 	fails       map[string]string // which checks an item's last attempt failed (see specDecide)
 }
 
@@ -329,6 +329,8 @@ type specWork struct {
 	Note     string // change: the spec's diff; removal: the text that was deleted
 	Redo     bool
 	Debt     specDebt // refactor: measured when the round was picked
+	// LintMissing: why the linter did not run last round, so this one installs it.
+	LintMissing string
 }
 
 func (r *specRun) say(ctx context.Context, s string) { r.a.say(ctx, r.sid, s) }
@@ -501,6 +503,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		}
 		addFixes(a.prepareChecks(ctx, sess, sid))
 
+		w.LintMissing = r.lintMissing
 		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, r.testCmd(), r.lintCmd())
 		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
 		since, started := len(sess.Messages), time.Now() // the round's own tool calls start here
@@ -1214,6 +1217,9 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 	if lintCmd != "" {
 		lint = fmt.Sprintf("`%s`, run from `%s/`", lintCmd, cfg.OutDir)
 	}
+	if lintCmd != "" && w.LintMissing != "" {
+		lint += fmt.Sprintf(". It does not run in this container yet (%s): install it first, the way SKILL-base.md installs tools, and persist the install in `.devcontainer/Dockerfile`", w.LintMissing)
+	}
 	maxLines := strconv.Itoa(cfg.maxFileLines())
 	if cfg.maxFileLines() < 0 {
 		maxLines = "any number of" // the budget is off
@@ -1321,11 +1327,12 @@ func (r *specRun) gates(ctx context.Context, w specWork, ch specChanges, res *sp
 	res.Oversize = specOversize(r.outAbs, r.cfg, ch)
 	if cmd := r.lintCmd(); cmd != "" && res.TestsPass {
 		r.say(ctx, fmt.Sprintf("🔎 linting: `%s` in `%s/`\n", cmd, r.cfg.OutDir))
-		findings, ran := specLint(ctx, r.outAbs, cmd, ch)
+		findings, missing := specLint(ctx, r.outAbs, cmd, ch)
+		if missing != "" && r.lintMissing == "" {
+			r.say(ctx, fmt.Sprintf("⚠ /spec: `%s` does not run here (%s); the next round installs it. `lint_cmd` in .codehalter/spec.toml sets another linter, `lint_cmd = \"off\"` none.\n", cmd, missing))
+		}
+		r.lintMissing = missing
 		switch {
-		case !ran && !r.lintMissing:
-			r.lintMissing = true
-			r.say(ctx, fmt.Sprintf("⚠ /spec: `%s` did not run (not installed?), so rounds are not linted. Set `lint_cmd` in .codehalter/spec.toml, or `lint_cmd = \"off\"`.\n", cmd))
 		case len(findings) > 0:
 			r.say(ctx, fmt.Sprintf("🔎 %d lint finding(s) in lines this round wrote\n", len(findings)))
 		}
