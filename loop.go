@@ -69,7 +69,7 @@ type planResult struct {
 
 // planProblem names how a planner submission missed its contract, with the
 // corrective for the one retry: invalid JSON, prose (after the loop's own
-// nudge), or a clear plan with neither an answer nor any work.
+// nudge), or a plan with neither an answer, a question nor any work.
 func planProblem(res toolLoopResult, p *planResult, parseErr error) (wrong, corrective string) {
 	switch {
 	case parseErr != nil && res.Terminal == "":
@@ -78,11 +78,38 @@ func planProblem(res toolLoopResult, p *planResult, parseErr error) (wrong, corr
 	case parseErr != nil:
 		return fmt.Sprintf("submit_plan's arguments were not valid JSON (%v)", parseErr),
 			fmt.Sprintf("Your `submit_plan` arguments were not valid JSON (%v). Call it again, emitting the arguments as one well-formed JSON object.", parseErr)
-	case p.Clear && len(p.Subtasks) == 0 && p.answer == "" && len(p.Redo) == 0 && len(p.Spec) == 0:
+	// Whether or not it set clear: an empty plan once ended six /spec rounds in a row.
+	case len(p.Subtasks) == 0 && p.answer == "" && len(p.Redo) == 0 && len(p.Spec) == 0 && strings.TrimSpace(p.Question) == "":
 		return "the planner submitted neither an answer nor any subtasks",
-			"Your `submit_plan` had neither an answer nor subtasks, so nothing reaches the user. Call it again with EITHER the complete answer in `answer` (report_only=true, no subtasks) OR the subtasks that do the work."
+			"Your `submit_plan` had neither an answer nor subtasks, so nothing reaches the user. Call it again with EITHER the complete answer in `answer` (report_only=true, no subtasks) OR the subtasks that do the work. Put the fields at the top level of the arguments, `{\"clear\": true, \"subtasks\": [...]}`, not inside another key."
 	}
 	return "", ""
+}
+
+// unwrapPlan: a plan put inside one wrapper key, as an object or as JSON text
+// (`{"plan": {...}}`, `{"plan": "[{...}]"}`), is the plan itself. Qwen3.8 did
+// this six rounds in a row, copying its own call from the history, and each
+// round read as an empty plan.
+func unwrapPlan(raw string) string {
+	var outer map[string]json.RawMessage
+	if json.Unmarshal([]byte(raw), &outer) != nil || len(outer) != 1 {
+		return raw
+	}
+	for _, inner := range outer {
+		var text string
+		if json.Unmarshal(inner, &text) == nil {
+			inner = json.RawMessage(strings.TrimSpace(text))
+		}
+		var list []json.RawMessage
+		if json.Unmarshal(inner, &list) == nil && len(list) == 1 {
+			inner = list[0]
+		}
+		var plan map[string]json.RawMessage
+		if json.Unmarshal(inner, &plan) == nil && (plan["subtasks"] != nil || plan["clear"] != nil || plan["answer"] != nil) {
+			return string(inner)
+		}
+	}
+	return raw
 }
 
 // respond as the plan terminal is a direct answer: a report_only plan with no subtasks.
@@ -91,7 +118,7 @@ func planFrom(res toolLoopResult) (*planResult, error) {
 		return &planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(res.Text)}, nil
 	}
 	var p planResult
-	if err := json.Unmarshal([]byte(trimJSON(res.Text)), &p); err != nil {
+	if err := json.Unmarshal([]byte(unwrapPlan(trimJSON(res.Text))), &p); err != nil {
 		return nil, err
 	}
 	switch {
@@ -253,7 +280,7 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	}
 	if res.Terminal == submitPlanToolName {
 		var up planResult
-		if err := json.Unmarshal([]byte(trimJSON(res.Text)), &up); err == nil && len(up.Subtasks) > 0 {
+		if err := json.Unmarshal([]byte(unwrapPlan(trimJSON(res.Text))), &up); err == nil && len(up.Subtasks) > 0 {
 			out.Upsert = &up
 			return out
 		}

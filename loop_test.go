@@ -367,6 +367,39 @@ func TestPlanRecoversFromMalformedSubmitPlanArguments(t *testing.T) {
 	}
 }
 
+// The shapes Qwen3.8 sent six rounds in a row: the plan inside a `plan` key, as
+// an object or as JSON text holding a list. They are the plan, with no retry.
+func TestPlanUnwrapsAWrappedPlan(t *testing.T) {
+	for _, args := range []string{
+		`{"plan": {"clear": true, "report_only": false, "subtasks": [{"description": "fix the compile break"}]}}`,
+		`{"plan": "[{\"clear\": true, \"report_only\": false, \"subtasks\": [{\"description\": \"fix the compile break\"}]}]"}`,
+	} {
+		a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, args))
+		plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+		if err != nil || plan == nil || len(plan.Subtasks) != 1 || plan.Subtasks[0].Description != "fix the compile break" {
+			t.Errorf("%s: plan=%+v err=%v, want the wrapped subtask", args, plan, err)
+		}
+		if mock.callCount() != 1 {
+			t.Errorf("%s: %d calls, want 1 (no retry)", args, mock.callCount())
+		}
+	}
+}
+
+// A plan with nothing in it gets the one retry even without clear set.
+func TestPlanRetriesAnEmptyPlan(t *testing.T) {
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear": false, "report_only": false}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear": true, "subtasks": [{"description": "do it"}]}`),
+	)
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil || plan == nil || len(plan.Subtasks) != 1 {
+		t.Fatalf("plan=%+v err=%v, want the retry's subtask", plan, err)
+	}
+	if mock.callCount() != 2 || !strings.Contains(fmt.Sprint(mock.request(1)["messages"]), "not inside another key") {
+		t.Errorf("%d calls, want 2 with the corrective", mock.callCount())
+	}
+}
+
 func planPhaseAgent(t *testing.T, responses ...string) (*agent, *Session, *mockLLM) {
 	t.Helper()
 	mock := newMockLLM(t, responses...)
