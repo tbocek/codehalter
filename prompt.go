@@ -1,14 +1,17 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -618,11 +621,65 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			return lastResult, nil
 		}
 
+		// What the failed subtask spent its calls on: "see history" alone let replans
+		// repeat the same hunt.
+		var reads, edits, runs int
+		var edited []string
+		count := map[string]int{}
+		for _, u := range lastResult.ToolUses {
+			args := parseArgs(u.Input)
+			cmd := args.str("command")
+			switch {
+			case u.Name == "read_file", u.Name == "web_search", u.Name == "web_read", u.Name == "run_command" && onlyReads(cmd):
+				reads++
+			case u.Name == "edit_file" || u.Name == "write_file":
+				if !strings.HasPrefix(u.Output, "file written") { // refused or unmatched
+					break
+				}
+				edits++
+				if p := args.str("path"); p != "" && !slices.Contains(edited, p) {
+					edited = append(edited, p)
+				}
+			case u.Name == "run_command" && commandWrites(cmd):
+				edits++
+				runs++
+			case u.Name == "run_command", u.Name == "run_background":
+				runs++
+			}
+			key := u.Name + " " + u.Input
+			if u.Name == "run_command" {
+				key, _ = commandKey(cmd)
+			}
+			count[key]++
+		}
+		var digest strings.Builder
+		fmt.Fprintf(&digest, "What the failed subtask did, counted by codehalter: %d tool calls, %d of them reads or searches, %d edits, %d commands run.", len(lastResult.ToolUses), reads, edits, runs)
+		switch {
+		case edits == 0:
+			digest.WriteString(" It changed no file.")
+		case len(edited) > 0:
+			fmt.Fprintf(&digest, " Files changed through edits: %s.", strings.Join(edited, ", "))
+		}
+		keys := slices.Collect(maps.Keys(count))
+		slices.SortFunc(keys, func(x, y string) int { return cmp.Or(count[y]-count[x], strings.Compare(x, y)) })
+		var repeated []string
+		for _, k := range keys {
+			if count[k] < 3 || len(repeated) == 3 {
+				break
+			}
+			repeated = append(repeated, fmt.Sprintf("`%s` %d times", truncate(k, 100), count[k]))
+		}
+		if len(repeated) > 0 {
+			digest.WriteString(" Repeated: " + strings.Join(repeated, "; ") + ".")
+		}
+		if reads >= 20 && reads > 2*(edits+runs) {
+			digest.WriteString(" It kept looking things up: put what it was hunting for (the verified signatures, paths and line ranges) into the new subtasks, so the executor does not have to find it again.")
+		}
 		var replanCtx string
 		if dupCount >= 2 {
-			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. Same failure has surfaced %d times — the prior fix didn't work; propose a structurally different approach. See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason, dupCount)
+			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. %s Same failure has surfaced %d times — the prior fix didn't work; propose a structurally different approach. See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason, digest.String(), dupCount)
 		} else {
-			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason)
+			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. %s See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason, digest.String())
 		}
 
 		a.sendPhase(ctx, sid, 0, false)
@@ -639,8 +696,11 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		plan = newPlan
 	}
 
-	a.sendPhase(ctx, sid, 2, false)
-	lastResult = a.runDocumentPhase(ctx, sid, lastResult)
+	// A /spec round plans its own docs step; a documenter after it edits past the round's test run.
+	if sess == nil || sess.specFence() == "" {
+		a.sendPhase(ctx, sid, 2, false)
+		lastResult = a.runDocumentPhase(ctx, sid, lastResult)
+	}
 	a.sendPhase(ctx, sid, 2, true)
 
 	return lastResult, nil
@@ -722,6 +782,20 @@ func (a *agent) loadPromptFile(sid string, filename string) string {
 var agentsFileNames = []string{"AGENTS.md", "AGENT.md", "agents.md", "agent.md"}
 
 const agentsFileBudget = 12 * 1024
+
+// agentsFileRefusal: over budget, the brief may not grow. In one day of /spec
+// rounds it went from 73 to 179 lines with the over-budget note in the prompt.
+func (a *agent) agentsFileRefusal(sid, path, oldContent, newContent string) string {
+	sess := a.getSession(sid)
+	if sess == nil || filepath.Dir(path) != filepath.Clean(sess.Cwd) || !slices.Contains(agentsFileNames, filepath.Base(path)) {
+		return ""
+	}
+	if len(newContent) <= agentsFileBudget || len(newContent) <= len(oldContent) {
+		return ""
+	}
+	return fmt.Sprintf("refused: %s would be %.1f KB, over its %d KB budget, and this change makes it longer. Nothing was written. It is a brief for the next agent, not a log of the work: in the same edit, shorten or delete lines that the code, the tests and git already say, so the file does not grow.",
+		filepath.Base(path), float64(len(newContent))/1024, agentsFileBudget/1024)
+}
 
 func loadAgentsFile(cwd string) (string, string) {
 	for _, name := range agentsFileNames {

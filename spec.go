@@ -73,6 +73,17 @@ type specConfig struct {
 	Items map[string]specLedger `toml:"items,omitempty"`
 	// Final is redone when the item or blocked count has moved since.
 	Final *specFinal `toml:"final,omitempty"`
+	// LintCmd overrides the detected linter; "off" turns the lint gate off.
+	LintCmd string `toml:"lint_cmd,omitempty"`
+	// MaxFileLines: a program file over it may barely grow; 0 is the default, below 0 off.
+	MaxFileLines int `toml:"max_file_lines,omitempty"`
+	// RefactorEvery finished items one round cleans up; 0 is the default, below 0 off.
+	RefactorEvery int `toml:"refactor_every,omitempty"`
+	// RefactorAt is the ledger size at the last refactor round.
+	RefactorAt int `toml:"refactor_at,omitempty"`
+	// Bases holds HEAD as an item's first attempt found it: a failed attempt is
+	// committed too, and the next attempt's changes count from here.
+	Bases map[string]string `toml:"bases,omitempty"`
 }
 
 type specFinal struct {
@@ -93,6 +104,9 @@ type specLedger struct {
 	// An adopted item (already covered by a test) has no Commit.
 	At      time.Time `toml:"at,omitempty"`
 	Version string    `toml:"version,omitempty"`
+	// Named: recorded under the rule that only a test's name counts, so reconcile
+	// holds it to that; an older entry may rest on a comment and stays done.
+	Named bool `toml:"named,omitempty"`
 }
 
 // specBlock.Answer is filled by the user; the next /spec retries the item with it.
@@ -125,7 +139,10 @@ func saveSpecConfig(cwd string, cfg *specConfig) error {
 		"# or from the questions the first /spec asked.\n" +
 		"# To answer a blocked item, fill its `answer` and run /spec again.\n" +
 		"# accept_open_markers = true starts the loop despite open REVIEW/TBD markers.\n" +
-		"# test_cmd overrides the detected test command (run from out_dir).\n" +
+		"# test_cmd overrides the detected test command (run from out_dir); lint_cmd the\n" +
+		"# detected linter (\"off\" skips linting). max_file_lines is the size budget of a\n" +
+		"# program file (1500, -1 off); refactor_every the finished items between two\n" +
+		"# refactor rounds (10, -1 off).\n" +
 		"# [items] is what the loop finished, with the spec text it was built from:\n" +
 		"# editing that section makes the next run redo the item, deleting it makes\n" +
 		"# the next run remove its code. Delete an entry to forget an item.\n\n")
@@ -280,12 +297,10 @@ func (c *specConfig) open(id string) bool {
 	return c.Attempts[id] > 0 || c.Redo[id] != ""
 }
 
-func (c *specConfig) done(id string, covered map[string]string) bool {
-	if _, ok := c.Items[id]; ok {
-		return true
-	}
-	_, ok := covered[id]
-	return ok && !c.open(id)
+// done is the ledger's word: specReconcile keeps it in step with the tests.
+func (c *specConfig) done(id string) bool {
+	_, ok := c.Items[id]
+	return ok
 }
 
 type specDoc struct {
@@ -913,6 +928,8 @@ var specSkipDirs = map[string]bool{
 
 func skipWalkDir(name string) bool { return specSkipDirs[name] || strings.HasPrefix(name, ".") }
 
+var cfgTestModRe = regexp.MustCompile(`^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{`)
+
 // testSourceText returns a Rust file from #[cfg(test)] on, so an id in a production doc
 // comment above it does not pass for a test.
 func testSourceText(rel, content string) string {
@@ -929,8 +946,18 @@ func testSourceText(rel, content string) string {
 			return content
 		}
 	}
-	if i := strings.Index(content, "#[cfg(test)]"); i >= 0 {
-		return content[i:]
+	// An inline `#[cfg(test)] mod tests {` starts the test code; the attribute on
+	// anything else (`mod tests;`, one `use` or `fn`) marks only that item.
+	for from := 0; ; {
+		i := strings.Index(content[from:], "#[cfg(test)]")
+		if i < 0 {
+			break
+		}
+		i += from
+		if cfgTestModRe.MatchString(content[i+len("#[cfg(test)]"):]) {
+			return content[i:]
+		}
+		from = i + 1
 	}
 	if strings.Contains(content, "#[test]") {
 		return content
@@ -962,18 +989,13 @@ func specCoverage(outAbs string, ids []string) (covered map[string]string, testF
 			return nil
 		}
 		rel, _ := filepath.Rel(outAbs, path)
-		text := testSourceText(rel, string(data))
+		text := testNameText(rel, string(data))
 		if text == "" {
 			return nil
 		}
 		testFiles++
-		lower := strings.ToLower(text)
 		for _, id := range ids {
-			if _, done := covered[id]; done {
-				continue
-			}
-			// '_' is not alphanumeric, so "f2_3" matches in "fn f2_3_s1_greyed" but not in "f2_30".
-			if idBoundaryIndex(text, id) >= 0 || idBoundaryIndex(lower, specTestToken(id)) >= 0 {
+			if _, done := covered[id]; !done && namesItem(text, id) {
 				covered[id] = filepath.ToSlash(rel)
 			}
 		}
@@ -1039,13 +1061,20 @@ type specDelta struct {
 	Changed []string
 	Removed []string
 	Renamed []string // "old → new"
-	Adopted int      // covered items that predate the ledger
+	Adopted int      // parameter and tool rows a test names, recorded without a round
+	// Reopened: ledger items no test names any more; a comment or a string does not count.
+	Reopened []string
+	// Unnamed: so many would reopen at once that it reads as a scan problem, and none does.
+	Unnamed int
+	// Legacy: done before the test-name rule and named by no test; they stay done.
+	Legacy []string
 	// Vanished: Removed is most of the ledger, which reads as a missing spec, so nothing is removed.
 	Vanished bool
 }
 
-// specReconcile mutates cfg: renames carry their entry, and covered items without one are
-// adopted at their current text so the next run does not report them all as changed.
+// specReconcile mutates cfg: renames carry their entry; a done item no test names
+// any more is open again; and a parameter or tool row a test names is adopted at its
+// current text. A flow or a section is done only by a round of its own.
 func specReconcile(cfg *specConfig, idx *specIndex, covered map[string]string) specDelta {
 	var d specDelta
 	if cfg.Items == nil {
@@ -1088,14 +1117,34 @@ func specReconcile(cfg *specConfig, idx *specIndex, covered map[string]string) s
 	}
 	// Below 4 items "more than half" is one or two deletions, too few to call the spec missing.
 	d.Vanished = len(d.Removed) > 0 && (len(d.Removed) == ledgered || ledgered >= 4 && 2*len(d.Removed) > ledgered)
+	var unnamed []string
+	for _, id := range idx.order {
+		switch led, known := cfg.Items[id]; {
+		case !known || covered[id] != "":
+		case led.Named:
+			unnamed = append(unnamed, id)
+		default:
+			// Reopening these at once would queue a round each (130 in one project):
+			// they are reported, and /spec redo rebuilds the ones that matter.
+			d.Legacy = append(d.Legacy, id)
+		}
+	}
+	if len(unnamed) > 0 && 2*len(unnamed) > len(cfg.Items) && len(cfg.Items) >= 4 {
+		d.Unnamed = len(unnamed)
+	} else {
+		for _, id := range unnamed {
+			delete(cfg.Items, id)
+		}
+		d.Reopened = unnamed
+	}
 	for _, id := range idx.order {
 		led, known := cfg.Items[id]
 		switch {
 		// After a failed round the test exists but the suite did not pass: not done.
-		case !known && covered[id] != "" && !cfg.open(id):
+		case !known && covered[id] != "" && !cfg.open(id) && (idx.items[id].Kind == specDefTableRow || idx.items[id].Kind == specDefMention):
 			cfg.Items[id] = specLedger{Hash: hashes[id], Title: idx.items[id].Title,
 				File: idx.docs[idx.items[id].Doc].rel, CoveredBy: covered[id],
-				At: time.Now().UTC(), Version: versionStamp()}
+				At: time.Now().UTC(), Version: versionStamp(), Named: true}
 			d.Adopted++
 		case known && led.Hash != hashes[id]:
 			d.Changed = append(d.Changed, id)
@@ -1397,7 +1446,7 @@ func specSectionFromText(content, id string) string {
 
 func renderSpecDelta(d specDelta) string {
 	// Adoptions alone are bookkeeping, not news.
-	if len(d.Changed) == 0 && len(d.Removed) == 0 && len(d.Renamed) == 0 {
+	if len(d.Changed) == 0 && len(d.Removed) == 0 && len(d.Renamed) == 0 && len(d.Reopened) == 0 && d.Unnamed == 0 && len(d.Legacy) == 0 {
 		return ""
 	}
 	var b strings.Builder
@@ -1414,16 +1463,29 @@ func renderSpecDelta(d specDelta) string {
 	if len(d.Renamed) > 0 {
 		fmt.Fprintf(&b, "- %d item(s) moved or were retitled, their record travelled with them: %s\n", len(d.Renamed), strings.Join(d.Renamed, ", "))
 	}
+	if len(d.Reopened) > 0 {
+		fmt.Fprintf(&b, "- %d done item(s) are open again: no test is named after them, and a comment or a string that mentions one does not count: %s\n", len(d.Reopened), strings.Join(d.Reopened, ", "))
+	}
+	if d.Unnamed > 0 {
+		fmt.Fprintf(&b, "- ⚠ %d done item(s) are named by no test, more than half of the ledger: that looks like a problem reading the tests, not missing work, so none is reopened\n", d.Unnamed)
+	}
 	if d.Adopted > 0 {
-		fmt.Fprintf(&b, "- %d item(s) already covered were recorded at their current text\n", d.Adopted)
+		fmt.Fprintf(&b, "- %d parameter or tool row(s) a test is named after were recorded at their current text\n", d.Adopted)
+	}
+	if len(d.Legacy) > 0 {
+		ids := strings.Join(d.Legacy[:min(len(d.Legacy), 12)], ", ")
+		if len(d.Legacy) > 12 {
+			ids += ", …"
+		}
+		fmt.Fprintf(&b, "- %d item(s) were counted done before only a test's name counted, and no test is named after them (a comment or a string mentions them). They stay done; `/spec redo <ids>` rebuilds any of them: %s\n", len(d.Legacy), ids)
 	}
 	b.WriteString("\n")
 	return b.String()
 }
 
-func nextSpecItem(idx *specIndex, covered map[string]string, cfg *specConfig) (id, answer string) {
+func nextSpecItem(idx *specIndex, cfg *specConfig) (id, answer string) {
 	for _, it := range idx.order {
-		if cfg.done(it, covered) {
+		if cfg.done(it) {
 			continue
 		}
 		if b := cfg.block(it); b != nil {
@@ -1439,7 +1501,7 @@ func nextSpecItem(idx *specIndex, covered map[string]string, cfg *specConfig) (i
 
 type specTally struct{ total, done, blocked int }
 
-func specTallies(cfg *specConfig, idx *specIndex, covered map[string]string) (kinds [4]specTally, perDoc []specTally) {
+func specTallies(cfg *specConfig, idx *specIndex) (kinds [4]specTally, perDoc []specTally) {
 	perDoc = make([]specTally, len(idx.docs))
 	for _, id := range idx.order {
 		it := idx.items[id]
@@ -1447,7 +1509,7 @@ func specTallies(cfg *specConfig, idx *specIndex, covered map[string]string) (ki
 		k.total++
 		d.total++
 		switch {
-		case cfg.done(id, covered):
+		case cfg.done(id):
 			k.done++
 			d.done++
 		case cfg.block(id) != nil:
@@ -1458,7 +1520,7 @@ func specTallies(cfg *specConfig, idx *specIndex, covered map[string]string) (ki
 	return kinds, perDoc
 }
 
-func renderSpecStatus(cfg *specConfig, idx *specIndex, covered map[string]string, testFiles int, testCmd string) string {
+func renderSpecStatus(cfg *specConfig, idx *specIndex, testFiles int, testCmd string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "**/spec** `%s/` → `%s/`", cfg.SpecDir, cfg.OutDir)
 	if cfg.Target != "" {
@@ -1474,7 +1536,7 @@ func renderSpecStatus(cfg *specConfig, idx *specIndex, covered map[string]string
 	}
 	fmt.Fprintf(&b, "Test command: %s · %d test source file(s) in `%s/`\n\n", cmd, testFiles, cfg.OutDir)
 
-	kinds, perDoc := specTallies(cfg, idx, covered)
+	kinds, perDoc := specTallies(cfg, idx)
 	fmt.Fprintf(&b, "Covered: %d/%d flows · %d/%d sections (formats, screens, rules) · %d/%d parameters and tools · %d/%d cited-only ids\n\n",
 		kinds[specDefHeading].done, kinds[specDefHeading].total, kinds[specDefSection].done, kinds[specDefSection].total,
 		kinds[specDefTableRow].done, kinds[specDefTableRow].total, kinds[specDefMention].done, kinds[specDefMention].total)
@@ -1484,7 +1546,7 @@ func renderSpecStatus(cfg *specConfig, idx *specIndex, covered map[string]string
 			fmt.Fprintf(&b, "| %s | %d | %d | %d |\n", idx.docs[d].rel, t.done, t.blocked, t.total)
 		}
 	}
-	if next, _ := nextSpecItem(idx, covered, cfg); next != "" {
+	if next, _ := nextSpecItem(idx, cfg); next != "" {
 		fmt.Fprintf(&b, "\nNext: **%s**", next)
 		if t := idx.items[next].Title; t != "" {
 			fmt.Fprintf(&b, " (%s)", t)

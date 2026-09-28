@@ -99,11 +99,15 @@ func (a *agent) specFenceRefusal(sid, absPath string) string {
 type specMode int
 
 const (
-	specModeItem   specMode = iota // implement an item the spec added
-	specModeSetup                  // the one-off project skeleton round
-	specModeChange                 // redo an item whose spec text moved
-	specModeRemove                 // delete an item the spec no longer has
+	specModeItem     specMode = iota // implement an item the spec added
+	specModeSetup                    // the one-off project skeleton round
+	specModeChange                   // redo an item whose spec text moved
+	specModeRemove                   // delete an item the spec no longer has
+	specModeRefactor                 // every few items: the code's shape, no item
 )
+
+// specRefactorID is the refactor round's pseudo-item.
+const specRefactorID = "refactor"
 
 type specRoundResult struct {
 	Mode      specMode
@@ -116,6 +120,14 @@ type specRoundResult struct {
 	TestsPass bool
 	TestTail  string
 	Covered   bool // setup: a test source exists
+	// Gates on what the round wrote: functions only tests reach, lint findings in
+	// its own lines, files grown past the size budget.
+	Unreachable []string
+	Lint        []string
+	Oversize    []string
+	// Refactor: the debt shrank, and how it moved.
+	Improved bool
+	Debt     string
 }
 
 // specDecide counts the attempt in cfg.Attempts, so a cancelled and resumed /spec gives no fresh budget.
@@ -128,14 +140,19 @@ func specDecide(cfg *specConfig, item string, r specRoundResult) (done, block bo
 		if r.TurnErr == "" && r.TestsPass && !r.Covered {
 			return true, false, ""
 		}
+	case r.Mode == specModeRefactor:
+		if r.TurnErr == "" && r.TestsPass && r.Committed && r.Improved && len(r.Lint)+len(r.Oversize) == 0 {
+			return true, false, ""
+		}
 	case r.Mode == specModeChange:
 		// The test for the OLD text still covers a changed item; the commit is the evidence of work.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed {
+		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.Unreachable)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, ""
 		}
 	default:
 		// A reopened item's old test still names it: like a change, it needs a commit.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen) == 0 && (r.Committed || !r.Redo) {
+		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen) == 0 && (r.Committed || !r.Redo) &&
+			len(r.Unreachable)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, ""
 		}
 	}
@@ -155,12 +172,23 @@ func specDecide(cfg *specConfig, item string, r specRoundResult) (done, block bo
 	if r.Mode == specModeRemove && r.Covered {
 		why = append(why, fmt.Sprintf("a test in the output directory still names %s", item))
 	}
-	if !r.Covered && r.Mode != specModeRemove {
-		if r.Mode == specModeSetup {
-			why = append(why, "no test source exists in the output directory yet")
-		} else {
-			why = append(why, fmt.Sprintf("no test in the output directory names %s (a test name containing `%s`, or `%s` in a comment or string inside a test)", item, specTestToken(item), item))
-		}
+	switch {
+	case r.Covered, r.Mode == specModeRemove, r.Mode == specModeRefactor:
+	case r.Mode == specModeSetup:
+		why = append(why, "no test source exists in the output directory yet")
+	default:
+		why = append(why, fmt.Sprintf("no test this round added or changed is named after %s: put `%s` in a test function's name or in a test call's title; a comment or a string that mentions it does not count", item, specTestToken(item)))
+	}
+	if len(r.Unreachable) > 0 {
+		why = append(why, "the program does not call these functions the round added: "+strings.Join(r.Unreachable, "; ")+
+			". Call each from the path the spec describes (a UI handler, main, the flow that owns it) or delete it; a helper that exists only for tests says so in its name (`rows_for_test`)")
+	}
+	if len(r.Lint) > 0 {
+		why = append(why, "the linter reports problems in lines this round wrote:\n\n```\n"+strings.Join(r.Lint, "\n")+"\n```")
+	}
+	why = append(why, r.Oversize...)
+	if r.Mode == specModeRefactor && !r.Improved && r.TurnErr == "" {
+		why = append(why, "the refactoring made no measured progress ("+r.Debt+"): one of the numbers must go down and none up")
 	}
 	if !r.TestsPass {
 		why = append(why, "the test command did not pass. The end of its output:\n\n```\n"+strings.TrimSpace(r.TestTail)+"\n```")
@@ -271,9 +299,10 @@ type specRun struct {
 	idx    *specIndex
 	outAbs string
 
-	reasons   map[string]string // why the last round on an item did not count
-	lastDelta string            // the change report already shown
-	vanished  bool              // the last scan lost most of the ledger at once
+	reasons     map[string]string // why the last round on an item did not count
+	lastDelta   string            // the change report already shown
+	vanished    bool              // the last scan lost most of the ledger at once
+	lintMissing bool              // the linter did not run once; said, and not again
 }
 
 type specWork struct {
@@ -284,6 +313,7 @@ type specWork struct {
 	Reason   string
 	Note     string // change: the spec's diff; removal: the text that was deleted
 	Redo     bool
+	Debt     specDebt // refactor: measured when the round was picked
 }
 
 func (r *specRun) say(ctx context.Context, s string) { r.a.say(ctx, r.sid, s) }
@@ -380,7 +410,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		}
 		// Reconcile as a run would, so status names the work it picks up first.
 		delta := specReconcile(cfg, r.idx, covered)
-		r.say(ctx, renderSpecStatus(cfg, r.idx, covered, testFiles, r.testCmd())+"\n"+renderSpecDelta(delta))
+		r.say(ctx, renderSpecStatus(cfg, r.idx, testFiles, r.testCmd())+"\n"+renderSpecDelta(delta))
 		r.save(ctx)
 		return end, nil
 	}
@@ -433,7 +463,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		// The last round has committed and is in the ledger: the clean place to honour a stop.
 		if sess.takeSpecStop() {
 			r.say(ctx, fmt.Sprintf("\n⏹ **/spec stopped** as asked, after %d round(s). Nothing is half done: every finished item is committed and in the ledger. `/spec` resumes with the next item.\n\n", round-1))
-			r.say(ctx, renderSpecStatus(cfg, r.idx, covered, testFiles, r.testCmd())+"\n")
+			r.say(ctx, renderSpecStatus(cfg, r.idx, testFiles, r.testCmd())+"\n")
 			r.save(ctx)
 			break
 		}
@@ -456,14 +486,14 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		}
 		addFixes(a.prepareChecks(ctx, sess, sid))
 
-		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, covered, r.testCmd())
+		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, r.testCmd(), r.lintCmd())
 		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
-		since := len(sess.Messages) // the round's own tool calls start here
+		since, started := len(sess.Messages), time.Now() // the round's own tool calls start here
 		turnErr := a.runPromptTurn(ctx, sess, prompt)
 		if isCancelled(turnErr) {
 			return stopped(turnErr)
 		}
-		done, block, err := r.finishRound(ctx, w, turnErr, since)
+		done, block, err := r.finishRound(ctx, w, turnErr, since, started)
 		if isCancelled(err) {
 			return stopped(err)
 		}
@@ -613,7 +643,16 @@ func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testF
 		w = specWork{Item: changed, Mode: specModeChange, Answer: changedAnswer}
 		w.Note = specSpecDiff(ctx, r.sess.Cwd, cfg.Items[w.Item].Commit, cfg.SpecDir+"/"+r.idx.docs[r.idx.items[w.Item].Doc].rel)
 	default:
-		w.Item, w.Answer = nextSpecItem(r.idx, covered, cfg)
+		// Every refactor_every finished items one round goes to the code's shape instead of an item.
+		if every := cfg.refactorEvery(); every > 0 && len(cfg.Items)-cfg.RefactorAt >= every {
+			if d := measureSpecDebt(r.outAbs, cfg); d.overLines+d.dead+d.copies > 0 {
+				w = specWork{Item: specRefactorID, Mode: specModeRefactor, Debt: d}
+				break
+			}
+			cfg.RefactorAt = len(cfg.Items) // nothing to clean up
+			delete(cfg.Attempts, specRefactorID)
+		}
+		w.Item, w.Answer = nextSpecItem(r.idx, cfg)
 	}
 	if w.Answer != "" {
 		if b := cfg.block(w.Item); b != nil {
@@ -679,27 +718,45 @@ func (a *agent) specFinalPrompt(sid string, cfg *specConfig, idx *specIndex, tes
 
 // roundRanGreen trusts the terminal's exit code, not the model, so a wrapped run
 // (`just test > log; echo exit=$?`) does not count: its exit code is the echo's.
-func (r *specRun) roundRanGreen(uses []ToolUse, cmd string) bool {
-	last := -1
-	for i, u := range uses {
-		switch u.Name {
-		case "edit_file", "write_file":
-			last = -1
-		case "run_command":
-			if testRunMatches(parseArgs(u.Input).str("command"), cmd, r.sess.Cwd, r.outAbs) && strings.HasPrefix(u.Output, "exit 0\n") {
-				last = i
+// The last run counts, in the round's calls or as a background job that exited
+// since the round began; an edit inside the output directory after it undoes it.
+func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) bool {
+	type event struct {
+		at    time.Time
+		green bool
+		since time.Time // nothing may be written after this: a job ran on the code as it started
+	}
+	var evs []event
+	for _, u := range uses {
+		args := parseArgs(u.Input)
+		switch {
+		case u.StartedAt.IsZero():
+		case u.Name == "edit_file" || u.Name == "write_file":
+			p := args.str("path")
+			if p != "" && !filepath.IsAbs(p) {
+				p = filepath.Join(r.sess.Cwd, p)
 			}
+			if p != "" && realInside(p, r.outAbs) {
+				evs = append(evs, event{at: u.StartedAt})
+			}
+		// A handed-over run reports its exit as a job run.
+		case u.Name == "run_command" && strings.HasPrefix(u.Output, "exit ") && testRunMatches(args.str("command"), cmd, r.sess.Cwd, r.outAbs):
+			end := u.StartedAt.Add(time.Duration(u.DurationMs) * time.Millisecond)
+			evs = append(evs, event{at: end, green: strings.HasPrefix(u.Output, "exit 0\n"), since: end})
 		}
 	}
-	if last < 0 {
+	r.sess.rt.mu.Lock()
+	for _, j := range r.sess.rt.jobRuns {
+		if j.ended.After(since) && testRunMatches(j.cmd, cmd, r.sess.Cwd, r.outAbs) {
+			evs = append(evs, event{at: j.ended, green: j.code == 0, since: j.started})
+		}
+	}
+	r.sess.rt.mu.Unlock()
+	slices.SortStableFunc(evs, func(x, y event) int { return x.at.Compare(y.at) })
+	if len(evs) == 0 || !evs[len(evs)-1].green {
 		return false
 	}
-	u := uses[last]
-	ended := u.StartedAt.Add(time.Duration(u.DurationMs) * time.Millisecond)
-	if u.StartedAt.IsZero() {
-		return false
-	}
-	return !writtenSince(r.outAbs, ended)
+	return !writtenSince(r.outAbs, evs[len(evs)-1].since)
 }
 
 // testRunMatches: the terminal's cwd is the project root, so a run without `cd <out> &&`
@@ -968,7 +1025,7 @@ func (r *specRun) finalPass(ctx context.Context) error {
 }
 
 // finishRound's err means cancelled, or a scan failure it already reported.
-func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, since int) (done, block bool, err error) {
+func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, since int, started time.Time) (done, block bool, err error) {
 	cfg, item := r.cfg, w.Item
 	var uses []ToolUse
 	for i := since; i < len(r.sess.Messages); i++ {
@@ -976,6 +1033,7 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 	}
 	res := specRoundResult{Mode: w.Mode, Redo: w.Redo}
 	var covered map[string]string
+	var coveredBy string
 	var q *specQuestionError
 	if errors.As(turnErr, &q) {
 		res.Question = q.Question
@@ -986,7 +1044,7 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 		switch cmd := r.testCmd(); {
 		case cmd == "":
 			res.TestTail = "no test command found: `" + cfg.OutDir + "/` has no justfile with a test recipe, no Cargo.toml, package.json or go.mod"
-		case r.roundRanGreen(uses, cmd):
+		case r.roundRanGreen(uses, cmd, started):
 			res.TestsPass = true
 			r.say(ctx, fmt.Sprintf("🧪 `%s` passed in the round, after its last change; not run again\n", cmd))
 		default:
@@ -1004,10 +1062,30 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 			r.say(ctx, "⚠ /spec: scanning "+cfg.OutDir+": "+err.Error()+"\n")
 			return false, false, err
 		}
-		if w.Mode == specModeSetup {
+		base := cfg.Bases[item]
+		if base == "" || cfg.Attempts[item] == 0 {
+			base = "HEAD"
+			if sha, err := specGit(ctx, r.sess.Cwd, "rev-parse", "HEAD"); err == nil {
+				base = strings.TrimSpace(sha)
+				if cfg.Bases == nil {
+					cfg.Bases = map[string]string{}
+				}
+				cfg.Bases[item] = base
+			}
+		}
+		ch := specRoundChanges(ctx, r.sess.Cwd, cfg.OutDir, base)
+		switch {
+		case w.Mode == specModeSetup:
 			res.Covered = testFiles > 0
-		} else {
+		case w.Mode == specModeRemove || !ch.ok:
 			_, res.Covered = covered[item]
+		default:
+			// An older test that happens to carry the token proves nothing about this round.
+			coveredBy = specNamedIn(r.outAbs, item, ch.files())
+			res.Covered = coveredBy != ""
+		}
+		if ch.ok && res.TurnErr == "" {
+			r.gates(ctx, w, ch, &res)
 		}
 	}
 
@@ -1018,7 +1096,17 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 		res.Committed = sha != ""
 	}
 	done, block, reason := specDecide(cfg, item, res)
+	if done || block {
+		delete(cfg.Bases, item)
+	}
 	switch {
+	case block && w.Mode == specModeRefactor:
+		// A refactor is not an item: it never blocks the loop, it waits for the next interval.
+		cfg.RefactorAt = len(cfg.Items)
+		delete(cfg.Attempts, item)
+		delete(r.reasons, item)
+		block = false
+		r.say(ctx, fmt.Sprintf("↷ refactor round skipped: %s. The next one comes after %d more items.\n", firstLine(reason), cfg.refactorEvery()))
 	case done:
 		delete(cfg.Attempts, item)
 		delete(cfg.Redo, item)
@@ -1029,15 +1117,22 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 			r.say(ctx, fmt.Sprintf("🗑 %s removed: the spec no longer has it.\n", item))
 		case specModeSetup:
 			r.say(ctx, "✅ project setup is done.\n")
+		case specModeRefactor:
+			cfg.RefactorAt = len(cfg.Items)
+			r.say(ctx, "✅ refactor done: "+res.Debt+"\n")
 		default:
+			if coveredBy == "" {
+				coveredBy = covered[item]
+			}
 			cfg.Items[item] = specLedger{
 				Hash:      specItemHash(r.idx, item),
 				Title:     r.idx.items[item].Title,
 				File:      r.idx.docs[r.idx.items[item].Doc].rel,
-				CoveredBy: covered[item],
+				CoveredBy: coveredBy,
 				Commit:    sha,
 				At:        time.Now().UTC(),
 				Version:   versionStamp(),
+				Named:     true,
 			}
 			r.say(ctx, fmt.Sprintf("✅ %s is covered.\n", item))
 		}
@@ -1058,11 +1153,20 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 	return done, block, nil
 }
 
-func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w specWork, covered map[string]string, testCmd string) (prompt, head string) {
+func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w specWork, testCmd, lintCmd string) (prompt, head string) {
 	item, mode, note := w.Item, w.Mode, w.Note
 	base := specBaseVars(cfg, idx, testCmd,
 		"No technology was given with /spec. Use what the spec implies; where it leaves the choice open, pick a mainstream option and state it in the project README.",
 		"Standing rules for every item: ", ". Read them if they are not already in this conversation.")
+	lint := "none is set up for this project, so this one is free"
+	if lintCmd != "" {
+		lint = fmt.Sprintf("`%s`, run from `%s/`", lintCmd, cfg.OutDir)
+	}
+	maxLines := strconv.Itoa(cfg.maxFileLines())
+	if cfg.maxFileLines() < 0 {
+		maxLines = "any number of" // the budget is off
+	}
+	base = append(base, "{{lint_cmd}}", lint, "{{max_lines}}", maxLines, "{{growth_slack}}", strconv.Itoa(specFileGrowthSlack))
 	previous := ""
 	switch {
 	case w.Answer != "":
@@ -1101,13 +1205,19 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 		)), "project setup in `" + cfg.OutDir + "/`"
 	}
 
+	if mode == specModeRefactor {
+		return a.renderSpecPrompt(sid, "SPEC-REFACTOR.md", append(base,
+			"{{previous}}", previous, "{{debt}}", w.Debt.String()+".", "{{targets}}", w.Debt.targets,
+		)), "refactor `" + cfg.OutDir + "/` · " + w.Debt.String()
+	}
+
 	it := idx.items[item]
 	sl := idx.slice(item, cfg.SpecDir)
 	title := strings.TrimSpace(strings.TrimPrefix(it.Title, item))
 	if title == "" {
 		title = item
 	}
-	k, _ := specTallies(cfg, idx, covered)
+	k, _ := specTallies(cfg, idx)
 	done := 0
 	for _, t := range k {
 		done += t.done
@@ -1131,12 +1241,49 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 		}
 		previous = change
 	}
+	var rows []string
+	for _, id := range idx.idsIn(sl.Text) {
+		if cited := idx.items[id]; cited != nil && cited.Kind == specDefTableRow && id != item && !cfg.done(id) {
+			rows = append(rows, fmt.Sprintf("`%s` → `%s`", id, specTestToken(id)))
+		}
+	}
+	rowTokens := "none open"
+	if len(rows) > 0 {
+		rowTokens = strings.Join(rows, ", ")
+	}
 	return a.renderSpecPrompt(sid, "SPEC.md", append(base,
 		"{{id}}", item, "{{title}}", title, "{{file}}", cfg.SpecDir+"/"+idx.docs[it.Doc].rel,
 		"{{progress}}", progress, "{{token}}", specTestToken(item),
 		"{{slice}}", strings.TrimRight(sl.Text, "\n"), "{{screens}}", screens, "{{related}}", related,
-		"{{previous}}", previous,
+		"{{previous}}", previous, "{{row_tokens}}", rowTokens,
 	)), fmt.Sprintf("%s %s · %s", item, title, progress)
+}
+
+// gates checks what the round wrote, beyond its tests: functions only tests
+// reach, lint findings in its own lines, files grown past the size budget, and
+// for a refactor whether the debt shrank.
+func (r *specRun) gates(ctx context.Context, w specWork, ch specChanges, res *specRoundResult) {
+	if w.Mode == specModeItem || w.Mode == specModeChange {
+		res.Unreachable = specUnreachable(r.outAbs, ch, loadSpecProgram(r.outAbs))
+	}
+	res.Oversize = specOversize(r.outAbs, r.cfg, ch)
+	if cmd := r.lintCmd(); cmd != "" && res.TestsPass {
+		r.say(ctx, fmt.Sprintf("🔎 linting: `%s` in `%s/`\n", cmd, r.cfg.OutDir))
+		findings, ran := specLint(ctx, r.outAbs, cmd, ch)
+		switch {
+		case !ran && !r.lintMissing:
+			r.lintMissing = true
+			r.say(ctx, fmt.Sprintf("⚠ /spec: `%s` did not run (not installed?), so rounds are not linted. Set `lint_cmd` in .codehalter/spec.toml, or `lint_cmd = \"off\"`.\n", cmd))
+		case len(findings) > 0:
+			r.say(ctx, fmt.Sprintf("🔎 %d lint finding(s) in lines this round wrote\n", len(findings)))
+		}
+		res.Lint = findings
+	}
+	if w.Mode == specModeRefactor {
+		after := measureSpecDebt(r.outAbs, r.cfg)
+		res.Improved = after.better(w.Debt)
+		res.Debt = w.Debt.String() + " → " + after.String()
+	}
 }
 
 // runSpecTests is codehalter's own check, so it runs directly, not in a visible terminal.
@@ -1144,12 +1291,7 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 	a.say(ctx, sid, fmt.Sprintf("🧪 checking: `%s` in `%s/`\n", cmd, outRel))
 	tctx, cancel := context.WithTimeout(ctx, specTestTimeout)
 	defer cancel()
-	shell := "sh"
-	if _, err := exec.LookPath("bash"); err == nil {
-		shell = "bash"
-	}
-	// A login shell finds toolchains on the profile PATH (rustup's ~/.cargo/bin).
-	c := exec.CommandContext(tctx, shell, "-lc", cmd)
+	c := exec.CommandContext(tctx, specShell(), "-lc", cmd)
 	c.Dir = outAbs
 	start := time.Now()
 	out, err := c.CombinedOutput()
@@ -1173,6 +1315,15 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 	}
 	a.say(ctx, sid, fmt.Sprintf("🧪 tests passed in %s\n", took))
 	return true, tail
+}
+
+// specShell runs with -lc: a login shell finds toolchains on the profile PATH
+// (rustup's ~/.cargo/bin). Alpine has no bash.
+func specShell() string {
+	if _, err := exec.LookPath("bash"); err == nil {
+		return "bash"
+	}
+	return "sh"
 }
 
 func specGit(ctx context.Context, cwd string, args ...string) (string, error) {
@@ -1202,6 +1353,8 @@ func (a *agent) specCommit(ctx context.Context, sid, cwd string, cfg *specConfig
 	switch {
 	case item == specSetupID:
 		msg = "spec: set up " + cfg.OutDir + "/"
+	case mode == specModeRefactor:
+		msg = "spec: refactor " + cfg.OutDir + "/"
 	case mode == specModeRemove:
 		msg = "spec: remove " + item
 	case idx.items[item] != nil && idx.items[item].Title != "":

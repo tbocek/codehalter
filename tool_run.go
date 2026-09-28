@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -77,6 +78,133 @@ func isSleepCmd(cmd string) bool {
 		}
 	}
 	return first == "sleep" || strings.HasPrefix(first, "sleep ")
+}
+
+// shellSegments splits a command line at ; && || & and newlines outside quotes,
+// and at | too when pipes is set; without it a pipeline stays one command.
+func shellSegments(cmd string, pipes bool) []string {
+	var segs []string
+	var cur strings.Builder
+	var quote byte
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			segs = append(segs, s)
+		}
+		cur.Reset()
+	}
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case quote != 0:
+			if c == '\\' && quote == '"' && i+1 < len(cmd) {
+				cur.WriteByte(c)
+				i++
+				c = cmd[i]
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '\\' && i+1 < len(cmd):
+			cur.WriteByte(c)
+			i++
+			c = cmd[i]
+		case c == '\'' || c == '"':
+			quote = c
+		// A redirect's & (2>&1, &>f, |&) joins, it does not split.
+		case c == '&' && (i > 0 && (cmd[i-1] == '>' || cmd[i-1] == '|') || i+1 < len(cmd) && cmd[i+1] == '>'):
+		case c == '|' && !pipes && (i+1 >= len(cmd) || cmd[i+1] != '|') && (i == 0 || cmd[i-1] != '|'):
+		case c == ';' || c == '\n' || c == '|' || c == '&':
+			flush()
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	flush()
+	return segs
+}
+
+// readOnlyTools only read files or print; git and find are checked further below.
+var readOnlyTools = map[string]bool{
+	"cat": true, "head": true, "tail": true, "sed": true, "awk": true, "grep": true, "egrep": true,
+	"fgrep": true, "rg": true, "nl": true, "wc": true, "ls": true, "find": true, "git": true,
+	"tree": true, "stat": true, "diff": true, "sort": true, "uniq": true, "cut": true, "tr": true,
+	"cd": false, "echo": false, "printf": false, "pwd": false, "true": false,
+}
+
+var readOnlyGit = map[string]bool{
+	"log": true, "show": true, "diff": true, "status": true, "ls-files": true, "grep": true,
+	"blame": true, "rev-parse": true, "shortlog": true, "cat-file": true, "ls-tree": true,
+}
+
+// unquoted blanks each quoted span to a pair of quotes, so a > or a flag inside an
+// argument is not seen as one.
+func unquoted(seg string) string {
+	var b strings.Builder
+	var quote byte
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		switch {
+		case quote != 0:
+			if c == '\\' && quote == '"' {
+				i++
+			} else if c == quote {
+				quote = 0
+				b.WriteString("''")
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// awkWritesRe: an awk program that runs a command or prints into a file or a pipe.
+var awkWritesRe = regexp.MustCompile(`system\(|\bprintf?\b[^;}]*(?:>|\|)\s*"`)
+
+// onlyReads: every segment is a file read, a search or a print, and nothing is
+// written. Such a command is served like read_file, not clipped to head and tail.
+func onlyReads(cmd string) bool {
+	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "`") || strings.Contains(cmd, "<<") {
+		return false
+	}
+	reads := false
+	for _, seg := range shellSegments(cmd, true) {
+		fields := strings.Fields(unquoted(seg))
+		if len(fields) == 0 {
+			continue
+		}
+		tool := fields[0]
+		reader, known := readOnlyTools[tool]
+		if !known {
+			return false
+		}
+		reads = reads || reader
+		sub := ""
+		for i, f := range fields[1:] {
+			switch {
+			case strings.Contains(f, ">") && f != "2>&1" && f != "2>/dev/null" && f != ">/dev/null" && f != "&>/dev/null":
+				return false
+			case tool == "sed" && (strings.HasPrefix(f, "--in-place") || !strings.HasPrefix(f, "--") && strings.HasPrefix(f, "-") && strings.Contains(f, "i")),
+				tool == "awk" && f == "-i",
+				tool == "find" && (strings.HasPrefix(f, "-exec") || strings.HasPrefix(f, "-ok") || strings.HasPrefix(f, "-fprint") || f == "-fls" || f == "-delete"),
+				tool == "sort" && (strings.HasPrefix(f, "--output") || !strings.HasPrefix(f, "--") && strings.HasPrefix(f, "-") && strings.Contains(f, "o")),
+				tool == "tree" && f == "-o",
+				strings.HasPrefix(f, "--output"):
+				return false
+			case tool == "git" && sub == "" && !strings.HasPrefix(f, "-") && (i == 0 || fields[i] != "-C" && fields[i] != "-c"):
+				sub = f
+			}
+		}
+		if tool == "git" && !readOnlyGit[sub] || tool == "awk" && awkWritesRe.MatchString(seg) {
+			return false
+		}
+		// `uniq in out` writes its second name.
+		if tool == "uniq" && len(slices.DeleteFunc(slices.Clone(fields[1:]), func(f string) bool { return strings.HasPrefix(f, "-") })) > 1 {
+			return false
+		}
+	}
+	return reads
 }
 
 // cmdOutputCap: the idle watchdog fires only on silence, so a steadily printing

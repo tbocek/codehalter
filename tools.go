@@ -439,6 +439,12 @@ const (
 // is byte-identical to the live wire. continue_read stays listed for old sessions.
 func liveToolOutput(toolName, args, content string) string {
 	switch toolName {
+	case "run_command":
+		// A shell read clipped to 600 + 600 chars was re-read 60% of the time, one
+		// window at a time. It gets read_file's allowance, still start and end.
+		if onlyReads(parseArgs(args).str("command")) {
+			return clipMiddle(toolName, args, content, liveExemptCap, liveExemptCap/4)
+		}
 	case "read_file", "continue_read", "web_search", "web_read":
 		if len(content) <= liveExemptCap {
 			return content
@@ -457,11 +463,17 @@ func truncateForLLM(toolName, args, content string) string {
 	if len(content) <= truncateThreshold {
 		return content
 	}
-	omitted := len(content) - truncateHeadChars - truncateTailChars
-	head := clipUTF8(content, truncateHeadChars)
-	tail := tailUTF8(content, truncateTailChars)
-	hint := truncationHint(toolName, args)
-	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", head, omitted, len(content), hint, tail)
+	return clipMiddle(toolName, args, content, truncateHeadChars+truncateTailChars, truncateHeadChars)
+}
+
+// clipMiddle keeps head bytes of the start and the rest of max from the end.
+func clipMiddle(toolName, args, content string, max, head int) string {
+	if len(content) <= max {
+		return content
+	}
+	tail := max - head
+	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", clipUTF8(content, head), len(content)-head-tail, len(content),
+		truncationHint(toolName, args), tailUTF8(content, tail))
 }
 
 // truncationHint: there is deliberately no tool that re-serves the cached full
@@ -475,7 +487,7 @@ func truncationHint(toolName, args string) string {
 		}
 		return "To see more: call this tool again with offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched."
 	case "run_command":
-		return "To see more: re-run it with the output narrowed (`| grep <pattern>`, `| tail -n <n>`, `| head -n <n>`), or redirect it to a file and read_file that. If re-running is slow or has side effects, redirect to a file the FIRST time."
+		return "To see more: re-run it with the output narrowed by `grep <pattern>`, or redirect it to a file and read the part you need with read_file (a line range). Do not pipe to head or tail: the cap already keeps the start and the end. If re-running is slow or has side effects, redirect to a file the FIRST time."
 	case "web_search":
 		return "To see more: refine the query (fewer, more specific terms) and search again, then web_read the most promising result."
 	default:

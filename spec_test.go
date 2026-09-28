@@ -147,28 +147,31 @@ func TestSpecCoverage(t *testing.T) {
 	}
 	write("tests/shell.rs", "#[test]\nfn f0_1_s1_switches() {}\n#[test]\nfn f0_10_other() {}\n")
 	// An id in a production doc comment is not a test; the inline test module is.
-	write("src/lib.rs", "//! F0.2 lives here\npub fn press() {}\n#[cfg(test)]\nmod tests {\n    // P.policy.padSeconds\n    #[test] fn pad() {}\n}\n")
+	write("src/lib.rs", "//! F0.2 lives here\npub fn press() {}\n#[cfg(test)]\nmod tests {\n    #[test] fn p_policy_padseconds_holds() {}\n}\n")
+	// A comment or a string inside a test does not name it: 130 items passed that way.
+	write("tests/said.rs", "// F1.1 is covered here\n#[test]\nfn checks() { assert_eq!(ITEM, \"F1.2\"); let s = r#\"F1.3\"#; }\n")
+	write("web/a.test.js", "it(\"F1.4 opens the file\", () => {});\nconst note = \"F1.5\";\n")
 	write("src/cut.rs", "// §01-files#2-cutjson\npub fn load() {}\n")
 	write("tests/files.rs", "#[test] fn sec_01_files_2_cutjson_round_trips() {}\n")
 	write("target/debug/stale.rs", "#[test] fn f0_2_would_count() {}\n") // build output: never scanned
 
-	ids := []string{"F0.1", "F0.2", "F0.10", "P.policy.padSeconds", "§01-files#2-cutjson", "F1.0"}
+	ids := []string{"F0.1", "F0.2", "F0.10", "P.policy.padSeconds", "§01-files#2-cutjson", "F1.0", "F1.1", "F1.2", "F1.3", "F1.4", "F1.5"}
 	covered, files, err := specCoverage(out, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"F0.1", "F0.10", "P.policy.padSeconds", "§01-files#2-cutjson"} {
+	for _, id := range []string{"F0.1", "F0.10", "P.policy.padSeconds", "§01-files#2-cutjson", "F1.4"} {
 		if _, ok := covered[id]; !ok {
 			t.Errorf("%s not covered, want it covered", id)
 		}
 	}
-	for _, id := range []string{"F0.2", "F1.0"} {
+	for _, id := range []string{"F0.2", "F1.0", "F1.1", "F1.2", "F1.3", "F1.5"} {
 		if f, ok := covered[id]; ok {
 			t.Errorf("%s covered by %s, want uncovered", id, f)
 		}
 	}
-	if files != 3 {
-		t.Errorf("test sources = %d, want 3 (tests/shell.rs, tests/files.rs, src/lib.rs)", files)
+	if files != 5 {
+		t.Errorf("test sources = %d, want 5 (tests/shell.rs, tests/files.rs, tests/said.rs, web/a.test.js, src/lib.rs)", files)
 	}
 }
 
@@ -262,14 +265,14 @@ func TestSpecRedoReopens(t *testing.T) {
 	if d := specReconcile(cfg, idx, covered); d.Adopted != 0 {
 		t.Errorf("adopted %d reopened items back", d.Adopted)
 	}
-	if next, _ := nextSpecItem(idx, covered, cfg); next != ids[0] {
+	if next, _ := nextSpecItem(idx, cfg); next != ids[0] {
 		t.Errorf("next = %q, want the first reopened item %q", next, ids[0])
 	}
 	if cfg.Redo[ids[0]] == "" {
 		t.Error("the redo mark did not stick")
 	}
 	// Status counts a reopened item as open although its test still names it.
-	status := renderSpecStatus(cfg, idx, covered, 1, "just test")
+	status := renderSpecStatus(cfg, idx, 1, "just test")
 	want := fmt.Sprintf("Covered: %d/%d flows", countKind(idx, specDefHeading)-countKindIn(idx, ids, specDefHeading), countKind(idx, specDefHeading))
 	if !strings.Contains(status, want) {
 		t.Errorf("status lacks %q:\n%s", want, status)
@@ -312,20 +315,21 @@ func TestDetectSpecTestCmd(t *testing.T) {
 	}
 }
 
+// Done is the ledger's word; a blocked item waits for its answer.
 func TestNextSpecItem(t *testing.T) {
 	idx := &specIndex{order: []string{"a", "b", "c", "d"}}
-	cfg := &specConfig{Blocked: []specBlock{{ID: "b", Reason: "stuck"}, {ID: "c", Reason: "asked", Answer: "use SQLite"}}}
-	covered := map[string]string{"a": "tests/a.rs"}
-	if id, ans := nextSpecItem(idx, covered, cfg); id != "c" || ans != "use SQLite" {
+	cfg := &specConfig{Blocked: []specBlock{{ID: "b", Reason: "stuck"}, {ID: "c", Reason: "asked", Answer: "use SQLite"}},
+		Items: map[string]specLedger{"a": {}}}
+	if id, ans := nextSpecItem(idx, cfg); id != "c" || ans != "use SQLite" {
 		t.Errorf("next = %q %q, want the answered block c before d", id, ans)
 	}
 	cfg.Blocked = cfg.Blocked[:1] // c was picked with its answer
-	covered["c"] = "tests/c.rs"
-	if id, _ := nextSpecItem(idx, covered, cfg); id != "d" {
+	cfg.Items["c"] = specLedger{}
+	if id, _ := nextSpecItem(idx, cfg); id != "d" {
 		t.Errorf("next = %q, want d (b stays blocked without an answer)", id)
 	}
-	covered["d"] = "tests/d.rs"
-	if id, _ := nextSpecItem(idx, covered, cfg); id != "" {
+	cfg.Items["d"] = specLedger{}
+	if id, _ := nextSpecItem(idx, cfg); id != "" {
 		t.Errorf("next = %q, want nothing left", id)
 	}
 }
@@ -360,6 +364,7 @@ func TestSpecConfigRoundTrip(t *testing.T) {
 		t.Fatalf("no file = (%v, %v), want (nil, nil)", cfg, err)
 	}
 	in := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs", Attempts: map[string]int{"F0.1": 1},
+		LintCmd: "off", MaxFileLines: 2000, RefactorEvery: -1, RefactorAt: 12,
 		Blocked: []specBlock{{ID: "F0.2", Reason: "asked", Question: "keep it?"}}}
 	if err := saveSpecConfig(cwd, in); err != nil {
 		t.Fatal(err)
@@ -432,18 +437,25 @@ func TestSpecReconcile(t *testing.T) {
 		// Same heading, different file: a section that moved.
 		"§98-moved#1-screen": {Hash: "moved", Title: idx.items["§03-shell#1-screen"].Title},
 	}}
-	// Covered but absent from the ledger: must be adopted, not reported as changed forever.
-	adoptable := ""
+	// A parameter row a test is named after, absent from the ledger: adopted, not
+	// reported as changed forever. A section likewise named: done only by a round.
+	adoptable, roundOnly := "", ""
 	for _, id := range idx.order {
-		if _, known := cfg.Items[id]; !known && id != "§03-shell#1-screen" {
+		if _, known := cfg.Items[id]; known || id == "§03-shell#1-screen" {
+			continue
+		}
+		switch {
+		case idx.items[id].Kind == specDefTableRow && adoptable == "":
 			adoptable = id
-			break
+		case idx.items[id].Kind != specDefTableRow && roundOnly == "":
+			roundOnly = id
 		}
 	}
-	if adoptable == "" {
-		t.Fatalf("fixture has no spare item; order: %v", idx.order)
+	if adoptable == "" || roundOnly == "" {
+		t.Fatalf("fixture has no spare row or section; order: %v", idx.order)
 	}
-	covered := map[string]string{adoptable: "tests/flows.rs"}
+	covered := map[string]string{adoptable: "tests/flows.rs", roundOnly: "tests/flows.rs",
+		unchanged: "tests/a.rs", edited: "tests/a.rs", "§03-shell#1-screen": "tests/a.rs"}
 
 	d := specReconcile(cfg, idx, covered)
 	if want := []string{edited}; !reflect.DeepEqual(d.Changed, want) {
@@ -462,7 +474,10 @@ func TestSpecReconcile(t *testing.T) {
 		t.Errorf("the renamed item must be recorded at its new text, got %+v", led)
 	}
 	if d.Adopted != 1 || cfg.Items[adoptable].CoveredBy != "tests/flows.rs" {
-		t.Errorf("covered work predating the ledger should be adopted, got %d and %+v", d.Adopted, cfg.Items[adoptable])
+		t.Errorf("a named parameter row predating the ledger should be adopted, got %d and %+v", d.Adopted, cfg.Items[adoptable])
+	}
+	if _, ok := cfg.Items[roundOnly]; ok {
+		t.Errorf("%s was adopted without a round; only parameter and tool rows are", roundOnly)
 	}
 	if e := cfg.Items[adoptable]; e.At.IsZero() || e.Version == "" || e.Commit != "" {
 		t.Errorf("an adopted entry must say when and by which codehalter it was recorded, and carry no commit: %+v", e)
@@ -474,6 +489,52 @@ func TestSpecReconcile(t *testing.T) {
 	}
 	if !reflect.DeepEqual(d2.Changed, d.Changed) || !reflect.DeepEqual(d2.Removed, d.Removed) {
 		t.Errorf("unacted work must still be reported: %+v then %+v", d, d2)
+	}
+}
+
+// A done item no test is named after any more is open again, unless most of the
+// ledger would reopen at once, which reads as a scan problem. An entry from before
+// the test-name rule stays done and is reported.
+func TestSpecReconcileReopensUnnamedItems(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := func() *specConfig {
+		cfg := &specConfig{Items: map[string]specLedger{}}
+		for _, id := range idx.order[:4] {
+			cfg.Items[id] = specLedger{Hash: specItemHash(idx, id), Title: idx.items[id].Title, Named: true}
+		}
+		return cfg
+	}
+	named := map[string]string{}
+	for _, id := range idx.order[:3] {
+		named[id] = "tests/a.rs"
+	}
+	cfg := ledger()
+	d := specReconcile(cfg, idx, named)
+	if gone := idx.order[3]; !reflect.DeepEqual(d.Reopened, []string{gone}) || cfg.done(gone) {
+		t.Errorf("Reopened = %v, want %s open again", d.Reopened, gone)
+	}
+	if !strings.Contains(renderSpecDelta(d), "open again") {
+		t.Errorf("the reopen is not reported:\n%s", renderSpecDelta(d))
+	}
+
+	cfg = ledger()
+	d = specReconcile(cfg, idx, map[string]string{idx.order[0]: "tests/a.rs"})
+	if d.Unnamed != 3 || len(d.Reopened) != 0 || len(cfg.Items) != 4 {
+		t.Errorf("three of four unnamed: Unnamed=%d Reopened=%v items=%d, want none reopened", d.Unnamed, d.Reopened, len(cfg.Items))
+	}
+
+	cfg = ledger()
+	legacy := idx.order[3]
+	cfg.Items[legacy] = specLedger{Hash: specItemHash(idx, legacy), Title: idx.items[legacy].Title}
+	d = specReconcile(cfg, idx, named)
+	if !cfg.done(legacy) || !reflect.DeepEqual(d.Legacy, []string{legacy}) || len(d.Reopened) != 0 {
+		t.Errorf("an entry from before the rule: done=%v Legacy=%v Reopened=%v, want it kept and reported", cfg.done(legacy), d.Legacy, d.Reopened)
+	}
+	if !strings.Contains(renderSpecDelta(d), "/spec redo") {
+		t.Errorf("the kept entries are not reported:\n%s", renderSpecDelta(d))
 	}
 }
 
@@ -593,7 +654,14 @@ func TestSpecFailedRoundStaysOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item := idx.order[0]
+	// A parameter row: the one kind a named test adopts without a round.
+	item := ""
+	for _, id := range idx.order {
+		if idx.items[id].Kind == specDefTableRow {
+			item = id
+			break
+		}
+	}
 	covered := map[string]string{item: "tests/x.rs"}
 	cfg := &specConfig{Attempts: map[string]int{item: 1}}
 
@@ -603,16 +671,16 @@ func TestSpecFailedRoundStaysOpen(t *testing.T) {
 	if _, known := cfg.Items[item]; known {
 		t.Error("a failed item landed in the ledger")
 	}
-	if id, _ := nextSpecItem(idx, covered, cfg); id != item {
-		t.Errorf("next = %q, want %q picked again", id, item)
+	if cfg.done(item) {
+		t.Errorf("%s counts as done after a failed round", item)
 	}
 
 	// A ledgered item is done whatever a stale attempt count says, and reconciling drops it.
 	cfg.Items[item] = specLedger{Hash: specItemHash(idx, item)}
-	if id, _ := nextSpecItem(idx, covered, cfg); id == item {
-		t.Error("a ledgered item was picked again because of a stale attempt count")
+	if !cfg.done(item) {
+		t.Error("a ledgered item is not done because of a stale attempt count")
 	}
-	if !strings.Contains(renderSpecStatus(cfg, idx, covered, 1, "just test"), "| 01-files.md | 1 |") {
+	if !strings.Contains(renderSpecStatus(cfg, idx, 1, "just test"), "| "+idx.docs[idx.items[item].Doc].rel+" | 1 |") {
 		t.Error("status does not count a ledgered item with a stale attempt count as covered")
 	}
 	specReconcile(cfg, idx, covered)
@@ -632,7 +700,7 @@ func TestSpecFailedRoundStaysOpen(t *testing.T) {
 	if d := specReconcile(cfg, idx, covered); d.Adopted != 1 {
 		t.Errorf("adopted %d, want 1 once no failed round stands", d.Adopted)
 	}
-	if id, _ := nextSpecItem(idx, covered, cfg); id == item {
+	if id, _ := nextSpecItem(idx, cfg); id == item {
 		t.Error("a covered item with no failed round was picked again")
 	}
 }

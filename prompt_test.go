@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -302,5 +303,54 @@ func TestSpecStopIsAnInstructionNotSteer(t *testing.T) {
 	prompt("also update the README")
 	if q := s.takePending(); len(q) != 1 {
 		t.Errorf("an ordinary message during the loop must still steer: %v", q)
+	}
+}
+
+// A replan is told what the failed subtask spent its calls on, counted in code.
+func TestReplanCarriesFailureDigest(t *testing.T) {
+	read := sseToolCall("r", "read_file", `{"path":"a.rs"}`)
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`),
+		read, read, read,
+		sseText("done, I think"), sseText("still done"), // no respond: the subtask fails
+		sseToolCall("p2", respondToolName, `{"message":"nothing more to do"}`),
+	)
+	a.tools.add(Tool{
+		Def: map[string]any{"type": "function", "function": map[string]any{
+			"name": "read_file", "description": "read", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			return "fn a() {}", false
+		},
+	})
+	s.AddUser("change a.rs")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	replan := fmt.Sprint(mock.request(mock.callCount() - 1)["messages"])
+	for _, want := range []string{"REPLAN: prior subtask failed", "3 tool calls, 3 of them reads", "It changed no file.", "`read_file {\"path\":\"a.rs\"}` 3 times"} {
+		if !strings.Contains(replan, want) {
+			t.Errorf("the replan request lacks %q", want)
+		}
+	}
+}
+
+// Inside a /spec round the documenter does not run: the round plans its own docs step.
+func TestSpecRoundSkipsTheDocumenter(t *testing.T) {
+	for _, fenced := range []bool{false, true} {
+		a, s, mock := planPhaseAgent(t,
+			sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`),
+			sseToolCall("e1", respondToolName, `{"message":"changed"}`),
+			sseText("nothing to document"),
+		)
+		if fenced {
+			s.setSpecFence(filepath.Join(s.Cwd, "spec"))
+		}
+		s.AddUser("change a.rs")
+		if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+			t.Fatal(err)
+		}
+		if want := map[bool]int{false: 3, true: 2}[fenced]; mock.callCount() != want {
+			t.Errorf("fenced=%v: %d model calls, want %d", fenced, mock.callCount(), want)
+		}
 	}
 }

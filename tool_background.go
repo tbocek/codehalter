@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,12 +35,15 @@ type backgroundJob struct {
 	started    time.Time
 	wakeAfter  time.Duration
 	announced  bool // under bgMu
-	// expectExit: a handed-over run_command, which a `respond` parks for and the
-	// stall watchdog may kill. A run_background server is quiet on purpose.
+	// expectExit: a handed-over run_command, not a run_background job.
 	expectExit bool
-	redirects  []string      // growth counts as progress
-	stalled    time.Duration // >0: killed by the stall watchdog (under bgMu)
-	exited     chan jobExit
+	// waitable: a `respond` parks for it, and the stall watchdog may kill it. A
+	// handed-over run_command, or a run_background test, build or lint run; never
+	// a server, which does not exit and is quiet on purpose.
+	waitable  bool
+	redirects []string      // growth counts as progress
+	stalled   time.Duration // >0: killed by the stall watchdog (under bgMu)
+	exited    chan jobExit
 }
 
 // jobExit is delivered once per job, to run_command's wait or, after handover,
@@ -54,7 +58,8 @@ type jobExit struct {
 func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit bool) (*backgroundJob, string) {
 	args := parseArgs(rawArgs)
 	cmdStr := args.str("command")
-	if cmdStr == "" {
+	cmds := shellSegments(cmdStr, false)
+	if len(cmds) == 0 {
 		return nil, "error: command is required" + wrongToolHint(args)
 	}
 	sess := a.getSession(sid)
@@ -80,6 +85,10 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 	}
 	tcId := a.StartToolCall(ctx, sid, verb+": "+cmdStr, "execute", nil)
 
+	// The last command decides: `cargo build && ./target/release/api` ends in a server.
+	last := cmds[len(cmds)-1]
+	waitable := expectExit || finiteRunRe.MatchString(last) && !serverRunRe.MatchString(last)
+
 	a.bgMu.Lock()
 	a.bgSeq++
 	id := a.bgSeq
@@ -91,6 +100,7 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 		pidPath:    filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-%d-job-%d.pid", os.Getpid(), id)),
 		wakeAfter:  time.Duration(secs) * time.Second,
 		expectExit: expectExit,
+		waitable:   waitable,
 		redirects:  redirectTargets(cmdStr, sess.Cwd),
 		exited:     make(chan jobExit, 1),
 	}
@@ -127,7 +137,7 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 func (a *agent) handOver(job *backgroundJob) string {
 	job.pid = readPidFile(job.pidPath)
 	stop := make(chan struct{})
-	if job.expectExit {
+	if job.waitable {
 		// Limits read here, not in the watcher, which may outlive a test that shortened them.
 		go a.stallWatch(job, stop, bgStallTimeout, bgStallPoll)
 	}
@@ -180,10 +190,20 @@ func (a *agent) sayRunningBgJobs(sess *Session) {
 	a.say(context.Background(), sess.ID, "\n⏳ Running in the background: "+strings.Join(names, ", ")+". When it exits I pick up the work that was waiting on it and tell you; you can carry on meanwhile.\n")
 }
 
-// parkableJobs: a job from an earlier turn, or a run_background server, never
+// A run_background gate ended the subtask on its "waiting" respond 13 times in
+// the logs, and the result arrived in another subtask's context.
+// A finite run is a test, build or lint tool, by its command and subcommand
+// (after a wrapper like xvfb-run): a word in a path or a flag (`--build`,
+// `build/libs/app.jar`) says nothing.
+var (
+	finiteRunRe = regexp.MustCompile(`^(?:(?:xvfb-run|timeout|time|nice|env)\b[^|;&]*?\s+)?(?:just\s+(?:test|check|build|lint|ci)\b|cargo\s+(?:test|build|check|clippy|bench|nextest)\b|go\s+(?:test|build|vet)\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|check)\b|make\b|pytest\b|python3?\s+-m\s+(?:pytest|unittest)\b|tox\b|nox\b|jest\b|vitest\s+run\b|mocha\b|rspec\b|ctest\b|mvn\s+(?:test|verify|package)\b|(?:\./)?gradlew?\s+(?:test|build|check)\b|dotnet\s+(?:test|build)\b|swift\s+(?:test|build)\b|mix\s+test\b)`)
+	serverRunRe = regexp.MustCompile(`(?i)--watch|\bwatch\b|\bmake\s+(?:run|serve|dev|start)\b`)
+)
+
+// parkableJobs: a job from an earlier turn, or one that may never exit, never
 // parks a turn.
 func (a *agent) parkableJobs(sid string, since time.Time) string {
-	return a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.expectExit && j.started.After(since) })
+	return a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.waitable && j.started.After(since) })
 }
 
 var parkPoll = 500 * time.Millisecond
@@ -293,8 +313,12 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 		// Never print `kill 0`: it would signal the whole process group.
 		stop = "its pid was not recorded, so it can only be stopped by ending the session"
 	}
-	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, end the turn with `respond` saying the job is running.%s Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
-		job.id, job.pid, wake, job.logPath, stop, readLogTail(job.logPath, bgLogTailCap))
+	idle := "end the turn with `respond` saying the job is running"
+	if job.waitable {
+		idle = fmt.Sprintf("call `respond` saying you are waiting for job %d: that parks this step, it does not end it, and you continue here the moment the job reports", job.id)
+	}
+	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, %s.%s Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
+		job.id, job.pid, idle, wake, job.logPath, stop, readLogTail(job.logPath, bgLogTailCap))
 	a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Background: %s (pid %d)", job.cmdStr, job.pid), "completed")
 	return result, false
 }
@@ -333,6 +357,9 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 		return
 	}
 	outcome := fmt.Sprintf("exited with code %d", exit.code())
+	if stalled == 0 && err == nil {
+		sess.recordJobRun(jobRun{cmd: job.cmdStr, code: exit.code(), started: job.started, ended: time.Now()})
+	}
 	switch {
 	case stalled > 0:
 		outcome = fmt.Sprintf("was killed after %s without any output (hung, or waiting for input)", humanDuration(stalled.Milliseconds()))

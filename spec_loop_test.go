@@ -38,6 +38,32 @@ func TestSpecDecide(t *testing.T) {
 	}
 }
 
+// The gates on what a round wrote hold an item back and say why; a refactor
+// counts when its debt shrank.
+func TestSpecDecideGates(t *testing.T) {
+	green := specRoundResult{Covered: true, TestsPass: true, Committed: true}
+	for name, r := range map[string]specRoundResult{
+		"unreachable": {Covered: true, TestsPass: true, Unreachable: []string{"`run` (src/a.rs:3): only tests call it"}},
+		"lint":        {Covered: true, TestsPass: true, Lint: []string{"src/a.rs:3: unused variable"}},
+		"oversize":    {Covered: true, TestsPass: true, Oversize: []string{"`src/ui.rs` is 12000 lines, over the 1500-line budget"}},
+	} {
+		done, _, reason := specDecide(&specConfig{}, "F0.1", r)
+		if done || !strings.Contains(reason, map[string]string{"unreachable": "only tests call it", "lint": "unused variable", "oversize": "1500-line budget"}[name]) {
+			t.Errorf("%s: done=%v reason=%q", name, done, reason)
+		}
+	}
+	if done, _, _ := specDecide(&specConfig{}, "F0.1", green); !done {
+		t.Error("a clean round was held back")
+	}
+	cfg := &specConfig{}
+	if done, _, reason := specDecide(cfg, specRefactorID, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Debt: "a → b"}); done || !strings.Contains(reason, "no measured progress") {
+		t.Errorf("a refactor that shrank nothing: done=%v reason=%q", done, reason)
+	}
+	if done, _, _ := specDecide(cfg, specRefactorID, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Improved: true}); !done {
+		t.Error("a refactor that shrank the debt was held back")
+	}
+}
+
 func TestSpecPaths(t *testing.T) {
 	cwd := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cwd, "spec"), 0o755); err != nil {
@@ -89,11 +115,13 @@ func TestSpecRoundPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs libadwaita", Context: []string{"00-principles.md"}}
+	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs libadwaita", Context: []string{"00-principles.md"},
+		Items: map[string]specLedger{"§01-files#1-layout": {}}}
 
-	prompt, head := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.1", Reason: "no test names f0_1"}, map[string]string{"§01-files#1-layout": "tests/x.rs"}, "just test")
+	prompt, head := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.1", Reason: "no test names f0_1"}, "just test", "cargo clippy --all-targets --quiet")
 	for _, want := range []string{"**F0.1**", "`f0_1`", "just test", "use gtk4-rs libadwaita", "rust/", "S1 Switch.",
-		"did not count", "no test names f0_1", "spec/00-principles.md", "1 of"} {
+		"did not count", "no test names f0_1", "spec/00-principles.md", "1 of", "`cargo clippy --all-targets --quiet`, run from `rust/`",
+		"over 1500 lines grows by at most 20"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("item prompt lacks %q", want)
 		}
@@ -105,17 +133,23 @@ func TestSpecRoundPrompt(t *testing.T) {
 		t.Errorf("heading = %q", head)
 	}
 
-	setup, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: specSetupID, Mode: specModeSetup}, nil, "")
+	refactor, head := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: specRefactorID, Mode: specModeRefactor,
+		Debt: specDebt{overLines: 900, targets: "- `src/ui/window.rs`: 2400 lines\n"}}, "just test", "")
+	if strings.Contains(refactor, "{{") || !strings.Contains(refactor, "`src/ui/window.rs`: 2400 lines") || !strings.Contains(head, "lines over the size budget 900") {
+		t.Errorf("refactor prompt (%s):\n%s", head, refactor)
+	}
+
+	setup, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: specSetupID, Mode: specModeSetup}, "", "")
 	if strings.Contains(setup, "{{") || !strings.Contains(setup, "use gtk4-rs libadwaita") || !strings.Contains(setup, "`rust/`") {
 		t.Errorf("setup prompt:\n%s", setup)
 	}
 
-	answered, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Question: "keep or drop?", Answer: "keep it"}, nil, "just test")
+	answered, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Question: "keep or drop?", Answer: "keep it"}, "just test", "")
 	if !strings.Contains(answered, "keep or drop?") || !strings.Contains(answered, "keep it") {
 		t.Errorf("answered prompt lacks the question and answer:\n%s", answered)
 	}
 	// A changed item that was blocked comes back with its answer; the diff fence must still close.
-	changed, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Mode: specModeChange, Note: "-old\n+new", Answer: "keep it"}, nil, "just test")
+	changed, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Mode: specModeChange, Note: "-old\n+new", Answer: "keep it"}, "just test", "")
 	if !strings.Contains(changed, "+new\n```\n\n## Your earlier question was answered") {
 		t.Errorf("the answer runs into the diff fence:\n%s", changed)
 	}
@@ -229,7 +263,8 @@ func TestRunSpecTestsTailCarriesExitStatus(t *testing.T) {
 	}
 }
 
-// Only a bare run in the output dir, exit 0 per the terminal, nothing written since, counts.
+// Only a bare run in the output dir, exit 0 per the terminal, nothing written in
+// it since, counts; the run may be a background job that exited this round.
 func TestSpecRoundOwnGreenRun(t *testing.T) {
 	a, sess := newTestAgent(t)
 	out := filepath.Join(sess.Cwd, "rust")
@@ -240,33 +275,49 @@ func TestSpecRoundOwnGreenRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: &specConfig{OutDir: "rust"}, outAbs: out}
+	round := time.Now().Add(-time.Minute)
 	ran := func(cmd, output string) ToolUse {
 		return ToolUse{Name: "run_command", Input: `{"command":` + strconv.Quote(cmd) + `}`, Output: output, StartedAt: time.Now().Add(time.Second), DurationMs: 10}
 	}
-	edit := ToolUse{Name: "edit_file", Input: `{"path":"rust/src/lib.rs"}`}
+	edit := func(path string, after time.Duration) ToolUse {
+		return ToolUse{Name: "edit_file", Input: `{"path":"` + path + `"}`, StartedAt: time.Now().Add(after)}
+	}
+	green := func(uses ...ToolUse) bool { return r.roundRanGreen(uses, "just test", round) }
 
-	if !r.roundRanGreen([]ToolUse{edit, ran("cd rust && just test > /tmp/t.log 2>&1", "exit 0\n\n")}, "just test") {
+	if !green(edit("rust/src/lib.rs", 0), ran("cd rust && just test > /tmp/t.log 2>&1", "exit 0\n\n")) {
 		t.Error("a plain green run after the last edit did not count")
 	}
-	if !r.roundRanGreen([]ToolUse{ran("cd "+out+" && just test", "exit 0\n\nok")}, "just test") {
+	if !green(ran("cd "+out+" && just test", "exit 0\n\nok")) {
 		t.Error("an absolute cd to the output dir did not count")
+	}
+	if !green(ran("cd rust && just test", "exit 0\n"), edit("AGENT.md", 2*time.Second)) {
+		t.Error("an edit outside the output directory undid the green run")
 	}
 	for name, uses := range map[string][]ToolUse{
 		"wrapped, exit is the echo's": {ran("cd rust && (just test > /tmp/t.log 2>&1; echo exit=$? >> /tmp/t.log)", "exit 0\n")},
 		"red":                         {ran("cd rust && just test", "exit 101\n")},
-		"edited after the run":        {ran("cd rust && just test", "exit 0\n"), edit},
+		"edited after the run":        {ran("cd rust && just test", "exit 0\n"), edit("rust/src/lib.rs", 2*time.Second)},
 		"wrong directory":             {ran("just test", "exit 0\n")},
 		"handed over, no exit yet":    {ran("cd rust && just test", "still running after 2m")},
 	} {
-		if r.roundRanGreen(uses, "just test") {
+		if green(uses...) {
 			t.Errorf("%s: counted as green", name)
 		}
 	}
 	// A file written after the run, by whatever means.
 	uses := []ToolUse{ran("cd rust && just test", "exit 0\n")}
 	uses[0].StartedAt = time.Now().Add(-time.Minute)
-	if r.roundRanGreen(uses, "just test") {
+	if green(uses...) {
 		t.Error("a source file newer than the run did not force a re-run")
+	}
+
+	sess.recordJobRun(jobRun{cmd: "cd rust && just test > /tmp/gate.log 2>&1", code: 0, started: time.Now().Add(time.Second), ended: time.Now().Add(time.Second)})
+	if !green() {
+		t.Error("a background gate that exited 0 this round did not count")
+	}
+	sess.recordJobRun(jobRun{cmd: "cd rust && just test", code: 101, started: time.Now().Add(time.Second), ended: time.Now().Add(2 * time.Second)})
+	if green(ran("cd rust && just test", "exit 0\n")) {
+		t.Error("a red background run after the green one still counted as green")
 	}
 }
 
@@ -364,7 +415,11 @@ func TestSpecPickWorkRemovals(t *testing.T) {
 		h := newTerminalHarness(t)
 		r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, idx: idx, reasons: map[string]string{},
 			cfg: &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "just test", Items: items}}
-		w := r.pickWork(t.Context(), nil, 1)
+		named := map[string]string{} // built means a test is named after it
+		for _, id := range idx.order {
+			named[id] = "tests/a.rs"
+		}
+		w := r.pickWork(t.Context(), named, 1)
 		if m := h.sentMethods(); len(m) != 0 {
 			t.Errorf("pickWork asked the client %v, want no card", m)
 		}
@@ -437,5 +492,56 @@ func TestSpecPickWorkRemovals(t *testing.T) {
 	}
 	if _, ok := r.cfg.Items[now]; !ok {
 		t.Errorf("the record did not follow the moved section to %s", now)
+	}
+}
+
+// A failed attempt is committed too; the next attempt, which only fixes the
+// program, still counts the test the first one wrote.
+func TestSpecSecondAttemptKeepsFirstAttemptsTest(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	a, sess := newTestAgent(t)
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "false", LintCmd: "off", Items: map[string]specLedger{}}
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-C", sess.Cwd, "-c", "user.email=t@t", "-c", "user.name=t"}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	write := func(rel, body string) {
+		t.Helper()
+		p := filepath.Join(sess.Cwd, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
+	write("rust/src/lib.rs", "// v1\n")
+	git("add", "-A")
+	git("commit", "-q", "-m", "base")
+	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: cfg, idx: idx, outAbs: filepath.Join(sess.Cwd, "rust"), reasons: map[string]string{}}
+
+	write("rust/tests/switch.rs", "#[test]\nfn f0_1_switches() {}\n") // attempt 1: its test, and a red suite
+	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, len(sess.Messages), time.Now()); err != nil || done {
+		t.Fatalf("attempt 1: done=%v err=%v, want a failed attempt", done, err)
+	}
+	cfg.TestCmd = "true"
+	write("rust/src/lib.rs", "// v2, the fix\n") // attempt 2 touches only the program
+	done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, len(sess.Messages), time.Now())
+	if err != nil || !done {
+		t.Fatalf("attempt 2: done=%v err=%v reason=%q, want the first attempt's test to count", done, err, r.reasons["F0.1"])
+	}
+	if _, ok := cfg.Bases["F0.1"]; ok {
+		t.Error("the base outlived the finished item")
 	}
 }

@@ -136,6 +136,23 @@ type sessionRuntime struct {
 	prevCall  toolCallBrief
 	// Later calls of the same reply were batched already and get no batching note.
 	replyStart bool
+	// jobRuns are the background jobs that exited: a /spec gate that ran as one counts.
+	jobRuns []jobRun
+}
+
+type jobRun struct {
+	cmd            string
+	code           int
+	started, ended time.Time
+}
+
+func (s *Session) recordJobRun(j jobRun) {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	s.rt.jobRuns = append(s.rt.jobRuns, j)
+	if len(s.rt.jobRuns) > 20 {
+		s.rt.jobRuns = s.rt.jobRuns[1:]
+	}
 }
 
 func (s *Session) markReplyStart() {

@@ -500,6 +500,10 @@ var fileTools = []Tool{
 			drift = sess.takeDriftNote(path)
 		}
 		newContent = a.formatGuarded(sid, path, oldContent, newContent)
+		if refusal := a.agentsFileRefusal(sid, path, oldContent, newContent); refusal != "" {
+			a.FailToolCall(ctx, sid, tcId, firstLine(refusal))
+			return refusal + drift, true
+		}
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())
@@ -618,6 +622,10 @@ var fileTools = []Tool{
 			notes = append(notes, note)
 		}
 		newContent := a.formatGuarded(sid, path, content, cur)
+		if refusal := a.agentsFileRefusal(sid, path, content, newContent); refusal != "" {
+			a.FailToolCall(ctx, sid, tcId, firstLine(refusal))
+			return refusal + drift, true
+		}
 
 		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
 			a.FailToolCall(ctx, sid, tcId, err.Error())

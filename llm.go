@@ -631,7 +631,6 @@ func (a *agent) llmStream(ctx context.Context, sid string, conn *LLMConnection, 
 	text, calls, reasoning, err := a.llmStreamOnce(ctx, sid, conn, messages, tools, on, think, onArgs)
 	var he *llmHTTPError
 	if conn != nil && conn.noThinkPrefill && !conn.noPrefill && errors.As(err, &he) && he.Status == 400 && strings.Contains(he.Body, "continue_final_message") {
-		// A settings reload forgets the mark, which costs one more rejected call.
 		a.cfgMu.Lock()
 		if i := a.entryIndex(conn); i >= 0 && !a.settings.LLM[i].noPrefill {
 			a.settings.LLM[i].noPrefill = true
@@ -974,15 +973,18 @@ func (a *agent) connForBackgroundLLM() (*LLMConnection, bool) {
 	return c, true
 }
 
-// setSettings installs loaded settings. An unset parallel takes the total_slots
-// the last probe of the same server and model reported: a reload must not drop
-// it. Caller holds a.cfgMu for writing.
+// setSettings installs loaded settings. A reload must not drop what was learned
+// about the same server and model: the probed total_slots for an unset parallel,
+// and a rejected closed-think continuation. Caller holds a.cfgMu for writing.
 func (a *agent) setSettings(s Settings) {
 	for i := range s.LLM {
 		c := &s.LLM[i]
 		if p := a.connProbe[c.Server+"\x00"+c.Model]; c.Parallel == nil && p.TotalSlots > 0 {
 			n := p.TotalSlots
 			c.Parallel = &n
+		}
+		if j := a.entryIndex(c); j >= 0 && a.settings.LLM[j].noPrefill {
+			c.noPrefill = true
 		}
 	}
 	a.settings = s

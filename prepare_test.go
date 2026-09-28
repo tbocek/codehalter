@@ -671,8 +671,9 @@ func TestRenderLLMStatusNamesPurpose(t *testing.T) {
 	}
 }
 
-// Reloading an unchanged file would reset the back-filled parallel to unset.
-func TestEnsureLLMKeepsProbedParallel(t *testing.T) {
+// Reloading the file must keep what was learned about the server: the probed
+// parallel and a rejected closed-think continuation.
+func TestSettingsReloadKeepsWhatWasLearned(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	ts := llamaCppServer(65536, 2)
 	defer ts.Close()
@@ -690,7 +691,8 @@ func TestEnsureLLMKeepsProbedParallel(t *testing.T) {
 			t.Fatalf("turn %d: parallel = %v, want 2 from the probe", turn, p)
 		}
 	}
-	// Opening another thread reloads the settings file; the probe still holds.
+	a.settings.LLM[0].noPrefill = true // the server refused the continuation once
+	// Opening another thread reloads the settings file; what was learned still holds.
 	other, err := newSession(s.Cwd)
 	if err != nil {
 		t.Fatal(err)
@@ -701,5 +703,8 @@ func TestEnsureLLMKeepsProbedParallel(t *testing.T) {
 	a.ensureLLM(context.Background(), s, s.ID)
 	if p := a.settings.LLM[0].Parallel; p == nil || *p != 2 || cap(a.connSems[0]) != 2 {
 		t.Fatalf("after another session opened: parallel = %v, want 2 from the probe", p)
+	}
+	if !a.settings.LLM[0].noPrefill {
+		t.Error("a reload forgot that the server refuses the closed-think continuation")
 	}
 }

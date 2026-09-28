@@ -83,9 +83,37 @@ func TestRunCommandCapsHugeOutput(t *testing.T) {
 
 func TestRunCommandRequiresCommand(t *testing.T) {
 	h := newTerminalHarness(t)
-	res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{}`)
-	if failed || !strings.Contains(res, "command is required") {
-		t.Fatalf("expected command-required error, got: %s (failed=%v)", res, failed)
+	// Separators alone are no command either; they once crashed the job classifier.
+	for _, args := range []string{`{}`, `{"command":" ; "}`, `{"command":"\n"}`} {
+		res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, args)
+		if failed || !strings.Contains(res, "command is required") {
+			t.Errorf("%s: expected command-required error, got: %s (failed=%v)", args, res, failed)
+		}
+	}
+}
+
+// A respond parks for a finite run, judged by the last command's tool and
+// subcommand; a word in a path or a flag says nothing.
+func TestFiniteRunCommands(t *testing.T) {
+	for cmd, want := range map[string]bool{
+		"cd rust && just test > /tmp/gate.log 2>&1":     true,
+		"cd rust && cargo test 2>&1 | tee /tmp/t.log":   true,
+		"xvfb-run -a cargo test":                        true,
+		"npm run test":                                  true,
+		"python -m pytest -q":                           true,
+		"docker compose up --build":                     false,
+		"cmake --build build && ./build/app":            false,
+		"node build":                                    false,
+		"java -jar build/libs/app.jar":                  false,
+		"jest --watchAll":                               false,
+		"cargo build --release && ./target/release/api": false,
+		"npm run build && npm run preview":              false,
+	} {
+		cmds := shellSegments(cmd, false)
+		last := cmds[len(cmds)-1]
+		if got := finiteRunRe.MatchString(last) && !serverRunRe.MatchString(last); got != want {
+			t.Errorf("%q: finite = %v, want %v", cmd, got, want)
+		}
 	}
 }
 
@@ -285,5 +313,57 @@ func TestBgSleepHint(t *testing.T) {
 		if note, _ := bgSleepHint(c); note != "" {
 			t.Errorf("%q got a note: %q", c, note)
 		}
+	}
+}
+
+// A read of files, a search or a print is served whole; anything that writes,
+// runs or hides a command is not.
+func TestOnlyReads(t *testing.T) {
+	for cmd, want := range map[string]bool{
+		`cd rust && awk 'NR>=90 && NR<=200 {printf "%d|%s\n", NR, $0}' src/a.rs`: true,
+		`sed -n '10,40p' src/a.rs; echo "=== b ==="; sed -n '1,9p' src/b.rs`:     true,
+		`grep -rn -C3 -F 'fn run' src tests | head -50`:                          true,
+		`cat a.rs 2>/dev/null || echo missing`:                                   true,
+		`git --no-pager log -3 --oneline && git -C rust show HEAD:src/a.rs`:      true,
+		`find src -name '*.rs' | sort`:                                           true,
+		`echo hi`:                                                                false,
+		`sed -i 's/a/b/' src/a.rs`:                                               false,
+		`cat a.rs > /tmp/copy`:                                                   false,
+		`cargo test 2>&1 | tail -20`:                                             false,
+		`grep -n x $(git ls-files)`:                                              false,
+		`python3 - <<'EOF'` + "\nprint(1)\nEOF":                                  false,
+		`git checkout src/a.rs`:                                                  false,
+		`find . -name '*.tmp' -delete`:                                           false,
+		`awk 'BEGIN { system("rm -rf x") }' a.rs`:                                false,
+		`sed -Ei 's/a/b/' src/a.rs`:                                              false,
+		`sed --in-place=.bak 's/a/b/' src/a.rs`:                                  false,
+		`awk '{print > "out.txt"}' a.rs`:                                         false,
+		`find . -name x -fprint list`:                                            false,
+		`sort -o sorted.txt a.txt`:                                               false,
+		`git diff --output=d.patch`:                                              false,
+	} {
+		if got := onlyReads(cmd); got != want {
+			t.Errorf("onlyReads(%q) = %v, want %v", cmd, got, want)
+		}
+	}
+}
+
+// A shell read is served like read_file, whole up to its cap; a build is still
+// clipped to head and tail.
+func TestLiveToolOutputServesShellReadsWhole(t *testing.T) {
+	body := strings.Repeat("let x = 1;\n", 400)
+	read := `{"command":"sed -n '1,400p' src/a.rs"}`
+	if got := liveToolOutput("run_command", read, "exit 0\n\n"+body); !strings.HasSuffix(got, body) {
+		t.Errorf("a shell read was clipped: %d of %d chars", len(got), len(body))
+	}
+	build := `{"command":"cargo build"}`
+	if got := liveToolOutput("run_command", build, "exit 0\n\n"+body); !strings.Contains(got, "chars omitted") {
+		t.Error("a build's long output was not clipped")
+	}
+	// Past the allowance a read keeps its end too: a failing suite's log ends in its summary.
+	log := strings.Repeat("running a test\n", 4000) + "test result: FAILED. 3 failed\n"
+	got := liveToolOutput("run_command", `{"command":"cat /tmp/job.log"}`, log)
+	if len(got) > liveExemptCap+1024 || !strings.HasSuffix(got, "3 failed\n") || !strings.HasPrefix(got, "running a test") {
+		t.Errorf("an oversized shell read: %d chars, start or end lost", len(got))
 	}
 }

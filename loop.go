@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 )
@@ -333,13 +334,24 @@ const planRoundNudge = 20
 // Backstop for "different enough" calls forever; the repetition ladder catches the rest earlier.
 const maxToolLoopIterations = 100
 
+// An execute subtask that only reads for this long is lost: in the logs, no
+// successful one read more than about 32 calls in a row, and most capped ones did.
+const (
+	readStreakEscalate = 20
+	readStreakBail     = 40
+)
+
 // The completed small turns 400 recovery keeps verbatim (see Session.keepWindowStart).
 const keepSmallTurnTokens = 10_000
 
-// A mid-response drop (router model swap, a blip) is usually momentary.
-const (
-	maxTransientStreamRetries = 5
-	transientStreamBackoff    = 3 * time.Second
+// A mid-response drop (router model swap, a blip) is usually momentary. A server
+// that refuses connections is restarting, which took two minutes in the logs, so
+// it gets doubling waits for up to serverDownPatience. Vars so tests can shorten them.
+const maxTransientStreamRetries = 5
+
+var (
+	transientStreamBackoff = 3 * time.Second
+	serverDownPatience     = 5 * time.Minute
 )
 
 // Per-token updates at high rates contend for the one conn write lock, and a slow
@@ -449,20 +461,63 @@ type repetitionTracker struct {
 	writeAt map[string]int
 }
 
-// A counter the model bumps to make each call look new does not make it new.
+// A timestamp or a counter in the output does not make it new.
 var digitRunRe = regexp.MustCompile(`\d+`)
 
 // Shell commands that rewrite source files. A redirect is NOT one: it writes a
 // log, not the tree.
-var inPlaceWriterRe = regexp.MustCompile(`sed -i|-i\b.*\bsed|cargo fmt|gofmt -w|prettier --write|go mod tidy|git (checkout|stash|apply|revert|reset)|cargo add|npm i|apk add|apt-get install|python3? -\s|<<-?'?(PY|EOF|PYTHON)'?`)
+var inPlaceWriterRe = regexp.MustCompile(`sed -i|-i\b.*\bsed|cargo fmt|gofmt -w|prettier --write|go mod tidy|git (checkout|stash|apply|revert|reset)|cargo add|npm i|apk add|apt-get install`)
+
+// commandWrites: a command that rewrites the tree, including a script that opens a
+// file for writing and a heredoc redirected into a file outside /tmp.
+func commandWrites(cmd string) bool {
+	if inPlaceWriterRe.MatchString(cmd) || scriptWriteRe.MatchString(cmd) {
+		return true
+	}
+	if strings.Contains(cmd, "<<") {
+		for _, f := range redirectTargets(cmd, "/") {
+			if !strings.HasPrefix(f, "/tmp/") && !strings.HasPrefix(f, "/dev/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// commandKey drops a command that only prints a label (an echo or printf that is
+// neither piped nor redirected), and labels is what those echoes print: a new
+// label on the same grep is the same grep, in the key and in the output.
+func commandKey(cmd string) (key string, labels map[string]bool) {
+	var keep []string
+	labels = map[string]bool{}
+	for _, seg := range shellSegments(cmd, false) {
+		first := strings.Fields(seg)[0]
+		if bare := unquoted(seg); strings.ContainsAny(bare, "|>") || first != "echo" && first != "printf" && first != "true" && first != ":" {
+			keep = append(keep, seg)
+			continue
+		}
+		if first == "echo" {
+			text := strings.TrimSpace(strings.TrimPrefix(seg, "echo"))
+			text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "-e "), "-n "))
+			if len(text) >= 2 && (text[0] == '"' || text[0] == '\'') && text[len(text)-1] == text[0] {
+				text = text[1 : len(text)-1]
+			}
+			labels[text] = true
+		}
+	}
+	return strings.Join(keep, " ; "), labels
+}
 
 func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 	args := tc.Function.Arguments
+	out, _, _ := strings.Cut(tu.Output, batchNoteLead) // the note depends on the call before, not on this one
 	if tc.Function.Name == "run_command" {
-		args = digitRunRe.ReplaceAllString(args, "#") // a counter in the line is still the same line
+		var labels map[string]bool
+		args, labels = commandKey(parseArgs(args).str("command"))
+		lines := strings.Split(out, "\n")
+		out = strings.Join(slices.DeleteFunc(lines, func(l string) bool { return labels[strings.TrimSpace(l)] }), "\n")
 	}
 	key := tc.Function.Name + "\x00" + args
-	out, _, _ := strings.Cut(tu.Output, batchNoteLead) // the note depends on the call before, not on this one
 	out = digitRunRe.ReplaceAllString(out, "#")
 	h := fnvHash(out)
 	bag := issueBag([]string{out})
@@ -479,15 +534,17 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
 	if rt.writeAt == nil {
 		rt.writeAt = map[string]int{}
 	}
+	// Before this call's own write: a writer re-run with nothing changed since is a spin.
+	changedSince := rt.writeAt[key] < rt.writes
 	switch tc.Function.Name {
 	case "edit_file", "write_file":
 		rt.writes++
 	case "run_command":
-		if inPlaceWriterRe.MatchString(tc.Function.Arguments) {
+		// The command, not the JSON arguments: there a script's "w" is \"w\".
+		if commandWrites(parseArgs(tc.Function.Arguments).str("command")) {
 			rt.writes++
 		}
 	}
-	changedSince := rt.writeAt[key] < rt.writes
 	rt.writeAt[key] = rt.writes
 	if repeated && !tu.Failed && tc.Function.Name == "run_command" && changedSince {
 		repeated = false
@@ -568,7 +625,8 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		callConn := *conn
 		callConn.cacheLineage = true
 		capNudged, capDoubled := false, false // per round: one be-concise nudge, then one doubled cap
-		transientRetries := 0
+		transientRetries, refusals := 0, 0
+		var downFor time.Duration
 		for {
 			// Fresh sink per attempt: an aborted attempt's partial arguments must not carry over.
 			text, calls, _, err := a.llmStream(ctx, sid, &callConn, messages, tools, on, think, a.planTableSink(ctx, sid))
@@ -602,17 +660,30 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				return "", nil, messages, err
 			}
 			if isTransientStreamError(err) {
-				if transientRetries >= maxTransientStreamRetries {
+				wait := transientStreamBackoff
+				switch refused := strings.Contains(err.Error(), "connection refused"); {
+				case refused && downFor >= serverDownPatience:
+					return "", nil, messages, fmt.Errorf("the LLM server refused connections for %s; start it, then send the message again: %w", humanDuration(downFor.Milliseconds()), err)
+				case refused:
+					wait = min(transientStreamBackoff<<refusals, time.Minute)
+					refusals++
+					downFor += wait
+					a.logSession(sid, "RECOVER", "server refused the connection (%v): retry in %s", err, wait)
+					if sid != "" && refusals == 1 {
+						a.say(ctx, sid, fmt.Sprintf("\n⟲ The LLM server refuses connections (restarting?); retrying for up to %s.\n", humanDuration(serverDownPatience.Milliseconds())))
+					}
+				case transientRetries >= maxTransientStreamRetries:
 					return "", nil, messages, fmt.Errorf("lost the connection to the LLM mid-response %d times (the server or router dropped the stream); this is usually transient — try again in a moment", transientRetries+1)
-				}
-				transientRetries++
-				a.logSession(sid, "RECOVER", "stream dropped mid-response (%v) — retry %d/%d", err, transientRetries, maxTransientStreamRetries)
-				if sid != "" {
-					// Streaming cannot rewind, so the retry's repeated prefix needs this flag.
-					a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
+				default:
+					transientRetries++
+					a.logSession(sid, "RECOVER", "stream dropped mid-response (%v) — retry %d/%d", err, transientRetries, maxTransientStreamRetries)
+					if sid != "" {
+						// Streaming cannot rewind, so the retry's repeated prefix needs this flag.
+						a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
+					}
 				}
 				select {
-				case <-time.After(transientStreamBackoff):
+				case <-time.After(wait):
 					continue
 				case <-ctx.Done():
 					return "", nil, messages, ctx.Err()
@@ -645,6 +716,27 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
 	var failedRounds int
+	var readStreak int // execute calls since the last edit, test or build
+	readNudged := false
+	// Samplers do not enter the KV cache key, so the prefix survives unless a role
+	// carries chat_template_kwargs (see res/settings.toml).
+	escalate := func() bool {
+		if escalated || conn == nil || conn.Tag == "thinking" {
+			return false
+		}
+		thinkConn := a.connFor("thinking")
+		if thinkConn == nil {
+			return false
+		}
+		// Without it the thinking role may answer in prose, ending an execute loop. It
+		// is a grammar, not a rendering, on llama.cpp and Halogen alike.
+		if tc, ok := conn.ExtraBody["tool_choice"]; ok {
+			thinkConn = thinkConn.withBody("tool_choice", tc)
+		}
+		conn = thinkConn
+		escalated = true
+		return true
+	}
 	for iter := 0; ; iter++ {
 		if iter >= maxToolLoopIterations {
 			return finish(fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations))
@@ -740,6 +832,15 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if !repeats.sawAgain(tc, tu) {
 				roundStuck = false
 			}
+			if phase == "execute" && !denied {
+				switch name := tc.Function.Name; {
+				case name == "read_file", name == "web_search", name == "web_read",
+					name == "run_command" && onlyReads(parseArgs(tc.Function.Arguments).str("command")):
+					readStreak++
+				case name == "edit_file", name == "write_file", name == "run_command", name == "run_background":
+					readStreak, readNudged = 0, false
+				}
+			}
 			if policy.terminals[tc.Function.Name] && !terminalCalled {
 				terminalCalled = true
 				terminalName = tc.Function.Name
@@ -793,6 +894,21 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			}
 		}
 
+		// The nudge always comes first, even when one reply of parallel reads jumps past both marks.
+		if readStreak >= readStreakBail && readNudged {
+			return finish(fmt.Errorf("read %d calls in a row without an edit, a test or a build", readStreak))
+		}
+		if readStreak >= readStreakEscalate && !readNudged {
+			readNudged = true
+			messages = a.addCorrective(sid, messages, fmt.Sprintf(
+				"You have read for %d calls in a row without changing a file or running a test. Stop gathering: make the edit, run the test, or call `respond` with what blocks you. At %d reads in a row this subtask ends and is planned again.", readStreak, readStreakBail))
+			if escalate() {
+				a.say(ctx, sid, "⚠ Reading without acting: nudged, and switched to the thinking sampler.\n")
+			} else {
+				a.say(ctx, sid, "⚠ Reading without acting: nudged the model to act.\n")
+			}
+		}
+
 		if !roundStuck {
 			stuckRounds = 0
 			continue
@@ -811,21 +927,8 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				"1. If a read came back PARTIAL and you need more, make the read_file call its note names for the next part; never re-read the same window, never rewrite a whole file.\n"+
 				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n"+
 				"3. If you are stuck or the task is infeasible, say so and stop.")
-		// Samplers do not enter the KV cache key, so the prefix survives unless a role
-		// carries chat_template_kwargs (see res/settings.toml).
-		if stuckRounds >= stuckEscalateRounds && !escalated && conn != nil && conn.Tag != "thinking" {
-			if thinkConn := a.connFor("thinking"); thinkConn != nil {
-				// Without it the thinking role may answer in prose, ending an execute loop. It
-				// is a grammar, not a rendering, on llama.cpp and Halogen alike.
-				if tc, ok := conn.ExtraBody["tool_choice"]; ok {
-					thinkConn = thinkConn.withBody("tool_choice", tc)
-				}
-				conn = thinkConn
-				escalated = true
-				if sid != "" {
-					a.say(ctx, sid, "⚠ Still repeating — switching to the thinking sampler to break out.\n")
-				}
-			}
+		if stuckRounds >= stuckEscalateRounds && escalate() && sid != "" {
+			a.say(ctx, sid, "⚠ Still repeating — switching to the thinking sampler to break out.\n")
 		}
 	}
 }

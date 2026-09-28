@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -751,6 +754,44 @@ func TestToolLoopNoDedup(t *testing.T) {
 
 // A nudge each stuck round, a swap to the thinking sampler (keeping a forced
 // tool_choice) at stuckEscalateRounds, a graceful bail at stuckBailRounds.
+// An execute loop that only reads is nudged and moved to the thinking sampler at
+// readStreakEscalate, and ends at readStreakBail with a reason the replan sees.
+func TestToolLoopEndsAReadOnlyStreak(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a, Tool{
+		Def: map[string]any{"type": "function", "function": map[string]any{
+			"name": "read_file", "description": "read", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			return "the text of " + parseArgs(rawArgs).str("path"), false
+		},
+	})
+	var resp []string
+	for i := range readStreakBail + 5 {
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "read_file", fmt.Sprintf(`{"path":"file%c%c.rs"}`, 'a'+i/26, 'a'+i%26)))
+	}
+	mock := newMockLLM(t, resp...)
+	defer mock.Close()
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m",
+		ParamsExecute: map[string]any{"temperature": 0.3}, ParamsThinking: map[string]any{"temperature": 1.0}}}}
+
+	_, err := a.runToolLoopSeeded(context.Background(), s.ID, a.connFor("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+	if err == nil || !strings.Contains(err.Error(), "in a row without an edit") {
+		t.Fatalf("err = %v, want the read-streak bail", err)
+	}
+	if got := mock.callCount(); got != readStreakBail {
+		t.Errorf("model calls = %d, want %d", got, readStreakBail)
+	}
+	next := mock.request(readStreakEscalate)
+	if fmt.Sprint(next["messages"]) == "" || !strings.Contains(fmt.Sprint(next["messages"]), "You have read for 20 calls") {
+		t.Error("the call after the escalate threshold carries no nudge")
+	}
+	if next["temperature"] != 1.0 || mock.request(readStreakEscalate - 1)["temperature"] != 0.3 {
+		t.Errorf("temperature before/after the threshold = %v/%v, want 0.3/1.0 (the thinking sampler)",
+			mock.request(readStreakEscalate - 1)["temperature"], next["temperature"])
+	}
+}
+
 func TestToolLoopRepetitionLadder(t *testing.T) {
 	var testTools []Tool
 	const toolName = "test_probe_a3f"
@@ -1267,6 +1308,50 @@ func TestToolLoopParksOnRespondWhileJobRuns(t *testing.T) {
 	}
 }
 
+// A run_background test run parks a waiting respond like a handed-over command;
+// a server does not, or the step would wait forever.
+func TestToolLoopParksForBackgroundTestRun(t *testing.T) {
+	gate := filepath.Join(t.TempDir(), "gate.mk")
+	if err := os.WriteFile(gate, []byte("all:\n\t@sleep 0.6; echo test-suite-green\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		cmd   string
+		calls int
+	}{
+		{"sleep 5; echo serve-forever", 2},
+		{"make -s -f " + gate + " && sleep 5", 2}, // built, then something that stays up
+	}
+	if _, err := exec.LookPath("make"); err == nil {
+		cases = append(cases, struct {
+			cmd   string
+			calls int
+		}{"make -s -f " + gate, 3})
+	}
+	for _, tc := range cases {
+		h := newTerminalHarness(t)
+		oldGrace, oldPoll := bgJobGrace, parkPoll
+		bgJobGrace, parkPoll = 50*time.Millisecond, 20*time.Millisecond
+		mock := newMockLLM(t,
+			sseToolCall("c1", "run_background", fmt.Sprintf(`{"command":%q}`, tc.cmd)),
+			sseToolCall("c2", respondToolName, `{"message":"Waiting for job 1."}`),
+			sseToolCall("c3", respondToolName, `{"message":"final"}`),
+		)
+		h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_background", "parameters": map[string]any{"type": "object"}}}, Execute: runBackgroundExecute})
+		_, err := h.agent.runToolLoopSeeded(context.Background(), h.sess.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "run it"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+		bgJobGrace, parkPoll = oldGrace, oldPoll
+		h.agent.shutdownBackground()
+		mock.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", tc.cmd, err)
+		}
+		if got := mock.callCount(); got != tc.calls {
+			t.Errorf("%s: %d model calls, want %d", tc.cmd, got, tc.calls)
+		}
+	}
+}
+
 // Needs no message text: a server that forces the tool call returns none.
 func TestPlanAnswerInArgument(t *testing.T) {
 	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
@@ -1331,6 +1416,44 @@ func TestStuckLadderSeesRepeatPastBatchNote(t *testing.T) {
 	read("b.toml")
 	if !read("b.toml") {
 		t.Error("the first identical re-read after a batching note did not count as a repeat")
+	}
+}
+
+// Three blind spots of the old key: a fresh echo label, a range revisited after
+// another one, and a read-only heredoc that counted as a write.
+func TestStuckLadderKeysCommandsBySubstance(t *testing.T) {
+	rt := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
+	run := func(cmd, out string) bool {
+		var tc toolCall
+		tc.Function.Name = "run_command"
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		tc.Function.Arguments = string(b)
+		return rt.sawAgain(tc, ToolUse{Name: "run_command", Output: "exit 0\n\n" + out})
+	}
+	run(`echo "=== the prompt ==="; grep -n prompt spec/09.md | head -3`, "=== the prompt ===\n12:prompt")
+	if !run(`echo "=== system message ==="; grep -n prompt spec/09.md | head -3`, "=== system message ===\n12:prompt") {
+		t.Error("the same grep under a new echo label did not count as a repeat")
+	}
+	run(`sed -n '10,20p' src/a.rs`, "ten to twenty")
+	run(`sed -n '30,40p' src/a.rs`, "thirty to forty")
+	if !run(`sed -n '10,20p' src/a.rs`, "ten to twenty") {
+		t.Error("a range read again after another range did not count as a repeat")
+	}
+	heredoc := "python3 - <<'EOF'\nprint(open('a.rs').read().count('fn'))\nEOF"
+	run(heredoc, "7")
+	if !run(heredoc, "7") {
+		t.Error("a read-only python heredoc run twice counted as a write, not a repeat")
+	}
+	// A script that writes, with the double quotes JSON escapes, makes the re-check new.
+	run("go build ./...", "ok")
+	run("python3 - <<'EOF'\nopen(\"a.go\", \"w\").write(\"x\")\nEOF", "")
+	if run("go build ./...", "ok") {
+		t.Error("the build after a python write counted as a repeat")
+	}
+	// An echo piped into a program is its input, not a label.
+	run(`echo "hello" | ./parse`, "error: bad input")
+	if run(`echo '{"a":1}' | ./parse`, "error: bad input") {
+		t.Error("two different inputs piped into the same program counted as one call")
 	}
 }
 
@@ -1414,5 +1537,46 @@ func TestPlanNeitherAnswerNorWorkRetries(t *testing.T) {
 	}
 	if got := lastUserMessage(s); !strings.Contains(got, "neither an answer nor subtasks") {
 		t.Errorf("stored corrective = %q", got)
+	}
+}
+
+// A server that refuses connections is waited for with growing pauses, and the
+// call goes through once it listens again; past the patience it is an error.
+func TestToolLoopWaitsForARestartingServer(t *testing.T) {
+	oldBackoff, oldPatience := transientStreamBackoff, serverDownPatience
+	transientStreamBackoff, serverDownPatience = 20*time.Millisecond, 5*time.Second
+	defer func() { transientStreamBackoff, serverDownPatience = oldBackoff, oldPatience }()
+
+	mock := newMockLLM(t, sseText("back"))
+	defer mock.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		if ln, err := net.Listen("tcp", addr); err == nil {
+			go http.Serve(ln, mock.ts.Config.Handler)
+			t.Cleanup(func() { ln.Close() })
+		}
+	}()
+	a, s := newTestAgent(t)
+	conn := &LLMConnection{Server: "http://" + addr, Model: "m", Tag: "execute"}
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, conn, []llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
+	if err != nil || res.Text != "back" {
+		t.Fatalf("res=%q err=%v, want the reply once the server listens again", res.Text, err)
+	}
+
+	serverDownPatience = 50 * time.Millisecond
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	conn.Server = "http://" + closed.Addr().String()
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, conn, []llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0); err == nil || !strings.Contains(err.Error(), "refused connections") {
+		t.Errorf("err = %v, want the give-up after the patience", err)
 	}
 }

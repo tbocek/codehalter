@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -601,5 +602,40 @@ func TestReadFileStartEndLine(t *testing.T) {
 	}
 	if out := read(fmt.Sprintf(`{"reads":[{"path":%q,"start_line":30,"end_line":30}]}`, path)); !strings.Contains(out, "from line 30") || !strings.Contains(out, "L30\n") || strings.Contains(out, "L31\n") {
 		t.Errorf("reads item:\n%s", out)
+	}
+}
+
+// Over budget, the project brief may shrink or stay, never grow; elsewhere the
+// same name is an ordinary file.
+func TestAgentsFileMayNotGrowOverBudget(t *testing.T) {
+	a, s := newTestAgent(t)
+	brief := filepath.Join(s.Cwd, "AGENT.md")
+	body := "# Brief\n" + strings.Repeat("- a line the next agent needs\n", 450) // about 13 KB
+	if err := os.WriteFile(brief, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	edit := func(path, oldText, newText string) string {
+		var tc toolCall
+		tc.Function.Name = "edit_file"
+		b, _ := json.Marshal(map[string]string{"path": path, "old_text": oldText, "new_text": newText})
+		tc.Function.Arguments = string(b)
+		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+		return tu.Output
+	}
+	if out := edit(brief, "# Brief\n", "# Brief\n- F4.2 added the call module\n"); !strings.HasPrefix(out, "refused:") {
+		t.Errorf("growing an over-budget brief was allowed: %q", out)
+	}
+	if out := edit(brief, "# Brief\n- a line the next agent needs\n", "# Brief\n"); !strings.HasPrefix(out, "file written") {
+		t.Errorf("shrinking it was refused: %q", out)
+	}
+	nested := filepath.Join(s.Cwd, "docs", "AGENT.md")
+	if err := os.MkdirAll(filepath.Dir(nested), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(nested, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out := edit(nested, "# Brief\n", "# Brief\n- more\n"); !strings.HasPrefix(out, "file written") {
+		t.Errorf("a docs/AGENT.md is not the brief, but was refused: %q", out)
 	}
 }
