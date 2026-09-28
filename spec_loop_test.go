@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -566,5 +567,120 @@ func TestSpecSecondAttemptKeepsFirstAttemptsTest(t *testing.T) {
 	}
 	if _, ok := cfg.Bases["F0.1"]; ok {
 		t.Error("the base outlived the finished item")
+	}
+}
+
+// A whole round: the executor adds a function nothing calls; the in-round check
+// finds it before the round is judged, one more turn deletes it, and the item
+// counts on its first attempt.
+func TestSpecRoundCheckFixesBeforeJudging(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	h := newTerminalHarness(t)
+	a, sess := h.agent, h.sess
+	git := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("git", append([]string{"-C", sess.Cwd, "-c", "user.email=t@t", "-c", "user.name=t"}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	for rel, body := range map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+		".gitignore":        ".codehalter/\n",
+	} {
+		p := filepath.Join(sess.Cwd, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	git("init", "-q")
+	git("config", "user.email", "t@t")
+	git("config", "user.name", "t")
+	git("add", "-A")
+	git("commit", "-q", "-m", "base")
+	idx, err := scanSpec(filepath.Join(sess.Cwd, "spec"), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &specConfig{SpecDir: "spec", OutDir: "app", TestCmd: "true", LintCmd: "off", RefactorEvery: -1,
+		Items: map[string]specLedger{}, Final: &specFinal{Items: len(idx.order)}}
+	for _, id := range idx.order {
+		if id != "F0.1" {
+			cfg.Items[id] = specLedger{Hash: specItemHash(idx, id), Title: idx.items[id].Title}
+		}
+	}
+	if err := saveSpecConfig(sess.Cwd, cfg); err != nil {
+		t.Fatal(err)
+	}
+	write := func(id, path, content string) string {
+		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
+		return sseToolCall(id, "write_file", string(b))
+	}
+	mock := newMockLLM(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"build F0.1"}]}`),
+		write("w1", "app/src/lib.rs", "pub fn helper() {}\n"),
+		write("w2", "app/tests/f0_1.rs", "#[test]\nfn f0_1_does_the_thing() {}\n"),
+		sseToolCall("r1", respondToolName, `{"message":"built"}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"delete helper"}]}`),
+		write("w3", "app/src/lib.rs", "// the program\n"),
+		sseToolCall("r2", respondToolName, `{"message":"deleted"}`),
+	)
+	defer mock.Close()
+	// The pre-turn checks probe the LLM from the settings file: point it at the mock
+	// and mark the probe done, so nothing reaches a real server.
+	t.Setenv("HOME", t.TempDir())
+	// Each turn's background summary goes to its own server, off the scripted one.
+	var notes []string
+	for range 10 {
+		notes = append(notes, sseText("turn note"))
+	}
+	summariser := newMockLLM(t, notes...)
+	defer summariser.Close()
+	settings := fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"m\"\n\n[[llm]]\nserver = %q\nmodel = \"s\"\npurpose = \"summary\"\n", mock.ts.URL, summariser.ts.URL)
+	if err := os.WriteFile(filepath.Join(sess.Cwd, ".codehalter", "settings.toml"), []byte(settings), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadSettings(sess.Cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.connProbe = map[string]probeResult{mock.ts.URL + "\x00m": {Reachable: true, ModelKnown: true, ModelLoaded: true},
+		summariser.ts.URL + "\x00s": {Reachable: true, ModelKnown: true, ModelLoaded: true}}
+	a.cfgMu.Lock()
+	a.setSettings(loaded) // builds the per-server slots the summary is routed by
+	a.cfgMu.Unlock()
+	a.mainSlotTokens.Store(100_000)
+	sess.llmHash = hashSettingsFiles(sess.Cwd)
+	a.tools.add()
+
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	defer cancel()
+	if _, err := a.runSpec(ctx, sess.ID, sess, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadSpecConfig(sess.Cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, done := got.Items["F0.1"]; !done || got.Attempts["F0.1"] != 0 {
+		t.Errorf("F0.1 done=%v attempts=%d blocked=%v, want done on its first attempt", done, got.Attempts["F0.1"], got.Blocked)
+	}
+	var said strings.Builder
+	for _, u := range h.updatesOfKind(KindAgentMessage) {
+		if c, _ := u["content"].(map[string]any); c != nil {
+			said.WriteString(fmt.Sprint(c["text"]))
+		}
+	}
+	if !strings.Contains(said.String(), "Before this round counts: the program does not call these functions the round added: `helper`") {
+		t.Errorf("the in-round check did not report helper:\n%s", said.String())
+	}
+	if mock.callCount() != 7 {
+		t.Errorf("model calls = %d, want 7 (the round, then the fix turn)", mock.callCount())
 	}
 }

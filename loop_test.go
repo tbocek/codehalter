@@ -1613,3 +1613,39 @@ func TestToolLoopWaitsForARestartingServer(t *testing.T) {
 		t.Errorf("err = %v, want the give-up after the patience", err)
 	}
 }
+
+// A step still editing and building at the call cap gets one extension to finish;
+// one that did not edit hits the cap as before.
+func TestToolLoopExtendsAProductiveStepOnce(t *testing.T) {
+	fake := func(name, out string) Tool {
+		return Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": name, "parameters": map[string]any{"type": "object"}}},
+			Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+				return out + rawArgs, false
+			}}
+	}
+	run := func(editing bool) (toolLoopResult, error, int) {
+		var resp []string
+		for i := range maxToolLoopIterations {
+			switch {
+			case editing && i%2 == 0:
+				resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "edit_file", fmt.Sprintf(`{"path":"src/f%d.rs"}`, i)))
+			default:
+				resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "run_command", fmt.Sprintf(`{"command":"cargo build --bin b%d"}`, i)))
+			}
+		}
+		resp = append(resp, sseToolCall("done", respondToolName, `{"message":"page built"}`))
+		mock := newMockLLM(t, resp...)
+		defer mock.Close()
+		a, s := newTestAgent(t)
+		withTools(a, fake("edit_file", "file written successfully "), fake("run_command", "exit 0\n\nbuilt "))
+		res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "build the page"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", false, 0)
+		return res, err, mock.callCount()
+	}
+	if res, err, calls := run(true); err != nil || res.Terminal != respondToolName || calls != maxToolLoopIterations+1 {
+		t.Errorf("editing step: terminal=%q err=%v calls=%d, want it to finish on the extension", res.Terminal, err, calls)
+	}
+	if _, err, calls := run(false); err == nil || !strings.Contains(err.Error(), "exceeded") || calls != maxToolLoopIterations {
+		t.Errorf("step without edits: err=%v calls=%d, want the cap", err, calls)
+	}
+}

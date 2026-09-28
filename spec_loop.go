@@ -508,6 +508,25 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		if isCancelled(turnErr) {
 			return stopped(turnErr)
 		}
+		// The checks run once before the round is judged, so what they find costs a
+		// turn, not an attempt: one uncalled function once blocked a two-round item.
+		if turnErr == nil && (w.Mode == specModeItem || w.Mode == specModeChange) {
+			var uses []ToolUse
+			for i := since; i < len(sess.Messages); i++ {
+				uses = append(uses, sess.Messages[i].ToolUses...)
+			}
+			res := specRoundResult{Mode: w.Mode, Redo: w.Redo, Committed: true}
+			if _, _, err := r.inspect(ctx, w, uses, started, false, &res); err == nil {
+				if done, _, findings, _ := specDecide(&specConfig{}, w.Item, res, ""); !done {
+					r.say(ctx, "🔎 Before this round counts: "+firstLine(findings)+"\n")
+					turnErr = a.runPromptTurn(ctx, sess, a.renderSpecPrompt(sid, "SPEC-CHECK.md", []string{
+						"{{id}}", w.Item, "{{findings}}", findings, "{{out_dir}}", cfg.OutDir, "{{test_cmd}}", r.testCmd()}))
+					if isCancelled(turnErr) {
+						return stopped(turnErr)
+					}
+				}
+			}
+		}
 		done, block, err := r.finishRound(ctx, w, turnErr, since, started)
 		if isCancelled(err) {
 			return stopped(err)
@@ -1056,51 +1075,8 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 		if turnErr != nil {
 			res.TurnErr = turnErr.Error()
 		}
-		switch cmd := r.testCmd(); {
-		case cmd == "":
-			res.TestTail = "no test command found: `" + cfg.OutDir + "/` has no justfile with a test recipe, no Cargo.toml, package.json or go.mod"
-		case r.roundRanGreen(uses, cmd, started):
-			res.TestsPass = true
-			r.say(ctx, fmt.Sprintf("🧪 `%s` passed in the round, after its last change; not run again\n", cmd))
-		default:
-			res.TestsPass, res.TestTail = r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd)
-			if err := ctx.Err(); err != nil {
-				return false, false, err
-			}
-		}
-		// A snapshot recipe makes looking possible; only then is an unseen UI change blind.
-		if w.Mode != specModeRemove && justRecipe(r.outAbs, "snapshot") {
-			res.UIUnseen = uiEditedUnseen(uses, r.sess.Cwd)
-		}
-		var testFiles int
-		if covered, testFiles, err = specCoverage(r.outAbs, r.idx.order); err != nil {
-			r.say(ctx, "⚠ /spec: scanning "+cfg.OutDir+": "+err.Error()+"\n")
+		if covered, coveredBy, err = r.inspect(ctx, w, uses, started, true, &res); err != nil {
 			return false, false, err
-		}
-		base := cfg.Bases[item]
-		if base == "" || cfg.Attempts[item] == 0 {
-			base = "HEAD"
-			if sha, err := specGit(ctx, r.sess.Cwd, "rev-parse", "HEAD"); err == nil {
-				base = strings.TrimSpace(sha)
-				if cfg.Bases == nil {
-					cfg.Bases = map[string]string{}
-				}
-				cfg.Bases[item] = base
-			}
-		}
-		ch := specRoundChanges(ctx, r.sess.Cwd, cfg.OutDir, base)
-		switch {
-		case w.Mode == specModeSetup:
-			res.Covered = testFiles > 0
-		case w.Mode == specModeRemove || !ch.ok:
-			_, res.Covered = covered[item]
-		default:
-			// An older test that happens to carry the token proves nothing about this round.
-			coveredBy = specNamedIn(r.outAbs, item, ch.files())
-			res.Covered = coveredBy != ""
-		}
-		if ch.ok && res.TurnErr == "" {
-			r.gates(ctx, w, ch, &res)
 		}
 	}
 
@@ -1171,6 +1147,62 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 	}
 	r.save(ctx)
 	return done, block, nil
+}
+
+// inspect runs the checks that decide a round into res: the suite (unless
+// runTests is off, for the in-round check), the UI look, the test naming this
+// item in the round's own files, and the gates on what the round wrote.
+func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, started time.Time, runTests bool, res *specRoundResult) (covered map[string]string, coveredBy string, err error) {
+	cfg, item := r.cfg, w.Item
+	switch cmd := r.testCmd(); {
+	case !runTests:
+		res.TestsPass = true // not run yet: the other checks still say what to fix
+	case cmd == "":
+		res.TestTail = "no test command found: `" + cfg.OutDir + "/` has no justfile with a test recipe, no Cargo.toml, package.json or go.mod"
+	case r.roundRanGreen(uses, cmd, started):
+		res.TestsPass = true
+		r.say(ctx, fmt.Sprintf("🧪 `%s` passed in the round, after its last change; not run again\n", cmd))
+	default:
+		res.TestsPass, res.TestTail = r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd)
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
+	}
+	// A snapshot recipe makes looking possible; only then is an unseen UI change blind.
+	if w.Mode != specModeRemove && justRecipe(r.outAbs, "snapshot") {
+		res.UIUnseen = uiEditedUnseen(uses, r.sess.Cwd)
+	}
+	covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
+	if err != nil {
+		r.say(ctx, "⚠ /spec: scanning "+cfg.OutDir+": "+err.Error()+"\n")
+		return nil, "", err
+	}
+	base := cfg.Bases[item]
+	if base == "" || cfg.Attempts[item] == 0 {
+		base = "HEAD"
+		if sha, err := specGit(ctx, r.sess.Cwd, "rev-parse", "HEAD"); err == nil {
+			base = strings.TrimSpace(sha)
+			if cfg.Bases == nil {
+				cfg.Bases = map[string]string{}
+			}
+			cfg.Bases[item] = base
+		}
+	}
+	ch := specRoundChanges(ctx, r.sess.Cwd, cfg.OutDir, base)
+	switch {
+	case w.Mode == specModeSetup:
+		res.Covered = testFiles > 0
+	case w.Mode == specModeRemove || !ch.ok:
+		_, res.Covered = covered[item]
+	default:
+		// An older test that happens to carry the token proves nothing about this round.
+		coveredBy = specNamedIn(r.outAbs, item, ch.files())
+		res.Covered = coveredBy != ""
+	}
+	if ch.ok && res.TurnErr == "" {
+		r.gates(ctx, w, ch, res)
+	}
+	return covered, coveredBy, nil
 }
 
 func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w specWork, testCmd, lintCmd string) (prompt, head string) {

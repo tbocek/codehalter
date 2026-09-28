@@ -638,4 +638,9 @@ func TestAgentsFileMayNotGrowOverBudget(t *testing.T) {
 	if out := edit(nested, "# Brief\n", "# Brief\n- more\n"); !strings.HasPrefix(out, "file written") {
 		t.Errorf("a docs/AGENT.md is not the brief, but was refused: %q", out)
 	}
+	// While /spec runs the brief is read-only, even an edit that shrinks it.
+	s.setSpecFence(filepath.Join(s.Cwd, "spec"))
+	if out := edit(brief, "# Brief\n", "# The brief\n"); !strings.Contains(out, "read-only while /spec runs") {
+		t.Errorf("an AGENT.md edit during /spec went through: %q", out)
+	}
 }

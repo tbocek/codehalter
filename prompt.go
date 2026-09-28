@@ -753,7 +753,7 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 
 	// Only the directories, never the moving item count: the prefix must stay stable.
 	if cfg, err := loadSpecConfig(sess.Cwd); err == nil && cfg != nil {
-		fmt.Fprintf(&b, "\n\n## This project is built with /spec\n\nThe specification in `%s/` is implemented into `%s/` item by item, each item done when a test names it and the suite passes (the item ids are in the spec files). A chat request that amounts to many rounds of work, or that says something built does not work, is not a plan here: name the spec items it concerns in submit_plan's `redo` and codehalter rebuilds them one per round. Inside a /spec round (the prompt says which item it is) the item is already chosen: plan and execute that item.\n", cfg.SpecDir, cfg.OutDir)
+		fmt.Fprintf(&b, "\n\n## This project is built with /spec\n\nThe specification in `%s/` is implemented into `%s/` item by item, each item done when a test names it and the suite passes (the item ids are in the spec files). A chat request that amounts to many rounds of work, or that says something built does not work, is not a plan here: name the spec items it concerns in submit_plan's `redo` and codehalter rebuilds them one per round. Inside a /spec round (the prompt says which item it is) the item is already chosen: plan and execute that item, and leave AGENT.md alone: it is read-only while /spec runs.\n", cfg.SpecDir, cfg.OutDir)
 	}
 
 	// In the cached prefix, not re-sent per phase: each copy would stack in history.
@@ -783,12 +783,16 @@ var agentsFileNames = []string{"AGENTS.md", "AGENT.md", "agents.md", "agent.md"}
 
 const agentsFileBudget = 12 * 1024
 
-// agentsFileRefusal: over budget, the brief may not grow. In one day of /spec
-// rounds it went from 73 to 179 lines with the over-budget note in the prompt.
+// agentsFileRefusal: during /spec rounds the brief is read-only, since every
+// round planned a bullet for its item and it went from 73 to 179 lines in a day;
+// elsewhere, over budget, it may not grow.
 func (a *agent) agentsFileRefusal(sid, path, oldContent, newContent string) string {
 	sess := a.getSession(sid)
 	if sess == nil || filepath.Dir(path) != filepath.Clean(sess.Cwd) || !slices.Contains(agentsFileNames, filepath.Base(path)) {
 		return ""
+	}
+	if sess.specFence() != "" {
+		return fmt.Sprintf("refused: %s is read-only while /spec runs. It is the project brief, not a log: this round's work is recorded in the code, its tests and git. Nothing was written; go on with the task without it.", filepath.Base(path))
 	}
 	if len(newContent) <= agentsFileBudget || len(newContent) <= len(oldContent) {
 		return ""

@@ -361,6 +361,13 @@ const planRoundNudge = 20
 // Backstop for "different enough" calls forever; the repetition ladder catches the rest earlier.
 const maxToolLoopIterations = 100
 
+// An execute step at the cap with at least two edits and a build or test run in
+// its last productiveWindow calls gets productiveExtension more, once.
+const (
+	productiveWindow    = 40
+	productiveExtension = 50
+)
+
 // An execute subtask that only reads for this long is lost: in the logs, no
 // successful one read more than about 32 calls in a row, and most capped ones did.
 const (
@@ -744,6 +751,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	var escalated bool
 	var failedRounds int
 	var readStreak int // execute calls since the last edit, test or build
+	limit, extended := maxToolLoopIterations, false
 	readNudged := false
 	// Samplers do not enter the KV cache key, so the prefix survives unless a role
 	// carries chat_template_kwargs (see res/settings.toml).
@@ -765,8 +773,27 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		return true
 	}
 	for iter := 0; ; iter++ {
-		if iter >= maxToolLoopIterations {
-			return finish(fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations))
+		if iter >= limit {
+			// A step still editing and building at the cap is big work, not a spiral (the
+			// read tripwire ends those): two such steps building a page hit it in one morning,
+			// and each cost a replan that had to find out again where things stood.
+			edits, runs := 0, 0
+			for _, u := range res.ToolUses[max(0, len(res.ToolUses)-productiveWindow):] {
+				switch {
+				case (u.Name == "edit_file" || u.Name == "write_file") && strings.HasPrefix(u.Output, "file written"):
+					edits++
+				case u.Name == "run_command" && !onlyReads(parseArgs(u.Input).str("command")):
+					runs++
+				}
+			}
+			if extended || phase != "execute" || edits < 2 || runs < 1 {
+				return finish(fmt.Errorf("tool loop exceeded %d iterations", limit))
+			}
+			extended = true
+			limit += productiveExtension
+			messages = a.addCorrective(sid, messages, fmt.Sprintf(
+				"You have used %d calls on this step. You are still making progress, so you get %d more, and no more after that: finish the step, run its check, and call `respond`. What does not fit goes into `respond` as the next step.", iter, productiveExtension))
+			a.say(ctx, sid, fmt.Sprintf("\n⏱ Step at %d calls and still editing and building: %d more to finish it.\n", iter, productiveExtension))
 		}
 		sess := a.getSession(sid)
 		// Steering and finished jobs go in mid-turn, or the model polls for jobs, as one
