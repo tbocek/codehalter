@@ -131,80 +131,94 @@ type specRoundResult struct {
 }
 
 // specDecide counts the attempt in cfg.Attempts, so a cancelled and resumed /spec gives no fresh budget.
-func specDecide(cfg *specConfig, item string, r specRoundResult) (done, block bool, reason string) {
+// prev is what the item's last attempt failed; fails is what this one failed.
+// A second failure of another kind earns one more attempt: the item moved.
+func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (done, block bool, reason, fails string) {
 	if r.Question != "" {
-		return false, true, "the planner asked a question instead of guessing"
+		return false, true, "the planner asked a question instead of guessing", ""
 	}
 	switch {
 	case r.Mode == specModeRemove:
 		if r.TurnErr == "" && r.TestsPass && !r.Covered {
-			return true, false, ""
+			return true, false, "", ""
 		}
 	case r.Mode == specModeRefactor:
 		if r.TurnErr == "" && r.TestsPass && r.Committed && r.Improved && len(r.Lint)+len(r.Oversize) == 0 {
-			return true, false, ""
+			return true, false, "", ""
 		}
 	case r.Mode == specModeChange:
 		// The test for the OLD text still covers a changed item; the commit is the evidence of work.
 		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.Unreachable)+len(r.Lint)+len(r.Oversize) == 0 {
-			return true, false, ""
+			return true, false, "", ""
 		}
 	default:
 		// A reopened item's old test still names it: like a change, it needs a commit.
 		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen) == 0 && (r.Committed || !r.Redo) &&
 			len(r.Unreachable)+len(r.Lint)+len(r.Oversize) == 0 {
-			return true, false, ""
+			return true, false, "", ""
 		}
 	}
-	var why []string
+	var why, kinds []string
+	add := func(kind, text string) {
+		why = append(why, text)
+		if !slices.Contains(kinds, kind) {
+			kinds = append(kinds, kind)
+		}
+	}
 	if len(r.UIUnseen) > 0 && r.TurnErr == "" {
-		why = append(why, fmt.Sprintf("you changed the UI (%s) and never looked at it: render the screen and look at it with `screenshot`", strings.Join(r.UIUnseen, ", ")))
+		add("ui", fmt.Sprintf("you changed the UI (%s) and never looked at it: render the screen and look at it with `screenshot`", strings.Join(r.UIUnseen, ", ")))
 	}
 	if r.TurnErr != "" {
-		why = append(why, "the round ended with an error: "+r.TurnErr)
+		add("error", "the round ended with an error: "+r.TurnErr)
 	}
 	if r.Mode == specModeChange && !r.Committed && r.TurnErr == "" {
-		why = append(why, "the spec text changed but no code did: update the implementation AND its test to match the new text")
+		add("nochange", "the spec text changed but no code did: update the implementation AND its test to match the new text")
 	}
 	if r.Redo && !r.Committed && r.TurnErr == "" {
-		why = append(why, "the item was sent back with /spec redo but no code changed: rebuild what falls short of the spec text")
+		add("nochange", "the item was sent back with /spec redo but no code changed: rebuild what falls short of the spec text")
 	}
 	if r.Mode == specModeRemove && r.Covered {
-		why = append(why, fmt.Sprintf("a test in the output directory still names %s", item))
+		add("stillnamed", fmt.Sprintf("a test in the output directory still names %s", item))
 	}
 	switch {
 	case r.Covered, r.Mode == specModeRemove, r.Mode == specModeRefactor:
 	case r.Mode == specModeSetup:
-		why = append(why, "no test source exists in the output directory yet")
+		add("notests", "no test source exists in the output directory yet")
 	default:
-		why = append(why, fmt.Sprintf("no test this round added or changed is named after %s: put `%s` in a test function's name or in a test call's title; a comment or a string that mentions it does not count", item, specTestToken(item)))
+		add("unnamed", fmt.Sprintf("no test this round added or changed is named after %s: put `%s` in a test function's name or in a test call's title; a comment or a string that mentions it does not count", item, specTestToken(item)))
 	}
 	if len(r.Unreachable) > 0 {
-		why = append(why, "the program does not call these functions the round added: "+strings.Join(r.Unreachable, "; ")+
+		add("unreachable", "the program does not call these functions the round added: "+strings.Join(r.Unreachable, "; ")+
 			". Call each from the path the spec describes (a UI handler, main, the flow that owns it) or delete it; a helper that exists only for tests says so in its name (`rows_for_test`)")
 	}
 	if len(r.Lint) > 0 {
-		why = append(why, "the linter reports problems in lines this round wrote:\n\n```\n"+strings.Join(r.Lint, "\n")+"\n```")
+		add("lint", "the linter reports problems in lines this round wrote:\n\n```\n"+strings.Join(r.Lint, "\n")+"\n```")
 	}
-	why = append(why, r.Oversize...)
+	for _, o := range r.Oversize {
+		add("oversize", o)
+	}
 	if r.Mode == specModeRefactor && !r.Improved && r.TurnErr == "" {
-		why = append(why, "the refactoring made no measured progress ("+r.Debt+"): one of the numbers must go down and none up")
+		add("noprogress", "the refactoring made no measured progress ("+r.Debt+"): one of the numbers must go down and none up")
 	}
 	if !r.TestsPass {
-		why = append(why, "the test command did not pass. The end of its output:\n\n```\n"+strings.TrimSpace(r.TestTail)+"\n```")
+		add("tests", "the test command did not pass. The end of its output:\n\n```\n"+strings.TrimSpace(r.TestTail)+"\n```")
 	}
 	if len(why) == 0 {
-		why = append(why, "the round did not finish the item")
+		add("unfinished", "the round did not finish the item")
 	}
 	if cfg.Attempts == nil {
 		cfg.Attempts = map[string]int{}
 	}
 	cfg.Attempts[item]++
-	reason = strings.Join(why, "; ")
-	if cfg.Attempts[item] >= specMaxAttempts {
-		return false, true, reason
+	reason, fails = strings.Join(why, "; "), strings.Join(kinds, ",")
+	limit := specMaxAttempts
+	if cfg.Attempts[item] == specMaxAttempts && prev != "" && fails != prev {
+		limit++
 	}
-	return false, false, reason
+	if cfg.Attempts[item] >= limit {
+		return false, true, reason, fails
+	}
+	return false, false, reason, fails
 }
 
 func specPaths(cwd, specArg, outArg string) (specRel, outRel string, err error) {
@@ -303,6 +317,7 @@ type specRun struct {
 	lastDelta   string            // the change report already shown
 	vanished    bool              // the last scan lost most of the ledger at once
 	lintMissing bool              // the linter did not run once; said, and not again
+	fails       map[string]string // which checks an item's last attempt failed (see specDecide)
 }
 
 type specWork struct {
@@ -1095,9 +1110,14 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, si
 		sha = r.a.specCommit(ctx, r.sid, r.sess.Cwd, cfg, r.idx, item, w.Mode)
 		res.Committed = sha != ""
 	}
-	done, block, reason := specDecide(cfg, item, res)
+	done, block, reason, fails := specDecide(cfg, item, res, r.fails[item])
+	if r.fails == nil {
+		r.fails = map[string]string{}
+	}
+	r.fails[item] = fails
 	if done || block {
 		delete(cfg.Bases, item)
+		delete(r.fails, item)
 	}
 	switch {
 	case block && w.Mode == specModeRefactor:

@@ -15,26 +15,49 @@ import (
 // Done only when a test names the item and the suite passes; one retry, then blocked.
 func TestSpecDecide(t *testing.T) {
 	cfg := &specConfig{}
-	if done, block, _ := specDecide(cfg, "F0.1", specRoundResult{Covered: true, TestsPass: true}); !done || block {
+	if done, block, _, _ := specDecide(cfg, "F0.1", specRoundResult{Covered: true, TestsPass: true}, ""); !done || block {
 		t.Errorf("covered and passing: done=%v block=%v, want done", done, block)
 	}
 
 	// Covered but the suite fails: a broken earlier item counts against the round.
-	done, block, reason := specDecide(cfg, "F0.2", specRoundResult{Covered: true, TestsPass: false, TestTail: "test f0_1 failed"})
+	done, block, reason, _ := specDecide(cfg, "F0.2", specRoundResult{Covered: true, TestsPass: false, TestTail: "test f0_1 failed"}, "")
 	if done || block || !strings.Contains(reason, "test f0_1 failed") {
 		t.Errorf("first failure: done=%v block=%v reason=%q, want a retry carrying the test output", done, block, reason)
 	}
-	done, block, reason = specDecide(cfg, "F0.2", specRoundResult{TestsPass: true})
+	done, block, reason, _ = specDecide(cfg, "F0.2", specRoundResult{TestsPass: true}, "")
 	if done || !block || !strings.Contains(reason, "f0_2") {
 		t.Errorf("second failure: done=%v block=%v reason=%q, want blocked, naming the expected test token", done, block, reason)
 	}
 
-	if _, block, _ := specDecide(cfg, "F0.3", specRoundResult{Question: "keep or drop?"}); !block {
+	if _, block, _, _ := specDecide(cfg, "F0.3", specRoundResult{Question: "keep or drop?"}, ""); !block {
 		t.Error("a planner question did not block the item")
 	}
-	_, _, reason = specDecide(&specConfig{}, specSetupID, specRoundResult{Mode: specModeSetup, TestsPass: true})
+	_, _, reason, _ = specDecide(&specConfig{}, specSetupID, specRoundResult{Mode: specModeSetup, TestsPass: true}, "")
 	if !strings.Contains(reason, "no test source") {
 		t.Errorf("setup without tests: reason %q", reason)
+	}
+}
+
+// A second failure of another kind earns a third attempt; the same failure twice,
+// or any third failure, blocks.
+func TestSpecDecideThirdAttemptOnlyWhenTheFailureMoved(t *testing.T) {
+	red := specRoundResult{Covered: true, TestsPass: false}
+	unseen := specRoundResult{Covered: true, TestsPass: true, UIUnseen: []string{"src/ui.rs"}}
+
+	cfg := &specConfig{}
+	_, _, _, first := specDecide(cfg, "F0.1", red, "")
+	if _, block, _, _ := specDecide(cfg, "F0.1", red, first); !block {
+		t.Error("the same failure twice did not block")
+	}
+
+	cfg = &specConfig{}
+	_, _, _, first = specDecide(cfg, "F0.2", red, "")
+	_, block, _, second := specDecide(cfg, "F0.2", unseen, first)
+	if block {
+		t.Errorf("a failure that moved (%s -> %s) blocked at the second attempt", first, second)
+	}
+	if _, block, _, _ := specDecide(cfg, "F0.2", red, second); !block {
+		t.Error("a third failure did not block")
 	}
 }
 
@@ -47,19 +70,19 @@ func TestSpecDecideGates(t *testing.T) {
 		"lint":        {Covered: true, TestsPass: true, Lint: []string{"src/a.rs:3: unused variable"}},
 		"oversize":    {Covered: true, TestsPass: true, Oversize: []string{"`src/ui.rs` is 12000 lines, over the 1500-line budget"}},
 	} {
-		done, _, reason := specDecide(&specConfig{}, "F0.1", r)
+		done, _, reason, _ := specDecide(&specConfig{}, "F0.1", r, "")
 		if done || !strings.Contains(reason, map[string]string{"unreachable": "only tests call it", "lint": "unused variable", "oversize": "1500-line budget"}[name]) {
 			t.Errorf("%s: done=%v reason=%q", name, done, reason)
 		}
 	}
-	if done, _, _ := specDecide(&specConfig{}, "F0.1", green); !done {
+	if done, _, _, _ := specDecide(&specConfig{}, "F0.1", green, ""); !done {
 		t.Error("a clean round was held back")
 	}
 	cfg := &specConfig{}
-	if done, _, reason := specDecide(cfg, specRefactorID, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Debt: "a → b"}); done || !strings.Contains(reason, "no measured progress") {
+	if done, _, reason, _ := specDecide(cfg, specRefactorID, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Debt: "a → b"}, ""); done || !strings.Contains(reason, "no measured progress") {
 		t.Errorf("a refactor that shrank nothing: done=%v reason=%q", done, reason)
 	}
-	if done, _, _ := specDecide(cfg, specRefactorID, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Improved: true}); !done {
+	if done, _, _, _ := specDecide(cfg, specRefactorID, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Improved: true}, ""); !done {
 		t.Error("a refactor that shrank the debt was held back")
 	}
 }
@@ -194,34 +217,34 @@ func TestSpecIgnoredProbes(t *testing.T) {
 // test names the item.
 func TestSpecDecideChangeAndRemove(t *testing.T) {
 	cfg := &specConfig{}
-	done, _, reason := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true})
+	done, _, reason, _ := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true}, "")
 	if done || !strings.Contains(reason, "no code did") {
 		t.Errorf("a change round that wrote nothing: done=%v reason=%q", done, reason)
 	}
-	if done, _, _ := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true, Committed: true}); !done {
+	if done, _, _, _ := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true, Committed: true}, ""); !done {
 		t.Error("a change round that committed should be done")
 	}
 
-	done, _, reason = specDecide(cfg, "F0.2", specRoundResult{Mode: specModeRemove, TestsPass: true, Covered: true, Committed: true})
+	done, _, reason, _ = specDecide(cfg, "F0.2", specRoundResult{Mode: specModeRemove, TestsPass: true, Covered: true, Committed: true}, "")
 	if done || !strings.Contains(reason, "still names") {
 		t.Errorf("a removal with the test still in place: done=%v reason=%q", done, reason)
 	}
-	if done, _, _ := specDecide(cfg, "F0.2", specRoundResult{Mode: specModeRemove, TestsPass: true, Committed: true}); !done {
+	if done, _, _, _ := specDecide(cfg, "F0.2", specRoundResult{Mode: specModeRemove, TestsPass: true, Committed: true}, ""); !done {
 		t.Error("a removal whose test is gone and whose suite passes should be done")
 	}
 	// The suite must still pass: deleting an item cannot take the build with it.
-	if done, _, reason := specDecide(cfg, "F0.3", specRoundResult{Mode: specModeRemove, TestTail: "3 failed"}); done || !strings.Contains(reason, "did not pass") {
+	if done, _, reason, _ := specDecide(cfg, "F0.3", specRoundResult{Mode: specModeRemove, TestTail: "3 failed"}, ""); done || !strings.Contains(reason, "did not pass") {
 		t.Errorf("a removal that broke the suite: done=%v reason=%q", done, reason)
 	}
 }
 
 func TestSpecDecideRedoNeedsACommit(t *testing.T) {
 	cfg := &specConfig{}
-	done, _, reason := specDecide(cfg, "F0.1", specRoundResult{Redo: true, Covered: true, TestsPass: true})
+	done, _, reason, _ := specDecide(cfg, "F0.1", specRoundResult{Redo: true, Covered: true, TestsPass: true}, "")
 	if done || !strings.Contains(reason, "/spec redo") {
 		t.Errorf("a redo round that wrote nothing: done=%v reason=%q", done, reason)
 	}
-	if done, _, _ := specDecide(cfg, "F0.1", specRoundResult{Redo: true, Covered: true, TestsPass: true, Committed: true}); !done {
+	if done, _, _, _ := specDecide(cfg, "F0.1", specRoundResult{Redo: true, Covered: true, TestsPass: true, Committed: true}, ""); !done {
 		t.Error("a redo round that committed should be done")
 	}
 }
@@ -368,7 +391,7 @@ func TestSpecUIChangeNeedsALook(t *testing.T) {
 	if got := uiEditedUnseen([]ToolUse{editPlain}, sess.Cwd); got != nil {
 		t.Errorf("a round with no UI change reports %v", got)
 	}
-	done, block, reason := specDecide(&specConfig{}, "F1.1", specRoundResult{Covered: true, TestsPass: true, UIUnseen: []string{"rust/src/ui.rs"}})
+	done, block, reason, _ := specDecide(&specConfig{}, "F1.1", specRoundResult{Covered: true, TestsPass: true, UIUnseen: []string{"rust/src/ui.rs"}}, "")
 	if done || block || !strings.Contains(reason, "never looked at it") {
 		t.Errorf("decide = %v %v %q, want one more round with the reason", done, block, reason)
 	}
