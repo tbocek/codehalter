@@ -636,6 +636,58 @@ func specUnreachable(outAbs string, ch specChanges, prog *specProgram) []string 
 	return out
 }
 
+var (
+	// forTestCallRe: a call of a helper named for tests, the naming rule the round prompt sets.
+	forTestCallRe  = regexp.MustCompile(`\b([A-Za-z_]\w*(?:_for_tests?|_for_testing|ForTests?|ForTesting))\s*\(`)
+	notBuiltCodeRe = regexp.MustCompile(`\b(?:todo|unimplemented)!\s*[(\[{]|\bNotImplemented(?:Error|Exception)?\b`)
+	// notBuiltTextRe runs on code with its strings kept, comments gone: a message, not a remark.
+	notBuiltTextRe = regexp.MustCompile(`(?i)\bnot (?:yet )?implemented\b|\bunimplemented\b|\bstub(?:bed)?\b`)
+)
+
+// specStandIns lists the lines the round added to the program that stand in for
+// the work instead of doing it. naivepost counted its LLM, translation, speech
+// and image calls done for weeks: the program asked `reply_for_test()`, which only
+// tests fill, and otherwise answered "no llm server here"; a comment called that
+// "exercised rather than stubbed out", and every test passed.
+func specStandIns(outAbs string, ch specChanges) []string {
+	var out []string
+	for _, rel := range ch.files() {
+		data, err := os.ReadFile(filepath.Join(outAbs, rel))
+		if err != nil {
+			continue
+		}
+		prod := prodSource(rel, string(data))
+		if prod == "" {
+			continue
+		}
+		raw := strings.Split(prod, "\n")
+		code := strings.Split(codeText(rel, prod, blankStrings), "\n")
+		kept := strings.Split(codeText(rel, prod, keepStrings), "\n")
+		added := map[int]bool{}
+		for _, n := range ch.added[rel] {
+			added[n] = true
+		}
+		inHelper := false // inside a top-level function that is itself a for-test helper
+		for i, ln := range code {
+			if m := topLevelDefRe.FindStringSubmatch(ln); m != nil {
+				inHelper = forTestCallRe.MatchString(m[1] + m[2] + "(")
+			}
+			if !added[i+1] || inHelper {
+				continue
+			}
+			at := fmt.Sprintf("%s:%d", rel, i+1)
+			switch {
+			case forTestCallRe.MatchString(ln):
+				name := forTestCallRe.FindStringSubmatch(ln)[1]
+				out = append(out, fmt.Sprintf("`%s` (%s): the program asks a helper that exists for tests, so outside a test it never gets the real answer", name, at))
+			case notBuiltCodeRe.MatchString(ln) || i < len(kept) && notBuiltTextRe.MatchString(kept[i]):
+				out = append(out, fmt.Sprintf("%s: `%s` says the work is not built", at, strings.TrimSpace(clipUTF8(raw[i], 120))))
+			}
+		}
+	}
+	return out
+}
+
 // Defaults for the size budget: a file over maxFileLines may still grow by
 // fileGrowthSlack lines, enough for the call into a new module.
 const (

@@ -67,8 +67,7 @@ type specConfig struct {
 	Skip     []string       `toml:"skip,omitempty"`
 	Attempts map[string]int `toml:"attempts,omitempty"`
 	// Redo: any non-empty value counts, older ledgers hold reason text.
-	Redo    map[string]string `toml:"redo,omitempty"`
-	Blocked []specBlock       `toml:"blocked,omitempty"`
+	Redo map[string]string `toml:"redo,omitempty"`
 	// Items records the spec text each item was built from, which coverage cannot know.
 	Items map[string]specLedger `toml:"items,omitempty"`
 	// Final is redone when the item or blocked count has moved since.
@@ -107,14 +106,9 @@ type specLedger struct {
 	// Named: recorded under the rule that only a test's name counts, so reconcile
 	// holds it to that; an older entry may rest on a comment and stays done.
 	Named bool `toml:"named,omitempty"`
-}
-
-// specBlock.Answer is filled by the user; the next /spec retries the item with it.
-type specBlock struct {
-	ID       string `toml:"id"`
-	Reason   string `toml:"reason"`
-	Question string `toml:"question,omitempty"`
-	Answer   string `toml:"answer,omitempty"`
+	// Checked: when and by which codehalter the completion check found the item done;
+	// a round that rebuilds the item writes a new entry without it.
+	Checked string `toml:"checked,omitempty"`
 }
 
 func specConfigPath(cwd string) string {
@@ -137,7 +131,7 @@ func saveSpecConfig(cwd string, cfg *specConfig) error {
 	var buf bytes.Buffer
 	buf.WriteString("# /spec loop state. spec_dir, out_dir and target come from the /spec command,\n" +
 		"# or from the questions the first /spec asked.\n" +
-		"# To answer a blocked item, fill its `answer` and run /spec again.\n" +
+		"# Questions for you are in the spec directory's QUESTIONS.md, not here.\n" +
 		"# accept_open_markers = true starts the loop despite open REVIEW/TBD markers.\n" +
 		"# test_cmd overrides the detected test command (run from out_dir); lint_cmd the\n" +
 		"# detected linter (\"off\" skips linting). max_file_lines is the size budget of a\n" +
@@ -191,15 +185,6 @@ func (c *specConfig) context(idx *specIndex) []string {
 		return c.Context
 	}
 	return defaultSpecContext(idx)
-}
-
-func (c *specConfig) block(id string) *specBlock {
-	for i := range c.Blocked {
-		if c.Blocked[i].ID == id {
-			return &c.Blocked[i]
-		}
-	}
-	return nil
 }
 
 // parseSpecArgs has no positional form: the setup questions read their options off the project.
@@ -351,6 +336,8 @@ type specIndex struct {
 	items    map[string]*specItem
 	order    []string
 	patterns []*regexp.Regexp
+	// questions: the spec's QUESTIONS.md by item id, written by the loop, answered by the user.
+	questions map[string][]specQuestion
 }
 
 var (
@@ -382,6 +369,9 @@ func scanSpec(root string, patterns, context, skip []string) (*specIndex, error)
 			if err != nil {
 				return err
 			}
+			if strings.EqualFold(rel, specQuestionsFile) {
+				return nil // no items: read below
+			}
 			files = append(files, filepath.ToSlash(rel))
 		}
 		return nil
@@ -397,6 +387,12 @@ func scanSpec(root string, patterns, context, skip []string) (*specIndex, error)
 		return files[i] < files[j]
 	})
 
+	switch data, err := os.ReadFile(filepath.Join(root, specQuestionsFile)); {
+	case err == nil:
+		idx.questions = parseSpecQuestions(string(data))
+	case !os.IsNotExist(err):
+		return nil, err
+	}
 	for _, rel := range files {
 		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
 		if err != nil {
@@ -1052,6 +1048,12 @@ func specItemHash(idx *specIndex, id string) string {
 	if text == "" {
 		return ""
 	}
+	// An answer is spec text of the item: changing it rebuilds the item.
+	for _, q := range idx.questions[id] {
+		if q.Answer != "" {
+			text += "\n" + q.Question + "\n" + q.Answer
+		}
+	}
 	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(text), " ")))
 	return hex.EncodeToString(sum[:8])
 }
@@ -1483,23 +1485,17 @@ func renderSpecDelta(d specDelta) string {
 	return b.String()
 }
 
-func nextSpecItem(idx *specIndex, cfg *specConfig) (id, answer string) {
+// nextSpecItem passes over an item waiting on its question, and those skip names.
+func nextSpecItem(idx *specIndex, cfg *specConfig, skip func(string) bool) string {
 	for _, it := range idx.order {
-		if cfg.done(it) {
-			continue
+		if !cfg.done(it) && !idx.asked(it) && (skip == nil || !skip(it)) {
+			return it
 		}
-		if b := cfg.block(it); b != nil {
-			if strings.TrimSpace(b.Answer) == "" {
-				continue
-			}
-			return it, b.Answer
-		}
-		return it, ""
 	}
-	return "", ""
+	return ""
 }
 
-type specTally struct{ total, done, blocked int }
+type specTally struct{ total, done, asked int }
 
 func specTallies(cfg *specConfig, idx *specIndex) (kinds [4]specTally, perDoc []specTally) {
 	perDoc = make([]specTally, len(idx.docs))
@@ -1512,9 +1508,9 @@ func specTallies(cfg *specConfig, idx *specIndex) (kinds [4]specTally, perDoc []
 		case cfg.done(id):
 			k.done++
 			d.done++
-		case cfg.block(id) != nil:
-			k.blocked++
-			d.blocked++
+		case idx.asked(id):
+			k.asked++
+			d.asked++
 		}
 	}
 	return kinds, perDoc
@@ -1540,32 +1536,25 @@ func renderSpecStatus(cfg *specConfig, idx *specIndex, testFiles int, testCmd st
 	fmt.Fprintf(&b, "Covered: %d/%d flows · %d/%d sections (formats, screens, rules) · %d/%d parameters and tools · %d/%d cited-only ids\n\n",
 		kinds[specDefHeading].done, kinds[specDefHeading].total, kinds[specDefSection].done, kinds[specDefSection].total,
 		kinds[specDefTableRow].done, kinds[specDefTableRow].total, kinds[specDefMention].done, kinds[specDefMention].total)
-	b.WriteString("| file | covered | blocked | total |\n|---|---|---|---|\n")
+	b.WriteString("| file | covered | waiting on a question | total |\n|---|---|---|---|\n")
 	for d, t := range perDoc {
 		if t.total > 0 {
-			fmt.Fprintf(&b, "| %s | %d | %d | %d |\n", idx.docs[d].rel, t.done, t.blocked, t.total)
+			fmt.Fprintf(&b, "| %s | %d | %d | %d |\n", idx.docs[d].rel, t.done, t.asked, t.total)
 		}
 	}
-	if next, _ := nextSpecItem(idx, cfg); next != "" {
+	if next := nextSpecItem(idx, cfg, nil); next != "" {
 		fmt.Fprintf(&b, "\nNext: **%s**", next)
 		if t := idx.items[next].Title; t != "" {
 			fmt.Fprintf(&b, " (%s)", t)
 		}
 		b.WriteString("\n")
 	} else {
-		b.WriteString("\nNothing left: every id is covered or blocked.\n")
+		b.WriteString("\nNothing left: every id is covered or waits on a question.\n")
 	}
-	if len(cfg.Blocked) > 0 {
-		b.WriteString("\nBlocked (fill `answer` in `.codehalter/spec.toml`, then run /spec):\n")
-		for _, bl := range cfg.Blocked {
-			fmt.Fprintf(&b, "- **%s**: %s", bl.ID, bl.Reason)
-			if bl.Question != "" {
-				fmt.Fprintf(&b, " · question: %s", bl.Question)
-			}
-			if bl.Answer != "" {
-				b.WriteString(" · answered, will retry")
-			}
-			b.WriteString("\n")
+	if open := specOpenQuestions(idx); len(open) > 0 {
+		fmt.Fprintf(&b, "\nWaiting on your answer in `%s/%s` (write it after **Answer:**, then run /spec):\n", cfg.SpecDir, specQuestionsFile)
+		for _, q := range open {
+			fmt.Fprintf(&b, "- **%s**: %s\n", q.ID, q.Question)
 		}
 	}
 	if ctx := cfg.context(idx); len(ctx) > 0 {

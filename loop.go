@@ -52,6 +52,9 @@ type planResult struct {
 	Choices  []string  `json:"choices"`
 	Question string    `json:"question"`
 	Subtasks []subtask `json:"subtasks"`
+	// A /spec round's question: the spec text that comes closest, and options with examples.
+	SpecQuote string       `json:"spec_quote"`
+	Options   []specOption `json:"options"`
 	// Every subtask only relays findings, so the orchestrator skips the confirmation.
 	ReportOnly bool `json:"report_only"`
 	// The planner's third exit, for a request too big for one plan (see specFromPlan).
@@ -193,20 +196,39 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		return nil, fmt.Errorf("plan not valid JSON: %w", parseErr)
 	}
 
+	// A /spec question goes to the spec's QUESTIONS.md, once it is one the user can
+	// answer from the spec alone: autopilot's first option would let the model settle
+	// an open point of the spec by itself, and an answer given in chat is gone for
+	// every later round of the item.
+	if fence := sess.specFence(); fence != "" && !plan.Clear {
+		q, wrong := specQuestionFrom(plan, fence)
+		if wrong != "" {
+			a.say(ctx, sid, fmt.Sprintf("\n⚠ The planner asked a question that is not answerable from the spec as asked: %s. Asking it to look again.\n", wrong))
+			retry, retryErr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, specQuestionCorrective(wrong))
+			if retryErr != nil {
+				return nil, retryErr
+			}
+			if plan, parseErr = planFrom(retry); parseErr != nil {
+				a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning failed! The planner's second answer was not a valid plan (%v). Nothing will run.\n", parseErr))
+				return nil, fmt.Errorf("plan not valid JSON: %w", parseErr)
+			}
+			if plan.Clear {
+				return plan, nil // it found the answer in the spec
+			}
+			q, wrong = specQuestionFrom(plan, fence)
+		}
+		a.say(ctx, sid, q.Question+"\n")
+		sess.AddUser("Question parked for the user by the spec loop: " + q.Question)
+		sess.saveOrLog()
+		return nil, &specQuestionError{Q: q, Problem: wrong}
+	}
+
 	if !plan.Clear && len(plan.Choices) > 0 {
 		question := plan.Question
 		if question == "" {
 			question = "I'm not sure what you mean. Which of these?"
 		}
 		a.say(ctx, sid, question)
-
-		// Under /spec autopilot, taking the first option would let the model settle an
-		// open spec point by itself, so the question is parked instead.
-		if sess.specFence() != "" && a.isAutopilot() {
-			sess.AddUser("Question parked for the user by the spec loop: " + question)
-			sess.saveOrLog()
-			return nil, &specQuestionError{Question: question, Choices: plan.Choices}
-		}
 
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
 		choice := plan.Choices[0]

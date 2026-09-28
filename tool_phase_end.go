@@ -38,6 +38,22 @@ var submitPlanTool = Tool{Def: map[string]any{
 					"type":        "string",
 					"description": "One sentence asking which interpretation, only when clear=false.",
 				},
+				"spec_quote": map[string]any{
+					"type":        "string",
+					"description": "Only in a /spec round, with clear=false: the spec text that comes closest to deciding the question, copied exactly from a spec file. codehalter checks that it is there.",
+				},
+				"options": map[string]any{
+					"type":        "array",
+					"description": "Only in a /spec round, with clear=false, instead of choices: 2 or 3 ways to decide the question, your pick first.",
+					"items": map[string]any{
+						"type":     "object",
+						"required": []string{"choice", "example"},
+						"properties": map[string]any{
+							"choice":  map[string]any{"type": "string", "description": "The option in a few words."},
+							"example": map[string]any{"type": "string", "description": "What the user would see or the program would do with it: a label, a layout, a value, a line of a file."},
+						},
+					},
+				},
 				"subtasks": map[string]any{
 					"type":        "array",
 					"description": "One or more units of work for the executor. Empty only when clear=false (clarification) or report_only with the answer in the `answer` argument.",

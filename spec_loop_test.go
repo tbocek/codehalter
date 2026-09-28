@@ -70,9 +70,10 @@ func TestSpecDecideGates(t *testing.T) {
 		"unreachable": {Covered: true, TestsPass: true, Unreachable: []string{"`run` (src/a.rs:3): only tests call it"}},
 		"lint":        {Covered: true, TestsPass: true, Lint: []string{"src/a.rs:3: unused variable"}},
 		"oversize":    {Covered: true, TestsPass: true, Oversize: []string{"`src/ui.rs` is 12000 lines, over the 1500-line budget"}},
+		"standin":     {Covered: true, TestsPass: true, StandIns: []string{"`reply_for_test` (src/a.rs:3): the program asks a helper that exists for tests"}},
 	} {
 		done, _, reason, _ := specDecide(&specConfig{}, "F0.1", r, "")
-		if done || !strings.Contains(reason, map[string]string{"unreachable": "only tests call it", "lint": "unused variable", "oversize": "1500-line budget"}[name]) {
+		if done || !strings.Contains(reason, map[string]string{"unreachable": "only tests call it", "lint": "unused variable", "oversize": "1500-line budget", "standin": "is not done"}[name]) {
 			t.Errorf("%s: done=%v reason=%q", name, done, reason)
 		}
 	}
@@ -174,14 +175,19 @@ func TestSpecRoundPrompt(t *testing.T) {
 		t.Errorf("setup prompt:\n%s", setup)
 	}
 
-	answered, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Question: "keep or drop?", Answer: "keep it"}, "just test", "")
-	if !strings.Contains(answered, "keep or drop?") || !strings.Contains(answered, "keep it") {
+	qa := "## F0.2 · keep or drop?\n\n**Answer:** keep it"
+	answered, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Answered: qa}, "just test", "")
+	if !strings.Contains(answered, qa) {
 		t.Errorf("answered prompt lacks the question and answer:\n%s", answered)
 	}
-	// A changed item that was blocked comes back with its answer; the diff fence must still close.
-	changed, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Mode: specModeChange, Note: "-old\n+new", Answer: "keep it"}, "just test", "")
-	if !strings.Contains(changed, "+new\n```\n\n## Your earlier question was answered") {
+	// A changed item comes back with its answer; the diff fence must still close.
+	changed, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Mode: specModeChange, Note: "-old\n+new", Answered: qa}, "just test", "")
+	if !strings.Contains(changed, "+new\n```\n\n## Answered in the spec's QUESTIONS.md") {
 		t.Errorf("the answer runs into the diff fence:\n%s", changed)
+	}
+	// A retry keeps the answer beside why the last attempt failed.
+	if retry, _ := a.specRoundPrompt(s.ID, cfg, idx, specWork{Item: "F0.2", Answered: qa, Reason: "the suite failed"}, "just test", ""); !strings.Contains(retry, qa) || !strings.Contains(retry, "the suite failed") {
+		t.Errorf("a retry lost the answer or the reason:\n%s", retry)
 	}
 	// cfg.Context is saved to spec.toml: rendering must not rewrite it.
 	if cfg.Context[0] != "00-principles.md" {
@@ -264,11 +270,12 @@ func TestSpecFinalPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs libadwaita",
-		Items:   map[string]specLedger{"F0.1": {}, "F0.2": {}},
-		Blocked: []specBlock{{ID: "§12-decisions#x", Reason: "the planner asked a question"}}}
-	prompt := a.specFinalPrompt(s.ID, cfg, idx, "just test")
-	for _, want := range []string{"use gtk4-rs libadwaita", "`rust/README.md`", "just test", "2 items, 1 blocked",
-		"§12-decisions#x: the planner asked a question", "spec/00-principles.md", "`--help`", "snapshot"} {
+		Items: map[string]specLedger{"F0.1": {}, "F0.2": {}}}
+	stuck := idx.order[len(idx.order)-1]
+	idx.questions = map[string][]specQuestion{"F0.3": {{ID: "F0.3", Question: "keep or drop?"}}}
+	prompt := a.specFinalPrompt(s.ID, cfg, idx, "just test", map[string]string{stuck: "the build stayed red"})
+	for _, want := range []string{"use gtk4-rs libadwaita", "`rust/README.md`", "just test", "2 items, 2 not done",
+		stuck + ": the build stayed red", `F0.3: waits on the user's answer to "keep or drop?" in spec/QUESTIONS.md`, "spec/00-principles.md", "`--help`", "snapshot"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("final prompt lacks %q", want)
 		}
@@ -276,7 +283,8 @@ func TestSpecFinalPrompt(t *testing.T) {
 	if strings.Contains(prompt, "{{") {
 		t.Errorf("unfilled placeholder:\n%s", prompt)
 	}
-	if !strings.Contains(a.specFinalPrompt(s.ID, &specConfig{SpecDir: "spec", OutDir: "rust"}, idx, "cargo test"), "none") {
+	idx.questions = nil
+	if !strings.Contains(a.specFinalPrompt(s.ID, &specConfig{SpecDir: "spec", OutDir: "rust"}, idx, "cargo test", nil), "none") {
 		t.Error("no blocked items must render as none")
 	}
 }
@@ -496,22 +504,27 @@ func TestSpecPickWorkRemovals(t *testing.T) {
 		t.Errorf("work = %+v, want %s built while the removals are held", w, idx.order[0])
 	}
 
-	// A blocked removal waits for its answer instead of being picked every round.
-	blockedPick := func(answer string) specWork {
+	// A removal blocked in this run, or waiting on its question, is not picked every round.
+	pickRemoval := func(blocked map[string]string) specWork {
 		t.Helper()
 		h := newTerminalHarness(t)
-		r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, idx: idx, reasons: map[string]string{},
+		r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, idx: idx, reasons: map[string]string{}, blocked: blocked,
 			cfg: &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "just test",
-				Items:   built(map[string]specLedger{dropped: {Hash: "whatever", Title: "1. Dropped"}}),
-				Blocked: []specBlock{{ID: dropped, Reason: "stuck", Answer: answer}}}}
+				Items: built(map[string]specLedger{dropped: {Hash: "whatever", Title: "1. Dropped"}})}}
 		return r.pickWork(t.Context(), nil, 1)
 	}
-	if w := blockedPick(""); w.Item != "" {
-		t.Errorf("work = %+v, want the unanswered blocked removal skipped", w)
+	if w := pickRemoval(map[string]string{dropped: "stuck"}); w.Item != "" {
+		t.Errorf("work = %+v, want the removal blocked in this run skipped", w)
 	}
-	if w := blockedPick("keep the helper"); w.Item != dropped || w.Mode != specModeRemove || w.Answer != "keep the helper" {
+	idx.questions = map[string][]specQuestion{dropped: {{ID: dropped, Question: "keep the helper?"}}}
+	if w := pickRemoval(nil); w.Item != "" {
+		t.Errorf("work = %+v, want the removal waiting on its question skipped", w)
+	}
+	idx.questions[dropped][0].Answer, idx.questions[dropped][0].Text = "keep it", "## x · keep the helper?\n\n**Answer:** keep it"
+	if w := pickRemoval(nil); w.Item != dropped || w.Mode != specModeRemove || !strings.Contains(w.Answered, "keep it") {
 		t.Errorf("work = %+v, want the answered removal picked with its answer", w)
 	}
+	idx.questions = nil
 
 	const moved, now = "§98-moved#1-screen", "§03-shell#1-screen"
 	items = built(map[string]specLedger{moved: {Hash: "moved", Title: idx.items[now].Title}})
@@ -580,6 +593,47 @@ func TestSpecSecondAttemptKeepsFirstAttemptsTest(t *testing.T) {
 // finds it before the round is judged, one more turn deletes it, and the item
 // counts on its first attempt.
 func TestSpecRoundCheckFixesBeforeJudging(t *testing.T) {
+	write := func(id, path, content string) string {
+		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
+		return sseToolCall(id, "write_file", string(b))
+	}
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(id string) bool { return id != "F0.1" },
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"build F0.1"}]}`),
+		write("w1", "app/src/lib.rs", "pub fn helper() {}\n"),
+		write("w2", "app/tests/f0_1.rs", "#[test]\nfn f0_1_does_the_thing() {}\n"),
+		sseToolCall("r1", respondToolName, `{"message":"built"}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"delete helper"}]}`),
+		write("w3", "app/src/lib.rs", "// the program\n"),
+		sseToolCall("r2", respondToolName, `{"message":"deleted"}`),
+		sseToolCall("c1", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F0.1: DONE"}`),
+	)
+	said := rig.run(t)
+	got := rig.ledger(t)
+	if _, done := got.Items["F0.1"]; !done || got.Attempts["F0.1"] != 0 {
+		t.Errorf("F0.1 done=%v attempts=%d, want done on its first attempt", done, got.Attempts["F0.1"])
+	}
+	if !strings.Contains(said, "Before this round counts: the program does not call these functions the round added: `helper`") {
+		t.Errorf("the in-round check did not report helper:\n%s", said)
+	}
+	if rig.mock.callCount() != 8 {
+		t.Errorf("model calls = %d, want 8 (the round, the fix turn, the completion check)", rig.mock.callCount())
+	}
+}
+
+// specLoopRig is a git repo holding files, a ledger with every item done that
+// done names, and a scripted main model; its summariser is a mock of its own,
+// so each turn's background note does not take a scripted response.
+type specLoopRig struct {
+	h    *terminalHarness
+	mock *mockLLM
+}
+
+func newSpecLoopRig(t *testing.T, files map[string]string, done func(id string) bool, responses ...string) *specLoopRig {
+	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("no git")
 	}
@@ -587,16 +641,12 @@ func TestSpecRoundCheckFixesBeforeJudging(t *testing.T) {
 	a, sess := h.agent, h.sess
 	git := func(args ...string) {
 		t.Helper()
-		if out, err := exec.Command("git", append([]string{"-C", sess.Cwd, "-c", "user.email=t@t", "-c", "user.name=t"}, args...)...).CombinedOutput(); err != nil {
+		if out, err := exec.Command("git", append([]string{"-C", sess.Cwd}, args...)...).CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v %s", args, err, out)
 		}
 	}
-	for rel, body := range map[string]string{
-		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
-		"app/src/lib.rs":    "// the program\n",
-		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
-		".gitignore":        ".codehalter/\n",
-	} {
+	files[".gitignore"] = ".codehalter/\n"
+	for rel, body := range files {
 		p := filepath.Join(sess.Cwd, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			t.Fatal(err)
@@ -617,37 +667,24 @@ func TestSpecRoundCheckFixesBeforeJudging(t *testing.T) {
 	cfg := &specConfig{SpecDir: "spec", OutDir: "app", TestCmd: "true", LintCmd: "off", RefactorEvery: -1,
 		Items: map[string]specLedger{}, Final: &specFinal{Items: len(idx.order)}}
 	for _, id := range idx.order {
-		if id != "F0.1" {
+		if done(id) {
 			cfg.Items[id] = specLedger{Hash: specItemHash(idx, id), Title: idx.items[id].Title}
 		}
 	}
 	if err := saveSpecConfig(sess.Cwd, cfg); err != nil {
 		t.Fatal(err)
 	}
-	write := func(id, path, content string) string {
-		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
-		return sseToolCall(id, "write_file", string(b))
-	}
-	mock := newMockLLM(t,
-		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"build F0.1"}]}`),
-		write("w1", "app/src/lib.rs", "pub fn helper() {}\n"),
-		write("w2", "app/tests/f0_1.rs", "#[test]\nfn f0_1_does_the_thing() {}\n"),
-		sseToolCall("r1", respondToolName, `{"message":"built"}`),
-		sseToolCall("p2", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"delete helper"}]}`),
-		write("w3", "app/src/lib.rs", "// the program\n"),
-		sseToolCall("r2", respondToolName, `{"message":"deleted"}`),
-	)
-	defer mock.Close()
+	mock := newMockLLM(t, responses...)
+	t.Cleanup(mock.Close)
 	// The pre-turn checks probe the LLM from the settings file: point it at the mock
 	// and mark the probe done, so nothing reaches a real server.
 	t.Setenv("HOME", t.TempDir())
-	// Each turn's background summary goes to its own server, off the scripted one.
 	var notes []string
-	for range 10 {
+	for range 20 {
 		notes = append(notes, sseText("turn note"))
 	}
 	summariser := newMockLLM(t, notes...)
-	defer summariser.Close()
+	t.Cleanup(summariser.Close)
 	settings := fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"m\"\n\n[[llm]]\nserver = %q\nmodel = \"s\"\npurpose = \"summary\"\n", mock.ts.URL, summariser.ts.URL)
 	if err := os.WriteFile(filepath.Join(sess.Cwd, ".codehalter", "settings.toml"), []byte(settings), 0o644); err != nil {
 		t.Fatal(err)
@@ -664,29 +701,214 @@ func TestSpecRoundCheckFixesBeforeJudging(t *testing.T) {
 	a.mainSlotTokens.Store(100_000)
 	sess.llmHash = hashSettingsFiles(sess.Cwd)
 	a.tools.add()
+	return &specLoopRig{h: h, mock: mock}
+}
 
+// run is one /spec; it returns everything the loop said.
+func (g *specLoopRig) run(t *testing.T) string {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
 	defer cancel()
-	if _, err := a.runSpec(ctx, sess.ID, sess, "", nil); err != nil {
+	if _, err := g.h.agent.runSpec(ctx, g.h.sess.ID, g.h.sess, "", nil); err != nil {
 		t.Fatal(err)
-	}
-	got, err := loadSpecConfig(sess.Cwd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, done := got.Items["F0.1"]; !done || got.Attempts["F0.1"] != 0 {
-		t.Errorf("F0.1 done=%v attempts=%d blocked=%v, want done on its first attempt", done, got.Attempts["F0.1"], got.Blocked)
 	}
 	var said strings.Builder
-	for _, u := range h.updatesOfKind(KindAgentMessage) {
+	for _, u := range g.h.updatesOfKind(KindAgentMessage) {
 		if c, _ := u["content"].(map[string]any); c != nil {
 			said.WriteString(fmt.Sprint(c["text"]))
 		}
 	}
-	if !strings.Contains(said.String(), "Before this round counts: the program does not call these functions the round added: `helper`") {
-		t.Errorf("the in-round check did not report helper:\n%s", said.String())
+	return said.String()
+}
+
+func (g *specLoopRig) ledger(t *testing.T) *specConfig {
+	t.Helper()
+	cfg, err := loadSpecConfig(g.h.sess.Cwd)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if mock.callCount() != 7 {
-		t.Errorf("model calls = %d, want 7 (the round, then the fix turn)", mock.callCount())
+	return cfg
+}
+
+// request is what the model was sent on call i, as JSON text.
+func (g *specLoopRig) request(i int) string {
+	b, _ := json.Marshal(g.mock.request(i))
+	return string(b)
+}
+
+func TestSpecCompletionCheck(t *testing.T) {
+	write := func(id, path, content string) string {
+		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
+		return sseToolCall(id, "write_file", string(b))
+	}
+	rig := newSpecLoopRig(t, map[string]string{
+		// F0.3 has no picture and still gets checked; the one it links to is F0.1's.
+		"spec/01.md": "# 01 Screens\n\n### F0.1 Prepare\n\n![prepare](img/prepare.png)\n\nSources on the left, User Context on the right.\n\n" +
+			"### F0.2 Cut\n\n![cut](img/cut.png) ![flow](img/flow.svg)\n\nThe toolbar on top.\n\n### F0.3 Help\n\nSee [Prepare](#f01-prepare).\n",
+		"app/src/lib.rs":       "// the program\n",
+		"app/tests/screens.rs": "#[test]\nfn f0_1_prepare() {}\n#[test]\nfn f0_2_cut() {}\n#[test]\nfn f0_3_help() {}\n",
+	}, func(string) bool { return true },
+		// Run 1: one round checks the file's three items; the planner looks and answers itself.
+		sseToolCall("c1", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F0.1: MISSING sources list: the spec has it on the left, the program on the right\n- F0.2: DONE\n`+"`F0.3` \u2014 DONE"+`"}`),
+		// The rebuild of F0.1.
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"swap the panels"}]}`),
+		write("w1", "app/src/lib.rs", "// sources left, context right\n"),
+		write("w2", "app/tests/screens.rs", "#[test]\nfn f0_1_prepare_sources_left() {}\n#[test]\nfn f0_2_cut() {}\n#[test]\nfn f0_3_help() {}\n"),
+		sseToolCall("r1", respondToolName, `{"message":"swapped"}`),
+		// Run 2 checks only the rebuilt item.
+		sseToolCall("c2", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F0.1: DONE"}`),
+	)
+	said := rig.run(t)
+	if rig.mock.callCount() != 5 {
+		t.Fatalf("run 1 model calls = %d, want 5 (one check round, then the rebuild)\n%s", rig.mock.callCount(), said)
+	}
+	check := rig.request(0)
+	for _, want := range []string{"`F0.1` Prepare (`spec/01.md:3`); the spec pictures it: `spec/img/prepare.png`", "`F0.2` Cut", "`spec/img/cut.png`", "`F0.3` Help (`spec/01.md:15`)"} {
+		if !strings.Contains(check, want) {
+			t.Errorf("the check round lacks %q:\n%s", want, check)
+		}
+	}
+	if strings.Contains(check, "flow.svg`") || strings.Contains(check, "Help (`spec/01.md:15`); the spec pictures") {
+		t.Errorf("an svg drawing or a linked section's picture was given as the item's own:\n%s", check)
+	}
+	if round := rig.request(1); !strings.Contains(round, "sources list: the spec has it on the left, the program on the right") {
+		t.Errorf("the rebuild does not carry what is missing:\n%s", round)
+	}
+	got := rig.ledger(t)
+	for _, id := range []string{"F0.2", "F0.3"} {
+		if got.Items[id].Checked == "" {
+			t.Errorf("%s was found done but is not marked checked", id)
+		}
+	}
+	if !got.done("F0.1") || got.Items["F0.1"].Checked != "" || got.Redo["F0.1"] != "" {
+		t.Errorf("F0.1 = %+v redo=%q, want rebuilt, done and not checked yet", got.Items["F0.1"], got.Redo["F0.1"])
+	}
+
+	said = rig.run(t)
+	if rig.mock.callCount() != 6 {
+		t.Fatalf("model calls after run 2 = %d, want 6 (one check of F0.1 alone)\n%s", rig.mock.callCount(), said)
+	}
+	// This run's check prompt, not the history before it.
+	req := rig.request(5)
+	again := req[strings.LastIndex(req, "# Completion check"):]
+	if !strings.Contains(again, "`F0.1` Prepare") || strings.Contains(again, "`F0.2` Cut") {
+		t.Errorf("run 2 should check only the rebuilt item:\n%s", again)
+	}
+	if rig.ledger(t).Items["F0.1"].Checked == "" {
+		t.Error("F0.1 is not marked checked after run 2")
+	}
+}
+
+// A question the spec cannot ground gets one corrective; the grounded one goes to
+// the spec's QUESTIONS.md, the item waits there (no block in the ledger), and the
+// answer written there reaches the next run's round and the item's fingerprint.
+func TestSpecQuestionWaitsInTheSpecForItsAnswer(t *testing.T) {
+	write := func(id, path, content string) string {
+		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
+		return sseToolCall(id, "write_file", string(b))
+	}
+	good := `{"clear":false,"subtasks":[],"question":"In which order do the play buttons sit?",` +
+		`"spec_quote":"The toolbar groups left to right: recording, cut.",` +
+		`"options":[{"choice":"Side by side","example":"one row: [▶ recording] [▶✂ cut]"},{"choice":"Stacked","example":"▶ recording above ▶✂ cut"}]}`
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Cut\n\n### F2.2 Play buttons\n\nThe toolbar groups left to right:\nrecording, cut.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(id string) bool { return id != "F2.2" },
+		// Run 1: a question without the spec text it rests on, then a grounded one, then the final pass.
+		sseToolCall("q1", submitPlanToolName, `{"clear":false,"subtasks":[],"question":"side by side or stacked?","choices":["side by side","stacked"]}`),
+		sseToolCall("q2", submitPlanToolName, good),
+		sseToolCall("f1", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"README written"}`),
+		// Run 2: the answered item, its completion check, then the final pass again.
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"side by side"}]}`),
+		write("w1", "app/tests/f2_2.rs", "#[test]\nfn f2_2_play_buttons_side_by_side() {}\n"),
+		sseToolCall("r1", respondToolName, `{"message":"built"}`),
+		sseToolCall("c1", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F2.2: DONE"}`),
+		sseToolCall("f2", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"README updated"}`),
+	)
+	said := rig.run(t)
+	if rig.mock.callCount() != 3 {
+		t.Fatalf("run 1 model calls = %d, want 3\n%s", rig.mock.callCount(), said)
+	}
+	if retry := rig.request(1); !strings.Contains(retry, "Your question was not recorded: it has no `spec_quote`") {
+		t.Errorf("the corrective did not say what the question lacked:\n%s", retry)
+	}
+	qpath := filepath.Join(rig.h.sess.Cwd, "spec", specQuestionsFile)
+	qs, err := os.ReadFile(qpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"## F2.2 · In which order do the play buttons sit?", "`01.md:5`",
+		"> The toolbar groups left to right: recording, cut.", "1. Side by side. Example: one row: [▶ recording] [▶✂ cut]",
+		"2. Stacked. Example: ▶ recording above ▶✂ cut", "**Answer:** \n"} {
+		if !strings.Contains(string(qs), want) {
+			t.Errorf("QUESTIONS.md lacks %q:\n%s", want, qs)
+		}
+	}
+	if !strings.Contains(said, "❓ F2.2 waits on your answer") || strings.Contains(said, "⛔") {
+		t.Errorf("the question should wait, not block:\n%s", said)
+	}
+	if raw, _ := os.ReadFile(specConfigPath(rig.h.sess.Cwd)); strings.Contains(string(raw), "blocked]]") {
+		t.Errorf("the ledger holds a block:\n%s", raw)
+	}
+
+	answered := strings.Replace(string(qs), "**Answer:** \n", "**Answer:** 1, side by side as the toolbar line says.\n", 1)
+	if err := os.WriteFile(qpath, []byte(answered), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	said = rig.run(t)
+	if rig.mock.callCount() != 8 {
+		t.Fatalf("model calls after run 2 = %d, want 8\n%s", rig.mock.callCount(), said)
+	}
+	if round := rig.request(3); !strings.Contains(round, "Answered in the spec's QUESTIONS.md") || !strings.Contains(round, "1, side by side as the toolbar line says.") {
+		t.Errorf("the round lacks the answer:\n%s", round)
+	}
+	idx, err := scanSpec(filepath.Join(rig.h.sess.Cwd, "spec"), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := rig.ledger(t); !got.done("F2.2") || got.Items["F2.2"].Hash != specItemHash(idx, "F2.2") {
+		t.Errorf("F2.2 = %+v, want done with the answer in its fingerprint", got.Items["F2.2"])
+	}
+}
+
+// An item that does not pass its attempts becomes a question codehalter words
+// itself; the next run leaves it waiting and, with only questions left, stops.
+func TestSpecStuckItemBecomesAQuestion(t *testing.T) {
+	answer := func(id string) string {
+		return sseToolCall(id, submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"looked, changed nothing"}`)
+	}
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(id string) bool { return id != "F0.1" },
+		// Two attempts, each a round and its in-round check, that write no test; then the final pass.
+		answer("a1"), answer("a2"), answer("a3"), answer("a4"), answer("f1"),
+	)
+	said := rig.run(t)
+	if rig.mock.callCount() != 5 {
+		t.Fatalf("run 1 model calls = %d, want 5\n%s", rig.mock.callCount(), said)
+	}
+	qs, err := os.ReadFile(filepath.Join(rig.h.sess.Cwd, "spec", specQuestionsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"## F0.1 · This item did not pass its attempts. How should the rounds go on?", "`01.md:3`", "> F0.1 Do it",
+		"What stopped the last attempt:\n\n```\nno test this round added or changed is named after F0.1", "1. Try again as the spec says.", "`spec/01.md`", "**Answer:** \n"} {
+		if !strings.Contains(string(qs), want) {
+			t.Errorf("QUESTIONS.md lacks %q:\n%s", want, qs)
+		}
+	}
+	if !strings.Contains(said, "❓ F0.1 did not pass its attempts") {
+		t.Errorf("the stuck item was not reported as a question:\n%s", said)
+	}
+
+	said = rig.run(t)
+	if rig.mock.callCount() != 5 {
+		t.Errorf("run 2 spent %d model call(s) on an item that waits on its question\n%s", rig.mock.callCount()-5, said)
+	}
+	if !strings.Contains(said, "1 question(s) wait on your answer in `spec/QUESTIONS.md`") {
+		t.Errorf("run 2 did not stop on the waiting question:\n%s", said)
 	}
 }

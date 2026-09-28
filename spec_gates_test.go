@@ -167,6 +167,41 @@ func TestSpecUnreachable(t *testing.T) {
 	}
 }
 
+// The naivepost stand-ins, and the same shapes in Go, Python and JS; old lines,
+// comments, tests and the for-test helpers themselves are not the round's stand-ins.
+func TestSpecStandIns(t *testing.T) {
+	cwd := gitRepo(t, map[string]string{
+		"out/src/upload.rs": "pub fn old() -> Result<(), String> { Err(\"not implemented\".into()) }\n",
+	})
+	writeTree(t, cwd, map[string]string{
+		"out/src/upload.rs": "pub fn old() -> Result<(), String> { Err(\"not implemented\".into()) }\n\n" +
+			"pub fn reply_for_test() -> Option<String> { SCRIPT.with(|c| c.borrow().clone()) }\n\n" +
+			"pub fn scripted_or_live_for_test() -> Option<String> { reply_for_test() }\n\n" +
+			"// a refusal is reachable, so this is exercised rather than stubbed out\n" +
+			"pub fn scripted_ask() -> Box<AskModel> {\n    match reply_for_test() {\n        Some(s) => Box::new(move |_| Ok(s.clone())),\n        None => Box::new(|_| Err(\"no llm server here\".to_string())),\n    }\n}\n\n" +
+			"pub fn speak() { todo!() }\n\npub fn set_placeholder() { entry.set_placeholder_text(Some(\"Search\")); }\n\n" +
+			"#[cfg(test)]\nmod tests {\n    fn t() { super::reply_for_test(); todo!() }\n}\n",
+		"out/go/svc.go":   "package svc\n\nfunc Ask() error { return errors.New(\"not yet implemented\") }\n\nfunc Live() string { return clientForTest().Get() }\n",
+		"out/py/tts.py":   "def speak(line):\n    raise NotImplementedError\n",
+		"out/web/draw.js": "export function draw() { return 'stub' }\n",
+		"out/tests/t.rs":  "#[test]\nfn f1_1() { naivepost::upload::reply_for_test(); unimplemented!() }\n",
+	})
+	ch := specRoundChanges(t.Context(), cwd, "out", "HEAD")
+	got := strings.Join(specStandIns(filepath.Join(cwd, "out"), ch), "\n")
+	for _, want := range []string{"`reply_for_test` (src/upload.rs:9): the program asks a helper that exists for tests",
+		"src/upload.rs:15: `pub fn speak() { todo!() }`", "go/svc.go:3: `func Ask() error { return errors.New(\"not yet implemented\") }`",
+		"`clientForTest` (go/svc.go:5)", "py/tts.py:2: `raise NotImplementedError`", "web/draw.js:1:"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	for _, fine := range []string{"upload.rs:1:", "upload.rs:3", "upload.rs:5", "upload.rs:7", "upload.rs:17", "upload.rs:21", "tests/t.rs"} {
+		if strings.Contains(got, fine) {
+			t.Errorf("%s flagged (an old line, a helper, a comment, a placeholder text or a test):\n%s", fine, got)
+		}
+	}
+}
+
 // A file over the budget may grow by the slack, not more; one under it is free.
 func TestSpecOversize(t *testing.T) {
 	cwd := gitRepo(t, map[string]string{"out/src/big.rs": strings.Repeat("x\n", 30), "out/src/small.rs": "x\n"})

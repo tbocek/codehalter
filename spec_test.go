@@ -265,7 +265,7 @@ func TestSpecRedoReopens(t *testing.T) {
 	if d := specReconcile(cfg, idx, covered); d.Adopted != 0 {
 		t.Errorf("adopted %d reopened items back", d.Adopted)
 	}
-	if next, _ := nextSpecItem(idx, cfg); next != ids[0] {
+	if next := nextSpecItem(idx, cfg, nil); next != ids[0] {
 		t.Errorf("next = %q, want the first reopened item %q", next, ids[0])
 	}
 	if cfg.Redo[ids[0]] == "" {
@@ -315,21 +315,21 @@ func TestDetectSpecTestCmd(t *testing.T) {
 	}
 }
 
-// Done is the ledger's word; a blocked item waits for its answer.
+// Done is the ledger's word; an item waits while its question has no answer.
 func TestNextSpecItem(t *testing.T) {
-	idx := &specIndex{order: []string{"a", "b", "c", "d"}}
-	cfg := &specConfig{Blocked: []specBlock{{ID: "b", Reason: "stuck"}, {ID: "c", Reason: "asked", Answer: "use SQLite"}},
-		Items: map[string]specLedger{"a": {}}}
-	if id, ans := nextSpecItem(idx, cfg); id != "c" || ans != "use SQLite" {
-		t.Errorf("next = %q %q, want the answered block c before d", id, ans)
+	idx := &specIndex{order: []string{"a", "b", "c", "d"}, questions: map[string][]specQuestion{
+		"b": {{ID: "b", Question: "which store?"}},
+		"c": {{ID: "c", Question: "which db?", Answer: "use SQLite"}},
+	}}
+	cfg := &specConfig{Items: map[string]specLedger{"a": {}}}
+	if id := nextSpecItem(idx, cfg, nil); id != "c" {
+		t.Errorf("next = %q, want c: b waits on its question, c is answered", id)
 	}
-	cfg.Blocked = cfg.Blocked[:1] // c was picked with its answer
-	cfg.Items["c"] = specLedger{}
-	if id, _ := nextSpecItem(idx, cfg); id != "d" {
-		t.Errorf("next = %q, want d (b stays blocked without an answer)", id)
+	if id := nextSpecItem(idx, cfg, func(id string) bool { return id == "c" }); id != "d" {
+		t.Errorf("next = %q, want d past c blocked in this run", id)
 	}
-	cfg.Items["d"] = specLedger{}
-	if id, _ := nextSpecItem(idx, cfg); id != "" {
+	cfg.Items["c"], cfg.Items["d"] = specLedger{}, specLedger{}
+	if id := nextSpecItem(idx, cfg, nil); id != "" {
 		t.Errorf("next = %q, want nothing left", id)
 	}
 }
@@ -364,8 +364,7 @@ func TestSpecConfigRoundTrip(t *testing.T) {
 		t.Fatalf("no file = (%v, %v), want (nil, nil)", cfg, err)
 	}
 	in := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs", Attempts: map[string]int{"F0.1": 1},
-		LintCmd: "off", MaxFileLines: 2000, RefactorEvery: -1, RefactorAt: 12,
-		Blocked: []specBlock{{ID: "F0.2", Reason: "asked", Question: "keep it?"}}}
+		LintCmd: "off", MaxFileLines: 2000, RefactorEvery: -1, RefactorAt: 12}
 	if err := saveSpecConfig(cwd, in); err != nil {
 		t.Fatal(err)
 	}
@@ -375,6 +374,15 @@ func TestSpecConfigRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(in, out) {
 		t.Errorf("round trip:\n got %+v\nwant %+v", out, in)
+	}
+	// A ledger from before blocks lasted one run still loads; saving drops its blocks.
+	old, _ := os.ReadFile(specConfigPath(cwd))
+	old = append(old, "\n[[blocked]]\n  id = \"F0.2\"\n  reason = \"stuck\"\n  answer = \"\"\n"...)
+	if err := os.WriteFile(specConfigPath(cwd), old, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if out, err = loadSpecConfig(cwd); err != nil || !reflect.DeepEqual(in, out) {
+		t.Errorf("old ledger = %+v, %v; want it read as %+v", out, err, in)
 	}
 }
 
@@ -700,7 +708,7 @@ func TestSpecFailedRoundStaysOpen(t *testing.T) {
 	if d := specReconcile(cfg, idx, covered); d.Adopted != 1 {
 		t.Errorf("adopted %d, want 1 once no failed round stands", d.Adopted)
 	}
-	if id, _ := nextSpecItem(idx, cfg); id == item {
+	if id := nextSpecItem(idx, cfg, nil); id == item {
 		t.Error("a covered item with no failed round was picked again")
 	}
 }
