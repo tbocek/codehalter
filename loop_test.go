@@ -291,6 +291,63 @@ func TestStuckLadderFuzzyOutput(t *testing.T) {
 	}
 }
 
+// A step ended for repeating one call hands it on: the turn's next step gets
+// that call's output back instead of a run, until it writes something. On one
+// /spec item five replanned steps each opened with the grep that ended the one before.
+func TestStuckCallIsNotRunAgainInTheSameTurn(t *testing.T) {
+	const toolName = "same_probe_test_tool"
+	runs := 0
+	a, s := newTestAgent(t)
+	a.tools.add()
+	a.tools.add(Tool{Def: map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        toolName,
+			"description": "test-only probe with the same answer every time",
+			"parameters":  map[string]any{"type": "object"},
+		},
+	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+		runs++
+		return "13:![The Cut page](img/05-cut.png)", false
+	}})
+	a.mainSlotTokens.Store(85248)
+	call := sseToolCall("c1", toolName, `{}`)
+	var step1 []string
+	for range 1 + stuckBailRounds {
+		step1 = append(step1, call)
+	}
+	write, _ := json.Marshal(map[string]string{"path": "note.txt", "content": "changed\n"})
+	mock := newMockLLM(t, append(step1,
+		call, // step 2 opens with the same call: not run
+		sseToolCall("w1", "write_file", string(write)),
+		call, // after a write it is a re-check: runs
+		sseToolCall("r1", respondToolName, `{"message":"done"}`),
+	)...)
+	defer mock.Close()
+	step := func() toolLoopResult {
+		t.Helper()
+		res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "look at the picture"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", false, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	if res := step(); res.Terminal != "" || runs != 1+stuckBailRounds {
+		t.Fatalf("step 1: terminal=%q runs=%d, want ended after %d runs", res.Terminal, runs, 1+stuckBailRounds)
+	}
+	if res := step(); res.Terminal != respondToolName {
+		t.Fatalf("step 2 did not finish: %+v", res)
+	}
+	if runs != 2+stuckBailRounds {
+		t.Errorf("runs = %d, want %d: refused once, run again after the write", runs, 2+stuckBailRounds)
+	}
+	if got := mock.request(len(step1) + 1); !strings.Contains(fmt.Sprint(got["messages"]), "not run: an earlier attempt at this task ran exactly this call") ||
+		!strings.Contains(fmt.Sprint(got["messages"]), "img/05-cut.png") {
+		t.Errorf("the refused call did not carry the note and the earlier output:\n%v", got["messages"])
+	}
+}
+
 func TestToolMeterShowsTheArgument(t *testing.T) {
 	h := newTerminalHarness(t)
 	a, s := h.agent, h.sess

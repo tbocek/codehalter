@@ -525,6 +525,9 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 
 func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
+	sess.rt.mu.Lock()
+	sess.rt.stuckCalls = nil // a new request may need any call again
+	sess.rt.mu.Unlock()
 
 	a.sendPhase(ctx, sid, 0, false)
 	p, err := a.runPlanPhase(ctx, sid, "")

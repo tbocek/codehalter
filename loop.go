@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"regexp"
 	"slices"
 	"strings"
@@ -564,16 +565,23 @@ func commandKey(cmd string) (key string, labels map[string]bool) {
 	return strings.Join(keep, " ; "), labels
 }
 
-func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
+// repeatKey is what makes two calls the same: the tool and its arguments, a shell
+// command by what it runs (commandKey), with the echo labels it prints.
+func repeatKey(tc toolCall) (key string, labels map[string]bool) {
 	args := tc.Function.Arguments
-	out, _, _ := strings.Cut(tu.Output, batchNoteLead) // the note depends on the call before, not on this one
 	if tc.Function.Name == "run_command" {
-		var labels map[string]bool
 		args, labels = commandKey(parseArgs(args).str("command"))
+	}
+	return tc.Function.Name + "\x00" + args, labels
+}
+
+func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
+	out, _, _ := strings.Cut(tu.Output, batchNoteLead) // the note depends on the call before, not on this one
+	key, labels := repeatKey(tc)
+	if labels != nil {
 		lines := strings.Split(out, "\n")
 		out = strings.Join(slices.DeleteFunc(lines, func(l string) bool { return labels[strings.TrimSpace(l)] }), "\n")
 	}
-	key := tc.Function.Name + "\x00" + args
 	out = digitRunRe.ReplaceAllString(out, "#")
 	h := fnvHash(out)
 	bag := issueBag([]string{out})
@@ -768,6 +776,16 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	// Consecutive stuck rounds climb one ladder (nudge, warm the sampler, bail); any
 	// productive round resets it, so read-after-write and fan-out are never punished.
 	repeats := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
+	// An earlier step of this turn was ended repeating these calls; its successor
+	// copied the same call from the history, five steps in a row on one /spec item.
+	var stuckBefore map[string]string
+	loopSess := a.getSession(sid) // nil for a sessionless internal pass
+	if loopSess != nil {
+		loopSess.rt.mu.Lock()
+		stuckBefore = maps.Clone(loopSess.rt.stuckCalls)
+		loopSess.rt.mu.Unlock()
+	}
+	var roundRepeats map[string]string // this round's calls that repeated, with their output
 	var stuckRounds int
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
@@ -870,6 +888,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		var terminalName string
 		var terminalMessage string
 		var failedThisRound bool
+		roundRepeats = map[string]string{}
 		// True only if EVERY call this round reproduced known output.
 		roundStuck := len(calls) > 0
 
@@ -891,11 +910,20 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			var tu ToolUse
 			var content any
 			denied := policy.deny[tc.Function.Name]
+			key, _ := repeatKey(tc)
+			before, wasStuck := stuckBefore[key]
 			switch {
 			case denied:
 				var msg string
 				tu, msg = a.denyToolCall(ctx, sid, phase, tc)
 				content = msg
+			// Once the step wrote something, the same call may answer differently: a re-check.
+			case wasStuck && repeats.writes == 0:
+				msg := "not run: an earlier attempt at this task ran exactly this call again and again until codehalter ended it, so it answers nothing new. Its output, which you already have:\n\n" +
+					before + "\n\nDo what the task asks with a different call; if the task asks you to look at a picture, call `screenshot` on it."
+				tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (repeated from an ended attempt)", "tool", nil)
+				a.FailToolCall(ctx, sid, tcId, "not run: this call ended an earlier attempt by repeating")
+				tu, content = a.recordToolUse(sid, tc, ToolUse{Output: msg, Failed: true, StartedAt: time.Now()}), msg
 			default:
 				tu, content = a.runToolCall(ctx, sid, tc)
 			}
@@ -907,6 +935,8 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			}
 			if !repeats.sawAgain(tc, tu) {
 				roundStuck = false
+			} else {
+				roundRepeats[key] = tu.Output
 			}
 			if phase == "execute" && !denied {
 				switch name := tc.Function.Name; {
@@ -991,6 +1021,14 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		}
 		stuckRounds++
 		if stuckRounds >= stuckBailRounds {
+			if loopSess != nil {
+				loopSess.rt.mu.Lock()
+				if loopSess.rt.stuckCalls == nil {
+					loopSess.rt.stuckCalls = map[string]string{}
+				}
+				maps.Copy(loopSess.rt.stuckCalls, roundRepeats)
+				loopSess.rt.mu.Unlock()
+			}
 			// No error: the normal failure paths (replan, plan salvage) beat a hard error.
 			return finish(nil)
 		}

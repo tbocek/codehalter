@@ -133,7 +133,11 @@ type sessionRuntime struct {
 	specHandoff string
 	// specAudit: a bare /spec redo is auditing, so the planner's list is not asked about.
 	specAudit bool
-	prevCall  toolCallBrief
+	// stuckCalls: the calls a step repeated until the loop ended it, keyed like the
+	// repetition tracker, with their output. The turn's later steps get the output
+	// back instead of a run, until they write something (see runToolLoop).
+	stuckCalls map[string]string
+	prevCall   toolCallBrief
 	// Later calls of the same reply were batched already and get no batching note.
 	replyStart bool
 	// jobRuns are the background jobs that exited: a /spec gate that ran as one counts.

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -389,5 +390,33 @@ func TestRunCommandRefusesPictureScripts(t *testing.T) {
 		if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, string(b)); strings.HasPrefix(res, "refused:") {
 			t.Errorf("%q was refused: %q", cmd, res)
 		}
+	}
+}
+
+// What a command leaves running is swept when it exits: two green suites each
+// left an Xvfb behind, and the next `xvfb-run -a` took the next display number.
+func TestRunCommandSweepsWhatItLeftBehind(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	log := filepath.Join(t.TempDir(), "child.pid")
+	out, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 30 & echo $! > `+log+`; echo left a child"}`)
+	if !strings.HasPrefix(out, "exit 0\n") {
+		t.Fatalf("command: %q", out)
+	}
+	pidText, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(pidText)))
+	if pid <= 0 {
+		t.Fatalf("child pid %q", pidText)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("the child (pid %d) survived the command's exit", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

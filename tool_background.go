@@ -53,6 +53,21 @@ type jobExit struct {
 	err  error
 }
 
+// jobSweepFn signals every process in the wrapper's process group, and in its
+// session when it leads one; it succeeds when it signalled something. /proc, not
+// pkill: BusyBox and GNU differ, /proc/<pid>/stat does not.
+const jobSweepFn = `sweep() {
+  local sig=$1 me=$$ own p line n=0
+  read -r line < /proc/$me/stat; set -- ${line##*) }; own=$4
+  for p in /proc/[0-9]*; do
+    p=${p#/proc/}; [ "$p" = "$me" ] && continue
+    read -r line < /proc/$p/stat 2>/dev/null || continue
+    set -- ${line##*) }
+    if [ "$3" = "$me" ] || { [ "$own" = "$me" ] && [ "$4" = "$me" ]; }; then kill -$sig $p 2>/dev/null && n=$((n+1)); fi
+  done
+  [ $n -gt 0 ]
+}`
+
 // ACP terminals expose no pid or log, so the wrapper writes its pid (a process
 // group under a pty, killed whole by its trap) and tees the output to a log.
 func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit bool) (*backgroundJob, string) {
@@ -111,9 +126,14 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 		redirects:  redirectTargets(cmdStr, sess.Cwd),
 		exited:     make(chan jobExit, 1),
 	}
-	// pipefail + wait: the exit status is the command's, not tee's.
+	// pipefail + wait: the exit status is the command's, not tee's. What the
+	// command leaves behind is swept when it exits, not only on a kill: two
+	// green `xvfb-run` suites each left an Xvfb (in the wrapper's own group),
+	// and `timeout` moves its command into a group of its own, so the sweep
+	// goes by process group, and by session where the wrapper leads one (a pty).
 	quoted := "'" + strings.ReplaceAll(cmdStr, "'", `'\''`) + "'"
-	script := fmt.Sprintf("echo $$ > %s\nset -o pipefail\ntrap 'trap - TERM INT HUP; kill -- -$$ 2>/dev/null; exit 143' TERM INT HUP\n( exec bash -c %s ) 2>&1 | tee %s &\nwait $!", job.pidPath, quoted, job.logPath)
+	script := fmt.Sprintf("echo $$ > %s\nset -o pipefail\n%s\ntrap 'trap - TERM INT HUP; sweep TERM; exit 143' TERM INT HUP\n( exec bash -c %s ) 2>&1 | tee %s &\nwait $!\nrc=$?\ntrap '' TERM\nif sweep TERM; then sleep 1; sweep KILL; fi\nexit $rc",
+		job.pidPath, jobSweepFn, quoted, job.logPath)
 	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", script}, sess.Cwd)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
