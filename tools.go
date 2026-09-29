@@ -266,7 +266,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	var result string
 	var failed bool
 	var multimodal any
-	var imageID string
+	var imageID, sameImage string
 	switch {
 	case tc.Function.Name == "view_image" && a.imagesSupported:
 		text, parts, ferr := dispatchViewImage(a.getSession(sid), tc.Function.Arguments)
@@ -277,7 +277,12 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	case tc.Function.Name == "screenshot" && a.imagesSupported:
 		text, parts, id, ferr := dispatchScreenshot(ctx, a, sid, tc.Function.Arguments)
 		result, failed = text, ferr
-		if !ferr {
+		switch sess := a.getSession(sid); {
+		case ferr:
+		case sess != nil && sess.imageInView(id):
+			// The same pixels are already in view: a note, not a second copy.
+			result, sameImage = fmt.Sprintf("[This picture of %s is the same as %s, which is already in your view above, so it is not attached again: nothing on it changed since.]", parseArgs(tc.Function.Arguments).str("path"), id), id
+		default:
 			multimodal, imageID = parts, id
 		}
 	default:
@@ -292,8 +297,11 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		// Attach the rendered screen: the executor rarely calls screenshot on
 		// its own.
 		if !failed && tc.Function.Name == "run_command" && a.imagesSupported {
-			if text, parts, id := a.attachRenderedScreen(ctx, sid, tc.Function.Arguments, result, started); id != "" {
+			switch text, parts, id, same := a.attachRenderedScreen(ctx, sid, tc.Function.Arguments, result, started); {
+			case id != "":
 				result, multimodal, imageID = text, parts, id
+			case same != "":
+				result, sameImage = text, same
 			}
 		}
 	}
@@ -309,11 +317,12 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	}
 
 	tu := a.recordToolUse(sid, tc, ToolUse{
-		Output:     result,
-		Failed:     failed,
-		StartedAt:  started,
-		DurationMs: time.Since(started).Milliseconds(),
-		ImageID:    imageID,
+		Output:      result,
+		Failed:      failed,
+		StartedAt:   started,
+		DurationMs:  time.Since(started).Milliseconds(),
+		ImageID:     imageID,
+		SameImageAs: sameImage,
 	})
 	if multimodal != nil {
 		return tu, multimodal

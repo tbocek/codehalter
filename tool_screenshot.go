@@ -353,40 +353,48 @@ func (b *beacon) report() string {
 
 // attachRenderedScreen returns an empty id when there is nothing to attach. It
 // stores and builds parts like screenshot, so replay rebuilds the same message.
-func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result string, since time.Time) (string, []any, string) {
+// sameAs is set instead of id when the render is a picture already in view.
+func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result string, since time.Time) (text string, parts []any, id, sameAs string) {
 	cmd := parseArgs(rawArgs).str("command")
 	if !strings.Contains(cmd, "snapshot") || !strings.HasPrefix(result, "exit 0\n") {
-		return "", nil, ""
+		return "", nil, "", ""
 	}
 	sess := a.getSession(sid)
 	if sess == nil {
-		return "", nil, ""
+		return "", nil, "", ""
 	}
 	// Whole-second mtimes on some filesystems: a file written in the same
 	// second the command started must still count.
 	png := newestPNGSince(sess.Cwd, since.Truncate(time.Second).Add(-time.Nanosecond))
 	if png == "" {
-		return "", nil, ""
+		return "", nil, "", ""
 	}
 	data, err := os.ReadFile(png)
 	if err != nil || len(data) == 0 || len(data) > maxScreenshotBytes {
-		return "", nil, ""
+		return "", nil, "", ""
 	}
 	data = downscalePNG(data, attachMaxSide)
-	id, err := storeImage(sess.Cwd, "image/png", data)
+	rel, err := filepath.Rel(sess.Cwd, png)
+	if err != nil {
+		rel = png
+	}
+	rel = filepath.ToSlash(rel)
+	if same, _ := storeImage("", "image/png", data); sess.imageInView(same) {
+		a.say(ctx, sid, fmt.Sprintf("👁 the rendered screen %s is unchanged (%s): not attached again\n", rel, same))
+		return result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s, is the same picture as %s, which is already in your view above, so it is not attached again: nothing on it changed. Rendering it again shows the same; change the code, or look at the spec's picture with `screenshot` and compare.]", rel, same), nil, "", same
+	}
+	id, err = storeImage(sess.Cwd, "image/png", data)
 	if err != nil {
 		slog.Debug("attachRenderedScreen: could not store the render", "png", png, "err", err)
-		return "", nil, ""
+		return "", nil, "", ""
 	}
-	rel, _ := filepath.Rel(sess.Cwd, png)
-	rel = filepath.ToSlash(rel)
 	size := ""
 	if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 		size = fmt.Sprintf(", %dx%d px as attached", cfg.Width, cfg.Height)
 	}
-	text := result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s%s, is attached below as %s. For a closer look at one part, call screenshot on that file with \"region\": [x, y, width, height] in the file's own pixels; never crop with a script. Look at it now, before anything else: is every widget the spec names on it, in the order it says; is anything empty, overlapping, cut off or unlabeled? Where the spec has its own picture of this screen (its image with the same name), look at that too with `screenshot` and compare widgets, order and labels, not pixels. Fix what you see, then render again.]", rel, size, id)
+	text = result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s%s, is attached below as %s. For a closer look at one part, call screenshot on that file with \"region\": [x, y, width, height] in the file's own pixels; never crop with a script. Look at it now, before anything else: is every widget the spec names on it, in the order it says; is anything empty, overlapping, cut off or unlabeled? Where the spec has its own picture of this screen (its image with the same name), look at that too with `screenshot` and compare widgets, order and labels, not pixels. Fix what you see, then render again.]", rel, size, id)
 	a.say(ctx, sid, fmt.Sprintf("👁 attached the rendered screen %s to the model's view\n", rel))
-	return text, imageParts(text, "image/png", data), id
+	return text, imageParts(text, "image/png", data), id, ""
 }
 
 // attachMaxSide halves a HiDPI (2x) snapshot back to window size, where text is

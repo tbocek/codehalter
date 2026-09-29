@@ -327,6 +327,24 @@ func TestRunCommandAttachesRenderedScreen(t *testing.T) {
 		t.Errorf("an attached render did not count as a look: %v", got)
 	}
 
+	// The same pixels again are a note, not a second copy, and still a look.
+	first := tu.ImageID
+	tc.ID, tc.Function.Arguments = "c1b", `{"command":"printf '`+png+`' > rust/shots/05-cut.png; echo 'just snapshot 05-cut again'"}`
+	again, content := h.agent.runToolCall(context.Background(), h.sess.ID, tc)
+	if again.ImageID != "" || again.SameImageAs != first || !strings.Contains(again.Output, "is the same picture as "+first) {
+		t.Errorf("an unchanged render was attached again: %+v", again)
+	}
+	if _, isText := content.(string); !isText {
+		t.Errorf("an unchanged render sent %T, want text only", content)
+	}
+	if got := uiEditedUnseen([]ToolUse{{Name: "edit_file", Input: `{"path":"rust/src/ui.rs"}`}, again}, h.sess.Cwd); got != nil {
+		t.Errorf("an unchanged render did not count as a look: %v", got)
+	}
+	tc.ID, tc.Function.Arguments = "c1c", `{"command":"printf 'OTHER-BYTES' > rust/shots/05-cut.png; echo 'just snapshot 05-cut'"}`
+	if changed, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); changed.ImageID == "" || changed.ImageID == first {
+		t.Errorf("a changed render was not attached: %+v", changed)
+	}
+
 	tc.ID, tc.Function.Arguments = "c2", `{"command":"echo snapshot failed; exit 1"}`
 	if tu, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); tu.ImageID != "" {
 		t.Error("a failed render attached a picture")
@@ -417,5 +435,30 @@ func TestScreenshotPictureRegion(t *testing.T) {
 	}
 	if text, _, _, failed := dispatchScreenshot(context.Background(), h.agent, h.sess.ID, `{"path":"shot.png","region":[500,500,10,10]}`); !failed || !strings.Contains(text, "300x200") {
 		t.Errorf("region outside = %q %v", text, failed)
+	}
+}
+
+// Looking at the same picture again gets a note: the pixels are already in view.
+func TestScreenshotOfAPictureAlreadyInView(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.imagesSupported = true
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Cwd, "shot.png"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var tc toolCall
+	tc.ID, tc.Function.Name, tc.Function.Arguments = "s1", "screenshot", `{"path":"shot.png"}`
+	first, content := a.runToolCall(context.Background(), s.ID, tc)
+	if _, isParts := content.([]any); first.ImageID == "" || !isParts {
+		t.Fatalf("the first look sent no picture: %+v", first)
+	}
+	tc.ID = "s2"
+	again, content := a.runToolCall(context.Background(), s.ID, tc)
+	if _, isText := content.(string); !isText || again.ImageID != "" || again.SameImageAs != first.ImageID || !strings.Contains(again.Output, "already in your view") {
+		t.Errorf("the same picture was sent again: %+v (%T)", again, content)
 	}
 }

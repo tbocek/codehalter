@@ -100,3 +100,28 @@ func TestSpecQuestionsFile(t *testing.T) {
 		t.Errorf("stuck question parsed as %+v (F9.9: %v), quote at %q", qs, idx.questions["F9.9"], stuck.QuoteAt)
 	}
 }
+
+// A question says which codehalter asked it, so one a since-fixed bug caused can be told apart.
+func TestSpecQuestionsKnowWhoAsked(t *testing.T) {
+	dir := t.TempDir()
+	if err := appendSpecQuestion(dir, "F0.1 Store", specQuestion{ID: "F0.1", Question: "Which store?",
+		Options: []specOption{{Choice: "SQLite", Example: "notes.db"}, {Choice: "JSON", Example: "notes.json"}}}); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, specQuestionsFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data) + "\n## F0.2 · Which font?\n\nAsked 2026-09-28 by codehalter v118 (2026-09-28, 993ef45) while building F0.2 Font.\n\n**Answer:** \n" +
+		"\n## F0.3 · Which size?\n\nAsked 2026-09-27 while building F0.3 Size.\n\n**Answer:** \n"
+	qs := parseSpecQuestions(text)
+	if q := qs["F0.1"][0]; q.Version != versionStamp() || specStaleNote(q) != "" {
+		t.Errorf("this codehalter's question: version %q, note %q", q.Version, specStaleNote(q))
+	}
+	if note := specStaleNote(qs["F0.2"][0]); !strings.Contains(note, "codehalter v118 (2026-09-28, 993ef45), not this one") {
+		t.Errorf("another version's question: note %q", note)
+	}
+	if note := specStaleNote(qs["F0.3"][0]); !strings.Contains(note, "older codehalter") {
+		t.Errorf("a question from before versions were written: note %q", note)
+	}
+}

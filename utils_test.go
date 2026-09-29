@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"unicode/utf8"
 )
@@ -24,5 +26,29 @@ func TestClipUTF8(t *testing.T) {
 		if !utf8.ValidString(tailUTF8(s, n)) {
 			t.Errorf("tailUTF8(%q, %d) is not valid UTF-8: %q", s, n, tailUTF8(s, n))
 		}
+	}
+}
+
+// Replaced whole, with its mode, and no temp file left beside it either way.
+func TestWriteFileAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session_x.toml")
+	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFileAtomic(path, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(path); string(b) != "new" {
+		t.Errorf("content = %q", b)
+	}
+	if st, _ := os.Stat(path); st.Mode().Perm() != 0o644 {
+		t.Errorf("mode = %v", st.Mode().Perm())
+	}
+	if err := writeFileAtomic(filepath.Join(dir, "gone", "x.toml"), []byte("x"), 0o644); err == nil {
+		t.Error("a write into a missing directory succeeded")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Errorf("left behind: %v", entries)
 	}
 }

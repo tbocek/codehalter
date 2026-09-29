@@ -521,6 +521,15 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			r.say(ctx, fmt.Sprintf("\n✅ **/spec finished**: every item in `%s/` is covered by a passing test, blocked in this run, or waiting on a question.", cfg.SpecDir))
 			if open := specOpenQuestions(r.idx); len(open) > 0 {
 				r.say(ctx, fmt.Sprintf(" %d question(s) wait on your answer in `%s/%s`; answer them there and run /spec.", len(open), cfg.SpecDir, specQuestionsFile))
+				stale := 0
+				for _, q := range open {
+					if specStaleNote(q) != "" {
+						stale++
+					}
+				}
+				if stale > 0 {
+					r.say(ctx, fmt.Sprintf(" %d of them were asked by another codehalter than this one; `/spec status` names them.", stale))
+				}
 			}
 			if len(r.blocked) > 0 {
 				r.say(ctx, fmt.Sprintf(" %d item(s) blocked in this run; the next /spec tries them again.", len(r.blocked)))
@@ -908,8 +917,8 @@ func uiEditedUnseen(uses []ToolUse, cwd string) []string {
 	seen := map[string]bool{}
 	var files []string
 	for _, u := range uses {
-		if u.ImageID != "" {
-			return nil // a screenshot, or a render codehalter attached (attachRenderedScreen)
+		if u.ImageID != "" || u.SameImageAs != "" {
+			return nil // a screenshot, or a render codehalter attached (attachRenderedScreen), maybe one already in view
 		}
 		switch u.Name {
 		case "screenshot":

@@ -146,7 +146,7 @@ func saveSpecConfig(cwd string, cfg *specConfig) error {
 	if err := os.MkdirAll(filepath.Dir(specConfigPath(cwd)), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(specConfigPath(cwd), buf.Bytes(), 0o644)
+	return writeFileAtomic(specConfigPath(cwd), buf.Bytes(), 0o644)
 }
 
 func (c *specConfig) idPatterns() []string {
@@ -1554,7 +1554,7 @@ func renderSpecStatus(cfg *specConfig, idx *specIndex, testFiles int, testCmd st
 	if open := specOpenQuestions(idx); len(open) > 0 {
 		fmt.Fprintf(&b, "\nWaiting on your answer in `%s/%s` (write it after **Answer:**, then run /spec):\n", cfg.SpecDir, specQuestionsFile)
 		for _, q := range open {
-			fmt.Fprintf(&b, "- **%s**: %s\n", q.ID, q.Question)
+			fmt.Fprintf(&b, "- **%s**: %s%s\n", q.ID, q.Question, specStaleNote(q))
 		}
 	}
 	if ctx := cfg.context(idx); len(ctx) > 0 {

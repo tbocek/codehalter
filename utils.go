@@ -225,3 +225,39 @@ func clipBytes(s string, max int) string {
 	half := max / 2
 	return clipUTF8(s, half) + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + tailUTF8(s, half)
 }
+
+// writeFileAtomic replaces path in one step: a temp file beside it, synced, then
+// renamed over it. A crash leaves the old file or the new one, never half of
+// either. The machine went down twice in one day while the session file, the
+// /spec ledger and QUESTIONS.md were being rewritten in place.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	// Hidden and without the target's extension, so no listing takes it for the file.
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	fail := func(err error) error {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		return fail(err)
+	}
+	if err := f.Chmod(perm); err != nil {
+		return fail(err)
+	}
+	if err := f.Sync(); err != nil {
+		return fail(err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}

@@ -36,13 +36,15 @@ type specQuestion struct {
 	Options  []specOption
 	Stopped  string // a stuck item's question: what stopped its last attempt
 	// Parsed back from the file.
-	Text   string // the whole section as the file holds it
-	Answer string
+	Text    string // the whole section as the file holds it
+	Answer  string
+	Version string // the codehalter that asked; "" in a file from before it was written down
 }
 
 var (
 	specQuestionHeadRe = regexp.MustCompile(`^##\s+(\S+)\s+·\s*(.*?)\s*$`)
 	specAnswerRe       = regexp.MustCompile(`^\*{0,2}Answer\*{0,2}:\*{0,2}\s*(.*)$`)
+	specAskedByRe      = regexp.MustCompile(`^Asked \S+ by codehalter (.+?) while building `)
 )
 
 // parseSpecQuestions keys the sections by item id; an item may have asked more than once.
@@ -71,6 +73,9 @@ func parseSpecQuestions(text string) map[string][]specQuestion {
 			continue
 		}
 		body = append(body, ln)
+		if m := specAskedByRe.FindStringSubmatch(ln); m != nil && cur.Version == "" && !inFence {
+			cur.Version = m[1]
+		}
 		switch m := specAnswerRe.FindStringSubmatch(strings.TrimSpace(ln)); {
 		case m != nil && !inFence:
 			inAnswer = true
@@ -111,6 +116,18 @@ func specOpenQuestions(idx *specIndex) []specQuestion {
 	return out
 }
 
+// specStaleNote says a question came from another codehalter than this one, whose
+// cause (three questions once came from a codehalter bug) may be gone.
+func specStaleNote(q specQuestion) string {
+	switch q.Version {
+	case versionStamp():
+		return ""
+	case "":
+		return " (asked by an older codehalter: if its cause was in codehalter, answer `1` to try again)"
+	}
+	return " (asked by codehalter " + q.Version + ", not this one: if its cause was in codehalter, answer `1` to try again)"
+}
+
 // answered is every answered question of the item, as the file words it.
 func (idx *specIndex) answered(id string) string {
 	var parts []string
@@ -135,7 +152,8 @@ func appendSpecQuestion(specAbs, title string, q specQuestion) error {
 		b.WriteString(strings.TrimRight(string(old), "\n") + "\n")
 	}
 	fmt.Fprintf(&b, "\n## %s · %s\n\n", q.ID, q.Question)
-	fmt.Fprintf(&b, "Asked %s while building %s.\n\n", time.Now().Format("2006-01-02"), title)
+	// The version, so a question a codehalter bug caused can be told apart once fixed.
+	fmt.Fprintf(&b, "Asked %s by codehalter %s while building %s.\n\n", time.Now().Format("2006-01-02"), versionStamp(), title)
 	if q.Quote != "" {
 		fmt.Fprintf(&b, "The spec comes closest in `%s`:\n\n", q.QuoteAt)
 		for _, ln := range strings.Split(strings.TrimSpace(q.Quote), "\n") {
@@ -154,7 +172,7 @@ func appendSpecQuestion(specAbs, title string, q specQuestion) error {
 		fmt.Fprintf(&b, "%d. %s. Example: %s\n", i+1, strings.TrimRight(strings.TrimSpace(o.Choice), "."), strings.TrimSpace(o.Example))
 	}
 	b.WriteString("\n**Answer:** \n")
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+	return writeFileAtomic(path, []byte(b.String()), 0o644)
 }
 
 // specStuckStopped caps what a stuck item's question quotes of its failure: the

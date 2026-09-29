@@ -52,6 +52,9 @@ type ToolUse struct {
 	// ImageID is an image this call produced. Replay uses the stored bytes, never
 	// a re-run: re-rendering is not pure, and new bytes would bust the cache.
 	ImageID string `toml:"image_id,omitempty"`
+	// SameImageAs: the call produced a picture already in view, sent as a note
+	// instead (see imageInView); it still counts as a look.
+	SameImageAs string `toml:"same_image_as,omitempty"`
 	// Changed: the call changed the project (observed, see changedBy). Not stored.
 	Changed bool `toml:"-"`
 }
@@ -642,16 +645,27 @@ func (s *Session) rotate(keep []Message, summary string) (string, error) {
 }
 
 // Caller must hold s.mu or own the session exclusively.
+// imageInView: a tool call still in the history carries this picture. Ids are
+// content hashes, so the same id is the same pixels. Of 186 renders attached in
+// one /spec run only 111 were distinct, and the repeats pushed a request past
+// Halogen's 64-picture limit.
+func (s *Session) imageInView(id string) bool {
+	for _, m := range s.Messages {
+		for _, u := range m.ToolUses {
+			if u.ImageID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (s *Session) saveLocked() error {
-	f, err := os.Create(sessionPath(s.Cwd, s.ID, "toml"))
-	if err != nil {
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(s); err != nil {
 		return err
 	}
-	if err := toml.NewEncoder(f).Encode(s); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
+	return writeFileAtomic(sessionPath(s.Cwd, s.ID, "toml"), buf.Bytes(), 0o644)
 }
 
 type SessionInfo struct {
