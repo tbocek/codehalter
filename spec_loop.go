@@ -464,13 +464,24 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	addFixes(pendingFixes)
 	stopped := func(err error) (PromptResponse, error) {
 		r.save(context.Background())
-		msg := "⏹ Spec loop stopped. `/spec` resumes it where the ledger says it is.\n"
-		if !errors.Is(err, errUserCancelled) {
-			msg = "⏹ Spec loop cancelled (" + cancelReason(err) + "). `/spec` resumes it where the ledger says it is.\n"
+		msg := "⏹ **/spec stopped.** `/spec` resumes it where the ledger says it is.\n"
+		if errors.Is(err, context.DeadlineExceeded) {
+			msg = "⏹ **/spec stopped** (" + cancelReason(err) + "). `/spec` resumes it where the ledger says it is.\n"
 		}
 		a.say(context.Background(), sid, msg)
 		return PromptResponse{StopReason: "cancelled"}, nil
 	}
+	// A stop is acknowledged at once: the step in flight (a test run takes minutes)
+	// ends before the loop does, and one stop sat that out with nothing on screen.
+	loopDone := make(chan struct{})
+	defer close(loopDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			a.say(context.Background(), sid, "\n⏹ **Stopping /spec**: the step in flight ends first (a test run can take a few minutes), then the loop stops.\n")
+		case <-loopDone:
+		}
+	}()
 
 	maxBlocked := cfg.MaxBlocked
 	if maxBlocked <= 0 {
@@ -1564,6 +1575,10 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 			tail = fmt.Sprintf("[the command printed nothing and ended with: %v]", err)
 		default:
 			tail += fmt.Sprintf("\n[%v]", err)
+		}
+		if ctx.Err() != nil {
+			a.say(context.Background(), sid, fmt.Sprintf("🧪 test run cut short by the stop after %s\n", took))
+			return false, tail
 		}
 		a.say(ctx, sid, fmt.Sprintf("🧪 tests failed after %s\n", took))
 		return false, tail

@@ -955,3 +955,33 @@ func TestSpecPausesWhenTheModelCallFails(t *testing.T) {
 		t.Errorf("attempts = %d, want none counted", got.Attempts["F0.1"])
 	}
 }
+
+// A stop is acknowledged at once, before the step in flight ends, and the loop's
+// last word is that it stopped, not that the editor aborted a request.
+func TestSpecStopIsAcknowledged(t *testing.T) {
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(id string) bool { return id != "F0.1" })
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // the stop arrives before the first round
+	if _, err := rig.h.agent.runSpec(ctx, rig.h.sess.ID, rig.h.sess, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	var said string
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		said = ""
+		for _, u := range rig.h.updatesOfKind(KindAgentMessage) {
+			if c, _ := u["content"].(map[string]any); c != nil {
+				said += fmt.Sprint(c["text"])
+			}
+		}
+		if strings.Contains(said, "Stopping /spec") && strings.Contains(said, "/spec stopped.") {
+			break
+		}
+	}
+	if !strings.Contains(said, "Stopping /spec") || !strings.Contains(said, "/spec stopped.") || strings.Contains(said, "aborted") {
+		t.Errorf("the stop was not acknowledged plainly:\n%s", said)
+	}
+}
