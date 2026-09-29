@@ -712,6 +712,20 @@ func (g *specLoopRig) run(t *testing.T) string {
 	if _, err := g.h.agent.runSpec(ctx, g.h.sess.ID, g.h.sess, "", nil); err != nil {
 		t.Fatal(err)
 	}
+	// Updates are recorded by the harness's reader, in order: once this marker is
+	// in, so is everything the loop said before it.
+	const marker = "\x00end of run"
+	g.h.agent.say(ctx, g.h.sess.ID, marker)
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		n := g.h.updatesOfKind(KindAgentMessage)
+		if c, _ := n[len(n)-1]["content"].(map[string]any); c != nil && c["text"] == marker {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the loop's messages did not all arrive")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	var said strings.Builder
 	for _, u := range g.h.updatesOfKind(KindAgentMessage) {
 		if c, _ := u["content"].(map[string]any); c != nil {
@@ -910,5 +924,34 @@ func TestSpecStuckItemBecomesAQuestion(t *testing.T) {
 	}
 	if !strings.Contains(said, "1 question(s) wait on your answer in `spec/QUESTIONS.md`") {
 		t.Errorf("run 2 did not stop on the waiting question:\n%s", said)
+	}
+}
+
+// A server that refuses every request is no failure of the item: the loop pauses,
+// counts no attempt and asks nothing. Three items once became questions about
+// Halogen's 64-picture limit, and the loop stopped as if they were stuck.
+func TestSpecPausesWhenTheModelCallFails(t *testing.T) {
+	refused := `data: {"error":{"message":"the engine refused this request: IMG count outside 0..64"}}` + "\n\n"
+	var resp []string
+	for range 6 {
+		resp = append(resp, refused)
+	}
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(id string) bool { return id != "F0.1" }, resp...)
+	said := rig.run(t)
+	if !strings.Contains(said, "/spec paused") || !strings.Contains(said, "IMG count outside 0..64") {
+		t.Errorf("the loop did not pause on the refused call:\n%s", said)
+	}
+	if strings.Contains(said, "❓") || strings.Contains(said, "not done yet") {
+		t.Errorf("a refused call was counted against the item:\n%s", said)
+	}
+	if _, err := os.Stat(filepath.Join(rig.h.sess.Cwd, "spec", specQuestionsFile)); err == nil {
+		t.Error("a refused call became a question")
+	}
+	if got := rig.ledger(t); got.Attempts["F0.1"] != 0 {
+		t.Errorf("attempts = %d, want none counted", got.Attempts["F0.1"])
 	}
 }

@@ -560,6 +560,14 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 				}
 			}
 		}
+		// The model call failed, not the item: nothing counts, and the next round would
+		// meet the same server. Three items became questions about an image limit.
+		var lce *llmCallError
+		if errors.As(turnErr, &lce) {
+			r.save(ctx)
+			r.say(ctx, fmt.Sprintf("\n⏹ **/spec paused**: the LLM request failed, so this round does not count against %s and nothing was recorded: %s\nWhen the server answers again, `/spec` resumes with the same item.\n", w.Item, firstLine(lce.Error())))
+			break
+		}
 		done, block, err := r.finishRound(ctx, w, turnErr, since, started)
 		if isCancelled(err) {
 			return stopped(err)

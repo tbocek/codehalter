@@ -526,7 +526,7 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
 	sess.rt.mu.Lock()
-	sess.rt.stuckCalls = nil // a new request may need any call again
+	sess.rt.stuckCalls, sess.rt.stuckOutputs = nil, nil // a new request may need any call again
 	sess.rt.mu.Unlock()
 
 	a.sendPhase(ctx, sid, 0, false)
@@ -628,7 +628,10 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		// repeat the same hunt.
 		var reads, edits, runs int
 		var edited []string
+		// Grouped by what came back, as the repetition tracker does: the same answer
+		// under a new echo label or log name is the same call, shown as its first form.
 		count := map[string]int{}
+		first := map[string]string{}
 		for _, u := range lastResult.ToolUses {
 			args := parseArgs(u.Input)
 			cmd := args.str("command")
@@ -643,17 +646,23 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 				if p := args.str("path"); p != "" && !slices.Contains(edited, p) {
 					edited = append(edited, p)
 				}
-			case u.Name == "run_command" && commandWrites(cmd):
+			case u.Name == "run_command" && u.Changed:
 				edits++
 				runs++
 			case u.Name == "run_command", u.Name == "run_background":
 				runs++
 			}
-			key := u.Name + " " + u.Input
-			if u.Name == "run_command" {
-				key, _ = commandKey(cmd)
+			// A short answer ("exit 0") says which call only by the call itself.
+			h := "call " + u.Name + " " + u.Input
+			if out := repeatText(u.Input, u.Output); len(out) >= repeatMinOutput {
+				h = "answer " + out
 			}
-			count[key]++
+			if count[h]++; first[h] == "" {
+				first[h] = u.Name + " " + u.Input
+				if cmd != "" {
+					first[h] = cmd
+				}
+			}
 		}
 		var digest strings.Builder
 		fmt.Fprintf(&digest, "What the failed subtask did, counted by codehalter: %d tool calls, %d of them reads or searches, %d edits, %d commands run.", len(lastResult.ToolUses), reads, edits, runs)
@@ -664,13 +673,13 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			fmt.Fprintf(&digest, " Files changed through edits: %s.", strings.Join(edited, ", "))
 		}
 		keys := slices.Collect(maps.Keys(count))
-		slices.SortFunc(keys, func(x, y string) int { return cmp.Or(count[y]-count[x], strings.Compare(x, y)) })
+		slices.SortFunc(keys, func(x, y string) int { return cmp.Or(count[y]-count[x], strings.Compare(first[x], first[y])) })
 		var repeated []string
 		for _, k := range keys {
 			if count[k] < 3 || len(repeated) == 3 {
 				break
 			}
-			repeated = append(repeated, fmt.Sprintf("`%s` %d times", truncate(k, 100), count[k]))
+			repeated = append(repeated, fmt.Sprintf("`%s` %d times", truncate(first[k], 100), count[k]))
 		}
 		if len(repeated) > 0 {
 			digest.WriteString(" Repeated: " + strings.Join(repeated, "; ") + ".")

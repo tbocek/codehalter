@@ -787,3 +787,13 @@ func TestRequestLogDelta(t *testing.T) {
 		t.Errorf("an early change was not called out: %q", got)
 	}
 }
+
+// Halogen's picture limit, refused in the stream, is recovered like a full context.
+func TestIsContextFullSeesThePictureLimit(t *testing.T) {
+	if !isContextFull(&llmStreamError{Msg: "the engine refused this request: IMG count outside 0..64"}) {
+		t.Error("the picture-count refusal was not taken for a full context")
+	}
+	if isContextFull(&llmStreamError{Msg: "the engine refused this request: bad grammar"}) {
+		t.Error("another in-stream refusal was taken for a full context")
+	}
+}

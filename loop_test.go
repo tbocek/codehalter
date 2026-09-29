@@ -318,7 +318,8 @@ func TestStuckCallIsNotRunAgainInTheSameTurn(t *testing.T) {
 	}
 	write, _ := json.Marshal(map[string]string{"path": "note.txt", "content": "changed\n"})
 	mock := newMockLLM(t, append(step1,
-		call, // step 2 opens with the same call: not run
+		sseToolCall("v1", toolName, `{"log":"snap73"}`), // varied: runs, and its answer is the stuck one
+		call, // the same call again: not run
 		sseToolCall("w1", "write_file", string(write)),
 		call, // after a write it is a re-check: runs
 		sseToolCall("r1", respondToolName, `{"message":"done"}`),
@@ -339,10 +340,13 @@ func TestStuckCallIsNotRunAgainInTheSameTurn(t *testing.T) {
 	if res := step(); res.Terminal != respondToolName {
 		t.Fatalf("step 2 did not finish: %+v", res)
 	}
-	if runs != 2+stuckBailRounds {
-		t.Errorf("runs = %d, want %d: refused once, run again after the write", runs, 2+stuckBailRounds)
+	if runs != 3+stuckBailRounds {
+		t.Errorf("runs = %d, want %d: the varied call ran, the same one was refused once, then ran after the write", runs, 3+stuckBailRounds)
 	}
-	if got := mock.request(len(step1) + 1); !strings.Contains(fmt.Sprint(got["messages"]), "not run: an earlier attempt at this task ran exactly this call") ||
+	if got := mock.request(len(step1) + 1); !strings.Contains(fmt.Sprint(got["messages"]), "Changing the command does not change the answer") {
+		t.Errorf("the varied call with the stuck answer got no note:\n%v", got["messages"])
+	}
+	if got := mock.request(len(step1) + 2); !strings.Contains(fmt.Sprint(got["messages"]), "not run: an earlier attempt at this task ran exactly this call") ||
 		!strings.Contains(fmt.Sprint(got["messages"]), "img/05-cut.png") {
 		t.Errorf("the refused call did not carry the note and the earlier output:\n%v", got["messages"])
 	}
@@ -974,7 +978,7 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 // A green re-run after an edit is a re-verify, never a repeat.
 func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 	var testTools []Tool
-	var execs int
+	var execs, edits int
 	testTools = append(testTools, Tool{
 		Def: map[string]any{
 			"type": "function",
@@ -996,6 +1000,11 @@ func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 			},
 		},
 		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			// A real change on disk: codehalter looks, it does not take the tool's word.
+			edits++
+			if err := os.WriteFile(filepath.Join(a.getSession(sid).Cwd, "a.go"), []byte(strings.Repeat("x", edits)), 0o644); err != nil {
+				return err.Error(), true
+			}
 			return "edited", false
 		},
 	})
@@ -1488,7 +1497,7 @@ func TestPlanStringifiedSubtasksWithStrayBrace(t *testing.T) {
 // not, and the second must still count as a repeat.
 func TestStuckLadderSeesRepeatPastBatchNote(t *testing.T) {
 	a, s := newTestAgent(t)
-	rt := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
+	rt := newRepetitionTracker("", nil)
 	for _, name := range []string{"a.toml", "b.toml"} {
 		if err := os.WriteFile(filepath.Join(s.Cwd, name), []byte("k = 1\n"), 0o644); err != nil {
 			t.Fatal(err)
@@ -1500,7 +1509,7 @@ func TestStuckLadderSeesRepeatPastBatchNote(t *testing.T) {
 		tc.Function.Name = "read_file"
 		tc.Function.Arguments = fmt.Sprintf(`{"path":%q}`, path)
 		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
-		return rt.sawAgain(tc, tu)
+		return rt.sawAgain(tc, tu, false)
 	}
 	read("a.toml")
 	read("b.toml")
@@ -1509,20 +1518,28 @@ func TestStuckLadderSeesRepeatPastBatchNote(t *testing.T) {
 	}
 }
 
-// Three blind spots of the old key: a fresh echo label, a range revisited after
-// another one, and a read-only heredoc that counted as a write.
-func TestStuckLadderKeysCommandsBySubstance(t *testing.T) {
-	rt := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
+// Repeats are judged by what came back, so a varied call with the same answer is
+// caught with no parsing of the command: a new echo label, a counter or a letter in
+// a log name (renders of one screen ran 98, 135 and 93 times that way).
+func TestStuckLadderJudgesByTheAnswer(t *testing.T) {
+	rt := newRepetitionTracker("", nil)
 	run := func(cmd, out string) bool {
 		var tc toolCall
 		tc.Function.Name = "run_command"
 		b, _ := json.Marshal(map[string]string{"command": cmd})
 		tc.Function.Arguments = string(b)
-		return rt.sawAgain(tc, ToolUse{Name: "run_command", Output: "exit 0\n\n" + out})
+		return rt.sawAgain(tc, ToolUse{Name: "run_command", Output: "exit 0\n\n" + out}, false)
 	}
-	run(`echo "=== the prompt ==="; grep -n prompt spec/09.md | head -3`, "=== the prompt ===\n12:prompt")
-	if !run(`echo "=== system message ==="; grep -n prompt spec/09.md | head -3`, "=== system message ===\n12:prompt") {
+	grep := "12:the prompt is assembled from the spec slice"
+	run(`echo "=== the prompt ==="; grep -n prompt spec/09.md | head -3`, "=== the prompt ===\n"+grep)
+	if !run(`echo "=== system message ==="; grep -n prompt spec/09.md | head -3`, "=== system message ===\n"+grep) {
 		t.Error("the same grep under a new echo label did not count as a repeat")
+	}
+	shot := "exit=0\n-rw-r--r-- 1 dev dev 158790 Sep 29 12:54 shots/07-narrate.png"
+	for i, log := range []string{"f47-snap36", "f47-snap37", "snap-fa", "snap-fb"} {
+		if got := run("rm -f shots/07-narrate.png; just snapshot 07-narrate > /tmp/"+log+".log 2>&1; echo \"exit=$?\"; ls -la shots/07-narrate.png", shot); got != (i > 0) {
+			t.Errorf("render into %s: repeat = %v, want %v", log, got, i > 0)
+		}
 	}
 	run(`sed -n '10,20p' src/a.rs`, "ten to twenty")
 	run(`sed -n '30,40p' src/a.rs`, "thirty to forty")
@@ -1532,83 +1549,94 @@ func TestStuckLadderKeysCommandsBySubstance(t *testing.T) {
 	heredoc := "python3 - <<'EOF'\nprint(open('a.rs').read().count('fn'))\nEOF"
 	run(heredoc, "7")
 	if !run(heredoc, "7") {
-		t.Error("a read-only python heredoc run twice counted as a write, not a repeat")
+		t.Error("the same short-answered script run twice did not count as a repeat")
 	}
-	// A script that writes, with the double quotes JSON escapes, makes the re-check new.
-	run("go build ./...", "ok")
-	run("python3 - <<'EOF'\nopen(\"a.go\", \"w\").write(\"x\")\nEOF", "")
-	if run("go build ./...", "ok") {
-		t.Error("the build after a python write counted as a repeat")
-	}
-	// An echo piped into a program is its input, not a label.
+	// A short answer shared by different calls says nothing: many probes fail alike.
 	run(`echo "hello" | ./parse`, "error: bad input")
 	if run(`echo '{"a":1}' | ./parse`, "error: bad input") {
-		t.Error("two different inputs piped into the same program counted as one call")
+		t.Error("two different inputs with the same short error counted as one call")
 	}
 }
 
-// The same command straight after itself, exit 0 and the same output, is a spin.
-func TestStuckLadderCatchesSuccessfulCommandSpin(t *testing.T) {
-	rt := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
-	mk := func(id, name, args string) toolCall {
+// A change to the project makes a command's answer new (a re-check), not a read's.
+func TestStuckLadderResetsOnAChange(t *testing.T) {
+	rt := newRepetitionTracker("", nil)
+	mk := func(name, args string) toolCall {
 		var tc toolCall
-		tc.ID, tc.Function.Name, tc.Function.Arguments = id, name, args
+		tc.Function.Name, tc.Function.Arguments = name, args
 		return tc
 	}
-	probe := mk("c", "run_command", `{"command":"ls -la shots/x.png"}`)
-	edit := mk("e", "edit_file", `{"path":"a.rs"}`)
-	out := ToolUse{Name: "run_command", Output: "exit 0\n\n-rw-r--r-- 1 dev dev 33037 x.png\n"}
+	test := mk("run_command", `{"command":"cargo test"}`)
+	red := ToolUse{Name: "run_command", Output: "exit 101\n\ntest a::b ... FAILED: expected 3, got 4"}
+	read := mk("read_file", `{"path":"src/b.rs"}`)
+	body := ToolUse{Name: "read_file", Output: "fn b() -> u32 { 4 } // the other file, untouched"}
+	rt.sawAgain(test, red, false)
+	rt.sawAgain(read, body, false)
+	if !rt.sawAgain(test, red, false) {
+		t.Error("the same red test with nothing changed did not count as a repeat")
+	}
+	if rt.sawAgain(mk("edit_file", `{"path":"src/a.rs"}`), ToolUse{Name: "edit_file", Output: "file written successfully"}, true) {
+		t.Error("a change is never a repeat")
+	}
+	if rt.sawAgain(test, red, false) {
+		t.Error("the test after a change is a re-check, not a repeat")
+	}
+	if !rt.sawAgain(read, body, false) {
+		t.Error("re-reading a file the change did not touch still says nothing new")
+	}
+	// An edit that fails the same way is only a repeat as the same edit, and a job's
+	// launch note only for the same job.
+	fail := ToolUse{Name: "edit_file", Output: "error: old_text not found, the file differs from what you remember"}
+	rt.sawAgain(mk("edit_file", `{"path":"a.rs","old_text":"x"}`), fail, false)
+	if rt.sawAgain(mk("edit_file", `{"path":"a.rs","old_text":"y"}`), fail, false) {
+		t.Error("a different edit failing with the same message counted as a repeat")
+	}
+	if !rt.sawAgain(mk("edit_file", `{"path":"a.rs","old_text":"x"}`), fail, false) {
+		t.Error("the same failing edit again did not count as a repeat")
+	}
+	launch := func(cmd string) bool {
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		return rt.sawAgain(mk("run_background", string(b)), ToolUse{Name: "run_background", Output: "background job 7 running (pid 4242). It keeps running across tool calls."}, false)
+	}
+	launch("just test > /tmp/a.log")
+	if launch("just snapshot 05-cut > /tmp/b.log") {
+		t.Error("two different jobs counted as one because their launch notes read alike")
+	}
+}
 
-	other := mk("o", "run_command", `{"command":"grep -n foo a.rs"}`)
-	otherOut := ToolUse{Name: "run_command", Output: "exit 0\n\n12:foo\n"}
-
-	if rt.sawAgain(probe, out) {
-		t.Fatal("the first run is new")
+// The fingerprint goes by content: rewriting the same bytes (a render of the same
+// screen) changes nothing, other bytes or a new file do; outside git too.
+func TestProjectSig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
 	}
-	if !rt.sawAgain(probe, out) {
-		t.Error("the same successful command straight after itself did not count as a repeat")
-	}
-	// Alternating two probes changes nothing either.
-	rt.sawAgain(other, otherOut)
-	if !rt.sawAgain(probe, out) {
-		t.Error("a successful command re-run after only another probe did not count as a repeat")
-	}
-	if !rt.sawAgain(other, otherOut) {
-		t.Error("the alternating probe did not count as a repeat")
-	}
-	rt.sawAgain(edit, ToolUse{Name: "edit_file", Output: "ok"})
-	if rt.sawAgain(probe, out) {
-		t.Error("a re-run after an edit is a re-verify, not a repeat")
-	}
-	rt.sawAgain(mk("s", "run_command", `{"command":"sed -i s/a/b/ a.rs"}`), ToolUse{Name: "run_command", Output: "exit 0\n"})
-	if rt.sawAgain(probe, out) {
-		t.Error("a re-run after an in-place shell write is a re-verify, not a repeat")
-	}
-	rt.sawAgain(mk("p", "run_command", "{\"command\":\"cd rust && python3 - <<'PY'\\nopen('a.rs','w').write('x')\\nPY\"}"), ToolUse{Name: "run_command", Output: "exit 0\n"})
-	if rt.sawAgain(probe, out) {
-		t.Error("a re-run after a Python heredoc edit is a re-verify, not a repeat")
-	}
-	// A counter bumped into the command changes neither the key nor the answer.
-	for i := 1; i <= 3; i++ {
-		poll := mk("r", "run_command", fmt.Sprintf(`{"command":"ls -l shotview/cut.png | cut -c1-70; echo READY%d"}`, i))
-		pollOut := ToolUse{Name: "run_command", Output: fmt.Sprintf("exit 0\n\n-rw-r--r-- 1 dev dev 115300 Sep 26 22:20 shotview/cut.\nREADY%d\n", i)}
-		if got := rt.sawAgain(poll, pollOut); got != (i > 1) {
-			t.Errorf("poll %d: repeat = %v, want %v", i, got, i > 1)
+	for _, withGit := range []bool{true, false} {
+		dir := t.TempDir()
+		if withGit {
+			if out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v %s", err, out)
+			}
 		}
-	}
-	// A redirect to a log is not a change to the tree.
-	snap := mk("n", "run_command", `{"command":"cd rust && just snapshot 04-prepare > /tmp/snap.log 2>&1"}`)
-	snapOut := ToolUse{Name: "run_command", Output: "exit 0\n\n-> shots/04-prepare.png\n"}
-	rt.sawAgain(snap, snapOut)
-	if !rt.sawAgain(snap, snapOut) {
-		t.Error("a repeated snapshot render with only a log redirect did not count as a repeat")
-	}
-	if !rt.sawAgain(probe, ToolUse{Name: "run_command", Output: "exit 1\n\nboom", Failed: true}) {
-		// New output is not a repeat; the next identical failure is.
-		t.Log("first failure is new output")
-	}
-	if !rt.sawAgain(probe, ToolUse{Name: "run_command", Output: "exit 1\n\nboom", Failed: true}) {
-		t.Error("a repeated failure did not count")
+		write := func(name, body string) {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write("shot.png", "pixels")
+		before := projectSig(dir)
+		write("shot.png", "pixels")
+		if same := projectSig(dir); withGit && same != before {
+			t.Errorf("git: the same bytes written again changed the fingerprint")
+		}
+		write("shot.png", "other pixels")
+		changed := projectSig(dir)
+		if changed == before {
+			t.Errorf("git=%v: new content did not change the fingerprint", withGit)
+		}
+		write("new.rs", "fn x() {}")
+		if projectSig(dir) == changed {
+			t.Errorf("git=%v: a new file did not change the fingerprint", withGit)
+		}
 	}
 }
 

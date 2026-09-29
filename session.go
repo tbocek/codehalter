@@ -52,6 +52,8 @@ type ToolUse struct {
 	// ImageID is an image this call produced. Replay uses the stored bytes, never
 	// a re-run: re-rendering is not pure, and new bytes would bust the cache.
 	ImageID string `toml:"image_id,omitempty"`
+	// Changed: the call changed the project (observed, see changedBy). Not stored.
+	Changed bool `toml:"-"`
 }
 
 type Session struct {
@@ -137,7 +139,10 @@ type sessionRuntime struct {
 	// repetition tracker, with their output. The turn's later steps get the output
 	// back instead of a run, until they write something (see runToolLoop).
 	stuckCalls map[string]string
-	prevCall   toolCallBrief
+	// stuckOutputs: those calls' outputs as repeats are judged (repeatText): a changed
+	// command with the same answer is the same loop.
+	stuckOutputs map[uint64]bool
+	prevCall     toolCallBrief
 	// Later calls of the same reply were batched already and get no batching note.
 	replyStart bool
 	// jobRuns are the background jobs that exited: a /spec gate that ran as one counts.

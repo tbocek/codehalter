@@ -6,10 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"log/slog"
 	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -508,113 +514,228 @@ func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (st
 // Past this the phase name and the seconds counter get pushed out of view.
 const toolMeterArgRunes = 48
 
-// An interleaved revisit counts too, hence a map rather than a last-call comparison.
+// An interleaved revisit counts too, hence maps rather than a last-call comparison.
+// Repeats are keyed by what the model got back, not by what it typed: a model that
+// varies the call (a new echo label, a counter in a log name: one step rendered the
+// same screen 98 times, each into a new log) still gets the same answer.
 type repetitionTracker struct {
-	// bag catches near-identical output the hash misses, like a timestamp in a failing build.
-	hash map[string]uint64
+	// A change to the project makes a command's answer new again (a re-check), but
+	// not a read's: re-reading a file the edit did not touch still says nothing new.
+	reads, runs repeatMemory
+	// stuck: outputs that ended an earlier step of this turn by repeating.
+	stuck map[uint64]bool
+	// cwd and sig: the project and its fingerprint after the last observed call.
+	cwd, sig string
+	changes  int  // calls that changed the project in this step
+	hitStuck bool // the last sawAgain returned an output that ended an earlier step
+}
+
+// repeatMemory: the outputs the model got, from any call, and per exact call its
+// last output, whose bag catches near-identical output the hash misses (a
+// timestamp in a failing build).
+type repeatMemory struct {
+	seen map[uint64]bool
+	last map[string]uint64
 	bag  map[string]map[string]bool
-	// writeAt is the writes count when each call last ran.
-	writes  int
-	writeAt map[string]int
 }
 
-// A timestamp or a counter in the output does not make it new.
-var digitRunRe = regexp.MustCompile(`\d+`)
+func newRepeatMemory() repeatMemory {
+	return repeatMemory{seen: map[uint64]bool{}, last: map[string]uint64{}, bag: map[string]map[string]bool{}}
+}
 
-// Shell commands that rewrite source files. A redirect is NOT one: it writes a
-// log, not the tree.
-var inPlaceWriterRe = regexp.MustCompile(`sed -i|-i\b.*\bsed|cargo fmt|gofmt -w|prettier --write|go mod tidy|git (checkout|stash|apply|revert|reset)|cargo add|npm i|apk add|apt-get install`)
+// readerTools cannot change the project.
+var readerTools = map[string]bool{"read_file": true, "continue_read": true, "screenshot": true, "view_image": true,
+	"web_search": true, "web_read": true, "ask_user": true, respondToolName: true, submitPlanToolName: true}
 
-// commandWrites: a command that rewrites the tree, including a script that opens a
-// file for writing and a heredoc redirected into a file outside /tmp.
-func commandWrites(cmd string) bool {
-	if inPlaceWriterRe.MatchString(cmd) || scriptWriteRe.MatchString(cmd) {
-		return true
+func newRepetitionTracker(cwd string, stuck map[uint64]bool) *repetitionTracker {
+	rt := &repetitionTracker{reads: newRepeatMemory(), runs: newRepeatMemory(), stuck: maps.Clone(stuck), cwd: cwd}
+	if cwd != "" {
+		rt.sig = projectSig(cwd)
 	}
-	if strings.Contains(cmd, "<<") {
-		for _, f := range redirectTargets(cmd, "/") {
-			if !strings.HasPrefix(f, "/tmp/") && !strings.HasPrefix(f, "/dev/") {
-				return true
+	return rt
+}
+
+// From the same call again, a timestamp, a pid or a counter in the output does not
+// make it new. Between different calls a number can be the news ("3 passed", "5
+// passed"), so there only a clock time or a date is folded.
+var (
+	digitRunRe = regexp.MustCompile(`\d+`)
+	clockRe    = regexp.MustCompile(`\d{4}-\d\d-\d\d|\d{1,2}:\d\d(?::\d\d(?:\.\d+)?)?`)
+)
+
+// repeatMinOutput: shorter answers ("exit 0", "no matches found") come from many
+// different probes alike, so across calls they say nothing about a loop; from the
+// same call again they do.
+const repeatMinOutput = 24
+
+// callKey is exactly the call: the tool and its arguments.
+func callKey(tc toolCall) string { return tc.Function.Name + "\x00" + tc.Function.Arguments }
+
+// repeatText is an output as a repeat between different calls is judged: without
+// the batching note (it depends on the call before), without the lines the call
+// spelled out itself (an echo label is the model's own text, not an answer), clock
+// times and dates folded.
+func repeatText(args, output string) string {
+	out, _, _ := strings.Cut(output, batchNoteLead)
+	var own strings.Builder
+	var walk func(v any)
+	walk = func(v any) {
+		switch v := v.(type) {
+		case string:
+			own.WriteString(v)
+			own.WriteByte('\n')
+		case []any:
+			for _, e := range v {
+				walk(e)
+			}
+		case map[string]any:
+			for _, e := range v {
+				walk(e)
 			}
 		}
 	}
-	return false
+	var v any
+	if json.Unmarshal([]byte(args), &v) == nil {
+		walk(v)
+	}
+	spelled := own.String()
+	lines := strings.Split(out, "\n")
+	lines = slices.DeleteFunc(lines, func(l string) bool {
+		t := strings.TrimSpace(l)
+		return len(t) >= 3 && strings.Contains(spelled, t)
+	})
+	return strings.TrimSpace(clockRe.ReplaceAllString(strings.Join(lines, "\n"), "#"))
 }
 
-// commandKey drops a command that only prints a label (an echo or printf that is
-// neither piped nor redirected), and labels is what those echoes print: a new
-// label on the same grep is the same grep, in the key and in the output.
-func commandKey(cmd string) (key string, labels map[string]bool) {
-	var keep []string
-	labels = map[string]bool{}
-	for _, seg := range shellSegments(cmd, false) {
-		first := strings.Fields(seg)[0]
-		if bare := unquoted(seg); strings.ContainsAny(bare, "|>") || first != "echo" && first != "printf" && first != "true" && first != ":" {
-			keep = append(keep, seg)
-			continue
-		}
-		if first == "echo" {
-			text := strings.TrimSpace(strings.TrimPrefix(seg, "echo"))
-			text = strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "-e "), "-n "))
-			if len(text) >= 2 && (text[0] == '"' || text[0] == '\'') && text[len(text)-1] == text[0] {
-				text = text[1 : len(text)-1]
-			}
-			labels[text] = true
-		}
+// changedBy: whether a call changed the project. A write tool says so; a tool that
+// cannot write did not; anything else (a shell command, an MCP tool) is observed,
+// not guessed from its text: a redirect, `sed -i` or a Python heredoc all show up
+// the same way.
+func (rt *repetitionTracker) changedBy(tc toolCall, tu ToolUse) bool {
+	if readerTools[tc.Function.Name] {
+		return false
 	}
-	return strings.Join(keep, " ; "), labels
+	// Without a project to look at, a write tool's own word is all there is. With
+	// one, the look decides: an edit that wrote the same bytes changed nothing.
+	if rt.cwd == "" {
+		return (tc.Function.Name == "edit_file" || tc.Function.Name == "write_file") && strings.HasPrefix(tu.Output, "file written")
+	}
+	sig := projectSig(rt.cwd)
+	changed := sig != rt.sig
+	rt.sig = sig
+	if changed {
+		rt.changes++
+	}
+	return changed
 }
 
-// repeatKey is what makes two calls the same: the tool and its arguments, a shell
-// command by what it runs (commandKey), with the echo labels it prints.
-func repeatKey(tc toolCall) (key string, labels map[string]bool) {
-	args := tc.Function.Arguments
-	if tc.Function.Name == "run_command" {
-		args, labels = commandKey(parseArgs(args).str("command"))
+// sawAgain: the call brought nothing new, since the model already got this output
+// with the project as it is.
+func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse, changed bool) bool {
+	rt.hitStuck = false
+	if changed {
+		// Every command may answer differently now: a re-run is a re-check.
+		rt.runs = newRepeatMemory()
+		clear(rt.stuck)
+		return false
 	}
-	return tc.Function.Name + "\x00" + args, labels
-}
-
-func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
-	out, _, _ := strings.Cut(tu.Output, batchNoteLead) // the note depends on the call before, not on this one
-	key, labels := repeatKey(tc)
-	if labels != nil {
-		lines := strings.Split(out, "\n")
-		out = strings.Join(slices.DeleteFunc(lines, func(l string) bool { return labels[strings.TrimSpace(l)] }), "\n")
+	mem := &rt.runs
+	if readerTools[tc.Function.Name] {
+		mem = &rt.reads
 	}
-	out = digitRunRe.ReplaceAllString(out, "#")
+	out := repeatText(tc.Function.Arguments, tu.Output)
 	h := fnvHash(out)
-	bag := issueBag([]string{out})
-	repeated := false
-	if prev, ok := rt.hash[key]; ok && prev == h {
-		repeated = true
-	} else if prevBag, ok := rt.bag[key]; ok && jaccard(prevBag, bag) >= stuckOutputSimilarity {
+	folded := digitRunRe.ReplaceAllString(out, "#")
+	bag := issueBag([]string{folded})
+	key := callKey(tc)
+	last, again := mem.last[key]
+	repeated := again && last == fnvHash(folded)
+	if prev, ok := mem.bag[key]; ok && jaccard(prev, bag) >= stuckOutputSimilarity {
 		repeated = true
 	}
-	rt.hash[key] = h
-	rt.bag[key] = bag
-	// A green run_command re-run after a write is a re-verify. A red one, or a green
-	// one with nothing written since its last run, is a spin.
-	if rt.writeAt == nil {
-		rt.writeAt = map[string]int{}
-	}
-	// Before this call's own write: a writer re-run with nothing changed since is a spin.
-	changedSince := rt.writeAt[key] < rt.writes
-	switch tc.Function.Name {
-	case "edit_file", "write_file":
-		rt.writes++
-	case "run_command":
-		// The command, not the JSON arguments: there a script's "w" is \"w\".
-		if commandWrites(parseArgs(tc.Function.Arguments).str("command")) {
-			rt.writes++
+	// A write's error and a job's launch note read alike for any call: only the
+	// same call again repeats them.
+	// The length is the answer's, without run_command's own exit line.
+	answer := strings.TrimSpace(strings.TrimPrefix(folded, "exit #"))
+	if name := tc.Function.Name; len(answer) >= repeatMinOutput && name != "edit_file" && name != "write_file" && name != "run_background" {
+		repeated = repeated || mem.seen[h]
+		if rt.stuck[h] {
+			repeated, rt.hitStuck = true, true
 		}
+		mem.seen[h] = true
 	}
-	rt.writeAt[key] = rt.writes
-	if repeated && !tu.Failed && tc.Function.Name == "run_command" && changedSince {
-		repeated = false
-	}
+	mem.last[key] = fnvHash(folded)
+	mem.bag[key] = bag
 	return repeated
 }
+
+// projectSig fingerprints what a call could change in the project: the files git
+// reports as changed or new, by content. Content, not mtime: a render that writes
+// the same picture again changed nothing. Outside git, each file's size and mtime.
+func projectSig(cwd string) string {
+	h := fnv.New64a()
+	out, err := exec.Command("git", "-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all").Output()
+	if err != nil {
+		n := 0
+		walkErr := filepath.WalkDir(cwd, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil // a file gone mid-walk is a change the next look sees
+			}
+			if d.IsDir() {
+				if path != cwd && skipWalkDir(d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if n++; n > projectSigMaxFiles {
+				return filepath.SkipAll
+			}
+			if info, err := d.Info(); err == nil {
+				fmt.Fprintf(h, "%s\x00%d\x00%d\x00", path, info.Size(), info.ModTime().UnixNano())
+			}
+			return nil
+		})
+		if walkErr != nil {
+			slog.Debug("projectSig: walk", "cwd", cwd, "err", walkErr)
+		}
+		return strconv.FormatUint(h.Sum64(), 16)
+	}
+	h.Write(out)
+	hashed := 0
+	for _, entry := range strings.Split(string(out), "\x00") {
+		// "XY path"; a rename's second field is the old path alone, with no status.
+		if len(entry) < 4 || entry[2] != ' ' {
+			continue
+		}
+		path := filepath.Join(cwd, entry[3:])
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if hashed++; hashed > projectSigMaxFiles || info.Size() > projectSigMaxBytes {
+			fmt.Fprintf(h, "%d\x00%d\x00", info.Size(), info.ModTime().UnixNano())
+			continue
+		}
+		// An unreadable file goes in as its error: seen the same way twice, it is no change.
+		f, err := os.Open(path)
+		if err != nil {
+			fmt.Fprintf(h, "\x00%v\x00", err)
+			continue
+		}
+		if _, err := io.Copy(h, f); err != nil {
+			fmt.Fprintf(h, "\x00%v\x00", err)
+		}
+		f.Close()
+	}
+	return strconv.FormatUint(h.Sum64(), 16)
+}
+
+// Bounds on projectSig's cost per call: content is hashed for this many changed
+// files up to this size; past them size and mtime stand in.
+const (
+	projectSigMaxFiles = 500
+	projectSigMaxBytes = 8 << 20
+)
 
 func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 	// Only MCP tools and the card-less few lack a card that already shows the arguments.
@@ -775,17 +896,25 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 
 	// Consecutive stuck rounds climb one ladder (nudge, warm the sampler, bail); any
 	// productive round resets it, so read-after-write and fan-out are never punished.
-	repeats := &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
 	// An earlier step of this turn was ended repeating these calls; its successor
 	// copied the same call from the history, five steps in a row on one /spec item.
 	var stuckBefore map[string]string
+	var stuckOutputs map[uint64]bool
+	cwd := ""
 	loopSess := a.getSession(sid) // nil for a sessionless internal pass
 	if loopSess != nil {
+		cwd = loopSess.Cwd
 		loopSess.rt.mu.Lock()
-		stuckBefore = maps.Clone(loopSess.rt.stuckCalls)
+		stuckBefore, stuckOutputs = maps.Clone(loopSess.rt.stuckCalls), maps.Clone(loopSess.rt.stuckOutputs)
 		loopSess.rt.mu.Unlock()
 	}
-	var roundRepeats map[string]string // this round's calls that repeated, with their output
+	repeats := newRepetitionTracker(cwd, stuckOutputs)
+	type repeatedCall struct {
+		key, output string
+		hash        uint64
+	}
+	var roundRepeats []repeatedCall // this round's calls that repeated
+	var hitStuck bool               // one of them was an output that ended an earlier step
 	var stuckRounds int
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
@@ -853,6 +982,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		text, calls, rewritten, err := callModel(sess, messages)
 		messages = rewritten
 		if err != nil {
+			if ctx.Err() == nil {
+				err = &llmCallError{err}
+			}
 			return finish(err)
 		}
 		allText.WriteString(text)
@@ -888,7 +1020,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		var terminalName string
 		var terminalMessage string
 		var failedThisRound bool
-		roundRepeats = map[string]string{}
+		roundRepeats, hitStuck = nil, false
 		// True only if EVERY call this round reproduced known output.
 		roundStuck := len(calls) > 0
 
@@ -910,7 +1042,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			var tu ToolUse
 			var content any
 			denied := policy.deny[tc.Function.Name]
-			key, _ := repeatKey(tc)
+			key := callKey(tc)
 			before, wasStuck := stuckBefore[key]
 			switch {
 			case denied:
@@ -918,7 +1050,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				tu, msg = a.denyToolCall(ctx, sid, phase, tc)
 				content = msg
 			// Once the step wrote something, the same call may answer differently: a re-check.
-			case wasStuck && repeats.writes == 0:
+			case wasStuck && repeats.changes == 0:
 				msg := "not run: an earlier attempt at this task ran exactly this call again and again until codehalter ended it, so it answers nothing new. Its output, which you already have:\n\n" +
 					before + "\n\nDo what the task asks with a different call; if the task asks you to look at a picture, call `screenshot` on it."
 				tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (repeated from an ended attempt)", "tool", nil)
@@ -933,10 +1065,13 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if tu.Failed && !denied {
 				failedThisRound = true
 			}
-			if !repeats.sawAgain(tc, tu) {
+			changed := repeats.changedBy(tc, tu)
+			res.ToolUses[len(res.ToolUses)-1].Changed = changed
+			if !repeats.sawAgain(tc, tu, changed) {
 				roundStuck = false
 			} else {
-				roundRepeats[key] = tu.Output
+				roundRepeats = append(roundRepeats, repeatedCall{key, tu.Output, fnvHash(repeatText(tc.Function.Arguments, tu.Output))})
+				hitStuck = hitStuck || repeats.hitStuck
 			}
 			if phase == "execute" && !denied {
 				switch name := tc.Function.Name; {
@@ -1024,9 +1159,12 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if loopSess != nil {
 				loopSess.rt.mu.Lock()
 				if loopSess.rt.stuckCalls == nil {
-					loopSess.rt.stuckCalls = map[string]string{}
+					loopSess.rt.stuckCalls, loopSess.rt.stuckOutputs = map[string]string{}, map[uint64]bool{}
 				}
-				maps.Copy(loopSess.rt.stuckCalls, roundRepeats)
+				for _, c := range roundRepeats {
+					loopSess.rt.stuckCalls[c.key] = c.output
+					loopSess.rt.stuckOutputs[c.hash] = true
+				}
 				loopSess.rt.mu.Unlock()
 			}
 			// No error: the normal failure paths (replan, plan salvage) beat a hard error.
@@ -1035,6 +1173,12 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		if !nudgedUI && sid != "" {
 			nudgedUI = true
 			a.say(ctx, sid, "⚠ Repeating with no new information — nudging the model to change course.\n")
+		}
+		if hitStuck {
+			// The call differs from the one that ended the earlier attempt; its answer does not.
+			messages = a.addCorrective(sid, messages,
+				"That output is the one an earlier attempt at this task got again and again until codehalter ended it. Changing the command does not change the answer. Do what the task asks with a different call; if it asks you to look at a picture, call `screenshot` on it.")
+			continue
 		}
 		messages = a.addCorrective(sid, messages,
 			"Your last tool call(s) returned output you already have — that makes no progress. Do NOT repeat them. Instead:\n"+

@@ -110,6 +110,20 @@ func (e *llmHTTPError) Error() string {
 	return fmt.Sprintf("LLM returned %d: %s [URL: %s]", e.Status, e.Body, e.URL)
 }
 
+// llmStreamError is a refusal the server sent in the stream after a 200.
+type llmStreamError struct{ Role, Model, Msg string }
+
+func (e *llmStreamError) Error() string {
+	return fmt.Sprintf("LLM returned an error mid-stream (role=%s, model=%s): %s", e.Role, e.Model, e.Msg)
+}
+
+// llmCallError marks a turn that failed because the model call did, not because of
+// what the model did: /spec does not count it against the item.
+type llmCallError struct{ err error }
+
+func (e *llmCallError) Error() string { return e.err.Error() }
+func (e *llmCallError) Unwrap() error { return e.err }
+
 // finish=length below the max_tokens cap: the prompt fit but left no room, so it
 // is recovered like a context-overflow 400.
 var errContextCeiling = errors.New("generation hit the context ceiling")
@@ -133,6 +147,13 @@ func isContextFull(err error) bool {
 			}
 		}
 		return false
+	}
+	// Halogen refuses a request carrying more than 64 pictures, in the stream: a
+	// render loop attached 98 and every later request of the session was refused.
+	// A fold drops the older pictures (the summary keeps their ids).
+	var se *llmStreamError
+	if errors.As(err, &se) && strings.Contains(strings.ToLower(se.Msg), "img count") {
+		return true
 	}
 	return errors.Is(err, errContextCeiling)
 }
@@ -517,7 +538,7 @@ func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r 
 func (a *agent) streamOutcomeError(conn *LLMConnection, reqBody map[string]any, r *streamResult) error {
 	switch {
 	case r.streamErrMsg != "":
-		return fmt.Errorf("LLM returned an error mid-stream (role=%s, model=%s): %s", conn.Tag, conn.Model, r.streamErrMsg)
+		return &llmStreamError{Role: conn.Tag, Model: conn.Model, Msg: r.streamErrMsg}
 	case r.scanErr != nil:
 		return fmt.Errorf("reading SSE stream: %w", r.scanErr)
 	case r.finishReason == "length":
