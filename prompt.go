@@ -354,14 +354,33 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		return PromptResponse{}, errors.New(abort)
 	}
 
-	// A still-running bootstrap is parked on an interactive question.
+	// Startup still running: a prompt waits for it, unless startup is asking the
+	// user something, which the prompt would answer past. Refusing outright made
+	// `--cli -p`, which prompts at once, fail every time with a question nobody asked.
 	if a.indexDone != nil {
 		select {
 		case <-a.indexDone:
 			slog.Debug("Prompt: indexDone gate passed", "sid", req.SessionId)
 		default:
-			slog.Debug("Prompt: indexDone gate refused (bootstrap still running)", "sid", req.SessionId)
-			return PromptResponse{}, errors.New("Please answer the pending question above first.")
+			if a.asking.Load() > 0 {
+				slog.Debug("Prompt: indexDone gate refused (startup is asking)", "sid", req.SessionId)
+				return PromptResponse{}, errors.New("Please answer the pending question above first.")
+			}
+			slog.Debug("Prompt: waiting for startup", "sid", req.SessionId)
+			a.say(ctx, req.SessionId, "⏳ Still setting up; your message runs as soon as that is done.\n")
+			select {
+			case <-a.indexDone:
+			case <-ctx.Done():
+				return PromptResponse{}, ctx.Err()
+			}
+			// Startup may have ended on a problem the abort gate above did not see yet.
+			a.mu.Lock()
+			abort := a.abortReason
+			a.mu.Unlock()
+			if abort != "" {
+				a.say(ctx, req.SessionId, abort+"\n")
+				return PromptResponse{}, errors.New(abort)
+			}
 		}
 	} else {
 		slog.Debug("Prompt: indexDone nil, no gate", "sid", req.SessionId)

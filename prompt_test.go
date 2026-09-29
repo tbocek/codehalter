@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseLineRange(t *testing.T) {
@@ -352,5 +353,43 @@ func TestSpecRoundSkipsTheDocumenter(t *testing.T) {
 		if want := map[bool]int{false: 3, true: 2}[fenced]; mock.callCount() != want {
 			t.Errorf("fenced=%v: %d model calls, want %d", fenced, mock.callCount(), want)
 		}
+	}
+}
+
+// A prompt during startup waits for it, unless startup is asking the user
+// something; `--cli -p` prompts at once and was refused every time.
+func TestPromptDuringStartup(t *testing.T) {
+	a, s := newTestAgent(t)
+	req := PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: "what does Shout do?"}}}
+
+	a.indexDone = make(chan struct{})
+	a.asking.Add(1)
+	if _, err := a.Prompt(context.Background(), req); err == nil || !strings.Contains(err.Error(), "answer the pending question") {
+		t.Errorf("a prompt while startup asks: err = %v, want the refusal", err)
+	}
+	a.asking.Add(-1)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Prompt(context.Background(), req)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("the prompt did not wait for startup: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// Startup ends on a problem: the waiting prompt reports it.
+	a.mu.Lock()
+	a.abortReason = "setup failed: no LLM"
+	a.mu.Unlock()
+	close(a.indexDone)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "setup failed: no LLM") {
+			t.Errorf("after startup: err = %v, want startup's problem", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the prompt still waits after startup ended")
 	}
 }

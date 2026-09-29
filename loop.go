@@ -524,8 +524,10 @@ type repetitionTracker struct {
 	reads, runs repeatMemory
 	// stuck: outputs that ended an earlier step of this turn by repeating.
 	stuck map[uint64]bool
-	// cwd and sig: the project and its fingerprint after the last observed call.
+	// cwd and sig: the project and its fingerprint after the last observed call;
+	// exact: git gave it, so it sees every change by content.
 	cwd, sig string
+	exact    bool
 	changes  int  // calls that changed the project in this step
 	hitStuck bool // the last sawAgain returned an output that ended an earlier step
 }
@@ -550,7 +552,7 @@ var readerTools = map[string]bool{"read_file": true, "continue_read": true, "scr
 func newRepetitionTracker(cwd string, stuck map[uint64]bool) *repetitionTracker {
 	rt := &repetitionTracker{reads: newRepeatMemory(), runs: newRepeatMemory(), stuck: maps.Clone(stuck), cwd: cwd}
 	if cwd != "" {
-		rt.sig = projectSig(cwd)
+		rt.sig, rt.exact = projectSig(cwd)
 	}
 	return rt
 }
@@ -615,14 +617,16 @@ func (rt *repetitionTracker) changedBy(tc toolCall, tu ToolUse) bool {
 	if readerTools[tc.Function.Name] {
 		return false
 	}
-	// Without a project to look at, a write tool's own word is all there is. With
-	// one, the look decides: an edit that wrote the same bytes changed nothing.
+	// With git the look decides: an edit that wrote the same bytes changed nothing.
+	// Without it the look is partial (sizes and times of the first files), so a
+	// write tool's own word counts too.
+	written := (tc.Function.Name == "edit_file" || tc.Function.Name == "write_file") && strings.HasPrefix(tu.Output, "file written")
 	if rt.cwd == "" {
-		return (tc.Function.Name == "edit_file" || tc.Function.Name == "write_file") && strings.HasPrefix(tu.Output, "file written")
+		return written
 	}
-	sig := projectSig(rt.cwd)
-	changed := sig != rt.sig
-	rt.sig = sig
+	sig, exact := projectSig(rt.cwd)
+	changed := sig != rt.sig || written && !exact
+	rt.sig, rt.exact = sig, exact
 	if changed {
 		rt.changes++
 	}
@@ -671,8 +675,9 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse, changed bool) boo
 
 // projectSig fingerprints what a call could change in the project: the files git
 // reports as changed or new, by content. Content, not mtime: a render that writes
-// the same picture again changed nothing. Outside git, each file's size and mtime.
-func projectSig(cwd string) string {
+// the same picture again changed nothing. Outside git, each file's size and mtime,
+// for the first files only, so not exact.
+func projectSig(cwd string) (sig string, exact bool) {
 	h := fnv.New64a()
 	out, err := exec.Command("git", "-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all").Output()
 	if err != nil {
@@ -698,7 +703,7 @@ func projectSig(cwd string) string {
 		if walkErr != nil {
 			slog.Debug("projectSig: walk", "cwd", cwd, "err", walkErr)
 		}
-		return strconv.FormatUint(h.Sum64(), 16)
+		return strconv.FormatUint(h.Sum64(), 16), false
 	}
 	h.Write(out)
 	hashed := 0
@@ -727,7 +732,7 @@ func projectSig(cwd string) string {
 		}
 		f.Close()
 	}
-	return strconv.FormatUint(h.Sum64(), 16)
+	return strconv.FormatUint(h.Sum64(), 16), true
 }
 
 // Bounds on projectSig's cost per call: content is hashed for this many changed

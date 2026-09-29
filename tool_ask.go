@@ -137,7 +137,9 @@ func (a *agent) elicitForm(ctx context.Context, sid, tcId, message string, props
 	if tcId != "" {
 		req["toolCallId"] = tcId
 	}
+	a.asking.Add(1)
 	raw, err := a.conn.sendRequest(ctx, "elicitation/create", req)
+	a.asking.Add(-1)
 	if err != nil {
 		return "", nil, err
 	}
@@ -262,6 +264,8 @@ func (a *agent) doPermissionRequest(ctx context.Context, r permissionRequest) (s
 	}
 	var raw json.RawMessage
 	var err error
+	a.asking.Add(1)
+	defer a.asking.Add(-1)
 	for attempt := 0; attempt <= len(unknownSessionBackoffs); attempt++ {
 		raw, err = a.conn.sendRequest(ctx, "session/request_permission", r)
 		if err == nil || !strings.Contains(err.Error(), "unknown session") || attempt == len(unknownSessionBackoffs) {

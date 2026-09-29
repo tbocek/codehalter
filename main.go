@@ -61,6 +61,9 @@ type agent struct {
 	emptyProject bool
 	indexDone    chan struct{}
 	mode         string // "Interactive" | "Autopilot"
+	// asking counts questions waiting on the user (a card or a form): a prompt
+	// during startup is refused only while startup asks, and waits otherwise.
+	asking atomic.Int32
 
 	// Keyed by Server+"\x00"+Model; nil before the first prepare reads as the zero result.
 	connProbe map[string]probeResult

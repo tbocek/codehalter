@@ -1623,18 +1623,21 @@ func TestProjectSig(t *testing.T) {
 			}
 		}
 		write("shot.png", "pixels")
-		before := projectSig(dir)
+		before, exact := projectSig(dir)
+		if exact != withGit {
+			t.Errorf("git=%v: exact = %v", withGit, exact)
+		}
 		write("shot.png", "pixels")
-		if same := projectSig(dir); withGit && same != before {
+		if same, _ := projectSig(dir); withGit && same != before {
 			t.Errorf("git: the same bytes written again changed the fingerprint")
 		}
 		write("shot.png", "other pixels")
-		changed := projectSig(dir)
+		changed, _ := projectSig(dir)
 		if changed == before {
 			t.Errorf("git=%v: new content did not change the fingerprint", withGit)
 		}
 		write("new.rs", "fn x() {}")
-		if projectSig(dir) == changed {
+		if again, _ := projectSig(dir); again == changed {
 			t.Errorf("git=%v: a new file did not change the fingerprint", withGit)
 		}
 	}
