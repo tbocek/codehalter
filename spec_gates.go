@@ -256,7 +256,11 @@ type specChanges struct {
 	// removed names the free functions whose definition line the round took out: a
 	// changed signature or a moved function is not a new one.
 	removed map[string]bool
-	ok      bool // false without git or without a first commit: the gates that need it are skipped
+	// moved: added lines whose text the round deleted elsewhere. Moved code keeps
+	// its old findings; a refactor that moved one function out of an 11,000-line
+	// file was held to its deprecated calls, which stayed in the file unflagged.
+	moved map[string]map[int]bool
+	ok    bool // false without git or without a first commit: the gates that need it are skipped
 }
 
 func (c specChanges) files() []string {
@@ -273,7 +277,14 @@ var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 // specRoundChanges diffs the work tree against base, the commit before the
 // item's first attempt (see specRoundBase).
 func specRoundChanges(ctx context.Context, cwd, outRel, base string) specChanges {
-	ch := specChanges{added: map[string][]int{}, grown: map[string]int{}, removed: map[string]bool{}}
+	ch := specChanges{added: map[string][]int{}, grown: map[string]int{}, removed: map[string]bool{}, moved: map[string]map[int]bool{}}
+	type addedLine struct {
+		file string
+		line int
+		text string
+	}
+	var addedLines []addedLine
+	deleted := map[string]bool{}
 	diff, err := specGit(ctx, cwd, "-c", "core.quotePath=false", "diff", base, "--no-color", "--no-ext-diff", "--no-prefix", "--relative", "-U0", "--", outRel)
 	if err != nil {
 		return ch
@@ -297,12 +308,14 @@ func specRoundChanges(ctx context.Context, cwd, outRel, base string) specChanges
 		case !inHunk:
 		case cur != "" && strings.HasPrefix(l, "+"):
 			ch.added[cur] = append(ch.added[cur], line)
+			addedLines = append(addedLines, addedLine{cur, line, l[1:]})
 			ch.grown[cur]++
 			line++
 		case strings.HasPrefix(l, "-"):
 			if m := topLevelDefRe.FindStringSubmatch(l[1:]); m != nil {
 				ch.removed[m[1]+m[2]] = true
 			}
+			deleted[movedKey(l[1:])] = true
 			if cur != "" {
 				ch.grown[cur]--
 			}
@@ -319,13 +332,32 @@ func specRoundChanges(ctx context.Context, cwd, outRel, base string) specChanges
 			continue
 		}
 		n := strings.Count(string(data), "\n")
-		for i := 1; i <= n; i++ {
-			ch.added[rel] = append(ch.added[rel], i)
+		for i, text := range strings.SplitN(string(data), "\n", n+1)[:n] {
+			ch.added[rel] = append(ch.added[rel], i+1)
+			addedLines = append(addedLines, addedLine{rel, i + 1, text})
 		}
 		ch.grown[rel] = n
 	}
+	for _, a := range addedLines {
+		if k := movedKey(a.text); k != "" && deleted[k] {
+			if ch.moved[a.file] == nil {
+				ch.moved[a.file] = map[int]bool{}
+			}
+			ch.moved[a.file][a.line] = true
+		}
+	}
 	ch.ok = true
 	return ch
+}
+
+// movedKey is a line as a move is recognised: without its indentation, which a
+// move may change. Short lines (a brace, `} else {`) match anywhere, so they
+// are never taken for moved.
+func movedKey(line string) string {
+	if t := strings.TrimSpace(line); len(t) >= 12 {
+		return t
+	}
+	return ""
 }
 
 // The extensions the size budget and the reachability scan read as program code.
@@ -820,7 +852,7 @@ func specLint(ctx context.Context, outAbs, cmd string, ch specChanges) (findings
 			}
 			p = strings.TrimPrefix(p, "./")
 			n, _ := strconv.Atoi(lc.line)
-			if !slices.Contains(ch.added[p], n) || seen[p+":"+lc.line] {
+			if !slices.Contains(ch.added[p], n) || ch.moved[p][n] || seen[p+":"+lc.line] {
 				continue
 			}
 			seen[p+":"+lc.line] = true

@@ -279,3 +279,32 @@ func TestMeasureSpecDebt(t *testing.T) {
 		t.Error("better must need one measure down and none up")
 	}
 }
+
+// Code a round moved (deleted in one place, added in another, indented anew or
+// not, into a tracked or a new file) is not code it wrote: its old lint findings
+// are not the round's.
+func TestSpecRoundChangesSeesMovedLines(t *testing.T) {
+	old := "fn open() {\n    let chooser = gtk::FileChooserNative::builder();\n}\n\nfn keep() {}\n"
+	cwd := gitRepo(t, map[string]string{"out/src/window.rs": old, "out/src/other.rs": "fn other() {}\n"})
+	writeTree(t, cwd, map[string]string{
+		"out/src/window.rs":  "fn keep() {}\n",
+		"out/src/other.rs":   "fn other() {}\n\nmod inner {\n        let chooser = gtk::FileChooserNative::builder();\n}\n",
+		"out/src/cut_svg.rs": "fn open() {\n    let chooser = gtk::FileChooserNative::builder();\n    let fresh = gtk::FileDialog::new();\n}\n",
+	})
+	ch := specRoundChanges(t.Context(), cwd, "out", "HEAD")
+	if !ch.moved["src/cut_svg.rs"][2] || !ch.moved["src/other.rs"][4] {
+		t.Errorf("moved lines not seen: %v", ch.moved)
+	}
+	if ch.moved["src/cut_svg.rs"][3] {
+		t.Error("a new line was taken for moved")
+	}
+	if ch.moved["src/cut_svg.rs"][1] || ch.moved["src/cut_svg.rs"][4] {
+		t.Error("a short line (a brace, a signature under 12 characters) was taken for moved")
+	}
+
+	lint := "warning: use of deprecated struct `gtk4::FileChooserNative`\n  --> src/cut_svg.rs:2:19\nwarning: unused variable: `fresh`\n  --> src/cut_svg.rs:3:9\n"
+	findings, _ := specLint(t.Context(), filepath.Join(cwd, "out"), "printf '"+strings.ReplaceAll(lint, "`", "")+"'", ch)
+	if len(findings) != 1 || !strings.Contains(findings[0], "cut_svg.rs:3") {
+		t.Errorf("findings = %v, want only the new line's", findings)
+	}
+}
