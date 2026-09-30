@@ -449,6 +449,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	}
 
 	sess.setSpecFence(filepath.Join(sess.Cwd, cfg.SpecDir))
+	defer sess.startToolLog()() // what each round did, whatever a compaction folds away
 	defer sess.setSpecFence("")
 	sess.takeSpecStop() // a request left over from an earlier loop is not this one's
 
@@ -556,7 +557,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		w.LintMissing = r.lintMissing
 		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, r.testCmd(), r.lintCmd())
 		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
-		since, started := len(sess.Messages), time.Now() // the round's own tool calls start here
+		mark, started := sess.toolMark(), time.Now() // the round's own tool calls start here
 		turnErr := a.runPromptTurn(ctx, sess, prompt)
 		if isCancelled(turnErr) {
 			return stopped(turnErr)
@@ -564,10 +565,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		// The checks run once before the round is judged, so what they find costs a
 		// turn, not an attempt: one uncalled function once blocked a two-round item.
 		if turnErr == nil && (w.Mode == specModeItem || w.Mode == specModeChange) {
-			var uses []ToolUse
-			for i := since; i < len(sess.Messages); i++ {
-				uses = append(uses, sess.Messages[i].ToolUses...)
-			}
+			uses := sess.toolUsesSince(mark)
 			res := specRoundResult{Mode: w.Mode, Redo: w.Redo, Committed: true}
 			if _, _, err := r.inspect(ctx, w, uses, started, false, &res); err == nil {
 				if done, _, findings, _ := specDecide(&specConfig{}, w.Item, res, ""); !done {
@@ -588,7 +586,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			r.say(ctx, fmt.Sprintf("\n⏹ **/spec paused**: the LLM request failed, so this round does not count against %s and nothing was recorded: %s\nWhen the server answers again, `/spec` resumes with the same item.\n", w.Item, firstLine(lce.Error())))
 			break
 		}
-		done, block, err := r.finishRound(ctx, w, turnErr, since, started)
+		done, block, err := r.finishRound(ctx, w, turnErr, mark, started)
 		if isCancelled(err) {
 			return stopped(err)
 		}
@@ -1122,12 +1120,10 @@ func (r *specRun) finalPass(ctx context.Context) error {
 }
 
 // finishRound's err means cancelled, or a scan failure it already reported.
-func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, since int, started time.Time) (done, block bool, err error) {
+// mark is the round's start in the session's tool log (toolMark).
+func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, mark int, started time.Time) (done, block bool, err error) {
 	cfg, item := r.cfg, w.Item
-	var uses []ToolUse
-	for i := since; i < len(r.sess.Messages); i++ {
-		uses = append(uses, r.sess.Messages[i].ToolUses...)
-	}
+	uses := r.sess.toolUsesSince(mark)
 	res := specRoundResult{Mode: w.Mode, Redo: w.Redo}
 	var covered map[string]string
 	var coveredBy string
@@ -1491,7 +1487,7 @@ func (r *specRun) completionCheck(ctx context.Context) (reopened []string, err e
 			list = append(list, line)
 		}
 		r.say(ctx, fmt.Sprintf("\n## /spec completion check %d of %d · `%s` · %s\n\n", i+1, len(batches), b.file, strings.Join(b.ids, ", ")))
-		since := len(r.sess.Messages)
+		mark := r.sess.toolMark()
 		turnErr := r.a.runPromptTurn(ctx, r.sess, r.a.renderSpecPrompt(r.sid, "SPEC-COMPLETE.md", append(base,
 			"{{file}}", b.file, "{{items}}", strings.Join(list, "\n"))))
 		if isCancelled(turnErr) {
@@ -1503,18 +1499,16 @@ func (r *specRun) completionCheck(ctx context.Context) (reopened []string, err e
 		// The last verdict per item counts: the executor's respond, or the planner's
 		// answer when it looked and answered directly; a closing summary may follow.
 		verdicts, found := map[string]string{}, map[string]string{}
-		for _, m := range r.sess.Messages[since:] {
-			for _, u := range m.ToolUses {
-				text := u.Output
-				if u.Name == submitPlanToolName {
-					text = parseArgs(u.Input).str("answer")
-				} else if u.Name != respondToolName {
-					continue
-				}
-				for _, ln := range strings.Split(text, "\n") {
-					if v := specCheckVerdictRe.FindStringSubmatch(strings.TrimSpace(ln)); v != nil && slices.Contains(b.ids, v[1]) {
-						verdicts[v[1]], found[v[1]] = strings.ToUpper(v[2]), strings.TrimSpace(v[3])
-					}
+		for _, u := range r.sess.toolUsesSince(mark) {
+			text := u.Output
+			if u.Name == submitPlanToolName {
+				text = parseArgs(u.Input).str("answer")
+			} else if u.Name != respondToolName {
+				continue
+			}
+			for _, ln := range strings.Split(text, "\n") {
+				if v := specCheckVerdictRe.FindStringSubmatch(strings.TrimSpace(ln)); v != nil && slices.Contains(b.ids, v[1]) {
+					verdicts[v[1]], found[v[1]] = strings.ToUpper(v[2]), strings.TrimSpace(v[3])
 				}
 			}
 		}

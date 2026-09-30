@@ -575,12 +575,12 @@ func TestSpecSecondAttemptKeepsFirstAttemptsTest(t *testing.T) {
 	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: cfg, idx: idx, outAbs: filepath.Join(sess.Cwd, "rust"), reasons: map[string]string{}}
 
 	write("rust/tests/switch.rs", "#[test]\nfn f0_1_switches() {}\n") // attempt 1: its test, and a red suite
-	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, len(sess.Messages), time.Now()); err != nil || done {
+	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now()); err != nil || done {
 		t.Fatalf("attempt 1: done=%v err=%v, want a failed attempt", done, err)
 	}
 	cfg.TestCmd = "true"
 	write("rust/src/lib.rs", "// v2, the fix\n") // attempt 2 touches only the program
-	done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, len(sess.Messages), time.Now())
+	done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now())
 	if err != nil || !done {
 		t.Fatalf("attempt 2: done=%v err=%v reason=%q, want the first attempt's test to count", done, err, r.reasons["F0.1"])
 	}

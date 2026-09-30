@@ -508,3 +508,33 @@ func TestLoadSessionRepairsInvalidUTF8(t *testing.T) {
 		t.Errorf("messages not restored: %+v", got.Messages)
 	}
 }
+
+// A compaction mid-round folds the round's first calls out of the history; the
+// tool log still has them. A round that looked at its screen before a compaction
+// was told it never looked, and a check read past the end of the shrunk history.
+func TestToolLogOutlivesACompaction(t *testing.T) {
+	_, s := newTestAgent(t)
+	stop := s.startToolLog()
+	s.AppendToolUse(ToolUse{Name: "read_file"}) // an earlier round
+	mark := s.toolMark()
+	s.AppendToolUse(ToolUse{Name: "screenshot", ImageID: "img_1"})
+	s.AppendToolUse(ToolUse{Name: "edit_file", Input: `{"path":"src/ui.rs"}`})
+	s.AddUser("the next step")
+	if _, err := s.rotate(s.Messages[len(s.Messages)-1:], "summary of the round so far"); err != nil {
+		t.Fatal(err)
+	}
+	s.AppendToolUse(ToolUse{Name: "run_command"})
+	got := s.toolUsesSince(mark)
+	if len(got) != 3 || got[0].Name != "screenshot" || got[2].Name != "run_command" {
+		t.Errorf("the round's calls after a compaction = %+v, want screenshot, edit, command", got)
+	}
+	// The next round starts clean; stopping the log frees it and keeps nothing more.
+	if next := s.toolMark(); len(s.toolUsesSince(next)) != 0 {
+		t.Error("a new mark still returns the old round's calls")
+	}
+	stop()
+	s.AppendToolUse(ToolUse{Name: "read_file"})
+	if len(s.toolLog) != 0 {
+		t.Error("calls were kept with the log off")
+	}
+}

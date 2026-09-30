@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -102,6 +103,14 @@ type Session struct {
 	llmHash           string   `toml:"-"`
 	knownStacks       []string `toml:"-"`
 	capabilitiesShown bool     `toml:"-"`
+	// toolLog holds every tool call since the /spec loop last trimmed it, while the
+	// loop runs (guarded by mu, not stored). The history cannot say what a round
+	// did: a compaction mid-round folds its first calls away, and a check once read
+	// past the end of a history shrunk from 301 messages to 59. toolLogBase is the
+	// position of toolLog[0]; positions never move.
+	toolLog     []ToolUse `toml:"-"`
+	toolLogOn   bool      `toml:"-"`
+	toolLogBase int       `toml:"-"`
 }
 
 // turnState is replaced per turn, so it needs no reset code. Background calls
@@ -399,6 +408,42 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 	}
 	last := &s.Messages[len(s.Messages)-1]
 	last.ToolUses = append(last.ToolUses, tu)
+	if s.toolLogOn {
+		s.toolLog = append(s.toolLog, tu)
+	}
+}
+
+// startToolLog begins collecting tool calls; the returned stop ends it and frees them.
+func (s *Session) startToolLog() (stop func()) {
+	s.mu.Lock()
+	s.toolLogOn, s.toolLog = true, nil
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		s.toolLogOn, s.toolLog = false, nil
+		s.mu.Unlock()
+	}
+}
+
+// toolMark is the position of the next tool call; a compaction does not move it.
+// It also forgets the calls before it: the loop only asks about the round in flight.
+func (s *Session) toolMark() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.toolLogBase += len(s.toolLog)
+	s.toolLog = nil
+	return s.toolLogBase
+}
+
+// toolUsesSince returns the calls from mark on.
+func (s *Session) toolUsesSince(mark int) []ToolUse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := max(mark-s.toolLogBase, 0)
+	if i >= len(s.toolLog) {
+		return nil
+	}
+	return slices.Clone(s.toolLog[i:])
 }
 
 // Names the likely cause because the model cannot see the editor.
