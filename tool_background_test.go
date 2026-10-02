@@ -4,8 +4,11 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -44,7 +47,7 @@ func TestRunBackgroundStaysRunning(t *testing.T) {
 	if job.pid <= 0 {
 		t.Errorf("job.pid = %d, want the pid the wrapper recorded", job.pid)
 	}
-	if !strings.Contains(res, fmt.Sprintf("kill %d", job.pid)) {
+	if !strings.Contains(res, fmt.Sprintf("kill -TERM -%d; sleep 3; kill -KILL -%d", job.pid, job.pid)) {
 		t.Errorf("result should tell the model how to stop it, got: %s", res)
 	}
 	// Not released while the job should live: releasing kills the process.
@@ -333,5 +336,88 @@ func TestStopKeepsQueuedNotesForNextPrompt(t *testing.T) {
 	h.sess.cancelTurn()
 	if h.sess.stoppedIdle() {
 		t.Error("a Stop while idle held back the next note")
+	}
+}
+
+// A job that ignores SIGTERM, as commands in Zed's terminals do, is gone shortly
+// after the grace; one that has a live codehalter is not an orphan.
+func TestKillGroupEscalates(t *testing.T) {
+	old := jobKillGrace
+	jobKillGrace = 200 * time.Millisecond
+	defer func() { jobKillGrace = old }()
+	c := exec.Command("sh", "-c", "trap '' TERM; sleep 30 & wait")
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.Wait() }()
+	killGroup(c.Process.Pid)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+		t.Fatal("a group that ignores SIGTERM outlived the grace")
+	}
+}
+
+// At startup the jobs of a codehalter that is gone are stopped; a live
+// codehalter's job, and a process that only reuses a pid, are left alone.
+func TestKillOrphanedJobs(t *testing.T) {
+	old := jobKillGrace
+	jobKillGrace = 100 * time.Millisecond
+	defer func() { jobKillGrace = old }()
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	dead := gone.Process.Pid // its codehalter has exited
+	start := func(pidFile string, names bool) *exec.Cmd {
+		t.Helper()
+		script := "trap '' TERM; sleep 30 & wait"
+		if names {
+			script = "echo $$ > " + pidFile + "; " + script
+		}
+		c := exec.Command("sh", "-c", script)
+		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		if err := c.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL) })
+		if !names {
+			if err := os.WriteFile(pidFile, []byte(strconv.Itoa(c.Process.Pid)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for deadline := time.Now().Add(2 * time.Second); readPidFile(pidFile) == 0 && time.Now().Before(deadline); {
+			time.Sleep(10 * time.Millisecond)
+		}
+		return c
+	}
+	orphan := start(filepath.Join(dir, fmt.Sprintf("codehalter-%d-job-1.pid", dead)), true)
+	live := start(filepath.Join(dir, fmt.Sprintf("codehalter-%d-job-2.pid", os.Getppid())), true)
+	reused := start(filepath.Join(dir, fmt.Sprintf("codehalter-%d-job-3.pid", dead)), false)
+
+	killOrphanedJobs()
+	exited := func(c *exec.Cmd) bool {
+		done := make(chan struct{})
+		go func() { _ = c.Wait(); close(done) }()
+		select {
+		case <-done:
+			return true
+		case <-time.After(2 * time.Second):
+			return false
+		}
+	}
+	if !exited(orphan) {
+		t.Error("the orphaned job still runs")
+	}
+	if syscall.Kill(live.Process.Pid, 0) != nil {
+		t.Error("a live codehalter's job was killed")
+	}
+	if syscall.Kill(reused.Process.Pid, 0) != nil {
+		t.Error("a process that only reuses a job's pid was killed")
 	}
 }

@@ -132,7 +132,7 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 	// and `timeout` moves its command into a group of its own, so the sweep
 	// goes by process group, and by session where the wrapper leads one (a pty).
 	quoted := "'" + strings.ReplaceAll(cmdStr, "'", `'\''`) + "'"
-	script := fmt.Sprintf("echo $$ > %s\nset -o pipefail\n%s\ntrap 'trap - TERM INT HUP; sweep TERM; exit 143' TERM INT HUP\n( exec bash -c %s ) 2>&1 | tee %s &\nwait $!\nrc=$?\ntrap '' TERM\nif sweep TERM; then sleep 1; sweep KILL; fi\nexit $rc",
+	script := fmt.Sprintf("echo $$ > %s\nset -o pipefail\n%s\ntrap 'trap - TERM INT HUP; sweep TERM; exit 143' TERM INT HUP\n( exec bash -c %s ) 2>&1 | tee %s &\nwait $!\nrc=$?\ntrap '' TERM\nif sweep TERM; then sleep 3; sweep KILL; fi\nexit $rc",
 		job.pidPath, jobSweepFn, quoted, job.logPath)
 	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", script}, sess.Cwd)
 	if err != nil {
@@ -343,7 +343,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	}
 
 	wake := a.handOver(job)
-	stop := fmt.Sprintf("stop it with `run_command: kill %d`", job.pid)
+	stop := fmt.Sprintf("stop it with `run_command: kill -TERM -%d; sleep 3; kill -KILL -%d 2>/dev/null; true` (the whole job; here a plain kill can be ignored)", job.pid, job.pid)
 	if job.pid == 0 {
 		// Never print `kill 0`: it would signal the whole process group.
 		stop = "its pid was not recorded, so it can only be stopped by ending the session"
@@ -422,12 +422,68 @@ func (a *agent) killJob(job *backgroundJob) {
 		job.pid = readPidFile(job.pidPath)
 	}
 	if job.pid > 0 {
-		if err := syscall.Kill(-job.pid, syscall.SIGTERM); err != nil {
-			_ = syscall.Kill(job.pid, syscall.SIGTERM)
-		}
+		killGroup(job.pid)
 	}
 	if err := a.terminalKill(context.Background(), job.sid, job.terminalId); err != nil {
 		slog.Debug("terminal kill failed", "job", job.id, "err", err)
+	}
+}
+
+// jobKillGrace: a job still there this long after SIGTERM gets SIGKILL. Zed's
+// terminals start commands with SIGTERM ignored, so four hung test runs sat out
+// every polite stop, the model's `kill` included, for up to 32 hours.
+var jobKillGrace = 3 * time.Second
+
+// killGroup sends SIGTERM to the process group pid leads (the pid alone when it
+// leads none), then SIGKILL after jobKillGrace if any of it is still there. It
+// returns at once.
+func killGroup(pid int) {
+	target := -pid
+	if err := syscall.Kill(target, syscall.SIGTERM); err != nil {
+		target = pid
+		if err := syscall.Kill(target, syscall.SIGTERM); err != nil {
+			slog.Debug("killGroup: SIGTERM", "pid", pid, "err", err)
+			return // nothing left to stop
+		}
+	}
+	grace := jobKillGrace
+	go func() {
+		time.Sleep(grace)
+		if syscall.Kill(target, 0) != nil {
+			return // gone after the SIGTERM
+		}
+		if err := syscall.Kill(target, syscall.SIGKILL); err != nil {
+			slog.Debug("killGroup: SIGKILL", "pid", pid, "err", err)
+		}
+	}()
+}
+
+// killOrphanedJobs stops the jobs an earlier codehalter process left running: a
+// restart loses track of them, and the four hung test runs had outlived theirs
+// by a day. Only a wrapper whose command line names its own pid file is taken,
+// so a reused pid is never hit.
+func killOrphanedJobs() {
+	files, err := filepath.Glob(filepath.Join(os.TempDir(), "codehalter-*-job-*.pid"))
+	if err != nil {
+		slog.Debug("killOrphanedJobs: glob", "err", err)
+		return
+	}
+	for _, f := range files {
+		var owner, id int
+		if _, err := fmt.Sscanf(filepath.Base(f), "codehalter-%d-job-%d.pid", &owner, &id); err != nil ||
+			owner == os.Getpid() || syscall.Kill(owner, 0) == nil {
+			continue // not ours to judge, or its codehalter still runs
+		}
+		if pid := readPidFile(f); pid > 0 {
+			cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+			if err == nil && strings.Contains(string(cmdline), filepath.Base(f)) {
+				slog.Info("killing a job an earlier codehalter left running", "pidfile", f, "pid", pid)
+				killGroup(pid)
+			}
+		}
+		if err := os.Remove(f); err != nil {
+			slog.Debug("killOrphanedJobs: remove", "file", f, "err", err)
+		}
 	}
 }
 

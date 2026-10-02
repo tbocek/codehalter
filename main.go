@@ -146,6 +146,7 @@ func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
 	a := &agent{sessions: make(map[string]*Session), mode: "Interactive"}
+	go killOrphanedJobs()
 	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin)
 	a.conn = conn
 

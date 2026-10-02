@@ -121,6 +121,7 @@ func runCLI(argv []string) int {
 	clientIn, agentOut := io.Pipe()
 
 	a := &agent{sessions: make(map[string]*Session), mode: "Interactive", standalone: true}
+	go killOrphanedJobs()
 	acp := NewAgentSideConnection(a, agentOut, agentIn)
 	a.conn = acp
 
