@@ -985,3 +985,46 @@ func TestSpecStopIsAcknowledged(t *testing.T) {
 		t.Errorf("the stop was not acknowledged plainly:\n%s", said)
 	}
 }
+
+// The check's answer names an item however the model writes it: an id with a colon
+// of its own, a long section id shortened, an id followed by its title. Six items
+// once stayed unread this way, each with a clear MISSING.
+func TestSpecCompletionCheckReadsEveryNaming(t *testing.T) {
+	spec := "# 01 Things\n\n### tool:set_policy Set the policy\n\nThe model sets the policy.\n\n" +
+		"### F0.2 Cut\n\nThe toolbar on top.\n\n## 3. Project settings tab controls\n\nFreq, language, copy sources.\n"
+	pre := t.TempDir()
+	if err := os.WriteFile(filepath.Join(pre, "01.md"), []byte(spec), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx, err := scanSpec(pre, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	section := ""
+	for _, id := range idx.order {
+		if strings.HasSuffix(id, "-tab-controls") {
+			section = id
+		}
+	}
+	if section == "" {
+		t.Fatalf("no section item among %v", idx.order)
+	}
+	short := strings.TrimSuffix(section, "-tab-controls")
+	answer := "tool:set_policy: DONE\n" + short + ": DONE\n- **F0.2 Cut** — DONE"
+	b, _ := json.Marshal(map[string]any{"clear": true, "report_only": true, "subtasks": []any{}, "answer": answer})
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":          spec,
+		"app/src/lib.rs":      "// the program\n",
+		"app/tests/things.rs": "#[test]\nfn f0_2_cut() {}\n#[test]\nfn tool_set_policy() {}\n",
+	}, func(string) bool { return true }, sseToolCall("c1", submitPlanToolName, string(b)))
+	said := rig.run(t)
+	got := rig.ledger(t)
+	for _, id := range []string{"tool:set_policy", section, "F0.2"} {
+		if it, ok := got.Items[id]; !ok || it.Checked == "" {
+			t.Errorf("%s was answered DONE but is not done and checked (in ledger: %v)\n%s", id, ok, said)
+		}
+	}
+	if strings.Contains(said, "no verdict") {
+		t.Errorf("an answered item was taken for unanswered:\n%s", said)
+	}
+}

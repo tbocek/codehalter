@@ -1434,8 +1434,10 @@ func (r *specRun) gates(ctx context.Context, w specWork, ch specChanges, res *sp
 }
 
 // specCheckVerdictRe reads one line of the completion check's answer: "F1.2: DONE",
-// "- `F1.2` - MISSING: the Save button writes nothing" (a dash of any width, or a colon).
-var specCheckVerdictRe = regexp.MustCompile("(?i)^[\\s*>-]*`?([^\\s:*`]+)`?\\s*[:\u2014\u2013-]\\s*\\**(DONE|MISSING)\\b\\**[\\s:\u2014\u2013.-]*(.*)$")
+// "- `F1.2` - MISSING: the Save button writes nothing" (a dash of any width, or a
+// colon). The name is everything before the verdict, so an id with a colon of its
+// own (`tool:set_policy: MISSING`) is read whole.
+var specCheckVerdictRe = regexp.MustCompile("(?i)^[\\s*>-]*(.+?)\\s*[:\u2014\u2013-]\\s*\\**(DONE|MISSING)\\b\\**[\\s:\u2014\u2013.-]*(.*)$")
 
 // specCheckMark starts a Redo entry the completion check wrote; the rest is what is missing.
 const specCheckMark = "completion check: "
@@ -1507,8 +1509,29 @@ func (r *specRun) completionCheck(ctx context.Context) (reopened []string, err e
 				continue
 			}
 			for _, ln := range strings.Split(text, "\n") {
-				if v := specCheckVerdictRe.FindStringSubmatch(strings.TrimSpace(ln)); v != nil && slices.Contains(b.ids, v[1]) {
-					verdicts[v[1]], found[v[1]] = strings.ToUpper(v[2]), strings.TrimSpace(v[3])
+				v := specCheckVerdictRe.FindStringSubmatch(strings.TrimSpace(ln))
+				if v == nil {
+					continue
+				}
+				// The item the line names: its exact id, else the one id of the batch it
+				// shortens (`§10-parameters#3-project-settings` for `…-tab-controls`) or
+				// that it opens with before a title (`F1.2 Save`).
+				name, id := strings.Trim(v[1], " `*"), ""
+				if slices.Contains(b.ids, name) {
+					id = name
+				} else {
+					for _, cand := range b.ids {
+						if strings.HasPrefix(cand, name) || strings.HasPrefix(name, cand+" ") {
+							if id != "" {
+								id = "" // two fit: neither is meant for sure
+								break
+							}
+							id = cand
+						}
+					}
+				}
+				if id != "" {
+					verdicts[id], found[id] = strings.ToUpper(v[2]), strings.TrimSpace(v[3])
 				}
 			}
 		}
