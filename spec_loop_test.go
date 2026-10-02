@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -744,6 +745,29 @@ func (g *specLoopRig) ledger(t *testing.T) *specConfig {
 	return cfg
 }
 
+// said is everything the loop said so far, once the harness has it all.
+func (g *specLoopRig) said(t *testing.T) string {
+	t.Helper()
+	const marker = "\x00said so far"
+	g.h.agent.say(context.Background(), g.h.sess.ID, marker)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		n := g.h.updatesOfKind(KindAgentMessage)
+		if c, _ := n[len(n)-1]["content"].(map[string]any); c != nil && c["text"] == marker {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the loop's messages did not all arrive")
+		}
+	}
+	var said strings.Builder
+	for _, u := range g.h.updatesOfKind(KindAgentMessage) {
+		if c, _ := u["content"].(map[string]any); c != nil {
+			said.WriteString(fmt.Sprint(c["text"]))
+		}
+	}
+	return said.String()
+}
+
 // request is what the model was sent on call i, as JSON text.
 func (g *specLoopRig) request(i int) string {
 	b, _ := json.Marshal(g.mock.request(i))
@@ -956,33 +980,84 @@ func TestSpecPausesWhenTheModelCallFails(t *testing.T) {
 	}
 }
 
-// A stop is acknowledged at once, before the step in flight ends, and the loop's
-// last word is that it stopped, not that the editor aborted a request.
-func TestSpecStopIsAcknowledged(t *testing.T) {
-	rig := newSpecLoopRig(t, map[string]string{
-		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
-		"app/src/lib.rs":    "// the program\n",
-		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
-	}, func(id string) bool { return id != "F0.1" })
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel() // the stop arrives before the first round
-	if _, err := rig.h.agent.runSpec(ctx, rig.h.sess.ID, rig.h.sess, "", nil); err != nil {
-		t.Fatal(err)
-	}
-	var said string
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-		said = ""
-		for _, u := range rig.h.updatesOfKind(KindAgentMessage) {
-			if c, _ := u["content"].(map[string]any); c != nil {
-				said += fmt.Sprint(c["text"])
+// Zed sends a message typed during a turn as a cancel first and the text only
+// after the turn ended. So the cancel ends Zed's request at once and the loop
+// finishes its round before it stops; `/spec abort` meanwhile stops it at once.
+func TestSpecStopFinishesTheRoundAndAbortDoesNot(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stop", true: "abort"}[abort], func(t *testing.T) {
+			entered, unblock := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			answer := func(id string) string {
+				return sseToolCall(id, submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"looked"}`)
 			}
-		}
-		if strings.Contains(said, "Stopping /spec") && strings.Contains(said, "/spec stopped.") {
-			break
-		}
-	}
-	if !strings.Contains(said, "Stopping /spec") || !strings.Contains(said, "/spec stopped.") || strings.Contains(said, "aborted") {
-		t.Errorf("the stop was not acknowledged plainly:\n%s", said)
+			rig := newSpecLoopRig(t, map[string]string{
+				"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+				"app/src/lib.rs":    "// the program\n",
+				"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+			}, func(id string) bool { return id != "F0.1" },
+				sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do it"}]}`),
+				sseToolCall("w1", "wait_tool", `{}`),
+				sseToolCall("r1", respondToolName, `{"message":"did it"}`),
+				answer("c1"), answer("c2"), answer("c3"))
+			rig.h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "wait_tool", "parameters": map[string]any{"type": "object"}}},
+				Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+					once.Do(func() { close(entered) })
+					select {
+					case <-unblock:
+					case <-ctx.Done():
+					}
+					return "waited", false
+				}})
+			released := make(chan struct{})
+			turnCtx, cancel := context.WithCancel(t.Context())
+			type out struct {
+				detached bool
+				err      error
+			}
+			ret := make(chan out, 1)
+			go func() {
+				_, err, d := rig.h.agent.runSpecTurn(turnCtx, rig.h.sess.ID, rig.h.sess, "", nil, func() { close(released) })
+				ret <- out{d, err}
+			}()
+			select {
+			case <-entered:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the round never reached its step")
+			}
+			cancel() // Zed's cancel, sent the moment the message is entered
+			select {
+			case o := <-ret:
+				if !o.detached || o.err != nil {
+					t.Fatalf("Zed's request: detached=%v err=%v, want ended at once with the loop going on", o.detached, o.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Zed's request did not end on the cancel")
+			}
+			if abort {
+				if !rig.h.sess.abortSpec() {
+					t.Fatal("no running loop to abort")
+				}
+			} else {
+				close(unblock) // the round's step ends by itself
+			}
+			select {
+			case <-released:
+			case <-time.After(20 * time.Second):
+				t.Fatal("the loop never ended and gave the turn back")
+			}
+			said := rig.said(t)
+			if !strings.Contains(said, "stops after the round in flight") || !strings.Contains(said, "/spec abort") {
+				t.Errorf("the cancel was not explained:\n%s", said)
+			}
+			want := map[bool]string{false: "/spec stopped** as asked", true: "/spec aborted."}[abort]
+			if !strings.Contains(said, want) {
+				t.Errorf("want %q:\n%s", want, said)
+			}
+			if !abort && !strings.Contains(said, "🧪") {
+				t.Errorf("the stopped loop skipped the round's own check:\n%s", said)
+			}
+		})
 	}
 }
 

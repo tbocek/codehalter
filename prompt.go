@@ -314,12 +314,20 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	// round. Images can't be queued, and the reply says so.
 	if sess.turnRunning() {
 		text, images := promptContent(sess.Cwd, req.Content)
-		if strings.TrimSpace(text) == "/spec stop" {
+		switch strings.TrimSpace(text) {
+		case "/spec stop":
 			if sess.specFence() == "" {
 				a.say(ctx, req.SessionId, "No /spec loop is running in this session.\n")
 			} else {
 				sess.requestSpecStop()
-				a.say(ctx, req.SessionId, "⏹ /spec stops after the round in flight; its commit lands first. `/spec` later resumes where the ledger says.\n")
+				a.say(ctx, req.SessionId, "⏹ /spec stops after the round in flight; its tests and commit finish first. To stop right away, send `/spec abort`.\n")
+			}
+			return PromptResponse{StopReason: "end_turn"}, nil
+		case "/spec abort":
+			if !sess.abortSpec() {
+				a.say(ctx, req.SessionId, "No /spec loop is running in this session.\n")
+			} else {
+				a.say(ctx, req.SessionId, "⏹ Aborting /spec now: the round in flight is cut off. What it did so far stays in the project; the next `/spec` continues from it.\n")
 			}
 			return PromptResponse{StopReason: "end_turn"}, nil
 		}
@@ -340,7 +348,12 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	var release func()
 	ctx, release, _ = a.holdTurn(ctx, sess, true)
-	defer release()
+	detached := false // a /spec loop that outlives Zed's cancel releases the turn itself
+	defer func() {
+		if !detached {
+			release()
+		}
+	}()
 
 	// These gates refuse before the message is stored, so history gets no reply.
 	// The abort is also said in chat: Zed keeps the first red box open, so a later
@@ -408,7 +421,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	}
 
 	if name, args := splitMacro(userText); name == "spec" {
-		return a.runSpec(ctx, req.SessionId, sess, args, pendingFixes)
+		resp, err, d := a.runSpecTurn(ctx, req.SessionId, sess, args, pendingFixes, release)
+		detached = d
+		return resp, err
 	}
 	if rendered, stopMsg, handled := a.expandMacro(ctx, req.SessionId, sess.Cwd, userText); handled {
 		if stopMsg != "" {
@@ -461,7 +476,9 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	a.drainFixes(ctx, req.SessionId, pendingFixes)
 
 	if sess.specHandoffPending() {
-		return a.runSpec(ctx, req.SessionId, sess, "", nil)
+		resp, err, d := a.runSpecTurn(ctx, req.SessionId, sess, "", nil, release)
+		detached = d
+		return resp, err
 	}
 
 	// The stop reason is how the client tells a clean turn from an abort.

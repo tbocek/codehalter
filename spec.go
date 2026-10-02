@@ -194,12 +194,12 @@ func parseSpecArgs(args string) (cmd string, err error) {
 		return "resume", nil
 	case "status":
 		return "status", nil
-	case "stop":
+	case "stop", "abort":
 		return "stop", nil
 	case "redo":
 		return "redo", nil
 	}
-	return "", fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop, /spec redo")
+	return "", fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop (after the round in flight), /spec abort (at once), /spec redo")
 }
 
 // specRedoTargets takes an item id, a section id with a paraphrased slug, or a spec file

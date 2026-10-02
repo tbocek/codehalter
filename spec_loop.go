@@ -43,6 +43,65 @@ func (s *Session) setSpecFence(dir string) {
 }
 
 // requestSpecStop ends the running loop at its next round boundary, not now.
+// setSpecAbort records how to cancel the running loop; nil when none runs.
+func (s *Session) setSpecAbort(abort context.CancelFunc) {
+	s.rt.mu.Lock()
+	s.rt.specAbort = abort
+	s.rt.mu.Unlock()
+}
+
+// abortSpec cancels the running loop at once; false when none runs.
+func (s *Session) abortSpec() bool {
+	s.rt.mu.Lock()
+	abort := s.rt.specAbort
+	s.rt.mu.Unlock()
+	if abort == nil {
+		return false
+	}
+	abort()
+	return true
+}
+
+// runSpecTurn runs /spec under the turn Prompt holds. Zed turns a message typed
+// during a turn into a cancel first and sends the text only after the turn has
+// ended, so a loop that stopped on the cancel could never hear `/spec abort`. A
+// cancel once the loop runs therefore asks it to stop after the round in flight
+// and ends Zed's request at once; the loop goes on holding the turn, releases it
+// when it ends, and the text that follows reaches it as steering (Prompt). Before
+// the loop runs (setup questions, status) a cancel still stops it outright.
+func (a *agent) runSpecTurn(ctx context.Context, sid string, sess *Session, args string, fixes []fixProblem, release func()) (resp PromptResponse, err error, detached bool) {
+	loopCtx, abort := context.WithCancel(context.WithoutCancel(ctx))
+	sess.setSpecAbort(abort)
+	type result struct {
+		resp PromptResponse
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		resp, err := a.runSpec(loopCtx, sid, sess, args, fixes)
+		sess.setSpecAbort(nil)
+		abort()
+		done <- result{resp, err}
+	}()
+	select {
+	case r := <-done:
+		return r.resp, r.err, false
+	case <-ctx.Done():
+	}
+	if sess.specFence() == "" {
+		abort() // no round in flight to finish
+		r := <-done
+		return r.resp, r.err, false
+	}
+	sess.requestSpecStop()
+	a.say(context.Background(), sid, "\n⏹ **/spec stops after the round in flight** (its tests and commit finish first). To stop right away, send `/spec abort`.\n")
+	go func() {
+		<-done
+		release()
+	}()
+	return PromptResponse{StopReason: "cancelled"}, nil, true
+}
+
 func (s *Session) requestSpecStop() {
 	s.rt.mu.Lock()
 	s.rt.specStop = true
@@ -463,26 +522,12 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		}
 	}
 	addFixes(pendingFixes)
+	// Only `/spec abort` cancels a running loop (see runSpecTurn).
 	stopped := func(err error) (PromptResponse, error) {
 		r.save(context.Background())
-		msg := "⏹ **/spec stopped.** `/spec` resumes it where the ledger says it is.\n"
-		if errors.Is(err, context.DeadlineExceeded) {
-			msg = "⏹ **/spec stopped** (" + cancelReason(err) + "). `/spec` resumes it where the ledger says it is.\n"
-		}
-		a.say(context.Background(), sid, msg)
+		a.say(context.Background(), sid, "⏹ **/spec aborted.** What the round in flight did so far stays in the project; `/spec` continues from it.\n")
 		return PromptResponse{StopReason: "cancelled"}, nil
 	}
-	// A stop is acknowledged at once: the step in flight (a test run takes minutes)
-	// ends before the loop does, and one stop sat that out with nothing on screen.
-	loopDone := make(chan struct{})
-	defer close(loopDone)
-	go func() {
-		select {
-		case <-ctx.Done():
-			a.say(context.Background(), sid, "\n⏹ **Stopping /spec**: the step in flight ends first (a test run can take a few minutes), then the loop stops.\n")
-		case <-loopDone:
-		}
-	}()
 
 	maxBlocked := cfg.MaxBlocked
 	if maxBlocked <= 0 {
@@ -1594,7 +1639,7 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 			tail += fmt.Sprintf("\n[%v]", err)
 		}
 		if ctx.Err() != nil {
-			a.say(context.Background(), sid, fmt.Sprintf("🧪 test run cut short by the stop after %s\n", took))
+			a.say(context.Background(), sid, fmt.Sprintf("🧪 test run cut short by `/spec abort` after %s\n", took))
 			return false, tail
 		}
 		a.say(ctx, sid, fmt.Sprintf("🧪 tests failed after %s\n", took))

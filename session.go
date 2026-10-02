@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
@@ -141,6 +142,8 @@ type sessionRuntime struct {
 	drifted   map[string]bool
 	pending   []pendingInput
 	specStop  bool
+	// specAbort cancels the running /spec loop at once (`/spec abort`).
+	specAbort context.CancelFunc
 	// specFenceDir is read-only for the file tools while a /spec loop runs.
 	specFenceDir string
 	// specHandoff is a /spec command the planner asked for, run after the planning turn.
