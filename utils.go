@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -260,4 +261,50 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 		return err
 	}
 	return nil
+}
+
+// stackFrameRe matches one line of a stack trace in the common languages: a
+// numbered Rust frame, an `at` line (Rust, Java, JavaScript, C#), Python's
+// `File "…", line N`, Go's `/path/file.go:N +0x…`.
+var stackFrameRe = regexp.MustCompile(`^\s*\d+:\s+(0x[0-9a-f]+ - )?\S|^\s+at \S|^\s+File ".*", line \d+|^\s+\S+\.go:\d+( \+0x[0-9a-f]+)?$`)
+
+// stackCollapseMin: a shorter trace stays, it is the failure's own location.
+const stackCollapseMin = 6
+
+// collapseStackTraces shortens each long stack trace to one line, so cutting a
+// failed test run's output to its end keeps the failure's message: a Rust
+// panic's backtrace alone filled the last 4,000 bytes, and the assertion above
+// it was cut off for the next round and for the question to the user.
+func collapseStackTraces(out string) string {
+	lines := strings.Split(out, "\n")
+	kept := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); {
+		if !stackFrameRe.MatchString(lines[i]) {
+			kept = append(kept, lines[i])
+			i++
+			continue
+		}
+		// A trace runs over frame lines, each perhaps followed by one other line:
+		// Python's source line, Go's function line.
+		j, frames := i, 0
+		for j < len(lines) {
+			switch {
+			case stackFrameRe.MatchString(lines[j]):
+				frames++
+				j++
+				continue
+			case j+1 < len(lines) && stackFrameRe.MatchString(lines[j+1]):
+				j++
+				continue
+			}
+			break
+		}
+		if frames >= stackCollapseMin {
+			kept = append(kept, fmt.Sprintf("[… %d stack-trace lines left out …]", j-i))
+		} else {
+			kept = append(kept, lines[i:j]...)
+		}
+		i = j
+	}
+	return strings.Join(kept, "\n")
 }

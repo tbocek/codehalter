@@ -1623,7 +1623,7 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 	c.Dir = outAbs
 	start := time.Now()
 	out, err := c.CombinedOutput()
-	tail := string(out)
+	tail := collapseStackTraces(string(out))
 	if len(tail) > specTestTailBytes {
 		tail = "…" + tailUTF8(tail, specTestTailBytes)
 	}

@@ -303,10 +303,11 @@ func readLogTail(path string, max int) string {
 	if err != nil {
 		return ""
 	}
-	if len(data) > max {
-		return "[... earlier output truncated ...]\n" + tailUTF8(string(data), max)
+	out := collapseStackTraces(string(data))
+	if len(out) > max {
+		return "[... earlier output truncated ...]\n" + tailUTF8(out, max)
 	}
-	return string(data)
+	return out
 }
 
 func readPidFile(path string) int {
