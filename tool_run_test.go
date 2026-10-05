@@ -95,31 +95,6 @@ func TestRunCommandRequiresCommand(t *testing.T) {
 	}
 }
 
-// A respond parks for a finite run, judged by the last command's tool and
-// subcommand; a word in a path or a flag says nothing.
-func TestFiniteRunCommands(t *testing.T) {
-	for cmd, want := range map[string]bool{
-		"cd rust && just test > /tmp/gate.log 2>&1":     true,
-		"cd rust && cargo test 2>&1 | tee /tmp/t.log":   true,
-		"xvfb-run -a cargo test":                        true,
-		"npm run test":                                  true,
-		"python -m pytest -q":                           true,
-		"docker compose up --build":                     false,
-		"cmake --build build && ./build/app":            false,
-		"node build":                                    false,
-		"java -jar build/libs/app.jar":                  false,
-		"jest --watchAll":                               false,
-		"cargo build --release && ./target/release/api": false,
-		"npm run build && npm run preview":              false,
-	} {
-		cmds := shellSegments(cmd, false)
-		last := cmds[len(cmds)-1]
-		if got := finiteRunRe.MatchString(last) && !serverRunRe.MatchString(last); got != want {
-			t.Errorf("%q: finite = %v, want %v", cmd, got, want)
-		}
-	}
-}
-
 // With no job running a sleep is ordinary, and a sleep inside other work is not
 // a wait.
 func TestRunCommandRefusesSleepForBackgroundJob(t *testing.T) {

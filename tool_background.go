@@ -35,14 +35,12 @@ type backgroundJob struct {
 	started    time.Time
 	wakeAfter  time.Duration
 	announced  bool // under bgMu
-	// expectExit: a handed-over run_command, not a run_background job.
+	// expectExit: a handed-over run_command, not a run_background job; the stall
+	// watchdog guards it from the handover, a background job only while a step waits for it.
 	expectExit bool
-	// waitable: a finite run (handed-over run_command, test, build or lint job):
-	// respond parks for it and the stall watchdog may kill it. Never a server.
-	waitable  bool
-	redirects []string      // growth counts as progress
-	stalled   time.Duration // >0: killed by the stall watchdog (under bgMu)
-	exited    chan jobExit
+	redirects  []string      // growth counts as progress
+	stalled    time.Duration // >0: killed by the stall watchdog (under bgMu)
+	exited     chan jobExit
 }
 
 // jobExit is delivered once per job, to run_command's wait or, after handover,
@@ -110,10 +108,6 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 	}
 	tcId := a.StartToolCall(ctx, sid, verb+": "+cmdStr, "execute", nil)
 
-	// The last command decides: `cargo build && ./target/release/api` ends in a server.
-	last := cmds[len(cmds)-1]
-	waitable := expectExit || finiteRunRe.MatchString(last) && !serverRunRe.MatchString(last)
-
 	a.bgMu.Lock()
 	a.bgSeq++
 	id := a.bgSeq
@@ -125,7 +119,6 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 		pidPath:    filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-%d-job-%d.pid", os.Getpid(), id)),
 		wakeAfter:  time.Duration(secs) * time.Second,
 		expectExit: expectExit,
-		waitable:   waitable,
 		redirects:  redirectTargets(cmdStr, sess.Cwd),
 		exited:     make(chan jobExit, 1),
 	}
@@ -165,7 +158,7 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 func (a *agent) handOver(job *backgroundJob) string {
 	job.pid = readPidFile(job.pidPath)
 	stop := make(chan struct{})
-	if job.waitable {
+	if job.expectExit {
 		// Limits read here, not in the watcher, which may outlive a test that shortened them.
 		go a.stallWatch(job, stop, bgStallTimeout, bgStallPoll)
 	}
@@ -229,15 +222,12 @@ var (
 // A finite run is a test, build or lint tool, by its command and subcommand
 // (after a wrapper like xvfb-run): a word in a path or a flag (`--build`,
 // `build/libs/app.jar`) says nothing.
-var (
-	finiteRunRe = regexp.MustCompile(`^(?:(?:xvfb-run|timeout|time|nice|env)\b[^|;&]*?\s+)?(?:just\s+(?:test|check|build|lint|ci)\b|cargo\s+(?:test|build|check|clippy|bench|nextest)\b|go\s+(?:test|build|vet)\b|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|check)\b|make\b|pytest\b|python3?\s+-m\s+(?:pytest|unittest)\b|tox\b|nox\b|jest\b|vitest\s+run\b|mocha\b|rspec\b|ctest\b|mvn\s+(?:test|verify|package)\b|(?:\./)?gradlew?\s+(?:test|build|check)\b|dotnet\s+(?:test|build)\b|swift\s+(?:test|build)\b|mix\s+test\b)`)
-	serverRunRe = regexp.MustCompile(`(?i)--watch|\bwatch\b|\bmake\s+(?:run|serve|dev|start)\b`)
-)
+var ()
 
-// parkableJobs: a job from an earlier turn, or one that may never exit, never
-// parks a turn.
+// parkableJobs: every job this step started; one from an earlier turn (a dev
+// server left up on purpose) never parks it.
 func (a *agent) parkableJobs(sid string, since time.Time) string {
-	return a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.waitable && j.started.After(since) })
+	return a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.started.After(since) })
 }
 
 var parkPoll = 500 * time.Millisecond
@@ -245,12 +235,23 @@ var parkPoll = 500 * time.Millisecond
 // parkForJobs returns what resumes a parked turn: the queued job notes and the
 // user's text, in arrival order. Without parking, a gate that ended on a
 // "waiting" respond got its result in another subtask.
-func (a *agent) parkForJobs(ctx context.Context, sid, jobs string) (string, error) {
+func (a *agent) parkForJobs(ctx context.Context, sid string, since time.Time) (string, error) {
 	sess := a.getSession(sid)
 	if sess == nil {
 		return "", fmt.Errorf("no session")
 	}
-	a.say(ctx, sid, "\n⏸ Waiting for "+jobs+". This turn continues when it reports; type and Send Now to interject.\n")
+	// Nothing talks to a job while the step waits, so one that stays silent never
+	// finishes (a hang, a prompt for input, a server): the watchdog stops it.
+	parked := make(chan struct{})
+	defer close(parked)
+	a.bgMu.Lock()
+	for _, j := range a.bgJobs {
+		if j.sid == sid && j.started.After(since) && !j.expectExit {
+			go a.stallWatch(j, parked, bgStallTimeout, bgStallPoll)
+		}
+	}
+	a.bgMu.Unlock()
+	a.say(ctx, sid, "\n⏸ Waiting for "+a.parkableJobs(sid, since)+". This turn continues when it reports; type and Send Now to interject.\n")
 	for {
 		if items := sess.takePending(); len(items) > 0 {
 			text, hasNote := a.sayPending(ctx, sid, items, true)
@@ -259,7 +260,7 @@ func (a *agent) parkForJobs(ctx context.Context, sid, jobs string) (string, erro
 			}
 			return text, nil
 		}
-		if a.parkableJobs(sid, time.Time{}) == "" && !sess.hasPending() {
+		if a.parkableJobs(sid, since) == "" && !sess.hasPending() {
 			// Every job is gone without a note (a session teardown took them):
 			// resume rather than hang.
 			return "[codehalter, not the user: the background job you were waiting for is no longer running; check its log.]", nil
@@ -352,10 +353,8 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 
 	wake := a.handOver(job)
 	stop := stopHint(job.pid)
-	idle := "end the turn with `respond` saying the job is running"
-	if job.waitable {
-		idle = fmt.Sprintf("call `respond` saying you are waiting for job %d: that parks this step, it does not end it, and you continue here the moment the job reports", job.id)
-	}
+	idle := fmt.Sprintf("call `respond` saying you are waiting for job %d: that parks this step, it does not end it, and you continue here the moment the job reports. "+
+		"A job that stays silent for %s while the step waits is stopped, so stop a server you no longer need before you respond", job.id, humanDuration(bgStallTimeout.Milliseconds()))
 	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, %s.%s Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
 		job.id, job.pid, idle, wake, job.logPath, stop, readLogTail(job.logPath, bgLogTailCap))
 	a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Background: %s (pid %d)", job.cmdStr, job.pid), "completed")
@@ -384,15 +383,22 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 	a.bgMu.Lock()
 	_, tracked := a.bgJobs[job.id]
 	stalled := job.stalled
-	delete(a.bgJobs, job.id)
 	a.bgMu.Unlock()
 	if !tracked {
 		return
+	}
+	// Forgotten only once its note is queued: a parked step that saw neither would
+	// resume without the exit code.
+	forget := func() {
+		a.bgMu.Lock()
+		delete(a.bgJobs, job.id)
+		a.bgMu.Unlock()
 	}
 	a.terminalRelease(job.sid, job.terminalId)
 	removeJobFiles(job.pidPath) // the log stays: the note points the model at it
 	sess := a.getSession(job.sid)
 	if sess == nil {
+		forget()
 		return
 	}
 	outcome := fmt.Sprintf("exited with code %d", exit.code())
@@ -401,7 +407,7 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 	}
 	switch {
 	case stalled > 0:
-		outcome = fmt.Sprintf("was killed after %s without any output (hung, or waiting for input)", humanDuration(stalled.Milliseconds()))
+		outcome = fmt.Sprintf("was killed after %s without any output (hung, waiting for input, or a server nothing talked to)", humanDuration(stalled.Milliseconds()))
 	case err != nil:
 		outcome = "was lost (" + err.Error() + ")"
 	}
@@ -416,6 +422,7 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` %s after %s. Full log: %s. Last output:]\n\n%s",
 			job.id, job.cmdStr, outcome, took, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
 	})
+	forget()
 	a.deliverBgNotesWhenIdle(sess)
 }
 
@@ -520,9 +527,14 @@ func (a *agent) stallWatch(job *backgroundJob, stop <-chan struct{}, timeout, po
 				continue
 			}
 			a.bgMu.Lock()
-			job.stalled = timeout
+			_, tracked := a.bgJobs[job.id]
+			if tracked {
+				job.stalled = timeout
+			}
 			a.bgMu.Unlock()
-			a.killJob(job)
+			if tracked {
+				a.killJob(job)
+			}
 			return
 		}
 	}

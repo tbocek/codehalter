@@ -1172,48 +1172,52 @@ func TestToolLoopParksOnRespondWhileJobRuns(t *testing.T) {
 	}
 }
 
-// A run_background test run parks a waiting respond like a handed-over command;
-// a server does not, or the step would wait forever.
-func TestToolLoopParksForBackgroundTestRun(t *testing.T) {
-	gate := filepath.Join(t.TempDir(), "gate.mk")
-	if err := os.WriteFile(gate, []byte("all:\n\t@sleep 0.6; echo test-suite-green\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	cases := []struct {
-		cmd   string
-		calls int
-	}{
-		{"sleep 5; echo serve-forever", 2},
-		{"make -s -f " + gate + " && sleep 5", 2}, // built, then something that stays up
-	}
-	if _, err := exec.LookPath("make"); err == nil {
-		cases = append(cases, struct {
-			cmd   string
-			calls int
-		}{"make -s -f " + gate, 3})
-	}
-	for _, tc := range cases {
-		h := newTerminalHarness(t)
-		oldGrace, oldPoll := bgJobGrace, parkPoll
-		bgJobGrace, parkPoll = 50*time.Millisecond, 20*time.Millisecond
-		mock := newMockLLM(t,
-			sseToolCall("c1", "run_background", fmt.Sprintf(`{"command":%q}`, tc.cmd)),
-			sseToolCall("c2", respondToolName, `{"message":"Waiting for job 1."}`),
-			sseToolCall("c3", respondToolName, `{"message":"final"}`),
-		)
+// A respond waits for every job the step started, whatever the command looks
+// like; one that stays silent while the step waits is stopped, and a job from an
+// earlier turn never holds the step.
+func TestToolLoopParksForBackgroundJobs(t *testing.T) {
+	oldGrace, oldPoll, oldStall, oldStallPoll := bgJobGrace, parkPoll, bgStallTimeout, bgStallPoll
+	bgJobGrace, parkPoll, bgStallTimeout, bgStallPoll = 50*time.Millisecond, 20*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
+	defer func() { bgJobGrace, parkPoll, bgStallTimeout, bgStallPoll = oldGrace, oldPoll, oldStall, oldStallPoll }()
+	run := func(t *testing.T, h *terminalHarness, responses ...string) (*mockLLM, string) {
+		t.Helper()
+		h.sess.ctl.held.Lock() // a turn is running, so a job's note waits for it
+		defer h.sess.ctl.held.Unlock()
+		mock := newMockLLM(t, responses...)
+		defer mock.Close()
 		h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_background", "parameters": map[string]any{"type": "object"}}}, Execute: runBackgroundExecute})
-		_, err := h.agent.runToolLoopSeeded(context.Background(), h.sess.ID, mock.conn("execute"),
-			[]llmMessage{{Role: "user", Content: "run it"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
-		bgJobGrace, parkPoll = oldGrace, oldPoll
-		h.agent.shutdownBackground()
-		mock.Close()
-		if err != nil {
-			t.Fatalf("%s: %v", tc.cmd, err)
+		if _, err := h.agent.runToolLoopSeeded(context.Background(), h.sess.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "run it"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0); err != nil {
+			t.Fatal(err)
 		}
-		if got := mock.callCount(); got != tc.calls {
-			t.Errorf("%s: %d model calls, want %d", tc.cmd, got, tc.calls)
-		}
+		return mock, lastUserMessage(h.sess)
 	}
+	for _, c := range []struct{ name, cmd, resumedWith string }{
+		{"report after the run", `sleep 0.2 > /dev/null 2>&1; echo "exit=$?"`, "exited with code 0"},
+		{"a silent job", "sleep 30", "without any output"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newTerminalHarness(t)
+			defer h.agent.shutdownBackground()
+			mock, resumed := run(t, h,
+				sseToolCall("c1", "run_background", fmt.Sprintf(`{"command":%q}`, c.cmd)),
+				sseToolCall("c2", respondToolName, `{"message":"Waiting for job 1."}`),
+				sseToolCall("c3", respondToolName, `{"message":"final"}`))
+			if mock.callCount() != 3 || !strings.Contains(resumed, c.resumedWith) {
+				t.Errorf("%d model calls, resumed with %q; want 3 and %q", mock.callCount(), resumed, c.resumedWith)
+			}
+		})
+	}
+	t.Run("a job from an earlier turn", func(t *testing.T) {
+		h := newTerminalHarness(t)
+		defer h.agent.shutdownBackground()
+		if _, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 30"}`); failed {
+			t.Fatal("the earlier job did not start")
+		}
+		if mock, _ := run(t, h, sseToolCall("c1", respondToolName, `{"message":"done"}`)); mock.callCount() != 1 {
+			t.Errorf("%d model calls, want the respond to end the step", mock.callCount())
+		}
+	})
 }
 
 // Needs no message text: a server that forces the tool call returns none.

@@ -1145,12 +1145,12 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			// A respond while this loop's background job still runs parks the turn until
 			// the job's note resumes it.
 			if terminalName == respondToolName {
-				if jobs := a.parkableJobs(sid, loopStart); jobs != "" {
+				if a.parkableJobs(sid, loopStart) != "" {
 					if streams.text != nil && terminalMessage != "" {
 						streams.text(terminalMessage)
 						streams.flush()
 					}
-					resume, perr := a.parkForJobs(ctx, sid, jobs)
+					resume, perr := a.parkForJobs(ctx, sid, loopStart)
 					if perr != nil {
 						res.Text, res.Content = terminalMessage, allText.String()
 						return res, perr
