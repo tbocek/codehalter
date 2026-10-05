@@ -256,7 +256,7 @@
   <section class="section" style="padding:56px 0;">
     <div class="wrap">
       <div class="stats">
-        <div class="stat"><div class="num">~16k</div><div class="lbl">lines of Go (SLOC) · two dependencies · single static binary</div></div>
+        <div class="stat"><div class="num">~18k</div><div class="lbl">lines of Go (SLOC) · two dependencies · single static binary</div></div>
         <div class="stat"><div class="num">90%+</div><div class="lbl">cache reuse on large sessions, the conversation is <b>append-only</b>, so nothing already sent is ever rewritten and the KV cache is never busted</div></div>
         <div class="stat"><div class="num">sandboxed</div><div class="lbl">runs only inside a devcontainer, it scaffolds one on first run, so edits and commands never touch your host</div></div>
         <div class="stat"><div class="num">your call</div><div class="lbl">the agent is instructed never to commit or push on its own, it drafts the message; committing stays yours</div></div>
@@ -340,7 +340,19 @@
         </li>
         <li>
           <h3>Done means tested</h3>
-          <p>An item counts as done only when a test in your output folder <b>names</b> it and the entire suite passes. No self-reported success: codehalter runs the tests itself and reads the result, then commits that item alone.</p>
+          <p>An item counts as done only when a test the round added or changed <b>names</b> it and the entire suite passes. No self-reported success: codehalter runs the tests itself and reads the result, then commits that item alone. A red suite is run once more unchanged, so a flaky test is named as flaky and handed to the next round to fix, instead of failing an item it has nothing to do with.</p>
+        </li>
+        <li>
+          <h3>No stand-ins</h3>
+          <p>What a round wrote is checked in code, for any language: every function it adds must be called by the program, not only by a test; a stub, a <code>todo!()</code> or a "not implemented" message fails the round; so do new lint findings and a file grown past its size budget. An item that starts with a click also needs a test that fires the real widget.</p>
+        </li>
+        <li>
+          <h3>Stuck? It asks you, in the spec</h3>
+          <p>A decision the spec does not make, or an item that will not pass its attempts, becomes a question in the spec folder's <code>QUESTIONS.md</code>: what to decide, the spec text that comes closest, and two or three options with an example of each. The item waits, the loop goes on with the others. Your answer reaches every later round of the item, and the question leaves the file once the item is built with it.</p>
+        </li>
+        <li>
+          <h3>Checked against the spec, not just the tests</h3>
+          <p>A named test and a green suite do not prove the program does what the spec says. So at the end every finished item is checked against its text, from where a user starts it down through the calls, and a screen next to the spec's picture; an item that falls short is reopened with what is missing. A final round then builds and runs the program the way a user would and writes its README.</p>
         </li>
         <li>
           <h3>The spec is the master</h3>
@@ -370,7 +382,7 @@
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.2-8.5"/><path d="M21 4v6h-6"/></svg></div>
           <h3>Self-verify, then replan</h3>
-          <p>Each subtask carries its own verify recipe and runs it before declaring done. A failure feeds a fresh plan with the context, up to 20 attempts, bailing early when the model keeps rephrasing the same problem.</p>
+          <p>Each subtask carries its own verify recipe and runs it before declaring done, and a command that exits non-zero overrides the model saying it worked. A failure feeds a fresh plan with what the failed step spent its calls on and which commands failed, up to 20 attempts, bailing early when the model keeps rephrasing the same problem.</p>
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 2 9 5-9 5-9-5 9-5z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg></div>
@@ -385,12 +397,12 @@
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="18" height="7" rx="1.5"/><path d="M7 6.5h.01M7 17.5h.01"/></svg></div>
           <h3>Spec loop: <code>/spec</code></h3>
-          <p>A whole specification implemented item by item, unattended, each finished item one commit (<a href="#spec">above</a>). Cancel any time, <code>/spec</code> resumes where the ledger says it is and <code>/spec stop</code> ends it after the round in flight (its commit lands first), and <code>/spec status</code> reports coverage per chapter plus anything you changed in the spec since. The spec folder is read-only to the file tools while the loop runs, so a round cannot quietly rewrite the requirement it failed to meet.</p>
+          <p>A whole specification implemented item by item, unattended, each finished item one commit (<a href="#spec">above</a>). <code>/spec</code> resumes where the ledger says it is, <code>/spec stop</code> ends it after the round in flight (its tests and commit land first), <code>/spec abort</code> stops it at once, <code>/spec status</code> reports coverage per chapter plus anything you changed in the spec since, and <code>/spec redo</code> has the model audit the program against the spec and rebuild the items that do not deliver. The spec folder is read-only to the file tools while the loop runs, so a round cannot quietly rewrite the requirement it failed to meet.</p>
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14h6v6"/><path d="M20 10h-6V4"/><path d="M14 10 21 3"/><path d="M3 21l7-7"/></svg></div>
           <h3>Smart background compaction</h3>
-          <p>Every turn, the background condenses that turn into structured notes while you read the reply, so when the context nears the model's <code>n_ctx</code>, compaction is already prepared and fast. With ≥2 slots it runs in parallel; on a single slot it rides the conversation's own prefix cache.</p>
+          <p>Every turn, the background condenses that turn into structured notes while you read the reply, so when the server refuses a context that has grown too large, compaction is already prepared and fast. It runs only then, never on an estimate, so the cache is not thrown away early. With ≥2 slots it runs in parallel; on a single slot it rides the conversation's own prefix cache.</p>
         </div>
         <div class="fcard">
           <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
