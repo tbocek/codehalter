@@ -906,7 +906,10 @@ func TestSpecQuestionWaitsInTheSpecForItsAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := rig.ledger(t); !got.done("F2.2") || got.Items["F2.2"].Hash != specItemHash(idx, "F2.2") {
-		t.Errorf("F2.2 = %+v, want done with the answer in its fingerprint", got.Items["F2.2"])
+		t.Errorf("F2.2 = %+v, want done, its fingerprint the spec's as it now stands", got.Items["F2.2"])
+	}
+	if after, _ := os.ReadFile(qpath); strings.Contains(string(after), "## F2.2") {
+		t.Errorf("F2.2 was built with its answer, but its question is still in the file:\n%s", after)
 	}
 }
 
@@ -1101,5 +1104,48 @@ func TestSpecCompletionCheckReadsEveryNaming(t *testing.T) {
 	}
 	if strings.Contains(said, "no verdict") {
 		t.Errorf("an answered item was taken for unanswered:\n%s", said)
+	}
+}
+
+// A suite that fails and then passes unchanged is a flaky test, not the round's
+// failure: the round counts, and the next item round is asked to fix the test.
+func TestSpecFlakyTestIsNotTheRoundsFault(t *testing.T) {
+	write := func(id, path, content string) string {
+		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
+		return sseToolCall(id, "write_file", string(b))
+	}
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n\n### F0.2 Do more\n\nS1 do more.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(id string) bool { return id != "F0.1" && id != "F0.2" },
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do it"}]}`),
+		write("w1", "app/tests/f0_1.rs", "#[test]\nfn f0_1_does_it() {}\n"),
+		sseToolCall("r1", respondToolName, `{"message":"done"}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do more"}]}`),
+		write("w2", "app/tests/f0_2.rs", "#[test]\nfn f0_2_does_more() {}\n"),
+		sseToolCall("r2", respondToolName, `{"message":"done"}`),
+		sseToolCall("c1", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F0.1: DONE\nF0.2: DONE"}`),
+	)
+	// The suite fails its first run only, as a test that hangs on a timing would.
+	once := filepath.Join(t.TempDir(), "ran")
+	cfg := rig.ledger(t)
+	cfg.TestCmd = "if [ -e " + once + " ]; then exit 0; fi; touch " + once + "; echo \"panicked at tests/cam.rs:254: and the status says so: playing\"; exit 101"
+	if err := saveSpecConfig(rig.h.sess.Cwd, cfg); err != nil {
+		t.Fatal(err)
+	}
+	said := rig.run(t)
+	if !strings.Contains(said, "Flaky test") || !strings.Contains(said, "and the status says so") {
+		t.Errorf("the flaky run was not reported:\n%s", said)
+	}
+	got := rig.ledger(t)
+	if !got.done("F0.1") || !got.done("F0.2") {
+		t.Errorf("F0.1 done=%v F0.2 done=%v, want both: the flaky test is no fault of theirs\n%s", got.done("F0.1"), got.done("F0.2"), said)
+	}
+	if round2 := rig.request(3); !strings.Contains(round2, "First: a flaky test") || !strings.Contains(round2, "and the status says so") {
+		t.Errorf("the next round was not asked to fix the flaky test:\n%s", round2)
+	}
+	if got.Flaky != "" {
+		t.Errorf("the flaky entry outlived the round that was asked to fix it: %q", got.Flaky)
 	}
 }

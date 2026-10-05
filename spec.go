@@ -83,6 +83,9 @@ type specConfig struct {
 	// Bases holds HEAD as an item's first attempt found it: a failed attempt is
 	// committed too, and the next attempt's changes count from here.
 	Bases map[string]string `toml:"bases,omitempty"`
+	// Flaky holds the failure of a suite that failed and then passed with nothing
+	// changed; the next item round is asked to make that test deterministic first.
+	Flaky string `toml:"flaky,omitempty"`
 }
 
 type specFinal struct {

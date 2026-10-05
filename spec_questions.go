@@ -20,8 +20,8 @@ const specQuestionsFile = "QUESTIONS.md"
 const specQuestionsHead = "# Questions\n\n" +
 	"The /spec loop writes a question here when the spec does not decide something a round needs, " +
 	"and skips that item until the question has an answer. Write the answer after **Answer:**, in your " +
-	"own words or as the number of an option, then run /spec. An answered question is part of the spec: " +
-	"every later round of the item reads it, and changing the answer rebuilds the item.\n"
+	"own words or as the number of an option, then run /spec. An answered question is part of the spec " +
+	"until its item is built with it; then codehalter removes it from here.\n"
 
 type specOption struct {
 	Choice  string `json:"choice"`
@@ -50,14 +50,26 @@ var (
 // parseSpecQuestions keys the sections by item id; an item may have asked more than once.
 func parseSpecQuestions(text string) map[string][]specQuestion {
 	out := map[string][]specQuestion{}
+	_, secs := parseSpecQuestionFile(text)
+	for _, q := range secs {
+		out[q.ID] = append(out[q.ID], q)
+	}
+	return out
+}
+
+// parseSpecQuestionFile splits the file into the text before its first question
+// and its questions in order. A `---` line is the separator between two
+// questions, not part of either.
+func parseSpecQuestionFile(text string) (head string, secs []specQuestion) {
 	var cur *specQuestion
-	var body []string
+	var body, headLines []string
 	inAnswer, inFence := false, false
 	flush := func() {
 		if cur != nil {
-			cur.Text = strings.TrimSpace(strings.Join(body, "\n"))
+			// Newlines only: the empty answer line keeps its space after "**Answer:**".
+			cur.Text = strings.Trim(strings.Join(body, "\n"), "\n")
 			cur.Answer = strings.TrimSpace(cur.Answer)
-			out[cur.ID] = append(out[cur.ID], *cur)
+			secs = append(secs, *cur)
 		}
 	}
 	for _, ln := range strings.Split(text, "\n") {
@@ -65,11 +77,15 @@ func parseSpecQuestions(text string) map[string][]specQuestion {
 		if strings.HasPrefix(strings.TrimSpace(ln), "```") {
 			inFence = !inFence
 		}
+		if !inFence && strings.TrimSpace(ln) == "---" {
+			continue
+		}
 		if m := specQuestionHeadRe.FindStringSubmatch(ln); m != nil && !inFence {
 			flush()
 			cur, body, inAnswer = &specQuestion{ID: m[1], Question: m[2]}, nil, false
 		}
 		if cur == nil {
+			headLines = append(headLines, ln)
 			continue
 		}
 		body = append(body, ln)
@@ -85,7 +101,46 @@ func parseSpecQuestions(text string) map[string][]specQuestion {
 		}
 	}
 	flush()
-	return out
+	return strings.TrimSpace(strings.Join(headLines, "\n")), secs
+}
+
+// writeSpecQuestionFile writes the head and the questions, `---` between two.
+func writeSpecQuestionFile(path, head string, secs []string) error {
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(head) + "\n")
+	for i, s := range secs {
+		if i > 0 {
+			b.WriteString("\n---\n")
+		}
+		b.WriteString("\n" + strings.Trim(s, "\n") + "\n")
+	}
+	return writeFileAtomic(path, []byte(b.String()), 0o644)
+}
+
+// removeAnsweredQuestions takes the item's answered questions out of the file once
+// a round has built the item with them; an unanswered one stays.
+func removeAnsweredQuestions(specAbs, id string) (removed int, err error) {
+	path := filepath.Join(specAbs, specQuestionsFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	head, secs := parseSpecQuestionFile(string(data))
+	var kept []string
+	for _, q := range secs {
+		if q.ID == id && q.Answer != "" {
+			removed++
+			continue
+		}
+		kept = append(kept, q.Text)
+	}
+	if removed == 0 {
+		return 0, nil
+	}
+	return removed, writeSpecQuestionFile(path, head, kept)
 }
 
 // asked: the item has a question without an answer, so a round would only ask again.
@@ -145,13 +200,12 @@ func appendSpecQuestion(specAbs, title string, q specQuestion) error {
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	var b strings.Builder
-	if len(old) == 0 {
-		b.WriteString(specQuestionsHead)
-	} else {
-		b.WriteString(strings.TrimRight(string(old), "\n") + "\n")
+	head, secs := specQuestionsHead, []specQuestion(nil)
+	if len(old) > 0 {
+		head, secs = parseSpecQuestionFile(string(old))
 	}
-	fmt.Fprintf(&b, "\n## %s · %s\n\n", q.ID, q.Question)
+	var b strings.Builder
+	fmt.Fprintf(&b, "## %s · %s\n\n", q.ID, q.Question)
 	// The version, so a question a codehalter bug caused can be told apart once fixed.
 	fmt.Fprintf(&b, "Asked %s by codehalter %s while building %s.\n\n", time.Now().Format("2006-01-02"), versionStamp(), title)
 	if q.Quote != "" {
@@ -172,7 +226,11 @@ func appendSpecQuestion(specAbs, title string, q specQuestion) error {
 		fmt.Fprintf(&b, "%d. %s. Example: %s\n", i+1, strings.TrimRight(strings.TrimSpace(o.Choice), "."), strings.TrimSpace(o.Example))
 	}
 	b.WriteString("\n**Answer:** \n")
-	return writeFileAtomic(path, []byte(b.String()), 0o644)
+	texts := make([]string, 0, len(secs)+1)
+	for _, s := range secs {
+		texts = append(texts, s.Text)
+	}
+	return writeSpecQuestionFile(path, head, append(texts, b.String()))
 }
 
 // specStuckStopped caps what a stuck item's question quotes of its failure: the

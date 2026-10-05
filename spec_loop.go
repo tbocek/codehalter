@@ -403,6 +403,9 @@ type specWork struct {
 	Debt     specDebt // refactor: measured when the round was picked
 	// LintMissing: why the linter did not run last round, so this one installs it.
 	LintMissing string
+	// Flaky: a test failed and then passed unchanged (specConfig.Flaky); this round
+	// makes it deterministic first.
+	Flaky string
 }
 
 func (r *specRun) say(ctx context.Context, s string) { r.a.say(ctx, r.sid, s) }
@@ -600,6 +603,9 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		addFixes(a.prepareChecks(ctx, sess, sid))
 
 		w.LintMissing = r.lintMissing
+		if w.Mode == specModeItem || w.Mode == specModeChange {
+			w.Flaky = cfg.Flaky
+		}
 		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, r.testCmd(), r.lintCmd())
 		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
 		mark, started := sess.toolMark(), time.Now() // the round's own tool calls start here
@@ -1224,6 +1230,20 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 			if coveredBy == "" {
 				coveredBy = covered[item]
 			}
+			if w.Flaky != "" && cfg.Flaky == w.Flaky {
+				cfg.Flaky = "" // the round that was asked to fix it is through
+			}
+			// Built with its answers: they leave QUESTIONS.md, and the fingerprint is
+			// taken without them, so their going is no change to the spec.
+			if r.idx.answered(item) != "" {
+				switch n, err := removeAnsweredQuestions(filepath.Join(r.sess.Cwd, cfg.SpecDir), item); {
+				case err != nil:
+					r.say(ctx, fmt.Sprintf("⚠ /spec: taking %s's answered question out of %s: %v\n", item, specQuestionsFile, err))
+				case n > 0:
+					r.idx.questions[item] = slices.DeleteFunc(r.idx.questions[item], func(q specQuestion) bool { return q.Answer != "" })
+					r.say(ctx, fmt.Sprintf("🗑 %s is built with your answer, so its question is out of `%s/%s`.\n", item, cfg.SpecDir, specQuestionsFile))
+				}
+			}
 			cfg.Items[item] = specLedger{
 				Hash:      specItemHash(r.idx, item),
 				Title:     r.idx.items[item].Title,
@@ -1304,6 +1324,23 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
+		// The same code once more: a pass now is a flaky test, not this round's
+		// failure. Two such tests failed thirteen rounds that never touched them.
+		if !res.TestsPass {
+			r.say(ctx, "🧪 running the suite once more, unchanged, to tell a flaky test from a real failure\n")
+			again, againTail := r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd)
+			if err := ctx.Err(); err != nil {
+				return nil, "", err
+			}
+			if again {
+				cfg.Flaky = res.TestTail
+				r.say(ctx, "⚠ **Flaky test:** the suite failed, then passed with nothing changed. This round is not held to it; the next item round makes that test deterministic first. The failure:\n```\n"+
+					strings.ReplaceAll(tailUTF8(res.TestTail, 1200), "```", "` ` `")+"\n```\n")
+				res.TestsPass, res.TestTail = true, ""
+			} else {
+				res.TestTail = againTail
+			}
+		}
 	}
 	// A snapshot recipe makes looking possible; only then is an unseen UI change blind.
 	if w.Mode != specModeRemove && justRecipe(r.outAbs, "snapshot") {
@@ -1367,6 +1404,10 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 		previous = "## Answered in the spec's " + specQuestionsFile + "\n\nThe user answered this item's question. The answer is spec: build to it.\n\n" + w.Answered
 	case w.Reason != "":
 		previous = "## The previous round on this item did not count\n\n" + w.Reason + "\n\nFix that first."
+	}
+	if w.Flaky != "" {
+		previous = strings.TrimSpace("## First: a flaky test\n\ncodehalter ran the test suite twice on the same code: it failed, then passed. A test that does that fails other rounds at random, which is no fault of theirs. Before this item, find that test and make it deterministic: it must not call a live server (use the project's loopback fakes), wait on the clock, or read a status line that other parts of the program also write (assert the state the action itself changes). The failure from the run that failed:\n\n```\n" +
+			strings.ReplaceAll(w.Flaky, "```", "` ` `") + "\n```\n\n" + previous)
 	}
 
 	if mode == specModeRemove {

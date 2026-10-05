@@ -125,3 +125,45 @@ func TestSpecQuestionsKnowWhoAsked(t *testing.T) {
 		t.Errorf("a question from before versions were written: note %q", note)
 	}
 }
+
+// Questions are separated by `---`, which is no part of an answer; once an item is
+// built with its answer, that question leaves the file and the others stay.
+func TestSpecQuestionsSeparatedAndRemoved(t *testing.T) {
+	dir := t.TempDir()
+	ask := func(id, question string) {
+		t.Helper()
+		q := specQuestion{ID: id, Question: question, Options: []specOption{{Choice: "A", Example: "a.db"}, {Choice: "B", Example: "b.json"}}}
+		if err := appendSpecQuestion(dir, id, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ask("F0.1", "Which store?")
+	ask("F0.1", "Which name?")
+	ask("F0.2", "Which font?")
+	path := filepath.Join(dir, specQuestionsFile)
+	data, _ := os.ReadFile(path)
+	if strings.Count(string(data), "# Questions") != 1 || strings.Count(string(data), "\n---\n") != 2 {
+		t.Fatalf("want one head and a separator between each two questions:\n%s", data)
+	}
+	// The first question gets an answer; the others stay open, `---` after them included.
+	text := strings.Replace(string(data), "**Answer:** \n", "**Answer:** SQLite\n", 1)
+	if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	qs := parseSpecQuestions(text)
+	if qs["F0.1"][0].Answer != "SQLite" || qs["F0.1"][1].Answer != "" || qs["F0.2"][0].Answer != "" {
+		t.Fatalf("a separator leaked into an answer: %+v", qs)
+	}
+	if n, err := removeAnsweredQuestions(dir, "F0.1"); n != 1 || err != nil {
+		t.Fatalf("removed %d, %v; want the one answered question", n, err)
+	}
+	data, _ = os.ReadFile(path)
+	left := parseSpecQuestions(string(data))
+	if len(left["F0.1"]) != 1 || left["F0.1"][0].Question != "Which name?" || len(left["F0.2"]) != 1 ||
+		strings.Count(string(data), "# Questions") != 1 || strings.Count(string(data), "\n---\n") != 1 || strings.Contains(string(data), "SQLite") {
+		t.Errorf("after the removal:\n%s", data)
+	}
+	if n, _ := removeAnsweredQuestions(dir, "F0.2"); n != 0 {
+		t.Error("an unanswered question was removed")
+	}
+}
