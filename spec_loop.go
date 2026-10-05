@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -411,6 +412,41 @@ func (r *specRun) save(ctx context.Context) {
 	}
 }
 
+// dropAnswers takes a built item's answered questions out of QUESTIONS.md.
+func (r *specRun) dropAnswers(ctx context.Context, item string) bool {
+	if r.idx.answered(item) == "" {
+		return false
+	}
+	n, err := removeAnsweredQuestions(filepath.Join(r.sess.Cwd, r.cfg.SpecDir), item)
+	if err != nil {
+		r.say(ctx, fmt.Sprintf("⚠ /spec: taking %s's answered question out of %s: %v\n", item, specQuestionsFile, err))
+	}
+	if n == 0 {
+		return false
+	}
+	r.idx.questions[item] = slices.DeleteFunc(r.idx.questions[item], func(q specQuestion) bool { return q.Answer != "" })
+	r.say(ctx, fmt.Sprintf("🗑 %s is built with your answer, so its question is out of `%s/%s`.\n", item, r.cfg.SpecDir, specQuestionsFile))
+	return true
+}
+
+// dropBuiltAnswers catches answers whose item was finished without dropAnswers (by an
+// older codehalter, or a failed write). Built with the answer means the ledger's
+// fingerprint includes it; an answer given after the build leaves the item changed instead.
+func (r *specRun) dropBuiltAnswers(ctx context.Context) {
+	ids := slices.Sorted(maps.Keys(r.idx.questions))
+	for _, id := range ids {
+		led, done := r.cfg.Items[id]
+		if !done || r.cfg.Redo[id] != "" || led.Hash != specItemHash(r.idx, id) {
+			continue
+		}
+		if r.dropAnswers(ctx, id) {
+			led.Hash = specItemHash(r.idx, id)
+			r.cfg.Items[id] = led
+			r.save(ctx)
+		}
+	}
+}
+
 func (r *specRun) scan() error {
 	idx, err := scanSpec(filepath.Join(r.sess.Cwd, r.cfg.SpecDir), r.cfg.idPatterns(), r.cfg.Context, r.cfg.Skip)
 	if err == nil {
@@ -540,6 +576,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			r.say(ctx, "⚠ /spec: reading the spec: "+err.Error()+"\n")
 			break
 		}
+		r.dropBuiltAnswers(ctx)
 		covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
 		if err != nil {
 			r.say(ctx, "⚠ /spec: scanning "+cfg.OutDir+": "+err.Error()+"\n")
@@ -1232,17 +1269,8 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 			if w.Flaky != "" && cfg.Flaky == w.Flaky {
 				cfg.Flaky = "" // the round that was asked to fix it is through
 			}
-			// Built with its answers: they leave QUESTIONS.md, and the fingerprint is
-			// taken without them, so their going is no change to the spec.
-			if r.idx.answered(item) != "" {
-				switch n, err := removeAnsweredQuestions(filepath.Join(r.sess.Cwd, cfg.SpecDir), item); {
-				case err != nil:
-					r.say(ctx, fmt.Sprintf("⚠ /spec: taking %s's answered question out of %s: %v\n", item, specQuestionsFile, err))
-				case n > 0:
-					r.idx.questions[item] = slices.DeleteFunc(r.idx.questions[item], func(q specQuestion) bool { return q.Answer != "" })
-					r.say(ctx, fmt.Sprintf("🗑 %s is built with your answer, so its question is out of `%s/%s`.\n", item, cfg.SpecDir, specQuestionsFile))
-				}
-			}
+			// The fingerprint below is taken without the answers, so their going is no change to the spec.
+			r.dropAnswers(ctx, item)
 			cfg.Items[item] = specLedger{
 				Hash:      specItemHash(r.idx, item),
 				Title:     r.idx.items[item].Title,

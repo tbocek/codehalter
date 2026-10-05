@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1140,5 +1141,44 @@ func TestSpecRefactorCadence(t *testing.T) {
 	w, cfg := pick(0, 2000)
 	if w.Item != "F0.3" || cfg.RefactorAt != 2 {
 		t.Errorf("no debt: work = %+v RefactorAt = %d, want F0.3 and the cadence restarted at 2", w, cfg.RefactorAt)
+	}
+}
+
+// An item finished with its answer before the answer could be dropped loses the
+// question at the next round, without counting as a spec change; an answer given
+// after the build stays for the change round, an open question stays open.
+func TestSpecDropsAnswersOfBuiltItems(t *testing.T) {
+	h := newTerminalHarness(t)
+	specAbs := filepath.Join(h.sess.Cwd, "spec")
+	writeTree(t, specAbs, map[string]string{"01.md": "# 01\n\n### F0.1 Store\n\nS1.\n\n### F0.2 Font\n\nS2.\n\n### F0.3 Name\n\nS3.\n"})
+	before, err := scanSpec(specAbs, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"F0.1", "F0.2", "F0.3"} {
+		if err := appendSpecQuestion(specAbs, id, specQuestion{ID: id, Question: "Which " + id + "?"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(specAbs, specQuestionsFile)
+	data, _ := os.ReadFile(path)
+	writeTree(t, specAbs, map[string]string{specQuestionsFile: strings.Replace(strings.Replace(string(data), "**Answer:** \n", "**Answer:** SQLite\n", 1), "**Answer:** \n", "**Answer:** serif\n", 1)})
+	cfg := &specConfig{SpecDir: "spec", Items: map[string]specLedger{"F0.2": {Hash: specItemHash(before, "F0.2")}, "F0.3": {Hash: specItemHash(before, "F0.3")}}}
+	r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, cfg: cfg, reasons: map[string]string{}}
+	if err := r.scan(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Items["F0.1"] = specLedger{Hash: specItemHash(r.idx, "F0.1")} // built with SQLite
+
+	r.dropBuiltAnswers(t.Context())
+	left, _ := os.ReadFile(path)
+	if strings.Contains(string(left), "SQLite") || !strings.Contains(string(left), "serif") || !strings.Contains(string(left), "Which F0.3?") {
+		t.Errorf("QUESTIONS.md after the sweep:\n%s", left)
+	}
+	if err := r.scan(); err != nil {
+		t.Fatal(err)
+	}
+	if d := specReconcile(cfg, r.idx, nil); slices.Contains(d.Changed, "F0.1") || !slices.Contains(d.Changed, "F0.2") {
+		t.Errorf("changed = %v, want F0.2 (answered after its build) and not F0.1", d.Changed)
 	}
 }
