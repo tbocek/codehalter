@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -419,5 +420,32 @@ func TestKillOrphanedJobs(t *testing.T) {
 	}
 	if syscall.Kill(reused.Process.Pid, 0) != nil {
 		t.Error("a process that only reuses a job's pid was killed")
+	}
+}
+
+// A render in the background finishes unseen, so it is refused with the way to
+// run it; other jobs, and the same render through run_command, are not.
+func TestRunBackgroundRefusesARender(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	for _, cmd := range []string{
+		`cd /workspaces/naivepost/rust && just snapshot 07-narrate > /tmp/snap-f46i.log 2>&1; echo "exit=$?" >> /tmp/snap-f46i.log`,
+		`make snapshot SCREEN=03-window`,
+		`npm run snapshot -- prepare`,
+		`cargo run -- --snapshot 05-cut --out shots/05-cut.png`,
+	} {
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		if res, _ := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, string(b)); !strings.HasPrefix(res, "refused: this renders a screen") || !strings.Contains(res, "run_command") {
+			t.Errorf("%q was not refused: %s", cmd, res)
+		}
+	}
+	for _, cmd := range []string{`npx jest --updateSnapshot > /tmp/j.log`, `cat snapshots.txt; sleep 5`} {
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		if res, _ := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, string(b)); strings.HasPrefix(res, "refused: this renders") {
+			t.Errorf("%q is no render but was refused", cmd)
+		}
+	}
+	if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo just snapshot 07-narrate"}`); strings.HasPrefix(res, "refused") {
+		t.Errorf("run_command refused a render: %s", res)
 	}
 }

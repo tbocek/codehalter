@@ -92,6 +92,12 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 			"Look at it with `screenshot` on the file; for a close look at one part, give `region` [x, y, width, height] in its pixels and that part comes back enlarged: "+
 			`{"path": %q, "region": [0, 0, 800, 400]}. The reply for the whole picture states its size.`, strings.Trim(pic, `'" `))
 	}
+	// A render belongs in the foreground: only there is its picture attached, and
+	// only an attached picture counts as a look. One /spec round started its render
+	// here, ended five seconds before it finished, and failed as never looked.
+	if !expectExit && renderCmdRe.MatchString(cmdStr) {
+		return nil, "refused: this renders a screen, which takes seconds. Run it with `run_command` instead: only a render through run_command attaches the picture to your view, and only then does the look count. A render in the background finishes unseen."
+	}
 	// A foreground sleep while a job runs is a guessed wait: the job wakes the
 	// model itself, and a running shell cannot be interrupted with the note.
 	if expectExit && isSleepCmd(cmdStr) {
@@ -429,6 +435,10 @@ func (a *agent) killJob(job *backgroundJob) {
 		slog.Debug("terminal kill failed", "job", job.id, "err", err)
 	}
 }
+
+// renderCmdRe is a run of the project's snapshot recipe, the render the setup
+// round adds (SPEC-SETUP.md), or the app's own --snapshot flag.
+var renderCmdRe = regexp.MustCompile(`(?:^|[\s;&|(])(?:just|make|task)\s+snapshot\b|\b(?:npm|pnpm|yarn)\s+(?:run\s+)?snapshot\b|\s--snapshot\b`)
 
 // jobKillGrace: a job still there this long after SIGTERM gets SIGKILL. Zed's
 // terminals start commands with SIGTERM ignored, so four hung test runs sat out
