@@ -29,7 +29,7 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	const frozen = "EXISTING PROMPT — do not mutate"
+	const frozen = "EXISTING PROMPT: do not mutate"
 	s.SystemPrompt = frozen
 	s.promptSkills = skillSet(s.Cwd, nil)
 
@@ -41,7 +41,7 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	a.checkEnv(s, s.ID)
 
 	if s.SystemPrompt != frozen {
-		t.Errorf("system prompt was mutated mid-session — KV cache bust")
+		t.Errorf("system prompt was mutated mid-session: KV cache bust")
 	}
 	var injected bool
 	for _, m := range s.Messages {
@@ -268,7 +268,7 @@ func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
 	if a.mainSlotTokens.Load() != 128000 {
 		t.Errorf("mainSlotTokens: got %d, want 128000 (from settings.toml context_size)", a.mainSlotTokens.Load())
 	}
-	if !a.imagesSupported {
+	if !a.imagesSupported.Load() {
 		t.Errorf("imagesSupported: got false, want true (from settings.toml image_support)")
 	}
 }
@@ -298,7 +298,7 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 	if a.mainSlotTokens.Load() != 0 {
 		t.Errorf("mainSlotTokens: got %d, want 0 (probe metadata-bare, no config override)", a.mainSlotTokens.Load())
 	}
-	if a.imagesSupported {
+	if a.imagesSupported.Load() {
 		t.Errorf("imagesSupported: got true, want false (probe metadata-bare, no config override)")
 	}
 }
@@ -411,8 +411,8 @@ func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
 	}
 	a.probeAllLLMs(context.Background())
 
-	if a.imagesSupported {
-		t.Errorf("imagesSupported: probe detected vision but user explicitly disabled — config must win")
+	if a.imagesSupported.Load() {
+		t.Errorf("imagesSupported: probe detected vision but user explicitly disabled, config must win")
 	}
 }
 
@@ -513,7 +513,9 @@ func TestScaffoldSettings(t *testing.T) {
 	}
 
 	// A second call must not clobber an existing file.
-	os.WriteFile(path, []byte("# user edited\n"), 0o644)
+	if err := os.WriteFile(path, []byte("# user edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	a.scaffoldSettings(context.Background(), s.Cwd, s.ID)
 	if again, _ := os.ReadFile(path); string(again) != "# user edited\n" {
 		t.Error("scaffoldSettings clobbered an existing settings.toml")
@@ -629,7 +631,7 @@ func TestEmptyProject(t *testing.T) {
 	}
 
 	if _, err := os.Stat(filepath.Join(dir, "Makefile")); err == nil {
-		t.Error("bootstrap must be deferred — no Makefile should be written")
+		t.Error("bootstrap must be deferred: no Makefile should be written")
 	}
 
 	populated := t.TempDir()

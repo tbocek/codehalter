@@ -39,7 +39,6 @@ const (
 type cliCall struct {
 	id      string
 	title   string
-	kind    string
 	status  string
 	started time.Time
 	termID  string
@@ -421,9 +420,6 @@ func (u *cliUI) Card(up toolCallUpdate) {
 	}
 	if up.Title != "" {
 		c.title = sanitize(up.Title)
-	}
-	if up.ToolKind != "" {
-		c.kind = up.ToolKind
 	}
 	if up.Status != "" {
 		c.status = up.Status

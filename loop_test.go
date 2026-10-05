@@ -7,10 +7,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -75,91 +76,43 @@ func TestThrottledStream(t *testing.T) {
 	}
 }
 
-// The contract between PLAN.md and runExecutePhase.
-func TestPlanResultSubtasksDeserialize(t *testing.T) {
-	raw := `{
-		"clear": true,
-		"subtasks": [
-			{"description": "refactor storage", "verify": ["go build ./...", "go test ./storage/..."]},
-			{"description": "update API", "verify": ["curl /healthz"]},
-			{"description": "write migration"}
-		]
-	}`
-	var p planResult
-	if err := json.Unmarshal([]byte(raw), &p); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(p.Subtasks) != 3 {
-		t.Fatalf("subtasks: want 3, got %d", len(p.Subtasks))
-	}
-	if p.Subtasks[0].Description != "refactor storage" {
-		t.Errorf("subtasks[0].Description = %q", p.Subtasks[0].Description)
-	}
-	if !slices.Equal(p.Subtasks[0].Verify, []string{"go build ./...", "go test ./storage/..."}) {
-		t.Errorf("subtasks[0].Verify = %v", p.Subtasks[0].Verify)
-	}
-	if len(p.Subtasks[2].Verify) != 0 {
-		t.Errorf("subtasks[2].Verify should be empty (omitempty), got %v", p.Subtasks[2].Verify)
-	}
-
-	// report_only round-trips so renderPlan can label it "Findings:".
-	rawReport := `{"clear": true, "report_only": true, "subtasks": [{"description": "summarise X"}]}`
-	var p2 planResult
-	if err := json.Unmarshal([]byte(rawReport), &p2); err != nil {
-		t.Fatalf("unmarshal report_only: %v", err)
-	}
-	if !p2.ReportOnly {
-		t.Errorf("expected report_only=true")
-	}
+// fakeTool is a test tool with an object schema; run answers each call.
+func fakeTool(name string, run func(args string) (string, bool)) Tool {
+	return Tool{Def: map[string]any{"type": "function", "function": map[string]any{
+		"name": name, "description": "test tool", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, args string) (string, bool) { return run(args) }}
 }
 
-// Lowercase, punctuation-stripped, order-independent, so rewordings match.
-func TestIssueBagTokenisation(t *testing.T) {
-	a := issueBag([]string{"Missing import!", "Syntax error."})
-	b := issueBag([]string{"syntax  ERROR", "missing\timport"})
-	if !slices.Equal(sortedKeys(a), sortedKeys(b)) {
-		t.Errorf("expected equivalent bags, got %v vs %v", sortedKeys(a), sortedKeys(b))
-	}
-
-	// No empty tokens from adjacent separators.
-	bag := issueBag([]string{"foo--bar...baz"})
-	want := []string{"bar", "baz", "foo"}
-	if !slices.Equal(sortedKeys(bag), want) {
-		t.Errorf("got %v, want %v", sortedKeys(bag), want)
-	}
-}
-
-func sortedKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
-}
-
-// A reworded near-duplicate scores above the threshold, unrelated failures below.
-func TestJaccardSimilarity(t *testing.T) {
-	// Two empty bags are treated as identical (degenerate but well-defined).
-	if got := jaccard(map[string]bool{}, map[string]bool{}); got != 1 {
-		t.Errorf("empty/empty: got %v, want 1", got)
-	}
-
-	// |∩|=2, |∪|=3: 0.67, above the threshold.
-	a := issueBag([]string{"missing import"})
-	b := issueBag([]string{"import is missing"})
-	if s := jaccard(a, b); s < failureSimilarityThreshold {
-		t.Errorf("reworded duplicate: got %v, want >= %v", s, failureSimilarityThreshold)
-	}
-
-	c := issueBag([]string{"missing import in foo.go"})
-	d := issueBag([]string{"unused variable x"})
-	if s := jaccard(c, d); s >= failureSimilarityThreshold {
-		t.Errorf("disjoint issues: got %v, want < %v", s, failureSimilarityThreshold)
-	}
-
-	if jaccard(a, b) != jaccard(b, a) {
-		t.Errorf("expected jaccard to be symmetric")
+// The contract between PLAN.md and runExecutePhase, including the shapes planners
+// send: subtasks serialised into a string, with a stray brace after it.
+func TestPlanResultUnmarshalJSON(t *testing.T) {
+	want := []subtask{{Description: "do x", Verify: []string{"just test"}}}
+	for _, tc := range []struct {
+		name, raw  string
+		subtasks   []subtask
+		reportOnly bool
+		wantErr    bool
+	}{
+		{"array", `{"clear":true,"subtasks":[{"description":"do x","verify":["just test"]}]}`, want, false, false},
+		{"no verify", `{"clear":true,"subtasks":[{"description":"do x"}]}`, []subtask{{Description: "do x"}}, false, false},
+		{"stringified", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}]"}`, want, false, false},
+		{"stringified with a stray brace", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}]}"}`, want, false, false},
+		// report_only round-trips so renderPlan can label it "Findings:".
+		{"report only, no subtasks", `{"clear":true,"report_only":true}`, nil, true, false},
+		{"a string that is not an array", `{"clear":true,"subtasks":"do x"}`, nil, false, true},
+	} {
+		var p planResult
+		err := json.Unmarshal([]byte(tc.raw), &p)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, want error %v", tc.name, err, tc.wantErr)
+			continue
+		}
+		if tc.wantErr {
+			continue
+		}
+		if !p.Clear || p.ReportOnly != tc.reportOnly || !reflect.DeepEqual(p.Subtasks, tc.subtasks) {
+			t.Errorf("%s: got %+v, want subtasks %+v report_only=%v", tc.name, p, tc.subtasks, tc.reportOnly)
+		}
 	}
 }
 
@@ -252,19 +205,11 @@ func TestCapHitLadderExhausted(t *testing.T) {
 func TestStuckLadderFuzzyOutput(t *testing.T) {
 	const toolName = "noisy_probe_test_tool"
 	attempt := 0
-	var testTools []Tool
-	testTools = append(testTools, Tool{Def: map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name":        toolName,
-			"description": "test-only failing probe with noisy output",
-			"parameters":  map[string]any{"type": "object"},
-		},
-	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+	probe := fakeTool(toolName, func(string) (string, bool) {
 		attempt++
 		// Jaccard ≈ 0.93 between outputs: above stuckOutputSimilarity, a new hash every time.
 		return fmt.Sprintf("build FAILED: cannot load package example.com/foo/bar: import cycle not allowed in dependency graph involving widget factory manager controller service repository handler adapter transport codec parser lexer scanner tokenizer emitter renderer scheduler dispatcher broker queue worker pool cache index shard replica leader follower quorum consensus journal snapshot compaction segment (elapsed %dms, attempt %d)", 1200+attempt*7, attempt), true
-	}})
+	})
 
 	call := sseToolCall("c1", toolName, `{}`)
 	responses := make([]string, 12)
@@ -274,7 +219,7 @@ func TestStuckLadderFuzzyOutput(t *testing.T) {
 	mock := newMockLLM(t, responses...)
 	defer mock.Close()
 	a, s := newTestAgent(t)
-	a.tools.add(testTools...)
+	a.tools.add(probe)
 	a.mainSlotTokens.Store(85248)
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
@@ -298,18 +243,10 @@ func TestStuckCallIsNotRunAgainInTheSameTurn(t *testing.T) {
 	const toolName = "same_probe_test_tool"
 	runs := 0
 	a, s := newTestAgent(t)
-	a.tools.add()
-	a.tools.add(Tool{Def: map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name":        toolName,
-			"description": "test-only probe with the same answer every time",
-			"parameters":  map[string]any{"type": "object"},
-		},
-	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+	a.tools.add(fakeTool(toolName, func(string) (string, bool) {
 		runs++
 		return "13:![The Cut page](img/05-cut.png)", false
-	}})
+	}))
 	a.mainSlotTokens.Store(85248)
 	call := sseToolCall("c1", toolName, `{}`)
 	var step1 []string
@@ -403,7 +340,7 @@ func TestAddCorrectiveSurvivesRebuild(t *testing.T) {
 
 	rebuilt := a.buildLLMContext(s)
 	if len(rebuilt) != len(wire) {
-		t.Fatalf("rebuild has %d messages, wire had %d — the corrective did not persist", len(rebuilt), len(wire))
+		t.Fatalf("rebuild has %d messages, wire had %d: the corrective did not persist", len(rebuilt), len(wire))
 	}
 	for i := range wire {
 		if rebuilt[i].Role != wire[i].Role || fmt.Sprint(rebuilt[i].Content) != fmt.Sprint(wire[i].Content) {
@@ -539,24 +476,9 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 }
 
 func TestToolLoopRecordsToolUses(t *testing.T) {
-	var testTools []Tool
 	const testToolName = "test_echo_tool_9d7f"
-	testTools = append(testTools, Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        testToolName,
-				"description": "echoes the input.msg field (test only)",
-				"parameters": map[string]any{
-					"type":       "object",
-					"properties": map[string]any{"msg": map[string]any{"type": "string"}},
-				},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			args := parseArgs(rawArgs)
-			return "echo: " + args.str("msg"), false
-		},
+	echo := fakeTool(testToolName, func(args string) (string, bool) {
+		return "echo: " + parseArgs(args).str("msg"), false
 	})
 
 	mock := newMockLLM(t,
@@ -578,7 +500,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 	}
-	withTools(a, testTools...)
+	withTools(a, echo)
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "please echo hello"}}, phasePolicy{}, "execute", true, 0)
@@ -664,16 +586,7 @@ func TestToolLoopRespondExits(t *testing.T) {
 
 // A denied tool stays in the array; dispatch rejects it and the loop continues.
 func TestRunToolLoopDenyGate(t *testing.T) {
-	var testTools []Tool
 	var execs int
-	testTools = append(testTools, Tool{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "mutate", "description": "x", "parameters": map[string]any{"type": "object"}}},
-		Execute: func(ctx context.Context, a *agent, sid string, raw string) (string, bool) {
-			execs++
-			return "did it", false
-		},
-	})
 	mock := newMockLLM(t,
 		sseToolCall("c1", "mutate", `{}`),
 		sseText("ok"),
@@ -681,7 +594,10 @@ func TestRunToolLoopDenyGate(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	withTools(a, testTools...)
+	withTools(a, fakeTool("mutate", func(string) (string, bool) {
+		execs++
+		return "did it", false
+	}))
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}},
 		phasePolicy{deny: map[string]bool{"mutate": true}}, "plan", true, 0)
@@ -781,84 +697,13 @@ func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 	}
 }
 
-// Identical calls each execute: a cached read after a mutating command would be stale.
-func TestToolLoopNoDedup(t *testing.T) {
-	var testTools []Tool
-	const readName = "test_read"
-	const writeName = "test_write"
-	var reads, writes int
-	testTools = append(testTools, Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": readName, "description": "read",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			reads++
-			return "read-ok", false
-		},
-	})
-	testTools = append(testTools, Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": writeName, "description": "write",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			writes++
-			return "wrote", false
-		},
-	})
-
-	mock := newMockLLM(t,
-		sseToolCall("c1", readName, `{}`),
-		sseToolCall("c2", readName, `{}`),
-		sseToolCall("c3", writeName, `{}`),
-		sseToolCall("c4", writeName, `{}`),
-		sseText("done"),
-	)
-	defer mock.Close()
-
-	a, s := newTestAgent(t)
-	withTools(a, testTools...)
-	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
-	if err != nil {
-		t.Fatalf("runToolLoop: %v", err)
-	}
-	if reads != 2 {
-		t.Errorf("read tool executed %d times, want 2 (no dedup)", reads)
-	}
-	if writes != 2 {
-		t.Errorf("write tool executed %d times, want 2 (no dedup)", writes)
-	}
-	if len(res.ToolUses) != 4 {
-		t.Fatalf("ToolUses: got %d, want 4", len(res.ToolUses))
-	}
-	for i, tu := range res.ToolUses {
-		if strings.HasPrefix(tu.Output, "[deduped:") {
-			t.Errorf("ToolUses[%d] should not be deduped, got %q", i, tu.Output)
-		}
-	}
-}
-
-// A nudge each stuck round, a swap to the thinking sampler (keeping a forced
-// tool_choice) at stuckEscalateRounds, a graceful bail at stuckBailRounds.
 // An execute loop that only reads is nudged and moved to the thinking sampler at
 // readStreakEscalate, and ends at readStreakBail with a reason the replan sees.
 func TestToolLoopEndsAReadOnlyStreak(t *testing.T) {
 	a, s := newTestAgent(t)
-	withTools(a, Tool{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "read_file", "description": "read", "parameters": map[string]any{"type": "object"}}},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			return "the text of " + parseArgs(rawArgs).str("path"), false
-		},
-	})
+	withTools(a, fakeTool("read_file", func(args string) (string, bool) {
+		return "the text of " + parseArgs(args).str("path"), false
+	}))
 	var resp []string
 	for i := range readStreakBail + 5 {
 		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "read_file", fmt.Sprintf(`{"path":"file%c%c.rs"}`, 'a'+i/26, 'a'+i%26)))
@@ -886,23 +731,11 @@ func TestToolLoopEndsAReadOnlyStreak(t *testing.T) {
 	}
 }
 
+// A nudge each stuck round, a swap to the thinking sampler (keeping a forced
+// tool_choice) at stuckEscalateRounds, a graceful bail at stuckBailRounds.
 func TestToolLoopRepetitionLadder(t *testing.T) {
-	var testTools []Tool
 	const toolName = "test_probe_a3f"
 	var execs int
-	testTools = append(testTools, Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": toolName, "description": "probe",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			execs++
-			return "same result", false
-		},
-	})
 
 	var resp []string
 	for i := 0; i < 8; i++ {
@@ -912,7 +745,10 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	withTools(a, testTools...)
+	withTools(a, fakeTool(toolName, func(string) (string, bool) {
+		execs++
+		return "same result", false
+	}))
 	a.settings = Settings{
 		LLM: []LLMConnection{{
 			Server:         mock.ts.URL,
@@ -977,37 +813,19 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 
 // A green re-run after an edit is a re-verify, never a repeat.
 func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
-	var testTools []Tool
 	var execs, edits int
-	testTools = append(testTools, Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": "run_command", "description": "probe",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			execs++
-			return "go build -o codehalter .", false // identical green output, success
-		},
-	}, Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": "edit_file", "description": "probe",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			// A real change on disk: codehalter looks, it does not take the tool's word.
-			edits++
-			if err := os.WriteFile(filepath.Join(a.getSession(sid).Cwd, "a.go"), []byte(strings.Repeat("x", edits)), 0o644); err != nil {
-				return err.Error(), true
-			}
-			return "edited", false
-		},
-	})
+	a, s := newTestAgent(t)
+	withTools(a, fakeTool("run_command", func(string) (string, bool) {
+		execs++
+		return "go build -o codehalter .", false // identical green output, success
+	}), fakeTool("edit_file", func(string) (string, bool) {
+		// A real change on disk: codehalter looks, it does not take the tool's word.
+		edits++
+		if err := os.WriteFile(filepath.Join(s.Cwd, "a.go"), []byte(strings.Repeat("x", edits)), 0o644); err != nil {
+			return err.Error(), true
+		}
+		return "edited", false
+	}))
 
 	var resp []string
 	for i := 0; i < 6; i++ {
@@ -1017,9 +835,6 @@ func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 	resp = append(resp, sseText("all green, done"))
 	mock := newMockLLM(t, resp...)
 	defer mock.Close()
-
-	a, s := newTestAgent(t)
-	withTools(a, testTools...)
 	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
 	conn := a.connFor("execute")
 	if conn == nil {
@@ -1046,22 +861,8 @@ func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 
 // Fan-out over distinct arguments returns new output each call, so no round is stuck.
 func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
-	var testTools []Tool
 	const toolName = "test_grep_q9z"
 	var execs int
-	testTools = append(testTools, Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": toolName, "description": "grep",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			execs++
-			return "no match", false
-		},
-	})
 
 	mock := newMockLLM(t,
 		sseToolCall("c1", toolName, `{"q":"x1"}`),
@@ -1074,7 +875,10 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
-	withTools(a, testTools...)
+	withTools(a, fakeTool(toolName, func(string) (string, bool) {
+		execs++
+		return "no match", false
+	}))
 	a.settings = Settings{
 		LLM: []LLMConnection{{
 			Server:         mock.ts.URL,
@@ -1160,20 +964,15 @@ func TestPhaseContractNudge(t *testing.T) {
 // Picked up before the next model call as an ordinary, stored user message.
 func TestSteeringLandsBetweenRounds(t *testing.T) {
 	a, s := newTestAgent(t)
-	testTools := []Tool{{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "probe", "description": "x", "parameters": map[string]any{"type": "object"}}},
-		Execute: func(ctx context.Context, a *agent, sid string, raw string) (string, bool) {
-			s.addSteer("also update the README")
-			return "probed", false
-		},
-	}}
 	mock := newMockLLM(t,
 		sseToolCall("c1", "probe", `{}`),
 		sseToolCall("c2", respondToolName, `{"message":"done"}`),
 	)
 	defer mock.Close()
-	withTools(a, append(testTools, respondTool)...)
+	withTools(a, fakeTool("probe", func(string) (string, bool) {
+		s.addSteer("also update the README")
+		return "probed", false
+	}), respondTool)
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}},
@@ -1207,16 +1006,12 @@ func TestSteeringLandsBetweenRounds(t *testing.T) {
 
 func TestBackgroundNoteReachesTheLoopMidTurn(t *testing.T) {
 	a, s := newTestAgent(t)
-	withTools(a, Tool{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "run_command", "description": "probe", "parameters": map[string]any{"type": "object"}}},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			// The job finishes while this round's tool is still running.
-			s.addBgNote(bgNote{line: "background job 7 `just test` exited with code 0 after 2m20s",
-				full: "[codehalter, not the user: background job 7 `just test` exited with code 0 after 2m20s. Last output:]\n\ntest result: ok. 12 passed"})
-			return "edited", false
-		},
-	})
+	withTools(a, fakeTool("run_command", func(string) (string, bool) {
+		// The job finishes while this round's tool is still running.
+		s.addBgNote(bgNote{line: "background job 7 `just test` exited with code 0 after 2m20s",
+			full: "[codehalter, not the user: background job 7 `just test` exited with code 0 after 2m20s. Last output:]\n\ntest result: ok. 12 passed"})
+		return "edited", false
+	}))
 	mock := newMockLLM(t, sseToolCall("c1", "run_command", `{"command":"sed -i s/a/b/ x.rs"}`), sseText("done"))
 	defer mock.Close()
 	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
@@ -1243,15 +1038,11 @@ func TestSteerAndNoteShareOneMessage(t *testing.T) {
 	a, s := newTestAgent(t)
 	note := bgNote{line: "background job 7 `just test` exited with code 0 after 2m20s",
 		full: "[codehalter, not the user: background job 7 `just test` exited with code 0 after 2m20s. Last output:]\n\ntest result: ok. 12 passed"}
-	withTools(a, Tool{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "probe", "description": "x", "parameters": map[string]any{"type": "object"}}},
-		Execute: func(ctx context.Context, a *agent, sid string, raw string) (string, bool) {
-			s.addBgNote(note)
-			s.addSteer("also update the README")
-			return "probed", false
-		},
-	}, respondTool)
+	withTools(a, fakeTool("probe", func(string) (string, bool) {
+		s.addBgNote(note)
+		s.addSteer("also update the README")
+		return "probed", false
+	}), respondTool)
 	mock := newMockLLM(t,
 		sseToolCall("c1", "probe", `{}`),
 		sseToolCall("c2", respondToolName, `{"message":"done"}`),
@@ -1291,11 +1082,7 @@ func TestSteerAndNoteShareOneMessage(t *testing.T) {
 // Once, as a user message; the execute phase never sees it.
 func TestPlanRoundNudgeAsksToSubmit(t *testing.T) {
 	a, s := newTestAgent(t)
-	withTools(a, Tool{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "read_file", "description": "probe", "parameters": map[string]any{"type": "object"}}},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) { return "hit", false },
-	})
+	withTools(a, fakeTool("read_file", func(string) (string, bool) { return "hit", false }))
 	var resp []string
 	for i := 0; i <= planRoundNudge+1; i++ {
 		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "read_file", fmt.Sprintf(`{"path":"f%d.rs"}`, i)))
@@ -1322,28 +1109,6 @@ func TestPlanRoundNudgeAsksToSubmit(t *testing.T) {
 	}
 	if nudges != 1 {
 		t.Errorf("nudges = %d, want exactly 1", nudges)
-	}
-}
-
-// A string that is not an array is still an error.
-func TestPlanResultAcceptsStringifiedSubtasks(t *testing.T) {
-	var direct, quoted planResult
-	if err := json.Unmarshal([]byte(`{"clear":true,"subtasks":[{"description":"do x","verify":["run just test via run_command"]}]}`), &direct); err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal([]byte(`{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"run just test via run_command\"]}]"}`), &quoted); err != nil {
-		t.Fatalf("stringified subtasks rejected: %v", err)
-	}
-	if !direct.Clear || len(direct.Subtasks) != 1 || len(quoted.Subtasks) != 1 || quoted.Subtasks[0].Description != "do x" || len(quoted.Subtasks[0].Verify) != 1 {
-		t.Errorf("shapes differ: direct=%+v quoted=%+v", direct, quoted)
-	}
-	var bad planResult
-	if err := json.Unmarshal([]byte(`{"clear":true,"subtasks":"do x"}`), &bad); err == nil {
-		t.Error("a plain string that is not an array parsed as subtasks")
-	}
-	var none planResult
-	if err := json.Unmarshal([]byte(`{"clear":true,"report_only":true}`), &none); err != nil || !none.ReportOnly {
-		t.Errorf("a plan with no subtasks must still parse: %v %+v", err, none)
 	}
 }
 
@@ -1479,17 +1244,6 @@ func TestPlanRedoIsAPlan(t *testing.T) {
 	}
 	if plan == nil || strings.Join(plan.Redo, ",") != "F0.9,§03-shell#1-screen" {
 		t.Fatalf("plan = %+v, want the redo ids", plan)
-	}
-}
-
-func TestPlanStringifiedSubtasksWithStrayBrace(t *testing.T) {
-	var p planResult
-	raw := `{"clear": true, "report_only": false, "subtasks": "[{\"description\": \"look\", \"verify\": [\"a\"]}]}"}`
-	if err := json.Unmarshal([]byte(raw), &p); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(p.Subtasks) != 1 || p.Subtasks[0].Description != "look" {
-		t.Errorf("subtasks = %+v", p.Subtasks)
 	}
 }
 
@@ -1706,10 +1460,7 @@ func TestToolLoopWaitsForARestartingServer(t *testing.T) {
 // one that did not edit hits the cap as before.
 func TestToolLoopExtendsAProductiveStepOnce(t *testing.T) {
 	fake := func(name, out string) Tool {
-		return Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": name, "parameters": map[string]any{"type": "object"}}},
-			Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-				return out + rawArgs, false
-			}}
+		return fakeTool(name, func(args string) (string, bool) { return out + args, false })
 	}
 	run := func(editing bool) (toolLoopResult, error, int) {
 		var resp []string
@@ -1735,5 +1486,163 @@ func TestToolLoopExtendsAProductiveStepOnce(t *testing.T) {
 	}
 	if _, err, calls := run(false); err == nil || !strings.Contains(err.Error(), "exceeded") || calls != maxToolLoopIterations {
 		t.Errorf("step without edits: err=%v calls=%d, want the cap", err, calls)
+	}
+}
+
+// A planner that never gets clear is asked at most maxClarifications times; then
+// its last plan goes on instead of another round.
+func TestPlanClarificationsAreBounded(t *testing.T) {
+	unclear := sseToolCall("p", submitPlanToolName, `{"clear":false,"question":"Which one?","choices":["the CLI","the server"]}`)
+	var resp []string
+	for range maxClarifications + 1 {
+		resp = append(resp, unclear)
+	}
+	a, s, mock := planPhaseAgent(t, resp...)
+	a.mode = "Autopilot" // answers each clarification with its first choice
+
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil || plan == nil || plan.Clear {
+		t.Fatalf("plan=%+v err=%v, want the last unclear plan", plan, err)
+	}
+	if got := mock.callCount(); got != maxClarifications+1 {
+		t.Errorf("planner calls = %d, want %d", got, maxClarifications+1)
+	}
+	asked := 0
+	for _, m := range s.Messages {
+		if m.Role == "user" && m.Content == "User chose: the CLI" {
+			asked++
+		}
+	}
+	if asked != maxClarifications {
+		t.Errorf("clarifications answered = %d, want %d", asked, maxClarifications)
+	}
+}
+
+// ctxFull, queued in refusingLLM, answers that call with the server's context-full refusal.
+const ctxFull = "\x00context-full"
+
+func refusingLLM(t *testing.T, responses ...string) *mockLLM {
+	t.Helper()
+	m := &mockLLM{resps: responses, t: t}
+	m.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("refusingLLM: decode request body: %v", err)
+		}
+		m.mu.Lock()
+		m.reqs = append(m.reqs, body)
+		m.mu.Unlock()
+		switch i := int(m.idx.Add(1)) - 1; {
+		case i >= len(m.resps):
+			t.Errorf("refusingLLM: unexpected call %d", i+1)
+			http.Error(w, "no response queued", http.StatusInternalServerError)
+		case m.resps[i] == ctxFull:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"the request exceeds the available context size","type":"exceed_context_size_error"}}`)
+		default:
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, m.resps[i])
+		}
+	}))
+	t.Cleanup(m.ts.Close)
+	return m
+}
+
+// The server's context-full refusal folds history and retries the call: first
+// keeping the turn's recent steps (keepWindowStart), then from the last assistant
+// message. Only plan and execute recover; another phase gets the error.
+func TestToolLoopFoldsOnContextFull(t *testing.T) {
+	setup := func(t *testing.T) (*agent, *Session) {
+		a, s := newTestAgent(t)
+		s.AddUser("old question")
+		s.AddAssistant("old answer")
+		s.appendShadow("Goal: old\nProgress: answered the old question")
+		s.AddUser("new question")
+		s.markTurnStart()
+		s.AddAssistant("step one")
+		s.AddAssistant("step two")
+		// Real prompt sizes, so the first rung keeps both steps.
+		s.Messages[3].PromptTokens, s.Messages[4].PromptTokens = 1000, 2000
+		return a, s
+	}
+	assistants := func(req map[string]any) []string {
+		var out []string
+		msgs, _ := req["messages"].([]any)
+		for _, m := range msgs {
+			if mm, _ := m.(map[string]any); mm["role"] == "assistant" {
+				out = append(out, fmt.Sprint(mm["content"]))
+			}
+		}
+		return out
+	}
+
+	a, s := setup(t)
+	mock := refusingLLM(t, ctxFull, ctxFull, sseText("done"))
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"), a.buildLLMContext(s), phasePolicy{}, "execute", false, 0)
+	if err != nil || res.Text != "done" || mock.callCount() != 3 {
+		t.Fatalf("res=%q err=%v calls=%d, want the reply after two folds", res.Text, err, mock.callCount())
+	}
+	for i, want := range [][]string{{"old answer", "step one", "step two"}, {"step one", "step two"}, {"step two"}} {
+		if got := assistants(mock.request(i)); !reflect.DeepEqual(got, want) {
+			t.Errorf("call %d sent assistant turns %q, want %q", i, got, want)
+		}
+	}
+	if wire := fmt.Sprint(mock.request(2)["messages"]); !strings.Contains(wire, "answered the old question") || !strings.Contains(wire, "step one") {
+		t.Errorf("the retry does not carry the folded turns in its summary:\n%s", wire)
+	}
+
+	a, s = setup(t)
+	mock = refusingLLM(t, ctxFull)
+	_, err = a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("document"), a.buildLLMContext(s), phasePolicy{}, "document", false, 0)
+	if !isContextFull(err) || mock.callCount() != 1 || s.Summary != "" || len(s.Messages) != 5 {
+		t.Errorf("document phase: err=%v calls=%d summary=%q messages=%d, want the refusal and no fold", err, mock.callCount(), s.Summary, len(s.Messages))
+	}
+}
+
+// Exit codes override the executor's respond, by each call's last run: a failed
+// run_command fails the subtask, a green re-run of the same call clears it, and
+// other tools' failures are no verdict.
+func TestExecutorVerdictFromExitCodes(t *testing.T) {
+	type step struct {
+		tool, cmd string
+		failed    bool
+	}
+	for _, tc := range []struct {
+		name   string
+		steps  []step
+		reason string // "" for a pass
+	}{
+		{"failed run", []step{{"run_command", "go test ./...", true}}, "failed commands: `go test ./...`"},
+		{"green re-run", []step{{"run_command", "go test ./...", true}, {"run_command", "go test ./...", false}}, ""},
+		{"another command green", []step{{"run_command", "go test ./...", true}, {"run_command", "go vet ./...", false}}, "failed commands: `go test ./...`"},
+		{"failed edit", []step{{"edit_file", "", true}}, ""},
+	} {
+		var resp []string
+		for i, st := range tc.steps {
+			args, _ := json.Marshal(map[string]string{"command": st.cmd, "path": "a.go"})
+			resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), st.tool, string(args)))
+		}
+		resp = append(resp, sseToolCall("r", respondToolName, `{"message":"all done"}`))
+		a, s, _ := planPhaseAgent(t, resp...)
+		next := 0
+		answer := func(string) (string, bool) {
+			st := tc.steps[next]
+			next++
+			if st.failed {
+				return "exit 1\n\nFAIL", true
+			}
+			return "exit 0\n\nok", false
+		}
+		a.tools.add(fakeTool("run_command", answer), fakeTool("edit_file", answer))
+
+		out := a.runExecutePhase(context.Background(), s.ID, subtask{Description: "make the tests pass"}, 0, 1)
+		if out.Success != (tc.reason == "") || out.Reason != tc.reason {
+			t.Errorf("%s: success=%v reason=%q, want reason %q", tc.name, out.Success, out.Reason, tc.reason)
+		}
 	}
 }

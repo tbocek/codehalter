@@ -37,9 +37,8 @@ type backgroundJob struct {
 	announced  bool // under bgMu
 	// expectExit: a handed-over run_command, not a run_background job.
 	expectExit bool
-	// waitable: a `respond` parks for it, and the stall watchdog may kill it. A
-	// handed-over run_command, or a run_background test, build or lint run; never
-	// a server, which does not exit and is quiet on purpose.
+	// waitable: a finite run (handed-over run_command, test, build or lint job):
+	// respond parks for it and the stall watchdog may kill it. Never a server.
 	waitable  bool
 	redirects []string      // growth counts as progress
 	stalled   time.Duration // >0: killed by the stall watchdog (under bgMu)
@@ -92,9 +91,7 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 			"Look at it with `screenshot` on the file; for a close look at one part, give `region` [x, y, width, height] in its pixels and that part comes back enlarged: "+
 			`{"path": %q, "region": [0, 0, 800, 400]}. The reply for the whole picture states its size.`, strings.Trim(pic, `'" `))
 	}
-	// A render belongs in the foreground: only there is its picture attached, and
-	// only an attached picture counts as a look. One /spec round started its render
-	// here, ended five seconds before it finished, and failed as never looked.
+	// Only a foreground render attaches its picture, so only it counts as a look.
 	if !expectExit && renderCmdRe.MatchString(cmdStr) {
 		return nil, "refused: this renders a screen, which takes seconds. Run it with `run_command` instead: only a render through run_command attaches the picture to your view, and only then does the look count. A render in the background finishes unseen."
 	}
@@ -132,11 +129,9 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 		redirects:  redirectTargets(cmdStr, sess.Cwd),
 		exited:     make(chan jobExit, 1),
 	}
-	// pipefail + wait: the exit status is the command's, not tee's. What the
-	// command leaves behind is swept when it exits, not only on a kill: two
-	// green `xvfb-run` suites each left an Xvfb (in the wrapper's own group),
-	// and `timeout` moves its command into a group of its own, so the sweep
-	// goes by process group, and by session where the wrapper leads one (a pty).
+	// pipefail + wait: the exit status is the command's, not tee's. Leftovers are
+	// swept on every exit, by group and by session (timeout moves its command out
+	// of the group; an xvfb-run suite left its Xvfb behind).
 	quoted := "'" + strings.ReplaceAll(cmdStr, "'", `'\''`) + "'"
 	script := fmt.Sprintf("echo $$ > %s\nset -o pipefail\n%s\ntrap 'trap - TERM INT HUP; sweep TERM; exit 143' TERM INT HUP\n( exec bash -c %s ) 2>&1 | tee %s &\nwait $!\nrc=$?\ntrap '' TERM\nif sweep TERM; then sleep 3; sweep KILL; fi\nexit $rc",
 		job.pidPath, jobSweepFn, quoted, job.logPath)
@@ -223,8 +218,6 @@ func (a *agent) sayRunningBgJobs(sess *Session) {
 	a.say(context.Background(), sess.ID, "\n⏳ Running in the background: "+strings.Join(names, ", ")+". When it exits I pick up the work that was waiting on it and tell you; you can carry on meanwhile.\n")
 }
 
-// A run_background gate ended the subtask on its "waiting" respond 13 times in
-// the logs, and the result arrived in another subtask's context.
 // A picture file, and an inline script or an image tool that would crop or
 // measure it. A project's own script file (`python3 tools/icons.py a.png`) is not
 // inline and stays allowed.
@@ -250,7 +243,8 @@ func (a *agent) parkableJobs(sid string, since time.Time) string {
 var parkPoll = 500 * time.Millisecond
 
 // parkForJobs returns what resumes a parked turn: the queued job notes and the
-// user's text, in arrival order.
+// user's text, in arrival order. Without parking, a gate that ended on a
+// "waiting" respond got its result in another subtask.
 func (a *agent) parkForJobs(ctx context.Context, sid, jobs string) (string, error) {
 	sess := a.getSession(sid)
 	if sess == nil {
@@ -278,12 +272,21 @@ func (a *agent) parkForJobs(ctx context.Context, sid, jobs string) (string, erro
 	}
 }
 
-func (a *agent) forgetBgJob(job *backgroundJob) {
+// endJob releases a finished or stopped job's terminal and forgets it.
+func (a *agent) endJob(job *backgroundJob) {
+	a.terminalRelease(job.sid, job.terminalId)
 	a.bgMu.Lock()
 	delete(a.bgJobs, job.id)
 	a.bgMu.Unlock()
-	_ = os.Remove(job.logPath)
-	_ = os.Remove(job.pidPath)
+	removeJobFiles(job.logPath, job.pidPath)
+}
+
+func removeJobFiles(files ...string) {
+	for _, f := range files {
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			slog.Debug("background job: file not removed", "file", f, "err", err)
+		}
+	}
 }
 
 func (a *agent) shutdownBackground() {
@@ -299,8 +302,7 @@ func (a *agent) shutdownBackground() {
 			a.killJob(j)
 			a.terminalRelease(j.sid, j.terminalId)
 		}
-		_ = os.Remove(j.logPath)
-		_ = os.Remove(j.pidPath)
+		removeJobFiles(j.logPath, j.pidPath)
 	}
 }
 
@@ -337,24 +339,19 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	select {
 	case res := <-job.exited:
 		tail := readLogTail(job.logPath, bgLogTailCap)
-		a.terminalRelease(sid, job.terminalId)
-		a.forgetBgJob(job)
+		a.endJob(job)
 		if res.err != nil {
 			a.FailToolCall(ctx, sid, job.tcId, res.err.Error())
 			return "error reading terminal: " + res.err.Error(), false
 		}
-		result := fmt.Sprintf("background job %d exited immediately (exit %d) — it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", job.id, res.exit.code(), tail)
+		result := fmt.Sprintf("background job %d exited immediately (exit %d): it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", job.id, res.exit.code(), tail)
 		a.CompleteToolCallTitled(ctx, sid, job.tcId, fmt.Sprintf("Background: %s (exited %d)", job.cmdStr, res.exit.code()), []ToolCallContent{TextContent(result)})
 		return result, false
 	case <-time.After(bgJobGrace):
 	}
 
 	wake := a.handOver(job)
-	stop := fmt.Sprintf("stop it with `run_command: kill -TERM -%d; sleep 3; kill -KILL -%d 2>/dev/null; true` (the whole job; here a plain kill can be ignored)", job.pid, job.pid)
-	if job.pid == 0 {
-		// Never print `kill 0`: it would signal the whole process group.
-		stop = "its pid was not recorded, so it can only be stopped by ending the session"
-	}
+	stop := stopHint(job.pid)
 	idle := "end the turn with `respond` saying the job is running"
 	if job.waitable {
 		idle = fmt.Sprintf("call `respond` saying you are waiting for job %d: that parks this step, it does not end it, and you continue here the moment the job reports", job.id)
@@ -393,7 +390,7 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 		return
 	}
 	a.terminalRelease(job.sid, job.terminalId)
-	_ = os.Remove(job.pidPath)
+	removeJobFiles(job.pidPath) // the log stays: the note points the model at it
 	sess := a.getSession(job.sid)
 	if sess == nil {
 		return
@@ -440,14 +437,21 @@ func (a *agent) killJob(job *backgroundJob) {
 // round adds (SPEC-SETUP.md), or the app's own --snapshot flag.
 var renderCmdRe = regexp.MustCompile(`(?:^|[\s;&|(])(?:just|make|task)\s+snapshot\b|\b(?:npm|pnpm|yarn)\s+(?:run\s+)?snapshot\b|\s--snapshot\b`)
 
+// stopHint tells the model how to stop a job: its whole group, SIGKILL if
+// SIGTERM is ignored. Never `kill -0`, which signals the caller's own group.
+func stopHint(pid int) string {
+	if pid <= 0 {
+		return "its pid was not recorded, so it can only be stopped by ending the session"
+	}
+	return fmt.Sprintf("stop it with `run_command: kill -TERM -%d; sleep 3; kill -KILL -%d 2>/dev/null; true` (the whole job; here a plain kill can be ignored)", pid, pid)
+}
+
 // jobKillGrace: a job still there this long after SIGTERM gets SIGKILL. Zed's
-// terminals start commands with SIGTERM ignored, so four hung test runs sat out
-// every polite stop, the model's `kill` included, for up to 32 hours.
+// terminals start commands with SIGTERM ignored.
 var jobKillGrace = 3 * time.Second
 
-// killGroup sends SIGTERM to the process group pid leads (the pid alone when it
-// leads none), then SIGKILL after jobKillGrace if any of it is still there. It
-// returns at once.
+// killGroup: SIGTERM to pid's group (the pid alone if it leads none), SIGKILL
+// after jobKillGrace; it returns at once.
 func killGroup(pid int) {
 	target := -pid
 	if err := syscall.Kill(target, syscall.SIGTERM); err != nil {
@@ -469,10 +473,8 @@ func killGroup(pid int) {
 	}()
 }
 
-// killOrphanedJobs stops the jobs an earlier codehalter process left running: a
-// restart loses track of them, and the four hung test runs had outlived theirs
-// by a day. Only a wrapper whose command line names its own pid file is taken,
-// so a reused pid is never hit.
+// killOrphanedJobs stops the jobs a dead codehalter left running. Only a wrapper
+// whose command line names its own pid file is taken, so a reused pid is safe.
 func killOrphanedJobs() {
 	files, err := filepath.Glob(filepath.Join(os.TempDir(), "codehalter-*-job-*.pid"))
 	if err != nil {

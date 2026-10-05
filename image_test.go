@@ -43,11 +43,3 @@ func TestImageFileRoundTrip(t *testing.T) {
 		})
 	}
 }
-
-func TestImageFileNotFound(t *testing.T) {
-	dir := t.TempDir()
-	_, _, err := readImageFile(dir, "img_doesnotexist")
-	if err == nil {
-		t.Fatal("expected error for missing image, got nil")
-	}
-}

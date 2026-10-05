@@ -20,9 +20,6 @@ import (
 	"time"
 )
 
-// Each subtask runs as ONE tool loop that verifies itself before `respond`;
-// there is no separate verify call.
-
 // An empty Verify is legal only for pure-lookup subtasks that edit no files.
 type subtask struct {
 	Description string   `json:"description"`
@@ -142,6 +139,10 @@ func planFrom(res toolLoopResult) (*planResult, error) {
 	return &p, nil
 }
 
+// Past this many clarifying questions in one planning phase, the planner's last
+// plan goes on as it is.
+const maxClarifications = 3
+
 // Does not ask "Execute this plan?": the orchestrator does, after the whole list
 // is shown. errUserCancelled means the user aborted a clarification.
 func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext string) (*planResult, error) {
@@ -154,83 +155,87 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		return nil, fmt.Errorf("no session found")
 	}
 	// PLAN.md lives in the cached system prompt; repeating it here would stack a copy per replan.
-	marker := "Begin the PLANNING phase — produce the plan now (planning guidance is in the system prompt)."
+	marker := "Begin the PLANNING phase: produce the plan now (planning guidance is in the system prompt)."
 	if replanContext != "" {
 		marker = "Begin the PLANNING phase again.\n\n" + replanContext
 	}
-
-	sess.AddUser(marker)
-	sess.saveOrLog()
-	// A plan phase that errored after streaming a row never reaches renderPlan.
-	sess.phaseMu.Lock()
-	sess.planTableShown = false
-	sess.phaseMu.Unlock()
-
 	// Planner edits would leak into history (`sed -i` cannot be blocked here).
 	policy := phasePolicy{
 		deny:      map[string]bool{"write_file": true, "edit_file": true},
 		terminals: map[string]bool{submitPlanToolName: true, respondToolName: true},
 	}
-
-	// stream=false: planning output is machinery; orchestrate renders the result.
-	planRes, err := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0)
-	if err != nil {
-		return nil, err
-	}
-	plan, parseErr := planFrom(planRes)
-	// Prose was already nudged in the loop; this retry covers what the loop cannot see.
-	if wrong, corrective := planProblem(planRes, plan, parseErr); wrong != "" {
-		// Rows already on screen must be named as not final.
-		salvaged := ""
-		var partial struct {
-			Subtasks []subtask `json:"subtasks"`
+	// Planning does not stream, so the warning is all that shows during the extra round trip.
+	retry := func(warning, corrective string) (*planResult, error) {
+		a.say(ctx, sid, warning)
+		res, err := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, corrective)
+		if err != nil {
+			return nil, err
 		}
-		if json.Unmarshal([]byte(repairJSON(planRes.Text)), &partial) == nil && len(partial.Subtasks) > 0 {
-			salvaged = fmt.Sprintf(" %d subtask(s) already reached the table and are not final.", len(partial.Subtasks))
+		plan, err := planFrom(res)
+		if err != nil {
+			a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning failed! The planner's corrected answer was not a valid plan either (%v). Nothing will run.\n", err))
+			return nil, fmt.Errorf("plan not valid JSON: %w", err)
 		}
-		// Planning does not stream, so otherwise nothing shows during the extra round trip.
-		a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning went wrong! %s.%s Asking the planner to try again.\n", wrong, salvaged))
-		slog.Info("planner submission missed its contract; retrying with corrective",
-			"sid", sid, "calledSubmitPlan", planRes.Terminal != "", "err", parseErr, "snippet", truncate(planRes.Text, 200))
-		retry, retryErr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, corrective)
-		if retryErr != nil {
-			return nil, retryErr
-		}
-		plan, parseErr = planFrom(retry)
-	}
-	if parseErr != nil {
-		a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning failed! The planner could not produce a valid plan even after a corrective retry (%v). Nothing will run.\n", parseErr))
-		return nil, fmt.Errorf("plan not valid JSON: %w", parseErr)
+		return plan, nil
 	}
 
-	// A /spec question goes to the spec's QUESTIONS.md, once it is one the user can
-	// answer from the spec alone: autopilot's first option would let the model settle
-	// an open point of the spec by itself, and an answer given in chat is gone for
-	// every later round of the item.
-	if fence := sess.specFence(); fence != "" && !plan.Clear {
-		q, wrong := specQuestionFrom(plan, fence)
-		if wrong != "" {
-			a.say(ctx, sid, fmt.Sprintf("\n⚠ The planner asked a question that is not answerable from the spec as asked: %s. Asking it to look again.\n", wrong))
-			retry, retryErr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, specQuestionCorrective(wrong))
-			if retryErr != nil {
-				return nil, retryErr
-			}
-			if plan, parseErr = planFrom(retry); parseErr != nil {
-				a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning failed! The planner's second answer was not a valid plan (%v). Nothing will run.\n", parseErr))
-				return nil, fmt.Errorf("plan not valid JSON: %w", parseErr)
-			}
-			if plan.Clear {
-				return plan, nil // it found the answer in the spec
-			}
-			q, wrong = specQuestionFrom(plan, fence)
-		}
-		a.say(ctx, sid, q.Question+"\n")
-		sess.AddUser("Question parked for the user by the spec loop: " + q.Question)
+	for asked := 0; ; asked++ {
+		sess.AddUser(marker)
 		sess.saveOrLog()
-		return nil, &specQuestionError{Q: q, Problem: wrong}
-	}
+		// A plan phase that errored after streaming a row never reaches renderPlan.
+		sess.phaseMu.Lock()
+		sess.planTableShown = false
+		sess.phaseMu.Unlock()
 
-	if !plan.Clear && len(plan.Choices) > 0 {
+		// stream=false: planning output is machinery; orchestrate renders the result.
+		planRes, err := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0)
+		if err != nil {
+			return nil, err
+		}
+		plan, parseErr := planFrom(planRes)
+		// Prose was already nudged in the loop; this retry covers what the loop cannot see.
+		if wrong, corrective := planProblem(planRes, plan, parseErr); wrong != "" {
+			// Rows already on screen must be named as not final.
+			salvaged := ""
+			var partial struct {
+				Subtasks []subtask `json:"subtasks"`
+			}
+			if json.Unmarshal([]byte(repairJSON(planRes.Text)), &partial) == nil && len(partial.Subtasks) > 0 {
+				salvaged = fmt.Sprintf(" %d subtask(s) already reached the table and are not final.", len(partial.Subtasks))
+			}
+			slog.Info("planner submission missed its contract; retrying with corrective",
+				"sid", sid, "calledSubmitPlan", planRes.Terminal != "", "err", parseErr, "snippet", truncate(planRes.Text, 200))
+			if plan, err = retry(fmt.Sprintf("\n⚠ Planning went wrong! %s.%s Asking the planner to try again.\n", wrong, salvaged), corrective); err != nil {
+				return nil, err
+			}
+		}
+
+		// A /spec question is parked in QUESTIONS.md, and only once the spec alone can
+		// answer it: autopilot would settle it itself, and a chat answer is lost to later rounds.
+		if fence := sess.specFence(); fence != "" && !plan.Clear {
+			q, wrong := specQuestionFrom(plan, fence)
+			if wrong != "" {
+				if plan, err = retry(fmt.Sprintf("\n⚠ The planner asked a question that is not answerable from the spec as asked: %s. Asking it to look again.\n", wrong), specQuestionCorrective(wrong)); err != nil {
+					return nil, err
+				}
+				if plan.Clear {
+					return plan, nil // it found the answer in the spec
+				}
+				q, wrong = specQuestionFrom(plan, fence)
+			}
+			a.say(ctx, sid, q.Question+"\n")
+			sess.AddUser("Question parked for the user by the spec loop: " + q.Question)
+			sess.saveOrLog()
+			return nil, &specQuestionError{Q: q, Problem: wrong}
+		}
+
+		if plan.Clear || len(plan.Choices) == 0 {
+			return plan, nil
+		}
+		if asked == maxClarifications {
+			a.say(ctx, sid, fmt.Sprintf("\n⚠ Still unclear after %d clarifications; going on with the planner's last plan.\n", maxClarifications))
+			return plan, nil
+		}
 		question := plan.Question
 		if question == "" {
 			question = "I'm not sure what you mean. Which of these?"
@@ -239,34 +244,30 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
 		choice := plan.Choices[0]
-		var err error
+		var askErr error
 		if !a.autoAnswer(ctx, sid, choice) {
-			choice, err = a.askChoice(ctx, sid, tcId, question, plan.Choices)
+			choice, askErr = a.askChoice(ctx, sid, tcId, question, plan.Choices)
 		}
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
 		// A new user message, never an edit: the planner's stored reply is in the server's cache.
 		note := "User chose: " + choice
 		switch {
-		case err != nil:
+		case askErr != nil:
 			note = "Clarification cancelled."
 		case choice == "abort":
 			note = "User aborted on clarification."
 		}
 		sess.AddUser(note)
 		sess.saveOrLog()
-		if err != nil {
-			return nil, err
+		if askErr != nil {
+			return nil, askErr
 		}
 		if choice == "abort" {
 			return nil, errUserCancelled
 		}
 		a.say(ctx, sid, "Understood: "+choice+"\n")
-
-		return a.runPlanPhase(ctx, sid, replanContext)
 	}
-
-	return plan, nil
 }
 
 // Reason feeds the replan context and the Jaccard duplicate-failure check.
@@ -283,9 +284,9 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 
 	// EXECUTE.md lives in the system prompt; repeating it would stack a copy per subtask.
 	var prompt strings.Builder
-	fmt.Fprintf(&prompt, "EXECUTION phase — Task %d/%d\n\n%s\n", idx+1, total, st.Description)
+	fmt.Fprintf(&prompt, "EXECUTION phase: Task %d/%d\n\n%s\n", idx+1, total, st.Description)
 	if len(st.Verify) > 0 {
-		prompt.WriteString("\n## Verify recipe — run every entry via tools before calling respond\n\n")
+		prompt.WriteString("\n## Verify recipe: run every entry via tools before calling respond\n\n")
 		for i, v := range st.Verify {
 			fmt.Fprintf(&prompt, "%d. %s\n", i+1, v)
 		}
@@ -322,25 +323,26 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	}
 	// Exit codes override the model's verdict (small models declare success over a
 	// non-zero exit), but only each call's LAST run counts: a fixed re-run is green.
-	type callKey struct{ name, input string }
-	lastFailed := map[callKey]bool{}
-	var order []callKey
+	type runKey struct{ name, input string }
+	lastFailed := map[runKey]bool{}
+	var order []runKey
 	for _, u := range res.ToolUses {
-		k := callKey{u.Name, u.Input}
+		k := runKey{u.Name, u.Input}
 		if _, seen := lastFailed[k]; !seen {
 			order = append(order, k)
 		}
 		lastFailed[k] = u.Failed
 	}
-	var failedNames []string
+	var failed []string
 	for _, k := range order {
 		// Other tools set Failed only to feed the fail cap; they are not verdicts.
 		if lastFailed[k] && k.name == "run_command" {
-			failedNames = append(failedNames, k.name)
+			cmd := strings.Join(strings.Fields(parseArgs(k.input).str("command")), " ")
+			failed = append(failed, "`"+truncate(cmd, 100)+"`")
 		}
 	}
-	if len(failedNames) > 0 {
-		out.Reason = "failed tools: " + strings.Join(failedNames, ", ")
+	if len(failed) > 0 {
+		out.Reason = "failed commands: " + strings.Join(failed, ", ")
 		return out
 	}
 	out.Success = true
@@ -514,10 +516,8 @@ func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (st
 // Past this the phase name and the seconds counter get pushed out of view.
 const toolMeterArgRunes = 48
 
-// An interleaved revisit counts too, hence maps rather than a last-call comparison.
-// Repeats are keyed by what the model got back, not by what it typed: a model that
-// varies the call (a new echo label, a counter in a log name: one step rendered the
-// same screen 98 times, each into a new log) still gets the same answer.
+// Repeats are keyed by the answer, not the call: a varied call (a new echo label, a
+// counter in a log name) still gets the same answer. Maps, so an interleaved revisit counts.
 type repetitionTracker struct {
 	// A change to the project makes a command's answer new again (a re-check), but
 	// not a read's: re-reading a file the edit did not touch still says nothing new.
@@ -549,6 +549,22 @@ func newRepeatMemory() repeatMemory {
 var readerTools = map[string]bool{"read_file": true, "continue_read": true, "screenshot": true, "view_image": true,
 	"web_search": true, "web_read": true, "ask_user": true, respondToolName: true, submitPlanToolName: true}
 
+// wroteFile: a refused or unmatched edit says otherwise.
+func wroteFile(name, output string) bool {
+	return (name == "edit_file" || name == "write_file") && strings.HasPrefix(output, "file written")
+}
+
+// isReadCall: the call looks something up and changes nothing.
+func isReadCall(name, args string) bool {
+	switch name {
+	case "read_file", "web_search", "web_read":
+		return true
+	case "run_command":
+		return onlyReads(parseArgs(args).str("command"))
+	}
+	return false
+}
+
 func newRepetitionTracker(cwd string, stuck map[uint64]bool) *repetitionTracker {
 	rt := &repetitionTracker{reads: newRepeatMemory(), runs: newRepeatMemory(), stuck: maps.Clone(stuck), cwd: cwd}
 	if cwd != "" {
@@ -573,10 +589,8 @@ const repeatMinOutput = 24
 // callKey is exactly the call: the tool and its arguments.
 func callKey(tc toolCall) string { return tc.Function.Name + "\x00" + tc.Function.Arguments }
 
-// repeatText is an output as a repeat between different calls is judged: without
-// the batching note (it depends on the call before), without the lines the call
-// spelled out itself (an echo label is the model's own text, not an answer), clock
-// times and dates folded.
+// repeatText is an output as compared across calls: no batching note, no lines the
+// call spelled out itself (an echo label), clock times and dates folded.
 func repeatText(args, output string) string {
 	out, _, _ := strings.Cut(output, batchNoteLead)
 	var own strings.Builder
@@ -609,18 +623,14 @@ func repeatText(args, output string) string {
 	return strings.TrimSpace(clockRe.ReplaceAllString(strings.Join(lines, "\n"), "#"))
 }
 
-// changedBy: whether a call changed the project. A write tool says so; a tool that
-// cannot write did not; anything else (a shell command, an MCP tool) is observed,
-// not guessed from its text: a redirect, `sed -i` or a Python heredoc all show up
-// the same way.
+// changedBy observes the project rather than guessing from a command's text (a
+// redirect, `sed -i`, a heredoc). A write tool's own word counts only where the
+// look is partial (no git); with git, an edit that wrote the same bytes changed nothing.
 func (rt *repetitionTracker) changedBy(tc toolCall, tu ToolUse) bool {
 	if readerTools[tc.Function.Name] {
 		return false
 	}
-	// With git the look decides: an edit that wrote the same bytes changed nothing.
-	// Without it the look is partial (sizes and times of the first files), so a
-	// write tool's own word counts too.
-	written := (tc.Function.Name == "edit_file" || tc.Function.Name == "write_file") && strings.HasPrefix(tu.Output, "file written")
+	written := wroteFile(tc.Function.Name, tu.Output)
 	if rt.cwd == "" {
 		return written
 	}
@@ -673,10 +683,9 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse, changed bool) boo
 	return repeated
 }
 
-// projectSig fingerprints what a call could change in the project: the files git
-// reports as changed or new, by content. Content, not mtime: a render that writes
-// the same picture again changed nothing. Outside git, each file's size and mtime,
-// for the first files only, so not exact.
+// projectSig fingerprints the files git reports as changed or new by content (a
+// re-render of the same picture changes nothing); outside git, size and mtime of
+// the first files, so not exact.
 func projectSig(cwd string) (sig string, exact bool) {
 	h := fnv.New64a()
 	out, err := exec.Command("git", "-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all").Output()
@@ -766,29 +775,165 @@ func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 	a.say(ctx, sid, fmt.Sprintf("\n**%s**\n%sjson\n%s\n%s\n", tc.Function.Name, fence, shown, fence))
 }
 
-func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
-	// `stream` gates the TEXT channel only: reasoning is the sole live signal during a
-	// long call, and never the machinery stream=false hides.
-	var on, think func(string)
-	flushStream := func() {} // no-op unless streaming; flushes the batched tail
-	if sid != "" {
-		var flushOn, flushThink func()
-		if stream {
-			on, flushOn = throttledStream(func(chunk string) {
-				// Not through say: the text is logged whole in its RESPONSE block.
-				a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: chunk}})
-			})
-		}
-		think, flushThink = throttledStream(func(chunk string) {
-			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: chunk}})
-		})
-		flushStream = func() {
-			if flushOn != nil {
-				flushOn()
-			}
-			flushThink()
-		}
+// loopStreams is a tool loop's live output. `stream` gates the text channel only:
+// reasoning is the sole live signal during a long call.
+type loopStreams struct {
+	text, think func(string) // text is nil unless streaming
+	flush       func()       // sends the batched tails
+}
+
+func (a *agent) newLoopStreams(ctx context.Context, sid string, stream bool) loopStreams {
+	s := loopStreams{flush: func() {}}
+	if sid == "" {
+		return s
 	}
+	var flushText, flushThink func()
+	if stream {
+		s.text, flushText = throttledStream(func(chunk string) {
+			// Not through say: the text is logged whole in its RESPONSE block.
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: chunk}})
+		})
+	}
+	s.think, flushThink = throttledStream(func(chunk string) {
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: chunk}})
+	})
+	s.flush = func() {
+		if flushText != nil {
+			flushText()
+		}
+		flushThink()
+	}
+	return s
+}
+
+// callModelRecovering is one model call of a tool loop, riding out the output cap,
+// a dropped or refused connection and, in plan and execute, the server's
+// context-full refusal (by folding history). It returns the messages too: a
+// corrective turn or a fold rewrites them.
+func (a *agent) callModelRecovering(ctx context.Context, sid string, sess *Session, conn *LLMConnection, messages []llmMessage, tools []map[string]any, phase string, streams loopStreams) (string, []toolCall, []llmMessage, error) {
+	// Each fold step strictly shrinks the context, so recovery terminates.
+	recoverStep := 0
+	recoverKeepFrom := []func(*Session) int{
+		func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
+		(*Session).lastAssistantIndex,
+	}
+	// Tool-loop calls append to each other, which the rewind check relies on.
+	callConn := *conn
+	callConn.cacheLineage = true
+	capNudged, capDoubled := false, false // per round: one be-concise nudge, then one doubled cap
+	transientRetries, refusals := 0, 0
+	var downFor time.Duration
+	for {
+		// Fresh sink per attempt: an aborted attempt's partial arguments must not carry over.
+		text, calls, _, err := a.llmStream(ctx, sid, &callConn, messages, tools, streams.text, streams.think, a.planTableSink(ctx, sid))
+		streams.flush()
+		if err == nil {
+			return text, calls, messages, nil
+		}
+		var ce *capHitError
+		if errors.As(err, &ce) {
+			switch {
+			case !capNudged:
+				capNudged = true
+				a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d): retrying with a be-concise nudge", ce.Cap)
+				if sid != "" {
+					a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
+				}
+				messages = a.addCorrective(sid, messages, fmt.Sprintf(
+					"Your previous response was cut off at the %d-token output limit and was DISCARDED: nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
+				continue
+			case !capDoubled:
+				// A file that needs more than the cap cannot be made concise. The cap is
+				// a sampler setting, so the doubled retry keeps the prefix cache.
+				capDoubled = true
+				callConn = *callConn.withBody("max_tokens", 2*ce.Cap)
+				a.logSession(sid, "RECOVER", "still at the cap after the nudge: one retry with max_tokens=%d", 2*ce.Cap)
+				if sid != "" {
+					a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", 2*ce.Cap))
+				}
+				continue
+			}
+			return "", nil, messages, err
+		}
+		if isTransientStreamError(err) {
+			wait := transientStreamBackoff
+			switch refused := strings.Contains(err.Error(), "connection refused"); {
+			case refused && downFor >= serverDownPatience:
+				return "", nil, messages, fmt.Errorf("the LLM server refused connections for %s; start it, then send the message again: %w", humanDuration(downFor.Milliseconds()), err)
+			case refused:
+				wait = min(transientStreamBackoff<<refusals, time.Minute)
+				refusals++
+				downFor += wait
+				a.logSession(sid, "RECOVER", "server refused the connection (%v): retry in %s", err, wait)
+				if sid != "" && refusals == 1 {
+					a.say(ctx, sid, fmt.Sprintf("\n⟲ The LLM server refuses connections (restarting?); retrying for up to %s.\n", humanDuration(serverDownPatience.Milliseconds())))
+				}
+			case transientRetries >= maxTransientStreamRetries:
+				return "", nil, messages, fmt.Errorf("lost the connection to the LLM mid-response %d times (the server or router dropped the stream); this is usually transient, try again in a moment", transientRetries+1)
+			default:
+				transientRetries++
+				a.logSession(sid, "RECOVER", "stream dropped mid-response (%v): retry %d/%d", err, transientRetries, maxTransientStreamRetries)
+				if sid != "" {
+					// Streaming cannot rewind, so the retry's repeated prefix needs this flag.
+					a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
+				}
+			}
+			select {
+			case <-time.After(wait):
+				continue
+			case <-ctx.Done():
+				return "", nil, messages, ctx.Err()
+			}
+		}
+		if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
+			(phase != "plan" && phase != "execute") || sess == nil {
+			return "", nil, messages, err
+		}
+		folded := false
+		for recoverStep < len(recoverKeepFrom) {
+			keepFrom := recoverKeepFrom[recoverStep](sess)
+			recoverStep++
+			if a.foldHistory(ctx, sess, keepFrom) {
+				folded = true
+				break
+			}
+		}
+		if !folded {
+			return "", nil, messages, err
+		}
+		messages = a.buildLLMContext(sess)
+	}
+}
+
+// repeatedCall is a call of a stuck round, keyed like the repetition tracker.
+type repeatedCall struct {
+	key, output string
+	hash        uint64
+}
+
+// stuckSnapshot: the calls that ended an earlier step of this turn by repeating,
+// with their outputs, and those outputs as repeats are judged (repeatText hashes).
+func (s *Session) stuckSnapshot() (map[string]string, map[uint64]bool) {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	return maps.Clone(s.rt.stuckCalls), maps.Clone(s.rt.stuckOutputs)
+}
+
+// recordStuck hands the calls that ended this step on to the turn's later steps.
+func (s *Session) recordStuck(calls []repeatedCall) {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	if s.rt.stuckCalls == nil {
+		s.rt.stuckCalls, s.rt.stuckOutputs = map[string]string{}, map[uint64]bool{}
+	}
+	for _, c := range calls {
+		s.rt.stuckCalls[c.key] = c.output
+		s.rt.stuckOutputs[c.hash] = true
+	}
+}
+
+func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
+	streams := a.newLoopStreams(ctx, sid, stream)
 	tools := a.tools.defs()
 
 	// Only jobs this loop's own run_command calls handed over can park it.
@@ -803,121 +948,18 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		return res, err
 	}
 
-	// Returns the messages too: a corrective turn or a fold rewrites them.
-	callModel := func(sess *Session, messages []llmMessage) (string, []toolCall, []llmMessage, error) {
-		// Each fold step strictly shrinks the context, so recovery terminates.
-		recoverStep := 0
-		recoverKeepFrom := []func(*Session) int{
-			func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
-			(*Session).lastAssistantIndex,
-		}
-		// Tool-loop calls append to each other, which the rewind check relies on.
-		callConn := *conn
-		callConn.cacheLineage = true
-		capNudged, capDoubled := false, false // per round: one be-concise nudge, then one doubled cap
-		transientRetries, refusals := 0, 0
-		var downFor time.Duration
-		for {
-			// Fresh sink per attempt: an aborted attempt's partial arguments must not carry over.
-			text, calls, _, err := a.llmStream(ctx, sid, &callConn, messages, tools, on, think, a.planTableSink(ctx, sid))
-			flushStream()
-			if err == nil {
-				return text, calls, messages, nil
-			}
-			var ce *capHitError
-			if errors.As(err, &ce) {
-				switch {
-				case !capNudged:
-					capNudged = true
-					a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
-					if sid != "" {
-						a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
-					}
-					messages = a.addCorrective(sid, messages, fmt.Sprintf(
-						"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
-					continue
-				case !capDoubled:
-					// A file that needs more than the cap cannot be made concise. The cap is
-					// a sampler setting, so the doubled retry keeps the prefix cache.
-					capDoubled = true
-					callConn = *callConn.withBody("max_tokens", 2*ce.Cap)
-					a.logSession(sid, "RECOVER", "still at the cap after the nudge: one retry with max_tokens=%d", 2*ce.Cap)
-					if sid != "" {
-						a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", 2*ce.Cap))
-					}
-					continue
-				}
-				return "", nil, messages, err
-			}
-			if isTransientStreamError(err) {
-				wait := transientStreamBackoff
-				switch refused := strings.Contains(err.Error(), "connection refused"); {
-				case refused && downFor >= serverDownPatience:
-					return "", nil, messages, fmt.Errorf("the LLM server refused connections for %s; start it, then send the message again: %w", humanDuration(downFor.Milliseconds()), err)
-				case refused:
-					wait = min(transientStreamBackoff<<refusals, time.Minute)
-					refusals++
-					downFor += wait
-					a.logSession(sid, "RECOVER", "server refused the connection (%v): retry in %s", err, wait)
-					if sid != "" && refusals == 1 {
-						a.say(ctx, sid, fmt.Sprintf("\n⟲ The LLM server refuses connections (restarting?); retrying for up to %s.\n", humanDuration(serverDownPatience.Milliseconds())))
-					}
-				case transientRetries >= maxTransientStreamRetries:
-					return "", nil, messages, fmt.Errorf("lost the connection to the LLM mid-response %d times (the server or router dropped the stream); this is usually transient — try again in a moment", transientRetries+1)
-				default:
-					transientRetries++
-					a.logSession(sid, "RECOVER", "stream dropped mid-response (%v) — retry %d/%d", err, transientRetries, maxTransientStreamRetries)
-					if sid != "" {
-						// Streaming cannot rewind, so the retry's repeated prefix needs this flag.
-						a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
-					}
-				}
-				select {
-				case <-time.After(wait):
-					continue
-				case <-ctx.Done():
-					return "", nil, messages, ctx.Err()
-				}
-			}
-			if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
-				(phase != "plan" && phase != "execute") || sess == nil {
-				return "", nil, messages, err
-			}
-			folded := false
-			for recoverStep < len(recoverKeepFrom) {
-				keepFrom := recoverKeepFrom[recoverStep](sess)
-				recoverStep++
-				if a.foldHistory(ctx, sess, keepFrom) {
-					folded = true
-					break
-				}
-			}
-			if !folded {
-				return "", nil, messages, err
-			}
-			messages = a.buildLLMContext(sess)
-		}
-	}
-
-	// Consecutive stuck rounds climb one ladder (nudge, warm the sampler, bail); any
-	// productive round resets it, so read-after-write and fan-out are never punished.
-	// An earlier step of this turn was ended repeating these calls; its successor
-	// copied the same call from the history, five steps in a row on one /spec item.
+	// Stuck rounds climb one ladder (nudge, warm the sampler, bail); a productive
+	// round resets it. Calls that ended an earlier step of this turn are not run
+	// again: successors copied them from the history, five steps in a row.
 	var stuckBefore map[string]string
 	var stuckOutputs map[uint64]bool
 	cwd := ""
 	loopSess := a.getSession(sid) // nil for a sessionless internal pass
 	if loopSess != nil {
 		cwd = loopSess.Cwd
-		loopSess.rt.mu.Lock()
-		stuckBefore, stuckOutputs = maps.Clone(loopSess.rt.stuckCalls), maps.Clone(loopSess.rt.stuckOutputs)
-		loopSess.rt.mu.Unlock()
+		stuckBefore, stuckOutputs = loopSess.stuckSnapshot()
 	}
 	repeats := newRepetitionTracker(cwd, stuckOutputs)
-	type repeatedCall struct {
-		key, output string
-		hash        uint64
-	}
 	var roundRepeats []repeatedCall // this round's calls that repeated
 	var hitStuck bool               // one of them was an output that ended an earlier step
 	var stuckRounds int
@@ -948,15 +990,14 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	}
 	for iter := 0; ; iter++ {
 		if iter >= limit {
-			// A step still editing and building at the cap is big work, not a spiral (the
-			// read tripwire ends those): two such steps building a page hit it in one morning,
-			// and each cost a replan that had to find out again where things stood.
+			// Still editing and building at the cap is big work, not a spiral (the read
+			// tripwire ends those), so it gets one extension rather than a replan.
 			edits, runs := 0, 0
 			for _, u := range res.ToolUses[max(0, len(res.ToolUses)-productiveWindow):] {
 				switch {
-				case (u.Name == "edit_file" || u.Name == "write_file") && strings.HasPrefix(u.Output, "file written"):
+				case wroteFile(u.Name, u.Output):
 					edits++
-				case u.Name == "run_command" && !onlyReads(parseArgs(u.Input).str("command")):
+				case u.Name == "run_command" && !isReadCall(u.Name, u.Input):
 					runs++
 				}
 			}
@@ -984,7 +1025,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			a.say(ctx, sid, "\n⏱ Planning past "+fmt.Sprint(planRoundNudge)+" rounds: asked to submit with what it has.\n")
 		}
 
-		text, calls, rewritten, err := callModel(sess, messages)
+		text, calls, rewritten, err := a.callModelRecovering(ctx, sid, sess, conn, messages, tools, phase, streams)
 		messages = rewritten
 		if err != nil {
 			if ctx.Err() == nil {
@@ -1080,8 +1121,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			}
 			if phase == "execute" && !denied {
 				switch name := tc.Function.Name; {
-				case name == "read_file", name == "web_search", name == "web_read",
-					name == "run_command" && onlyReads(parseArgs(tc.Function.Arguments).str("command")):
+				case isReadCall(name, tc.Function.Arguments):
 					readStreak++
 				case name == "edit_file", name == "write_file", name == "run_command", name == "run_background":
 					readStreak, readNudged = 0, false
@@ -1106,9 +1146,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			// the job's note resumes it.
 			if terminalName == respondToolName {
 				if jobs := a.parkableJobs(sid, loopStart); jobs != "" {
-					if on != nil && terminalMessage != "" {
-						on(terminalMessage)
-						flushStream()
+					if streams.text != nil && terminalMessage != "" {
+						streams.text(terminalMessage)
+						streams.flush()
 					}
 					resume, perr := a.parkForJobs(ctx, sid, jobs)
 					if perr != nil {
@@ -1120,11 +1160,11 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				}
 			}
 			switch {
-			case on == nil:
+			case streams.text == nil:
 				// Silent internal pass, such as the planner.
 			case terminalMessage != "":
-				on(terminalMessage)
-				flushStream() // the FINAL emit: never leave it batched
+				streams.text(terminalMessage)
+				streams.flush() // the FINAL emit: never leave it batched
 			default:
 				a.say(ctx, sid, "(done)\n")
 			}
@@ -1162,22 +1202,14 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		stuckRounds++
 		if stuckRounds >= stuckBailRounds {
 			if loopSess != nil {
-				loopSess.rt.mu.Lock()
-				if loopSess.rt.stuckCalls == nil {
-					loopSess.rt.stuckCalls, loopSess.rt.stuckOutputs = map[string]string{}, map[uint64]bool{}
-				}
-				for _, c := range roundRepeats {
-					loopSess.rt.stuckCalls[c.key] = c.output
-					loopSess.rt.stuckOutputs[c.hash] = true
-				}
-				loopSess.rt.mu.Unlock()
+				loopSess.recordStuck(roundRepeats)
 			}
 			// No error: the normal failure paths (replan, plan salvage) beat a hard error.
 			return finish(nil)
 		}
 		if !nudgedUI && sid != "" {
 			nudgedUI = true
-			a.say(ctx, sid, "⚠ Repeating with no new information — nudging the model to change course.\n")
+			a.say(ctx, sid, "⚠ Repeating with no new information: nudging the model to change course.\n")
 		}
 		if hitStuck {
 			// The call differs from the one that ended the earlier attempt; its answer does not.
@@ -1186,12 +1218,12 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			continue
 		}
 		messages = a.addCorrective(sid, messages,
-			"Your last tool call(s) returned output you already have — that makes no progress. Do NOT repeat them. Instead:\n"+
+			"Your last tool call(s) returned output you already have, which makes no progress. Do NOT repeat them. Instead:\n"+
 				"1. If a read came back PARTIAL and you need more, make the read_file call its note names for the next part; never re-read the same window, never rewrite a whole file.\n"+
 				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n"+
 				"3. If you are stuck or the task is infeasible, say so and stop.")
 		if stuckRounds >= stuckEscalateRounds && escalate() && sid != "" {
-			a.say(ctx, sid, "⚠ Still repeating — switching to the thinking sampler to break out.\n")
+			a.say(ctx, sid, "⚠ Still repeating: switching to the thinking sampler to break out.\n")
 		}
 	}
 }

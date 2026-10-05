@@ -7,10 +7,9 @@ import (
 	"sync"
 )
 
-// One turn per session, always started via holdTurn. Nothing replaces a running
-// turn: typing steers it (Session.addSteer) and the stop button cancels it.
-
-// held is taken for the whole turn; the other fields are guarded by mu.
+// turnControl allows one turn per session, always started via holdTurn. Nothing
+// replaces a running turn: typing steers it (Session.addSteer) and the stop button
+// cancels it. held is taken for the whole turn; the other fields are guarded by mu.
 type turnControl struct {
 	held     sync.Mutex
 	mu       sync.Mutex

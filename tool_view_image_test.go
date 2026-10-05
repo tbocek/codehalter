@@ -50,39 +50,21 @@ func TestDispatchViewImageHappyPath(t *testing.T) {
 	}
 }
 
-func TestDispatchViewImageMissingID(t *testing.T) {
-	dir := t.TempDir()
-	sess := &Session{Cwd: dir}
-
-	text, parts, failed := dispatchViewImage(sess, `{"id":"img_doesnotexist"}`)
-	if !failed {
-		t.Errorf("expected failed=true on missing id, got false")
-	}
-	if parts != nil {
-		t.Errorf("expected nil parts on miss, got %+v", parts)
-	}
-	if !strings.Contains(text, "img_doesnotexist") {
-		t.Errorf("error text missing id: %q", text)
-	}
-}
-
-func TestDispatchViewImageBadArgs(t *testing.T) {
+// Every way a view_image call can fail says why and returns no picture.
+func TestDispatchViewImageRefusals(t *testing.T) {
 	sess := &Session{Cwd: t.TempDir()}
-
-	if text, _, failed := dispatchViewImage(sess, "not json"); !failed || !strings.Contains(text, "invalid arguments") {
-		t.Errorf("bad JSON: failed=%v text=%q", failed, text)
-	}
-	if text, _, failed := dispatchViewImage(sess, `{}`); !failed || !strings.Contains(text, "missing `id`") {
-		t.Errorf("empty id: failed=%v text=%q", failed, text)
-	}
-}
-
-func TestDispatchViewImageNoSession(t *testing.T) {
-	text, _, failed := dispatchViewImage(nil, `{"id":"img_anything"}`)
-	if !failed {
-		t.Errorf("expected failed=true with nil session")
-	}
-	if !strings.Contains(text, "no session") {
-		t.Errorf("nil-session error text: %q", text)
+	for _, c := range []struct {
+		sess       *Session
+		args, want string
+	}{
+		{sess, `{"id":"img_doesnotexist"}`, "img_doesnotexist"},
+		{sess, "not json", "invalid arguments"},
+		{sess, `{}`, "missing `id`"},
+		{nil, `{"id":"img_anything"}`, "no session"},
+	} {
+		text, parts, failed := dispatchViewImage(c.sess, c.args)
+		if !failed || parts != nil || !strings.Contains(text, c.want) {
+			t.Errorf("%s: failed=%v parts=%v text=%q, want a failure naming %q", c.args, failed, parts != nil, text, c.want)
+		}
 	}
 }

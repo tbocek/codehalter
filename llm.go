@@ -148,9 +148,7 @@ func isContextFull(err error) bool {
 		}
 		return false
 	}
-	// Halogen refuses a request carrying more than 64 pictures, in the stream: a
-	// render loop attached 98 and every later request of the session was refused.
-	// A fold drops the older pictures (the summary keeps their ids).
+	// Halogen refuses more than 64 pictures in the stream; a fold drops the older ones.
 	var se *llmStreamError
 	if errors.As(err, &se) && strings.Contains(strings.ToLower(se.Msg), "img count") {
 		return true
@@ -215,7 +213,7 @@ func (a *agent) warnChatTemplateKwargsIgnored(ctx context.Context, sid string, c
 			"  costs decode time but nothing else; the damage stays capped, since reasoning that follows a closed block is short.\n"+
 			"  If this model does not delimit reasoning with <think>/</think>, that is the likelier cause.\n"+
 			"  The fallback is params_execute chat_template_kwargs = { enable_thinking = false }, which costs a second\n"+
-			"  prompt rendering — worth it only on a server with 2+ slots (see settings.toml).\n\n")
+			"  prompt rendering, worth it only on a server with 2+ slots (see settings.toml).\n\n")
 		return
 	}
 	slog.Warn("server ignored chat_template_kwargs.enable_thinking=false",
@@ -243,7 +241,11 @@ func (c *LLMConnection) withThinkingDisabled() *LLMConnection {
 }
 
 // The keys in use (max_tokens, tool_choice) are samplers, so the prefix cache is untouched.
+// nil in, nil out.
 func (c *LLMConnection) withBody(key string, v any) *LLMConnection {
+	if c == nil {
+		return nil
+	}
 	cp := *c
 	eb := make(map[string]any, len(c.ExtraBody)+1)
 	maps.Copy(eb, c.ExtraBody)
@@ -490,12 +492,6 @@ func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r 
 		}
 		rw := sess.noteCacheLineage(r.promptTokens, r.cachedTokens, render, time.Now())
 		if rw.tokens > 0 {
-			orNone := func(s string) string {
-				if s == "" {
-					return "(none)"
-				}
-				return s
-			}
 			var cause string
 			switch {
 			case rw.renderChanged && conn.noPrefill:
@@ -505,16 +501,16 @@ func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r 
 				cause = fmt.Sprintf("We asked for a different rendering than last call: template params went %s -> %s. "+
 					"The server keeps a prompt state per rendering, so this call could only reuse what THIS rendering held "+
 					"last time and had to re-evaluate everything the other role appended since. Make params_thinking and "+
-					"params_execute agree on everything that is not a sampler.", orNone(rw.prevRender), orNone(render))
+					"params_execute agree on everything that is not a sampler.", orElse(rw.prevRender, "(none)"), orElse(render, "(none)"))
 			case rw.idle >= idleEvictionSuspect:
 				cause = fmt.Sprintf("Both calls asked for the same rendering (%s) and the slot sat idle that whole time, "+
 					"which is the likeliest cause: servers reclaim idle slots and no setting prevents it. Nothing to fix "+
-					"unless the gap surprises you.", orNone(render))
+					"unless the gap surprises you.", orElse(render, "(none)"))
 			default:
 				cause = fmt.Sprintf("Both calls asked for the same rendering (%s) and came back to back, so an idle "+
 					"eviction is unlikely: something rewrote the middle of the prompt. A tool result that replayed "+
 					"differently than it was sent, or a chat template that repositions earlier messages as the "+
-					"conversation grows.", orNone(render))
+					"conversation grows.", orElse(render, "(none)"))
 			}
 			a.logSession(sid, connLabel+" CACHE",
 				"prefix cache rewound: %d tokens the previous call had already sent were re-read "+
@@ -566,7 +562,7 @@ func (a *agent) streamOutcomeError(conn *LLMConnection, reqBody map[string]any, 
 			return fmt.Errorf("generation hit the context ceiling (prompt=%d gen=%d, n_ctx=%d, role=%s): %w",
 				r.promptTokens, r.completionTokens, mst, conn.Tag, errContextCeiling)
 		default:
-			return &capHitError{Cap: reqMax, msg: fmt.Sprintf("LLM hit max_tokens cap (role=%s, model=%s) — response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
+			return &capHitError{Cap: reqMax, msg: fmt.Sprintf("LLM hit max_tokens cap (role=%s, model=%s): response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
 				conn.Tag, conn.Model, r.text.Len(), r.reasoning.Len(), len(r.calls), conn.Tag)}
 		}
 	default:
@@ -579,11 +575,7 @@ func (a *agent) logStreamResponse(sid, connLabel string, r *streamResult, err er
 	var rb strings.Builder
 	if r.promptTokens > 0 || r.completionTokens > 0 || r.finishReason != "" {
 		// "(none)": the stream broke before a finish_reason.
-		fr := r.finishReason
-		if fr == "" {
-			fr = "(none)"
-		}
-		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d finish=%s", r.promptTokens, r.completionTokens, fr)
+		fmt.Fprintf(&rb, "tokens: prompt=%d completion=%d finish=%s", r.promptTokens, r.completionTokens, orElse(r.finishReason, "(none)"))
 		if r.cachedTokens >= 0 || r.evaluatedTokens >= 0 {
 			fmt.Fprintf(&rb, " cached=%d evaluated=%d", r.cachedTokens, r.evaluatedTokens)
 		}
@@ -676,6 +668,58 @@ func (a *agent) entryIndex(conn *LLMConnection) int {
 	return -1
 }
 
+// acquireConnSlot waits for a free call slot on conn's [[llm]] entry. slot is the
+// entry index, -1 for test mocks and probes, which have no limit.
+func (a *agent) acquireConnSlot(ctx context.Context, sid string, conn *LLMConnection) (slot int, release func(), err error) {
+	// Release on this channel: a prepare phase can swap a.connSems meanwhile, and
+	// releasing on the new channel would block forever.
+	a.cfgMu.RLock()
+	slot = a.entryIndex(conn)
+	var sem chan struct{}
+	if slot >= 0 && slot < len(a.connSems) {
+		sem = a.connSems[slot]
+	}
+	a.cfgMu.RUnlock()
+	if sem == nil {
+		return slot, func() {}, nil
+	}
+	select {
+	case sem <- struct{}{}:
+	default:
+		a.setStatus(ctx, sid, " (queued…)")
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			a.setStatus(ctx, sid, "")
+			return slot, nil, ctx.Err()
+		}
+	}
+	return slot, func() { <-sem }, nil
+}
+
+// llmHTTPErrorFrom prefers the OpenAI-style error.message over the raw body.
+func (a *agent) llmHTTPErrorFrom(sid, connLabel string, resp *http.Response) error {
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("HTTP %d, failed to read body: %w", resp.StatusCode, err)
+	}
+	a.logSession(sid, connLabel, "[HTTP %d] %s", resp.StatusCode, string(bodyBytes))
+	msg := string(bodyBytes)
+	var apiErr struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(bodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
+		msg = apiErr.Error.Message
+	}
+	if strings.Contains(msg, "chat_template_kwargs") {
+		msg += "\n\nThis backend does not accept chat_template_kwargs (it is a llama.cpp / vLLM extension). Remove it from params_thinking / params_execute for this [[llm]] entry."
+	}
+	return &llmHTTPError{Status: resp.StatusCode, Body: msg, Type: apiErr.Error.Type, URL: resp.Request.URL.String()}
+}
+
 func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, tools []map[string]any, on, think func(string), onArgs func(idx int, name, delta string)) (string, []toolCall, string, error) {
 	reqBody := buildChatRequest(conn, messages, tools)
 	body, err := json.Marshal(reqBody)
@@ -683,29 +727,11 @@ func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnecti
 		return "", nil, "", fmt.Errorf("marshalling LLM request body: %w", err)
 	}
 
-	// Release on this local: a prepare phase can swap a.connSems meanwhile, and
-	// releasing on the new channel would block forever.
-	a.cfgMu.RLock()
-	slot := a.entryIndex(conn)
-	var sem chan struct{}
-	if slot >= 0 && slot < len(a.connSems) {
-		sem = a.connSems[slot]
+	slot, release, err := a.acquireConnSlot(ctx, sid, conn)
+	if err != nil {
+		return "", nil, "", err
 	}
-	a.cfgMu.RUnlock()
-	if sem != nil {
-		select {
-		case sem <- struct{}{}:
-		default:
-			a.setStatus(ctx, sid, " (queued…)")
-			select {
-			case sem <- struct{}{}:
-			case <-ctx.Done():
-				a.setStatus(ctx, sid, "")
-				return "", nil, "", ctx.Err()
-			}
-		}
-		defer func() { <-sem }()
-	}
+	defer release()
 
 	// The display index (llm[1] for background work), not the semaphore index slot.
 	slotLabel := "?"
@@ -756,25 +782,7 @@ func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnecti
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return "", nil, "", fmt.Errorf("HTTP %d, failed to read body: %w", resp.StatusCode, err)
-		}
-		a.logSession(sid, connLabel, "[HTTP %d] %s", resp.StatusCode, string(bodyBytes))
-		msg := string(bodyBytes)
-		var apiErr struct {
-			Error struct {
-				Message string `json:"message"`
-				Type    string `json:"type"`
-			} `json:"error"`
-		}
-		if json.Unmarshal(bodyBytes, &apiErr) == nil && apiErr.Error.Message != "" {
-			msg = apiErr.Error.Message
-		}
-		if strings.Contains(msg, "chat_template_kwargs") {
-			msg += "\n\nThis backend does not accept chat_template_kwargs (it is a llama.cpp / vLLM extension). Remove it from params_thinking / params_execute for this [[llm]] entry."
-		}
-		return "", nil, "", &llmHTTPError{Status: resp.StatusCode, Body: msg, Type: apiErr.Error.Type, URL: resp.Request.URL.String()}
+		return "", nil, "", a.llmHTTPErrorFrom(sid, connLabel, resp)
 	}
 
 	res := readSSEStream(resp.Body, conn, on, think, onArgs, &genChars)
@@ -817,18 +825,18 @@ func probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
-	r, _ := probeViaModels(probeCtx, conn)
-	p, ok := probeViaProps(probeCtx, conn, "/props")
+	r := probeViaModels(probeCtx, conn)
+	p := probeViaProps(probeCtx, conn, "/props")
 	// A llama.cpp router reports n_ctx=0 on bare /props; ?model= routes to the model
 	// and autoloads it (hence the timeout). QueryEscape: ids carry spaces and ';'.
-	if ok && p.ContextSize == 0 && p.SlotCtx == 0 {
+	if p.Reachable && p.ContextSize == 0 && p.SlotCtx == 0 {
 		upCtx, upCancel := context.WithTimeout(ctx, 180*time.Second)
-		if up, upOK := probeViaProps(upCtx, conn, "/props?model="+url.QueryEscape(conn.Model)); upOK {
+		if up := probeViaProps(upCtx, conn, "/props?model="+url.QueryEscape(conn.Model)); up.Reachable {
 			p = up
 		}
 		upCancel()
 	}
-	if ok {
+	if p.Reachable {
 		r.Reachable = true
 		if !r.ImageSupport {
 			r.ImageSupport = p.ImageSupport
@@ -882,7 +890,7 @@ func probeGetJSON(ctx context.Context, conn *LLMConnection, path, who string, v 
 }
 
 // Image support and context size come only from llama-swap's status.args.
-func probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool) {
+func probeViaModels(ctx context.Context, conn *LLMConnection) probeResult {
 	var models struct {
 		Data []struct {
 			ID     string `json:"id"`
@@ -892,7 +900,7 @@ func probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool
 		} `json:"data"`
 	}
 	if !probeGetJSON(ctx, conn, "/v1/models", "probeViaModels", &models) {
-		return probeResult{}, false
+		return probeResult{}
 	}
 	r := probeResult{Reachable: true, ModelKnown: true}
 	for _, m := range models.Data {
@@ -922,11 +930,11 @@ func probeViaModels(ctx context.Context, conn *LLMConnection) (probeResult, bool
 			}
 		}
 	}
-	return r, true
+	return r
 }
 
 // /props cannot say which model is loaded, so ModelKnown stays false.
-func probeViaProps(ctx context.Context, conn *LLMConnection, path string) (probeResult, bool) {
+func probeViaProps(ctx context.Context, conn *LLMConnection, path string) probeResult {
 	var props struct {
 		Modalities *struct {
 			Vision bool `json:"vision"`
@@ -939,7 +947,7 @@ func probeViaProps(ctx context.Context, conn *LLMConnection, path string) (probe
 		TotalSlots int `json:"total_slots"`
 	}
 	if !probeGetJSON(ctx, conn, path, "probeViaProps", &props) {
-		return probeResult{}, false
+		return probeResult{}
 	}
 	r := probeResult{Reachable: true, ContextSize: props.NCtx, TotalSlots: props.TotalSlots}
 	if props.Modalities != nil {
@@ -948,7 +956,7 @@ func probeViaProps(ctx context.Context, conn *LLMConnection, path string) (probe
 	if props.DefaultGenerationSettings != nil {
 		r.SlotCtx = props.DefaultGenerationSettings.NCtx
 	}
-	return r, true
+	return r
 }
 
 // Always LLM[0], whose KV cache owns the conversation prefix.

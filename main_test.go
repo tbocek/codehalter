@@ -602,3 +602,78 @@ func TestSayLandsInSessionLog(t *testing.T) {
 		t.Errorf("a blank line was logged:\n%s", data)
 	}
 }
+
+// callTool runs one tool call the way the loop does and returns what it recorded.
+func callTool(t *testing.T, a *agent, sid, name, args string) ToolUse {
+	t.Helper()
+	var tc toolCall
+	tc.ID, tc.Function.Name, tc.Function.Arguments = "c-"+name, name, args
+	tu, _ := a.runToolCall(context.Background(), sid, tc)
+	return tu
+}
+
+// writeTree writes files under dir, making their directories.
+func writeTree(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for rel, body := range files {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// writeFiles creates empty files.
+func writeFiles(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	files := map[string]string{}
+	for _, n := range names {
+		files[n] = ""
+	}
+	writeTree(t, dir, files)
+}
+
+// gitInit makes dir a repository with an identity for later commits, and commits what it holds.
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"add", "-A"}, {"commit", "-q", "-m", "base"}} {
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+}
+
+// gitRepo is a new repository holding files, committed.
+func gitRepo(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeTree(t, dir, files)
+	gitInit(t, dir)
+	return dir
+}
+
+// sseWriteFile is a scripted write_file call.
+func sseWriteFile(id, path, content string) string {
+	b, err := json.Marshal(map[string]string{"path": path, "content": content})
+	if err != nil {
+		panic(err)
+	}
+	return sseToolCall(id, "write_file", string(b))
+}
+
+func lastUserMessage(s *Session) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].Role == "user" {
+			return s.Messages[i].Content
+		}
+	}
+	return ""
+}

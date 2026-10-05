@@ -4,10 +4,36 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"unicode/utf8"
 )
+
+func TestTrimJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "plain", in: `{"ok":true}`, want: `{"ok":true}`},
+		{name: "leading whitespace", in: "  \n{\"ok\":true}\n  ", want: `{"ok":true}`},
+		{name: "json fence", in: "```json\n{\"ok\":true}\n```", want: `{"ok":true}`},
+		{name: "bare fence", in: "```\n{\"ok\":true}\n```", want: `{"ok":true}`},
+		{name: "prose prefix", in: "Sure, here's the JSON:\n{\"ok\":true}", want: `{"ok":true}`},
+		{name: "prose suffix", in: "{\"ok\":true}\nLet me know if you need more.", want: `{"ok":true}`},
+		{name: "prose both sides", in: "Here you go: {\"ok\":true}, that's it!", want: `{"ok":true}`},
+		{name: "nested", in: "noise {\"a\":{\"b\":1}} noise", want: `{"a":{"b":1}}`},
+		{name: "brace in string", in: `{"s":"} not the end"}`, want: `{"s":"} not the end"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := trimJSON(tc.in); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
 
 // TestClipUTF8 also covers tailUTF8.
 func TestClipUTF8(t *testing.T) {
@@ -81,5 +107,55 @@ func TestCollapseStackTraces(t *testing.T) {
 	plain := "12: fn walk() {\n13:     for x in xs {\n14:     }\n  3: a short trace frame\n      at src/a.rs:3\nok\n"
 	if got := collapseStackTraces(plain); got != plain {
 		t.Errorf("ordinary output changed:\n%s", got)
+	}
+}
+
+// Lowercase, punctuation-stripped, order-independent, so rewordings match.
+func TestIssueBagTokenisation(t *testing.T) {
+	a := issueBag([]string{"Missing import!", "Syntax error."})
+	b := issueBag([]string{"syntax  ERROR", "missing\timport"})
+	if !slices.Equal(sortedKeys(a), sortedKeys(b)) {
+		t.Errorf("expected equivalent bags, got %v vs %v", sortedKeys(a), sortedKeys(b))
+	}
+
+	// No empty tokens from adjacent separators.
+	bag := issueBag([]string{"foo--bar...baz"})
+	want := []string{"bar", "baz", "foo"}
+	if !slices.Equal(sortedKeys(bag), want) {
+		t.Errorf("got %v, want %v", sortedKeys(bag), want)
+	}
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// A reworded near-duplicate scores above the threshold, unrelated failures below.
+func TestJaccardSimilarity(t *testing.T) {
+	// Two empty bags are treated as identical (degenerate but well-defined).
+	if got := jaccard(map[string]bool{}, map[string]bool{}); got != 1 {
+		t.Errorf("empty/empty: got %v, want 1", got)
+	}
+
+	// |∩|=2, |∪|=3: 0.67, above the threshold.
+	a := issueBag([]string{"missing import"})
+	b := issueBag([]string{"import is missing"})
+	if s := jaccard(a, b); s < failureSimilarityThreshold {
+		t.Errorf("reworded duplicate: got %v, want >= %v", s, failureSimilarityThreshold)
+	}
+
+	c := issueBag([]string{"missing import in foo.go"})
+	d := issueBag([]string{"unused variable x"})
+	if s := jaccard(c, d); s >= failureSimilarityThreshold {
+		t.Errorf("disjoint issues: got %v, want < %v", s, failureSimilarityThreshold)
+	}
+
+	if jaccard(a, b) != jaccard(b, a) {
+		t.Errorf("expected jaccard to be symmetric")
 	}
 }

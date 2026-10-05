@@ -644,3 +644,46 @@ func TestAgentsFileMayNotGrowOverBudget(t *testing.T) {
 		t.Errorf("an AGENT.md edit during /spec went through: %q", out)
 	}
 }
+
+// write_file never erases a file over a non-string content, creates a new file,
+// and tells the model when the file changed on disk since codehalter wrote it.
+func TestWriteFile(t *testing.T) {
+	a, s := newTestAgent(t)
+	path := filepath.Join(s.Cwd, "a.txt")
+	read := func(p string) string {
+		t.Helper()
+		b, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	if tu := callTool(t, a, s.ID, "write_file", `{"path":"a.txt","content":"v1\n"}`); tu.Failed || read(path) != "v1\n" {
+		t.Fatalf("new file: %+v", tu)
+	}
+	if tu := callTool(t, a, s.ID, "write_file", `{"path":"a.txt","content":123}`); !strings.Contains(tu.Output, "must be a JSON string") || read(path) != "v1\n" {
+		t.Errorf("a number as content: %q, file %q; want refused and the file kept", tu.Output, read(path))
+	}
+	if err := os.WriteFile(path, []byte("changed outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if tu := callTool(t, a, s.ID, "write_file", `{"path":"a.txt","content":"v2\n"}`); !strings.Contains(tu.Output, "changed on disk") || read(path) != "v2\n" {
+		t.Errorf("after an outside change: %q, file %q; want written with the drift note", tu.Output, read(path))
+	}
+	if tu := callTool(t, a, s.ID, "write_file", `{"path":"a.txt","content":"v3\n"}`); strings.Contains(tu.Output, "changed on disk") {
+		t.Error("the drift note came again for a change already reported")
+	}
+}
+
+// A model that drops the leading "/" of an absolute path inside the project still
+// reaches the file.
+func TestToolPathWithoutLeadingSlash(t *testing.T) {
+	a, s := newTestAgent(t)
+	if err := os.WriteFile(filepath.Join(s.Cwd, "a.txt"), []byte("found\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rel := strings.TrimPrefix(filepath.Join(s.Cwd, "a.txt"), "/")
+	if tu := callTool(t, a, s.ID, "read_file", `{"path":"`+rel+`"}`); tu.Failed || !strings.Contains(tu.Output, "found") {
+		t.Errorf("read of %q: %q", rel, tu.Output)
+	}
+}

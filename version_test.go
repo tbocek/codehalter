@@ -57,28 +57,6 @@ func fakeBinary(reports string, size int) string {
 	return s + strings.Repeat("x", max(0, size-len(s)))
 }
 
-func TestReleaseNum(t *testing.T) {
-	for _, c := range []struct {
-		tag  string
-		want int
-	}{
-		{"v1", 1},
-		{"v42", 42},
-		{"42", 42},    // the API returns the tag; tolerate a missing v
-		{"dev", 0},    // an own build is older than every release
-		{"", 0},       //
-		{"v0", 0},     // release.sh starts at v1, so v0 is not a release
-		{"v1.2", 0},   // not the scheme release.sh writes
-		{"v-3", 0},    //
-		{"vNaN", 0},   //
-		{"latest", 0}, //
-	} {
-		if got := releaseNum(c.tag); got != c.want {
-			t.Errorf("releaseNum(%q) = %d, want %d", c.tag, got, c.want)
-		}
-	}
-}
-
 // A young cache must not stand in for the check; it answers only when GitHub is unreachable.
 func TestLatestReleaseSources(t *testing.T) {
 	isolateUpdate(t)

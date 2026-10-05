@@ -19,34 +19,22 @@ func uiFor(tty bool, cols, rows int) (*cliUI, *bytes.Buffer) {
 	return u, &buf
 }
 
-func TestBreakRow(t *testing.T) {
-	cases := []struct {
-		row                string
-		width              int
-		wantHead, wantTail string
-	}{
-		{"the quick brown fox ", 19, "the quick brown", "fox "},
-		{"hello world", 8, "hello", "world"},
-		// No space to break at: cut hard.
-		{"/very/long/path/without/spaces", 10, "/very/long", "/path/without/spaces"},
-		{"a b", 2, "a", "b"},
-	}
-	for _, c := range cases {
-		head, tail := breakRow([]rune(c.row), c.width)
-		if string(head) != c.wantHead || string(tail) != c.wantTail {
-			t.Errorf("breakRow(%q, %d) = %q, %q; want %q, %q",
-				c.row, c.width, string(head), string(tail), c.wantHead, c.wantTail)
-		}
-	}
-}
-
+// 20 columns leave 19 for text: a row breaks at its last space, or hard without one.
 func TestStreamWrapsAtWidth(t *testing.T) {
-	u, buf := uiFor(false, 20, 24)
-	u.Stream("", "", "the quick brown fox ")
-	u.Stream("", "", "jumps over the lazy dog\n")
-	want := "the quick brown\nfox jumps over the\nlazy dog\n"
-	if buf.String() != want {
-		t.Errorf("wrapped transcript:\n%q\nwant:\n%q", buf.String(), want)
+	for _, c := range []struct {
+		chunks []string
+		want   string
+	}{
+		{[]string{"the quick brown fox ", "jumps over the lazy dog\n"}, "the quick brown\nfox jumps over the\nlazy dog\n"},
+		{[]string{"/very/long/path/without/any/spaces\n"}, "/very/long/path/wit\nhout/any/spaces\n"},
+	} {
+		u, buf := uiFor(false, 20, 24)
+		for _, s := range c.chunks {
+			u.Stream("", "", s)
+		}
+		if buf.String() != c.want {
+			t.Errorf("wrapped transcript:\n%q\nwant:\n%q", buf.String(), c.want)
+		}
 	}
 }
 

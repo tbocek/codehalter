@@ -35,10 +35,10 @@ var viewImageTool = Tool{
 }
 
 func viewImageExecuteFallback(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-	if !a.imagesSupported {
-		return "view_image: this LLM doesn't support image inputs — call other tools (read_file, run_command) to inspect the attachment indirectly.", true
+	if !a.imagesSupported.Load() {
+		return "view_image: this LLM doesn't support image inputs; call other tools (read_file, run_command) to inspect the attachment indirectly.", true
 	}
-	return "view_image: internal — dispatch missed the intercept. Try again.", true
+	return "view_image: internal error: dispatch missed the intercept. Try again.", true
 }
 
 func dispatchViewImage(sess *Session, rawArgs string) (string, []any, bool) {

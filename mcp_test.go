@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -413,7 +414,7 @@ func TestStdioTransportSurfacesCrash(t *testing.T) {
 	select {
 	case <-tr.done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("child exit not detected — done never closed")
+		t.Fatal("child exit not detected: done never closed")
 	}
 	if se := tr.stderr.String(); !strings.Contains(se, "boom") {
 		t.Errorf("stderr was not captured (would be swallowed): %q", se)
@@ -437,13 +438,11 @@ func offerFixture(t *testing.T, a *agent, s *Session) {
 // liveServers parses mcp.toml the way reconcileMCP does, so tests assert on what would start.
 func liveServers(t *testing.T, cwd string) []MCPServerConfig {
 	t.Helper()
-	var f struct {
-		Server []MCPServerConfig `toml:"server"`
-	}
-	if _, err := toml.DecodeFile(mcpConfigPath(cwd), &f); err != nil {
+	cfgs, _, err := readMCPConfig(mcpConfigPath(cwd))
+	if err != nil {
 		t.Fatalf("mcp.toml does not parse: %v", err)
 	}
-	return f.Server
+	return cfgs
 }
 
 // A client without forms still gets its servers recorded (commented out), so the offer is one-shot.
@@ -519,7 +518,7 @@ func TestOfferMCPImportAdoptsPicked(t *testing.T) {
 		t.Fatalf("form has no %q property: %s", elicitMCPKey, line)
 	}
 	if prop.Type != "array" {
-		t.Errorf("property type = %q, want array — this is a multi-select", prop.Type)
+		t.Errorf("property type = %q, want array: this is a multi-select", prop.Type)
 	}
 	if len(prop.Items.AnyOf) != 2 || prop.Items.AnyOf[0].Const != "scad" || prop.Items.AnyOf[1].Const != "gmail" {
 		t.Errorf("options = %+v, want both offered servers", prop.Items.AnyOf)
@@ -593,7 +592,7 @@ func TestMCPTOMLEntryRoundTrips(t *testing.T) {
 		t.Fatalf("rendered toml does not parse: %v\n%s", err, text)
 	}
 	if len(f.Server) != 2 {
-		t.Fatalf("got %d servers, want 2 — the commented entry must be inert:\n%s", len(f.Server), text)
+		t.Fatalf("got %d servers, want 2: the commented entry must be inert:\n%s", len(f.Server), text)
 	}
 	if f.Server[0].Command != "node" || f.Server[0].Args[1] != "--flag" || f.Server[0].Env["K"] != "v" {
 		t.Errorf("stdio entry = %+v", f.Server[0])
@@ -632,11 +631,11 @@ func TestReconcileMCPStoppedStartIsRetried(t *testing.T) {
 
 // A Stop during the restart of an edited server keeps the old one running, and
 // the next prompt still applies the edit.
-func TestReconcileMCPStoppedRestartIsRetried(t *testing.T) {
-	a, s := newTestAgent(t)
-	withTools(a)
-	var header atomic.Value
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// fakeMCPServer is a modern HTTP server with one tool "t"; header holds the last X-Cfg sent.
+func fakeMCPServer(t *testing.T) (srv *httptest.Server, header *atomic.Value) {
+	t.Helper()
+	header = &atomic.Value{}
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var env mcpRequest
 		if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
 			return
@@ -652,23 +651,76 @@ func TestReconcileMCPStoppedRestartIsRetried(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(mcpResponse{JSONRPC: "2.0", ID: &env.ID, Result: json.RawMessage(result)})
 	}))
-	defer srv.Close()
-	defer a.shutdownMCP()
+	t.Cleanup(srv.Close)
+	return srv, header
+}
 
-	dir := filepath.Join(s.Cwd, ".codehalter")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+// writeMCPConfig writes mcp.toml aged by age: reconcileMCP diffs only on a changed mtime.
+func writeMCPConfig(t *testing.T, cwd, cfg string, age time.Duration) {
+	t.Helper()
+	path := mcpConfigPath(cwd)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(dir, "mcp.toml")
+	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().Add(-age)
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A server dropped from the file is stopped and its tools leave the registry.
+func TestReconcileMCPStopsARemovedServer(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a)
+	srv, _ := fakeMCPServer(t)
+	defer a.shutdownMCP()
+
+	writeMCPConfig(t, s.Cwd, "[[server]]\nname = \"srv\"\nurl = \""+srv.URL+"\"\n", time.Hour)
+	if changes := a.reconcileMCP(context.Background(), s.Cwd); len(changes) != 1 || changes[0].action != "started" {
+		t.Fatalf("first reconcile = %+v", changes)
+	}
+	writeMCPConfig(t, s.Cwd, "# nothing configured\n", 0)
+	changes := a.reconcileMCP(context.Background(), s.Cwd)
+	if len(changes) != 1 || changes[0].action != "stopped" || changes[0].name != "srv" {
+		t.Errorf("removing the entry reported %+v, want srv stopped", changes)
+	}
+	if slices.ContainsFunc(a.tools.defs(), func(d map[string]any) bool {
+		return strings.HasPrefix(d["function"].(map[string]any)["name"].(string), "srv__")
+	}) {
+		t.Error("the stopped server's tools are still registered")
+	}
+	if len(a.mcp.clients) != 0 || len(a.mcp.applied) != 0 {
+		t.Errorf("still tracked: clients %v, applied %v", a.mcp.clients, a.mcp.applied)
+	}
+}
+
+// A broken file is reported once, not on every prompt, and again after the next edit.
+func TestReconcileMCPReportsAParseErrorOncePerEdit(t *testing.T) {
+	a, s := newTestAgent(t)
+	writeMCPConfig(t, s.Cwd, "[[server]\nname = ", time.Hour)
+	for i, want := range []int{1, 0} {
+		changes := a.reconcileMCP(context.Background(), s.Cwd)
+		if len(changes) != want || (want == 1 && changes[0].action != "parse_error") {
+			t.Errorf("reconcile %d = %+v, want %d parse_error", i+1, changes, want)
+		}
+	}
+	writeMCPConfig(t, s.Cwd, "[[server]\nname = \"still broken\"", 0)
+	if changes := a.reconcileMCP(context.Background(), s.Cwd); len(changes) != 1 || changes[0].action != "parse_error" {
+		t.Errorf("after an edit = %+v, want the parse_error again", changes)
+	}
+}
+
+func TestReconcileMCPStoppedRestartIsRetried(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a)
+	srv, header := fakeMCPServer(t)
+	defer a.shutdownMCP()
+
 	write := func(v string, age time.Duration) {
-		cfg := "[[server]]\nname = \"srv\"\nurl = \"" + srv.URL + "\"\nheaders = { X-Cfg = \"" + v + "\" }\n"
-		if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		at := time.Now().Add(-age)
-		if err := os.Chtimes(path, at, at); err != nil {
-			t.Fatal(err)
-		}
+		writeMCPConfig(t, s.Cwd, "[[server]]\nname = \"srv\"\nurl = \""+srv.URL+"\"\nheaders = { X-Cfg = \""+v+"\" }\n", age)
 	}
 	write("1", time.Hour)
 	if changes := a.reconcileMCP(context.Background(), s.Cwd); len(changes) != 1 || changes[0].action != "started" {

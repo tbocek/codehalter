@@ -220,10 +220,10 @@ func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (stri
 	// start_line/end_line (the `sed -n '130,205p'` shape) and view_range (Qwen's
 	// own file tool) are both inclusive.
 	from, to := 0, 0
-	if a, ok := args.num("start_line"); ok {
-		from = a
-		if b, ok := args.num("end_line"); ok {
-			to = b
+	if n, ok := args.num("start_line"); ok {
+		from = n
+		if m, ok := args.num("end_line"); ok {
+			to = m
 		}
 	}
 	if vr, ok := args["view_range"].([]any); ok && len(vr) == 2 {
@@ -274,7 +274,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 		return "error: " + err.Error(), false
 	}
 	if looksBinary([]byte(content)) {
-		msg := fmt.Sprintf("%s is a binary file (NUL bytes) — not shown. Reading it as text would corrupt the context. Use a shell tool to inspect its bytes if you must.", path)
+		msg := fmt.Sprintf("%s is a binary file (NUL bytes), not shown. Reading it as text would corrupt the context. Use a shell tool to inspect its bytes if you must.", path)
 		a.CompleteToolCallTitled(ctx, sid, tcId, "Read (binary, skipped): "+path, []ToolCallContent{TextContent(msg)})
 		return msg, false
 	}
@@ -326,7 +326,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 			"LESS of it: `grep -n -C5 -F '<what you are looking for>' %s` through run_command returns only the lines around each hit. "+
 			"Do NOT re-read the whole file.]", start, end, path, end+1, readChunkLines, path)
 	default:
-		note = fmt.Sprintf("[end of file — line %d is the last; you have the file through line %d, do not re-read]", end, end)
+		note = fmt.Sprintf("[end of file: line %d is the last; you have the file through line %d, do not re-read]", end, end)
 	}
 
 	if byteNote != "" {
@@ -441,8 +441,8 @@ var fileTools = []Tool{
 			ta := toolArgs(t)
 			what := ta.str("symbol")
 			if what == "" {
-				if a, ok := ta.num("start_line"); ok {
-					what = fmt.Sprintf("from line %d", a)
+				if n, ok := ta.num("start_line"); ok {
+					what = fmt.Sprintf("from line %d", n)
 				} else if l, ok := ta.num("line"); ok {
 					what = fmt.Sprintf("from line %d", l)
 				} else {
@@ -499,19 +499,9 @@ var fileTools = []Tool{
 		if sess := a.getSession(sid); sess != nil {
 			drift = sess.takeDriftNote(path)
 		}
-		newContent = a.formatGuarded(sid, path, oldContent, newContent)
-		if refusal := a.agentsFileRefusal(sid, path, oldContent, newContent); refusal != "" {
-			a.FailToolCall(ctx, sid, tcId, firstLine(refusal))
-			return refusal + drift, true
+		if msg, failed := a.commitWrite(ctx, sid, tcId, path, oldContent, newContent, drift); msg != "" {
+			return msg, failed
 		}
-
-		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error writing file: " + err.Error(), false
-		}
-
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &oldContent, newContent)})
-
 		return "file written successfully" + drift, false
 	}},
 
@@ -621,24 +611,30 @@ var fileTools = []Tool{
 			cur = next
 			notes = append(notes, note)
 		}
-		newContent := a.formatGuarded(sid, path, content, cur)
-		if refusal := a.agentsFileRefusal(sid, path, content, newContent); refusal != "" {
-			a.FailToolCall(ctx, sid, tcId, firstLine(refusal))
-			return refusal + drift, true
+		if msg, failed := a.commitWrite(ctx, sid, tcId, path, content, cur, drift); msg != "" {
+			return msg, failed
 		}
-
-		if err := fsWrite(a, ctx, sid, path, newContent); err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return "error writing file: " + err.Error(), false
-		}
-
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &content, newContent)})
-
 		if len(edits) == 1 {
 			return "file written successfully" + notes[0] + drift, false
 		}
 		return fmt.Sprintf("file written successfully: all %d edits applied in order%s", len(edits), strings.Join(notes, "")) + drift, false
 	}},
+}
+
+// commitWrite is the end write_file and edit_file share: format, the brief's
+// guard, the write, the diff card. A non-empty msg is what the tool returns.
+func (a *agent) commitWrite(ctx context.Context, sid, tcId, path, old, next, drift string) (msg string, failed bool) {
+	next = a.formatGuarded(sid, path, old, next)
+	if refusal := a.agentsFileRefusal(sid, path, old, next); refusal != "" {
+		a.FailToolCall(ctx, sid, tcId, firstLine(refusal))
+		return refusal + drift, true
+	}
+	if err := fsWrite(a, ctx, sid, path, next); err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		return "error writing file: " + err.Error(), false
+	}
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &old, next)})
+	return "", false
 }
 
 // start includes leading comments and attributes; mentions is set only when no
@@ -808,7 +804,7 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 	}
 	switch count := strings.Count(content, oldText); {
 	case count > 1:
-		return "", "", fmt.Sprintf("error: old_text matches %d places — it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count)
+		return "", "", fmt.Sprintf("error: old_text matches %d places; it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count)
 	case count == 1:
 		return strings.Replace(content, oldText, newText, 1), "", ""
 	}
@@ -817,7 +813,7 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 	case n == 1:
 		return tol, " (old_text matched ignoring whitespace/indentation)", ""
 	case n > 1:
-		return "", "", fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places — add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n)
+		return "", "", fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places; add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n)
 	}
 	// A snippet copied from a numbered read still carries its `N|` prefixes.
 	if stripped, ok := stripLineNumbers(oldText); ok {
@@ -830,11 +826,11 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 		}
 	}
 	if line, snippet, found := nearMiss(content, oldText); found {
-		return "", "", fmt.Sprintf("error: old_text not found — the file has drifted from what you remember. The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
-			"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT call read_file first — the text above is the file's current content. Do NOT rewrite the whole file with write_file.",
+		return "", "", fmt.Sprintf("error: old_text not found: the file has drifted from what you remember. The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
+			"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT call read_file first: the text above is the file's current content. Do NOT rewrite the whole file with write_file.",
 			path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap))
 	}
-	return "", "", "error: old_text not found — the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file."
+	return "", "", "error: old_text not found: the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file."
 }
 
 var lineNumberPrefixRe = regexp.MustCompile(`^\s*\d+\|`)

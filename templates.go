@@ -61,7 +61,7 @@ func renderMacro(name, body, args string) (rendered, stopMsg string) {
 	args = strings.TrimSpace(args)
 	if strings.Contains(body, templatePlaceholder) {
 		if args == "" {
-			return "", fmt.Sprintf("⚠ /%s expects a prompt — type `/%s <your text>`.", name, name)
+			return "", fmt.Sprintf("⚠ /%s expects a prompt: type `/%s <your text>`.", name, name)
 		}
 		return strings.ReplaceAll(body, templatePlaceholder, args), ""
 	}
@@ -159,8 +159,8 @@ func (a *agent) sendAvailableCommands(ctx context.Context, sid string) {
 		availableCommand{Name: "settings", Description: "Show which settings.toml is in use and re-probe every configured model"},
 		availableCommand{
 			Name:        "spec",
-			Description: "Implement a spec item by item until every requirement has a passing test. /spec starts or resumes (the first run asks where the spec is, where to build, with what); `status` reports the ledger; `stop` ends the loop after the round in flight; `redo` finds the finished items that do not deliver and rebuilds them",
-			Input:       &commandInput{Hint: "status | stop | redo"},
+			Description: "Implement a spec item by item until every requirement has a passing test. /spec starts or resumes (the first run asks where the spec is, where to build, with what); `status` reports the ledger; `stop` ends the loop after the round in flight; `abort` stops it at once; `redo` finds the finished items that do not deliver and rebuilds them",
+			Input:       &commandInput{Hint: "status | stop | abort | redo"},
 		},
 	)
 	for _, n := range names {

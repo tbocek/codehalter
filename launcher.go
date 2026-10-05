@@ -638,13 +638,6 @@ func strs(v any) []string {
 	return s
 }
 
-func orElse(v, fallback string) string {
-	if v == "" {
-		return fallback
-	}
-	return v
-}
-
 func shortHash(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])[:12]
@@ -685,7 +678,7 @@ func containerTool() string {
 func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, bool) {
 	cfg, err := loadDevcontainerConfig(workspace)
 	switch {
-	case err == os.ErrNotExist:
+	case errors.Is(err, os.ErrNotExist):
 		return 0, false
 	case err != nil:
 		fmt.Fprintf(os.Stderr, "%s\n\nStart it with the devcontainer CLI instead:\n"+

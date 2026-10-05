@@ -90,7 +90,7 @@ var screenshotTool = Tool{
 // screenshotExecuteFallback is reached when the LLM takes no images: tell the
 // user, who can fix the config, rather than burn a browser launch.
 func screenshotExecuteFallback(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-	if !a.imagesSupported {
+	if !a.imagesSupported.Load() {
 		a.say(ctx, sid, "❕ The model asked for a screenshot, but this LLM reports no image support, so it can't be shown one. If your model does accept images, set `image_support = true` on its [[llm]] entry in settings.toml.\n")
 		return "screenshot: this LLM doesn't accept image inputs, so the rendering can't be delivered (the user has been told). Verify it as a NUMBER instead: render the page and print the measurement as text.", true
 	}

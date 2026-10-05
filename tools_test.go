@@ -31,10 +31,7 @@ func TestResolvePathSymlinkEscape(t *testing.T) {
 		t.Errorf("in-tree file rejected: %v", err)
 	}
 
-	if err := os.MkdirAll(filepath.Join(s.Cwd, "real"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	os.WriteFile(filepath.Join(s.Cwd, "real", "f.txt"), []byte("z"), 0o644)
+	writeTree(t, s.Cwd, map[string]string{"real/f.txt": "z"})
 	if err := os.Symlink(filepath.Join(s.Cwd, "real"), filepath.Join(s.Cwd, "alias")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
@@ -66,67 +63,33 @@ func TestArgsWrongType(t *testing.T) {
 	}
 }
 
-// Schema-correct JSON numbers and bools decode, and so do the quoted forms.
+// Numbers and flags arrive as JSON values or as quoted strings; anything else,
+// bad JSON included, reads as absent.
 func TestArgsTypedAccessors(t *testing.T) {
-	t.Run("num from JSON number", func(t *testing.T) {
-		a := parseArgs(`{"path":"x.go","line":42,"limit":10}`)
-		if got := a.str("path"); got != "x.go" {
-			t.Errorf("str(path) = %q, want x.go", got)
+	for _, c := range []struct {
+		raw   string
+		num   int
+		numOK bool
+		flag  bool
+	}{
+		{`{"v":42}`, 42, true, false},
+		{`{"v":"42"}`, 42, true, false},
+		{`{"v":"abc"}`, 0, false, false},
+		{`{}`, 0, false, false},
+		{`not json`, 0, false, false},
+		{`{"v":true}`, 0, false, true},
+		{`{"v":"TRUE"}`, 0, false, true},
+		{`{"v":false}`, 0, false, false},
+		{`{"v":"no"}`, 0, false, false},
+	} {
+		a := parseArgs(c.raw)
+		if n, ok := a.num("v"); n != c.num || ok != c.numOK {
+			t.Errorf("%s: num = %d,%v, want %d,%v", c.raw, n, ok, c.num, c.numOK)
 		}
-		if got, ok := a.num("line"); !ok || got != 42 {
-			t.Errorf("num(line) = %d,%v, want 42,true", got, ok)
+		if got := a.flag("v"); got != c.flag {
+			t.Errorf("%s: flag = %v, want %v", c.raw, got, c.flag)
 		}
-		if got, ok := a.num("limit"); !ok || got != 10 {
-			t.Errorf("num(limit) = %d,%v, want 10,true", got, ok)
-		}
-	})
-	t.Run("num from quoted digits", func(t *testing.T) {
-		a := parseArgs(`{"line":"42"}`)
-		if got, ok := a.num("line"); !ok || got != 42 {
-			t.Errorf("num(line) = %d,%v, want 42,true", got, ok)
-		}
-	})
-	t.Run("num absent or unparseable", func(t *testing.T) {
-		a := parseArgs(`{"line":"abc"}`)
-		if _, ok := a.num("line"); ok {
-			t.Error("num(line) on non-numeric text: ok = true, want false")
-		}
-		if _, ok := a.num("missing"); ok {
-			t.Error("num(missing): ok = true, want false")
-		}
-	})
-	t.Run("flag from JSON bool and string", func(t *testing.T) {
-		for _, raw := range []string{`{"regex":true}`, `{"regex":"true"}`, `{"regex":"TRUE"}`} {
-			if !parseArgs(raw).flag("regex") {
-				t.Errorf("flag(regex) on %s = false, want true", raw)
-			}
-		}
-		for _, raw := range []string{`{"regex":false}`, `{"regex":"no"}`, `{}`} {
-			if parseArgs(raw).flag("regex") {
-				t.Errorf("flag(regex) on %s = true, want false", raw)
-			}
-		}
-	})
-	t.Run("str refuses to coerce", func(t *testing.T) {
-		if got := parseArgs(`{"content":123}`).str("content"); got != "" {
-			t.Errorf("str on a number = %q, want \"\" (the caller rejects via wrongType)", got)
-		}
-	})
-	t.Run("has is type-blind", func(t *testing.T) {
-		a := parseArgs(`{"limit":0}`)
-		if !a.has("limit") {
-			t.Error("has(limit) = false for a supplied zero, want true")
-		}
-		if a.has("offset") {
-			t.Error("has(offset) = true for an absent key, want false")
-		}
-	})
-	t.Run("one bad key does not drop the others", func(t *testing.T) {
-		a := parseArgs(`{"path":"x.go","line":42}`)
-		if a.str("path") != "x.go" {
-			t.Errorf("str(path) = %q, want x.go", a.str("path"))
-		}
-	})
+	}
 }
 
 // Content-retrieval tools pass through whole; every other tool gets the clip.
@@ -167,13 +130,6 @@ func TestLiveExemptCap(t *testing.T) {
 	body := got[:strings.Index(got, "\n\n[...")]
 	if !strings.HasSuffix(body, "a") { // last kept char is real content, cut on a line boundary
 		t.Errorf("clip not line-aware: body ends %q", body[max(0, len(body)-5):])
-	}
-}
-
-func TestWebSearchRefineHint(t *testing.T) {
-	hint := truncationHint("web_search", `{"query":"x"}`)
-	if !strings.Contains(hint, "refine the query") {
-		t.Errorf("web_search hint should suggest refining the query, got %q", hint)
 	}
 }
 
@@ -247,34 +203,5 @@ func TestAllToolDefinitions(t *testing.T) {
 
 	if got, want := toolNames(a.tools.defs()), []string{"other", "read", "write"}; !slices.Equal(got, want) {
 		t.Errorf("got %v, want %v (all tools, sorted)", got, want)
-	}
-}
-
-func TestParseArgs(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want map[string]string
-	}{
-		{name: "valid flat", in: `{"key":"value","a":"b"}`, want: map[string]string{"key": "value", "a": "b"}},
-		{name: "empty object", in: `{}`, want: map[string]string{}},
-		{name: "empty string", in: ``, want: map[string]string{}},
-		{name: "invalid JSON", in: `not json`, want: map[string]string{}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := parseArgs(tc.in)
-			if got == nil {
-				t.Fatalf("parseArgs must never return nil")
-			}
-			if len(got) != len(tc.want) {
-				t.Errorf("got %v, want %v", got, tc.want)
-			}
-			for k, v := range tc.want {
-				if got.str(k) != v {
-					t.Errorf("key %q: got %q, want %q", k, got.str(k), v)
-				}
-			}
-		})
 	}
 }

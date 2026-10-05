@@ -42,7 +42,6 @@ func (s *Session) setSpecFence(dir string) {
 	s.rt.mu.Unlock()
 }
 
-// requestSpecStop ends the running loop at its next round boundary, not now.
 // setSpecAbort records how to cancel the running loop; nil when none runs.
 func (s *Session) setSpecAbort(abort context.CancelFunc) {
 	s.rt.mu.Lock()
@@ -62,13 +61,9 @@ func (s *Session) abortSpec() bool {
 	return true
 }
 
-// runSpecTurn runs /spec under the turn Prompt holds. Zed turns a message typed
-// during a turn into a cancel first and sends the text only after the turn has
-// ended, so a loop that stopped on the cancel could never hear `/spec abort`. A
-// cancel once the loop runs therefore asks it to stop after the round in flight
-// and ends Zed's request at once; the loop goes on holding the turn, releases it
-// when it ends, and the text that follows reaches it as steering (Prompt). Before
-// the loop runs (setup questions, status) a cancel still stops it outright.
+// runSpecTurn: Zed sends text typed mid-turn only after a cancel, so once the loop
+// runs a cancel means "stop after this round" and frees Zed's request; the loop
+// keeps the turn until it ends, and the text (`/spec abort`) reaches it there.
 func (a *agent) runSpecTurn(ctx context.Context, sid string, sess *Session, args string, fixes []fixProblem, release func()) (resp PromptResponse, err error, detached bool) {
 	loopCtx, abort := context.WithCancel(context.WithoutCancel(ctx))
 	sess.setSpecAbort(abort)
@@ -102,6 +97,7 @@ func (a *agent) runSpecTurn(ctx context.Context, sid string, sess *Session, args
 	return PromptResponse{StopReason: "cancelled"}, nil, true
 }
 
+// requestSpecStop ends the running loop at its next round boundary, not now.
 func (s *Session) requestSpecStop() {
 	s.rt.mu.Lock()
 	s.rt.specStop = true
@@ -180,7 +176,7 @@ type specRoundResult struct {
 	TurnErr   string
 	TestsPass bool
 	TestTail  string
-	Covered   bool // setup: a test source exists
+	Covered   bool // a test names the item; for setup, any test source exists
 	// Gates on what the round wrote: functions only tests reach, lint findings in
 	// its own lines, files grown past the size budget.
 	Unreachable []string
@@ -383,9 +379,8 @@ type specRun struct {
 	lastDelta   string            // the change report already shown
 	vanished    bool              // the last scan lost most of the ledger at once
 	lintMissing string            // why the linter did not run: the next round installs it
-	// blocked: items given up on in this run, with why. Not saved: the next /spec
-	// tries them afresh, since most blocks outlive their cause (a bug since fixed,
-	// a red build another item repaired).
+	// blocked: given up on in this run, with why; not saved, since most blocks
+	// outlive their cause.
 	blocked map[string]string
 	// completionChecked: the done items were checked against the spec in this run.
 	completionChecked bool
@@ -526,7 +521,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	}
 	addFixes(pendingFixes)
 	// Only `/spec abort` cancels a running loop (see runSpecTurn).
-	stopped := func(err error) (PromptResponse, error) {
+	stopped := func() (PromptResponse, error) {
 		r.save(context.Background())
 		a.say(context.Background(), sid, "⏹ **/spec aborted.** What the round in flight did so far stays in the project; `/spec` continues from it.\n")
 		return PromptResponse{StopReason: "cancelled"}, nil
@@ -538,7 +533,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	}
 	for consecutive, round := 0, 1; ; round++ {
 		if err := ctx.Err(); err != nil {
-			return stopped(err)
+			return stopped()
 		}
 		// Re-read every round: the user may edit the spec or the code in between.
 		if err := r.scan(); err != nil {
@@ -566,7 +561,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 				r.completionChecked = true
 				reopened, err := r.completionCheck(ctx)
 				if err != nil {
-					return stopped(err)
+					return stopped()
 				}
 				if len(reopened) > 0 {
 					r.say(ctx, fmt.Sprintf("\n🔍 %d item(s) do not do all their spec says yet and are open again: %s\n\n", len(reopened), strings.Join(reopened, ", ")))
@@ -575,7 +570,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			}
 			if f := cfg.Final; f == nil || f.Items != len(cfg.Items) || f.Blocked != r.notDone() {
 				if err := r.finalPass(ctx); err != nil {
-					return stopped(err)
+					return stopped()
 				}
 			}
 			r.say(ctx, fmt.Sprintf("\n✅ **/spec finished**: every item in `%s/` is covered by a passing test, blocked in this run, or waiting on a question.", cfg.SpecDir))
@@ -611,7 +606,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		mark, started := sess.toolMark(), time.Now() // the round's own tool calls start here
 		turnErr := a.runPromptTurn(ctx, sess, prompt)
 		if isCancelled(turnErr) {
-			return stopped(turnErr)
+			return stopped()
 		}
 		// The checks run once before the round is judged, so what they find costs a
 		// turn, not an attempt: one uncalled function once blocked a two-round item.
@@ -624,7 +619,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 					turnErr = a.runPromptTurn(ctx, sess, a.renderSpecPrompt(sid, "SPEC-CHECK.md", []string{
 						"{{id}}", w.Item, "{{findings}}", findings, "{{out_dir}}", cfg.OutDir, "{{test_cmd}}", r.testCmd()}))
 					if isCancelled(turnErr) {
-						return stopped(turnErr)
+						return stopped()
 					}
 				}
 			}
@@ -639,7 +634,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		}
 		done, block, err := r.finishRound(ctx, w, turnErr, mark, started)
 		if isCancelled(err) {
-			return stopped(err)
+			return stopped()
 		}
 		if err != nil {
 			r.save(ctx) // keeps what reconcile adopted and renamed
@@ -689,9 +684,7 @@ func (a *agent) specResolve(ctx context.Context, sid string, sess *Session, args
 		say("⚠ /spec: " + err.Error() + "\n")
 		return nil, "", false
 	}
-	if cfg == nil || cfg.SpecDir != specRel {
-		cfg = &specConfig{} // a different spec: its attempts and blocks don't carry over
-	}
+	cfg = &specConfig{}
 	cfg.SpecDir, cfg.OutDir, cfg.Target = specRel, outRel, target
 	if err := os.MkdirAll(filepath.Join(sess.Cwd, outRel), 0o755); err != nil {
 		say("⚠ /spec: creating " + outRel + ": " + err.Error() + "\n")
@@ -781,7 +774,15 @@ func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testF
 		w.Note = specRemovedText(ctx, r.sess.Cwd, cfg, w.Item)
 	case changed != "":
 		w = specWork{Item: changed, Mode: specModeChange}
-		w.Note = specSpecDiff(ctx, r.sess.Cwd, cfg.Items[w.Item].Commit, cfg.SpecDir+"/"+r.idx.docs[r.idx.items[w.Item].Doc].rel)
+		// The edit since the item was built, so the round sees what changed, not the section again.
+		if commit := cfg.Items[w.Item].Commit; commit != "" {
+			doc := cfg.SpecDir + "/" + r.idx.docs[r.idx.items[w.Item].Doc].rel
+			if out, err := specGit(ctx, r.sess.Cwd, "diff", commit+"..HEAD", "--", doc); err != nil {
+				slog.Debug("spec: diff of a changed item", "item", w.Item, "err", err)
+			} else {
+				w.Note = strings.TrimSpace(clipBytes(out, specSpecDiffBytes))
+			}
+		}
 	default:
 		// Every refactor_every finished items one round goes to the code's shape instead of an item.
 		if every := cfg.refactorEvery(); every > 0 && len(cfg.Items)-cfg.RefactorAt >= every {
@@ -862,10 +863,8 @@ func (a *agent) specFinalPrompt(sid string, cfg *specConfig, idx *specIndex, tes
 // notDone counts what the final pass lists as not done, so it runs again when that moves.
 func (r *specRun) notDone() int { return len(r.blocked) + len(specOpenQuestions(r.idx)) }
 
-// roundRanGreen trusts the terminal's exit code, not the model, so a wrapped run
-// (`just test > log; echo exit=$?`) does not count: its exit code is the echo's.
-// The last run counts, in the round's calls or as a background job that exited
-// since the round began; an edit inside the output directory after it undoes it.
+// roundRanGreen: the last matching run exited 0 by the terminal's count (a wrapped
+// run's exit is its echo's, so it does not match) and nothing changed since.
 func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) bool {
 	type event struct {
 		at    time.Time
@@ -902,7 +901,24 @@ func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) boo
 	if len(evs) == 0 || !evs[len(evs)-1].green {
 		return false
 	}
-	return !writtenSince(r.outAbs, evs[len(evs)-1].since)
+	// A write after the last run undoes it; a render's own shots are no write.
+	since, written := evs[len(evs)-1].since, false
+	_ = filepath.WalkDir(r.outAbs, func(path string, d os.DirEntry, err error) error {
+		if err != nil || written {
+			return nil // the callback swallows every error, so WalkDir returns none
+		}
+		if d.IsDir() {
+			if name := d.Name(); path != r.outAbs && (skipWalkDir(name) || name == "shots") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info, err := d.Info(); err == nil && info.ModTime().After(since) {
+			written = true
+		}
+		return nil
+	})
+	return !written
 }
 
 // testRunMatches: the terminal's cwd is the project root, so a run without `cd <out> &&`
@@ -944,27 +960,6 @@ func testRunMatches(line, cmd, cwd, outAbs string) bool {
 		}
 	}
 	return true
-}
-
-func writtenSince(root string, t time.Time) bool {
-	found := false
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || found {
-			return nil
-		}
-		if d.IsDir() {
-			name := d.Name()
-			if path != root && (skipWalkDir(name) || name == "shots") {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if info, err := d.Info(); err == nil && info.ModTime().After(t) {
-			found = true
-		}
-		return nil
-	})
-	return found
 }
 
 // uiSourceExt keeps a README that mentions libadwaita from counting as a screen.
@@ -1204,19 +1199,23 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 	if done || block {
 		delete(cfg.Bases, item)
 		delete(r.fails, item)
+		delete(cfg.Attempts, item)
+		delete(r.reasons, item)
+	}
+	title := item
+	if it := r.idx.items[item]; it != nil && it.Title != "" {
+		title = it.Title
+	} else if led, ok := cfg.Items[item]; ok && led.Title != "" {
+		title = led.Title
 	}
 	switch {
 	case block && w.Mode == specModeRefactor:
 		// A refactor is not an item: it never blocks the loop, it waits for the next interval.
 		cfg.RefactorAt = len(cfg.Items)
-		delete(cfg.Attempts, item)
-		delete(r.reasons, item)
 		block = false
 		r.say(ctx, fmt.Sprintf("↷ refactor round skipped: %s. The next one comes after %d more items.\n", firstLine(reason), cfg.refactorEvery()))
 	case done:
-		delete(cfg.Attempts, item)
 		delete(cfg.Redo, item)
-		delete(r.reasons, item)
 		switch w.Mode {
 		case specModeRemove:
 			delete(cfg.Items, item)
@@ -1260,13 +1259,7 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 		// Not a block: the item waits in QUESTIONS.md, where the answer becomes spec.
 		// Questions in a row are no shared failure, so they do not stop the loop.
 		block = w.Mode == specModeSetup
-		delete(cfg.Attempts, item)
-		delete(r.reasons, item)
 		q.Q.ID = item
-		title := item
-		if it := r.idx.items[item]; it != nil && it.Title != "" {
-			title = it.Title
-		}
 		if err := appendSpecQuestion(filepath.Join(r.sess.Cwd, cfg.SpecDir), title, q.Q); err != nil {
 			r.blocked[item] = "the planner asked a question, and writing it to " + specQuestionsFile + " failed: " + err.Error()
 			r.say(ctx, fmt.Sprintf("⛔ %s blocked for this run: %s\nThe question: %s\n", item, r.blocked[item], q.Q.Question))
@@ -1279,14 +1272,6 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 		if q != nil {
 			reason = "the planner needed a decision the spec does not make, but could not ask it answerably (" + q.Problem + "). Its question: " + q.Q.Question
 		}
-		delete(cfg.Attempts, item)
-		delete(r.reasons, item)
-		title := item
-		if it := r.idx.items[item]; it != nil && it.Title != "" {
-			title = it.Title
-		} else if led, ok := cfg.Items[item]; ok && led.Title != "" {
-			title = led.Title
-		}
 		if err := appendSpecQuestion(filepath.Join(r.sess.Cwd, cfg.SpecDir), title, specStuckQuestion(r.idx, cfg.SpecDir, item, reason)); err != nil {
 			r.blocked[item] = firstLine(reason)
 			r.say(ctx, fmt.Sprintf("⛔ %s blocked for this run: %s\nWriting its question to %s failed (%v); the next /spec tries it again.\n", item, firstLine(reason), specQuestionsFile, err))
@@ -1295,8 +1280,6 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 		r.say(ctx, fmt.Sprintf("❓ %s did not pass its attempts: %s\nHow it goes on is a question in `%s/%s`, with what stopped it and the options. It waits there; answer it and run /spec.\n", item, firstLine(reason), cfg.SpecDir, specQuestionsFile))
 	case block:
 		r.blocked[item] = firstLine(reason)
-		delete(cfg.Attempts, item)
-		delete(r.reasons, item)
 		r.say(ctx, fmt.Sprintf("⛔ %s blocked for this run: %s\nThe next /spec tries it again.\n", item, firstLine(reason)))
 	default:
 		r.reasons[item] = reason
@@ -1506,8 +1489,7 @@ func (r *specRun) gates(ctx context.Context, w specWork, ch specChanges, res *sp
 			r.say(ctx, fmt.Sprintf("⚠ /spec: `%s` does not run here (%s); the next round installs it. `lint_cmd` in .codehalter/spec.toml sets another linter, `lint_cmd = \"off\"` none.\n", cmd, missing))
 		}
 		r.lintMissing = missing
-		switch {
-		case len(findings) > 0:
+		if len(findings) > 0 {
 			r.say(ctx, fmt.Sprintf("🔎 %d lint finding(s) in lines this round wrote\n", len(findings)))
 		}
 		res.Lint = findings
@@ -1531,14 +1513,9 @@ const specCheckMark = "completion check: "
 // specCheckBatch is how many items of one spec file a completion round checks.
 const specCheckBatch = 8
 
-// completionCheck has every done item that was not checked since it was built
-// looked at against its spec text: the program, not a test, must do what the text
-// says, and a screen the spec pictures must look like the picture. A test named
-// after the item and a green suite said neither: naivepost counted its LLM calls
-// done while they only ever answered "no llm server here", and its Prepare screen
-// with the panels swapped. The rounds go by spec file, a few items each; what is
-// missing reopens the item with the list, what is done is marked checked in the
-// ledger, so the next run looks only at what was built since.
+// completionCheck asks, per spec file in batches, whether each done item not yet
+// checked does what its text says, in the program and on its pictured screen; a
+// named green test proves neither. Missing items reopen, done ones are marked checked.
 func (r *specRun) completionCheck(ctx context.Context) (reopened []string, err error) {
 	cfg, idx := r.cfg, r.idx
 	type batch struct {
@@ -1886,15 +1863,4 @@ func specRemovedText(ctx context.Context, cwd string, cfg *specConfig, id string
 		return ""
 	}
 	return clipBytes(specSectionFromText(out, id), specSpecDiffBytes)
-}
-
-func specSpecDiff(ctx context.Context, cwd, commit, relPath string) string {
-	if commit == "" {
-		return ""
-	}
-	out, err := specGit(ctx, cwd, "diff", commit+"..HEAD", "--", relPath)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(clipBytes(out, specSpecDiffBytes))
 }

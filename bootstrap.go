@@ -172,14 +172,18 @@ func hostSSHAgentAvailable() bool {
 const gitignoreSettingsEntry = sessionDir + "/settings.toml"
 
 // .git is a directory in a clone, a "gitdir:" file in a linked worktree or submodule.
-func gitManaged(cwd string) bool {
-	_, err := os.Stat(filepath.Join(cwd, ".git"))
-	return err == nil
+func gitManaged(cwd string) bool { return fileExists(cwd, ".git") }
+
+// appendGitignore adds entry as its own line after content, the file's current text.
+func appendGitignore(cwd, content, entry string) error {
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		entry = "\n" + entry
+	}
+	return appendFile(filepath.Join(cwd, ".gitignore"), entry+"\n")
 }
 
 func ensureSettingsGitignored(cwd string) bool {
-	gitignorePath := filepath.Join(cwd, ".gitignore")
-	data, rerr := os.ReadFile(gitignorePath)
+	data, rerr := os.ReadFile(filepath.Join(cwd, ".gitignore"))
 	if !gitManaged(cwd) && rerr != nil {
 		return false
 	}
@@ -188,11 +192,7 @@ func ensureSettingsGitignored(cwd string) bool {
 			return true
 		}
 	}
-	sep := ""
-	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
-		sep = "\n"
-	}
-	return appendFile(gitignorePath, sep+gitignoreSettingsEntry+"\n") == nil
+	return appendGitignore(cwd, string(data), gitignoreSettingsEntry) == nil
 }
 
 func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
@@ -225,7 +225,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	title := "Add .codehalter/ to .gitignore?"
 	labels := []string{"Ignore, add '.codehalter' to .gitignore", "Track, add '#.codehalter' to .gitignore"}
 	if !hasGitignore {
-		title = "No .gitignore found — create one for .codehalter/?"
+		title = "No .gitignore found: create one for .codehalter/?"
 		labels = []string{"Add .gitignore, ignore .codehalter", "Add .gitignore, track .codehalter"}
 	}
 	choice, tcId, err := a.askCard(ctx, sid, title, "think", choiceOptions(labels))
@@ -245,11 +245,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 		return
 	}
 
-	sep := ""
-	if content != "" && !strings.HasSuffix(content, "\n") {
-		sep = "\n"
-	}
-	if err := appendFile(gitignorePath, sep+entry+"\n"); err != nil {
+	if err := appendGitignore(cwd, content, entry); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
 	}
@@ -261,17 +257,15 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 func detectStacks(cwd string) []string {
 	var stacks []string
 
-	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err == nil {
+	if fileExists(cwd, "go.mod") {
 		stacks = append(stacks, "go")
 	}
 
-	_, pkgErr := os.Stat(filepath.Join(cwd, "package.json"))
-	_, tsconfigErr := os.Stat(filepath.Join(cwd, "tsconfig.json"))
-	hasTS := tsconfigErr == nil || hasFileWithExt(cwd, ".ts", ".tsx")
+	hasTS := fileExists(cwd, "tsconfig.json") || hasFileWithExt(cwd, ".ts", ".tsx")
 	if hasTS {
 		stacks = append(stacks, "ts")
 	}
-	if pkgErr == nil && !hasTS {
+	if fileExists(cwd, "package.json") && !hasTS {
 		stacks = append(stacks, "js")
 	}
 
@@ -279,26 +273,19 @@ func detectStacks(cwd string) []string {
 		stacks = append(stacks, "css")
 	}
 
-	for _, n := range []string{"pom.xml", "build.gradle", "build.gradle.kts"} {
-		if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
-			stacks = append(stacks, "java")
-			break
-		}
+	if fileExists(cwd, "pom.xml") || fileExists(cwd, "build.gradle") || fileExists(cwd, "build.gradle.kts") {
+		stacks = append(stacks, "java")
 	}
 
-	if _, err := os.Stat(filepath.Join(cwd, "Cargo.toml")); err == nil {
+	if fileExists(cwd, "Cargo.toml") {
 		stacks = append(stacks, "rust")
 	}
 
-	for _, n := range []string{"build.zig", "build.zig.zon"} {
-		if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
-			stacks = append(stacks, "zig")
-			break
-		}
+	if fileExists(cwd, "build.zig") || fileExists(cwd, "build.zig.zon") {
+		stacks = append(stacks, "zig")
 	}
 
-	_, cmakeErr := os.Stat(filepath.Join(cwd, "CMakeLists.txt"))
-	if cmakeErr == nil || hasFileWithExt(cwd, ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx") {
+	if fileExists(cwd, "CMakeLists.txt") || hasFileWithExt(cwd, ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx") {
 		stacks = append(stacks, "c")
 	}
 

@@ -21,7 +21,7 @@ func skillSet(cwd string, stacks []string) []string {
 		names = append(names, "SKILL-layout.md")
 	}
 	for _, n := range []string{"justfile", "Justfile", ".justfile"} {
-		if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
+		if fileExists(cwd, n) {
 			names = append(names, "SKILL-justfile.md")
 			break
 		}
@@ -54,7 +54,7 @@ func expandCmdPlaceholders(body string) string {
 		defer cancel()
 		out, err := exec.CommandContext(ctx, "sh", "-c", cmd).Output()
 		if err != nil {
-			slog.Warn("skill {{cmd:}} failed — leaving the placeholder in place", "cmd", cmd, "err", err)
+			slog.Warn("skill {{cmd:}} failed, leaving the placeholder in place", "cmd", cmd, "err", err)
 			return m
 		}
 		return strings.TrimSpace(string(out))
@@ -85,8 +85,7 @@ func skillBody(cwd, name string) string {
 	return expandCmdPlaceholders(body)
 }
 
-// loadSkills runs only at session start and compaction; a skill that applies later is sent
-// by checkEnv as a user message, so the cached prefix stays stable.
+// loadSkills runs only at session start and compaction (see checkEnv).
 func loadSkills(cwd string, names []string) string {
 	var b strings.Builder
 	for _, n := range names {

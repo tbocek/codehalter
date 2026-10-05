@@ -27,13 +27,13 @@ const (
 	// Separate card: nothing is installed, the work is judgement. Holes: formatter list, config files.
 	cardFormatHeader = "This project has no formatter config (%s), so every tool that touches it formats by its own defaults.\n" +
 		"\n" +
-		"That is not cosmetic. codehalter formats what it writes, the editor may format on save, CI may check a third way, and when they disagree a file is rewritten between the moment the model reads it and its next edit — so the edit fails on text that was correct when it was read.\n" +
+		"That is not cosmetic. codehalter formats what it writes, the editor may format on save, CI may check a third way, and when they disagree a file is rewritten between the moment the model reads it and its next edit, so the edit fails on text that was correct when it was read.\n" +
 		"\n" +
 		"PLAN ONLY → produce execute-phase steps that:\n" +
 		"1. MEASURE the style already in the repo. Do NOT impose defaults. Read several of the largest existing source files and count: indent width, tabs vs spaces, quote style, semicolons, trailing commas, the line width the code actually respects. State the numbers you measured.\n" +
 		"2. Write %s encoding exactly those numbers, so the formatter is a no-op on code that already matches the project.\n" +
-		"3. Prove it: run the formatter in check mode over the whole tree and report how many files it would still change. A large number means the config does not describe this codebase — go back to step 1 and fix the config. Do NOT reformat the repo to match a guess.\n" +
-		"4. Only once step 3 is small: format the whole tree and commit that as ONE commit containing formatting and nothing else. If `git status` is not clean, skip this step and say so — a formatting commit must not sweep up someone's work in progress.\n" +
+		"3. Prove it: run the formatter in check mode over the whole tree and report how many files it would still change. A large number means the config does not describe this codebase: go back to step 1 and fix the config. Do NOT reformat the repo to match a guess.\n" +
+		"4. Only once step 3 is small: format the whole tree and commit that as ONE commit containing formatting and nothing else. If `git status` is not clean, skip this step and say so: a formatting commit must not sweep up someone's work in progress.\n" +
 		"\n" +
 		"SKILL-base.md (\"Formatter config\") has the exact config files and flags. Change no behavior anywhere in this task.\n"
 
@@ -84,11 +84,11 @@ func isEmptyProject(cwd string) bool {
 	return true
 }
 
-const emptyProjectHint = `[Note: this project directory is empty — no source files or build manifests were found. Before doing anything else, use the ask_user tool to confirm:
+const emptyProjectHint = `[Note: this project directory is empty: no source files or build manifests were found. Before doing anything else, use the ask_user tool to confirm:
 1. What language/framework should this project use? (Rust, Go, Node.js, Python, C, etc.)
 2. Which build runner do they prefer? (Cargo, go modules, npm/pnpm, just, Make)
 
-Only then create the appropriate skeleton — Cargo.toml for Rust, go.mod for Go, package.json for Node, justfile/Makefile otherwise — with sensible build/test/lint/format targets.]
+Only then create the appropriate skeleton (Cargo.toml for Rust, go.mod for Go, package.json for Node, justfile/Makefile otherwise) with sensible build/test/lint/format targets.]
 `
 
 type formatterNeed struct {
@@ -248,20 +248,19 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
 		var msg string
 		switch {
 		case !a.hasReachableLLM():
-			msg = "LLM not reachable — edit settings.toml, then click Retry"
+			msg = "LLM not reachable: edit settings.toml, then click Retry"
 		case a.mainSlotTokens.Load() == 0:
 			probed := "GET /v1/models and GET /props"
+			a.cfgMu.RLock()
 			if len(a.settings.LLM) > 0 {
 				c := &a.settings.LLM[0]
 				probed = "GET " + c.endpoint("/v1/models") + " and GET " + c.endpoint("/props")
 			}
-			where := a.settings.path
-			if where == "" {
-				where = "your settings.toml"
-			}
-			msg = fmt.Sprintf("LLM reachable but neither metadata endpoint reported a context size (n_ctx) — codehalter probed %s. It needs the model's context window to size compaction safely. Fix it one of two ways: (1) set `context_size = N` (the model's max prompt+output tokens) on the [[llm]] entry in %s — use this when your backend doesn't expose n_ctx; or (2) restart your server with the size on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`, llama-server: ensure /props is enabled). Then click Retry.", probed, where)
+			where := orElse(a.settings.path, "your settings.toml")
+			a.cfgMu.RUnlock()
+			msg = fmt.Sprintf("LLM reachable but neither metadata endpoint reported a context size (n_ctx): codehalter probed %s. It needs the model's context window to size compaction safely. Fix it one of two ways: (1) set `context_size = N` (the model's max prompt+output tokens) on the [[llm]] entry in %s, use this when your backend doesn't expose n_ctx; or (2) restart your server with the size on the launch command (llama.cpp: `-c N`, vLLM: `--max-model-len N`, llama-server: ensure /props is enabled). Then click Retry.", probed, where)
 		default:
-			msg = fmt.Sprintf("LLM reachable but per-slot context window is only %d tokens — codehalter requires at least %d. Restart your server with a larger `-c N` (llama.cpp) / `--max-model-len N` (vLLM), or reduce the `parallel` slot count in settings.toml, then click Retry.", a.mainSlotTokens.Load(), minSlotTokens)
+			msg = fmt.Sprintf("LLM reachable but per-slot context window is only %d tokens; codehalter requires at least %d. Restart your server with a larger `-c N` (llama.cpp) / `--max-model-len N` (vLLM), or reduce the `parallel` slot count in settings.toml, then click Retry.", a.mainSlotTokens.Load(), minSlotTokens)
 		}
 		_, tcId, err := a.askCard(ctx, sid, msg, "think", []permissionOption{{OptionId: "ack", Name: "Retry", Kind: "allow_once"}})
 		if err != nil {
@@ -307,8 +306,8 @@ func (a *agent) scaffoldSettings(ctx context.Context, cwd string, sid string) {
 func hashSettingsFiles(cwd string) string {
 	h := sha256.New()
 	written := false
-	if home, err := os.UserHomeDir(); err == nil {
-		if data, err := os.ReadFile(filepath.Join(home, ".config", "codehalter", "settings.toml")); err == nil {
+	if path, err := globalConfigPath("settings.toml"); err == nil {
+		if data, err := os.ReadFile(path); err == nil {
 			h.Write(data)
 			written = true
 		}
@@ -325,6 +324,8 @@ func hashSettingsFiles(cwd string) string {
 }
 
 func (a *agent) hasReachableLLM() bool {
+	a.cfgMu.RLock()
+	defer a.cfgMu.RUnlock()
 	for _, p := range a.connProbe {
 		if p.Reachable {
 			return true
@@ -334,13 +335,15 @@ func (a *agent) hasReachableLLM() bool {
 }
 
 func (a *agent) probeAllLLMs(ctx context.Context) {
+	a.cfgMu.RLock()
 	conns := slices.Clone(a.settings.LLM)
+	a.cfgMu.RUnlock()
 	a.mainSlotTokens.Store(0)
 	if len(conns) == 0 {
 		a.cfgMu.Lock()
 		a.connProbe = map[string]probeResult{}
 		a.cfgMu.Unlock()
-		a.imagesSupported = false
+		a.imagesSupported.Store(false)
 		return
 	}
 	results := make([]probeResult, len(conns))
@@ -356,11 +359,11 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	a.cfgMu.Lock()
 	a.connProbe = probes
 	a.setSettings(a.settings)
-	a.cfgMu.Unlock()
-
 	// LLM[0] holds the session's KV cache, so its per-slot window sizes compaction. A declared
 	// context_size or /v1/models' -c is a total and is divided by the slot count.
 	slots := a.settings.LLM[0].parallelCap()
+	a.cfgMu.Unlock()
+
 	switch {
 	case conns[0].ContextSize != nil && *conns[0].ContextSize > 0:
 		a.mainSlotTokens.Store(int64(*conns[0].ContextSize / slots))
@@ -374,11 +377,11 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	// Only LLM[0] consumes images, and ACP advertises one agent-wide image capability.
 	switch {
 	case conns[0].ImageSupport != nil:
-		a.imagesSupported = *conns[0].ImageSupport
+		a.imagesSupported.Store(*conns[0].ImageSupport)
 	case results[0].Reachable:
-		a.imagesSupported = results[0].ImageSupport
+		a.imagesSupported.Store(results[0].ImageSupport)
 	default:
-		a.imagesSupported = false
+		a.imagesSupported.Store(false)
 	}
 }
 
@@ -402,14 +405,18 @@ func connPurpose(conns []LLMConnection, i int) string {
 }
 
 func (a *agent) renderLLMStatus() string {
+	a.cfgMu.RLock()
 	conns := slices.Clone(a.settings.LLM)
+	path := a.settings.path
+	probes := a.connProbe
+	a.cfgMu.RUnlock()
 	var b strings.Builder
 	if len(conns) == 0 {
-		b.WriteString("🟡 LLM: no [[llm]] in settings.toml — codehalter cannot run until you add one.\n\n")
+		b.WriteString("🟡 LLM: no [[llm]] in settings.toml: codehalter cannot run until you add one.\n\n")
 		return b.String()
 	}
-	if len(a.settings.LLM) > 0 && a.settings.LLM[0].Model == "your-model-id" {
-		fmt.Fprintf(&b, "🟡 LLM: %s still has the placeholder model \"your-model-id\". Edit it with your real url and model, then click Retry below.\n\n", a.settings.path)
+	if conns[0].Model == "your-model-id" {
+		fmt.Fprintf(&b, "🟡 LLM: %s still has the placeholder model \"your-model-id\". Edit it with your real url and model, then click Retry below.\n\n", path)
 		return b.String()
 	}
 	firstReachable := -1
@@ -419,17 +426,18 @@ func (a *agent) renderLLMStatus() string {
 		if i > 0 && c.Tag != "" {
 			label += " " + c.Tag
 		}
-		if !a.connProbe[c.Server+"\x00"+c.Model].Reachable {
-			fmt.Fprintf(&b, "🟡 %s: unreachable at %s — start your server or fix the server url.\n\n", label, c.Server)
+		pr := probes[c.Server+"\x00"+c.Model]
+		if !pr.Reachable {
+			fmt.Fprintf(&b, "🟡 %s: unreachable at %s: start your server or fix the server url.\n\n", label, c.Server)
 			continue
 		}
 		// Gateways answer an unknown model id with an empty 200, so warn before a turn fails to parse.
-		if pr := a.connProbe[c.Server+"\x00"+c.Model]; pr.ModelKnown && !pr.ModelLoaded {
+		if pr.ModelKnown && !pr.ModelLoaded {
 			avail := "its model list came back empty"
 			if len(pr.AvailableModels) > 0 {
 				avail = "it offers: " + strings.Join(pr.AvailableModels, ", ")
 			}
-			fmt.Fprintf(&b, "🟡 %s: reachable at %s, but model `%s` isn't in its /v1/models list — requests may return an empty response. Check `model =` in settings.toml (%s). Harmless if your gateway lists models under different ids or doesn't enumerate them.\n\n", label, c.Server, c.Model, avail)
+			fmt.Fprintf(&b, "🟡 %s: reachable at %s, but model `%s` isn't in its /v1/models list, so requests may return an empty response. Check `model =` in settings.toml (%s). Harmless if your gateway lists models under different ids or doesn't enumerate them.\n\n", label, c.Server, c.Model, avail)
 			if firstReachable < 0 {
 				firstReachable = i
 			}
@@ -439,38 +447,32 @@ func (a *agent) renderLLMStatus() string {
 		// Roles differing in non-sampler params get two renderings, so every phase switch re-reads
 		// what the other role appended; the rewind detector only notices after the tokens are spent.
 		if think, exec := renderKey(c.paramsFor("thinking")), renderKey(c.paramsFor("execute")); think != exec {
-			show := func(k string) string {
-				if k == "" {
-					return "(none)"
-				}
-				return k
-			}
-			fmt.Fprintf(&b, "❕ %s: the two roles ask for different renderings — `params_thinking` %s vs `params_execute` %s. "+
+			fmt.Fprintf(&b, "❕ %s: the two roles ask for different renderings: `params_thinking` %s vs `params_execute` %s. "+
 				"Anything that is not a sampler is an argument to the chat template, so every plan ↔ execute switch re-evaluates "+
 				"whatever the other role appended in between. Make them agree, or keep the split deliberately if you have priced it.\n\n",
-				label, show(think), show(exec))
+				label, orElse(think, "(none)"), orElse(exec, "(none)"))
 		}
 		if firstReachable < 0 {
 			firstReachable = i
 		}
 	}
 	if firstReachable < 0 {
-		b.WriteString("🟡 No LLM reachable — every connection above failed. Codehalter cannot run any prompt until at least one comes back.\n\n")
+		b.WriteString("🟡 No LLM reachable: every connection above failed. Codehalter cannot run any prompt until at least one comes back.\n\n")
 		return b.String()
 	}
 	switch {
-	case a.imagesSupported:
+	case a.imagesSupported.Load():
 		b.WriteString("✅ Image support: enabled\n\n")
 	case conns[0].ImageSupport != nil:
 		b.WriteString("Image support: disabled (declared image_support = false in settings.toml)\n\n")
 	default:
-		b.WriteString("❕ Image support: undetected — codehalter assumed disabled. If your model accepts images, set `image_support = true` on the [[llm]] entry in settings.toml.\n\n")
+		b.WriteString("❕ Image support: undetected, codehalter assumed disabled. If your model accepts images, set `image_support = true` on the [[llm]] entry in settings.toml.\n\n")
 	}
 	switch mst := int(a.mainSlotTokens.Load()); {
 	case mst == 0:
-		b.WriteString("🟡 Context window: unknown — set `context_size = N` on the [[llm]] entry in settings.toml. For llama.cpp/vLLM you can also restart with the launch flag (`-c N` / `--max-model-len N`) so the probe discovers it.\n\n")
+		b.WriteString("🟡 Context window: unknown. Set `context_size = N` on the [[llm]] entry in settings.toml. For llama.cpp/vLLM you can also restart with the launch flag (`-c N` / `--max-model-len N`) so the probe discovers it.\n\n")
 	case mst < minSlotTokens:
-		fmt.Fprintf(&b, "🟡 Context window: only %d tokens/slot — codehalter requires at least %d. Raise `context_size` in settings.toml, increase your server's launch flag (`-c N` / `--max-model-len N`), or reduce `parallel`.\n\n", mst, minSlotTokens)
+		fmt.Fprintf(&b, "🟡 Context window: only %d tokens/slot; codehalter requires at least %d. Raise `context_size` in settings.toml, increase your server's launch flag (`-c N` / `--max-model-len N`), or reduce `parallel`.\n\n", mst, minSlotTokens)
 	default:
 		inputCap := mst * compactTriggerPct / 100
 		if pc := conns[0].parallelCap(); pc > 1 {
@@ -510,7 +512,7 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 				continue
 			}
 			if body := skillBody(sess.Cwd, name); body != "" {
-				sess.AddUser("[New skill available this session — " + name +
+				sess.AddUser("[New skill available this session: " + name +
 					". It enters the system prompt at the next history compaction; until then it's here.]\n\n" + body)
 				sess.promptSkills = append(sess.promptSkills, name)
 			}
@@ -600,7 +602,8 @@ func markCheckDone(cwd, name string) {
 	}
 }
 
-// The only MCP reconcile, before a turn: the `tools` array renders ahead of the conversation, so a mid-turn one breaks the prefix cache.
+// The only MCP reconcile, before a turn: the `tools` array renders ahead of the conversation,
+// so a changed server re-reads the whole context and a mid-turn change would break the prefix cache.
 func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) []fixProblem {
 	stopBeat := a.heartbeat(ctx, sid)
 	changes := a.reconcileMCP(ctx, sess.Cwd)
@@ -620,8 +623,7 @@ func (a *agent) checkMCP(ctx context.Context, sess *Session, sid string) []fixPr
 				prompt: fmt.Sprintf(cardMCPStartError, ch.name, ch.err),
 			})
 		case "started", "restarted":
-			// New tools enter the `tools` array, rendered ahead of the conversation, so the next
-			// call re-reads the whole context; say so, or it looks like an unexplained slow turn.
+			// Said out loud, or the re-read looks like an unexplained slow turn.
 			a.say(ctx, sid, fmt.Sprintf("✅ MCP server %q %s (%d tools). This turn re-reads its context once to pick them up.\n",
 				ch.name, ch.action, ch.tools))
 		case "stopped":
@@ -635,8 +637,11 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	var b strings.Builder
 
 	b.WriteString(versionBanner())
-	if a.settings.path != "" {
-		fmt.Fprintf(&b, " · settings: %s", a.settings.path)
+	a.cfgMu.RLock()
+	path := a.settings.path
+	a.cfgMu.RUnlock()
+	if path != "" {
+		fmt.Fprintf(&b, " · settings: %s", path)
 	}
 	b.WriteString("\n\n")
 	if tag := newerRelease(ctx, sess.Cwd); tag != "" {
@@ -647,15 +652,15 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	if kind := containerKind(); kind != "" {
 		fmt.Fprintf(&b, "✅ Container: %s\n\n", kind)
 	} else {
-		b.WriteString("🟡 Container: none (running on host — file edits and tasks hit your real filesystem)\n\n")
+		b.WriteString("🟡 Container: none (running on host: file edits and tasks hit your real filesystem)\n\n")
 	}
 	if _, err := findFirefox(); err == nil {
 		b.WriteString("✅ Firefox: found (web_search/web_read enabled)\n\n")
 	} else {
-		b.WriteString("🟡 Firefox: not found — web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
+		b.WriteString("🟡 Firefox: not found, web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
 	}
 	// Only reachable inside a container (ensureDevcontainer), where run_command is always registered.
-	b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only — destructive git commands fail at the FS layer)\n\n")
+	b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only, destructive git commands fail at the FS layer)\n\n")
 
 	if len(sess.knownStacks) > 0 {
 		fmt.Fprintf(&b, "Stacks: %s", strings.Join(sess.knownStacks, ", "))
@@ -707,7 +712,7 @@ func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
 		return
 	}
 	if !ok {
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped — fix it manually when convenient")})
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped: fix it manually when convenient")})
 		return
 	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Dispatching: " + p.prompt)})

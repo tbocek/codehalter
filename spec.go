@@ -429,7 +429,7 @@ func scanSpec(root string, patterns, context, skip []string) (*specIndex, error)
 		idx.docs = append(idx.docs, doc)
 		idx.indexDoc(di)
 	}
-	if context == nil {
+	if len(context) == 0 { // as specConfig.context reads it
 		context = defaultSpecContext(idx)
 	}
 	idx.addSectionItems(context, skip)
@@ -656,8 +656,6 @@ type specSlice struct {
 	Text    string
 	Related []string // spec paths (with #anchor) that were relevant but did not fit or belong to another item
 	Images  []string
-	// Reached holds the sectionKey of every section shown, for the "never reached" report.
-	Reached []string
 }
 
 func sectionKey(rel string, start int) string { return fmt.Sprintf("%s:%d", rel, start) }
@@ -717,16 +715,9 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 		title = it.Title
 	}
 	add(path(primary.doc)+" · "+title, primaryText)
-	out.Reached = append(out.Reached, sectionKey(idx.docs[primary.doc].rel, primary.start))
 	seenRel[sectionKey(idx.docs[primary.doc].rel, primary.start)] = true
 
-	var navFree []string
-	for i := primary.start; i < primary.end && i < len(idx.docs[primary.doc].lines); i++ {
-		if !idx.docs[primary.doc].navLine[i] {
-			navFree = append(navFree, idx.docs[primary.doc].lines[i])
-		}
-	}
-	body := strings.Join(navFree, "\n")
+	body := idx.textNoNav(primary.doc, primary.start, min(primary.end, len(idx.docs[primary.doc].lines)))
 
 	var rows []string
 	rowHeader := ""
@@ -739,7 +730,6 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 			rowHeader = idx.tableHeader(o.Doc, o.Line)
 		}
 		rows = append(rows, idx.docs[o.Doc].lines[o.Line])
-		out.Reached = append(out.Reached, sectionKey(idx.docs[o.Doc].rel, o.Line))
 	}
 	if len(rows) > 0 {
 		add("rows for the ids cited above", rowHeader+strings.Join(rows, "\n"))
@@ -803,7 +793,6 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 			continue
 		}
 		add(ref+" (linked)", text)
-		out.Reached = append(out.Reached, key)
 	}
 
 	for _, m := range specLinkRe.FindAllStringSubmatch(b.String(), -1) {

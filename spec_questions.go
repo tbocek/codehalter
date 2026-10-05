@@ -237,11 +237,8 @@ func appendSpecQuestion(specAbs, title string, q specQuestion) error {
 // end of a test run is enough to see why, and the file is read by a person.
 const specStuckStopped = 2000
 
-// specStuckQuestion turns an item that did not pass its attempts into a question
-// codehalter words itself, so it does not hang on the model asking well: the
-// item's spec line, what stopped it, and how it can go on. Nine of ten blocks in
-// one run had causes only the user could see were gone (a bug fixed, a tool
-// installed), and a blind retry every run would spend the attempts again.
+// specStuckQuestion words a stuck item's question in code: only the user can tell
+// whether its cause is gone.
 func specStuckQuestion(idx *specIndex, specDir, id, reason string) specQuestion {
 	q := specQuestion{ID: id, Question: "This item did not pass its attempts. How should the rounds go on?",
 		Stopped: clipUTF8(strings.TrimSpace(reason), specStuckStopped)}
@@ -259,10 +256,8 @@ func specStuckQuestion(idx *specIndex, specDir, id, reason string) specQuestion 
 	return q
 }
 
-// specQuestionFrom holds a /spec question to what makes it answerable without
-// opening the code: what to decide, the spec text that comes closest (found, not
-// claimed), and options that each show what the user would get. F2.2 asked
-// "side by side or stacked?" when the spec's toolbar line already said.
+// specQuestionFrom returns why the planner's question is not answerable from the
+// spec as asked, or "": a quote found in the spec and options with examples.
 func specQuestionFrom(p *planResult, specAbs string) (q specQuestion, wrong string) {
 	q = specQuestion{Question: strings.TrimSpace(p.Question), Quote: strings.TrimSpace(p.SpecQuote)}
 	for _, o := range p.Options {

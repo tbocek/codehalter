@@ -84,15 +84,6 @@ var legacyEraVersions = []string{"2024-11-05", "2025-03-26", "2025-06-18", "2025
 // For the rare legacy server that ignores pre-initialize traffic instead of answering -32601.
 var mcpProbeTimeout = 5 * time.Second
 
-// Per spec, one of these during the era probe means a modern server: never fall back on it.
-func isModernRPCError(err error) bool {
-	var rpc *mcpRPCError
-	if !errors.As(err, &rpc) {
-		return false
-	}
-	return rpc.Code == mcpErrHeaderMismatch || rpc.Code == mcpErrMissingCapability || rpc.Code == mcpErrUnsupportedVersion
-}
-
 type mcpTransport interface {
 	send(ctx context.Context, req mcpRequest) (mcpResponse, error)
 	notify(ctx context.Context, n mcpNotification) error
@@ -118,7 +109,7 @@ const mcpStartTimeout = 30 * time.Second
 
 func StartMCPClient(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPClient, error) {
 	if cfg.Command != "" && cfg.URL != "" {
-		return nil, fmt.Errorf("mcp config %q sets both command and url — pick one", cfg.Name)
+		return nil, fmt.Errorf("mcp config %q sets both command and url: pick one", cfg.Name)
 	}
 	var t mcpTransport
 	switch {
@@ -158,6 +149,7 @@ func (c *MCPClient) detectEra(ctx context.Context) error {
 	probeCtx, cancel := context.WithTimeout(ctx, mcpProbeTimeout)
 	raw, err := c.send(probeCtx, "server/discover", nil, nil)
 	cancel()
+	var rpc *mcpRPCError
 	switch {
 	case err == nil:
 		var disc struct {
@@ -167,10 +159,9 @@ func (c *MCPClient) detectEra(ctx context.Context) error {
 			return nil
 		}
 		// A DiscoverResult without our version: dual-era on another revision, use the handshake.
-	case isModernRPCError(err):
-		// Modern server: fall back only if it lists a legacy revision (dual-era).
-		var rpc *mcpRPCError
-		errors.As(err, &rpc)
+	// Per spec, one of these codes means a modern server: never fall back on it,
+	// unless it lists a legacy revision (dual-era).
+	case errors.As(err, &rpc) && (rpc.Code == mcpErrHeaderMismatch || rpc.Code == mcpErrMissingCapability || rpc.Code == mcpErrUnsupportedVersion):
 		if rpc.Code != mcpErrUnsupportedVersion || !supportsLegacyEra(rpc.Data) {
 			return fmt.Errorf("no protocol version in common (client speaks %s and %s): %w", mcpModernVersion, mcpLegacyVersion, err)
 		}
@@ -182,7 +173,7 @@ func (c *MCPClient) detectEra(ctx context.Context) error {
 	_, err = c.send(ctx, "initialize", map[string]any{
 		"protocolVersion": mcpLegacyVersion,
 		"capabilities":    map[string]any{},
-		"clientInfo":      map[string]any{"name": "codehalter", "version": "0.1.0"},
+		"clientInfo":      map[string]any{"name": "codehalter", "version": version},
 	}, nil)
 	if err == nil {
 		err = c.transport.notify(ctx, mcpNotification{
@@ -220,7 +211,7 @@ func (c *MCPClient) send(ctx context.Context, method string, params map[string]a
 		// Empty capabilities: codehalter serves no sampling, elicitation or roots.
 		p["_meta"] = map[string]any{
 			"io.modelcontextprotocol/protocolVersion":    mcpModernVersion,
-			"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "codehalter", "version": "0.1.0"},
+			"io.modelcontextprotocol/clientInfo":         map[string]any{"name": "codehalter", "version": version},
 			"io.modelcontextprotocol/clientCapabilities": map[string]any{},
 		}
 		params = p
@@ -764,11 +755,11 @@ func collectHeaderParams(schema map[string]any) ([]mcpHeaderParam, error) {
 			if typ != "string" && typ != "integer" && typ != "boolean" {
 				return fmt.Errorf("x-mcp-header %q at %q: type %q not allowed (string/integer/boolean only)", name, strings.Join(path, "."), typ)
 			}
-			if lower := strings.ToLower(name); seen[lower] {
+			lower := strings.ToLower(name)
+			if seen[lower] {
 				return fmt.Errorf("x-mcp-header %q: duplicate (case-insensitive)", name)
-			} else { //nolint:revive // symmetric with the check above
-				seen[lower] = true
 			}
+			seen[lower] = true
 			out = append(out, mcpHeaderParam{header: name, path: slices.Clone(path), typ: typ})
 		}
 		for k, v := range node {
@@ -908,12 +899,12 @@ type mcpChange struct {
 // stdio children are started without a context and would outlive codehalter. Closed outside
 // the lock, under a deadline, so a wedged server cannot hang exit.
 func (a *agent) shutdownMCP() {
+	// mcp.mu waits out a reconcile in flight, whose new client would otherwise outlive us.
 	a.mcp.mu.Lock()
-	clients := make([]*MCPClient, 0, len(a.mcp.clients))
-	for _, c := range a.mcp.clients {
-		clients = append(clients, c)
-	}
+	a.mu.Lock()
+	clients := slices.Collect(maps.Values(a.mcp.clients))
 	a.mcp.clients = nil
+	a.mu.Unlock()
 	a.mcp.mu.Unlock()
 	if len(clients) == 0 {
 		return
@@ -1000,7 +991,7 @@ func (a *agent) askMCPImport(ctx context.Context, sid string, fresh []acpMCPServ
 		if s.URL != "" {
 			summary = "http " + s.URL
 		}
-		options = append(options, map[string]any{"const": s.Name, "title": s.Name + " — " + summary})
+		options = append(options, map[string]any{"const": s.Name, "title": s.Name + ": " + summary})
 	}
 	raw, err := a.conn.sendRequest(ctx, "elicitation/create", map[string]any{
 		"sessionId": sid,
@@ -1128,42 +1119,58 @@ func appendFile(path, body string) error {
 	return f.Close()
 }
 
-// Never called mid-turn: registering tools rewrites the `tools` array the conversation is
-// rendered behind. Restarts are start-then-stop, so a bad config never kills a working server.
+// readMCPConfig returns a zero mtime and no error when the file does not exist.
+func readMCPConfig(path string) ([]MCPServerConfig, time.Time, error) {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return nil, time.Time{}, nil
+	}
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	var f struct {
+		Server []MCPServerConfig `toml:"server"`
+	}
+	if _, err := toml.DecodeFile(path, &f); err != nil {
+		return nil, info.ModTime(), fmt.Errorf("loading %s: %w", path, err)
+	}
+	return f.Server, info.ModTime(), nil
+}
+
+// startMCPServer starts one server and lists its tools; the stdio transport has no
+// timeout of its own, so a hung server comes back as failed.
+func startMCPServer(ctx context.Context, cfg MCPServerConfig, cwd string) (*MCPClient, error) {
+	startCtx, cancel := context.WithTimeout(ctx, mcpStartTimeout)
+	defer cancel()
+	c, err := StartMCPClient(startCtx, cfg, cwd)
+	if err != nil {
+		return nil, err
+	}
+	tools, err := c.listTools(startCtx)
+	if err != nil {
+		c.Close()
+		return nil, fmt.Errorf("tools/list: %w", err)
+	}
+	c.tools = c.vetTools(tools)
+	return c, nil
+}
+
+// Only checkMCP calls this. Restarts are start-then-stop, so a bad config never kills
+// a working server.
 func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 	a.mcp.mu.Lock()
 	defer a.mcp.mu.Unlock()
 
-	path := mcpConfigPath(cwd)
-	var cfgs []MCPServerConfig
-	var mtime time.Time
-	var err error
-	if info, serr := os.Stat(path); serr == nil {
-		mtime = info.ModTime()
-		var f struct {
-			Server []MCPServerConfig `toml:"server"`
-		}
-		if _, derr := toml.DecodeFile(path, &f); derr != nil {
-			err = fmt.Errorf("loading %s: %w", path, derr)
-		} else {
-			cfgs = f.Server
-		}
-	} else if !os.IsNotExist(serr) {
-		err = serr
-	}
-	if err != nil {
-		// Reported once per mtime, not on every prompt.
-		if !mtime.IsZero() && mtime.Equal(a.mcp.appliedMtime) {
-			return nil
-		}
-		a.mcp.appliedMtime = mtime
-		return []mcpChange{{action: "parse_error", err: err}}
-	}
-	// Unchanged file: a failed start is retried only after an edit bumps the mtime.
+	cfgs, mtime, err := readMCPConfig(mcpConfigPath(cwd))
+	// An unchanged file is not diffed again (see mcpState.applied), and a parse error
+	// is reported once per mtime.
 	if !mtime.IsZero() && mtime.Equal(a.mcp.appliedMtime) {
 		return nil
 	}
 	a.mcp.appliedMtime = mtime
+	if err != nil {
+		return []mcpChange{{action: "parse_error", err: err}}
+	}
 
 	// Last write wins on duplicate names.
 	desired := make(map[string]MCPServerConfig, len(cfgs))
@@ -1192,28 +1199,14 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 			continue
 		}
 
-		// The stdio transport has no timeout of its own; a hung server is recorded as failed.
-		startCtx, cancel := context.WithTimeout(ctx, mcpStartTimeout)
-		newClient, err := StartMCPClient(startCtx, want, cwd)
+		newClient, err := startMCPServer(ctx, want, cwd)
 		if err != nil {
-			cancel()
 			if ctx.Err() == nil { // a start the user stopped is not a failure; the next prompt retries it
 				changes = append(changes, mcpChange{action: "failed", name: name, err: err})
 			}
 			continue
 		}
-		tools, err := newClient.listTools(startCtx)
-		cancel()
-		if err != nil {
-			newClient.Close()
-			if ctx.Err() == nil {
-				changes = append(changes, mcpChange{action: "failed", name: name, err: fmt.Errorf("tools/list: %w", err)})
-			}
-			continue
-		}
-		tools = newClient.vetTools(tools)
-
-		newClient.tools = tools
+		tools := newClient.tools
 
 		a.mu.Lock()
 		if a.mcp.clients == nil {
@@ -1255,8 +1248,7 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 	if ctx.Err() != nil {
 		a.mcp.appliedMtime = time.Time{}
 	}
-	// Recorded from what runs, not from the file: a failed or stopped start or
-	// restart is retried at the next reconcile.
+	// From what runs, not from the file (see mcpState.applied).
 	a.mcp.applied = a.mcp.applied[:0]
 	a.mu.Lock()
 	for _, c := range a.mcp.clients {

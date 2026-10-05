@@ -157,7 +157,7 @@ func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
 	}
 	for _, want := range []string{"PLAN_SENTINEL", "EXEC_SENTINEL"} {
 		if !strings.Contains(sp, want) {
-			t.Errorf("system prompt missing %q — phase guidance not carried in the prefix", want)
+			t.Errorf("system prompt missing %q: phase guidance not carried in the prefix", want)
 		}
 	}
 }
@@ -265,7 +265,7 @@ func TestSetSessionTitleAnnouncesOnce(t *testing.T) {
 	h.agent.setSessionTitle(context.Background(), h.sess, "Wire up the MCP import")
 	h.waitFor(func() bool { return len(h.updatesOfKind("session_info_update")) > 1 })
 	if n := len(h.updatesOfKind("session_info_update")); n != 1 {
-		t.Errorf("sent %d session_info_updates, want 1 — the title didn't change", n)
+		t.Errorf("sent %d session_info_updates, want 1: the title didn't change", n)
 	}
 }
 
@@ -316,13 +316,7 @@ func TestReplanCarriesFailureDigest(t *testing.T) {
 		sseText("done, I think"), sseText("still done"), // no respond: the subtask fails
 		sseToolCall("p2", respondToolName, `{"message":"nothing more to do"}`),
 	)
-	a.tools.add(Tool{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "read_file", "description": "read", "parameters": map[string]any{"type": "object"}}},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			return "fn a() {}", false
-		},
-	})
+	a.tools.add(fakeTool("read_file", func(string) (string, bool) { return "fn a() {}", false }))
 	s.AddUser("change a.rs")
 	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
 		t.Fatal(err)
@@ -332,6 +326,75 @@ func TestReplanCarriesFailureDigest(t *testing.T) {
 		if !strings.Contains(replan, want) {
 			t.Errorf("the replan request lacks %q", want)
 		}
+	}
+}
+
+func TestFailureDigest(t *testing.T) {
+	read := ToolUse{Name: "read_file", Input: `{"path":"a.rs"}`, Output: "fn a() {}"}
+	edit := ToolUse{Name: "edit_file", Input: `{"path":"src/a.rs"}`, Output: "file written successfully"}
+	refused := ToolUse{Name: "edit_file", Input: `{"path":"src/b.rs"}`, Output: "error: old_text not found in src/b.rs"}
+	build := ToolUse{Name: "run_command", Input: `{"command":"cargo build"}`, Output: "exit 0\n\nFinished the dev profile in 2.3 seconds"}
+	sedI := ToolUse{Name: "run_command", Input: `{"command":"sed -i s/a/b/ x.rs"}`, Output: "exit 0", Changed: true}
+	label := func(l string) ToolUse {
+		return ToolUse{Name: "run_command", Input: fmt.Sprintf(`{"command":"echo %s; grep -n prompt spec.md"}`, l),
+			Output: "exit 0\n\n" + l + "\n12:the prompt is assembled from the spec slice"}
+	}
+	var hunt []ToolUse
+	for i := range 20 {
+		hunt = append(hunt, ToolUse{Name: "read_file", Input: fmt.Sprintf(`{"path":"f%d.rs"}`, i), Output: fmt.Sprintf("file %d", i)})
+	}
+	for _, tc := range []struct {
+		name      string
+		uses      []ToolUse
+		want, not []string
+	}{
+		{"reads only", []ToolUse{read, read, read},
+			[]string{"3 tool calls, 3 of them reads or searches, 0 edits, 0 commands run.", "It changed no file.", "Repeated: `read_file {\"path\":\"a.rs\"}` 3 times."}, nil},
+		{"a refused edit is no edit", []ToolUse{edit, refused, build},
+			[]string{"3 tool calls, 0 of them reads or searches, 1 edits, 1 commands run.", "Files changed through edits: src/a.rs."}, []string{"src/b.rs", "Repeated"}},
+		{"a shell write is an edit and a run", []ToolUse{sedI},
+			[]string{"1 edits, 1 commands run."}, []string{"It changed no file.", "Files changed"}},
+		{"the same answer under new labels", []ToolUse{label("one"), label("two"), label("three")},
+			[]string{"Repeated: `echo one; grep -n prompt spec.md` 3 times."}, nil},
+		{"a long hunt", hunt, []string{"It kept looking things up"}, []string{"Repeated"}},
+	} {
+		got := failureDigest(tc.uses)
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: digest lacks %q:\n%s", tc.name, w, got)
+			}
+		}
+		for _, n := range tc.not {
+			if strings.Contains(got, n) {
+				t.Errorf("%s: digest has %q:\n%s", tc.name, n, got)
+			}
+		}
+	}
+}
+
+// The same failure again tells the replan to change approach; at maxReplans the
+// turn stops without another planner call.
+func TestOrchestrateRepeatedFailureAndReplanBudget(t *testing.T) {
+	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`)
+	// An executor revising the plan to nothing fails its subtask in one call, the same way each time.
+	fail := sseToolCall("e", submitPlanToolName, `{"clear":true,"subtasks":[]}`)
+	var resp []string
+	for range maxReplans {
+		resp = append(resp, plan, fail)
+	}
+	a, s, mock := planPhaseAgent(t, resp...)
+	s.AddUser("change a.rs")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := mock.callCount(); got != 2*maxReplans {
+		t.Errorf("%d model calls, want %d: the budget stops before another plan", got, 2*maxReplans)
+	}
+	if first := fmt.Sprint(mock.request(2)["messages"]); !strings.Contains(first, "REPLAN: prior subtask failed: executor called submit_plan with no usable subtasks") || strings.Contains(first, "Same failure") {
+		t.Errorf("the first replan should carry the failure and no repeat note")
+	}
+	if second := fmt.Sprint(mock.request(4)["messages"]); !strings.Contains(second, "Same failure has surfaced 2 times") {
+		t.Errorf("the second replan of the same failure lacks the repeat note")
 	}
 }
 

@@ -127,9 +127,6 @@ func (c *LLMConnection) paramsFor(role string) map[string]any {
 	return c.Params
 }
 
-// Roles never differ in chat_template_kwargs: that re-renders the prompt and re-prefills
-// on every plan/execute switch. See withThinkingDisabled and res/settings.toml.
-
 func (c *LLMConnection) endpoint(path string) string {
 	return strings.TrimRight(c.Server, "/") + path
 }
@@ -151,8 +148,8 @@ type settingsSource struct {
 
 func settingsSources(cwd string) []settingsSource {
 	out := []settingsSource{{Path: filepath.Join(cwd, sessionDir, "settings.toml"), Scope: "project"}}
-	if home, err := os.UserHomeDir(); err == nil {
-		out = append(out, settingsSource{Path: filepath.Join(home, ".config", "codehalter", "settings.toml"), Scope: "global"})
+	if path, err := globalConfigPath("settings.toml"); err == nil {
+		out = append(out, settingsSource{Path: path, Scope: "global"})
 	}
 	claimed := false
 	for i := range out {
@@ -177,13 +174,13 @@ func renderSettingsSources(cwd string) string {
 			found = true
 			fmt.Fprintf(&b, "✅ in use: `%s` (%s)\n\n", src.Path, src.Scope)
 		case src.Exists:
-			fmt.Fprintf(&b, "❕ shadowed: `%s` (%s) — the file above wins, this one is never read.\n\n", src.Path, src.Scope)
+			fmt.Fprintf(&b, "❕ shadowed: `%s` (%s): the file above wins, this one is never read.\n\n", src.Path, src.Scope)
 		default:
 			fmt.Fprintf(&b, "· absent: `%s` (%s)\n\n", src.Path, src.Scope)
 		}
 	}
 	if !found {
-		b.WriteString("🟡 No settings.toml at either path — codehalter cannot run a turn until one exists.\n\n")
+		b.WriteString("🟡 No settings.toml at either path: codehalter cannot run a turn until one exists.\n\n")
 	}
 	return b.String()
 }
@@ -198,12 +195,20 @@ func loadSettings(cwd string) (Settings, error) {
 	return Settings{}, nil
 }
 
-func loadGlobalSettings() (Settings, error) {
+// globalConfigPath is ~/.config/codehalter/<name>.
+func globalConfigPath(name string) (string, error) {
 	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "codehalter", name), nil
+}
+
+func loadGlobalSettings() (Settings, error) {
+	globalPath, err := globalConfigPath("settings.toml")
 	if err != nil {
 		return Settings{}, err
 	}
-	globalPath := filepath.Join(home, ".config", "codehalter", "settings.toml")
 	if _, err := os.Stat(globalPath); err != nil {
 		return Settings{}, fmt.Errorf("no global settings.toml at %s", globalPath)
 	}
@@ -217,21 +222,20 @@ type GlobalConfig struct {
 
 func loadGlobalConfig() GlobalConfig {
 	var g GlobalConfig
-	home, err := os.UserHomeDir()
+	path, err := globalConfigPath("global.toml")
 	if err != nil {
 		slog.Warn("loadGlobalConfig: no home directory; optional host mounts disabled", "err", err)
 		return g
 	}
-	path := filepath.Join(home, ".config", "codehalter", "global.toml")
 	md, err := toml.DecodeFile(path, &g)
 	if err != nil {
 		if !os.IsNotExist(err) {
-			slog.Warn("loadGlobalConfig: unreadable global config (ignored — optional host mounts disabled)", "file", path, "err", err)
+			slog.Warn("loadGlobalConfig: unreadable global config (ignored, optional host mounts disabled)", "file", path, "err", err)
 		}
 		return GlobalConfig{}
 	}
 	for _, key := range md.Undecoded() {
-		slog.Warn("unknown global config key (ignored — check for a typo)", "key", key.String(), "file", path)
+		slog.Warn("unknown global config key (ignored, check for a typo)", "key", key.String(), "file", path)
 	}
 	return g
 }
@@ -245,11 +249,11 @@ func decodeSettings(path string) (Settings, error) {
 	// BurntSushi silently drops unknown keys, so a typo like `url` would otherwise
 	// surface much later as an opaque probe error.
 	for _, key := range md.Undecoded() {
-		slog.Warn("unknown settings key (ignored — check for a typo)", "key", key.String(), "file", path)
+		slog.Warn("unknown settings key (ignored, check for a typo)", "key", key.String(), "file", path)
 	}
 	for i := range s.LLM {
 		if p := s.LLM[i].Purpose; p != "" && !strings.EqualFold(p, purposeSummary) {
-			slog.Warn("unknown llm purpose (ignored — the only valid value is \"summary\")", "purpose", p, "llm", i, "file", path)
+			slog.Warn("unknown llm purpose (ignored, the only valid value is \"summary\")", "purpose", p, "llm", i, "file", path)
 		}
 	}
 	s.path = path

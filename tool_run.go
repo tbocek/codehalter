@@ -244,8 +244,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	select {
 	case res := <-job.exited:
 		out, oerr := a.terminalOutput(ctx, sid, job.terminalId)
-		a.terminalRelease(sid, job.terminalId)
-		a.forgetBgJob(job)
+		a.endJob(job)
 		if res.err != nil {
 			// -1 tells "never got to finish" apart from a real exit 1.
 			a.FailToolCall(ctx, sid, job.tcId, res.err.Error())
@@ -264,8 +263,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 			slog.Debug("run_command: output read after cancel failed", "job", job.id, "err", oerr)
 		}
 		a.killJob(job)
-		a.terminalRelease(sid, job.terminalId)
-		a.forgetBgJob(job)
+		a.endJob(job)
 		a.FailToolCall(ctx, sid, job.tcId, ctx.Err().Error())
 		return fmt.Sprintf("exit -1\n\n%s\n[terminal error: %s]\n", boundedCapture(out), ctx.Err()), false
 	case <-time.After(cmdHandoverWait):
@@ -277,8 +275,8 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 	return hint() + "\n" + fmt.Sprintf("still running after %s: it continues as background job %d (pid %d), nothing was killed. "+
 		"When it exits, codehalter hands you its exit code and last output by itself, before your next step.%s "+
 		"Do other work meanwhile if there is any; if not, call `respond` saying you are waiting for job %d: that parks the turn, it does not end it, and you continue here the moment the job reports. "+
-		"Never sleep or poll for it. Read its output any time with `run_command: cat %s`; stop it with `run_command: kill -TERM -%d; sleep 3; kill -KILL -%d 2>/dev/null; true` (the whole job; here a plain kill can be ignored). Output so far:\n\n%s",
-		waited, job.id, job.pid, wake, job.id, job.logPath, job.pid, job.pid, readLogTail(job.logPath, bgLogTailCap)), false
+		"Never sleep or poll for it. Read its output any time with `run_command: cat %s`; %s. Output so far:\n\n%s",
+		waited, job.id, job.pid, wake, job.id, job.logPath, stopHint(job.pid), readLogTail(job.logPath, bgLogTailCap)), false
 }
 
 // toolHints returns (note for the model, chat line for the user). There are

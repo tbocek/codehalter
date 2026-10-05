@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"embed"
-	"encoding/base64"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -49,9 +48,10 @@ var defaultSettingsTOML string
 var defaultMCPToml string
 
 type agent struct {
-	// mu guards cancel, sessions, mode, abortReason, clientCaps and the probe-derived LLM fields.
+	// mu guards cancel, sessions, mode, abortReason, clientCaps, emptyProject, indexDone
+	// and mcp.clients.
 	mu sync.Mutex
-	// cfgMu guards settings and connSems, which prepare reassigns while a prior turn's
+	// cfgMu guards settings, connSems and connProbe, which prepare reassigns while a prior turn's
 	// goroutine reads them. A leaf: never held across a blocking call or while taking a.mu or sess.mu.
 	cfgMu        sync.RWMutex
 	conn         *AgentSideConnection
@@ -59,8 +59,9 @@ type agent struct {
 	sessions     map[string]*Session
 	settings     Settings
 	emptyProject bool
-	indexDone    chan struct{}
-	mode         string // "Interactive" | "Autopilot"
+	// indexDone is the latest session's startup; read it through startupDone.
+	indexDone chan struct{}
+	mode      string // "Interactive" | "Autopilot"
 	// asking counts questions waiting on the user (a card or a form): a prompt
 	// during startup is refused only while startup asks, and waits otherwise.
 	asking atomic.Int32
@@ -81,7 +82,7 @@ type agent struct {
 	// background llmStream reads it while the next turn's probe rewrites it.
 	mainSlotTokens atomic.Int64
 
-	imagesSupported bool
+	imagesSupported atomic.Bool
 
 	clientCaps ClientCapabilities
 
@@ -108,13 +109,14 @@ type agent struct {
 }
 
 type mcpState struct {
-	// mu guards the group across reconcileMCP's whole diff/start/stop sequence.
+	// mu serializes reconcileMCP and shutdownMCP. clients is under agent.mu instead,
+	// so notifyCapabilities need not wait out a slow server start.
 	mu      sync.Mutex
 	clients map[string]*MCPClient
-	// applied excludes servers that failed to start, so the next reconcile retries them.
-	applied []MCPServerConfig
-	// Unchanged mtime skips the diff, which also stops a broken server from
-	// re-emitting its failed card on every prompt.
+	// applied holds only the servers that run, so the next diff retries a failed
+	// start. The diff runs only when the mtime changed, so a broken server does not
+	// re-emit its failed card on every prompt.
+	applied      []MCPServerConfig
 	appliedMtime time.Time
 }
 
@@ -171,20 +173,20 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 		a.cfgMu.Lock()
 		a.setSettings(gs)
 		a.cfgMu.Unlock()
-		if conn := a.settings.ConnAt(0, "execute"); conn != nil {
+		if conn := a.connFor("execute"); conn != nil {
 			// The setting wins: a server without /props (Halogen) cannot report
 			// vision, and the client learns image support only here.
 			if conn.ImageSupport != nil {
-				a.imagesSupported = *conn.ImageSupport
+				a.imagesSupported.Store(*conn.ImageSupport)
 			} else {
-				a.imagesSupported = probeLLM(ctx, conn).ImageSupport
+				a.imagesSupported.Store(probeLLM(ctx, conn).ImageSupport)
 			}
 		}
 	}
 	var res InitializeResponse
 	res.ProtocolVersion = protocolVersion
 	res.AgentCapabilities.LoadSession = true
-	res.AgentCapabilities.PromptCapabilities.Image = a.imagesSupported
+	res.AgentCapabilities.PromptCapabilities.Image = a.imagesSupported.Load()
 	res.AgentCapabilities.PromptCapabilities.EmbeddedContext = true
 	res.AgentCapabilities.MCPCapabilities.HTTP = true
 	res.AgentCapabilities.SessionCapabilities = &struct {
@@ -254,48 +256,9 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 	if substituted {
 		a.say(ctx, req.SessionId, fmt.Sprintf("Started a new session: the workspace this thread was created in (%s) isn't available here, so there was nothing to restore.\n\n", req.Cwd))
 	}
-	s, err := loadSession(cwd, req.SessionId)
-	switch {
-	case os.IsNotExist(err):
-		slog.Debug("LoadSession: not found, treating as new", "sid", req.SessionId)
-		// Zed loads ids from a session/new that never saved and ignores a
-		// sessionId we send back, so accept the id or prompts won't route.
-		s = newSessionWithID(cwd, req.SessionId)
-	case err != nil:
-		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
-	}
-	if err := a.initSession(cwd, s, req.McpServers); err != nil {
+	s, err := a.restoreSession(ctx, cwd, req.SessionId, req.McpServers)
+	if err != nil {
 		return LoadSessionResponse{}, err
-	}
-	// Otherwise a reload labels the thread with its id.
-	if s.Title != "" {
-		a.sendUpdate(ctx, req.SessionId, sessionInfoUpdate{Kind: "session_info_update", Title: s.Title})
-	}
-	// An empty chunk of the opposite role separates two same-role messages, or
-	// Zed merges them into one turn.
-	lastRole := ""
-	for _, m := range s.Messages {
-		if m.Role == lastRole {
-			if m.Role == "user" {
-				a.say(ctx, req.SessionId, "")
-			} else {
-				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: ""}})
-			}
-		}
-		if m.Role == "user" {
-			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: m.Content}})
-			for _, img := range m.Images {
-				data, mime, err := readImageFile(s.Cwd, img.ID)
-				if err != nil {
-					a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[image %s missing on disk]", img.ID)}})
-					continue
-				}
-				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}})
-			}
-		} else {
-			a.say(ctx, req.SessionId, m.Content)
-		}
-		lastRole = m.Role
 	}
 	a.startIndexing(s.ID, cwd)
 	return LoadSessionResponse{Modes: a.sessionModes()}, nil
@@ -425,16 +388,18 @@ func (a *agent) initSession(cwd string, s *Session, mcpOffer []acpMCPServer) (er
 
 // Devcontainer first: the gitignore prompt assumes a sandbox.
 func (a *agent) startIndexing(sid string, cwd string) {
-	a.indexDone = make(chan struct{})
+	// The goroutine closes its own channel: a second session may replace a.indexDone meanwhile.
+	done := make(chan struct{})
+	// Lets Cancel reach a fix card prepare dispatches. One slot, last writer wins.
+	ctx, cancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.indexDone = done
+	a.cancel = cancel
+	a.mu.Unlock()
 	slog.Debug("startIndexing: spawning bootstrap goroutine", "sid", sid, "cwd", cwd)
 	go func() {
-		defer close(a.indexDone)
+		defer close(done)
 		defer slog.Debug("startIndexing: bootstrap goroutine done", "sid", sid)
-		// Lets Cancel reach a fix card prepare dispatches. One slot, last writer wins.
-		ctx, cancel := context.WithCancel(context.Background())
-		a.mu.Lock()
-		a.cancel = cancel
-		a.mu.Unlock()
 		defer cancel()
 
 		// Zed registers the session only after reading our session/new response
@@ -478,6 +443,13 @@ func (a *agent) startIndexing(sid string, cwd string) {
 	}()
 }
 
+// startupDone is closed once the latest session's startup has finished; nil before any.
+func (a *agent) startupDone() chan struct{} {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.indexDone
+}
+
 func (a *agent) sessionModes() *SessionModeState {
 	a.mu.Lock()
 	current := a.mode
@@ -490,7 +462,7 @@ func (a *agent) sessionModes() *SessionModeState {
 			Description string `json:"description,omitempty"`
 		}{
 			{Id: "Interactive", Name: "Interactive", Description: "Ask before setup and anything outside the container"},
-			{Id: "Autopilot", Name: "Autopilot", Description: "Auto-answer prompts — no user interruption"},
+			{Id: "Autopilot", Name: "Autopilot", Description: "Auto-answer prompts: no user interruption"},
 		},
 	}
 }

@@ -163,13 +163,14 @@ func stdinIsTTY() bool {
 	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
 
-// openCLILog returns nil on failure: a read-only project should lose the log, not the run.
+// openCLILog truncates: the log covers one run. nil on failure: a read-only project
+// should lose the log, not the run.
 func openCLILog(cwd string) *os.File {
 	dir := filepath.Join(cwd, ".codehalter")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "cli.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND|os.O_TRUNC, 0o644)
+	f, err := os.OpenFile(filepath.Join(dir, "cli.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		return nil
 	}

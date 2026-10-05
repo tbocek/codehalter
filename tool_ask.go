@@ -187,7 +187,7 @@ var askUserTool = Tool{Def: map[string]any{
 	switch {
 	case errors.Is(err, errNoFreeText):
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("This editor has no free-text prompt")})
-		return "error: this editor cannot show a free-text prompt — ask again with `options`", false
+		return "error: this editor cannot show a free-text prompt; ask again with `options`", false
 	case errors.Is(err, errPermissionCancelled):
 		// Not a tool failure: the user just closed the form.
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("No answer")})
@@ -198,7 +198,7 @@ var askUserTool = Tool{Def: map[string]any{
 	}
 	if answer == "" || answer == "abort" {
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("No answer")})
-		return "no answer given — use your own judgement and continue", false
+		return "no answer given; use your own judgement and continue", false
 	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User answered: " + answer)})
 	return "user answered: " + answer, false

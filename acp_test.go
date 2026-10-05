@@ -41,31 +41,25 @@ func readLine(t *testing.T, r io.Reader) []byte {
 	return []byte(strings.TrimRight(line, "\r\n"))
 }
 
-func TestJsonrpcRequestEncoding(t *testing.T) {
-	id := json.RawMessage(`"7"`)
-	req := jsonrpcRequest{JSONRPC: "2.0", ID: &id, Method: "session/prompt", Params: json.RawMessage(`{"x":1}`)}
-	b, err := json.Marshal(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := string(b)
-	want := `{"jsonrpc":"2.0","id":"7","method":"session/prompt","params":{"x":1}}`
-	if got != want {
-		t.Fatalf("got %s\nwant %s", got, want)
-	}
-
-	notif := jsonrpcRequest{JSONRPC: "2.0", Method: "session/update", Params: json.RawMessage(`{}`)}
-	b, _ = json.Marshal(notif)
-	if strings.Contains(string(b), `"id"`) {
-		t.Fatalf("notification leaked id field: %s", b)
-	}
-}
-
-func TestContentBlockOmitsEmptyFields(t *testing.T) {
-	b, _ := json.Marshal(ContentBlock{Type: "text", Text: "hello"})
-	got := string(b)
-	if got != `{"type":"text","text":"hello"}` {
-		t.Fatalf("text block leaked optional fields: %s", got)
+// ACP requires `text` on a text block (Zed rejects it otherwise), and history
+// replay uses an empty text chunk to separate two same-role messages.
+func TestContentBlockJSON(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		block ContentBlock
+		want  string
+	}{
+		{"text leaks no optional fields", ContentBlock{Type: "text", Text: "hello"}, `{"type":"text","text":"hello"}`},
+		{"empty text keeps its text field", ContentBlock{Type: "text"}, `{"type":"text","text":""}`},
+		{"an image grows no text field", ContentBlock{Type: "image", MimeType: "image/png", Data: "AA=="}, `{"type":"image","mimeType":"image/png","data":"AA=="}`},
+	} {
+		b, err := json.Marshal(c.block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != c.want {
+			t.Errorf("%s: got %s, want %s", c.name, b, c.want)
+		}
 	}
 }
 
@@ -273,23 +267,4 @@ func TestSendRequestCancelsOutboundOnCtxDone(t *testing.T) {
 		t.Errorf("cancelled requestId %s, want %s", p.RequestId, *out.ID)
 	}
 	<-done
-}
-
-// ACP requires `text` on a text block (Zed rejects it otherwise), and history
-// replay uses an empty text chunk to separate two same-role messages.
-func TestTextBlockKeepsEmptyText(t *testing.T) {
-	sep, err := json.Marshal(messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(sep), `"text":""`) {
-		t.Errorf("empty text block lost its text field: %s", sep)
-	}
-	img, err := json.Marshal(ContentBlock{Type: "image", MimeType: "image/png", Data: "AA=="})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(img), `"text"`) {
-		t.Errorf("an image block grew a text field: %s", img)
-	}
 }

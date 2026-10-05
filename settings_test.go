@@ -183,17 +183,44 @@ func TestRenderSettingsSourcesMarksShadowed(t *testing.T) {
 	}
 }
 
-// llama.cpp turns tool_choice into a grammar and leaves the prompt tokens alone.
-func TestRenderKeyIgnoresToolChoice(t *testing.T) {
-	base := map[string]any{"temperature": 0.7}
-	required := map[string]any{"temperature": 0.7, "tool_choice": "required"}
-	none := map[string]any{"temperature": 0.7, "tool_choice": "none"}
-	if renderKey(base) != renderKey(required) || renderKey(required) != renderKey(none) {
-		t.Errorf("tool_choice must not change the render fingerprint: %q vs %q vs %q",
-			renderKey(base), renderKey(required), renderKey(none))
+// Anything that is not a sampler, unknown fields included, counts as a rendering change.
+func TestRenderKey(t *testing.T) {
+	type m = map[string]any
+	for _, c := range []struct {
+		name string
+		a, b m
+		same bool
+	}{
+		{"samplers never enter the key", m{"temperature": 1.0, "top_p": 0.95, "max_tokens": 8000}, nil, true},
+		// llama.cpp turns tool_choice into a grammar and leaves the prompt tokens alone.
+		{"tool_choice is a grammar", m{"temperature": 0.7, "tool_choice": "required"}, m{"tool_choice": "none"}, true},
+		// Map iteration order is random; a flapping key would report a rewind every other call.
+		{"canonical", m{"temperature": 1.0, "chat_template_kwargs": m{"preserve_thinking": true, "enable_thinking": true}},
+			m{"temperature": 0.6, "chat_template_kwargs": m{"enable_thinking": true, "preserve_thinking": true}}, true},
+		{"chat_template_kwargs count", m{"chat_template_kwargs": m{"enable_thinking": false}}, m{"temperature": 0.7}, false},
+		{"unknown fields count", m{"reasoning_effort": "low"}, nil, false},
+	} {
+		if ka, kb := renderKey(c.a), renderKey(c.b); (ka == kb) != c.same {
+			t.Errorf("%s: %q vs %q, want same=%v", c.name, ka, kb, c.same)
+		}
 	}
-	if renderKey(base) == renderKey(map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}) {
-		t.Error("chat_template_kwargs must still change the fingerprint")
+}
+
+func TestLoadGlobalConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	if loadGlobalConfig().HasGitconfigInHome {
+		t.Errorf("missing global.toml → false")
+	}
+	cfg := filepath.Join(home, ".config", "codehalter")
+	if err := os.MkdirAll(cfg, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cfg, "global.toml"), []byte("has_gitconfig_in_home = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !loadGlobalConfig().HasGitconfigInHome {
+		t.Errorf("global.toml has_gitconfig_in_home=true → true")
 	}
 }
 

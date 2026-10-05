@@ -10,10 +10,11 @@ import (
 // The gate: what to decide, the spec text found where the model said it is, 2 or 3 options with examples.
 func TestSpecQuestionFrom(t *testing.T) {
 	dir := t.TempDir()
-	os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
-	os.WriteFile(filepath.Join(dir, "sub", "05-cut.md"), []byte("# Cut\n\n## Toolbar\n\nThe toolbar groups, left to right:\n  ▶ recording, ▶✂ cut.\n"), 0o644)
 	// QUESTIONS.md is no source: quoting an earlier question back proves nothing.
-	os.WriteFile(filepath.Join(dir, specQuestionsFile), []byte("## F1.1 · colour?\n\n> Buttons are teal.\n"), 0o644)
+	writeTree(t, dir, map[string]string{
+		"sub/05-cut.md":   "# Cut\n\n## Toolbar\n\nThe toolbar groups, left to right:\n  ▶ recording, ▶✂ cut.\n",
+		specQuestionsFile: "## F1.1 · colour?\n\n> Buttons are teal.\n",
+	})
 	two := []specOption{{Choice: "Side by side", Example: "[▶] [▶✂] in one row"}, {Choice: "Stacked", Example: "▶ above ▶✂"}}
 	for _, tc := range []struct {
 		name string
@@ -43,7 +44,7 @@ func TestSpecQuestionFrom(t *testing.T) {
 // Written by the loop, answered by hand, read back: open until answered, and not an item source.
 func TestSpecQuestionsFile(t *testing.T) {
 	dir := t.TempDir()
-	os.WriteFile(filepath.Join(dir, "01.md"), []byte("# 01\n\n### F0.1 Store\n\nKeep the notes.\n"), 0o644)
+	writeTree(t, dir, map[string]string{"01.md": "# 01\n\n### F0.1 Store\n\nKeep the notes.\n"})
 	q := specQuestion{ID: "F0.1", Question: "Which store?", Quote: "Keep the notes.", QuoteAt: "01.md:5",
 		Options: []specOption{{Choice: "SQLite.", Example: "notes.db beside the project"}, {Choice: "JSON", Example: "notes.json"}}}
 	for range 2 {
@@ -71,7 +72,7 @@ func TestSpecQuestionsFile(t *testing.T) {
 
 	// One answered on its own line below the marker, over two lines; the other still open.
 	text := strings.Replace(string(data), "**Answer:** \n", "**Answer:**\nSQLite,\nin .notes/\n", 1)
-	os.WriteFile(filepath.Join(dir, specQuestionsFile), []byte(text), 0o644)
+	writeTree(t, dir, map[string]string{specQuestionsFile: text})
 	if idx, err = scanSpec(dir, defaultSpecIDPatterns, nil, nil); err != nil {
 		t.Fatal(err)
 	}

@@ -6,10 +6,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestJsonrpcRequestEncoding(t *testing.T) {
+	id := json.RawMessage(`"7"`)
+	req := jsonrpcRequest{JSONRPC: "2.0", ID: &id, Method: "session/prompt", Params: json.RawMessage(`{"x":1}`)}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(b)
+	want := `{"jsonrpc":"2.0","id":"7","method":"session/prompt","params":{"x":1}}`
+	if got != want {
+		t.Fatalf("got %s\nwant %s", got, want)
+	}
+
+	notif := jsonrpcRequest{JSONRPC: "2.0", Method: "session/update", Params: json.RawMessage(`{}`)}
+	b, err = json.Marshal(notif)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(b), `"id"`) {
+		t.Fatalf("notification leaked id field: %s", b)
+	}
+}
 
 // Reverse order and half numeric ids: a routing mix-up hands a caller someone else's result.
 func TestRPCPeerRoutesConcurrentResponses(t *testing.T) {

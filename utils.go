@@ -12,25 +12,18 @@ import (
 	"unicode/utf8"
 )
 
-// fnvHash returns the 64-bit FNV-1a hash of s — a cheap, deterministic identity
-// for "is this byte-for-byte the content I saw before?" (read dedup, the tool
-// loop's repeat detection). Not cryptographic; collisions are irrelevant here.
+// fnvHash is a cheap identity for "same bytes as before?"; not cryptographic.
 func fnvHash(s string) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(s))
 	return h.Sum64()
 }
 
-// parallel runs fn for each index [0, n) with up to `cap` concurrent
-// goroutines. Callers pass an explicit upper bound matched to the work-list
-// (e.g. probeAllLLMs's len(conns))
-// so excess work queues instead of contending for slots.
-func parallel(n, cap int, fn func(i int)) {
-	if cap > n {
-		cap = n
-	}
+// parallel runs fn for each index [0, n) with up to limit at a time.
+func parallel(n, limit int, fn func(i int)) {
+	limit = min(limit, n)
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, cap)
+	sem := make(chan struct{}, limit)
 	for i := range n {
 		wg.Add(1)
 		go func(i int) {
@@ -177,6 +170,13 @@ func usableCwd(reqCwd string) (string, bool, error) {
 	return fallback, true, nil
 }
 
+func orElse(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
 func truncate(s string, maxLen int) string {
 	if len(s) > maxLen {
 		return clipUTF8(s, maxLen) + "..."
@@ -227,10 +227,8 @@ func clipBytes(s string, max int) string {
 	return clipUTF8(s, half) + fmt.Sprintf("\n[... %d bytes truncated ...]\n", len(s)-max) + tailUTF8(s, half)
 }
 
-// writeFileAtomic replaces path in one step: a temp file beside it, synced, then
-// renamed over it. A crash leaves the old file or the new one, never half of
-// either. The machine went down twice in one day while the session file, the
-// /spec ledger and QUESTIONS.md were being rewritten in place.
+// writeFileAtomic writes a synced temp file and renames it over path, so a crash
+// leaves the old file or the new one, never half of either.
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	// Hidden and without the target's extension, so no listing takes it for the file.
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
@@ -272,9 +270,7 @@ var stackFrameRe = regexp.MustCompile(`^\s*\d+:\s+(0x[0-9a-f]+ - )?\S|^\s+at \S|
 const stackCollapseMin = 6
 
 // collapseStackTraces shortens each long stack trace to one line, so cutting a
-// failed test run's output to its end keeps the failure's message: a Rust
-// panic's backtrace alone filled the last 4,000 bytes, and the assertion above
-// it was cut off for the next round and for the question to the user.
+// failed test run's output to its end keeps the failure's message above it.
 func collapseStackTraces(out string) string {
 	lines := strings.Split(out, "\n")
 	kept := make([]string, 0, len(lines))

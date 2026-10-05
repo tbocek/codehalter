@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -36,8 +38,29 @@ func TestWebReadIsRawTextOnly(t *testing.T) {
 			t.Errorf("web_read lost its %q parameter", p)
 		}
 	}
-	desc, _ := fn["description"].(string)
-	if !strings.Contains(desc, "offset") || !strings.Contains(desc, "cached") {
-		t.Errorf("the description must say the body is cached and paged with offset/limit: %q", desc)
+}
+
+// A cached page is served without a fetch: a repeat gets the same first page, and
+// any `limit`, or an offset, asks for a slice.
+func TestWebReadFromCache(t *testing.T) {
+	a, s := newTestAgent(t)
+	body := "HEAD" + strings.Repeat("x", maxRawPageChars) + "TAIL"
+	s.rememberWebBody("https://example.org/p", body)
+	read := func(args string) string {
+		t.Helper()
+		out, failed := webReadExecute(context.Background(), a, s.ID, args)
+		if failed {
+			t.Fatalf("%s failed: %s", args, out)
+		}
+		return out
+	}
+	if got := read(`{"url":"https://example.org/p"}`); got != firstPage(body) {
+		t.Errorf("a repeat without a range is not the first page: %d chars", len(got))
+	}
+	if got := read(`{"url":"https://example.org/p","limit":4}`); got != "HEAD" {
+		t.Errorf("limit alone = %q, want the first 4 chars", got)
+	}
+	if got := read(`{"url":"https://example.org/p","offset":` + strconv.Itoa(len(body)-4) + `}`); got != "TAIL" {
+		t.Errorf("offset to the end = %q, want TAIL", got)
 	}
 }

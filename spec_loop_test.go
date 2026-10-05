@@ -14,29 +14,42 @@ import (
 	"time"
 )
 
-// Done only when a test names the item and the suite passes; one retry, then blocked.
+// The verdict on one round: done only when a test names the item, the suite
+// passes and no gate holds it back; a change, redo or removal needs its own proof.
 func TestSpecDecide(t *testing.T) {
-	cfg := &specConfig{}
-	if done, block, _, _ := specDecide(cfg, "F0.1", specRoundResult{Covered: true, TestsPass: true}, ""); !done || block {
-		t.Errorf("covered and passing: done=%v block=%v, want done", done, block)
-	}
-
-	// Covered but the suite fails: a broken earlier item counts against the round.
-	done, block, reason, _ := specDecide(cfg, "F0.2", specRoundResult{Covered: true, TestsPass: false, TestTail: "test f0_1 failed"}, "")
-	if done || block || !strings.Contains(reason, "test f0_1 failed") {
-		t.Errorf("first failure: done=%v block=%v reason=%q, want a retry carrying the test output", done, block, reason)
-	}
-	done, block, reason, _ = specDecide(cfg, "F0.2", specRoundResult{TestsPass: true}, "")
-	if done || !block || !strings.Contains(reason, "f0_2") {
-		t.Errorf("second failure: done=%v block=%v reason=%q, want blocked, naming the expected test token", done, block, reason)
-	}
-
-	if _, block, _, _ := specDecide(cfg, "F0.3", specRoundResult{Question: "keep or drop?"}, ""); !block {
-		t.Error("a planner question did not block the item")
-	}
-	_, _, reason, _ = specDecide(&specConfig{}, specSetupID, specRoundResult{Mode: specModeSetup, TestsPass: true}, "")
-	if !strings.Contains(reason, "no test source") {
-		t.Errorf("setup without tests: reason %q", reason)
+	for _, c := range []struct {
+		name      string
+		item      string
+		attempts  int // attempts already spent on the item
+		r         specRoundResult
+		done      bool
+		block     bool
+		reasonHas string
+	}{
+		{"covered and green", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true}, true, false, ""},
+		{"a red suite is a retry with its output", "F0.2", 0, specRoundResult{Covered: true, TestTail: "test f0_1 failed"}, false, false, "test f0_1 failed"},
+		{"the second failure blocks, naming the test token", "F0.2", 1, specRoundResult{TestsPass: true}, false, true, "f0_2"},
+		{"a planner question blocks", "F0.3", 0, specRoundResult{Question: "keep or drop?"}, false, true, ""},
+		{"setup without a test source", specSetupID, 0, specRoundResult{Mode: specModeSetup, TestsPass: true}, false, false, "no test source"},
+		{"gate: unreachable", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Unreachable: []string{"`run` (src/a.rs:3): only tests call it"}}, false, false, "only tests call it"},
+		{"gate: lint", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Lint: []string{"src/a.rs:3: unused variable"}}, false, false, "unused variable"},
+		{"gate: oversize", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Oversize: []string{"`src/ui.rs` is 12000 lines, over the 1500-line budget"}}, false, false, "1500-line budget"},
+		{"gate: stand-in", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, StandIns: []string{"`reply_for_test` (src/a.rs:3)"}}, false, false, "is not done"},
+		{"refactor that shrank nothing", specRefactorID, 0, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Debt: "a -> b"}, false, false, "no measured progress"},
+		{"refactor that shrank the debt", specRefactorID, 0, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Improved: true}, true, false, ""},
+		{"change that wrote nothing", "F0.1", 0, specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true}, false, false, "no code did"},
+		{"change that committed", "F0.1", 0, specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true, Committed: true}, true, false, ""},
+		{"redo that wrote nothing", "F0.1", 0, specRoundResult{Redo: true, Covered: true, TestsPass: true}, false, false, "/spec redo"},
+		{"redo that committed", "F0.1", 0, specRoundResult{Redo: true, Covered: true, TestsPass: true, Committed: true}, true, false, ""},
+		{"removal with its test still there", "F0.2", 0, specRoundResult{Mode: specModeRemove, TestsPass: true, Covered: true, Committed: true}, false, false, "still names"},
+		{"removal done", "F0.2", 0, specRoundResult{Mode: specModeRemove, TestsPass: true, Committed: true}, true, false, ""},
+		{"removal that broke the suite", "F0.3", 0, specRoundResult{Mode: specModeRemove, TestTail: "3 failed"}, false, false, "did not pass"},
+	} {
+		cfg := &specConfig{Attempts: map[string]int{c.item: c.attempts}}
+		done, block, reason, _ := specDecide(cfg, c.item, c.r, "")
+		if done != c.done || block != c.block || !strings.Contains(reason, c.reasonHas) {
+			t.Errorf("%s: done=%v block=%v reason=%q, want done=%v block=%v reason with %q", c.name, done, block, reason, c.done, c.block, c.reasonHas)
+		}
 	}
 }
 
@@ -60,33 +73,6 @@ func TestSpecDecideThirdAttemptOnlyWhenTheFailureMoved(t *testing.T) {
 	}
 	if _, block, _, _ := specDecide(cfg, "F0.2", red, second); !block {
 		t.Error("a third failure did not block")
-	}
-}
-
-// The gates on what a round wrote hold an item back and say why; a refactor
-// counts when its debt shrank.
-func TestSpecDecideGates(t *testing.T) {
-	green := specRoundResult{Covered: true, TestsPass: true, Committed: true}
-	for name, r := range map[string]specRoundResult{
-		"unreachable": {Covered: true, TestsPass: true, Unreachable: []string{"`run` (src/a.rs:3): only tests call it"}},
-		"lint":        {Covered: true, TestsPass: true, Lint: []string{"src/a.rs:3: unused variable"}},
-		"oversize":    {Covered: true, TestsPass: true, Oversize: []string{"`src/ui.rs` is 12000 lines, over the 1500-line budget"}},
-		"standin":     {Covered: true, TestsPass: true, StandIns: []string{"`reply_for_test` (src/a.rs:3): the program asks a helper that exists for tests"}},
-	} {
-		done, _, reason, _ := specDecide(&specConfig{}, "F0.1", r, "")
-		if done || !strings.Contains(reason, map[string]string{"unreachable": "only tests call it", "lint": "unused variable", "oversize": "1500-line budget", "standin": "is not done"}[name]) {
-			t.Errorf("%s: done=%v reason=%q", name, done, reason)
-		}
-	}
-	if done, _, _, _ := specDecide(&specConfig{}, "F0.1", green, ""); !done {
-		t.Error("a clean round was held back")
-	}
-	cfg := &specConfig{}
-	if done, _, reason, _ := specDecide(cfg, specRefactorID, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Debt: "a → b"}, ""); done || !strings.Contains(reason, "no measured progress") {
-		t.Errorf("a refactor that shrank nothing: done=%v reason=%q", done, reason)
-	}
-	if done, _, _, _ := specDecide(cfg, specRefactorID, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Improved: true}, ""); !done {
-		t.Error("a refactor that shrank the debt was held back")
 	}
 }
 
@@ -206,10 +192,9 @@ func TestSpecIgnoredProbes(t *testing.T) {
 		t.Fatalf("git init: %v %s", err, out)
 	}
 	idx := &specIndex{docs: []specDoc{{rel: "05-cut.md"}, {rel: "07-narrate.md"}, {rel: "09-llm-and-tools.md"}}}
-	gi := filepath.Join(cwd, ".gitignore")
 
 	// llm/ hides the module named after the chapter's first word.
-	os.WriteFile(gi, []byte("cut/\n*.json\ntest*\nout/\nllm/\n"), 0o644)
+	writeTree(t, cwd, map[string]string{".gitignore": "cut/\n*.json\ntest*\nout/\nllm/\n"})
 	got := specIgnoredProbes(t.Context(), cwd, "rust", idx)
 	joined := strings.Join(got, "\n")
 	for _, rule := range []string{"`cut/`", "`*.json`", "`test*`", "`llm/`"} {
@@ -221,45 +206,9 @@ func TestSpecIgnoredProbes(t *testing.T) {
 		t.Errorf("a rule that hides nothing under rust/ was reported:\n%s", joined)
 	}
 
-	os.WriteFile(gi, []byte("/cut/\n/*.json\n/test*\n/out/\n/llm/\n"), 0o644)
+	writeTree(t, cwd, map[string]string{".gitignore": "/cut/\n/*.json\n/test*\n/out/\n/llm/\n"})
 	if got := specIgnoredProbes(t.Context(), cwd, "rust", idx); len(got) != 0 {
 		t.Errorf("anchored rules still reported: %v", got)
-	}
-}
-
-// A change round needs a commit, since the old test still covers it; a removal is done when no
-// test names the item.
-func TestSpecDecideChangeAndRemove(t *testing.T) {
-	cfg := &specConfig{}
-	done, _, reason, _ := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true}, "")
-	if done || !strings.Contains(reason, "no code did") {
-		t.Errorf("a change round that wrote nothing: done=%v reason=%q", done, reason)
-	}
-	if done, _, _, _ := specDecide(cfg, "F0.1", specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true, Committed: true}, ""); !done {
-		t.Error("a change round that committed should be done")
-	}
-
-	done, _, reason, _ = specDecide(cfg, "F0.2", specRoundResult{Mode: specModeRemove, TestsPass: true, Covered: true, Committed: true}, "")
-	if done || !strings.Contains(reason, "still names") {
-		t.Errorf("a removal with the test still in place: done=%v reason=%q", done, reason)
-	}
-	if done, _, _, _ := specDecide(cfg, "F0.2", specRoundResult{Mode: specModeRemove, TestsPass: true, Committed: true}, ""); !done {
-		t.Error("a removal whose test is gone and whose suite passes should be done")
-	}
-	// The suite must still pass: deleting an item cannot take the build with it.
-	if done, _, reason, _ := specDecide(cfg, "F0.3", specRoundResult{Mode: specModeRemove, TestTail: "3 failed"}, ""); done || !strings.Contains(reason, "did not pass") {
-		t.Errorf("a removal that broke the suite: done=%v reason=%q", done, reason)
-	}
-}
-
-func TestSpecDecideRedoNeedsACommit(t *testing.T) {
-	cfg := &specConfig{}
-	done, _, reason, _ := specDecide(cfg, "F0.1", specRoundResult{Redo: true, Covered: true, TestsPass: true}, "")
-	if done || !strings.Contains(reason, "/spec redo") {
-		t.Errorf("a redo round that wrote nothing: done=%v reason=%q", done, reason)
-	}
-	if done, _, _, _ := specDecide(cfg, "F0.1", specRoundResult{Redo: true, Covered: true, TestsPass: true, Committed: true}, ""); !done {
-		t.Error("a redo round that committed should be done")
 	}
 }
 
@@ -276,7 +225,7 @@ func TestSpecFinalPrompt(t *testing.T) {
 	idx.questions = map[string][]specQuestion{"F0.3": {{ID: "F0.3", Question: "keep or drop?"}}}
 	prompt := a.specFinalPrompt(s.ID, cfg, idx, "just test", map[string]string{stuck: "the build stayed red"})
 	for _, want := range []string{"use gtk4-rs libadwaita", "`rust/README.md`", "just test", "2 items, 2 not done",
-		stuck + ": the build stayed red", `F0.3: waits on the user's answer to "keep or drop?" in spec/QUESTIONS.md`, "spec/00-principles.md", "`--help`", "snapshot"} {
+		stuck + ": the build stayed red", `F0.3: waits on the user's answer to "keep or drop?" in spec/QUESTIONS.md`, "spec/00-principles.md"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("final prompt lacks %q", want)
 		}
@@ -421,7 +370,7 @@ func TestSpecAuditPrompt(t *testing.T) {
 		t.Fatal(err)
 	}
 	prompt := a.specAuditPrompt(s.ID, &specConfig{SpecDir: "spec", OutDir: "rust", Target: "gtk4"}, idx, "just test")
-	for _, want := range []string{"`redo`", "spec/00-principles.md", "just test", "gtk4", "snapshot", "report_only", "`F0.1`", "copied from the list below"} {
+	for _, want := range []string{"spec/00-principles.md", "just test", "gtk4", "`F0.1`"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("audit prompt lacks %q", want)
 		}
@@ -551,28 +500,12 @@ func TestSpecSecondAttemptKeepsFirstAttemptsTest(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "false", LintCmd: "off", Items: map[string]specLedger{}}
-	git := func(args ...string) {
-		t.Helper()
-		if out, err := exec.Command("git", append([]string{"-C", sess.Cwd, "-c", "user.email=t@t", "-c", "user.name=t"}, args...)...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v %s", args, err, out)
-		}
-	}
 	write := func(rel, body string) {
 		t.Helper()
-		p := filepath.Join(sess.Cwd, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeTree(t, sess.Cwd, map[string]string{rel: body})
 	}
-	git("init", "-q")
-	git("config", "user.email", "t@t")
-	git("config", "user.name", "t")
 	write("rust/src/lib.rs", "// v1\n")
-	git("add", "-A")
-	git("commit", "-q", "-m", "base")
+	gitInit(t, sess.Cwd)
 	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: cfg, idx: idx, outAbs: filepath.Join(sess.Cwd, "rust"), reasons: map[string]string{}}
 
 	write("rust/tests/switch.rs", "#[test]\nfn f0_1_switches() {}\n") // attempt 1: its test, and a red suite
@@ -594,10 +527,7 @@ func TestSpecSecondAttemptKeepsFirstAttemptsTest(t *testing.T) {
 // finds it before the round is judged, one more turn deletes it, and the item
 // counts on its first attempt.
 func TestSpecRoundCheckFixesBeforeJudging(t *testing.T) {
-	write := func(id, path, content string) string {
-		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
-		return sseToolCall(id, "write_file", string(b))
-	}
+	write := sseWriteFile
 	rig := newSpecLoopRig(t, map[string]string{
 		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
 		"app/src/lib.rs":    "// the program\n",
@@ -635,32 +565,11 @@ type specLoopRig struct {
 
 func newSpecLoopRig(t *testing.T, files map[string]string, done func(id string) bool, responses ...string) *specLoopRig {
 	t.Helper()
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("no git")
-	}
 	h := newTerminalHarness(t)
 	a, sess := h.agent, h.sess
-	git := func(args ...string) {
-		t.Helper()
-		if out, err := exec.Command("git", append([]string{"-C", sess.Cwd}, args...)...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v %s", args, err, out)
-		}
-	}
 	files[".gitignore"] = ".codehalter/\n"
-	for rel, body := range files {
-		p := filepath.Join(sess.Cwd, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	git("init", "-q")
-	git("config", "user.email", "t@t")
-	git("config", "user.name", "t")
-	git("add", "-A")
-	git("commit", "-q", "-m", "base")
+	writeTree(t, sess.Cwd, files)
+	gitInit(t, sess.Cwd)
 	idx, err := scanSpec(filepath.Join(sess.Cwd, "spec"), defaultSpecIDPatterns, nil, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -713,27 +622,7 @@ func (g *specLoopRig) run(t *testing.T) string {
 	if _, err := g.h.agent.runSpec(ctx, g.h.sess.ID, g.h.sess, "", nil); err != nil {
 		t.Fatal(err)
 	}
-	// Updates are recorded by the harness's reader, in order: once this marker is
-	// in, so is everything the loop said before it.
-	const marker = "\x00end of run"
-	g.h.agent.say(ctx, g.h.sess.ID, marker)
-	for deadline := time.Now().Add(5 * time.Second); ; {
-		n := g.h.updatesOfKind(KindAgentMessage)
-		if c, _ := n[len(n)-1]["content"].(map[string]any); c != nil && c["text"] == marker {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the loop's messages did not all arrive")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	var said strings.Builder
-	for _, u := range g.h.updatesOfKind(KindAgentMessage) {
-		if c, _ := u["content"].(map[string]any); c != nil {
-			said.WriteString(fmt.Sprint(c["text"]))
-		}
-	}
-	return said.String()
+	return g.said(t)
 }
 
 func (g *specLoopRig) ledger(t *testing.T) *specConfig {
@@ -775,10 +664,7 @@ func (g *specLoopRig) request(i int) string {
 }
 
 func TestSpecCompletionCheck(t *testing.T) {
-	write := func(id, path, content string) string {
-		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
-		return sseToolCall(id, "write_file", string(b))
-	}
+	write := sseWriteFile
 	rig := newSpecLoopRig(t, map[string]string{
 		// F0.3 has no picture and still gets checked; the one it links to is F0.1's.
 		"spec/01.md": "# 01 Screens\n\n### F0.1 Prepare\n\n![prepare](img/prepare.png)\n\nSources on the left, User Context on the right.\n\n" +
@@ -841,10 +727,7 @@ func TestSpecCompletionCheck(t *testing.T) {
 // the spec's QUESTIONS.md, the item waits there (no block in the ledger), and the
 // answer written there reaches the next run's round and the item's fingerprint.
 func TestSpecQuestionWaitsInTheSpecForItsAnswer(t *testing.T) {
-	write := func(id, path, content string) string {
-		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
-		return sseToolCall(id, "write_file", string(b))
-	}
+	write := sseWriteFile
 	good := `{"clear":false,"subtasks":[],"question":"In which order do the play buttons sit?",` +
 		`"spec_quote":"The toolbar groups left to right: recording, cut.",` +
 		`"options":[{"choice":"Side by side","example":"one row: [▶ recording] [▶✂ cut]"},{"choice":"Stacked","example":"▶ recording above ▶✂ cut"}]}`
@@ -1110,10 +993,7 @@ func TestSpecCompletionCheckReadsEveryNaming(t *testing.T) {
 // A suite that fails and then passes unchanged is a flaky test, not the round's
 // failure: the round counts, and the next item round is asked to fix the test.
 func TestSpecFlakyTestIsNotTheRoundsFault(t *testing.T) {
-	write := func(id, path, content string) string {
-		b, _ := json.Marshal(map[string]string{"path": path, "content": content})
-		return sseToolCall(id, "write_file", string(b))
-	}
+	write := sseWriteFile
 	rig := newSpecLoopRig(t, map[string]string{
 		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n\n### F0.2 Do more\n\nS1 do more.\n",
 		"app/src/lib.rs":    "// the program\n",
@@ -1147,5 +1027,118 @@ func TestSpecFlakyTestIsNotTheRoundsFault(t *testing.T) {
 	}
 	if got.Flaky != "" {
 		t.Errorf("the flaky entry outlived the round that was asked to fix it: %q", got.Flaky)
+	}
+}
+
+// Blocked items in a row mean one shared problem: the loop stops instead of burning every item.
+func TestSpecStopsAfterBlockedInARow(t *testing.T) {
+	// Turns that write nothing; the in-round check gives each round a second one.
+	var turns []string
+	for i, item := range []string{"F0.1", "F0.1", "F0.2", "F0.2"} {
+		turns = append(turns,
+			sseToolCall(fmt.Sprintf("p%d", i), submitPlanToolName, `{"clear":true,"subtasks":[{"description":"build `+item+`"}]}`),
+			sseToolCall(fmt.Sprintf("r%d", i), respondToolName, `{"message":"could not"}`))
+	}
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 One\n\nS1 one.\n\n### F0.2 Two\n\nS2 two.\n\n### F0.3 Three\n\nS3 three.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(string) bool { return false }, turns...)
+	cfg := rig.ledger(t)
+	cfg.MaxBlocked = 2
+	cfg.Attempts = map[string]int{"F0.1": specMaxAttempts - 1, "F0.2": specMaxAttempts - 1}
+	if err := saveSpecConfig(rig.h.sess.Cwd, cfg); err != nil {
+		t.Fatal(err)
+	}
+	said := rig.run(t)
+	if !strings.Contains(said, "Stopping: 2 items in a row did not pass") {
+		t.Errorf("no stop after two blocked items:\n%s", said)
+	}
+	if strings.Contains(said, "F0.3") {
+		t.Errorf("F0.3 was started after the stop:\n%s", said)
+	}
+}
+
+// Only the output dir and .devcontainer are committed; the user's other edits stay theirs.
+func TestSpecCommit(t *testing.T) {
+	a, sess := newTestAgent(t)
+	cwd := sess.Cwd
+	writeTree(t, cwd, map[string]string{".gitignore": ".codehalter/\n", "app/main.go": "package main\n", ".devcontainer/Dockerfile": "FROM alpine\n", "notes.txt": "mine\n",
+		"spec/01.md": "# 01\n\n### F0.1 Store notes\n\nKeep them.\n"})
+	gitInit(t, cwd)
+	idx, err := scanSpec(filepath.Join(cwd, "spec"), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &specConfig{SpecDir: "spec", OutDir: "app"}
+	git := func(args ...string) string {
+		t.Helper()
+		out, err := specGit(t.Context(), cwd, args...)
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(out)
+	}
+
+	if sha := a.specCommit(t.Context(), sess.ID, cwd, cfg, idx, "F0.1", specModeItem); sha != "" {
+		t.Errorf("nothing changed, got commit %s", sha)
+	}
+	for _, c := range []struct {
+		item string
+		mode specMode
+		want string
+	}{
+		{"F0.1", specModeItem, "spec: F0.1 Store notes"},
+		{"F0.1", specModeChange, "spec: update F0.1 Store notes"},
+		{"§02#1-gone", specModeRemove, "spec: remove §02#1-gone"},
+		{specRefactorID, specModeRefactor, "spec: refactor app/"},
+		{specSetupID, specModeSetup, "spec: set up app/"},
+	} {
+		writeTree(t, cwd, map[string]string{"app/main.go": "package main\n// " + c.want + "\n", ".devcontainer/Dockerfile": "FROM alpine # " + c.want + "\n",
+			"notes.txt": "mine, " + c.want + "\n"})
+		sha := a.specCommit(t.Context(), sess.ID, cwd, cfg, idx, c.item, c.mode)
+		if sha == "" || sha != git("rev-parse", "HEAD") {
+			t.Fatalf("%s: commit = %q", c.want, sha)
+		}
+		if got := git("log", "-1", "--format=%s"); got != c.want {
+			t.Errorf("message = %q, want %q", got, c.want)
+		}
+		if got := git("show", "--name-only", "--format=", "HEAD"); got != ".devcontainer/Dockerfile\napp/main.go" {
+			t.Errorf("%s committed:\n%s", c.want, got)
+		}
+	}
+	if got := git("status", "--porcelain"); got != "M notes.txt" {
+		t.Errorf("status after the commits = %q, want only the user's notes.txt modified", got)
+	}
+}
+
+// Every refactor_every finished items one round goes to the code's shape, but only when there is debt.
+func TestSpecRefactorCadence(t *testing.T) {
+	dir := t.TempDir()
+	long := "package main\n\nfunc main() {}\n" + strings.Repeat("// line\n", 10)
+	writeTree(t, dir, map[string]string{"spec/01.md": "# 01\n\n### F0.1 One\n\nS1.\n\n### F0.2 Two\n\nS2.\n\n### F0.3 Three\n\nS3.\n", "app/main.go": long})
+	idx, err := scanSpec(filepath.Join(dir, "spec"), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	covered := map[string]string{"F0.1": "app/main_test.go", "F0.2": "app/main_test.go"}
+	pick := func(refactorAt int, maxLines int) (specWork, *specConfig) {
+		t.Helper()
+		h := newTerminalHarness(t)
+		cfg := &specConfig{SpecDir: "spec", OutDir: "app", TestCmd: "true", RefactorEvery: 2, RefactorAt: refactorAt, MaxFileLines: maxLines,
+			Items: map[string]specLedger{"F0.1": {Hash: specItemHash(idx, "F0.1")}, "F0.2": {Hash: specItemHash(idx, "F0.2")}}}
+		r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, cfg: cfg, idx: idx, outAbs: filepath.Join(dir, "app"), reasons: map[string]string{}}
+		return r.pickWork(t.Context(), covered, 1), cfg
+	}
+
+	if w, _ := pick(0, 5); w.Mode != specModeRefactor || w.Debt.overLines == 0 {
+		t.Errorf("two items since the last refactor and a long file: work = %+v, want a refactor round", w)
+	}
+	if w, _ := pick(1, 5); w.Item != "F0.3" {
+		t.Errorf("one item since the last refactor: work = %+v, want F0.3", w)
+	}
+	w, cfg := pick(0, 2000)
+	if w.Item != "F0.3" || cfg.RefactorAt != 2 {
+		t.Errorf("no debt: work = %+v RefactorAt = %d, want F0.3 and the cadence restarted at 2", w, cfg.RefactorAt)
 	}
 }

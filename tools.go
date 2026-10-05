@@ -268,13 +268,13 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	var multimodal any
 	var imageID, sameImage string
 	switch {
-	case tc.Function.Name == "view_image" && a.imagesSupported:
+	case tc.Function.Name == "view_image" && a.imagesSupported.Load():
 		text, parts, ferr := dispatchViewImage(a.getSession(sid), tc.Function.Arguments)
 		result, failed = text, ferr
 		if !ferr {
 			multimodal = parts
 		}
-	case tc.Function.Name == "screenshot" && a.imagesSupported:
+	case tc.Function.Name == "screenshot" && a.imagesSupported.Load():
 		text, parts, id, ferr := dispatchScreenshot(ctx, a, sid, tc.Function.Arguments)
 		result, failed = text, ferr
 		switch sess := a.getSession(sid); {
@@ -296,7 +296,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		}
 		// Attach the rendered screen: the executor rarely calls screenshot on
 		// its own.
-		if !failed && tc.Function.Name == "run_command" && a.imagesSupported {
+		if !failed && tc.Function.Name == "run_command" && a.imagesSupported.Load() {
 			switch text, parts, id, same := a.attachRenderedScreen(ctx, sid, tc.Function.Arguments, result, started); {
 			case id != "":
 				result, multimodal, imageID = text, parts, id
@@ -339,9 +339,9 @@ func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall
 	case "plan":
 		hint = "planning is read-only; describe this change as a subtask in submit_plan and the executor will make it."
 	case "document":
-		hint = "the documentation phase only wraps up — write the note and stop, don't re-plan."
+		hint = "the documentation phase only wraps up: write the note and stop, don't re-plan."
 	}
-	msg := fmt.Sprintf("error: %s is not available during the %s phase — %s", tc.Function.Name, phase, hint)
+	msg := fmt.Sprintf("error: %s is not available during the %s phase: %s", tc.Function.Name, phase, hint)
 	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
 	a.FailToolCall(ctx, sid, tcId, msg)
 	return a.recordToolUse(sid, tc, ToolUse{Output: msg, Failed: true, StartedAt: time.Now()}), msg

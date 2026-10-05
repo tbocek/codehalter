@@ -15,8 +15,9 @@ import (
 )
 
 // A boundary compaction archives the old state, folds the whole Shadow into
-// Summary, keeps nothing verbatim and persists, all without an LLM call.
-func TestCompressHistoryRecordsSummary(t *testing.T) {
+// Summary after the prior one, keeps nothing verbatim and persists, all without
+// an LLM call.
+func TestFoldHistoryRecordsSummary(t *testing.T) {
 	mock := newMockLLM(t)
 	defer mock.Close()
 
@@ -25,6 +26,7 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
+	s.Summary = "PRIOR SUMMARY FROM AN EARLIER COMPACTION"
 
 	filler := strings.Repeat("lorem ipsum ", 100)
 	for i := 0; i < 10; i++ {
@@ -50,6 +52,9 @@ func TestCompressHistoryRecordsSummary(t *testing.T) {
 	s.turnStartIdx = len(s.Messages) // all turns completed → foldHistory(len) folds them all via shadow
 	a.foldHistory(context.Background(), s, len(s.Messages))
 
+	if !strings.HasPrefix(s.Summary, "PRIOR SUMMARY") {
+		t.Errorf("the prior Summary was dropped or moved; got %q", s.Summary)
+	}
 	for _, want := range []string{"scaffolded module", "wired up handler", "shipped it"} {
 		if !strings.Contains(s.Summary, want) {
 			t.Errorf("summary missing folded shadow entry %q; got %q", want, s.Summary)
@@ -117,7 +122,7 @@ func TestPrefixStableAcrossTurns(t *testing.T) {
 
 	sysPrompt, _ := a.systemPrompt(s.ID)
 	if sysPrompt == "" {
-		t.Fatal("expected non-empty systemPrompt — SKILL seed didn't take effect")
+		t.Fatal("expected non-empty systemPrompt: SKILL seed didn't take effect")
 	}
 
 	s.SystemPrompt = sysPrompt
@@ -172,53 +177,6 @@ func TestFoldHistoryNoopWhenNothingToFold(t *testing.T) {
 	}
 	if mock.callCount() != 0 {
 		t.Errorf("expected no LLM calls, got %d", mock.callCount())
-	}
-}
-
-// Notes already in Shadow fold into Summary with no LLM call.
-func TestCompressHistoryShadowFastPath(t *testing.T) {
-	mock := newMockLLM(t) // zero responses queued → any call fails the test.
-	defer mock.Close()
-
-	dir := t.TempDir()
-	s, err := newSession(dir)
-	if err != nil {
-		t.Fatalf("newSession: %v", err)
-	}
-
-	filler := strings.Repeat("lorem ipsum ", 100)
-	for i := 0; i < 10; i++ {
-		s.AddUser(fmt.Sprintf("user msg %d %s", i, filler))
-		s.AddAssistant(fmt.Sprintf("asst msg %d %s", i, filler))
-	}
-	if err := s.Save(); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-
-	s.appendShadow("Goal: do thing\nProgress: did thing")
-	s.appendShadow("Goal: do thing\nProgress: refined thing")
-	s.appendShadow("Goal: do thing\nProgress: finished thing")
-
-	a := &agent{
-		sessions: map[string]*Session{s.ID: s},
-		settings: Settings{
-			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
-		},
-	}
-
-	s.turnStartIdx = len(s.Messages)
-	a.foldHistory(context.Background(), s, len(s.Messages))
-
-	for _, want := range []string{"did thing", "refined thing", "finished thing"} {
-		if !strings.Contains(s.Summary, want) {
-			t.Errorf("expected Summary to contain folded shadow chunk %q, got %q", want, s.Summary)
-		}
-	}
-	if mock.callCount() != 0 {
-		t.Errorf("LLM calls: got %d, want 0 (shadow fast path is fully local)", mock.callCount())
-	}
-	if peek := s.peekShadow(); peek != "" {
-		t.Errorf("shadow buffer should be empty after compaction; got %q", peek)
 	}
 }
 
@@ -350,139 +308,126 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 // Every stored image is inlined every turn, so wire bytes stay identical until compaction.
 func TestBuildLLMHistoryImageHandling(t *testing.T) {
 	dir := t.TempDir()
-	bytes1 := []byte("pngbytes-1")
-	bytes2 := []byte("pngbytes-2-different")
-	id1, err := storeImage(dir, "image/png", bytes1)
+	id1, err := storeImage(dir, "image/png", []byte("pngbytes-1"))
 	if err != nil {
 		t.Fatalf("storeImage id1: %v", err)
 	}
-	id2, err := storeImage(dir, "image/png", bytes2)
+	id2, err := storeImage(dir, "image/png", []byte("pngbytes-2-different"))
 	if err != nil {
 		t.Fatalf("storeImage id2: %v", err)
 	}
 	img1 := ImageData{ID: id1, MimeType: "image/png"}
 	img2 := ImageData{ID: id2, MimeType: "image/png"}
+	a := &agent{}
+	a.imagesSupported.Store(true)
 
-	a := &agent{imagesSupported: false}
-	s := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "look at this", Images: []ImageData{img1, img2}}}}
-	out := a.buildLLMContext(s)
-	if len(out) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(out))
-	}
-	got := contentString(t, out[0])
-	if !strings.Contains(got, "[Image "+id1) || !strings.Contains(got, "[Image "+id2) {
-		t.Errorf("expected per-image placeholders in %q", got)
-	}
-	if !strings.Contains(got, "view_image id="+id1) || !strings.Contains(got, "view_image id="+id2) {
-		t.Errorf("expected view_image hints in %q", got)
-	}
-
-	a.imagesSupported = true
-	out = a.buildLLMContext(s)
-	parts, ok := out[0].Content.([]any)
-	if !ok {
-		t.Fatalf("expected []any content, got different type")
-	}
-	if len(parts) != 3 {
-		t.Fatalf("expected 3 parts (text + 2 images), got %d", len(parts))
-	}
-	text, _ := parts[0].(map[string]any)
-	if text["type"] != "text" || text["text"] != "look at this" {
-		t.Errorf("parts[0] wrong: %+v", text)
-	}
-	for i, part := range parts[1:] {
-		block, _ := part.(map[string]any)
-		if block["type"] != "image_url" {
-			t.Errorf("parts[%d] type: got %v, want image_url", i+1, block["type"])
+	t.Run("images off: placeholders with view_image hints", func(t *testing.T) {
+		s := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "look at this", Images: []ImageData{img1, img2}}}}
+		out := (&agent{}).buildLLMContext(s)
+		if len(out) != 1 {
+			t.Fatalf("expected 1 message, got %d", len(out))
 		}
-		url, _ := block["image_url"].(map[string]string)
-		if !strings.HasPrefix(url["url"], "data:image/png;base64,") {
-			t.Errorf("parts[%d] url prefix wrong: %q", i+1, url["url"])
+		got := contentString(t, out[0])
+		for _, id := range []string{id1, id2} {
+			if !strings.Contains(got, "[Image "+id) || !strings.Contains(got, "view_image id="+id) {
+				t.Errorf("expected a placeholder and a view_image hint for %s in %q", id, got)
+			}
 		}
-	}
+	})
 
-	// The older image is NOT degraded to a text placeholder.
-	s4 := &Session{Cwd: dir, Messages: []Message{
-		{Role: "user", Content: "earlier", Images: []ImageData{img1}},
-		{Role: "user", Content: "now look at this one", Images: []ImageData{img2}},
-	}}
-	out = a.buildLLMContext(s4)
-	if len(out) != 2 {
-		t.Fatalf("expected 2 messages, got %d", len(out))
-	}
-	olderParts, ok := out[0].Content.([]any)
-	if !ok || len(olderParts) != 2 {
-		t.Fatalf("older: expected []any of len 2 (text + image_url), got %+v", out[0].Content)
-	}
-	olderImg, _ := olderParts[1].(map[string]any)
-	if olderImg["type"] != "image_url" {
-		t.Errorf("older parts[1] type: got %v, want image_url", olderImg["type"])
-	}
-	trailingParts, ok := out[1].Content.([]any)
-	if !ok || len(trailingParts) != 2 {
-		t.Fatalf("trailing: expected []any of len 2, got %+v", out[1].Content)
-	}
+	t.Run("images on: text then image parts", func(t *testing.T) {
+		s := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "look at this", Images: []ImageData{img1, img2}}}}
+		parts, ok := a.buildLLMContext(s)[0].Content.([]any)
+		if !ok || len(parts) != 3 {
+			t.Fatalf("expected 3 parts (text + 2 images), got %+v", parts)
+		}
+		if text, _ := parts[0].(map[string]any); text["type"] != "text" || text["text"] != "look at this" {
+			t.Errorf("parts[0] wrong: %+v", text)
+		}
+		for i, part := range parts[1:] {
+			block, _ := part.(map[string]any)
+			url, _ := block["image_url"].(map[string]string)
+			if block["type"] != "image_url" || !strings.HasPrefix(url["url"], "data:image/png;base64,") {
+				t.Errorf("parts[%d] = %+v, want a png image_url", i+1, block)
+			}
+		}
+	})
 
-	first := a.buildLLMContext(s4)
-	second := a.buildLLMContext(s4)
-	firstJSON, err := json.Marshal(first)
-	if err != nil {
-		t.Fatalf("marshal first: %v", err)
-	}
-	secondJSON, err := json.Marshal(second)
-	if err != nil {
-		t.Fatalf("marshal second: %v", err)
-	}
-	if string(firstJSON) != string(secondJSON) {
-		t.Errorf("cache consistency: wire bytes differ between consecutive rebuilds\nfirst:  %s\nsecond: %s", firstJSON, secondJSON)
-	}
+	t.Run("an older image stays inlined and rebuilds are identical", func(t *testing.T) {
+		s := &Session{Cwd: dir, Messages: []Message{
+			{Role: "user", Content: "earlier", Images: []ImageData{img1}},
+			{Role: "user", Content: "now look at this one", Images: []ImageData{img2}},
+		}}
+		out := a.buildLLMContext(s)
+		if len(out) != 2 {
+			t.Fatalf("expected 2 messages, got %d", len(out))
+		}
+		for i, m := range out {
+			parts, ok := m.Content.([]any)
+			if !ok || len(parts) != 2 {
+				t.Fatalf("message %d: expected []any of len 2 (text + image_url), got %+v", i, m.Content)
+			}
+			if img, _ := parts[1].(map[string]any); img["type"] != "image_url" {
+				t.Errorf("message %d parts[1] type: got %v, want image_url", i, img["type"])
+			}
+		}
+		first, err := json.Marshal(out)
+		if err != nil {
+			t.Fatalf("marshal first: %v", err)
+		}
+		second, err := json.Marshal(a.buildLLMContext(s))
+		if err != nil {
+			t.Fatalf("marshal second: %v", err)
+		}
+		if !bytes.Equal(first, second) {
+			t.Errorf("cache consistency: wire bytes differ between consecutive rebuilds\nfirst:  %s\nsecond: %s", first, second)
+		}
+	})
 
-	imgMissing := ImageData{ID: "img_deadbeef00000000", MimeType: "image/png"}
-	sMissing := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "missing", Images: []ImageData{imgMissing}}}}
-	outMissing := a.buildLLMContext(sMissing)
-	missingParts, ok := outMissing[0].Content.([]any)
-	if !ok || len(missingParts) != 2 {
-		t.Fatalf("missing: expected []any of len 2 (text + fallback), got %+v", outMissing[0].Content)
-	}
-	fallback, _ := missingParts[1].(map[string]any)
-	if fallback["type"] != "text" {
-		t.Errorf("missing image fallback type: got %v, want text", fallback["type"])
-	}
-	if fallbackText, _ := fallback["text"].(string); !strings.Contains(fallbackText, "img_deadbeef00000000") {
-		t.Errorf("missing image fallback missing id reference: %q", fallbackText)
-	}
+	t.Run("a missing file becomes a text part naming the id", func(t *testing.T) {
+		s := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "missing", Images: []ImageData{{ID: "img_deadbeef00000000", MimeType: "image/png"}}}}}
+		parts, ok := a.buildLLMContext(s)[0].Content.([]any)
+		if !ok || len(parts) != 2 {
+			t.Fatalf("expected []any of len 2 (text + fallback), got %+v", parts)
+		}
+		fallback, _ := parts[1].(map[string]any)
+		if text, _ := fallback["text"].(string); fallback["type"] != "text" || !strings.Contains(text, "img_deadbeef00000000") {
+			t.Errorf("fallback = %+v, want a text part naming the id", fallback)
+		}
+	})
 
-	s2 := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "no imgs"}}}
-	if got := contentString(t, a.buildLLMContext(s2)[0]); got != "no imgs" {
-		t.Errorf("plain: got %q, want 'no imgs'", got)
-	}
+	t.Run("no images: plain string content", func(t *testing.T) {
+		s := &Session{Cwd: dir, Messages: []Message{{Role: "user", Content: "no imgs"}}}
+		if got := contentString(t, a.buildLLMContext(s)[0]); got != "no imgs" {
+			t.Errorf("plain: got %q, want 'no imgs'", got)
+		}
+	})
 
-	combined := Message{
-		Role:     "assistant",
-		Content:  "done",
-		Images:   []ImageData{img1},
-		ToolUses: []ToolUse{{ID: "tu_77", Name: "read_file", Input: `{"path":"x"}`, Output: "ok"}},
-	}
-	s3 := &Session{Cwd: dir, Messages: []Message{combined}}
-	outCombined := a.buildLLMContext(s3)
-	if len(outCombined) != 2 {
-		t.Fatalf("combined: expected 2 messages (assistant + tool), got %d: %+v", len(outCombined), outCombined)
-	}
-	parts, ok = outCombined[0].Content.([]any)
-	if !ok || len(parts) != 2 {
-		t.Fatalf("combined assistant Content: expected []any of len 2, got %+v", outCombined[0].Content)
-	}
-	text, _ = parts[0].(map[string]any)
-	textStr, _ := text["text"].(string)
-	if textStr != "done" {
-		t.Errorf("combined text block: got %q, want %q", textStr, "done")
-	}
-	if len(outCombined[0].ToolCalls) != 1 || outCombined[0].ToolCalls[0].ID != "tu_77" || outCombined[0].ToolCalls[0].Function.Name != "read_file" {
-		t.Errorf("combined ToolCalls wrong: %+v", outCombined[0].ToolCalls)
-	}
-	if outCombined[1].Role != "tool" || outCombined[1].ToolCallID != "tu_77" || outCombined[1].Content.(string) != "ok" {
-		t.Errorf("combined tool message wrong: %+v", outCombined[1])
-	}
+	t.Run("images and tool calls on one message", func(t *testing.T) {
+		s := &Session{Cwd: dir, Messages: []Message{{
+			Role:     "assistant",
+			Content:  "done",
+			Images:   []ImageData{img1},
+			ToolUses: []ToolUse{{ID: "tu_77", Name: "read_file", Input: `{"path":"x"}`, Output: "ok"}},
+		}}}
+		out := a.buildLLMContext(s)
+		if len(out) != 2 {
+			t.Fatalf("expected 2 messages (assistant + tool), got %d: %+v", len(out), out)
+		}
+		parts, ok := out[0].Content.([]any)
+		if !ok || len(parts) != 2 {
+			t.Fatalf("assistant Content: expected []any of len 2, got %+v", out[0].Content)
+		}
+		if text, _ := parts[0].(map[string]any); text["text"] != "done" {
+			t.Errorf("text block: got %v, want %q", text["text"], "done")
+		}
+		if len(out[0].ToolCalls) != 1 || out[0].ToolCalls[0].ID != "tu_77" || out[0].ToolCalls[0].Function.Name != "read_file" {
+			t.Errorf("ToolCalls wrong: %+v", out[0].ToolCalls)
+		}
+		if c, _ := out[1].Content.(string); out[1].Role != "tool" || out[1].ToolCallID != "tu_77" || c != "ok" {
+			t.Errorf("tool message wrong: %+v", out[1])
+		}
+	})
 }
 
 func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
@@ -546,70 +491,7 @@ func TestBackgroundSummariseAppendsImageRefsThroughCompaction(t *testing.T) {
 	}
 }
 
-func TestCompressHistoryShadowPreservesPriorSummary(t *testing.T) {
-	mock := newMockLLM(t) // the shadow fast path is local: any LLM call fails the test.
-	defer mock.Close()
-
-	dir := t.TempDir()
-	s, err := newSession(dir)
-	if err != nil {
-		t.Fatalf("newSession: %v", err)
-	}
-	s.Summary = "PRIOR SUMMARY FROM AN EARLIER COMPACTION"
-
-	filler := strings.Repeat("lorem ipsum ", 100)
-	for i := 0; i < 10; i++ {
-		s.AddUser(fmt.Sprintf("user %d %s", i, filler))
-		s.AddAssistant(fmt.Sprintf("asst %d %s", i, filler))
-	}
-
-	s.appendShadow("Goal: x\nProgress: y")
-	s.appendShadow("Goal: x\nProgress: anchor")
-
-	a := &agent{
-		sessions: map[string]*Session{s.ID: s},
-		settings: Settings{
-			LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}},
-		},
-	}
-
-	s.turnStartIdx = len(s.Messages)
-	a.foldHistory(context.Background(), s, len(s.Messages))
-
-	if !strings.Contains(s.Summary, "PRIOR SUMMARY") {
-		t.Errorf("prior Summary dropped during shadow fast path; got %q", s.Summary)
-	}
-	if !strings.Contains(s.Summary, "Goal: x") {
-		t.Errorf("shadow chunk missing from new Summary; got %q", s.Summary)
-	}
-}
-
-func TestShadowPersistsAcrossReload(t *testing.T) {
-	dir := t.TempDir()
-	s, err := newSession(dir)
-	if err != nil {
-		t.Fatalf("newSession: %v", err)
-	}
-	s.AddUser("hi")
-	s.appendShadow("Goal: a\nProgress: one")
-	s.appendShadow("Goal: a\nProgress: two")
-	if err := s.Save(); err != nil {
-		t.Fatalf("Save: %v", err)
-	}
-
-	loaded, err := loadSession(dir, s.ID)
-	if err != nil {
-		t.Fatalf("loadSession: %v", err)
-	}
-	if len(loaded.Shadow) != 2 {
-		t.Fatalf("Shadow not persisted: got %d entries, want 2 (%q)", len(loaded.Shadow), loaded.Shadow)
-	}
-	if loaded.Shadow[0] != "Goal: a\nProgress: one" || loaded.Shadow[1] != "Goal: a\nProgress: two" {
-		t.Errorf("Shadow entries corrupted on reload: %q", loaded.Shadow)
-	}
-}
-
-func TestCompressHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
+func TestFoldHistoryMidTurnKeepsInFlightTurn(t *testing.T) {
 	mock := newMockLLM(t) // folding is local; any LLM call fails the test.
 	defer mock.Close()
 
@@ -747,10 +629,6 @@ func TestBuildContextUsesModelCallID(t *testing.T) {
 	if gotCall != "call_abc" || gotResult != "call_abc" {
 		t.Errorf("wire ids: tool_call=%q tool_call_id=%q, want both %q (model's id)", gotCall, gotResult, "call_abc")
 	}
-
-	if got := wireCallID(ToolUse{ID: "tu_9"}); got != "tu_9" {
-		t.Errorf("fallback: got %q, want tu_9", got)
-	}
 }
 
 // Takes mu: tests poll it while the backgroundSummarise goroutine writes Shadow.
@@ -831,7 +709,8 @@ func TestReplayToolOutputViewImage(t *testing.T) {
 		t.Fatalf("storeImage: %v", err)
 	}
 	sess := &Session{Cwd: dir}
-	a := &agent{imagesSupported: true}
+	a := &agent{}
+	a.imagesSupported.Store(true)
 
 	// What the live call put on the wire (tools.go runToolCall).
 	text, live, failed := dispatchViewImage(sess, fmt.Sprintf(`{"id":%q}`, id))
@@ -843,7 +722,7 @@ func TestReplayToolOutputViewImage(t *testing.T) {
 	got := a.replayToolOutput(sess, tu)
 	parts, ok := got.([]any)
 	if !ok {
-		t.Fatalf("replay returned %T, want []any — the image was dropped from history", got)
+		t.Fatalf("replay returned %T, want []any: the image was dropped from history", got)
 	}
 	if !reflect.DeepEqual(parts, live) {
 		t.Errorf("replay differs from the live wire:\n got %#v\nwant %#v", parts, live)
@@ -853,7 +732,7 @@ func TestReplayToolOutputViewImage(t *testing.T) {
 		Input: `{"id":"img_gone"}`, Output: "view_image: image not found"}); bad != "view_image: image not found" {
 		t.Errorf("failed view_image replayed as %#v, want the stored text", bad)
 	}
-	noImg := &agent{imagesSupported: false}
+	noImg := &agent{}
 	if bad := noImg.replayToolOutput(sess, tu); bad != text {
 		t.Errorf("images-off replay = %#v, want the stored text", bad)
 	}
@@ -865,7 +744,8 @@ func TestReplayToolOutputViewImage(t *testing.T) {
 // Degrades to the stored text instead of failing the turn.
 func TestReplayToolOutputViewImageFileGone(t *testing.T) {
 	sess := &Session{Cwd: t.TempDir()}
-	a := &agent{imagesSupported: true}
+	a := &agent{}
+	a.imagesSupported.Store(true)
 	tu := ToolUse{ID: "tu_1", Name: "view_image", Input: `{"id":"img_deadbeefdeadbeef"}`,
 		Output: "[Image img_deadbeefdeadbeef re-delivered.]"}
 	if got := a.replayToolOutput(sess, tu); got != tu.Output {

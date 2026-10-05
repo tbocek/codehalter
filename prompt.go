@@ -147,7 +147,7 @@ func promptContent(cwd string, blocks []ContentBlock) (text string, images []Ima
 			case block.Resource.Text != "":
 				text += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, block.Resource.Text)
 			case block.Resource.Blob != "":
-				text += fmt.Sprintf("\n\n[Attached binary resource %s (%s) — not inlined]\n", label, block.Resource.MimeType)
+				text += fmt.Sprintf("\n\n[Attached binary resource %s (%s), not inlined]\n", label, block.Resource.MimeType)
 			default:
 				if snippet, l, ok := readLinkedResource(cwd, block.Resource.URI); ok {
 					text += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", l, snippet)
@@ -310,40 +310,8 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		return PromptResponse{}, fmt.Errorf("no session found")
 	}
 
-	// Typing while a turn runs steers it: the text is queued for its next tool
-	// round. Images can't be queued, and the reply says so.
-	if sess.turnRunning() {
-		text, images := promptContent(sess.Cwd, req.Content)
-		switch strings.TrimSpace(text) {
-		case "/spec stop":
-			if sess.specFence() == "" {
-				a.say(ctx, req.SessionId, "No /spec loop is running in this session.\n")
-			} else {
-				sess.requestSpecStop()
-				a.say(ctx, req.SessionId, "⏹ /spec stops after the round in flight; its tests and commit finish first. To stop right away, send `/spec abort`.\n")
-			}
-			return PromptResponse{StopReason: "end_turn"}, nil
-		case "/spec abort":
-			if !sess.abortSpec() {
-				a.say(ctx, req.SessionId, "No /spec loop is running in this session.\n")
-			} else {
-				a.say(ctx, req.SessionId, "⏹ Aborting /spec now: the round in flight is cut off. What it did so far stays in the project; the next `/spec` continues from it.\n")
-			}
-			return PromptResponse{StopReason: "end_turn"}, nil
-		}
-		if t := strings.TrimSpace(text); strings.HasPrefix(t, "/spec") && sess.specFence() != "" {
-			a.say(ctx, req.SessionId, "A /spec loop is running. `/spec stop` ends it after the round in flight; then `"+t+"`.\n")
-			return PromptResponse{StopReason: "end_turn"}, nil
-		}
-		if strings.TrimSpace(text) != "" {
-			sess.addSteer(text)
-			note := "↪ Queued for the turn in flight, it lands at its next step. Stop the turn to interrupt it instead.\n"
-			if len(images) > 0 {
-				note = fmt.Sprintf("↪ Queued your message for the turn in flight (%d image(s) left out, send them once it finishes). Stop the turn to interrupt it instead.\n", len(images))
-			}
-			a.say(ctx, req.SessionId, note)
-			return PromptResponse{StopReason: "end_turn"}, nil
-		}
+	if sess.turnRunning() && a.steerRunningTurn(ctx, sess, req.Content) {
+		return PromptResponse{StopReason: "end_turn"}, nil
 	}
 
 	var release func()
@@ -356,23 +324,15 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	}()
 
 	// These gates refuse before the message is stored, so history gets no reply.
-	// The abort is also said in chat: Zed keeps the first red box open, so a later
-	// error alone is invisible.
-	a.mu.Lock()
-	abort := a.abortReason
-	a.mu.Unlock()
-	slog.Debug("Prompt: abort gate", "sid", req.SessionId, "abortReason", abort)
-	if abort != "" {
-		a.say(ctx, req.SessionId, abort+"\n")
-		return PromptResponse{}, errors.New(abort)
+	if err := a.abortGate(ctx, req.SessionId); err != nil {
+		return PromptResponse{}, err
 	}
 
-	// Startup still running: a prompt waits for it, unless startup is asking the
-	// user something, which the prompt would answer past. Refusing outright made
-	// `--cli -p`, which prompts at once, fail every time with a question nobody asked.
-	if a.indexDone != nil {
+	// Startup still running: wait for it, unless it is asking the user something the
+	// prompt would answer past (refusing outright broke `--cli -p`, which prompts at once).
+	if startup := a.startupDone(); startup != nil {
 		select {
-		case <-a.indexDone:
+		case <-startup:
 			slog.Debug("Prompt: indexDone gate passed", "sid", req.SessionId)
 		default:
 			if a.asking.Load() > 0 {
@@ -382,17 +342,13 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			slog.Debug("Prompt: waiting for startup", "sid", req.SessionId)
 			a.say(ctx, req.SessionId, "⏳ Still setting up; your message runs as soon as that is done.\n")
 			select {
-			case <-a.indexDone:
+			case <-startup:
 			case <-ctx.Done():
 				return PromptResponse{}, ctx.Err()
 			}
 			// Startup may have ended on a problem the abort gate above did not see yet.
-			a.mu.Lock()
-			abort := a.abortReason
-			a.mu.Unlock()
-			if abort != "" {
-				a.say(ctx, req.SessionId, abort+"\n")
-				return PromptResponse{}, errors.New(abort)
+			if err := a.abortGate(ctx, req.SessionId); err != nil {
+				return PromptResponse{}, err
 			}
 		}
 	} else {
@@ -457,7 +413,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			// Background ctx: the request's own is already cancelled.
 			reason := cancelReason(err)
 			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "reason", reason, "err", err)
-			msg := "⏹ Turn cancelled — " + reason + ".\n"
+			msg := "⏹ Turn cancelled: " + reason + ".\n"
 			if errors.Is(err, errUserCancelled) {
 				msg = "⏹ Stopped.\n"
 			}
@@ -486,6 +442,55 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		return PromptResponse{StopReason: "cancelled"}, nil
 	}
 	return PromptResponse{StopReason: "end_turn"}, nil
+}
+
+// steerRunningTurn handles a prompt typed while a turn runs: /spec stop and abort
+// act at once, other text is queued for the turn's next tool round (images cannot
+// be queued, and the reply says so). False when there was nothing to handle.
+func (a *agent) steerRunningTurn(ctx context.Context, sess *Session, content []ContentBlock) bool {
+	text, images := promptContent(sess.Cwd, content)
+	t := strings.TrimSpace(text)
+	const noLoop = "No /spec loop is running in this session.\n"
+	switch {
+	case t == "/spec stop":
+		if sess.specFence() == "" {
+			a.say(ctx, sess.ID, noLoop)
+		} else {
+			sess.requestSpecStop()
+			a.say(ctx, sess.ID, "⏹ /spec stops after the round in flight; its tests and commit finish first. To stop right away, send `/spec abort`.\n")
+		}
+	case t == "/spec abort":
+		if sess.abortSpec() {
+			a.say(ctx, sess.ID, "⏹ Aborting /spec now: the round in flight is cut off. What it did so far stays in the project; the next `/spec` continues from it.\n")
+		} else {
+			a.say(ctx, sess.ID, noLoop)
+		}
+	case strings.HasPrefix(t, "/spec") && sess.specFence() != "":
+		a.say(ctx, sess.ID, "A /spec loop is running. `/spec stop` ends it after the round in flight; then `"+t+"`.\n")
+	case t == "":
+		return false
+	case len(images) > 0:
+		sess.addSteer(text)
+		a.say(ctx, sess.ID, fmt.Sprintf("↪ Queued your message for the turn in flight (%d image(s) left out, send them once it finishes). Stop the turn to interrupt it instead.\n", len(images)))
+	default:
+		sess.addSteer(text)
+		a.say(ctx, sess.ID, "↪ Queued for the turn in flight, it lands at its next step. Stop the turn to interrupt it instead.\n")
+	}
+	return true
+}
+
+// abortGate also says the abort in chat: Zed keeps the first red box open, so a
+// later error alone is invisible.
+func (a *agent) abortGate(ctx context.Context, sid string) error {
+	a.mu.Lock()
+	abort := a.abortReason
+	a.mu.Unlock()
+	slog.Debug("Prompt: abort gate", "sid", sid, "abortReason", abort)
+	if abort == "" {
+		return nil
+	}
+	a.say(ctx, sid, abort+"\n")
+	return errors.New(abort)
 }
 
 // runTurn is shared by typed prompts and accepted fix cards; the caller presents errors.
@@ -561,6 +566,9 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 
 func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
+	if sess == nil {
+		return toolLoopResult{}, fmt.Errorf("no session found")
+	}
 	sess.rt.mu.Lock()
 	sess.rt.stuckCalls, sess.rt.stuckOutputs = nil, nil // a new request may need any call again
 	sess.rt.mu.Unlock()
@@ -577,10 +585,10 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		// Returning the answer as Text lets runTurn's epilogue run.
 		switch {
 		case p.answer != "":
-			a.say(ctx, sid, p.answer+"\n\nℹ Answered directly — no code change to execute.\n")
+			a.say(ctx, sid, p.answer+"\n\nℹ Answered directly, no code change to execute.\n")
 			return toolLoopResult{Text: p.answer}, nil
 		default:
-			a.say(ctx, sid, "⚠ I couldn't produce a clear answer or a plan for that — try rephrasing, or ask for a specific change.\n")
+			a.say(ctx, sid, "⚠ I couldn't produce a clear answer or a plan for that. Try rephrasing, or ask for a specific change.\n")
 			return toolLoopResult{}, nil
 		}
 	}
@@ -632,10 +640,10 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		if upserted {
 			upserts++
 			if upserts > maxUpserts {
-				a.say(ctx, sid, fmt.Sprintf("⚠ Plan revised %d times — stopping to avoid a re-plan loop.\n", upserts))
+				a.say(ctx, sid, fmt.Sprintf("⚠ Plan revised %d times: stopping to avoid a re-plan loop.\n", upserts))
 				return lastResult, nil
 			}
-			a.renderPlan(ctx, sid, "\n📝 Plan updated — remaining:", plan.Subtasks)
+			a.renderPlan(ctx, sid, "\n📝 Plan updated, remaining:", plan.Subtasks)
 			continue
 		}
 
@@ -656,79 +664,16 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 
 		replans++
 		if replans >= maxReplans {
-			a.say(ctx, sid, fmt.Sprintf("⚠ Replan budget (%d) exhausted — giving up.\n", maxReplans))
+			a.say(ctx, sid, fmt.Sprintf("⚠ Replan budget (%d) exhausted: giving up.\n", maxReplans))
 			return lastResult, nil
 		}
 
-		// What the failed subtask spent its calls on: "see history" alone let replans
-		// repeat the same hunt.
-		var reads, edits, runs int
-		var edited []string
-		// Grouped by what came back, as the repetition tracker does: the same answer
-		// under a new echo label or log name is the same call, shown as its first form.
-		count := map[string]int{}
-		first := map[string]string{}
-		for _, u := range lastResult.ToolUses {
-			args := parseArgs(u.Input)
-			cmd := args.str("command")
-			switch {
-			case u.Name == "read_file", u.Name == "web_search", u.Name == "web_read", u.Name == "run_command" && onlyReads(cmd):
-				reads++
-			case u.Name == "edit_file" || u.Name == "write_file":
-				if !strings.HasPrefix(u.Output, "file written") { // refused or unmatched
-					break
-				}
-				edits++
-				if p := args.str("path"); p != "" && !slices.Contains(edited, p) {
-					edited = append(edited, p)
-				}
-			case u.Name == "run_command" && u.Changed:
-				edits++
-				runs++
-			case u.Name == "run_command", u.Name == "run_background":
-				runs++
-			}
-			// A short answer ("exit 0") says which call only by the call itself.
-			h := "call " + u.Name + " " + u.Input
-			if out := repeatText(u.Input, u.Output); len(out) >= repeatMinOutput {
-				h = "answer " + out
-			}
-			if count[h]++; first[h] == "" {
-				first[h] = u.Name + " " + u.Input
-				if cmd != "" {
-					first[h] = cmd
-				}
-			}
-		}
-		var digest strings.Builder
-		fmt.Fprintf(&digest, "What the failed subtask did, counted by codehalter: %d tool calls, %d of them reads or searches, %d edits, %d commands run.", len(lastResult.ToolUses), reads, edits, runs)
-		switch {
-		case edits == 0:
-			digest.WriteString(" It changed no file.")
-		case len(edited) > 0:
-			fmt.Fprintf(&digest, " Files changed through edits: %s.", strings.Join(edited, ", "))
-		}
-		keys := slices.Collect(maps.Keys(count))
-		slices.SortFunc(keys, func(x, y string) int { return cmp.Or(count[y]-count[x], strings.Compare(first[x], first[y])) })
-		var repeated []string
-		for _, k := range keys {
-			if count[k] < 3 || len(repeated) == 3 {
-				break
-			}
-			repeated = append(repeated, fmt.Sprintf("`%s` %d times", truncate(first[k], 100), count[k]))
-		}
-		if len(repeated) > 0 {
-			digest.WriteString(" Repeated: " + strings.Join(repeated, "; ") + ".")
-		}
-		if reads >= 20 && reads > 2*(edits+runs) {
-			digest.WriteString(" It kept looking things up: put what it was hunting for (the verified signatures, paths and line ranges) into the new subtasks, so the executor does not have to find it again.")
-		}
-		var replanCtx string
+		same := ""
 		if dupCount >= 2 {
-			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. %s Same failure has surfaced %d times — the prior fix didn't work; propose a structurally different approach. See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason, digest.String(), dupCount)
-		} else {
-			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. %s See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason, digest.String())
+			same = fmt.Sprintf(" Same failure has surfaced %d times: the prior fix didn't work; propose a structurally different approach.", dupCount)
 		}
+		replanCtx := fmt.Sprintf("REPLAN: prior subtask failed: %s. %s%s See history for executor attempts. Follow the 'Replanning' section in PLAN.md.",
+			failedReason, failureDigest(lastResult.ToolUses), same)
 
 		a.sendPhase(ctx, sid, 0, false)
 		newPlan, err := a.runPlanPhase(ctx, sid, replanCtx)
@@ -736,7 +681,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			return lastResult, err
 		}
 		if len(newPlan.Subtasks) == 0 {
-			a.say(ctx, sid, "Replan produced no further subtasks — stopping.\n")
+			a.say(ctx, sid, "Replan produced no further subtasks: stopping.\n")
 			return lastResult, nil
 		}
 
@@ -745,13 +690,77 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	}
 
 	// A /spec round plans its own docs step; a documenter after it edits past the round's test run.
-	if sess == nil || sess.specFence() == "" {
+	if sess.specFence() == "" {
 		a.sendPhase(ctx, sid, 2, false)
 		lastResult = a.runDocumentPhase(ctx, sid, lastResult)
 	}
 	a.sendPhase(ctx, sid, 2, true)
 
 	return lastResult, nil
+}
+
+// failureDigest is what a failed subtask spent its calls on: "see history" alone
+// let replans repeat the same hunt.
+func failureDigest(uses []ToolUse) string {
+	var reads, edits, runs int
+	var edited []string
+	// Grouped by what came back, as the repetition tracker does: the same answer
+	// under a new echo label or log name is the same call, shown as its first form.
+	count := map[string]int{}
+	first := map[string]string{}
+	for _, u := range uses {
+		args := parseArgs(u.Input)
+		cmd := args.str("command")
+		switch {
+		case isReadCall(u.Name, u.Input):
+			reads++
+		case wroteFile(u.Name, u.Output):
+			edits++
+			if p := args.str("path"); p != "" && !slices.Contains(edited, p) {
+				edited = append(edited, p)
+			}
+		case u.Name == "run_command" && u.Changed:
+			edits++
+			runs++
+		case u.Name == "run_command", u.Name == "run_background":
+			runs++
+		}
+		// A short answer ("exit 0") says which call only by the call itself.
+		h := "call " + u.Name + " " + u.Input
+		if out := repeatText(u.Input, u.Output); len(out) >= repeatMinOutput {
+			h = "answer " + out
+		}
+		if count[h]++; first[h] == "" {
+			first[h] = u.Name + " " + u.Input
+			if cmd != "" {
+				first[h] = cmd
+			}
+		}
+	}
+	var digest strings.Builder
+	fmt.Fprintf(&digest, "What the failed subtask did, counted by codehalter: %d tool calls, %d of them reads or searches, %d edits, %d commands run.", len(uses), reads, edits, runs)
+	switch {
+	case edits == 0:
+		digest.WriteString(" It changed no file.")
+	case len(edited) > 0:
+		fmt.Fprintf(&digest, " Files changed through edits: %s.", strings.Join(edited, ", "))
+	}
+	keys := slices.Collect(maps.Keys(count))
+	slices.SortFunc(keys, func(x, y string) int { return cmp.Or(count[y]-count[x], strings.Compare(first[x], first[y])) })
+	var repeated []string
+	for _, k := range keys {
+		if count[k] < 3 || len(repeated) == 3 {
+			break
+		}
+		repeated = append(repeated, fmt.Sprintf("`%s` %d times", truncate(first[k], 100), count[k]))
+	}
+	if len(repeated) > 0 {
+		digest.WriteString(" Repeated: " + strings.Join(repeated, "; ") + ".")
+	}
+	if reads >= 20 && reads > 2*(edits+runs) {
+		digest.WriteString(" It kept looking things up: put what it was hunting for (the verified signatures, paths and line ranges) into the new subtasks, so the executor does not have to find it again.")
+	}
+	return digest.String()
 }
 
 // No "Execute?" gate: the devcontainer is the approval.

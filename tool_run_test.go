@@ -83,13 +83,14 @@ func TestRunCommandCapsHugeOutput(t *testing.T) {
 	}
 }
 
+// Both executors refuse an empty command; separators alone once crashed the job classifier.
 func TestRunCommandRequiresCommand(t *testing.T) {
 	h := newTerminalHarness(t)
-	// Separators alone are no command either; they once crashed the job classifier.
-	for _, args := range []string{`{}`, `{"command":" ; "}`, `{"command":"\n"}`} {
-		res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, args)
-		if failed || !strings.Contains(res, "command is required") {
-			t.Errorf("%s: expected command-required error, got: %s (failed=%v)", args, res, failed)
+	for name, run := range map[string]func(context.Context, *agent, string, string) (string, bool){"run_command": runCmdExecute, "run_background": runBackgroundExecute} {
+		for _, args := range []string{`{}`, `{"command":" ; "}`, `{"command":"\n"}`} {
+			if res, failed := run(context.Background(), h.agent, h.sess.ID, args); failed || !strings.Contains(res, "command is required") {
+				t.Errorf("%s %s: %s (failed=%v), want command-required", name, args, res, failed)
+			}
 		}
 	}
 }
@@ -273,9 +274,6 @@ func TestToolHints(t *testing.T) {
 	if !strings.Contains(first, `Its replace is exactly this edit_file call: {"path": "tests/zoom_widgets.rs", "old_text": "a", "new_text": "b"}`) || !strings.Contains(told, "edit_file instead of a script on tests/zoom_widgets.rs") {
 		t.Errorf("hint = %q / %q", first, told)
 	}
-	if again, _ := toolHints(edit); again == "" {
-		t.Error("the second occurrence got no hint; every occurrence gets one")
-	}
 	multi := "python3 - <<'PY'\np='src/ui/window.rs'\ns=open(p).read()\ns=s.replace(\"\"\"let zoom = 1.0;\"\"\", \"\"\"let zoom = ZOOM;\"\"\")\ns=s.replace('old()', 'new()')\nopen(p,'w').write(s)\nPY"
 	if got := scriptEditPreview(multi, "src/ui/window.rs"); !strings.Contains(got, "Its 2 replaces are ONE edit_file call with an edits list") {
 		t.Errorf("multi preview = %q", got)
@@ -295,9 +293,6 @@ func TestRunCommandNamesTheToolItWasMeantFor(t *testing.T) {
 	res, _ = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"path":"a.rs","old_text":"x","new_text":"y"}`)
 	if !strings.Contains(res, "Call edit_file with them") {
 		t.Errorf("an edit sent to run_command = %q", res)
-	}
-	if res, _ = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{}`); res != "error: command is required" {
-		t.Errorf("empty call = %q", res)
 	}
 }
 

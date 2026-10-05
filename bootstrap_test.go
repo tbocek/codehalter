@@ -1,137 +1,63 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
 
-func writeFiles(t *testing.T, dir string, names ...string) {
-	t.Helper()
-	for _, n := range names {
-		p := filepath.Join(dir, n)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatalf("mkdir %s: %v", filepath.Dir(p), err)
-		}
-		if err := os.WriteFile(p, nil, 0o644); err != nil {
-			t.Fatalf("write %s: %v", n, err)
-		}
-	}
-}
-
-func TestDetectStacksEmpty(t *testing.T) {
-	if got := detectStacks(t.TempDir()); len(got) != 0 {
-		t.Errorf("empty dir: want no stacks, got %v", got)
-	}
-}
-
-func TestDetectStacksSingle(t *testing.T) {
-	cases := []struct {
+// want is in the fixed order skillSet relies on.
+func TestDetectStacks(t *testing.T) {
+	for _, c := range []struct {
 		name  string
 		files []string
-		want  string
+		dirs  []string
+		want  []string
 	}{
-		{"go", []string{"go.mod"}, "go"},
-		{"rust", []string{"Cargo.toml"}, "rust"},
-		{"zig-build", []string{"build.zig"}, "zig"},
-		{"zig-zon", []string{"build.zig.zon"}, "zig"},
-		{"java-pom", []string{"pom.xml"}, "java"},
-		{"java-gradle", []string{"build.gradle"}, "java"},
-		{"java-gradle-kts", []string{"build.gradle.kts"}, "java"},
-		{"ts-tsconfig", []string{"tsconfig.json"}, "ts"},
-		{"ts-fileonly", []string{"app.ts"}, "ts"},
-		{"js", []string{"package.json"}, "js"},
-		{"c-source", []string{"main.c"}, "c"},
-		{"cpp-source", []string{"main.cpp"}, "c"},
-		{"c-header-only", []string{"lib.h"}, "c"},
-		{"cmake", []string{"CMakeLists.txt"}, "c"},
-		{"css", []string{"layout.css"}, "css"},
-		{"css-html", []string{"index.html"}, "css"},
-	}
-	for _, c := range cases {
+		{name: "empty"},
+		{name: "go", files: []string{"go.mod"}, want: []string{"go"}},
+		{name: "rust", files: []string{"Cargo.toml"}, want: []string{"rust"}},
+		{name: "zig-build", files: []string{"build.zig"}, want: []string{"zig"}},
+		{name: "zig-zon", files: []string{"build.zig.zon"}, want: []string{"zig"}},
+		{name: "java-pom", files: []string{"pom.xml"}, want: []string{"java"}},
+		{name: "java-gradle", files: []string{"build.gradle"}, want: []string{"java"}},
+		{name: "java-gradle-kts", files: []string{"build.gradle.kts"}, want: []string{"java"}},
+		{name: "ts-tsconfig", files: []string{"tsconfig.json"}, want: []string{"ts"}},
+		{name: "ts-fileonly", files: []string{"app.ts"}, want: []string{"ts"}},
+		{name: "js", files: []string{"package.json"}, want: []string{"js"}},
+		{name: "c-source", files: []string{"main.c"}, want: []string{"c"}},
+		{name: "cpp-source", files: []string{"main.cpp"}, want: []string{"c"}},
+		{name: "c-header-only", files: []string{"lib.h"}, want: []string{"c"}},
+		{name: "cmake", files: []string{"CMakeLists.txt"}, want: []string{"c"}},
+		{name: "css", files: []string{"layout.css"}, want: []string{"css"}},
+		{name: "css-html", files: []string{"index.html"}, want: []string{"css"}},
+		{name: "ts beats js", files: []string{"package.json", "app.ts"}, want: []string{"ts"}},
+		{name: "scaffolding only", files: []string{"run.sh", "build.bash"}, dirs: []string{".devcontainer"}},
+		{name: "a directory named *.ts is no ts file", dirs: []string{"sub.ts"}},
+		{
+			name:  "multi, fixed order",
+			files: []string{"go.mod", "package.json", "tsconfig.json", "pom.xml", "Cargo.toml", "build.zig", "main.c", "run.sh", "layout.css"},
+			dirs:  []string{".devcontainer"},
+			want:  []string{"go", "ts", "css", "java", "rust", "zig", "c"},
+		},
+	} {
 		t.Run(c.name, func(t *testing.T) {
 			dir := t.TempDir()
 			writeFiles(t, dir, c.files...)
-			got := detectStacks(dir)
-			if len(got) != 1 || got[0] != c.want {
-				t.Errorf("files %v: want [%s], got %v", c.files, c.want, got)
+			for _, d := range c.dirs {
+				if err := os.MkdirAll(filepath.Join(dir, d), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := detectStacks(dir); !slices.Equal(got, c.want) {
+				t.Errorf("files %v dirs %v: want %v, got %v", c.files, c.dirs, c.want, got)
 			}
 		})
 	}
-}
-
-func TestDetectStacksTSBeatsJS(t *testing.T) {
-	dir := t.TempDir()
-	writeFiles(t, dir, "package.json", "app.ts")
-	got := detectStacks(dir)
-	for _, s := range got {
-		if s == "js" {
-			t.Errorf("expected ts to suppress js; got %v", got)
-		}
-	}
-	if !contains(got, "ts") {
-		t.Errorf("want ts in %v", got)
-	}
-}
-
-func TestDetectStacksSkipsScaffolding(t *testing.T) {
-	dir := t.TempDir()
-	writeFiles(t, dir, "run.sh", "build.bash")
-	if err := os.MkdirAll(filepath.Join(dir, ".devcontainer"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if got := detectStacks(dir); len(got) != 0 {
-		t.Errorf("scaffolding only: want no stacks, got %v", got)
-	}
-}
-
-// Pins the fixed stack order.
-func TestDetectStacksMulti(t *testing.T) {
-	dir := t.TempDir()
-	writeFiles(t, dir,
-		"go.mod", "package.json", "tsconfig.json",
-		"pom.xml", "Cargo.toml", "build.zig", "main.c", "run.sh", "layout.css",
-	)
-	if err := os.MkdirAll(filepath.Join(dir, ".devcontainer"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	want := []string{"go", "ts", "css", "java", "rust", "zig", "c"}
-	got := detectStacks(dir)
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("multi: want %v, got %v", want, got)
-	}
-}
-
-func TestHasFileWithExt(t *testing.T) {
-	dir := t.TempDir()
-	writeFiles(t, dir, "a.go", "b.md")
-	if err := os.MkdirAll(filepath.Join(dir, "sub.ts"), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if !hasFileWithExt(dir, ".go") {
-		t.Errorf("want .go detected")
-	}
-	if !hasFileWithExt(dir, ".rs", ".md") {
-		t.Errorf("want .md detected via multi-ext")
-	}
-	if hasFileWithExt(dir, ".rs") {
-		t.Errorf("want .rs not detected")
-	}
-	if hasFileWithExt(dir, ".ts") {
-		t.Errorf("dir named *.ts must not count as a .ts file")
-	}
-}
-
-func contains(xs []string, s string) bool {
-	for _, x := range xs {
-		if x == s {
-			return true
-		}
-	}
-	return false
 }
 
 func devMounts(t *testing.T, raw string) ([]string, map[string]any) {
@@ -146,18 +72,12 @@ func devMounts(t *testing.T, raw string) ([]string, map[string]any) {
 	return m.Mounts, m.ContainerEnv
 }
 
-func anyHas(ss []string, sub string) bool {
-	for _, s := range ss {
-		if strings.Contains(s, sub) {
-			return true
-		}
-	}
-	return false
-}
-
 func TestBuildDevcontainerJSON(t *testing.T) {
+	has := func(mounts []string, sub string) bool {
+		return slices.ContainsFunc(mounts, func(m string) bool { return strings.Contains(m, sub) })
+	}
 	bm, benv := devMounts(t, buildDevcontainerJSON(false, false, false))
-	if len(bm) != 1 || !anyHas(bm, "/.config/codehalter") {
+	if len(bm) != 1 || !has(bm, "/.config/codehalter") {
 		t.Errorf("base must be just the config mount, got %v", bm)
 	}
 	if _, ok := benv["SSH_AUTH_SOCK"]; ok {
@@ -165,20 +85,20 @@ func TestBuildDevcontainerJSON(t *testing.T) {
 	}
 
 	gm, _ := devMounts(t, buildDevcontainerJSON(true, false, false))
-	if !anyHas(gm, "containerWorkspaceFolder}/.git") {
+	if !has(gm, "containerWorkspaceFolder}/.git") {
 		t.Errorf("gitWritable must add the .git mount, got %v", gm)
 	}
-	if anyHas(gm, "/.gitconfig") || anyHas(gm, "ssh-agent") {
+	if has(gm, "/.gitconfig") || has(gm, "ssh-agent") {
 		t.Errorf("git-only must not add gitconfig/ssh, got %v", gm)
 	}
 
 	gcm, _ := devMounts(t, buildDevcontainerJSON(true, true, false))
-	if !anyHas(gcm, "containerWorkspaceFolder}/.git") || !anyHas(gcm, "/.gitconfig") {
+	if !has(gcm, "containerWorkspaceFolder}/.git") || !has(gcm, "/.gitconfig") {
 		t.Errorf("git+gitconfig must add both, got %v", gcm)
 	}
 
 	sm, senv := devMounts(t, buildDevcontainerJSON(false, false, true))
-	if !anyHas(sm, "ssh-agent") || anyHas(sm, "/.git,") {
+	if !has(sm, "ssh-agent") || has(sm, "/.git,") {
 		t.Errorf("ssh-only mounts wrong, got %v", sm)
 	}
 	if senv["SSH_AUTH_SOCK"] != "/ssh-agent" {
@@ -207,24 +127,6 @@ func TestHostSSHAgentAvailable(t *testing.T) {
 	t.Setenv("SSH_AUTH_SOCK", sock)
 	if !hostSSHAgentAvailable() {
 		t.Errorf("existing socket → true")
-	}
-}
-
-func TestLoadGlobalConfig(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if loadGlobalConfig().HasGitconfigInHome {
-		t.Errorf("missing global.toml → false")
-	}
-	cfg := filepath.Join(home, ".config", "codehalter")
-	if err := os.MkdirAll(cfg, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cfg, "global.toml"), []byte("has_gitconfig_in_home = true\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !loadGlobalConfig().HasGitconfigInHome {
-		t.Errorf("global.toml has_gitconfig_in_home=true → true")
 	}
 }
 
@@ -273,5 +175,49 @@ func TestEnsureSettingsGitignored(t *testing.T) {
 	}
 	if !ensureSettingsGitignored(worktree) {
 		t.Errorf("linked worktree: must gitignore settings.toml")
+	}
+}
+
+// Autopilot answers the card with its first option, ignoring .codehalter/.
+func TestEnsureGitignore(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		git       bool
+		gitignore *string // nil: no .gitignore
+		want      *string // nil: no .gitignore afterwards
+	}{
+		{name: "neither git nor .gitignore: nothing written", git: false},
+		{name: "git repo without .gitignore: created", git: true, want: ptr(".codehalter/\n")},
+		{
+			name:      "the settings-only entry does not count as the decision",
+			git:       true,
+			gitignore: ptr("node_modules\n" + gitignoreSettingsEntry),
+			want:      ptr("node_modules\n" + gitignoreSettingsEntry + "\n.codehalter/\n"),
+		},
+		{name: "already decided: untouched", git: true, gitignore: ptr("# .codehalter/ is intentionally tracked\n"), want: ptr("# .codehalter/ is intentionally tracked\n")},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			a, s := newTestAgent(t)
+			a.mode = "Autopilot"
+			if c.git {
+				if err := os.Mkdir(filepath.Join(s.Cwd, ".git"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(s.Cwd, ".gitignore")
+			if c.gitignore != nil {
+				if err := os.WriteFile(path, []byte(*c.gitignore), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			a.ensureGitignore(context.Background(), s.Cwd, s.ID)
+			data, err := os.ReadFile(path)
+			switch {
+			case c.want == nil && !os.IsNotExist(err):
+				t.Errorf(".gitignore written: %q, %v", data, err)
+			case c.want != nil && string(data) != *c.want:
+				t.Errorf(".gitignore = %q, want %q (err %v)", data, *c.want, err)
+			}
+		})
 	}
 }

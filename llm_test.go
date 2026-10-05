@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,81 +16,65 @@ import (
 	"time"
 )
 
-func TestTrimJSON(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
+// Only a `purpose = "summary"` entry takes background work off llm[0]. Slot is the
+// display index: background work on a 2-slot llm[0] shows as llm[1].
+func TestConnForBackgroundLLM(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		llm        []LLMConnection
+		saturate   int // an entry whose every slot is taken; 0 for none
+		wantServer string
+		wantSlot   int
+		wantOnMain bool
 	}{
-		{name: "plain", in: `{"ok":true}`, want: `{"ok":true}`},
-		{name: "leading whitespace", in: "  \n{\"ok\":true}\n  ", want: `{"ok":true}`},
-		{name: "json fence", in: "```json\n{\"ok\":true}\n```", want: `{"ok":true}`},
-		{name: "bare fence", in: "```\n{\"ok\":true}\n```", want: `{"ok":true}`},
-		{name: "prose prefix", in: "Sure, here's the JSON:\n{\"ok\":true}", want: `{"ok":true}`},
-		{name: "prose suffix", in: "{\"ok\":true}\nLet me know if you need more.", want: `{"ok":true}`},
-		{name: "prose both sides", in: "Here you go: {\"ok\":true} — that's it!", want: `{"ok":true}`},
-		{name: "nested", in: "noise {\"a\":{\"b\":1}} noise", want: `{"a":{"b":1}}`},
-		{name: "brace in string", in: `{"s":"} not the end"}`, want: `{"s":"} not the end"}`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := trimJSON(tc.in); got != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-// Only a `purpose = "summary"` entry takes background work off llm[0]; an unmarked
-// extra entry must NOT absorb the summariser.
-func TestBackgroundSlotLabel(t *testing.T) {
-	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2)}}}}
-	a.buildConnSems()
-	if fg := a.settings.ConnAt(0, "execute"); fg == nil || fg.Slot != 0 {
-		t.Fatalf("ConnAt(0).Slot = %v, want 0", fg)
-	}
-	bg, onMain := a.connForBackgroundLLM()
-	if bg == nil || bg.Slot != 1 || bg.Server != "u" || bg.Model != "m" || !onMain {
-		t.Fatalf("connForBackgroundLLM = %+v onMain=%v, want Slot 1 on u/m, onMain", bg, onMain)
-	}
-
-	a1 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(1)}}}}
-	a1.buildConnSems()
-	if bg, onMain := a1.connForBackgroundLLM(); bg == nil || bg.Slot != 0 || !onMain {
-		t.Fatalf("single-slot connForBackgroundLLM = %+v onMain=%v, want Slot 0, onMain", bg, onMain)
-	}
-
-	// Two entries, neither designated: background stays on llm[0].
-	a2 := &agent{settings: Settings{LLM: []LLMConnection{
-		{Server: "u0", Model: "m0", Parallel: ptr(1)},
-		{Server: "u1", Model: "m1", Parallel: ptr(1)},
-	}}}
-	a2.buildConnSems()
-	if bg, onMain := a2.connForBackgroundLLM(); bg == nil || bg.Server != "u0" || !onMain {
-		t.Fatalf("undesignated extra entry = %+v onMain=%v, want u0 onMain — it must not absorb the summariser", bg, onMain)
-	}
-
-	a3 := &agent{settings: Settings{LLM: []LLMConnection{
-		{Server: "u0", Model: "m0", Parallel: ptr(1)},
-		{Server: "u1", Model: "m1", Parallel: ptr(1)},
-		{Server: "u2", Model: "m2", Parallel: ptr(1), Purpose: "summary"},
-	}}}
-	a3.buildConnSems()
-	if bg, onMain := a3.connForBackgroundLLM(); bg == nil || bg.Slot != 2 || bg.Server != "u2" || onMain {
-		t.Fatalf("designated connForBackgroundLLM = %+v onMain=%v, want Slot 2 on u2, NOT onMain", bg, onMain)
-	}
-
-	// Designated but saturated → fall back to llm[0] rather than queue behind it.
-	a3.connSems[2] <- struct{}{}
-	if bg, onMain := a3.connForBackgroundLLM(); bg == nil || bg.Server != "u0" || !onMain {
-		t.Fatalf("saturated summary conn = %+v onMain=%v, want u0 onMain", bg, onMain)
-	}
-
-	// purpose on llm[0] is the same as no purpose: the fallback already lands there.
-	a4 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2), Purpose: "summary"}}}}
-	a4.buildConnSems()
-	if bg, onMain := a4.connForBackgroundLLM(); bg == nil || bg.Slot != 1 || !onMain {
-		t.Fatalf("purpose on llm[0] = %+v onMain=%v, want Slot 1 onMain", bg, onMain)
+		{
+			name:       "two slots on llm[0]",
+			llm:        []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2)}},
+			wantServer: "u", wantSlot: 1, wantOnMain: true,
+		},
+		{
+			name:       "one slot on llm[0]",
+			llm:        []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(1)}},
+			wantServer: "u", wantSlot: 0, wantOnMain: true,
+		},
+		{
+			name:       "an undesignated extra entry does not absorb the summariser",
+			llm:        []LLMConnection{{Server: "u0", Model: "m0", Parallel: ptr(1)}, {Server: "u1", Model: "m1", Parallel: ptr(1)}},
+			wantServer: "u0", wantSlot: 0, wantOnMain: true,
+		},
+		{
+			name: "the designated summariser",
+			llm: []LLMConnection{
+				{Server: "u0", Model: "m0", Parallel: ptr(1)},
+				{Server: "u1", Model: "m1", Parallel: ptr(1)},
+				{Server: "u2", Model: "m2", Parallel: ptr(1), Purpose: "summary"},
+			},
+			wantServer: "u2", wantSlot: 2, wantOnMain: false,
+		},
+		{
+			name: "a saturated summariser falls back rather than queue",
+			llm: []LLMConnection{
+				{Server: "u0", Model: "m0", Parallel: ptr(1)},
+				{Server: "u2", Model: "m2", Parallel: ptr(1), Purpose: "summary"},
+			},
+			saturate:   1,
+			wantServer: "u0", wantSlot: 0, wantOnMain: true,
+		},
+		{
+			name:       "purpose on llm[0] is no purpose",
+			llm:        []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2), Purpose: "summary"}},
+			wantServer: "u", wantSlot: 1, wantOnMain: true,
+		},
+	} {
+		a := &agent{settings: Settings{LLM: c.llm}}
+		a.buildConnSems()
+		if c.saturate > 0 {
+			a.connSems[c.saturate] <- struct{}{}
+		}
+		bg, onMain := a.connForBackgroundLLM()
+		if bg == nil || bg.Server != c.wantServer || bg.Slot != c.wantSlot || onMain != c.wantOnMain {
+			t.Errorf("%s: got %+v onMain=%v, want %s slot %d onMain=%v", c.name, bg, onMain, c.wantServer, c.wantSlot, c.wantOnMain)
+		}
 	}
 }
 
@@ -102,7 +87,7 @@ func TestBuildConnSemsIdempotent(t *testing.T) {
 
 	a.buildConnSems() // same shape → must reuse the same channel
 	if a.connSems[0] != first {
-		t.Fatal("buildConnSems swapped the channel on an unchanged reload — would orphan in-flight permits")
+		t.Fatal("buildConnSems swapped the channel on an unchanged reload: would orphan in-flight permits")
 	}
 
 	v := cap(first) + 3
@@ -185,6 +170,9 @@ func TestIsContextFull(t *testing.T) {
 		{"wrapped ceiling", fmt.Errorf("ceiling: %w", errContextCeiling), true},
 		{"transport", errors.New("dial tcp: connection refused"), false},
 		{"nil", nil, false},
+		// Halogen refuses a request over its picture limit in the stream.
+		{"halogen picture limit", &llmStreamError{Msg: "the engine refused this request: IMG count outside 0..64"}, true},
+		{"another in-stream refusal", &llmStreamError{Msg: "the engine refused this request: bad grammar"}, false},
 	} {
 		if got := isContextFull(tc.err); got != tc.want {
 			t.Errorf("%s: isContextFull = %v, want %v", tc.name, got, tc.want)
@@ -312,36 +300,6 @@ func TestThinkingOn(t *testing.T) {
 	}
 }
 
-// ExtraBody must stay untouched: renderKey fingerprints it, and writing
-// chat_template_kwargs there would re-render the whole prompt.
-func TestWithThinkingDisabled(t *testing.T) {
-	orig := &LLMConnection{Server: "s", Model: "m", Slot: 2, ExtraBody: map[string]any{
-		"temperature":          0.7,
-		"chat_template_kwargs": map[string]any{"preserve_thinking": true},
-	}}
-	off := orig.withThinkingDisabled()
-
-	if off.Server != "s" || off.Model != "m" || off.Slot != 2 {
-		t.Errorf("routing fields changed: %+v", off)
-	}
-	if !off.noThinkPrefill {
-		t.Error("withThinkingDisabled did not arm the prefill")
-	}
-	if renderKey(off.ExtraBody) != renderKey(orig.ExtraBody) {
-		t.Errorf("the retry changed the rendering: %s vs %s",
-			renderKey(off.ExtraBody), renderKey(orig.ExtraBody))
-	}
-	if _, set := off.ExtraBody["chat_template_kwargs"].(map[string]any)["enable_thinking"]; set {
-		t.Errorf("the retry still writes enable_thinking: %+v", off.ExtraBody)
-	}
-	if off.ExtraBody["temperature"] != 0.7 {
-		t.Errorf("sibling params dropped: %+v", off.ExtraBody)
-	}
-	if orig.noThinkPrefill {
-		t.Error("withThinkingDisabled mutated the original conn")
-	}
-}
-
 // Earlier messages and the caller's slice stay untouched: an append keeps the prefix cache.
 func TestPrefillIsAppendedNotRendered(t *testing.T) {
 	mock := newMockLLM(t, sseText("done"))
@@ -378,22 +336,54 @@ func TestPrefillIsAppendedNotRendered(t *testing.T) {
 	}
 }
 
-// The copy overrides the role default; the original keeps its own cap.
-func TestWithBody(t *testing.T) {
-	orig := &LLMConnection{Server: "s", Model: "m", Slot: 1, ExtraBody: map[string]any{
-		"max_tokens":  8192,
-		"temperature": 0.7,
-	}}
-	capped := orig.withBody("max_tokens", 1)
-
-	if capped.Server != "s" || capped.Model != "m" || capped.Slot != 1 {
-		t.Errorf("routing fields changed: %+v", capped)
+// The turn stats count only evaluated prompt tokens; a warm call counts nothing.
+func TestLLMStreamRecordsTurnStats(t *testing.T) {
+	frames := func(extra map[string]any) string {
+		text, _ := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"content": "ok"}}}})
+		tail := map[string]any{"choices": []any{}}
+		maps.Copy(tail, extra)
+		stats, _ := json.Marshal(tail)
+		return fmt.Sprintf("data: %s\n\ndata: %s\n\ndata: [DONE]\n\n", text, stats)
 	}
-	if capped.ExtraBody["max_tokens"] != 1 || capped.ExtraBody["temperature"] != 0.7 {
-		t.Errorf("ExtraBody: got %+v, want max_tokens=1 + temperature kept", capped.ExtraBody)
+	usage := func(cached int) map[string]any {
+		u := map[string]any{"prompt_tokens": 1000, "completion_tokens": 20}
+		if cached >= 0 {
+			u["prompt_tokens_details"] = map[string]any{"cached_tokens": cached}
+		}
+		return map[string]any{"usage": u}
 	}
-	if orig.ExtraBody["max_tokens"] != 8192 {
-		t.Error("withBody mutated the original conn")
+	for _, c := range []struct {
+		name           string
+		sse            string
+		warm           bool
+		wantEvaluated  int
+		wantCompletion int
+		wantCacheSplit bool
+	}{
+		{"usage cached_tokens: evaluated is the rest", frames(usage(900)), false, 100, 20, true},
+		{"timings win over usage", frames(map[string]any{
+			"usage":   usage(900)["usage"],
+			"timings": map[string]any{"prompt_n": 50, "cache_n": 950},
+		}), false, 50, 20, true},
+		{"no cache split reported", frames(usage(-1)), false, 0, 20, false},
+		{"a warm call counts nothing", frames(usage(900)), true, 0, 0, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mock := newMockLLM(t, c.sse)
+			defer mock.Close()
+			a, s := newTestAgent(t)
+			s.startTurn(time.Now())
+			conn := mock.conn("execute")
+			conn.noTurnStats = c.warm
+			if _, _, _, err := a.llmStream(context.Background(), s.ID, conn, []llmMessage{{Role: "user", Content: "hi"}}, nil, nil, nil, nil); err != nil {
+				t.Fatalf("llmStream: %v", err)
+			}
+			r := s.turnStats()
+			if r.evaluatedPrompt != c.wantEvaluated || r.completion != c.wantCompletion || r.haveServerCache != c.wantCacheSplit {
+				t.Errorf("evaluated=%d completion=%d cacheSplit=%v, want %d %d %v",
+					r.evaluatedPrompt, r.completion, r.haveServerCache, c.wantEvaluated, c.wantCompletion, c.wantCacheSplit)
+			}
+		})
 	}
 }
 
@@ -785,15 +775,5 @@ func TestRequestLogDelta(t *testing.T) {
 	changed := []byte(`{"max_tokens":8192,"messages":[{"role":"system","content":"new"}]}`)
 	if got := requestLogDelta(second, changed); !strings.Contains(got, "ONLY: a change this early") {
 		t.Errorf("an early change was not called out: %q", got)
-	}
-}
-
-// Halogen's picture limit, refused in the stream, is recovered like a full context.
-func TestIsContextFullSeesThePictureLimit(t *testing.T) {
-	if !isContextFull(&llmStreamError{Msg: "the engine refused this request: IMG count outside 0..64"}) {
-		t.Error("the picture-count refusal was not taken for a full context")
-	}
-	if isContextFull(&llmStreamError{Msg: "the engine refused this request: bad grammar"}) {
-		t.Error("another in-stream refusal was taken for a full context")
 	}
 }

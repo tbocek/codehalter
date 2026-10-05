@@ -36,7 +36,7 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 		notes.WriteString(shadow)
 	}
 	if len(inFlightCompleted) > 0 {
-		a.say(ctx, sess.ID, "🗜 Context limit reached — compacting: summarising completed small turns, keeping the unfinished one…\n")
+		a.say(ctx, sess.ID, "🗜 Context limit reached, compacting: summarising completed small turns, keeping the unfinished one…\n")
 		var note string
 		if prompt := a.loadPromptFile(sess.ID, "SUMMARISE.md"); prompt != "" {
 			// Paste mode, never prefix-extension: the context already overflowed.
@@ -92,7 +92,7 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 		if folded != "" {
 			note = fmt.Sprintf(", prior summary folded %d→%d KB", len(prev)/1024, len(folded)/1024)
 		}
-		a.say(ctx, sess.ID, fmt.Sprintf("🗜 Compacted — archived as %s%s\n\n", archiveID, note))
+		a.say(ctx, sess.ID, fmt.Sprintf("🗜 Compacted, archived as %s%s\n\n", archiveID, note))
 	}
 	// After the Save: the fold's worker saves again when it lands.
 	a.scheduleSummaryFold(sess, summary)
@@ -192,7 +192,7 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	var msgs []llmMessage
 	if onMain {
 		msgs = a.buildLLMContext(sess)
-		instr := prompt + "\n\nThe exchange to summarise is the FINAL turn of the conversation above — nothing before it."
+		instr := prompt + "\n\nThe exchange to summarise is the FINAL turn of the conversation above, nothing before it."
 		for _, m := range turn {
 			if m.Role == "user" && strings.TrimSpace(m.Content) != "" {
 				instr += " That turn began with the user message: \"" + clipBytes(strings.TrimSpace(m.Content), 200) + "\""
@@ -230,8 +230,8 @@ func (a *agent) summariseCall(ctx context.Context, sess *Session, conn *LLMConne
 	a.cfgMu.RUnlock()
 	if err != nil || strings.TrimSpace(out) == "" {
 		// Warn, not Debug: a fallback note silently degrades every later compaction.
-		slog.Warn("summarise: llm call failed — using raw fallback note", "sid", sess.ID, "server", conn.Server, "err", err)
-		a.logSession(sess.ID, "SUMMARISE", "failed on %s (%s) — turn note fell back to a raw transcript: %v", conn.Server, conn.Model, err)
+		slog.Warn("summarise: llm call failed, using raw fallback note", "sid", sess.ID, "server", conn.Server, "err", err)
+		a.logSession(sess.ID, "SUMMARISE", "failed on %s (%s): turn note fell back to a raw transcript: %v", conn.Server, conn.Model, err)
 		if dedicated {
 			// Strikes take the summariser out of rotation in connForBackgroundLLM.
 			a.summaryStrikes.Add(1)
@@ -318,7 +318,7 @@ func fallbackTurnNote(turn []Message) string {
 // view_image is pure and re-runs; a tool that produced an image replays from ImageID.
 func (a *agent) replayToolOutput(sess *Session, tu ToolUse) any {
 	text := liveToolOutput(tu.Name, tu.Input, tu.Output)
-	if tu.Failed || !a.imagesSupported {
+	if tu.Failed || !a.imagesSupported.Load() {
 		return text
 	}
 	// Image file gone: no replay can be identical, so fall back rather than fail.
@@ -375,7 +375,7 @@ func (a *agent) buildLLMContext(sess *Session) []llmMessage {
 	for _, m := range msgs {
 		var content any = m.Content
 		if len(m.Images) > 0 {
-			if !a.imagesSupported {
+			if !a.imagesSupported.Load() {
 				var buf strings.Builder
 				buf.WriteString(m.Content)
 				for _, img := range m.Images {

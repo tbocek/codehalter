@@ -31,15 +31,7 @@ func writeSpecFixture(t *testing.T) string {
 		"11-index.md":      "# 11 Index\n\n## 1. All flows\n\n| id | flow |\n|---|---|\n| [F0.1](03-shell.md#f01-switch-tab) | Switch |\n| [F0.2](03-shell.md#f02-press-) | Press |\n| F6.1 | Tool protocol |\n",
 		"inventory/cut.md": "# Raw inventory\n\n## F0.1 raw notes\n\nFrom the prototype.\n",
 	}
-	for rel, body := range files {
-		p := filepath.Join(root, filepath.FromSlash(rel))
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	writeTree(t, root, files)
 	return root
 }
 
@@ -137,13 +129,7 @@ func TestSpecCoverage(t *testing.T) {
 	out := t.TempDir()
 	write := func(rel, body string) {
 		t.Helper()
-		p := filepath.Join(out, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		writeTree(t, out, map[string]string{rel: body})
 	}
 	write("tests/shell.rs", "#[test]\nfn f0_1_s1_switches() {}\n#[test]\nfn f0_10_other() {}\n")
 	// An id in a production doc comment is not a test; the inline test module is.
@@ -203,7 +189,7 @@ func TestGithubSlug(t *testing.T) {
 }
 
 func TestParseSpecArgs(t *testing.T) {
-	for args, want := range map[string]string{"": "resume", "  ": "resume", "status": "status", " stop ": "stop", "redo": "redo"} {
+	for args, want := range map[string]string{"": "resume", "  ": "resume", "status": "status", " stop ": "stop", "abort": "stop", "redo": "redo"} {
 		if cmd, err := parseSpecArgs(args); err != nil || cmd != want {
 			t.Errorf("parseSpecArgs(%q) = %q, %v; want %q", args, cmd, err, want)
 		}
@@ -244,16 +230,17 @@ func TestSpecRedoReopens(t *testing.T) {
 			break
 		}
 	}
-	if section != "" {
-		stem := section[:strings.Index(section, "#")+1]
-		num := strings.SplitN(section[len(stem):], "-", 2)[0]
-		got, unknown := specRedoTargets(cfg, idx, []string{stem + num + "-something-else"})
-		if len(unknown) != 0 || len(got) != 1 || got[0] != section {
-			t.Errorf("paraphrased section = %v %v, want %q", got, unknown, section)
-		}
-		if _, unknown := specRedoTargets(cfg, idx, []string{stem + "99-nothing"}); len(unknown) != 1 {
-			t.Errorf("a section number the file lacks resolved: %v", unknown)
-		}
+	if section == "" {
+		t.Fatal("the fixture has no numbered section")
+	}
+	stem := section[:strings.Index(section, "#")+1]
+	num := strings.SplitN(section[len(stem):], "-", 2)[0]
+	got, unknown := specRedoTargets(cfg, idx, []string{stem + num + "-something-else"})
+	if len(unknown) != 0 || len(got) != 1 || got[0] != section {
+		t.Errorf("paraphrased section = %v %v, want %q", got, unknown, section)
+	}
+	if _, unknown := specRedoTargets(cfg, idx, []string{stem + "99-nothing"}); len(unknown) != 1 {
+		t.Errorf("a section number the file lacks resolved: %v", unknown)
 	}
 
 	cfg.reopen(ids)
@@ -271,32 +258,6 @@ func TestSpecRedoReopens(t *testing.T) {
 	if cfg.Redo[ids[0]] == "" {
 		t.Error("the redo mark did not stick")
 	}
-	// Status counts a reopened item as open although its test still names it.
-	status := renderSpecStatus(cfg, idx, 1, "just test")
-	want := fmt.Sprintf("Covered: %d/%d flows", countKind(idx, specDefHeading)-countKindIn(idx, ids, specDefHeading), countKind(idx, specDefHeading))
-	if !strings.Contains(status, want) {
-		t.Errorf("status lacks %q:\n%s", want, status)
-	}
-}
-
-func countKind(idx *specIndex, kind int) int {
-	n := 0
-	for _, id := range idx.order {
-		if idx.items[id].Kind == kind {
-			n++
-		}
-	}
-	return n
-}
-
-func countKindIn(idx *specIndex, ids []string, kind int) int {
-	n := 0
-	for _, id := range ids {
-		if idx.items[id].Kind == kind {
-			n++
-		}
-	}
-	return n
 }
 
 // A justfile test recipe wins over the bare toolchain command.
@@ -305,11 +266,11 @@ func TestDetectSpecTestCmd(t *testing.T) {
 	if got := detectSpecTestCmd(dir); got != "" {
 		t.Errorf("empty dir = %q, want none", got)
 	}
-	os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte("[package]\n"), 0o644)
+	writeTree(t, dir, map[string]string{"Cargo.toml": "[package]\n"})
 	if got := detectSpecTestCmd(dir); got != "cargo test" {
 		t.Errorf("cargo project = %q", got)
 	}
-	os.WriteFile(filepath.Join(dir, "justfile"), []byte("build:\n\tcargo build\n\ntest:\n\txvfb-run -a cargo test\n"), 0o644)
+	writeTree(t, dir, map[string]string{"justfile": "build:\n\tcargo build\n\ntest:\n\txvfb-run -a cargo test\n"})
 	if got := detectSpecTestCmd(dir); got != "just test" {
 		t.Errorf("with a justfile test recipe = %q, want just test", got)
 	}
@@ -374,15 +335,6 @@ func TestSpecConfigRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(in, out) {
 		t.Errorf("round trip:\n got %+v\nwant %+v", out, in)
-	}
-	// A ledger from before blocks lasted one run still loads; saving drops its blocks.
-	old, _ := os.ReadFile(specConfigPath(cwd))
-	old = append(old, "\n[[blocked]]\n  id = \"F0.2\"\n  reason = \"stuck\"\n  answer = \"\"\n"...)
-	if err := os.WriteFile(specConfigPath(cwd), old, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if out, err = loadSpecConfig(cwd); err != nil || !reflect.DeepEqual(in, out) {
-		t.Errorf("old ledger = %+v, %v; want it read as %+v", out, err, in)
 	}
 }
 

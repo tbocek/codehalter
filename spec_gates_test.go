@@ -2,8 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -58,38 +56,6 @@ func TestNamesItemCamelCase(t *testing.T) {
 	} {
 		if got := namesItem(text, "F4.1"); got != want {
 			t.Errorf("namesItem(%q) = %v, want %v", text, got, want)
-		}
-	}
-}
-
-func gitRepo(t *testing.T, files map[string]string) string {
-	t.Helper()
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("no git")
-	}
-	dir := t.TempDir()
-	run := func(args ...string) {
-		t.Helper()
-		if out, err := exec.Command("git", append([]string{"-C", dir, "-c", "user.email=t@t", "-c", "user.name=t"}, args...)...).CombinedOutput(); err != nil {
-			t.Fatalf("git %v: %v %s", args, err, out)
-		}
-	}
-	run("init", "-q")
-	writeTree(t, dir, files)
-	run("add", "-A")
-	run("commit", "-q", "-m", "base")
-	return dir
-}
-
-func writeTree(t *testing.T, dir string, files map[string]string) {
-	t.Helper()
-	for rel, body := range files {
-		p := filepath.Join(dir, rel)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-			t.Fatal(err)
 		}
 	}
 }

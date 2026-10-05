@@ -256,9 +256,8 @@ type specChanges struct {
 	// removed names the free functions whose definition line the round took out: a
 	// changed signature or a moved function is not a new one.
 	removed map[string]bool
-	// moved: added lines whose text the round deleted elsewhere. Moved code keeps
-	// its old findings; a refactor that moved one function out of an 11,000-line
-	// file was held to its deprecated calls, which stayed in the file unflagged.
+	// moved: added lines whose text the round deleted elsewhere; moved code keeps
+	// its old findings.
 	moved map[string]map[int]bool
 	ok    bool // false without git or without a first commit: the gates that need it are skipped
 }
@@ -462,12 +461,14 @@ var multiImportRe = regexp.MustCompile(`^\s*(?:pub(?:\([^)]*\))?\s+)?(?:use\s+[\
 
 // importModule is the module a multi-line import names: the path before `::{` or
 // after `from`, as the last segment.
+var importFromRe = regexp.MustCompile(`from\s+['"]?([^'"\s;(]+)`)
+
 func importModule(stmt string) string {
 	if i := strings.Index(stmt, "::{"); i >= 0 {
 		path := strings.Fields(stmt[:i])
 		return filepath.Base(strings.ReplaceAll(path[len(path)-1], "::", "/"))
 	}
-	if m := regexp.MustCompile(`from\s+['"]?([^'"\s;(]+)`).FindStringSubmatch(stmt); m != nil {
+	if m := importFromRe.FindStringSubmatch(stmt); m != nil {
 		p := strings.ReplaceAll(m[1], ".", "/")
 		return strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
 	}
@@ -677,11 +678,8 @@ var (
 	notBuiltTextRe = regexp.MustCompile(`(?i)\bnot (?:yet )?implemented\b|\bunimplemented\b|\bstub(?:bed)?\b`)
 )
 
-// specStandIns lists the lines the round added to the program that stand in for
-// the work instead of doing it. naivepost counted its LLM, translation, speech
-// and image calls done for weeks: the program asked `reply_for_test()`, which only
-// tests fill, and otherwise answered "no llm server here"; a comment called that
-// "exercised rather than stubbed out", and every test passed.
+// specStandIns lists added program lines that fake the work instead of doing it:
+// asking a for-test hook, or saying "not implemented".
 func specStandIns(outAbs string, ch specChanges) []string {
 	var out []string
 	for _, rel := range ch.files() {

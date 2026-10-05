@@ -238,7 +238,7 @@ func TestElicitationActionsMapToOutcomes(t *testing.T) {
 			}
 			res := make(chan result, 1)
 			go func() {
-				choice, err := a.doElicitation(context.Background(), permissionRequest{
+				choice, err := a.doPermissionRequest(context.Background(), permissionRequest{
 					SessionId: s.ID,
 					Message:   "pick",
 					Options: []permissionOption{
@@ -279,7 +279,7 @@ func TestElicitationActionsMapToOutcomes(t *testing.T) {
 					t.Errorf("choice = %q, want %q", got.choice, tc.want)
 				}
 			case <-time.After(2 * time.Second):
-				t.Fatal("doElicitation did not return")
+				t.Fatal("the permission request did not return")
 			}
 		})
 	}

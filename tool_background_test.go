@@ -129,25 +129,6 @@ func TestBackgroundLogIsReadableByRunCommand(t *testing.T) {
 	}
 }
 
-func TestRunBackgroundRequiresCommand(t *testing.T) {
-	h := newTerminalHarness(t)
-	res, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{}`)
-	if failed || !strings.Contains(res, "command is required") {
-		t.Fatalf("expected command-required error, got: %s (failed=%v)", res, failed)
-	}
-}
-
-func lastUserMessage(s *Session) string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := len(s.Messages) - 1; i >= 0; i-- {
-		if s.Messages[i].Role == "user" {
-			return s.Messages[i].Content
-		}
-	}
-	return ""
-}
-
 // A job finishing mid-turn changes nothing until the turn ends; then its note
 // runs a follow-up turn.
 func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {

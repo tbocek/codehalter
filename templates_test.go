@@ -24,76 +24,61 @@ func TestRenderMacro(t *testing.T) {
 	}
 }
 
-func TestExpandMacroNonCommand(t *testing.T) {
-	dir := t.TempDir() // no on-disk templates → embed-only lookup
+// A template with {{}} stops without args and takes them in place otherwise.
+func TestExpandMacro(t *testing.T) {
 	a, sess := newTestAgent(t)
-	for _, s := range []string{"hello world", "/nope-not-a-template here", "", "no slash here"} {
-		if _, _, handled := a.expandMacro(context.Background(), sess.ID, dir, s); handled {
-			t.Errorf("expandMacro(%q) handled=true, want false", s)
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, sessionDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, sessionDir, "TEMPLATE-ask.md"), []byte("do {{}} now"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		in       string
+		handled  bool
+		rendered string
+		stops    bool
+	}{
+		{in: "hello world"},
+		{in: "/nope-not-a-template here"},
+		{in: ""},
+		{in: "no slash here"},
+		{in: "/ask", handled: true, stops: true},
+		{in: "/ask the thing", handled: true, rendered: "do the thing now"},
+	} {
+		rendered, stopMsg, handled := a.expandMacro(context.Background(), sess.ID, dir, c.in)
+		if handled != c.handled || rendered != c.rendered || (stopMsg != "") != c.stops {
+			t.Errorf("expandMacro(%q) = %q, %q, %v; want %q, stop=%v, %v", c.in, rendered, stopMsg, handled, c.rendered, c.stops, c.handled)
 		}
 	}
 }
 
-func TestTemplateNamesIncludesGrillMe(t *testing.T) {
-	dir := t.TempDir()
-	if !contains(templateNames(dir), "grill-me") {
-		t.Errorf("templateNames() = %v, want it to include grill-me (res/TEMPLATE-grill-me.md)", templateNames(dir))
-	}
-}
-
+// Only session files go; everything else in .codehalter stays.
 func TestHandleClean(t *testing.T) {
-	dir := t.TempDir()
-	ch := filepath.Join(dir, ".codehalter")
-	os.MkdirAll(ch, 0o755)
-	for _, f := range []string{"session_20260614.log", "session_20260614.toml", "session_20260615.log"} {
-		os.WriteFile(filepath.Join(ch, f), []byte("test"), 0o644)
-	}
-	os.WriteFile(filepath.Join(ch, "PLAN.md"), []byte("keep"), 0o644)
-
-	msg := handleClean(dir)
-	if !strings.Contains(msg, "Cleaned 3") {
-		t.Errorf("handleClean: got %q, want message mentioning 3 files", msg)
-	}
-	entries, _ := os.ReadDir(ch)
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "session_") {
-			t.Errorf("session file still present: %s", e.Name())
+	for _, c := range []struct {
+		name    string
+		files   []string
+		wantMsg string
+	}{
+		{"session files", []string{"session_20260614.log", "session_20260614.toml", "session_20260615.log", "PLAN.md"}, "Cleaned 3"},
+		{"none to clean", []string{"PLAN.md"}, "No session"},
+	} {
+		dir := t.TempDir()
+		ch := filepath.Join(dir, sessionDir)
+		for _, f := range c.files {
+			writeFiles(t, ch, f)
 		}
-	}
-	if _, err := os.Stat(filepath.Join(ch, "PLAN.md")); os.IsNotExist(err) {
-		t.Error("PLAN.md was incorrectly deleted")
-	}
-}
-
-func TestHandleCleanNoFiles(t *testing.T) {
-	dir := t.TempDir()
-	ch := filepath.Join(dir, ".codehalter")
-	os.MkdirAll(ch, 0o755)
-	msg := handleClean(dir)
-	if !strings.Contains(msg, "No session") {
-		t.Errorf("handleClean: got %q, want message about no session files", msg)
-	}
-}
-
-// The shipped /grill-me carries {{}}: no args stops with a message, args land in the prompt.
-func TestExpandMacroGrillMe(t *testing.T) {
-	dir := t.TempDir()
-	a, sess := newTestAgent(t)
-	if _, stopMsg, handled := a.expandMacro(context.Background(), sess.ID, dir, "/grill-me"); !handled || stopMsg == "" {
-		t.Errorf("/grill-me with no args: handled=%v stopMsg=%q (want handled + a stop message)", handled, stopMsg)
-	}
-	rendered, stopMsg, handled := a.expandMacro(context.Background(), sess.ID, dir, "/grill-me the auth design")
-	if !handled || stopMsg != "" || !strings.Contains(rendered, "the auth design") {
-		t.Errorf("/grill-me <args>: handled=%v stopMsg=%q rendered=%q", handled, stopMsg, rendered)
-	}
-}
-
-func TestExpandMacroCommitRunsBare(t *testing.T) {
-	dir := t.TempDir()
-	a, sess := newTestAgent(t)
-	rendered, stopMsg, handled := a.expandMacro(context.Background(), sess.ID, dir, "/commit")
-	if !handled || stopMsg != "" || rendered == "" {
-		t.Fatalf("bare /commit should run: handled=%v stopMsg=%q renderedEmpty=%v", handled, stopMsg, rendered == "")
+		if msg := handleClean(dir); !strings.Contains(msg, c.wantMsg) {
+			t.Errorf("%s: handleClean = %q, want it to say %q", c.name, msg, c.wantMsg)
+		}
+		entries, err := os.ReadDir(ch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 || entries[0].Name() != "PLAN.md" {
+			t.Errorf("%s: left %v, want only PLAN.md", c.name, entries)
+		}
 	}
 }
 

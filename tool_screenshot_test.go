@@ -19,7 +19,7 @@ import (
 // browser.
 func TestScreenshotRejectsBadPaths(t *testing.T) {
 	a, s := newTestAgent(t)
-	a.imagesSupported = true
+	a.imagesSupported.Store(true)
 
 	cases := []struct {
 		name string
@@ -44,23 +44,6 @@ func TestScreenshotRejectsBadPaths(t *testing.T) {
 				t.Errorf("a failed call must deliver nothing: parts=%v id=%q", parts, id)
 			}
 		})
-	}
-}
-
-// The fallback tells the user in the transcript: only they can fix settings.toml.
-func TestScreenshotNoVisionTellsTheUser(t *testing.T) {
-	a, s := newTestAgent(t)
-	a.imagesSupported = false
-
-	text, failed := screenshotExecuteFallback(context.Background(), a, s.ID, `{"path":"out/index.html"}`)
-	if !failed {
-		t.Fatalf("failed=false, text=%q", text)
-	}
-	if !strings.Contains(text, "NUMBER") {
-		t.Errorf("model-facing text should point at numeric verification, got %q", text)
-	}
-	if !strings.Contains(text, "the user has been told") {
-		t.Errorf("model-facing text should say the user was informed, got %q", text)
 	}
 }
 
@@ -204,7 +187,7 @@ func TestScreenshotEndToEnd(t *testing.T) {
 		t.Skip("launches a browser")
 	}
 	a, s := newTestAgent(t)
-	a.imagesSupported = true
+	a.imagesSupported.Store(true)
 	page := filepath.Join(s.Cwd, "page.html")
 	// Well below the fold: without the translateY shift the capture misses it.
 	body := `<html><head><style>body{margin:0}#pad{height:3000px;background:#eee}
@@ -239,7 +222,7 @@ func TestScreenshotEndToEnd(t *testing.T) {
 
 func TestScreenshotReplayUsesStoredBytes(t *testing.T) {
 	a, s := newTestAgent(t)
-	a.imagesSupported = true
+	a.imagesSupported.Store(true)
 	id, err := storeImage(s.Cwd, "image/png", []byte("stored pixels"))
 	if err != nil {
 		t.Fatal(err)
@@ -276,10 +259,12 @@ func TestScreenshotReplayUsesStoredBytes(t *testing.T) {
 	}
 }
 
-// Goes through runToolCall so the registration itself is covered.
+// Without vision the tool says what is missing, points at numeric checks and says
+// the user was told (only they can fix settings.toml); through runToolCall, so
+// the registration is covered too.
 func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 	a, s := newTestAgent(t)
-	a.imagesSupported = false
+	a.imagesSupported.Store(false)
 	page := filepath.Join(s.Cwd, "page.html")
 	if err := os.WriteFile(page, []byte("<p>hi</p>"), 0o600); err != nil {
 		t.Fatal(err)
@@ -296,15 +281,17 @@ func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 	if strings.Contains(text, "unknown tool") {
 		t.Fatalf("screenshot is not registered: %q", text)
 	}
-	if !strings.Contains(text, "image inputs") {
-		t.Errorf("text = %q, want it to name the missing capability", text)
+	for _, want := range []string{"image inputs", "NUMBER", "the user has been told"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text = %q, want %q", text, want)
+		}
 	}
 }
 
 // A failed render, or a command that is not a render, attaches nothing.
 func TestRunCommandAttachesRenderedScreen(t *testing.T) {
 	h := newTerminalHarness(t)
-	h.agent.imagesSupported = true
+	h.agent.imagesSupported.Store(true)
 	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
 	shots := filepath.Join(h.sess.Cwd, "rust", "shots")
 	if err := os.MkdirAll(shots, 0o755); err != nil {
@@ -393,7 +380,7 @@ func TestDownscalePNG(t *testing.T) {
 // A region outside the picture says how big the picture is.
 func TestScreenshotPictureRegion(t *testing.T) {
 	h := newTerminalHarness(t)
-	h.agent.imagesSupported = true
+	h.agent.imagesSupported.Store(true)
 	img := image.NewRGBA(image.Rect(0, 0, 300, 200))
 	for y := 0; y < 200; y++ {
 		for x := 0; x < 300; x++ {
@@ -441,7 +428,7 @@ func TestScreenshotPictureRegion(t *testing.T) {
 // Looking at the same picture again gets a note: the pixels are already in view.
 func TestScreenshotOfAPictureAlreadyInView(t *testing.T) {
 	a, s := newTestAgent(t)
-	a.imagesSupported = true
+	a.imagesSupported.Store(true)
 	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {

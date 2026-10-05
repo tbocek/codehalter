@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"os"
@@ -97,17 +98,14 @@ type Session struct {
 	turn    turnState
 	lineage cacheLineage
 	rt      sessionRuntime
-	// promptSkills are the skills in SystemPrompt. A skill applicable later goes in
-	// as a user message until compaction re-renders: folding it in would bust the cache.
+	// promptSkills are the skills in SystemPrompt (see checkEnv).
 	promptSkills []string
 	// llmHash is the settings files' hash at the last successful probe.
 	llmHash           string   `toml:"-"`
 	knownStacks       []string `toml:"-"`
 	capabilitiesShown bool     `toml:"-"`
-	// toolLog holds every tool call since the /spec loop last trimmed it, while the
-	// loop runs (guarded by mu, not stored). The history cannot say what a round
-	// did: a compaction mid-round folds its first calls away, and a check once read
-	// past the end of a history shrunk from 301 messages to 59. toolLogBase is the
+	// toolLog holds every tool call since the /spec loop last trimmed it (guarded by
+	// mu): a compaction mid-round folds the history's copy away. toolLogBase is the
 	// position of toolLog[0]; positions never move.
 	toolLog     []ToolUse `toml:"-"`
 	toolLogOn   bool      `toml:"-"`
@@ -450,7 +448,7 @@ func (s *Session) toolUsesSince(mark int) []ToolUse {
 }
 
 // Names the likely cause because the model cannot see the editor.
-const externalChangeNote = "\n\n[NOTE: this file changed on disk after codehalter wrote it — something outside this session rewrote it, and an editor's format-on-save is the usual cause. Any old_text you remember from before that write may no longer match; copy it from THIS read.]"
+const externalChangeNote = "\n\n[NOTE: this file changed on disk after codehalter wrote it: something outside this session rewrote it, and an editor's format-on-save is the usual cause. Any old_text you remember from before that write may no longer match; copy it from THIS read.]"
 
 // recordWrite drops any pending drift note: we just overwrote the other writer's change.
 func (s *Session) recordWrite(path, content string) {
@@ -692,11 +690,9 @@ func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	return archiveID, nil
 }
 
+// imageInView: a tool call still in the history carries this picture (ids are
+// content hashes). Repeats once pushed a request past Halogen's 64-picture limit.
 // Caller must hold s.mu or own the session exclusively.
-// imageInView: a tool call still in the history carries this picture. Ids are
-// content hashes, so the same id is the same pixels. Of 186 renders attached in
-// one /spec run only 111 were distinct, and the repeats pushed a request past
-// Halogen's 64-picture limit.
 func (s *Session) imageInView(id string) bool {
 	for _, m := range s.Messages {
 		for _, u := range m.ToolUses {
@@ -761,4 +757,52 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 	})
 
 	return sessions, nil
+}
+
+// restoreSession registers sid and replays its stored messages to the client.
+func (a *agent) restoreSession(ctx context.Context, cwd, sid string, mcpOffer []acpMCPServer) (*Session, error) {
+	s, err := loadSession(cwd, sid)
+	switch {
+	case os.IsNotExist(err):
+		slog.Debug("LoadSession: not found, treating as new", "sid", sid)
+		// Zed loads ids from a session/new that never saved and ignores a
+		// sessionId we send back, so accept the id or prompts won't route.
+		s = newSessionWithID(cwd, sid)
+	case err != nil:
+		return nil, fmt.Errorf("loading session: %w", err)
+	}
+	if err := a.initSession(cwd, s, mcpOffer); err != nil {
+		return nil, err
+	}
+	// Otherwise a reload labels the thread with its id.
+	if s.Title != "" {
+		a.sendUpdate(ctx, sid, sessionInfoUpdate{Kind: "session_info_update", Title: s.Title})
+	}
+	// An empty chunk of the opposite role separates two same-role messages, or
+	// Zed merges them into one turn.
+	lastRole := ""
+	for _, m := range s.Messages {
+		if m.Role == lastRole {
+			if m.Role == "user" {
+				a.say(ctx, sid, "")
+			} else {
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: ""}})
+			}
+		}
+		if m.Role == "user" {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: m.Content}})
+			for _, img := range m.Images {
+				data, mime, err := readImageFile(s.Cwd, img.ID)
+				if err != nil {
+					a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[image %s missing on disk]", img.ID)}})
+					continue
+				}
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}})
+			}
+		} else {
+			a.say(ctx, sid, m.Content)
+		}
+		lastRole = m.Role
+	}
+	return s, nil
 }
