@@ -240,6 +240,9 @@ func (a *agent) parkForJobs(ctx context.Context, sid string, since time.Time) (s
 	if sess == nil {
 		return "", fmt.Errorf("no session")
 	}
+	if items := sess.takePending(); len(items) > 0 {
+		return a.resumeWith(ctx, sid, items), nil
+	}
 	// Nothing talks to a job while the step waits, so one that stays silent never
 	// finishes (a hang, a prompt for input, a server): the watchdog stops it.
 	parked := make(chan struct{})
@@ -254,11 +257,7 @@ func (a *agent) parkForJobs(ctx context.Context, sid string, since time.Time) (s
 	a.say(ctx, sid, "\n⏸ Waiting for "+a.parkableJobs(sid, since)+". This turn continues when it reports; type and Send Now to interject.\n")
 	for {
 		if items := sess.takePending(); len(items) > 0 {
-			text, hasNote := a.sayPending(ctx, sid, items, true)
-			if hasNote {
-				text += "\n\nContinue the work that was waiting on this."
-			}
-			return text, nil
+			return a.resumeWith(ctx, sid, items), nil
 		}
 		if a.parkableJobs(sid, since) == "" && !sess.hasPending() {
 			// Every job is gone without a note (a session teardown took them):
@@ -271,6 +270,14 @@ func (a *agent) parkForJobs(ctx context.Context, sid string, since time.Time) (s
 		case <-time.After(parkPoll):
 		}
 	}
+}
+
+func (a *agent) resumeWith(ctx context.Context, sid string, items []pendingInput) string {
+	text, hasNote := a.sayPending(ctx, sid, items, true)
+	if hasNote {
+		text += "\n\nContinue the work that was waiting on this."
+	}
+	return text
 }
 
 // endJob releases a finished or stopped job's terminal and forgets it.

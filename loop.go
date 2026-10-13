@@ -1143,9 +1143,10 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		// The terminal message came as tool arguments, never through the text stream.
 		if terminalCalled {
 			// A respond while this loop's background job still runs parks the turn until
-			// the job's note resumes it.
+			// the job's note resumes it. Input that came in during the call (a job's exit,
+			// the user's text) goes in first: the respond was written without it.
 			if terminalName == respondToolName {
-				if a.parkableJobs(sid, loopStart) != "" {
+				if a.parkableJobs(sid, loopStart) != "" || loopSess != nil && loopSess.hasPending() {
 					if streams.text != nil && terminalMessage != "" {
 						streams.text(terminalMessage)
 						streams.flush()

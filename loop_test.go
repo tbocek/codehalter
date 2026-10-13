@@ -1172,6 +1172,34 @@ func TestToolLoopParksOnRespondWhileJobRuns(t *testing.T) {
 	}
 }
 
+// What arrives while the model writes its respond (a job's exit, the user's text)
+// goes to the model before the step ends: the respond was written without it.
+func TestToolLoopRespondDoesNotEndOverQueuedInput(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.sess.ctl.held.Lock()
+	defer h.sess.ctl.held.Unlock()
+	mock := newMockLLM(t,
+		sseToolCall("c1", respondToolName, `{"message":"the suite is still running"}`),
+		sseToolCall("c2", respondToolName, `{"message":"the suite passed"}`))
+	defer mock.Close()
+	arrived := false
+	h.agent.tools.add(fakeTool(respondToolName, func(args string) (string, bool) {
+		if !arrived {
+			arrived = true
+			h.sess.addBgNote(bgNote{line: "background job 1 exited with code 0", full: "[codehalter, not the user: background job 1 exited with code 0]"})
+		}
+		return parseArgs(args).str("message"), false
+	}))
+	res, err := h.agent.runToolLoopSeeded(context.Background(), h.sess.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "run the suite"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+	if err != nil || res.Text != "the suite passed" || mock.callCount() != 2 {
+		t.Errorf("res=%q err=%v calls=%d, want the second respond, written after the job's exit", res.Text, err, mock.callCount())
+	}
+	if !strings.Contains(lastUserMessage(h.sess), "exited with code 0") {
+		t.Errorf("the exit note did not reach the model: %q", lastUserMessage(h.sess))
+	}
+}
+
 // A respond waits for every job the step started, whatever the command looks
 // like; one that stays silent while the step waits is stopped, and a job from an
 // earlier turn never holds the step.
