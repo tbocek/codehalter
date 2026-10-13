@@ -76,10 +76,11 @@ type specConfig struct {
 	LintCmd string `toml:"lint_cmd,omitempty"`
 	// MaxFileLines: a program file over it may barely grow; 0 is the default, below 0 off.
 	MaxFileLines int `toml:"max_file_lines,omitempty"`
-	// RefactorEvery finished items one round cleans up; 0 is the default, below 0 off.
-	RefactorEvery int `toml:"refactor_every,omitempty"`
-	// RefactorAt is the ledger size at the last refactor round.
-	RefactorAt int `toml:"refactor_at,omitempty"`
+	// Refactor lists the over-size files a round could not grow: the next round splits them.
+	Refactor []string `toml:"refactor,omitempty"`
+	// Refactored lists the files split since an item last passed; one of them that
+	// blocks again costs the item its attempt instead of another refactor.
+	Refactored []string `toml:"refactored,omitempty"`
 	// Bases holds HEAD as an item's first attempt found it: a failed attempt is
 	// committed too, and the next attempt's changes count from here.
 	Bases map[string]string `toml:"bases,omitempty"`
@@ -138,8 +139,8 @@ func saveSpecConfig(cwd string, cfg *specConfig) error {
 		"# accept_open_markers = true starts the loop despite open REVIEW/TBD markers.\n" +
 		"# test_cmd overrides the detected test command (run from out_dir); lint_cmd the\n" +
 		"# detected linter (\"off\" skips linting). max_file_lines is the size budget of a\n" +
-		"# program file (1500, -1 off); refactor_every the finished items between two\n" +
-		"# refactor rounds (10, -1 off).\n" +
+		"# program file (1500, -1 off): a round that grows a file over it is followed\n" +
+		"# by a round that splits that file.\n" +
 		"# [items] is what the loop finished, with the spec text it was built from:\n" +
 		"# editing that section makes the next run redo the item, deleting it makes\n" +
 		"# the next run remove its code. Delete an entry to forget an item.\n\n")

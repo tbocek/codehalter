@@ -161,7 +161,7 @@ const (
 	specModeSetup                    // the one-off project skeleton round
 	specModeChange                   // redo an item whose spec text moved
 	specModeRemove                   // delete an item the spec no longer has
-	specModeRefactor                 // every few items: the code's shape, no item
+	specModeRefactor                 // the code's shape, no item: an over-size file blocked a round, or the run's end
 )
 
 // specRefactorID is the refactor round's pseudo-item.
@@ -184,6 +184,7 @@ type specRoundResult struct {
 	StandIns    []string // program lines that stand in for the work: a for-test helper asked, "not implemented"
 	Lint        []string
 	Oversize    []string
+	Oversized   []string // the files behind Oversize
 	// Refactor: the debt shrank, and how it moved.
 	Improved bool
 	Debt     string
@@ -385,7 +386,10 @@ type specRun struct {
 	blocked map[string]string
 	// completionChecked: the done items were checked against the spec in this run.
 	completionChecked bool
-	fails             map[string]string // which checks an item's last attempt failed (see specDecide)
+	// cleanup: the run's last refactor round, for what the rounds' own gates let through, is due;
+	// cleanedUp: it was picked.
+	cleanup, cleanedUp bool
+	fails              map[string]string // which checks an item's last attempt failed (see specDecide)
 }
 
 type specWork struct {
@@ -410,6 +414,17 @@ func (r *specRun) save(ctx context.Context) {
 	if err := saveSpecConfig(r.sess.Cwd, r.cfg); err != nil {
 		r.say(ctx, "⚠ /spec: "+err.Error()+"\n")
 	}
+}
+
+// refactorOver ends a refactor round, through or not: its files are not split again
+// before an item passes.
+func (r *specRun) refactorOver() {
+	for _, f := range r.cfg.Refactor {
+		if !slices.Contains(r.cfg.Refactored, f) {
+			r.cfg.Refactored = append(r.cfg.Refactored, f)
+		}
+	}
+	r.cfg.Refactor, r.cleanup = nil, false
 }
 
 // dropAnswers takes a built item's answered questions out of QUESTIONS.md.
@@ -602,6 +617,15 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 				}
 				if len(reopened) > 0 {
 					r.say(ctx, fmt.Sprintf("\n🔍 %d item(s) do not do all their spec says yet and are open again: %s\n\n", len(reopened), strings.Join(reopened, ", ")))
+					continue
+				}
+			}
+			// Once a run, before the final pass: what the rounds' gates let through
+			// (helpers copied between tests, files grown past the budget a little at a time).
+			if !r.cleanedUp {
+				r.cleanedUp = true
+				if d := measureSpecDebt(r.outAbs, cfg); d.overLines+d.dead+d.copies > 0 {
+					r.cleanup = true
 					continue
 				}
 			}
@@ -803,9 +827,20 @@ func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testF
 	changed := firstOpen(delta.Changed)
 
 	var w specWork
+	split := ""
+	if len(cfg.Refactor) > 0 {
+		if split = specSplitTargets(r.outAbs, cfg); split == "" {
+			cfg.Refactor = nil // split since, by hand or by a round
+		}
+	}
 	switch {
 	case r.testCmd() == "" || testFiles == 0:
 		w = specWork{Item: specSetupID, Mode: specModeSetup}
+	case split != "":
+		w = specWork{Item: specRefactorID, Mode: specModeRefactor, Debt: measureSpecDebt(r.outAbs, cfg)}
+		w.Debt.targets = split
+	case r.cleanup:
+		w = specWork{Item: specRefactorID, Mode: specModeRefactor, Debt: measureSpecDebt(r.outAbs, cfg)}
 	case removed != "":
 		w = specWork{Item: removed, Mode: specModeRemove}
 		w.Note = specRemovedText(ctx, r.sess.Cwd, cfg, w.Item)
@@ -821,15 +856,6 @@ func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testF
 			}
 		}
 	default:
-		// Every refactor_every finished items one round goes to the code's shape instead of an item.
-		if every := cfg.refactorEvery(); every > 0 && len(cfg.Items)-cfg.RefactorAt >= every {
-			if d := measureSpecDebt(r.outAbs, cfg); d.overLines+d.dead+d.copies > 0 {
-				w = specWork{Item: specRefactorID, Mode: specModeRefactor, Debt: d}
-				break
-			}
-			cfg.RefactorAt = len(cfg.Items) // nothing to clean up
-			delete(cfg.Attempts, specRefactorID)
-		}
 		w.Item = nextSpecItem(r.idx, cfg, skip)
 	}
 	w.Answered = r.idx.answered(w.Item)
@@ -1229,6 +1255,27 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 		res.Committed = sha != ""
 	}
 	done, block, reason, fails := specDecide(cfg, item, res, r.fails[item])
+	// An over-size file the item had to grow is the code's shape, not the item: the
+	// next round splits it, and a round that failed only on it does not count. A file
+	// already split since an item last passed is not split again.
+	if w.Mode != specModeRefactor && !done {
+		var due []string
+		for _, f := range res.Oversized {
+			if !slices.Contains(cfg.Refactored, f) && !slices.Contains(cfg.Refactor, f) {
+				due = append(due, f)
+			}
+		}
+		if len(due) > 0 {
+			cfg.Refactor = append(cfg.Refactor, due...)
+			if fails == "oversize" {
+				if cfg.Attempts[item]--; cfg.Attempts[item] <= 0 {
+					delete(cfg.Attempts, item)
+				}
+				block = false
+			}
+			r.say(ctx, fmt.Sprintf("✂ %s is too big to add to; the next round splits it, then %s goes on.\n", strings.Join(due, ", "), item))
+		}
+	}
 	if r.fails == nil {
 		r.fails = map[string]string{}
 	}
@@ -1247,10 +1294,10 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 	}
 	switch {
 	case block && w.Mode == specModeRefactor:
-		// A refactor is not an item: it never blocks the loop, it waits for the next interval.
-		cfg.RefactorAt = len(cfg.Items)
+		// A refactor is not an item: it never blocks the loop.
+		r.refactorOver()
 		block = false
-		r.say(ctx, fmt.Sprintf("↷ refactor round skipped: %s. The next one comes after %d more items.\n", firstLine(reason), cfg.refactorEvery()))
+		r.say(ctx, fmt.Sprintf("↷ refactor round did not get through: %s. The work goes on.\n", firstLine(reason)))
 	case done:
 		delete(cfg.Redo, item)
 		switch w.Mode {
@@ -1260,7 +1307,7 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 		case specModeSetup:
 			r.say(ctx, "✅ project setup is done.\n")
 		case specModeRefactor:
-			cfg.RefactorAt = len(cfg.Items)
+			r.refactorOver()
 			r.say(ctx, "✅ refactor done: "+res.Debt+"\n")
 		default:
 			if coveredBy == "" {
@@ -1269,6 +1316,7 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 			if w.Flaky != "" && cfg.Flaky == w.Flaky {
 				cfg.Flaky = "" // the round that was asked to fix it is through
 			}
+			cfg.Refactored = nil
 			// The fingerprint below is taken without the answers, so their going is no change to the spec.
 			r.dropAnswers(ctx, item)
 			cfg.Items[item] = specLedger{
@@ -1509,7 +1557,7 @@ func (r *specRun) gates(ctx context.Context, w specWork, ch specChanges, res *sp
 		res.Unreachable = specUnreachable(r.outAbs, ch, loadSpecProgram(r.outAbs))
 		res.StandIns = specStandIns(r.outAbs, ch)
 	}
-	res.Oversize = specOversize(r.outAbs, r.cfg, ch)
+	res.Oversize, res.Oversized = specOversize(r.outAbs, r.cfg, ch)
 	if cmd := r.lintCmd(); cmd != "" && res.TestsPass {
 		r.say(ctx, fmt.Sprintf("🔎 linting: `%s` in `%s/`\n", cmd, r.cfg.OutDir))
 		findings, missing := specLint(ctx, r.outAbs, cmd, ch)

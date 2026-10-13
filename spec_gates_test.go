@@ -177,12 +177,12 @@ func TestSpecOversize(t *testing.T) {
 		"out/src/small.rs": strings.Repeat("x\n", 15),
 	})
 	ch := specRoundChanges(t.Context(), cwd, "out", "HEAD")
-	got := specOversize(filepath.Join(cwd, "out"), &specConfig{MaxFileLines: 20}, ch)
-	if len(got) != 1 || !strings.Contains(got[0], "`src/big.rs` is 51 lines, over the 20-line budget, and this round grew it by 21") {
-		t.Errorf("oversize = %v", got)
+	got, files := specOversize(filepath.Join(cwd, "out"), &specConfig{MaxFileLines: 20}, ch)
+	if len(got) != 1 || !strings.Contains(got[0], "`src/big.rs` is 51 lines, over the 20-line budget, and this round grew it by 21") || !slices.Equal(files, []string{"src/big.rs"}) {
+		t.Errorf("oversize = %v %v", got, files)
 	}
-	if got := specOversize(filepath.Join(cwd, "out"), &specConfig{MaxFileLines: -1}, ch); got != nil {
-		t.Errorf("a budget turned off still reports %v", got)
+	if got, files := specOversize(filepath.Join(cwd, "out"), &specConfig{MaxFileLines: -1}, ch); got != nil || files != nil {
+		t.Errorf("a budget turned off still reports %v %v", got, files)
 	}
 }
 

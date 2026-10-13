@@ -325,7 +325,7 @@ func TestSpecConfigRoundTrip(t *testing.T) {
 		t.Fatalf("no file = (%v, %v), want (nil, nil)", cfg, err)
 	}
 	in := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs", Attempts: map[string]int{"F0.1": 1},
-		LintCmd: "off", MaxFileLines: 2000, RefactorEvery: -1, RefactorAt: 12}
+		LintCmd: "off", MaxFileLines: 2000, Refactor: []string{"src/ui/window.rs"}, Refactored: []string{"src/a.rs"}}
 	if err := saveSpecConfig(cwd, in); err != nil {
 		t.Fatal(err)
 	}
@@ -335,6 +335,11 @@ func TestSpecConfigRoundTrip(t *testing.T) {
 	}
 	if !reflect.DeepEqual(in, out) {
 		t.Errorf("round trip:\n got %+v\nwant %+v", out, in)
+	}
+	// A ledger from when refactor rounds were counted still loads.
+	writeTree(t, cwd, map[string]string{".codehalter/spec.toml": "spec_dir = \"spec\"\nrefactor_every = 0\nrefactor_at = 289\n"})
+	if old, err := loadSpecConfig(cwd); err != nil || old.SpecDir != "spec" {
+		t.Errorf("old ledger = %+v, %v", old, err)
 	}
 }
 

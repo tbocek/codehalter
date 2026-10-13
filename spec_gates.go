@@ -724,7 +724,6 @@ func specStandIns(outAbs string, ch specChanges) []string {
 const (
 	specDefaultMaxFileLines = 1500
 	specFileGrowthSlack     = 20
-	specDefaultRefactorEach = 10
 )
 
 func (c *specConfig) maxFileLines() int {
@@ -734,21 +733,13 @@ func (c *specConfig) maxFileLines() int {
 	return c.MaxFileLines
 }
 
-func (c *specConfig) refactorEvery() int {
-	if c.RefactorEvery == 0 {
-		return specDefaultRefactorEach
-	}
-	return c.RefactorEvery
-}
-
 // specOversize: in naivepost one UI file took 60% of all new code and reached
 // 12,500 lines, too long for the model to read, so it copied blocks instead.
-func specOversize(outAbs string, cfg *specConfig, ch specChanges) []string {
+func specOversize(outAbs string, cfg *specConfig, ch specChanges) (out, files []string) {
 	max := cfg.maxFileLines()
 	if max < 0 {
-		return nil
+		return nil, nil
 	}
-	var out []string
 	for _, rel := range ch.files() {
 		data, err := os.ReadFile(filepath.Join(outAbs, rel))
 		if err != nil || prodSource(rel, string(data)) == "" {
@@ -757,9 +748,25 @@ func specOversize(outAbs string, cfg *specConfig, ch specChanges) []string {
 		n, grew := strings.Count(string(data), "\n"), ch.grown[rel]
 		if n > max && grew > specFileGrowthSlack {
 			out = append(out, fmt.Sprintf("`%s` is %d lines, over the %d-line budget, and this round grew it by %d: put the new code in a new file and keep this one's growth under %d lines", rel, n, max, grew, specFileGrowthSlack))
+			files = append(files, rel)
 		}
 	}
-	return out
+	return out, files
+}
+
+// specSplitTargets names the files of cfg.Refactor still over the budget, for the refactor round.
+func specSplitTargets(outAbs string, cfg *specConfig) string {
+	var b strings.Builder
+	for _, rel := range cfg.Refactor {
+		data, err := os.ReadFile(filepath.Join(outAbs, rel))
+		if n := strings.Count(string(data), "\n"); err == nil && n > cfg.maxFileLines() {
+			fmt.Fprintf(&b, "- `%s`: %d lines\n", rel, n)
+		}
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return fmt.Sprintf("A round could not add its code because these files are over the %d-line budget. Split each into modules next to it (one screen, one flow, one widget family per module), so the code the next rounds add has a file to go into:\n", cfg.maxFileLines()) + b.String()
 }
 
 // lintCmd is the linter the project already has, or spec.toml's; "" is none.

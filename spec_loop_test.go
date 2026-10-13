@@ -575,7 +575,7 @@ func newSpecLoopRig(t *testing.T, files map[string]string, done func(id string) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := &specConfig{SpecDir: "spec", OutDir: "app", TestCmd: "true", LintCmd: "off", RefactorEvery: -1,
+	cfg := &specConfig{SpecDir: "spec", OutDir: "app", TestCmd: "true", LintCmd: "off",
 		Items: map[string]specLedger{}, Final: &specFinal{Items: len(idx.order)}}
 	for _, id := range idx.order {
 		if done(id) {
@@ -1113,34 +1113,52 @@ func TestSpecCommit(t *testing.T) {
 	}
 }
 
-// Every refactor_every finished items one round goes to the code's shape, but only when there is debt.
-func TestSpecRefactorCadence(t *testing.T) {
-	dir := t.TempDir()
-	long := "package main\n\nfunc main() {}\n" + strings.Repeat("// line\n", 10)
-	writeTree(t, dir, map[string]string{"spec/01.md": "# 01\n\n### F0.1 One\n\nS1.\n\n### F0.2 Two\n\nS2.\n\n### F0.3 Three\n\nS3.\n", "app/main.go": long})
-	idx, err := scanSpec(filepath.Join(dir, "spec"), defaultSpecIDPatterns, nil, nil)
+// A round refused only for growing an over-size file costs the item nothing: the
+// next round splits that file. A file split since an item last passed is not split
+// again, and that refusal counts.
+func TestSpecSplitsWhatBlocked(t *testing.T) {
+	a, sess := newTestAgent(t)
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	covered := map[string]string{"F0.1": "app/main_test.go", "F0.2": "app/main_test.go"}
-	pick := func(refactorAt int, maxLines int) (specWork, *specConfig) {
+	body := func(n int) string { return "pub fn run() {\n" + strings.Repeat("    let _ = 1;\n", n) + "}\n" }
+	writeTree(t, sess.Cwd, map[string]string{".gitignore": ".codehalter/\n", "rust/src/lib.rs": body(40), "rust/tests/f0_1.rs": "#[test]\nfn f0_1_switches() {}\n"})
+	gitInit(t, sess.Cwd)
+	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "true", LintCmd: "off", MaxFileLines: 30, Items: map[string]specLedger{}}
+	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: cfg, idx: idx, outAbs: filepath.Join(sess.Cwd, "rust"), reasons: map[string]string{}}
+	round := func(lines int) bool {
 		t.Helper()
-		h := newTerminalHarness(t)
-		cfg := &specConfig{SpecDir: "spec", OutDir: "app", TestCmd: "true", RefactorEvery: 2, RefactorAt: refactorAt, MaxFileLines: maxLines,
-			Items: map[string]specLedger{"F0.1": {Hash: specItemHash(idx, "F0.1")}, "F0.2": {Hash: specItemHash(idx, "F0.2")}}}
-		r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, cfg: cfg, idx: idx, outAbs: filepath.Join(dir, "app"), reasons: map[string]string{}}
-		return r.pickWork(t.Context(), covered, 1), cfg
+		writeTree(t, sess.Cwd, map[string]string{"rust/src/lib.rs": body(lines), "rust/tests/f0_1.rs": fmt.Sprintf("#[test]\nfn f0_1_switches() { let _ = %d; }\n", lines)})
+		done, block, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now())
+		if err != nil || block {
+			t.Fatalf("done=%v block=%v err=%v", done, block, err)
+		}
+		return done
 	}
 
-	if w, _ := pick(0, 5); w.Mode != specModeRefactor || w.Debt.overLines == 0 {
-		t.Errorf("two items since the last refactor and a long file: work = %+v, want a refactor round", w)
+	if round(70) || !slices.Equal(cfg.Refactor, []string{"src/lib.rs"}) || cfg.Attempts["F0.1"] != 0 {
+		t.Fatalf("refactor %v attempts %d, want src/lib.rs due and the attempt not counted", cfg.Refactor, cfg.Attempts["F0.1"])
 	}
-	if w, _ := pick(1, 5); w.Item != "F0.3" {
-		t.Errorf("one item since the last refactor: work = %+v, want F0.3", w)
+	h := newTerminalHarness(t)
+	pick := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, cfg: cfg, idx: idx, outAbs: r.outAbs, reasons: map[string]string{}}
+	if w := pick.pickWork(t.Context(), nil, 1); w.Mode != specModeRefactor || !strings.Contains(w.Debt.targets, "`src/lib.rs`: 72 lines") {
+		t.Errorf("work = %+v, want the split of src/lib.rs", w)
 	}
-	w, cfg := pick(0, 2000)
-	if w.Item != "F0.3" || cfg.RefactorAt != 2 {
-		t.Errorf("no debt: work = %+v RefactorAt = %d, want F0.3 and the cadence restarted at 2", w, cfg.RefactorAt)
+	pick.refactorOver() // the split round ends, through or not
+
+	if round(100) || len(cfg.Refactor) != 0 || cfg.Attempts["F0.1"] != 1 {
+		t.Errorf("refactor %v attempts %d, want no second split and the attempt counted", cfg.Refactor, cfg.Attempts["F0.1"])
+	}
+	if !round(10) || len(cfg.Refactored) != 0 {
+		t.Errorf("refactored %v after the item passed, want it cleared", cfg.Refactored)
+	}
+
+	// A due file that is under the budget again is not split.
+	cfg.Refactor = []string{"src/lib.rs"}
+	cfg.MaxFileLines = 2000
+	if w := pick.pickWork(t.Context(), nil, 1); w.Mode == specModeRefactor || cfg.Refactor != nil {
+		t.Errorf("work = %+v refactor %v, want an item and nothing due", w, cfg.Refactor)
 	}
 }
 
