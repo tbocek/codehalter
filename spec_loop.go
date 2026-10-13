@@ -89,8 +89,9 @@ func (a *agent) runSpecTurn(ctx context.Context, sid string, sess *Session, args
 		r := <-done
 		return r.resp, r.err, false
 	}
-	sess.requestSpecStop()
-	a.say(context.Background(), sid, "\n⏹ **/spec stops after the round in flight** (its tests and commit finish first). To stop right away, send `/spec abort`.\n")
+	if !sess.requestSpecStop() {
+		a.say(context.Background(), sid, "\n⏹ **/spec stops after the round in flight** (its tests and commit finish first). To stop right away, send `/spec abort`.\n")
+	}
 	go func() {
 		<-done
 		release()
@@ -99,10 +100,13 @@ func (a *agent) runSpecTurn(ctx context.Context, sid string, sess *Session, args
 }
 
 // requestSpecStop ends the running loop at its next round boundary, not now.
-func (s *Session) requestSpecStop() {
+// requestSpecStop reports whether a stop was already asked for: Zed sends a typed
+// `/spec stop` as a cancel first and the text after, and the user hears it once.
+func (s *Session) requestSpecStop() (already bool) {
 	s.rt.mu.Lock()
-	s.rt.specStop = true
-	s.rt.mu.Unlock()
+	defer s.rt.mu.Unlock()
+	already, s.rt.specStop = s.rt.specStop, true
+	return already
 }
 
 // setSpecHandoff records the /spec command the planner handed back instead of a plan.

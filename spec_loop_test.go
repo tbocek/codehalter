@@ -926,6 +926,8 @@ func TestSpecStopFinishesTheRoundAndAbortDoesNot(t *testing.T) {
 					t.Fatal("no running loop to abort")
 				}
 			} else {
+				// The text Zed sends after its cancel asks for the same stop: no second notice.
+				rig.h.agent.steerRunningTurn(context.Background(), rig.h.sess, []ContentBlock{{Type: "text", Text: "/spec stop"}})
 				close(unblock) // the round's step ends by itself
 			}
 			select {
@@ -934,8 +936,8 @@ func TestSpecStopFinishesTheRoundAndAbortDoesNot(t *testing.T) {
 				t.Fatal("the loop never ended and gave the turn back")
 			}
 			said := rig.said(t)
-			if !strings.Contains(said, "stops after the round in flight") || !strings.Contains(said, "/spec abort") {
-				t.Errorf("the cancel was not explained:\n%s", said)
+			if strings.Count(said, "stops after the round in flight") != 1 || !strings.Contains(said, "/spec abort") {
+				t.Errorf("the cancel was not explained exactly once:\n%s", said)
 			}
 			want := map[bool]string{false: "/spec stopped** as asked", true: "/spec aborted."}[abort]
 			if !strings.Contains(said, want) {

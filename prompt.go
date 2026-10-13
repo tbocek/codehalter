@@ -455,9 +455,8 @@ func (a *agent) steerRunningTurn(ctx context.Context, sess *Session, content []C
 	case t == "/spec stop":
 		if sess.specFence() == "" {
 			a.say(ctx, sess.ID, noLoop)
-		} else {
-			sess.requestSpecStop()
-			a.say(ctx, sess.ID, "⏹ /spec stops after the round in flight; its tests and commit finish first. To stop right away, send `/spec abort`.\n")
+		} else if !sess.requestSpecStop() {
+			a.say(ctx, sess.ID, "\n⏹ **/spec stops after the round in flight** (its tests and commit finish first). To stop right away, send `/spec abort`.\n")
 		}
 	case t == "/spec abort":
 		if sess.abortSpec() {
