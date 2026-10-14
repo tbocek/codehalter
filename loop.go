@@ -46,7 +46,9 @@ func (p *planResult) UnmarshalJSON(b []byte) error {
 		if err := json.Unmarshal(raw.Subtasks, &inner); err != nil {
 			return err
 		}
-		raw.Subtasks = json.RawMessage(trimJSONArray(inner))
+		// The list in the string often lacks its closing bracket (both tries of five
+		// /spec rounds in a row, which stopped two items).
+		raw.Subtasks = json.RawMessage(repairJSON(trimJSONArray(inner)))
 	}
 	return json.Unmarshal(raw.Subtasks, &p.Subtasks)
 }

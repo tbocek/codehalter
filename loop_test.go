@@ -97,6 +97,7 @@ func TestPlanResultUnmarshalJSON(t *testing.T) {
 		{"no verify", `{"clear":true,"subtasks":[{"description":"do x"}]}`, []subtask{{Description: "do x"}}, false, false},
 		{"stringified", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}]"}`, want, false, false},
 		{"stringified with a stray brace", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}]}"}`, want, false, false},
+		{"stringified without its closing bracket", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}"}`, want, false, false},
 		// report_only round-trips so renderPlan can label it "Findings:".
 		{"report only, no subtasks", `{"clear":true,"report_only":true}`, nil, true, false},
 		{"a string that is not an array", `{"clear":true,"subtasks":"do x"}`, nil, false, true},
