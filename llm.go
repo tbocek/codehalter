@@ -137,11 +137,15 @@ func isContextFull(err error) bool {
 		if he.Status == 413 || he.Type == "exceed_context_size_error" {
 			return true
 		}
-		if he.Status != 400 {
+		// TGI answers its length checks with 422.
+		if he.Status != 400 && he.Status != 422 {
 			return false
 		}
 		msg := strings.ToLower(he.Body)
-		for _, p := range []string{"context", "too many tokens", "too long", "maximum prompt"} {
+		// Halogen 0.18.4+ keeps a 400 for a prompt longer than the context ("the prompt
+		// does not fit"); a budget over its cap names no context, and folding would not help.
+		for _, p := range []string{"context", "too many tokens", "too long", "maximum prompt", "prompt does not fit",
+			"`inputs` tokens + `max_new_tokens`", "`inputs` must have less than"} {
 			if strings.Contains(msg, p) {
 				return true
 			}
