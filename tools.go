@@ -260,6 +260,7 @@ func (a *agent) recordToolUse(sid string, tc toolCall, tu ToolUse) ToolUse {
 func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolUse, any) {
 	slog.Info("runToolCall", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 	started := time.Now()
+	ctx = withToolName(ctx, tc.Function.Name)
 
 	// With image support, view_image and screenshot bypass the registry to
 	// return multimodal parts in the same turn; the registered tools are text only.
@@ -342,7 +343,7 @@ func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall
 		hint = "the documentation phase only wraps up: write the note and stop, don't re-plan."
 	}
 	msg := fmt.Sprintf("error: %s is not available during the %s phase: %s", tc.Function.Name, phase, hint)
-	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
+	tcId := a.StartToolCall(withToolName(ctx, tc.Function.Name), sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
 	a.FailToolCall(ctx, sid, tcId, msg)
 	return a.recordToolUse(sid, tc, ToolUse{Output: msg, Failed: true, StartedAt: time.Now()}), msg
 }
@@ -350,6 +351,7 @@ func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall
 type toolCallUpdate struct {
 	Kind       string             `json:"sessionUpdate"`
 	ToolCallId string             `json:"toolCallId"`
+	Name       string             `json:"name,omitempty"` // the tool the model called, beside the card's title
 	Title      string             `json:"title,omitempty"`
 	ToolKind   string             `json:"kind,omitempty"`
 	Status     string             `json:"status,omitempty"`
@@ -380,11 +382,20 @@ func DiffContent(path string, oldText *string, newText string) ToolCallContent {
 	return ToolCallContent{Type: "diff", Path: path, OldText: oldText, NewText: newText}
 }
 
+type toolNameKey struct{}
+
+// withToolName carries the called tool to the cards its execution opens, which do not know it.
+func withToolName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, toolNameKey{}, name)
+}
+
 func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []ToolCallLocation) string {
 	id := fmt.Sprintf("tc_%d", toolCallCounter.Add(1))
+	name, _ := ctx.Value(toolNameKey{}).(string)
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call",
 		ToolCallId: id,
+		Name:       name,
 		Title:      title,
 		ToolKind:   kind,
 		Status:     "in_progress",

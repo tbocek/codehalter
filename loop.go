@@ -1101,7 +1101,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			case wasStuck && repeats.changes == 0:
 				msg := "not run: an earlier attempt at this task ran exactly this call again and again until codehalter ended it, so it answers nothing new. Its output, which you already have:\n\n" +
 					before + "\n\nDo what the task asks with a different call; if the task asks you to look at a picture, call `screenshot` on it."
-				tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (repeated from an ended attempt)", "tool", nil)
+				tcId := a.StartToolCall(withToolName(ctx, tc.Function.Name), sid, tc.Function.Name+" (repeated from an ended attempt)", "tool", nil)
 				a.FailToolCall(ctx, sid, tcId, "not run: this call ended an earlier attempt by repeating")
 				tu, content = a.recordToolUse(sid, tc, ToolUse{Output: msg, Failed: true, StartedAt: time.Now()}), msg
 			default:

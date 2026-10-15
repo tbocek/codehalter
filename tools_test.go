@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -203,5 +204,30 @@ func TestAllToolDefinitions(t *testing.T) {
 
 	if got, want := toolNames(a.tools.defs()), []string{"other", "read", "write"}; !slices.Equal(got, want) {
 		t.Errorf("got %v, want %v (all tools, sorted)", got, want)
+	}
+}
+
+// A card a tool opens names the tool the model called; a card no tool opened names none.
+func TestToolCardsNameTheirTool(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid, args string) (string, bool) {
+			a.StartToolCall(ctx, sid, "Looking it up", "read", nil)
+			return "ok", false
+		}})
+	callTool(t, h.agent, h.sess.ID, "lookup", `{}`)
+	h.agent.StartToolCall(context.Background(), h.sess.ID, "Clarification needed", "think", nil)
+	got := map[any]any{}
+	h.waitFor(func() bool {
+		for _, u := range h.updatesOfKind("tool_call") {
+			got[u["title"]] = u["name"]
+		}
+		return len(got) == 2
+	})
+	if got["Looking it up"] != "lookup" {
+		t.Errorf("the tool's card names %v, want lookup", got["Looking it up"])
+	}
+	if name, ok := got["Clarification needed"]; !ok || name != nil {
+		t.Errorf("a card no tool opened names %v, want none", name)
 	}
 }
