@@ -1469,7 +1469,7 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 		previous = "## The previous round on this item did not count\n\n" + w.Reason + "\n\nFix that first."
 	}
 	if w.Flaky != "" {
-		previous = strings.TrimSpace("## First: a flaky test\n\ncodehalter ran the test suite twice on the same code: it failed, then passed. A test that does that fails other rounds at random, which is no fault of theirs. Before this item, find that test and make it deterministic: it must not call a live server (use the project's loopback fakes), wait on the clock, or read a status line that other parts of the program also write (assert the state the action itself changes). The failure from the run that failed:\n\n```\n" +
+		previous = strings.TrimSpace("## First: a flaky test\n\ncodehalter ran the test suite twice on the same code: it failed, then passed. A test that does that fails other rounds at random, which is no fault of theirs. Before this item, find that test and make it deterministic: it must not call a live server (use the project's loopback fakes) or read a status line that other parts of the program also write (assert the state the action itself changes). The usual cause is a wait that guesses: a fixed sleep, a fixed number of event-loop turns, or \"until nothing is pending\", which runs out before a timer, a thread or a child process is done on a busy machine. Replace it with a wait for the condition itself, against a deadline in wall-clock seconds, through the shared test module's wait helper. Fix any other test that waits the same way. The failure from the run that failed:\n\n```\n" +
 			strings.ReplaceAll(w.Flaky, "```", "` ` `") + "\n```\n\n" + previous)
 	}
 
