@@ -334,8 +334,3 @@ func findSpecQuote(specAbs, quote string) (string, error) {
 	})
 	return found, err
 }
-
-func specQuestionCorrective(wrong string) string {
-	return "Your question was not recorded: " + wrong + ". Read the spec again first: a layout, a label, an order or a value it states anywhere (the chapter's screen description, its picture, a table, another item) decides it, so follow that and call `submit_plan` with the subtasks. " +
-		"Only if the spec truly does not decide it, call `submit_plan` again with clear=false, no subtasks, and: `question`, one sentence naming what the user must decide; `spec_quote`, the spec text that comes closest to deciding it, copied exactly from a spec file; `options`, 2 or 3 ways to decide it with your pick first, each a short `choice` and an `example` of what the user would see or the program would do with it (a label, a layout, a value, a line of a file)."
-}

@@ -35,18 +35,15 @@ type backgroundJob struct {
 	terminalId string
 	started    time.Time
 	wakeAfter  time.Duration
-	announced  bool // under bgMu
-	// expectExit: a handed-over run_command, not a run_background job; the stall
-	// watchdog guards it from the handover, a background job only while a step waits for it.
-	expectExit bool
+	announced  bool     // under bgMu
+	expectExit bool     // a handed-over run_command, not a run_background job
 	redirects  []string // growth counts as progress
-	// Under bgMu, written by stuckWatch: stuck >0 when it stopped the job; still is when its
-	// processes last used CPU or wrote output; listening when one of them holds a listening socket.
-	stuck        time.Duration
-	stuckStopped bool // the stuck job had a stopped process (state T)
-	still        time.Time
-	listening    bool
-	exited       chan jobExit
+	// Under bgMu, written by stuckWatch: stuck is why it stopped the job, "" while it runs;
+	// still is when its processes last moved; listening, one of them holds a listening socket.
+	stuck     string
+	still     time.Time
+	listening bool
+	exited    chan jobExit
 }
 
 // jobExit is delivered once per job, to run_command's wait or, after handover,
@@ -380,7 +377,7 @@ var (
 	bgStuckPoll  = 30 * time.Second
 )
 
-// watchBgJob closes stop, ending the job's stall watcher, once the job exits.
+// watchBgJob closes stop, ending the job's stuck watcher, once the job exits.
 func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 	defer close(stop)
 	res := <-job.exited
@@ -388,7 +385,7 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 	// Untracked means shutdown killed it: nothing to report, nobody to report to.
 	a.bgMu.Lock()
 	_, tracked := a.bgJobs[job.id]
-	stuck, stopped := job.stuck, job.stuckStopped
+	stuck := job.stuck
 	a.bgMu.Unlock()
 	if !tracked {
 		return
@@ -408,14 +405,12 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 		return
 	}
 	outcome := fmt.Sprintf("exited with code %d", exit.code())
-	if stuck == 0 && err == nil {
+	if stuck == "" && err == nil {
 		sess.recordJobRun(jobRun{cmd: job.cmdStr, code: exit.code(), started: job.started, ended: time.Now()})
 	}
 	switch {
-	case stuck > 0 && stopped:
-		outcome = "was stopped as stuck: one of its processes was stopped (state T, by SIGSTOP or a read from the terminal) and could not go on without a SIGCONT"
-	case stuck > 0:
-		outcome = fmt.Sprintf("was stopped as stuck: its processes used no CPU and wrote no output for %s (a deadlock, a prompt for input, or a wait for something that never comes)", humanDuration(stuck.Milliseconds()))
+	case stuck != "":
+		outcome = "was stopped as stuck: " + stuck
 	case err != nil:
 		outcome = "was lost (" + err.Error() + ")"
 	}
@@ -526,11 +521,9 @@ func killOrphanedJobs() {
 // on. Where /proc cannot say (not Linux), output alone decides.
 func (a *agent) stuckWatch(job *backgroundJob, stop <-chan struct{}, after, poll time.Duration) {
 	files := append([]string{job.logPath}, job.redirects...)
-	out := progressSignature(files)
-	prev := jobActivity(job.pid)
-	still := time.Now()
+	out, prev := progressSignature(files), jobActivity(job.pid)
 	a.bgMu.Lock()
-	job.still = still
+	job.still = time.Now()
 	a.bgMu.Unlock()
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
@@ -539,26 +532,28 @@ func (a *agent) stuckWatch(job *backgroundJob, stop <-chan struct{}, after, poll
 		case <-stop:
 			return
 		case <-ticker.C:
-			o := progressSignature(files)
-			now := jobActivity(job.pid)
-			moved := o != out || now.known && (now.cpu != prev.cpu || now.locked && now.lockCPU != prev.lockCPU)
-			out, prev = o, now
-			a.bgMu.Lock()
-			job.listening = now.listening
-			if moved || now.listening {
-				still = time.Now()
-				job.still = still
+		}
+		o, now := progressSignature(files), jobActivity(job.pid)
+		moved := o != out || now.known && (now.cpu != prev.cpu || now.locked && now.lockCPU != prev.lockCPU)
+		out, prev = o, now
+		a.bgMu.Lock()
+		job.listening = now.listening
+		if moved || now.listening {
+			job.still = time.Now()
+		}
+		if _, tracked := a.bgJobs[job.id]; tracked {
+			switch {
+			case now.stopped && !moved:
+				job.stuck = "one of its processes was stopped (state T, by SIGSTOP or a read from the terminal) and could not go on without a SIGCONT"
+			case time.Since(job.still) >= after:
+				job.stuck = fmt.Sprintf("its processes used no CPU and wrote no output for %s (a deadlock, a prompt for input, or a wait for something that never comes)", humanDuration(after.Milliseconds()))
 			}
-			_, tracked := a.bgJobs[job.id]
-			stuck := tracked && (now.stopped && !moved || time.Since(still) >= after)
-			if stuck {
-				job.stuck, job.stuckStopped = after, now.stopped
-			}
-			a.bgMu.Unlock()
-			if stuck {
-				a.killJob(job)
-				return
-			}
+		}
+		stuck := job.stuck != ""
+		a.bgMu.Unlock()
+		if stuck {
+			a.killJob(job)
+			return
 		}
 	}
 }
@@ -573,15 +568,17 @@ type procActivity struct {
 	lockCPU   uint64 // ticks the holders of those locks, with their children, used so far
 }
 
-func jobActivity(root int) procActivity {
+type proc struct {
+	ppid  int
+	state string
+	cpu   uint64
+}
+
+// procTable reads every process's parent, state and CPU ticks (its reaped children's included).
+func procTable() map[int]proc {
 	entries, err := os.ReadDir("/proc")
-	if err != nil || root <= 0 {
-		return procActivity{}
-	}
-	type proc struct {
-		ppid  int
-		state string
-		cpu   uint64
+	if err != nil {
+		return nil
 	}
 	procs := map[int]proc{}
 	for _, e := range entries {
@@ -606,23 +603,29 @@ func jobActivity(root int) procActivity {
 		}
 		procs[pid] = proc{ppid, f[0], ticks}
 	}
-	if _, alive := procs[root]; !alive {
-		return procActivity{}
-	}
-	// The tree under pid: the job's own, and a lock holder's, whose work may run in a child.
-	treeOf := func(pid int) map[int]bool {
-		tree := map[int]bool{pid: true}
-		for grew := true; grew; {
-			grew = false
-			for p, info := range procs {
-				if !tree[p] && tree[info.ppid] {
-					tree[p], grew = true, true
-				}
+	return procs
+}
+
+// treeUnder: root and every descendant in procs.
+func treeUnder(procs map[int]proc, root int) map[int]bool {
+	tree := map[int]bool{root: true}
+	for grew := true; grew; {
+		grew = false
+		for pid, p := range procs {
+			if !tree[pid] && tree[p.ppid] {
+				tree[pid], grew = true, true
 			}
 		}
-		return tree
 	}
-	tree := treeOf(root)
+	return tree
+}
+
+func jobActivity(root int) procActivity {
+	procs := procTable()
+	if _, alive := procs[root]; !alive || root <= 0 {
+		return procActivity{}
+	}
+	tree := treeUnder(procs, root)
 	act := procActivity{known: true}
 	sockets := map[string]bool{}
 	for pid := range tree {
@@ -630,15 +633,17 @@ func jobActivity(root int) procActivity {
 		act.stopped = act.stopped || procs[pid].state == "T"
 		fds, _ := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
 		for _, fd := range fds {
-			if link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd.Name())); err == nil && strings.HasPrefix(link, "socket:[") {
-				sockets[strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")] = true
+			link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd.Name()))
+			if inode, ok := strings.CutPrefix(link, "socket:["); err == nil && ok {
+				sockets[strings.TrimSuffix(inode, "]")] = true
 			}
 		}
 	}
 	act.listening = len(sockets) > 0 && listensOn(root, sockets)
+	// A holder's work may run in a child (flock's does).
 	for _, holder := range lockHolders(tree) {
 		act.locked = true
-		for pid := range treeOf(holder) {
+		for pid := range treeUnder(procs, holder) {
 			act.lockCPU += procs[pid].cpu
 		}
 	}

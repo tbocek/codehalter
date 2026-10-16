@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -364,12 +365,8 @@ func bgSleepHint(cmd string) (string, string) {
 	if job == "" {
 		job = "<the command you put in the background>"
 	}
-	var buf strings.Builder
-	enc := json.NewEncoder(&buf)
-	enc.SetEscapeHTML(false)
-	_ = enc.Encode(map[string]any{"command": job})
 	return "\n[codehalter: that line put a command in the background with `&` and slept " + m[2] + " s to wait for it, which is a guess, and the backgrounded command also kept this terminal open. " +
-			"run_background does it properly, and tells you the exit code and the last output the moment it finishes, with nothing to poll: " + strings.TrimSpace(buf.String()) +
+			"run_background does it properly, and tells you the exit code and the last output the moment it finishes, with nothing to poll: {\"command\": " + strconv.Quote(job) + "}" +
 			" (add \"wake_after\": seconds only if you want a look before it finishes). Meanwhile do other work, or call `respond` saying you are waiting.]",
 		"💡 told the model: run_background instead of `& sleep`"
 }

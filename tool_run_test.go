@@ -208,23 +208,21 @@ func TestBackgroundJobStoppedOnlyWhenStuck(t *testing.T) {
 	defer func() { cmdHandoverWait, bgStuckAfter, bgStuckPoll = oldWait, oldStuck, oldPoll }()
 	h.sess.ctl.held.Lock()
 	defer h.sess.ctl.held.Unlock()
-	var taken []bgNote // two jobs that end together queue two notes at once
+	var notes []bgNote // two jobs that end together queue two notes at once
 	waitNote := func() bgNote {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
-		for len(taken) == 0 {
+		for deadline := time.Now().Add(5 * time.Second); len(notes) == 0; time.Sleep(10 * time.Millisecond) {
 			if time.Now().After(deadline) {
 				t.Fatal("no note")
 			}
 			for _, item := range h.sess.takePending() {
 				if item.note != nil {
-					taken = append(taken, *item.note)
+					notes = append(notes, *item.note)
 				}
 			}
-			time.Sleep(10 * time.Millisecond)
 		}
-		n := taken[0]
-		taken = taken[1:]
+		n := notes[0]
+		notes = notes[1:]
 		return n
 	}
 

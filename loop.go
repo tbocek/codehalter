@@ -217,7 +217,9 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		if fence := sess.specFence(); fence != "" && !plan.Clear {
 			q, wrong := specQuestionFrom(plan, fence)
 			if wrong != "" {
-				if plan, err = retry(fmt.Sprintf("\n⚠ The planner asked a question that is not answerable from the spec as asked: %s. Asking it to look again.\n", wrong), specQuestionCorrective(wrong)); err != nil {
+				corrective := "Your question was not recorded: " + wrong + ". Read the spec again first: a layout, a label, an order or a value it states anywhere (the chapter's screen description, its picture, a table, another item) decides it, so follow that and call `submit_plan` with the subtasks. " +
+					"Only if the spec truly does not decide it, call `submit_plan` again with clear=false, no subtasks, and: `question`, one sentence naming what the user must decide; `spec_quote`, the spec text that comes closest to deciding it, copied exactly from a spec file; `options`, 2 or 3 ways to decide it with your pick first, each a short `choice` and an `example` of what the user would see or the program would do with it (a label, a layout, a value, a line of a file)."
+				if plan, err = retry(fmt.Sprintf("\n⚠ The planner asked a question that is not answerable from the spec as asked: %s. Asking it to look again.\n", wrong), corrective); err != nil {
 					return nil, err
 				}
 				if plan.Clear {
