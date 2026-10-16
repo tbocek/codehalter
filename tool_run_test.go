@@ -208,15 +208,24 @@ func TestBackgroundJobStoppedOnlyWhenStuck(t *testing.T) {
 	defer func() { cmdHandoverWait, bgStuckAfter, bgStuckPoll = oldWait, oldStuck, oldPoll }()
 	h.sess.ctl.held.Lock()
 	defer h.sess.ctl.held.Unlock()
+	var taken []bgNote // two jobs that end together queue two notes at once
 	waitNote := func() bgNote {
+		t.Helper()
 		deadline := time.Now().Add(5 * time.Second)
-		for !h.sess.hasPending() {
+		for len(taken) == 0 {
 			if time.Now().After(deadline) {
 				t.Fatal("no note")
 			}
+			for _, item := range h.sess.takePending() {
+				if item.note != nil {
+					taken = append(taken, *item.note)
+				}
+			}
 			time.Sleep(10 * time.Millisecond)
 		}
-		return *h.sess.takePending()[0].note
+		n := taken[0]
+		taken = taken[1:]
+		return n
 	}
 
 	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo start; sleep 30"}`)
@@ -233,6 +242,28 @@ func TestBackgroundJobStoppedOnlyWhenStuck(t *testing.T) {
 	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done; echo counted"}`)
 	if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
 		t.Errorf("a silent job busy computing was stopped: %q", n.full)
+	}
+
+	// A process that stopped itself cannot go on: stopped at once, long before the idle
+	// limit (read at the handover), and the note says why.
+	bgStuckAfter = 30 * time.Second
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sh -c 'kill -STOP $$; echo never'"}`)
+	bgStuckAfter = 400 * time.Millisecond
+	if n := waitNote(); !strings.Contains(n.full, "state T") {
+		t.Errorf("a stopped process was not named: %q", n.full)
+	}
+
+	// A job waiting for a lock whose holder is busy is not stuck, however idle it is itself.
+	if _, err := exec.LookPath("flock"); err == nil {
+		lock := filepath.Join(t.TempDir(), "build.lock")
+		runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"flock `+lock+` sh -c 'i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done'"}`)
+		time.Sleep(200 * time.Millisecond)
+		runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"flock `+lock+` true"}`)
+		for range 2 {
+			if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
+				t.Errorf("the lock's holder or its waiter was stopped: %q", n.full)
+			}
+		}
 	}
 
 	if _, err := exec.LookPath("python3"); err != nil {
