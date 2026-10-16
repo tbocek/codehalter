@@ -38,9 +38,13 @@ type backgroundJob struct {
 	// expectExit: a handed-over run_command, not a run_background job; the stall
 	// watchdog guards it from the handover, a background job only while a step waits for it.
 	expectExit bool
-	redirects  []string      // growth counts as progress
-	stalled    time.Duration // >0: killed by the stall watchdog (under bgMu)
-	exited     chan jobExit
+	redirects  []string // growth counts as progress
+	// Under bgMu, written by stuckWatch: stuck >0 when it stopped the job; still is when its
+	// processes last used CPU or wrote output; listening when one of them holds a listening socket.
+	stuck     time.Duration
+	still     time.Time
+	listening bool
+	exited    chan jobExit
 }
 
 // jobExit is delivered once per job, to run_command's wait or, after handover,
@@ -158,10 +162,8 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 func (a *agent) handOver(job *backgroundJob) string {
 	job.pid = readPidFile(job.pidPath)
 	stop := make(chan struct{})
-	if job.expectExit {
-		// Limits read here, not in the watcher, which may outlive a test that shortened them.
-		go a.stallWatch(job, stop, bgStallTimeout, bgStallPoll)
-	}
+	// Limits read here, not in the watcher, which may outlive a test that shortened them.
+	go a.stuckWatch(job, stop, bgStuckAfter, bgStuckPoll)
 	go a.watchBgJob(job, stop)
 	if job.wakeAfter <= 0 {
 		return ""
@@ -185,7 +187,11 @@ func (a *agent) runningBgJobs(sid string, keep func(*backgroundJob) bool) string
 	var names []string
 	for _, j := range a.bgJobs {
 		if j.sid == sid && (keep == nil || keep(j)) {
-			names = append(names, fmt.Sprintf("job %d `%s` (%s so far)", j.id, truncate(j.cmdStr, 60), humanDuration(time.Since(j.started).Milliseconds())))
+			state := fmt.Sprintf("%s so far", humanDuration(time.Since(j.started).Milliseconds()))
+			if quiet := time.Since(j.still); !j.still.IsZero() && quiet >= time.Minute {
+				state += fmt.Sprintf(", no CPU use or output for %s", humanDuration(quiet.Milliseconds()))
+			}
+			names = append(names, fmt.Sprintf("job %d `%s` (%s)", j.id, truncate(j.cmdStr, 60), state))
 		}
 	}
 	sort.Strings(names)
@@ -224,10 +230,10 @@ var (
 // `build/libs/app.jar`) says nothing.
 var ()
 
-// parkableJobs: every job this step started; one from an earlier turn (a dev
-// server left up on purpose) never parks it.
+// parkableJobs: every job this step started that will end; a server (it listens on a
+// port) and a job from an earlier turn never park it.
 func (a *agent) parkableJobs(sid string, since time.Time) string {
-	return a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.started.After(since) })
+	return a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.started.After(since) && !j.listening })
 }
 
 var parkPoll = 500 * time.Millisecond
@@ -243,17 +249,6 @@ func (a *agent) parkForJobs(ctx context.Context, sid string, since time.Time) (s
 	if items := sess.takePending(); len(items) > 0 {
 		return a.resumeWith(ctx, sid, items), nil
 	}
-	// Nothing talks to a job while the step waits, so one that stays silent never
-	// finishes (a hang, a prompt for input, a server): the watchdog stops it.
-	parked := make(chan struct{})
-	defer close(parked)
-	a.bgMu.Lock()
-	for _, j := range a.bgJobs {
-		if j.sid == sid && j.started.After(since) && !j.expectExit {
-			go a.stallWatch(j, parked, bgStallTimeout, bgStallPoll)
-		}
-	}
-	a.bgMu.Unlock()
 	a.say(ctx, sid, "\n⏸ Waiting for "+a.parkableJobs(sid, since)+". This turn continues when it reports; type and Send Now to interject.\n")
 	for {
 		if items := sess.takePending(); len(items) > 0 {
@@ -262,7 +257,7 @@ func (a *agent) parkForJobs(ctx context.Context, sid string, since time.Time) (s
 		if a.parkableJobs(sid, since) == "" && !sess.hasPending() {
 			// Every job is gone without a note (a session teardown took them):
 			// resume rather than hang.
-			return "[codehalter, not the user: the background job you were waiting for is no longer running; check its log.]", nil
+			return "[codehalter, not the user: the background job you were waiting for is no longer running, or turned out to be a server (it listens on a port, so no step waits for it); check its log.]", nil
 		}
 		select {
 		case <-ctx.Done():
@@ -361,7 +356,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	wake := a.handOver(job)
 	stop := stopHint(job.pid)
 	idle := fmt.Sprintf("call `respond` saying you are waiting for job %d: that parks this step, it does not end it, and you continue here the moment the job reports. "+
-		"A job that stays silent for %s while the step waits is stopped, so stop a server you no longer need before you respond", job.id, humanDuration(bgStallTimeout.Milliseconds()))
+		"A job whose processes neither use CPU nor write output for %s is stuck and gets stopped; a server, which listens on a port, is left running, so stop one you no longer need", job.id, humanDuration(bgStuckAfter.Milliseconds()))
 	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, %s.%s Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
 		job.id, job.pid, idle, wake, job.logPath, stop, readLogTail(job.logPath, bgLogTailCap))
 	a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Background: %s (pid %d)", job.cmdStr, job.pid), "completed")
@@ -374,11 +369,13 @@ const bgNoteTailCap = 3 * 1024
 
 const bgWakeRetry = 2 * time.Second
 
-// bgStallTimeout is long on purpose: it only has to catch a command that will
-// never finish (a hang, a prompt for input). Vars so tests can shorten them.
+// bgStuckAfter: a job whose processes used no CPU and wrote no output this long is
+// stuck (a deadlock, a prompt for input, a wait for something that never comes). A
+// silent build still uses CPU, and a server listens, so neither is taken for stuck.
+// Vars so tests can shorten them.
 var (
-	bgStallTimeout = 10 * time.Minute
-	bgStallPoll    = 30 * time.Second
+	bgStuckAfter = 5 * time.Minute
+	bgStuckPoll  = 30 * time.Second
 )
 
 // watchBgJob closes stop, ending the job's stall watcher, once the job exits.
@@ -389,7 +386,7 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 	// Untracked means shutdown killed it: nothing to report, nobody to report to.
 	a.bgMu.Lock()
 	_, tracked := a.bgJobs[job.id]
-	stalled := job.stalled
+	stuck := job.stuck
 	a.bgMu.Unlock()
 	if !tracked {
 		return
@@ -409,12 +406,12 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 		return
 	}
 	outcome := fmt.Sprintf("exited with code %d", exit.code())
-	if stalled == 0 && err == nil {
+	if stuck == 0 && err == nil {
 		sess.recordJobRun(jobRun{cmd: job.cmdStr, code: exit.code(), started: job.started, ended: time.Now()})
 	}
 	switch {
-	case stalled > 0:
-		outcome = fmt.Sprintf("was killed after %s without any output (hung, waiting for input, or a server nothing talked to)", humanDuration(stalled.Milliseconds()))
+	case stuck > 0:
+		outcome = fmt.Sprintf("was stopped as stuck: its processes used no CPU and wrote no output for %s (a deadlock, a prompt for input, or a wait for something that never comes)", humanDuration(stuck.Milliseconds()))
 	case err != nil:
 		outcome = "was lost (" + err.Error() + ")"
 	}
@@ -514,11 +511,17 @@ func killOrphanedJobs() {
 	}
 }
 
-// stallWatch counts any growth of the log or of a redirect target as progress,
-// so a quiet but working suite is never killed.
-func (a *agent) stallWatch(job *backgroundJob, stop <-chan struct{}, timeout, poll time.Duration) {
+// stuckWatch stops a job once its processes neither use CPU nor write output (its log or a
+// redirect target) for `after`, unless one of them listens on a socket: a server waits for
+// requests by design. Where /proc cannot say (not Linux), output alone decides.
+func (a *agent) stuckWatch(job *backgroundJob, stop <-chan struct{}, after, poll time.Duration) {
 	files := append([]string{job.logPath}, job.redirects...)
-	last, lastChange := progressSignature(files), time.Now()
+	out := progressSignature(files)
+	cpu, _, _ := jobActivity(job.pid)
+	still := time.Now()
+	a.bgMu.Lock()
+	job.still = still
+	a.bgMu.Unlock()
 	ticker := time.NewTicker(poll)
 	defer ticker.Stop()
 	for {
@@ -526,25 +529,109 @@ func (a *agent) stallWatch(job *backgroundJob, stop <-chan struct{}, timeout, po
 		case <-stop:
 			return
 		case <-ticker.C:
-			if sig := progressSignature(files); sig != last {
-				last, lastChange = sig, time.Now()
-				continue
-			}
-			if time.Since(lastChange) < timeout {
-				continue
-			}
+			o := progressSignature(files)
+			c, listening, known := jobActivity(job.pid)
+			moved := o != out || known && c != cpu
+			out, cpu = o, c
 			a.bgMu.Lock()
+			job.listening = listening
+			if moved || listening {
+				still = time.Now()
+				job.still = still
+			}
 			_, tracked := a.bgJobs[job.id]
-			if tracked {
-				job.stalled = timeout
+			stuck := tracked && time.Since(still) >= after
+			if stuck {
+				job.stuck = after
 			}
 			a.bgMu.Unlock()
-			if tracked {
+			if stuck {
 				a.killJob(job)
+				return
 			}
-			return
 		}
 	}
+}
+
+// jobActivity reads /proc for the process tree under root: the CPU it used so far
+// (children it reaped included) and whether any of it listens on a socket. known is
+// false where /proc cannot say.
+func jobActivity(root int) (cpu uint64, listening, known bool) {
+	entries, err := os.ReadDir("/proc")
+	if err != nil || root <= 0 {
+		return 0, false, false
+	}
+	type proc struct {
+		ppid int
+		cpu  uint64
+	}
+	procs := map[int]proc{}
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// The fields after the command, which may itself hold spaces and parentheses.
+		f := strings.Fields(string(data[strings.LastIndexByte(string(data), ')')+1:]))
+		if len(f) < 15 {
+			continue
+		}
+		ppid, _ := strconv.Atoi(f[1])
+		var ticks uint64
+		for _, field := range f[11:15] { // utime, stime, cutime, cstime
+			n, _ := strconv.ParseUint(field, 10, 64)
+			ticks += n
+		}
+		procs[pid] = proc{ppid, ticks}
+	}
+	if _, alive := procs[root]; !alive {
+		return 0, false, false
+	}
+	tree := map[int]bool{root: true}
+	for grew := true; grew; {
+		grew = false
+		for pid, p := range procs {
+			if !tree[pid] && tree[p.ppid] {
+				tree[pid], grew = true, true
+			}
+		}
+	}
+	sockets := map[string]bool{}
+	for pid := range tree {
+		cpu += procs[pid].cpu
+		fds, _ := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+		for _, fd := range fds {
+			if link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd.Name())); err == nil && strings.HasPrefix(link, "socket:[") {
+				sockets[strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")] = true
+			}
+		}
+	}
+	return cpu, len(sockets) > 0 && listensOn(root, sockets), true
+}
+
+// listensOn: one of the socket inodes is a listening TCP socket or a listening unix socket.
+func listensOn(pid int, sockets map[string]bool) bool {
+	for _, table := range []string{"tcp", "tcp6"} {
+		data, _ := os.ReadFile(fmt.Sprintf("/proc/%d/net/%s", pid, table))
+		for _, line := range strings.Split(string(data), "\n") {
+			// sl local remote st ... inode: state 0A is LISTEN.
+			if f := strings.Fields(line); len(f) > 9 && f[3] == "0A" && sockets[f[9]] {
+				return true
+			}
+		}
+	}
+	data, _ := os.ReadFile(fmt.Sprintf("/proc/%d/net/unix", pid))
+	for _, line := range strings.Split(string(data), "\n") {
+		// Num RefCount Protocol Flags Type St Inode: flag 00010000 is a listening socket.
+		if f := strings.Fields(line); len(f) > 6 && f[3] == "00010000" && sockets[f[6]] {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *agent) wakeForBgJob(job *backgroundJob) {

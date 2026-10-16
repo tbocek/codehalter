@@ -1205,9 +1205,9 @@ func TestToolLoopRespondDoesNotEndOverQueuedInput(t *testing.T) {
 // like; one that stays silent while the step waits is stopped, and a job from an
 // earlier turn never holds the step.
 func TestToolLoopParksForBackgroundJobs(t *testing.T) {
-	oldGrace, oldPoll, oldStall, oldStallPoll := bgJobGrace, parkPoll, bgStallTimeout, bgStallPoll
-	bgJobGrace, parkPoll, bgStallTimeout, bgStallPoll = 50*time.Millisecond, 20*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
-	defer func() { bgJobGrace, parkPoll, bgStallTimeout, bgStallPoll = oldGrace, oldPoll, oldStall, oldStallPoll }()
+	oldGrace, oldPoll, oldStuck, oldStuckPoll := bgJobGrace, parkPoll, bgStuckAfter, bgStuckPoll
+	bgJobGrace, parkPoll, bgStuckAfter, bgStuckPoll = 50*time.Millisecond, 20*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
+	defer func() { bgJobGrace, parkPoll, bgStuckAfter, bgStuckPoll = oldGrace, oldPoll, oldStuck, oldStuckPoll }()
 	run := func(t *testing.T, h *terminalHarness, responses ...string) (*mockLLM, string) {
 		t.Helper()
 		h.sess.ctl.held.Lock() // a turn is running, so a job's note waits for it
@@ -1223,7 +1223,7 @@ func TestToolLoopParksForBackgroundJobs(t *testing.T) {
 	}
 	for _, c := range []struct{ name, cmd, resumedWith string }{
 		{"report after the run", `sleep 0.2 > /dev/null 2>&1; echo "exit=$?"`, "exited with code 0"},
-		{"a silent job", "sleep 30", "without any output"},
+		{"a stuck job", "sleep 30", "was stopped as stuck"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			h := newTerminalHarness(t)

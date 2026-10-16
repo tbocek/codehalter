@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -196,14 +197,15 @@ func TestRunCommandHandsOverAfterWait(t *testing.T) {
 	}
 }
 
-// A command writing into a redirect file is never killed, however quiet its
-// terminal.
-func TestRunCommandStallKillsHungJob(t *testing.T) {
+// A job is stopped only when nothing moves: no CPU, no output, no listening socket.
+// A command writing into a redirect file, a silent one busy computing and a server
+// that only listens are left to finish.
+func TestBackgroundJobStoppedOnlyWhenStuck(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
-	oldWait, oldStall, oldPoll := cmdHandoverWait, bgStallTimeout, bgStallPoll
-	cmdHandoverWait, bgStallTimeout, bgStallPoll = 100*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
-	defer func() { cmdHandoverWait, bgStallTimeout, bgStallPoll = oldWait, oldStall, oldPoll }()
+	oldWait, oldStuck, oldPoll := cmdHandoverWait, bgStuckAfter, bgStuckPoll
+	cmdHandoverWait, bgStuckAfter, bgStuckPoll = 100*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
+	defer func() { cmdHandoverWait, bgStuckAfter, bgStuckPoll = oldWait, oldStuck, oldPoll }()
 	h.sess.ctl.held.Lock()
 	defer h.sess.ctl.held.Unlock()
 	waitNote := func() bgNote {
@@ -218,7 +220,7 @@ func TestRunCommandStallKillsHungJob(t *testing.T) {
 	}
 
 	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo start; sleep 30"}`)
-	if n := waitNote(); !strings.Contains(n.full, "killed after") || !strings.Contains(n.full, "without any output") {
+	if n := waitNote(); !strings.Contains(n.full, "was stopped as stuck") {
 		t.Errorf("hung command's note: %q", n.full)
 	}
 
@@ -226,6 +228,19 @@ func TestRunCommandStallKillsHungJob(t *testing.T) {
 	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"(for i in 1 2 3 4 5 6 7 8 9 10; do echo tick $i; sleep 0.1; done) > `+log+` 2>&1; echo exit=$? >> `+log+`"}`)
 	if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
 		t.Errorf("a suite writing into its file was not left alone: %q", n.full)
+	}
+
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done; echo counted"}`)
+	if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
+		t.Errorf("a silent job busy computing was stopped: %q", n.full)
+	}
+
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("no python3 for the listening server")
+	}
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"python3 -c \"import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(1.5)\""}`)
+	if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
+		t.Errorf("an idle server, which only listens, was stopped: %q", n.full)
 	}
 }
 
