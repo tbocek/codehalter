@@ -5,10 +5,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Inline TUI: rows above the live region are printed once; the bottom liveRows rows are
@@ -21,7 +23,6 @@ const (
 	ansiRed   = "\x1b[31m"
 	ansiGreen = "\x1b[32m"
 	ansiYell  = "\x1b[33m"
-	ansiBlue  = "\x1b[34m"
 	ansiCyan  = "\x1b[36m"
 )
 
@@ -257,10 +258,7 @@ func (u *cliUI) style(s, sty string) string {
 // clip keeps rows under cols-1 columns: a row reaching the last column wraps on some
 // terminals and desyncs liveRows. Escapes are kept whole so a cut never leaks colour.
 func (u *cliUI) clip(s string) string {
-	limit := u.cols - 1
-	if limit < 2 {
-		limit = 2
-	}
+	limit := max(u.cols-1, 2)
 	if visibleLen(s) <= limit {
 		return s
 	}
@@ -358,10 +356,7 @@ func (u *cliUI) Stream(sty, pre, s string) {
 		u.flushRow()
 		u.pendSty, u.pendPre = sty, pre
 	}
-	width := u.cols - 1 - len([]rune(u.pendPre))
-	if width < 16 {
-		width = 16
-	}
+	width := max(u.cols-1-utf8.RuneCountInString(u.pendPre), 16)
 	for _, r := range s {
 		if r == '\n' {
 			u.endRow()
@@ -450,17 +445,11 @@ func (u *cliUI) Card(up toolCallUpdate) {
 }
 
 func (u *cliUI) dropCall(c *cliCall) {
-	id := c.id
-	delete(u.calls, id)
+	delete(u.calls, c.id)
 	if c.termID != "" {
 		delete(u.terms, c.termID)
 	}
-	for i, o := range u.order {
-		if o == id {
-			u.order = append(u.order[:i], u.order[i+1:]...)
-			break
-		}
-	}
+	u.order = slices.DeleteFunc(u.order, func(o string) bool { return o == c.id })
 }
 
 // Terminal blocks are skipped: their output was shown live and also arrives as text.
@@ -535,11 +524,8 @@ func (u *cliUI) End() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.flushRow()
-	for _, id := range append([]string(nil), u.order...) {
+	for _, id := range slices.Clone(u.order) {
 		c := u.calls[id]
-		if c == nil {
-			continue
-		}
 		u.dropCall(c)
 		u.emitLine(u.clip(u.style("· "+c.title+" (interrupted)", ansiDim)))
 	}

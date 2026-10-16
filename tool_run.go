@@ -208,8 +208,8 @@ func onlyReads(cmd string) bool {
 	return reads
 }
 
-// cmdOutputCap: the idle watchdog fires only on silence, so a steadily printing
-// command needs a byte cap. A var so tests can shrink it.
+// cmdOutputCap bounds what run_command returns; the terminal itself keeps up to
+// terminalOutputLimit. A var so tests can shrink it.
 var cmdOutputCap = 64 * 1024
 
 // cmdHandoverWait is when run_command hands a still-running command to the

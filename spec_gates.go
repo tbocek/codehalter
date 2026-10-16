@@ -5,12 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -262,19 +262,12 @@ type specChanges struct {
 	ok    bool // false without git or without a first commit: the gates that need it are skipped
 }
 
-func (c specChanges) files() []string {
-	files := make([]string, 0, len(c.added))
-	for f := range c.added {
-		files = append(files, f)
-	}
-	sort.Strings(files)
-	return files
-}
+func (c specChanges) files() []string { return slices.Sorted(maps.Keys(c.added)) }
 
 var hunkRe = regexp.MustCompile(`^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@`)
 
 // specRoundChanges diffs the work tree against base, the commit before the
-// item's first attempt (see specRoundBase).
+// item's first attempt (specConfig.Bases).
 func specRoundChanges(ctx context.Context, cwd, outRel, base string) specChanges {
 	ch := specChanges{added: map[string][]int{}, grown: map[string]int{}, removed: map[string]bool{}, moved: map[string]map[int]bool{}}
 	type addedLine struct {
@@ -376,10 +369,8 @@ func prodSource(rel, content string) string {
 	if !codeExts[strings.ToLower(filepath.Ext(rel))] {
 		return ""
 	}
-	for _, part := range strings.Split(filepath.ToSlash(filepath.Dir(rel)), "/") {
-		if specSideDirs[part] {
-			return ""
-		}
+	if slices.ContainsFunc(strings.Split(filepath.ToSlash(filepath.Dir(rel)), "/"), func(part string) bool { return specSideDirs[part] }) {
+		return ""
 	}
 	t := testSourceText(rel, content)
 	return content[:len(content)-len(t)]
@@ -497,15 +488,14 @@ func indexCode(rel, text, raw string) *codeFile {
 	rawLines := strings.Split(raw, "\n")
 	block := -1 // first line of a multi-line import still open
 	for n, l := range rawLines {
-		switch m := starAliasRe.FindStringSubmatch(l); {
-		case m != nil:
+		if m := starAliasRe.FindStringSubmatch(l); m != nil {
 			f.aliases[strings.TrimSuffix(filepath.Base(m[2]), filepath.Ext(m[2]))] = m[1]
-		case asAliasRe.MatchString(l):
-			m := asAliasRe.FindStringSubmatch(l)
+		} else if m := asAliasRe.FindStringSubmatch(l); m != nil {
 			f.aliases[m[1]] = m[2]
-		case f.ext == ".go" && goAliasRe.MatchString(l):
-			m := goAliasRe.FindStringSubmatch(l)
-			f.aliases[filepath.Base(m[2])] = m[1]
+		} else if f.ext == ".go" {
+			if m := goAliasRe.FindStringSubmatch(l); m != nil {
+				f.aliases[filepath.Base(m[2])] = m[1]
+			}
 		}
 		// rustfmt and prettier put a long import on many lines; each name then
 		// carries the module, as it would on one line.
@@ -707,10 +697,9 @@ func specStandIns(outAbs string, ch specChanges) []string {
 				continue
 			}
 			at := fmt.Sprintf("%s:%d", rel, i+1)
-			switch {
-			case forTestCallRe.MatchString(ln):
-				name := forTestCallRe.FindStringSubmatch(ln)[1]
-				out = append(out, fmt.Sprintf("`%s` (%s): the program asks a helper that exists for tests, so outside a test it never gets the real answer", name, at))
+			switch m := forTestCallRe.FindStringSubmatch(ln); {
+			case m != nil:
+				out = append(out, fmt.Sprintf("`%s` (%s): the program asks a helper that exists for tests, so outside a test it never gets the real answer", m[1], at))
 			case notBuiltCodeRe.MatchString(ln) || i < len(kept) && notBuiltTextRe.MatchString(kept[i]):
 				out = append(out, fmt.Sprintf("%s: `%s` says the work is not built", at, strings.TrimSpace(clipUTF8(raw[i], 120))))
 			}

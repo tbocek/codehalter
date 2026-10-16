@@ -359,18 +359,10 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 	if docPrompt == "" {
 		return exec
 	}
-
 	sess := a.getSession(sid)
 	if sess == nil {
 		return exec
 	}
-
-	// The execute connection, so it reuses execute's warm KV prefix.
-	conn := a.connFor("execute").withThinkingDisabled()
-	if conn == nil {
-		return exec
-	}
-
 	sess.AddUser(docPrompt)
 	sess.saveOrLog()
 
@@ -381,7 +373,8 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 		terminals: map[string]bool{respondToolName: true},
 		proseEnds: true, // DOCUMENT.md asks for a prose reply when nothing changes
 	}
-	docRes, err := a.runToolLoop(ctx, sid, conn, docPolicy, "document", true, 0)
+	// The execute connection, so it reuses execute's warm KV prefix.
+	docRes, err := a.runToolLoop(ctx, sid, a.connFor("execute").withThinkingDisabled(), docPolicy, "document", true, 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
 		return exec
@@ -590,7 +583,6 @@ var (
 // same call again they do.
 const repeatMinOutput = 24
 
-// callKey is exactly the call: the tool and its arguments.
 func callKey(tc toolCall) string { return tc.Function.Name + "\x00" + tc.Function.Arguments }
 
 // repeatText is an output as compared across calls: no batching note, no lines the
@@ -757,9 +749,7 @@ const (
 
 func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 	// Only MCP tools and the card-less few lack a card that already shows the arguments.
-	switch name := tc.Function.Name; {
-	case strings.Contains(name, "__"), name == "view_image":
-	default:
+	if name := tc.Function.Name; !strings.Contains(name, "__") && name != "view_image" {
 		return
 	}
 	shown := tc.Function.Arguments
@@ -791,22 +781,18 @@ func (a *agent) newLoopStreams(ctx context.Context, sid string, stream bool) loo
 	if sid == "" {
 		return s
 	}
-	var flushText, flushThink func()
+	flushText := func() {}
 	if stream {
 		s.text, flushText = throttledStream(func(chunk string) {
 			// Not through say: the text is logged whole in its RESPONSE block.
 			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: chunk}})
 		})
 	}
+	var flushThink func()
 	s.think, flushThink = throttledStream(func(chunk string) {
 		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: chunk}})
 	})
-	s.flush = func() {
-		if flushText != nil {
-			flushText()
-		}
-		flushThink()
-	}
+	s.flush = func() { flushText(); flushThink() }
 	return s
 }
 
@@ -964,8 +950,6 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		stuckBefore, stuckOutputs = loopSess.stuckSnapshot()
 	}
 	repeats := newRepetitionTracker(cwd, stuckOutputs)
-	var roundRepeats []repeatedCall // this round's calls that repeated
-	var hitStuck bool               // one of them was an output that ended an earlier step
 	var stuckRounds int
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
@@ -1066,13 +1050,11 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		})
 
 		// The rest of the batch still runs, so its results land in history.
-		var terminalCalled bool
-		var terminalName string
-		var terminalMessage string
+		var terminalName, terminalMessage string
 		var failedThisRound bool
-		roundRepeats, hitStuck = nil, false
-		// True only if EVERY call this round reproduced known output.
-		roundStuck := len(calls) > 0
+		var roundRepeats []repeatedCall // this round's calls that repeated
+		hitStuck := false               // one of them was an output that ended an earlier step
+		roundStuck := true              // only if EVERY call this round reproduced known output
 
 		// A build or test run is the gap in which a server reclaims the idle slot.
 		stopWarm := func() {}
@@ -1131,10 +1113,8 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 					readStreak, readNudged = 0, false
 				}
 			}
-			if policy.terminals[tc.Function.Name] && !terminalCalled {
-				terminalCalled = true
-				terminalName = tc.Function.Name
-				terminalMessage = tu.Output
+			if policy.terminals[tc.Function.Name] && terminalName == "" {
+				terminalName, terminalMessage = tc.Function.Name, tu.Output
 			}
 			messages = append(messages, llmMessage{
 				Role:       "tool",
@@ -1145,7 +1125,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		stopWarm() // the model is about to be called again; the slot is busy from here
 
 		// The terminal message came as tool arguments, never through the text stream.
-		if terminalCalled {
+		if terminalName != "" {
 			// A respond while this loop's background job still runs parks the turn until
 			// the job's note resumes it. Input that came in during the call (a job's exit,
 			// the user's text) goes in first: the respond was written without it.

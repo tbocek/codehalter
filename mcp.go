@@ -420,12 +420,7 @@ func (t *stdioTransport) writeMessage(msg any) error {
 }
 
 func (t *stdioTransport) close() {
-	if t.stdin != nil {
-		t.stdin.Close()
-	}
-	if t.cmd == nil || t.cmd.Process == nil {
-		return
-	}
+	t.stdin.Close()
 	// readLoop owns cmd.Wait; kill a server that ignores the EOF so readLoop unblocks.
 	select {
 	case <-t.done:
@@ -534,10 +529,8 @@ func (t *httpTransport) readSSEResponse(body io.Reader) (mcpResponse, error) {
 		if trimmed == "" {
 			if data.Len() > 0 {
 				var env mcpResponse
-				if jerr := json.Unmarshal([]byte(data.String()), &env); jerr == nil {
-					if env.ID != nil {
-						return env, nil
-					}
+				if jerr := json.Unmarshal([]byte(data.String()), &env); jerr == nil && env.ID != nil {
+					return env, nil
 				}
 				data.Reset()
 			}
@@ -667,8 +660,8 @@ func (c *MCPClient) callTool(ctx context.Context, name string, args json.RawMess
 	return out, result.IsError, nil
 }
 
-func (a *agent) registerMCPTools(c *MCPClient, tools []mcpTool) {
-	for _, t := range tools {
+func (a *agent) registerMCPTools(c *MCPClient) {
+	for _, t := range c.tools {
 		fullName := c.name + "__" + t.Name
 		description := t.Description
 		if description == "" {
@@ -705,7 +698,7 @@ func (a *agent) registerMCPTools(c *MCPClient, tools []mcpTool) {
 			},
 		})
 	}
-	slog.Info("mcp tools registered", "server", c.name, "count", len(tools))
+	slog.Info("mcp tools registered", "server", c.name, "count", len(c.tools))
 }
 
 type mcpHeaderParam struct {
@@ -736,9 +729,6 @@ func (c *MCPClient) vetTools(tools []mcpTool) []mcpTool {
 // Per spec, an annotated property must be reachable from the root through `properties` keys
 // only; an annotation anywhere else invalidates the whole tool.
 func collectHeaderParams(schema map[string]any) ([]mcpHeaderParam, error) {
-	if schema == nil {
-		return nil, nil
-	}
 	var out []mcpHeaderParam
 	seen := map[string]bool{} // lowercased header names, for the uniqueness rule
 	var walk func(node map[string]any, path []string) error
@@ -833,9 +823,6 @@ func headerToken(s string) bool {
 
 // Absent, null or type-mismatched values omit the header, per spec.
 func headerParamValues(params []mcpHeaderParam, args map[string]any) map[string]string {
-	if len(params) == 0 {
-		return nil
-	}
 	out := map[string]string{}
 	for _, p := range params {
 		node := any(args)
@@ -1175,13 +1162,9 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 	// Last write wins on duplicate names.
 	desired := make(map[string]MCPServerConfig, len(cfgs))
 	for _, c := range cfgs {
-		if c.Name == "" {
-			continue
+		if c.Name != "" && (c.Command != "" || c.URL != "") {
+			desired[c.Name] = c
 		}
-		if c.Command == "" && c.URL == "" {
-			continue
-		}
-		desired[c.Name] = c
 	}
 
 	applied := make(map[string]MCPServerConfig, len(a.mcp.applied))
@@ -1206,8 +1189,6 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 			}
 			continue
 		}
-		tools := newClient.tools
-
 		a.mu.Lock()
 		if a.mcp.clients == nil {
 			a.mcp.clients = make(map[string]*MCPClient)
@@ -1219,12 +1200,12 @@ func (a *agent) reconcileMCP(ctx context.Context, cwd string) []mcpChange {
 		if oldClient != nil {
 			a.tools.removePrefix(name + "__")
 		}
-		a.registerMCPTools(newClient, tools)
+		a.registerMCPTools(newClient)
 		if oldClient != nil {
 			oldClient.Close()
-			changes = append(changes, mcpChange{action: "restarted", name: name, tools: len(tools)})
+			changes = append(changes, mcpChange{action: "restarted", name: name, tools: len(newClient.tools)})
 		} else {
-			changes = append(changes, mcpChange{action: "started", name: name, tools: len(tools)})
+			changes = append(changes, mcpChange{action: "started", name: name, tools: len(newClient.tools)})
 		}
 	}
 

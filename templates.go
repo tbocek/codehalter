@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -44,12 +45,7 @@ func templateNames(cwd string) []string {
 	if disk, err := os.ReadDir(filepath.Join(cwd, ".codehalter")); err == nil {
 		add(disk)
 	}
-	names := make([]string, 0, len(set))
-	for n := range set {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return names
+	return slices.Sorted(maps.Keys(set))
 }
 
 func loadTemplate(cwd, name string) (body string, ok bool) {

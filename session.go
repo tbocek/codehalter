@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -339,24 +338,16 @@ func loadSession(cwd string, id string) (*Session, error) {
 	if err != nil {
 		return nil, err
 	}
-	// TOML refuses invalid UTF-8. U+FFFD is what Go's JSON encoder already sent for
-	// those bytes, so the wire and the cache stay the same.
-	if !utf8.Valid(data) {
+	// TOML refuses invalid UTF-8. One U+FFFD per bad byte (not per run, as
+	// ToValidUTF8 does) is what Go's JSON encoder already sent for those bytes, so
+	// the wire and the cache stay the same.
+	text := string(data)
+	if !utf8.ValidString(text) {
 		slog.Warn("session file has invalid UTF-8, replacing it with U+FFFD", "path", path)
-		var fixed bytes.Buffer
-		for len(data) > 0 {
-			r, n := utf8.DecodeRune(data)
-			if r == utf8.RuneError && n == 1 {
-				fixed.WriteString("\uFFFD")
-			} else {
-				fixed.Write(data[:n])
-			}
-			data = data[n:]
-		}
-		data = fixed.Bytes()
+		text = string([]rune(text))
 	}
 	var s Session
-	if _, err := toml.Decode(string(data), &s); err != nil {
+	if _, err := toml.Decode(text, &s); err != nil {
 		return nil, err
 	}
 	s.ID = id
@@ -414,7 +405,6 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 	}
 }
 
-// startToolLog begins collecting tool calls; the returned stop ends it and frees them.
 func (s *Session) startToolLog() (stop func()) {
 	s.mu.Lock()
 	s.toolLogOn, s.toolLog = true, nil
@@ -436,7 +426,6 @@ func (s *Session) toolMark() int {
 	return s.toolLogBase
 }
 
-// toolUsesSince returns the calls from mark on.
 func (s *Session) toolUsesSince(mark int) []ToolUse {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -446,9 +435,6 @@ func (s *Session) toolUsesSince(mark int) []ToolUse {
 	}
 	return slices.Clone(s.toolLog[i:])
 }
-
-// Names the likely cause because the model cannot see the editor.
-const externalChangeNote = "\n\n[NOTE: this file changed on disk after codehalter wrote it: something outside this session rewrote it, and an editor's format-on-save is the usual cause. Any old_text you remember from before that write may no longer match; copy it from THIS read.]"
 
 // recordWrite drops any pending drift note: we just overwrote the other writer's change.
 func (s *Session) recordWrite(path, content string) {
@@ -486,7 +472,8 @@ func (s *Session) takeDriftNote(path string) string {
 		return ""
 	}
 	delete(s.rt.drifted, path)
-	return externalChangeNote
+	// Names the likely cause because the model cannot see the editor.
+	return "\n\n[NOTE: this file changed on disk after codehalter wrote it: something outside this session rewrote it, and an editor's format-on-save is the usual cause. Any old_text you remember from before that write may no longer match; copy it from THIS read.]"
 }
 
 // line is for the user; full (exit code, log path, tail) is for the model.
@@ -730,36 +717,25 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 
 	var sessions []SessionInfo
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), "session_") || !strings.HasSuffix(e.Name(), ".toml") {
+		id, ok := strings.CutPrefix(e.Name(), "session_")
+		if !ok {
 			continue
 		}
+		id, ok = strings.CutSuffix(id, ".toml")
 		// Archives and old subagent sessions are for inspection, not the picker.
-		if strings.HasPrefix(e.Name(), "session_sub_") ||
-			strings.HasPrefix(e.Name(), "session_archive_") {
+		if !ok || strings.HasPrefix(id, "sub_") || strings.HasPrefix(id, "archive_") {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		id := strings.TrimPrefix(e.Name(), "session_")
-		id = strings.TrimSuffix(id, ".toml")
-
-		sessions = append(sessions, SessionInfo{
-			SessionId: id,
-			Cwd:       cwd,
-			UpdatedAt: info.ModTime().Format(time.RFC3339),
-		})
+		sessions = append(sessions, SessionInfo{SessionId: id, Cwd: cwd, UpdatedAt: info.ModTime().Format(time.RFC3339)})
 	}
-
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
-	})
-
+	slices.SortFunc(sessions, func(x, y SessionInfo) int { return strings.Compare(y.UpdatedAt, x.UpdatedAt) })
 	return sessions, nil
 }
 
-// restoreSession registers sid and replays its stored messages to the client.
 func (a *agent) restoreSession(ctx context.Context, cwd, sid string, mcpOffer []acpMCPServer) (*Session, error) {
 	s, err := loadSession(cwd, sid)
 	switch {

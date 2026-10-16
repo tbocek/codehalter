@@ -204,13 +204,9 @@ func (b *Browser) Close() {
 	if b.conn != nil {
 		b.conn.Close(websocket.StatusNormalClosure, "shutdown")
 	}
-	if b.cmd != nil && b.cmd.Process != nil {
-		b.cmd.Process.Kill()
-		b.cmd.Wait()
-	}
-	if b.profileDir != "" {
-		os.RemoveAll(b.profileDir)
-	}
+	b.cmd.Process.Kill()
+	b.cmd.Wait()
+	os.RemoveAll(b.profileDir)
 	slog.Info("browser closed")
 }
 

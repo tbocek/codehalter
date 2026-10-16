@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -209,10 +210,8 @@ func parseSpecArgs(args string) (cmd string, err error) {
 // specRedoTargets takes an item id, a section id with a paraphrased slug, or a spec file
 // meaning every item it defines.
 func specRedoTargets(cfg *specConfig, idx *specIndex, targets []string) (ids, unknown []string) {
-	seen := map[string]bool{}
 	add := func(id string) {
-		if !seen[id] {
-			seen[id] = true
+		if !slices.Contains(ids, id) {
 			ids = append(ids, id)
 		}
 	}
@@ -279,11 +278,6 @@ func (c *specConfig) reopen(ids []string) {
 		delete(c.Items, id)
 		c.Redo[id] = "redo"
 	}
-}
-
-// open means a test naming the item exists but proves too little.
-func (c *specConfig) open(id string) bool {
-	return c.Attempts[id] > 0 || c.Redo[id] != ""
 }
 
 // done is the ledger's word: specReconcile keeps it in step with the tests.
@@ -435,10 +429,7 @@ func scanSpec(root string, patterns, context, skip []string) (*specIndex, error)
 	}
 	idx.addSectionItems(context, skip)
 
-	idx.order = make([]string, 0, len(idx.items))
-	for id := range idx.items {
-		idx.order = append(idx.order, id)
-	}
+	idx.order = slices.Collect(maps.Keys(idx.items))
 	// Headed and section items interleave in document order, so a chapter's file formats
 	// come before the flows that write them.
 	rank := [...]int{specDefHeading: 0, specDefSection: 0, specDefTableRow: 1, specDefMention: 2}
@@ -489,9 +480,9 @@ func (idx *specIndex) indexDoc(di int) {
 		}
 		kind := specDefMention
 		title := ""
-		switch {
-		case !doc.fenced[i] && headingRe.MatchString(ln):
-			title = headingRe.FindStringSubmatch(ln)[2]
+		switch m := headingRe.FindStringSubmatch(ln); {
+		case !doc.fenced[i] && m != nil:
+			title = m[2]
 			kind = specDefHeading
 		case strings.HasPrefix(strings.TrimSpace(ln), "|"):
 			cells := strings.Split(strings.TrimSpace(ln), "|")
@@ -587,13 +578,7 @@ func (idx *specIndex) addSectionItems(context, skip []string) {
 		if s.level < 2 || strings.Contains(d.rel, "/") || isContext[d.rel] || isSkip[d.rel+"#"+s.slug] {
 			continue
 		}
-		nested := false
-		for _, c := range chosen {
-			if c.doc == s.doc && s.start > c.start && s.start < c.end {
-				nested = true
-				break
-			}
-		}
+		nested := slices.ContainsFunc(chosen, func(c specSection) bool { return c.doc == s.doc && s.start > c.start && s.start < c.end })
 		if nested || defines(s.doc, s.start, s.end) {
 			continue
 		}
@@ -718,7 +703,7 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 	add(path(primary.doc)+" · "+title, primaryText)
 	seenRel[sectionKey(idx.docs[primary.doc].rel, primary.start)] = true
 
-	body := idx.textNoNav(primary.doc, primary.start, min(primary.end, len(idx.docs[primary.doc].lines)))
+	body := idx.textNoNav(primary.doc, primary.start, primary.end)
 
 	var rows []string
 	rowHeader := ""
@@ -775,12 +760,10 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 			ref += "#" + anchor
 		}
 		// Another heading item's section belongs to that item's round: name it, don't paste it.
-		if sec.start < len(idx.docs[doc].lines) {
-			if other := idx.idsIn(idx.docs[doc].lines[sec.start]); len(other) > 0 && !(len(other) == 1 && other[0] == id) {
-				if o := idx.items[other[0]]; o != nil && o.Kind == specDefHeading {
-					out.Related = appendUnique(out.Related, ref)
-					continue
-				}
+		if other := idx.idsIn(idx.docs[doc].lines[sec.start]); len(other) > 0 && !(len(other) == 1 && other[0] == id) {
+			if o := idx.items[other[0]]; o != nil && o.Kind == specDefHeading {
+				out.Related = appendUnique(out.Related, ref)
+				continue
 			}
 		}
 		text := idx.textNoNav(doc, sec.start, sec.end)
@@ -833,10 +816,8 @@ func (idx *specIndex) tableHeader(doc, line int) string {
 }
 
 func appendUnique(s []string, v string) []string {
-	for _, x := range s {
-		if x == v {
-			return s
-		}
+	if slices.Contains(s, v) {
+		return s
 	}
 	return append(s, v)
 }
@@ -1135,8 +1116,8 @@ func specReconcile(cfg *specConfig, idx *specIndex, covered map[string]string) s
 	for _, id := range idx.order {
 		led, known := cfg.Items[id]
 		switch {
-		// After a failed round the test exists but the suite did not pass: not done.
-		case !known && covered[id] != "" && !cfg.open(id) && (idx.items[id].Kind == specDefTableRow || idx.items[id].Kind == specDefMention):
+		// After a failed round, or a redo, the test exists but proves too little.
+		case !known && covered[id] != "" && cfg.Attempts[id] == 0 && cfg.Redo[id] == "" && (idx.items[id].Kind == specDefTableRow || idx.items[id].Kind == specDefMention):
 			cfg.Items[id] = specLedger{Hash: hashes[id], Title: idx.items[id].Title,
 				File: idx.docs[idx.items[id].Doc].rel, CoveredBy: covered[id],
 				At: time.Now().UTC(), Version: versionStamp(), Named: true}
@@ -1211,14 +1192,7 @@ func specDirCandidates(cwd string) []string {
 	rels := make([]string, 0, len(out))
 	for _, c := range out {
 		// A directory inside one already offered is part of that spec, not a rival.
-		nested := false
-		for _, kept := range rels {
-			if kept != "." && strings.HasPrefix(c.rel, kept+"/") {
-				nested = true
-				break
-			}
-		}
-		if !nested {
+		if !slices.ContainsFunc(rels, func(kept string) bool { return kept != "." && strings.HasPrefix(c.rel, kept+"/") }) {
 			rels = append(rels, c.rel)
 		}
 	}
@@ -1338,10 +1312,8 @@ func manifestStack(dir string) (lang string, deps []string) {
 				in = false
 			case strings.HasPrefix(line, "require "):
 				names = append(names, path.Base(strings.Fields(line)[1]))
-			case in && line != "" && !strings.HasPrefix(line, "//"):
-				if f := strings.Fields(line); len(f) >= 1 && !strings.Contains(line, "// indirect") {
-					names = append(names, path.Base(f[0]))
-				}
+			case in && line != "" && !strings.HasPrefix(line, "//") && !strings.Contains(line, "// indirect"):
+				names = append(names, path.Base(strings.Fields(line)[0]))
 			}
 		}
 		return "go", first3(names)
@@ -1352,10 +1324,7 @@ func manifestStack(dir string) (lang string, deps []string) {
 		}
 		var names []string
 		if json.Unmarshal([]byte(s), &pkg) == nil {
-			for name := range pkg.Dependencies {
-				names = append(names, name)
-			}
-			sort.Strings(names)
+			names = slices.Sorted(maps.Keys(pkg.Dependencies))
 		}
 		lang = "javascript"
 		if _, err := os.Stat(filepath.Join(dir, "tsconfig.json")); err == nil {
@@ -1555,8 +1524,7 @@ func renderSpecStatus(cfg *specConfig, idx *specIndex, testFiles int, testCmd st
 	}
 	var undefined []string
 	for _, id := range idx.order {
-		if idx.items[id].Kind == specDefMention {
-			it := idx.items[id]
+		if it := idx.items[id]; it.Kind == specDefMention {
 			undefined = append(undefined, fmt.Sprintf("%s (%s:%d)", id, idx.docs[it.Doc].rel, it.Line+1))
 		}
 	}

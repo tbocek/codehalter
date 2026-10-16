@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -95,22 +96,18 @@ func tolerantReplace(content, oldText, newText string) (string, int) {
 			if ignoreIndent {
 				repl = reindent(newText, leadingWS(oldLines[0]), leadingWS(fileLines[start]))
 			}
-			out := append([]string(nil), fileLines[:start]...)
-			out = append(out, strings.Split(repl, "\n")...)
-			out = append(out, fileLines[start+len(oldLines):]...)
-			return strings.Join(out, "\n"), 1
+			return strings.Join(slices.Concat(fileLines[:start], strings.Split(repl, "\n"), fileLines[start+len(oldLines):]), "\n"), 1
 		}
 	}
 	return "", 0
 }
 
-const nearMissMinScore = 0.5
-
-const nearMissMaxFileLines = 20_000
-
-const nearMissTieEpsilon = 1e-9
-
-const nearMissSnippetCap = 1500
+const (
+	nearMissMinScore     = 0.5
+	nearMissMaxFileLines = 20_000
+	nearMissTieEpsilon   = 1e-9
+	nearMissSnippetCap   = 1500
+)
 
 // nearMiss scores lines by shared prefix and suffix, since a renamed identifier
 // changes the whole line. A tie refuses: the wrong region is worse than none.
@@ -196,12 +193,8 @@ func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (stri
 			}
 			return msg, true
 		}
-		n := loc.end - loc.start + 1
-		if n > maxReadLines {
-			n = maxReadLines
-		}
 		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Reading: %s (%s)", path, sym), "read", []ToolCallLocation{{Path: path, Line: &loc.start}})
-		out, failed := a.serveRead(ctx, sid, path, loc.start, n, tcId, args.flag("numbered"))
+		out, failed := a.serveRead(ctx, sid, path, loc.start, min(loc.end-loc.start+1, maxReadLines), tcId, args.flag("numbered"))
 		head := fmt.Sprintf("[`%s`: lines %d-%d, block end found by %s", sym, loc.start, loc.end, loc.how)
 		if len(loc.others) > 0 {
 			head += fmt.Sprintf("; also declared at lines %s", joinInts(loc.others))
@@ -237,9 +230,7 @@ func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (stri
 			maxLines = to - from + 1
 		}
 	}
-	if maxLines > maxReadLines {
-		maxLines = maxReadLines
-	}
+	maxLines = min(maxLines, maxReadLines)
 	title := "Reading: " + path
 	if haveLine {
 		title = fmt.Sprintf("Reading: %s:%d", path, line)
@@ -267,8 +258,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 
 	// One line past the window tells whether the file continues.
 	fetch := maxLines + 1
-	startCopy := start
-	content, err := fsRead(a, ctx, sid, path, &startCopy, &fetch)
+	content, err := fsRead(a, ctx, sid, path, &start, &fetch)
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return "error: " + err.Error(), false
@@ -678,10 +668,8 @@ func locateSymbol(content, symbol string) symbolLoc {
 		return loc
 	}
 	d := decls[0]
-	for _, o := range decls[1:] {
-		if len(loc.others) < 5 {
-			loc.others = append(loc.others, o+1)
-		}
+	for _, o := range decls[1:min(6, len(decls))] {
+		loc.others = append(loc.others, o+1)
 	}
 	loc.mentions = nil
 	top := d
@@ -703,10 +691,7 @@ func locateSymbol(content, symbol string) symbolLoc {
 		loc.end, loc.how = indentBlockEnd(lines, d)+1, "indentation"
 		return loc
 	}
-	loc.end = d + symbolFallbackLines
-	if loc.end > len(lines) {
-		loc.end = len(lines)
-	}
+	loc.end = min(d+symbolFallbackLines, len(lines))
 	loc.how = fmt.Sprintf("the %d-line fallback (no block end found)", symbolFallbackLines)
 	return loc
 }
@@ -895,8 +880,7 @@ func replaceBlock(content, start, end, newText string) (string, string, string) 
 	if newText == "" {
 		repl = nil
 	}
-	out := append(append(append([]string{}, lines[:s]...), repl...), lines[e+1:]...)
-	return strings.Join(out, "\n"), fmt.Sprintf("%d-%d", s+1, e+1), ""
+	return strings.Join(slices.Concat(lines[:s], repl, lines[e+1:]), "\n"), fmt.Sprintf("%d-%d", s+1, e+1), ""
 }
 
 func joinInts(ns []int) string {

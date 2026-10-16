@@ -291,7 +291,10 @@ func (a *agent) doPermissionRequest(ctx context.Context, r permissionRequest) (s
 	return resp.Outcome.OptionId, nil
 }
 
-const elicitChoiceKey = "choice"
+const (
+	elicitChoiceKey = "choice"
+	elicitTextKey   = "text"
+)
 
 // doElicitation uses option ids as oneOf consts, so the answer is exactly the
 // optionId the permission path would return.
@@ -326,8 +329,6 @@ func (a *agent) doElicitation(ctx context.Context, r permissionRequest) (string,
 		return "", errPermissionCancelled
 	}
 }
-
-const elicitTextKey = "text"
 
 var errNoFreeText = errors.New("client cannot show a free-text prompt")
 

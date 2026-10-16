@@ -79,7 +79,6 @@ func (a *agent) terminalKill(ctx context.Context, sid, tid string) error {
 }
 
 // terminalRelease kills a still-running command and invalidates the id.
-// Best-effort: a failure is only logged.
 func (a *agent) terminalRelease(sid, tid string) {
 	// Not the caller's ctx: release is the cleanup for a cancelled context.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -116,7 +115,7 @@ func progressSignature(files []string) uint64 {
 		if st, err := os.Stat(f); err == nil {
 			size = st.Size()
 		}
-		_, _ = fmt.Fprintf(h, "\x00%s=%d", f, size)
+		fmt.Fprintf(h, "\x00%s=%d", f, size)
 	}
 	return h.Sum64()
 }

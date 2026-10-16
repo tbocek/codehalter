@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -296,10 +297,6 @@ func (c *cliClient) loadSession(id string) error {
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("session/load returned nonsense: %w", err)
 	}
-	// The response may omit the id, meaning the one requested.
-	if res.SessionId != "" {
-		id = res.SessionId
-	}
 	c.adopt(id, res.Modes)
 	return nil
 }
@@ -314,9 +311,7 @@ func (c *cliClient) storedSessions() ([]SessionInfo, error) {
 	if err := json.Unmarshal(raw, &list); err != nil {
 		return nil, fmt.Errorf("session/list returned nonsense: %w", err)
 	}
-	sort.Slice(list.Sessions, func(i, j int) bool {
-		return list.Sessions[i].UpdatedAt > list.Sessions[j].UpdatedAt
-	})
+	slices.SortFunc(list.Sessions, func(x, y SessionInfo) int { return strings.Compare(y.UpdatedAt, x.UpdatedAt) })
 	return list.Sessions, nil
 }
 
@@ -439,7 +434,7 @@ func (c *cliClient) help() {
 		c.ui.Note("", l)
 	}
 	c.cmdMu.Lock()
-	cmds := append([]availableCommand(nil), c.commands...)
+	cmds := slices.Clone(c.commands)
 	c.cmdMu.Unlock()
 	if len(cmds) == 0 {
 		return
@@ -581,10 +576,7 @@ func (c *cliClient) startTicker() func() {
 // Pulled on the render tick, not pushed per write: a chatty build would force thousands of redraws a second.
 func (c *cliClient) pumpTails() {
 	c.termMu.Lock()
-	terms := make([]*cliTerminal, 0, len(c.terms))
-	for _, t := range c.terms {
-		terms = append(terms, t)
-	}
+	terms := slices.Collect(maps.Values(c.terms))
 	c.termMu.Unlock()
 	for _, t := range terms {
 		c.ui.TerminalTail(t.id, t.tail(cliTermTail))
@@ -779,10 +771,7 @@ func (c *cliClient) askChoiceOrText(question string, labels []string, allowText 
 		line, err := c.in.ReadString('\n')
 		ans := strings.TrimSpace(line)
 		c.ui.Submitted(ans)
-		if err != nil {
-			return -1, ""
-		}
-		if ans == "" {
+		if err != nil || ans == "" {
 			return -1, ""
 		}
 		if n, err := strconv.Atoi(ans); err == nil && n >= 1 && n <= len(labels) {
@@ -860,13 +849,9 @@ func (c *cliClient) terminalCreate(params json.RawMessage) (any, error) {
 	if p.Command == "" {
 		return nil, errors.New("terminal/create: no command")
 	}
+	// Stdin stays nil (/dev/null): os.Stdin would steal the prompt's keystrokes.
 	cmd := exec.Command(p.Command, p.Args...)
-	cmd.Dir = p.Cwd
-	if cmd.Dir == "" {
-		cmd.Dir = c.cwd
-	}
-	// nil stdin is /dev/null; os.Stdin would steal the prompt's keystrokes.
-	cmd.Stdin = nil
+	cmd.Dir = orElse(p.Cwd, c.cwd)
 
 	c.termMu.Lock()
 	c.termSeq++
@@ -954,10 +939,8 @@ func (c *cliClient) terminalKill(params json.RawMessage) (any, error) {
 }
 
 func (t *cliTerminal) kill() {
-	if t.cmd.Process != nil {
-		if err := t.cmd.Process.Kill(); err != nil {
-			slog.Debug("cli: kill failed", "terminal", t.id, "err", err)
-		}
+	if err := t.cmd.Process.Kill(); err != nil {
+		slog.Debug("cli: kill failed", "terminal", t.id, "err", err)
 	}
 }
 

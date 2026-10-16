@@ -121,28 +121,24 @@ type mcpState struct {
 }
 
 func main() {
-	// Exactly one line: installed updaters compare the whole output of the
-	// downloaded binary, and a second line leaves them unable to update.
-	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println(versionLine(version))
-		os.Exit(0)
-	}
-	if len(os.Args) > 1 && os.Args[1] == "--build" {
-		fmt.Println(versionBanner())
-		os.Exit(0)
-	}
-
-	if len(os.Args) > 1 && os.Args[1] == "--update" {
-		os.Exit(runUpdate())
-	}
-
-	if len(os.Args) > 1 && os.Args[1] == "--setup" {
-		runSetup()
-		os.Exit(0)
-	}
-
-	if len(os.Args) > 1 && os.Args[1] == "--cli" {
-		os.Exit(runCLI(os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version":
+			// Exactly one line: installed updaters compare the whole output of the
+			// downloaded binary, and a second line leaves them unable to update.
+			fmt.Println(versionLine(version))
+			os.Exit(0)
+		case "--build":
+			fmt.Println(versionBanner())
+			os.Exit(0)
+		case "--update":
+			os.Exit(runUpdate())
+		case "--setup":
+			runSetup()
+			os.Exit(0)
+		case "--cli":
+			os.Exit(runCLI(os.Args[2:]))
+		}
 	}
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -532,9 +528,6 @@ func (a *agent) sendUpdateAndAbort(ctx context.Context, sid, reason string) {
 }
 
 func (a *agent) logSession(sid string, tag, format string, args ...any) {
-	if sid == "" {
-		return
-	}
 	sess := a.getSession(sid)
 	if sess == nil {
 		return

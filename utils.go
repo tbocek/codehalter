@@ -19,7 +19,6 @@ func fnvHash(s string) uint64 {
 	return h.Sum64()
 }
 
-// parallel runs fn for each index [0, n) with up to limit at a time.
 func parallel(n, limit int, fn func(i int)) {
 	limit = min(limit, n)
 	var wg sync.WaitGroup
@@ -218,7 +217,6 @@ func tailUTF8(s string, n int) string {
 // maxLLMInputBytes caps a single payload sent to an LLM outside the main tool loop.
 const maxLLMInputBytes = 20 * 1024
 
-// clipBytes keeps the head and tail halves with a truncation marker between.
 func clipBytes(s string, max int) string {
 	if len(s) <= max {
 		return s

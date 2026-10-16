@@ -13,8 +13,7 @@ import (
 // Every formatter runs as a stdin/stdout filter, never on the path: over ACP the
 // file may be a pending Zed edit not yet flushed to disk.
 func formatterCmd(path, cwd string) []string {
-	ext := strings.ToLower(filepath.Ext(path))
-	switch ext {
+	switch strings.ToLower(filepath.Ext(path)) {
 	case ".go":
 		return lookCmd("gofmt")
 	case ".rs":
@@ -59,9 +58,6 @@ func prettierBin(cwd string) string {
 }
 
 func runFormatter(argv []string, src, dir string) (string, bool) {
-	if len(argv) == 0 {
-		return "", false
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
@@ -90,9 +86,8 @@ func (a *agent) formatGuarded(sid, path, oldContent, newContent string) string {
 	if formattedOld, ok := runFormatter(argv, oldContent, dir); !ok || formattedOld != oldContent {
 		return newContent
 	}
-	formattedNew, ok := runFormatter(argv, newContent, dir)
-	if !ok {
-		return newContent
+	if formattedNew, ok := runFormatter(argv, newContent, dir); ok {
+		return formattedNew
 	}
-	return formattedNew
+	return newContent
 }

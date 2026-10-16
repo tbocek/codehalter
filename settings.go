@@ -122,7 +122,6 @@ func (c *LLMConnection) paramsFor(role string) map[string]any {
 		if len(c.ParamsExecute) > 0 {
 			return c.ParamsExecute
 		}
-		return c.Params
 	}
 	return c.Params
 }

@@ -134,10 +134,7 @@ func buildDevcontainerJSON(gitWritable, gitconfig, sshAgent bool) string {
 		extras = append(extras, sshMount)
 	}
 	if len(extras) > 0 {
-		ins := configMountAnchor
-		for _, m := range extras {
-			ins += ",\n    " + m
-		}
+		ins := strings.Join(append([]string{configMountAnchor}, extras...), ",\n    ")
 		out = strings.Replace(out, configMountAnchor, ins, 1)
 	}
 	if sshAgent {

@@ -6,11 +6,11 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 )
 
@@ -171,10 +171,6 @@ func hasPrettierConfig(cwd string) bool {
 // prepareChecks returns fix problems instead of offering them: a card accepted here would run a
 // whole fix cycle ahead of the request it interrupted. drainFixes offers them after the turn.
 func (a *agent) prepareChecks(ctx context.Context, sess *Session, sid string) []fixProblem {
-	if sess == nil {
-		slog.Debug("prepareChecks: nil sess, skipping")
-		return nil
-	}
 	slog.Debug("prepareChecks: start", "sid", sid, "cwd", sess.Cwd)
 	a.sendAvailableCommands(ctx, sid)
 	a.ensureLLM(ctx, sess, sid)
@@ -347,10 +343,7 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 		return
 	}
 	results := make([]probeResult, len(conns))
-	parallel(len(conns), len(conns), func(i int) {
-		c := conns[i]
-		results[i] = probeLLM(ctx, &c)
-	})
+	parallel(len(conns), len(conns), func(i int) { results[i] = probeLLM(ctx, &conns[i]) })
 	probes := make(map[string]probeResult, len(conns))
 	for i := range conns {
 		probes[conns[i].Server+"\x00"+conns[i].Model] = results[i]
@@ -386,12 +379,7 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 }
 
 func connPurpose(conns []LLMConnection, i int) string {
-	hasSummariser := false
-	for j := 1; j < len(conns); j++ {
-		if strings.EqualFold(conns[j].Purpose, purposeSummary) {
-			hasSummariser = true
-		}
-	}
+	hasSummariser := slices.ContainsFunc(conns[1:], func(c LLMConnection) bool { return strings.EqualFold(c.Purpose, purposeSummary) })
 	switch {
 	case i == 0 && hasSummariser:
 		return "the session (planning, execution, documentation)"
@@ -410,15 +398,13 @@ func (a *agent) renderLLMStatus() string {
 	path := a.settings.path
 	probes := a.connProbe
 	a.cfgMu.RUnlock()
-	var b strings.Builder
 	if len(conns) == 0 {
-		b.WriteString("🟡 LLM: no [[llm]] in settings.toml: codehalter cannot run until you add one.\n\n")
-		return b.String()
+		return "🟡 LLM: no [[llm]] in settings.toml: codehalter cannot run until you add one.\n\n"
 	}
 	if conns[0].Model == "your-model-id" {
-		fmt.Fprintf(&b, "🟡 LLM: %s still has the placeholder model \"your-model-id\". Edit it with your real url and model, then click Retry below.\n\n", path)
-		return b.String()
+		return fmt.Sprintf("🟡 LLM: %s still has the placeholder model \"your-model-id\". Edit it with your real url and model, then click Retry below.\n\n", path)
 	}
+	var b strings.Builder
 	firstReachable := -1
 	for i := range conns {
 		c := conns[i]
@@ -688,13 +674,9 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	}
 
 	a.mu.Lock()
-	var mcpRunning []string
-	for name := range a.mcp.clients {
-		mcpRunning = append(mcpRunning, name)
-	}
+	mcpRunning := slices.Sorted(maps.Keys(a.mcp.clients))
 	a.mu.Unlock()
 	if len(mcpRunning) > 0 {
-		sort.Strings(mcpRunning)
 		fmt.Fprintf(&b, "✅ MCP: %s\n\n", strings.Join(mcpRunning, ", "))
 	}
 

@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 )
@@ -20,11 +19,8 @@ func skillSet(cwd string, stacks []string) []string {
 	if slices.Contains(stacks, "css") {
 		names = append(names, "SKILL-layout.md")
 	}
-	for _, n := range []string{"justfile", "Justfile", ".justfile"} {
-		if fileExists(cwd, n) {
-			names = append(names, "SKILL-justfile.md")
-			break
-		}
+	if slices.ContainsFunc([]string{"justfile", "Justfile", ".justfile"}, func(n string) bool { return fileExists(cwd, n) }) {
+		names = append(names, "SKILL-justfile.md")
 	}
 	if n := "SKILL-" + readOSInfo().ID + ".md"; shipped(n) {
 		names = append(names, n)
@@ -38,7 +34,7 @@ func skillSet(cwd string, stacks []string) []string {
 			}
 		}
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return names
 }
 
@@ -72,7 +68,7 @@ func overriddenBuiltins(cwd string) []string {
 			over = append(over, e.Name())
 		}
 	}
-	sort.Strings(over)
+	slices.Sort(over)
 	return over
 }
 

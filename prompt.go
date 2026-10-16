@@ -85,23 +85,11 @@ func parseResourceURI(uri string) (path, frag string) {
 // parseLineRange accepts "L810-845", "810:845", "L810"; 0,0 means the whole file.
 func parseLineRange(frag string) (int, int) {
 	var nums []int
-	var cur strings.Builder
-	flush := func() {
-		if cur.Len() > 0 {
-			if n, err := strconv.Atoi(cur.String()); err == nil {
-				nums = append(nums, n)
-			}
-			cur.Reset()
+	for _, m := range digitRunRe.FindAllString(frag, -1) {
+		if n, err := strconv.Atoi(m); err == nil {
+			nums = append(nums, n)
 		}
 	}
-	for _, r := range frag {
-		if r >= '0' && r <= '9' {
-			cur.WriteRune(r)
-		} else {
-			flush()
-		}
-	}
-	flush()
 	switch len(nums) {
 	case 0:
 		return 0, 0
@@ -111,6 +99,8 @@ func parseLineRange(frag string) (int, int) {
 		return nums[0], nums[1]
 	}
 }
+
+const attachedContext = "\n\n[Attached context from %s]\n```\n%s\n```\n"
 
 // Images are stored by content id, so the wire's base64 never lands in session.toml.
 func promptContent(cwd string, blocks []ContentBlock) (text string, images []ImageData) {
@@ -145,12 +135,12 @@ func promptContent(cwd string, blocks []ContentBlock) (text string, images []Ima
 			}
 			switch {
 			case block.Resource.Text != "":
-				text += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, block.Resource.Text)
+				text += fmt.Sprintf(attachedContext, label, block.Resource.Text)
 			case block.Resource.Blob != "":
 				text += fmt.Sprintf("\n\n[Attached binary resource %s (%s), not inlined]\n", label, block.Resource.MimeType)
 			default:
 				if snippet, l, ok := readLinkedResource(cwd, block.Resource.URI); ok {
-					text += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", l, snippet)
+					text += fmt.Sprintf(attachedContext, l, snippet)
 				} else {
 					slog.Debug("prompt: empty embedded resource", "uri", block.Resource.URI)
 				}
@@ -158,7 +148,7 @@ func promptContent(cwd string, blocks []ContentBlock) (text string, images []Ima
 		case "resource_link":
 			// Inlined so the model doesn't read-loop hunting for the snippet.
 			if snippet, label, ok := readLinkedResource(cwd, block.URI); ok {
-				text += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, snippet)
+				text += fmt.Sprintf(attachedContext, label, snippet)
 			} else {
 				name := block.Name
 				path, _ := parseResourceURI(block.URI)
@@ -181,26 +171,9 @@ func isCancelled(err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
-// codehalter sets no foreground deadline, so DeadlineExceeded is the client's.
-func cancelReason(err error) string {
-	switch {
-	case errors.Is(err, errUserCancelled):
-		return "you stopped it"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "a deadline was exceeded (client-side timeout)"
-	case errors.Is(err, context.Canceled):
-		return "the editor aborted the request (Cancel button, or a client-side timeout while the LLM was busy)"
-	default:
-		return "cancelled"
-	}
-}
-
 var phaseNames = []string{"Planning", "Working", "Documenting"}
 
 func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
-	if phase < 0 || phase >= len(phaseNames) {
-		return nil
-	}
 	entries := make([]PlanEntry, 0, phase+1)
 	for i := 0; i <= phase; i++ {
 		status := "completed"
@@ -232,17 +205,12 @@ func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
 		return
 	}
 	sess.phaseMu.Lock()
-	active := sess.phaseActive
-	phase := sess.phaseCurrent
+	active, phase := sess.phaseActive, sess.phaseCurrent
 	sess.phaseMu.Unlock()
 	if !active {
 		return
 	}
-	entries := phaseEntries(phase, false, suffix)
-	if entries == nil {
-		return
-	}
-	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
+	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(phase, false, suffix)})
 }
 
 // stop() joins the goroutine so a late tick can't re-set a cleared row. A caller
@@ -314,8 +282,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		return PromptResponse{StopReason: "end_turn"}, nil
 	}
 
-	var release func()
-	ctx, release, _ = a.holdTurn(ctx, sess, true)
+	ctx, release, _ := a.holdTurn(ctx, sess, true)
 	detached := false // a /spec loop that outlives Zed's cancel releases the turn itself
 	defer func() {
 		if !detached {
@@ -410,13 +377,16 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	if err := a.runTurn(ctx, req.SessionId); err != nil {
 		if isCancelled(err) {
-			// Background ctx: the request's own is already cancelled.
-			reason := cancelReason(err)
-			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "reason", reason, "err", err)
-			msg := "⏹ Turn cancelled: " + reason + ".\n"
-			if errors.Is(err, errUserCancelled) {
+			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "err", err)
+			// codehalter sets no foreground deadline, so DeadlineExceeded is the client's.
+			msg := "⏹ Turn cancelled: the editor aborted the request (Cancel button, or a client-side timeout while the LLM was busy).\n"
+			switch {
+			case errors.Is(err, errUserCancelled):
 				msg = "⏹ Stopped.\n"
+			case errors.Is(err, context.DeadlineExceeded):
+				msg = "⏹ Turn cancelled: a deadline was exceeded (client-side timeout).\n"
 			}
+			// Background ctx: the request's own is already cancelled.
 			a.say(context.Background(), req.SessionId, msg)
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
@@ -444,9 +414,8 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	return PromptResponse{StopReason: "end_turn"}, nil
 }
 
-// steerRunningTurn handles a prompt typed while a turn runs: /spec stop and abort
-// act at once, other text is queued for the turn's next tool round (images cannot
-// be queued, and the reply says so). False when there was nothing to handle.
+// A prompt typed while a turn runs. Images cannot be queued, and the reply says
+// so. False when there was nothing to handle.
 func (a *agent) steerRunningTurn(ctx context.Context, sess *Session, content []ContentBlock) bool {
 	text, images := promptContent(sess.Cwd, content)
 	t := strings.TrimSpace(text)
@@ -581,15 +550,13 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		return a.specFromPlan(ctx, sid, sess, p)
 	}
 	if len(p.Subtasks) == 0 {
-		// Returning the answer as Text lets runTurn's epilogue run.
-		switch {
-		case p.answer != "":
-			a.say(ctx, sid, p.answer+"\n\nℹ Answered directly, no code change to execute.\n")
-			return toolLoopResult{Text: p.answer}, nil
-		default:
+		if p.answer == "" {
 			a.say(ctx, sid, "⚠ I couldn't produce a clear answer or a plan for that. Try rephrasing, or ask for a specific change.\n")
 			return toolLoopResult{}, nil
 		}
+		// Returning the answer as Text lets runTurn's epilogue run.
+		a.say(ctx, sid, p.answer+"\n\nℹ Answered directly, no code change to execute.\n")
+		return toolLoopResult{Text: p.answer}, nil
 	}
 	header := "Plan:"
 	if p.ReportOnly {

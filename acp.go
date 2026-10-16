@@ -18,12 +18,11 @@ const (
 )
 
 type AuthMethod struct {
-	ID          string            `json:"id"`
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Type        string            `json:"type"`
-	Args        []string          `json:"args,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
+	ID          string   `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Type        string   `json:"type"`
+	Args        []string `json:"args,omitempty"`
 }
 
 // An agent may only send fs/read_text_file and fs/write_text_file to a client
@@ -108,17 +107,14 @@ type (
 		McpServers []acpMCPServer `json:"mcpServers,omitempty"`
 	}
 	LoadSessionResponse struct {
-		SessionId string            `json:"sessionId,omitempty"`
-		Modes     *SessionModeState `json:"modes,omitempty"`
+		Modes *SessionModeState `json:"modes,omitempty"`
 	}
 
 	ListSessionsRequest struct {
-		Cwd    string `json:"cwd,omitempty"`
-		Cursor string `json:"cursor,omitempty"`
+		Cwd string `json:"cwd,omitempty"`
 	}
 	ListSessionsResponse struct {
-		Sessions   []SessionInfo `json:"sessions"`
-		NextCursor string        `json:"nextCursor,omitempty"`
+		Sessions []SessionInfo `json:"sessions"`
 	}
 
 	CloseSessionRequest struct {

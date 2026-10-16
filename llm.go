@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -234,22 +236,15 @@ func (a *agent) warnChatTemplateKwargsIgnored(ctx context.Context, sid string, c
 const noThinkPrefillContent = "<think>\n\n</think>\n\n"
 
 // Continues a closed think block rather than set enable_thinking=false, which
-// re-renders the prompt and loses the prefix cache. nil in, nil out.
+// re-renders the prompt and loses the prefix cache.
 func (c *LLMConnection) withThinkingDisabled() *LLMConnection {
-	if c == nil {
-		return nil
-	}
 	cp := *c
 	cp.noThinkPrefill = true
 	return &cp
 }
 
 // The keys in use (max_tokens, tool_choice) are samplers, so the prefix cache is untouched.
-// nil in, nil out.
 func (c *LLMConnection) withBody(key string, v any) *LLMConnection {
-	if c == nil {
-		return nil
-	}
 	cp := *c
 	eb := make(map[string]any, len(c.ExtraBody)+1)
 	maps.Copy(eb, c.ExtraBody)
@@ -276,7 +271,7 @@ func (a *agent) warmCall(ctx context.Context, sess *Session, conn *LLMConnection
 // runs. next() runs per tick, so the current prefix is the one refreshed.
 func (a *agent) keepWarm(sess *Session, conn *LLMConnection, next func() []llmMessage) (stop func()) {
 	every := a.keepWarmInterval()
-	if sess == nil || conn == nil || every <= 0 {
+	if conn == nil || every <= 0 {
 		return func() {}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -306,7 +301,7 @@ func (a *agent) keepWarm(sess *Session, conn *LLMConnection, next func() []llmMe
 
 // Errors are only logged: the real turn reports an unreachable server.
 func (a *agent) prewarm(sess *Session) {
-	if sess == nil || !a.prewarmEnabled() {
+	if !a.prewarmEnabled() {
 		return
 	}
 	conn := a.connFor("thinking")
@@ -561,14 +556,12 @@ func (a *agent) streamOutcomeError(conn *LLMConnection, reqBody map[string]any, 
 		belowCap := r.completionTokens > 0 && reqMax > 0 && r.completionTokens < reqMax
 		mst := int(a.mainSlotTokens.Load())
 		noRoom := r.promptTokens > 0 && reqMax > 0 && mst > 0 && r.promptTokens+reqMax > mst
-		switch {
-		case belowCap || noRoom:
+		if belowCap || noRoom {
 			return fmt.Errorf("generation hit the context ceiling (prompt=%d gen=%d, n_ctx=%d, role=%s): %w",
 				r.promptTokens, r.completionTokens, mst, conn.Tag, errContextCeiling)
-		default:
-			return &capHitError{Cap: reqMax, msg: fmt.Sprintf("LLM hit max_tokens cap (role=%s, model=%s): response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
-				conn.Tag, conn.Model, r.text.Len(), r.reasoning.Len(), len(r.calls), conn.Tag)}
 		}
+		return &capHitError{Cap: reqMax, msg: fmt.Sprintf("LLM hit max_tokens cap (role=%s, model=%s): response truncated (%d B content, %d B reasoning, %d tool calls). Likely the model is looping or stuck in <think>; raise max_tokens in params_%s, or set chat_template_kwargs.enable_thinking=false for this role if reasoning is dominating the budget",
+			conn.Tag, conn.Model, r.text.Len(), r.reasoning.Len(), len(r.calls), conn.Tag)}
 	default:
 		return nil
 	}
@@ -740,7 +733,7 @@ func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnecti
 	// The display index (llm[1] for background work), not the semaphore index slot.
 	slotLabel := "?"
 	if slot >= 0 {
-		slotLabel = fmt.Sprintf("%d", conn.Slot)
+		slotLabel = strconv.Itoa(conn.Slot)
 	}
 
 	upLabel := humanBytes(len(body))
@@ -842,18 +835,10 @@ func probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
 	}
 	if p.Reachable {
 		r.Reachable = true
-		if !r.ImageSupport {
-			r.ImageSupport = p.ImageSupport
-		}
-		if r.ContextSize == 0 {
-			r.ContextSize = p.ContextSize
-		}
-		if r.SlotCtx == 0 {
-			r.SlotCtx = p.SlotCtx
-		}
-		if r.TotalSlots == 0 {
-			r.TotalSlots = p.TotalSlots
-		}
+		r.ImageSupport = r.ImageSupport || p.ImageSupport
+		r.ContextSize = cmp.Or(r.ContextSize, p.ContextSize)
+		r.SlotCtx = cmp.Or(r.SlotCtx, p.SlotCtx)
+		r.TotalSlots = cmp.Or(r.TotalSlots, p.TotalSlots)
 	}
 
 	if r.Reachable {
@@ -1027,17 +1012,10 @@ func (a *agent) setSettings(s Settings) {
 // No-op when no cap changed, so in-flight calls keep their channels. Caller holds
 // a.cfgMu for writing.
 func (a *agent) buildConnSems() {
-	if len(a.connSems) == len(a.settings.LLM) {
-		unchanged := true
-		for i := range a.settings.LLM {
-			if cap(a.connSems[i]) != a.settings.LLM[i].parallelCap() {
-				unchanged = false
-				break
-			}
-		}
-		if unchanged {
-			return
-		}
+	if slices.EqualFunc(a.connSems, a.settings.LLM, func(sem chan struct{}, c LLMConnection) bool {
+		return cap(sem) == c.parallelCap()
+	}) {
+		return
 	}
 	sems := make([]chan struct{}, len(a.settings.LLM))
 	for i := range a.settings.LLM {

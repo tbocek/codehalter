@@ -79,16 +79,11 @@ func runSetup() {
 	}
 
 	// 0600 for the backup and the file: both can hold an api_key.
-	if _, err := os.Stat(configPath); err == nil {
-		old, readErr := os.ReadFile(configPath)
-		if readErr == nil {
-			hash := sha256.Sum256(old)
-			shaPrefix := hex.EncodeToString(hash[:])[:8]
-			ts := time.Now().Format("20060102150405")
-			backupPath := filepath.Join(configDir, fmt.Sprintf("settings.backup-%s-%s", ts, shaPrefix))
-			if writeErr := os.WriteFile(backupPath, old, 0o600); writeErr != nil {
-				fmt.Fprintf(os.Stderr, "Warning: could not create backup: %v\n", writeErr)
-			}
+	if old, err := os.ReadFile(configPath); err == nil {
+		hash := sha256.Sum256(old)
+		backupPath := filepath.Join(configDir, fmt.Sprintf("settings.backup-%s-%s", time.Now().Format("20060102150405"), hex.EncodeToString(hash[:])[:8]))
+		if err := os.WriteFile(backupPath, old, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not create backup: %v\n", err)
 		}
 	}
 

@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -185,7 +184,7 @@ func expandVars(src []byte, vars map[string]string) ([]byte, error) {
 			out = append(out, src[i])
 			continue
 		}
-		end := strings.IndexByte(string(src[i:]), '}')
+		end := bytes.IndexByte(src[i:], '}')
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated ${ at byte %d", i)
 		}
@@ -241,7 +240,7 @@ func devcontainerPath(workspace string) (string, error) {
 	for i, f := range found {
 		names[i] = filepath.Base(filepath.Dir(f))
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	return "", fmt.Errorf("%s holds several configurations (%s), and the launcher has no flag to pick one",
 		filepath.Join(workspace, ".devcontainer"), strings.Join(names, ", "))
 }
@@ -283,10 +282,10 @@ func loadDevcontainerConfig(workspace string) (*devcontainerConfig, error) {
 		}
 	}
 	if len(refused) > 0 {
-		sort.Strings(refused)
+		slices.Sort(refused)
 		return nil, &unsupportedConfig{path: path, keys: refused}
 	}
-	sort.Strings(cfg.notes)
+	slices.Sort(cfg.notes)
 
 	// containerWorkspaceFolder is resolved first: other values use it, and it may use the local ones.
 	base := filepath.Base(workspace)

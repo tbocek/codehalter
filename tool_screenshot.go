@@ -168,10 +168,7 @@ func clampDimension(args toolArgs, key string, def, max int) int {
 	if !ok || n <= 0 {
 		return def
 	}
-	if n > max {
-		return max
-	}
-	return n
+	return min(n, max)
 }
 
 // renderPage never writes to the project tree, not even to instrument the page.
@@ -445,8 +442,7 @@ func newestPNGSince(root string, t time.Time) string {
 			return nil
 		}
 		if d.IsDir() {
-			name := d.Name()
-			if path != root && skipWalkDir(name) {
+			if path != root && skipWalkDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -476,8 +472,9 @@ func (a *agent) viewPicture(ctx context.Context, sid string, sess *Session, rel,
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	what := fmt.Sprintf("%s (%dx%d px)", rel, w, h)
-	var out []byte
-	if r, ok := args["region"].([]any); ok {
+	var src image.Image = img
+	r, hasRegion := args["region"].([]any)
+	if hasRegion {
 		if len(r) != 4 {
 			return "screenshot: `region` is [x, y, width, height] in the picture's pixels, four numbers.", nil, "", true
 		}
@@ -500,18 +497,16 @@ func (a *agent) viewPicture(ctx context.Context, sid string, sess *Session, rel,
 				dst.Set(xx, yy, img.At(b.Min.X+cut.Min.X+xx/f, b.Min.Y+cut.Min.Y+yy/f))
 			}
 		}
-		var buf bytes.Buffer
-		if err := png.Encode(&buf, dst); err != nil {
-			return "screenshot: " + err.Error(), nil, "", true
-		}
-		out = buf.Bytes()
+		src = dst
 		what = fmt.Sprintf("%s, region x %d-%d, y %d-%d, enlarged %dx", what, cut.Min.X, cut.Max.X, cut.Min.Y, cut.Max.Y, f)
-	} else {
-		var buf bytes.Buffer
-		if err := png.Encode(&buf, img); err != nil {
-			return "screenshot: " + err.Error(), nil, "", true
-		}
-		out = downscalePNG(buf.Bytes(), attachMaxSide)
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		return "screenshot: " + err.Error(), nil, "", true
+	}
+	out := buf.Bytes()
+	if !hasRegion {
+		out = downscalePNG(out, attachMaxSide)
 	}
 	id, err := storeImage(sess.Cwd, "image/png", out)
 	if err != nil {

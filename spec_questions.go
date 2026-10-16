@@ -104,7 +104,6 @@ func parseSpecQuestionFile(text string) (head string, secs []specQuestion) {
 	return strings.TrimSpace(strings.Join(headLines, "\n")), secs
 }
 
-// writeSpecQuestionFile writes the head and the questions, `---` between two.
 func writeSpecQuestionFile(path, head string, secs []string) error {
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(head) + "\n")

@@ -43,14 +43,12 @@ func (s *Session) setSpecFence(dir string) {
 	s.rt.mu.Unlock()
 }
 
-// setSpecAbort records how to cancel the running loop; nil when none runs.
 func (s *Session) setSpecAbort(abort context.CancelFunc) {
 	s.rt.mu.Lock()
 	s.rt.specAbort = abort
 	s.rt.mu.Unlock()
 }
 
-// abortSpec cancels the running loop at once; false when none runs.
 func (s *Session) abortSpec() bool {
 	s.rt.mu.Lock()
 	abort := s.rt.specAbort
@@ -99,9 +97,9 @@ func (a *agent) runSpecTurn(ctx context.Context, sid string, sess *Session, args
 	return PromptResponse{StopReason: "cancelled"}, nil, true
 }
 
-// requestSpecStop ends the running loop at its next round boundary, not now.
-// requestSpecStop reports whether a stop was already asked for: Zed sends a typed
-// `/spec stop` as a cancel first and the text after, and the user hears it once.
+// requestSpecStop ends the running loop at its next round boundary, not now. It
+// reports whether a stop was already asked for: Zed sends a typed `/spec stop` as
+// a cancel first and the text after, and the user hears it once.
 func (s *Session) requestSpecStop() (already bool) {
 	s.rt.mu.Lock()
 	defer s.rt.mu.Unlock()
@@ -109,7 +107,6 @@ func (s *Session) requestSpecStop() (already bool) {
 	return already
 }
 
-// setSpecHandoff records the /spec command the planner handed back instead of a plan.
 func (s *Session) setSpecHandoff(cmd string) {
 	s.rt.mu.Lock()
 	s.rt.specHandoff = cmd
@@ -749,8 +746,7 @@ func (a *agent) specResolve(ctx context.Context, sid string, sess *Session, args
 		say("⚠ /spec: " + err.Error() + "\n")
 		return nil, "", false
 	}
-	cfg = &specConfig{}
-	cfg.SpecDir, cfg.OutDir, cfg.Target = specRel, outRel, target
+	cfg = &specConfig{SpecDir: specRel, OutDir: outRel, Target: target}
 	if err := os.MkdirAll(filepath.Join(sess.Cwd, outRel), 0o755); err != nil {
 		say("⚠ /spec: creating " + outRel + ": " + err.Error() + "\n")
 		return nil, "", false
@@ -1061,11 +1057,8 @@ func uiEditedUnseen(uses []ToolUse, cwd string) []string {
 			}
 			text := string(data)
 			text = strings.TrimSuffix(text, testSourceText(strings.TrimPrefix(path, cwd+string(filepath.Separator)), text))
-			for _, m := range uiMarkers {
-				if strings.Contains(text, m) {
-					files = append(files, path)
-					break
-				}
+			if slices.ContainsFunc(uiMarkers, func(m string) bool { return strings.Contains(text, m) }) {
+				files = append(files, path)
 			}
 		}
 	}
@@ -1083,7 +1076,7 @@ func writeSpecFiles(cwd, specDir string, files []specFile) ([]string, error) {
 	var written []string
 	for _, f := range files {
 		rel := filepath.Clean(strings.TrimPrefix(f.Path, specDir+"/"))
-		if rel == "." || rel == "" || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
+		if rel == "." || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
 			return written, fmt.Errorf("spec file path %q is not inside %s/", f.Path, specDir)
 		}
 		abs := filepath.Join(dir, rel)
@@ -1369,9 +1362,8 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 	return done, block, nil
 }
 
-// inspect runs the checks that decide a round into res: the suite (unless
-// runTests is off, for the in-round check), the UI look, the test naming this
-// item in the round's own files, and the gates on what the round wrote.
+// inspect fills res with what decides the round; runTests is off for the in-round
+// check, which judges the other findings before the suite runs.
 func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, started time.Time, runTests bool, res *specRoundResult) (covered map[string]string, coveredBy string, err error) {
 	cfg, item := r.cfg, w.Item
 	switch cmd := r.testCmd(); {
@@ -1450,9 +1442,9 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 	lint := "none is set up for this project, so this one is free"
 	if lintCmd != "" {
 		lint = fmt.Sprintf("`%s`, run from `%s/`", lintCmd, cfg.OutDir)
-	}
-	if lintCmd != "" && w.LintMissing != "" {
-		lint += fmt.Sprintf(". It does not run in this container yet (%s): install it first, the way SKILL-base.md installs tools, and persist the install in `.devcontainer/Dockerfile`", w.LintMissing)
+		if w.LintMissing != "" {
+			lint += fmt.Sprintf(". It does not run in this container yet (%s): install it first, the way SKILL-base.md installs tools, and persist the install in `.devcontainer/Dockerfile`", w.LintMissing)
+		}
 	}
 	maxLines := strconv.Itoa(cfg.maxFileLines())
 	if cfg.maxFileLines() < 0 {
@@ -1553,9 +1545,6 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 	)), fmt.Sprintf("%s %s · %s", item, title, progress)
 }
 
-// gates checks what the round wrote, beyond its tests: functions only tests
-// reach, lint findings in its own lines, files grown past the size budget, and
-// for a refactor whether the debt shrank.
 func (r *specRun) gates(ctx context.Context, w specWork, ch specChanges, res *specRoundResult) {
 	if w.Mode == specModeItem || w.Mode == specModeChange {
 		res.Unreachable = specUnreachable(r.outAbs, ch, loadSpecProgram(r.outAbs))
@@ -1828,8 +1817,7 @@ func (a *agent) suggestSpecTarget(ctx context.Context, sid, entry string) (outDi
 		}
 		for _, line := range strings.Split(out, "\n") {
 			line = strings.TrimSpace(strings.Trim(strings.TrimSpace(line), "`*"))
-			v, ok := strings.CutPrefix(line, "out_dir=")
-			if ok {
+			if v, ok := strings.CutPrefix(line, "out_dir="); ok {
 				outDir = strings.Trim(strings.TrimSpace(v), "`\"/")
 			}
 			if v, ok := strings.CutPrefix(line, "target="); ok {

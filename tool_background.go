@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -224,11 +225,6 @@ var (
 	pictureScriptRe = regexp.MustCompile(`\b(?:python3?|node|perl|ruby)\s+(?:-c\b|-e\b|-\s*<<)|\b(?:convert|magick|mogrify|pngtopnm|pnmcut|ffmpeg)\s`)
 )
 
-// A finite run is a test, build or lint tool, by its command and subcommand
-// (after a wrapper like xvfb-run): a word in a path or a flag (`--build`,
-// `build/libs/app.jar`) says nothing.
-var ()
-
 // parkableJobs: every job this step started that will end; a server (it listens on a
 // port) and a job from an earlier turn never park it.
 func (a *agent) parkableJobs(sid string, since time.Time) string {
@@ -274,7 +270,6 @@ func (a *agent) resumeWith(ctx context.Context, sid string, items []pendingInput
 	return text
 }
 
-// endJob releases a finished or stopped job's terminal and forgets it.
 func (a *agent) endJob(job *backgroundJob) {
 	a.terminalRelease(job.sid, job.terminalId)
 	a.bgMu.Lock()
@@ -293,10 +288,7 @@ func removeJobFiles(files ...string) {
 
 func (a *agent) shutdownBackground() {
 	a.bgMu.Lock()
-	jobs := make([]*backgroundJob, 0, len(a.bgJobs))
-	for _, j := range a.bgJobs {
-		jobs = append(jobs, j)
-	}
+	jobs := slices.Collect(maps.Values(a.bgJobs))
 	a.bgJobs = nil
 	a.bgMu.Unlock()
 	for _, j := range jobs {
@@ -404,15 +396,15 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 		forget()
 		return
 	}
-	outcome := fmt.Sprintf("exited with code %d", exit.code())
-	if stuck == "" && err == nil {
-		sess.recordJobRun(jobRun{cmd: job.cmdStr, code: exit.code(), started: job.started, ended: time.Now()})
-	}
+	var outcome string
 	switch {
 	case stuck != "":
 		outcome = "was stopped as stuck: " + stuck
 	case err != nil:
 		outcome = "was lost (" + err.Error() + ")"
+	default:
+		outcome = fmt.Sprintf("exited with code %d", exit.code())
+		sess.recordJobRun(jobRun{cmd: job.cmdStr, code: exit.code(), started: job.started, ended: time.Now()})
 	}
 	kind := "Background"
 	if job.expectExit {

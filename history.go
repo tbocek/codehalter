@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -19,21 +20,17 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 	// Join pending notes first, or the turns rotating out lose them.
 	sess.waitSummarise()
 
-	sess.mu.Lock()
-	if keepFrom > len(sess.Messages) {
-		keepFrom = len(sess.Messages)
-	}
 	if keepFrom <= 0 {
-		sess.mu.Unlock()
 		return false
 	}
+	sess.mu.Lock()
 	inFlightCompleted := append([]Message(nil), sess.Messages[sess.turnStartIdx:keepFrom]...)
 	keepMessages := append([]Message(nil), sess.Messages[keepFrom:]...)
 	sess.mu.Unlock()
 
-	var notes strings.Builder
+	var notes []string
 	if shadow := sess.drainShadow(); shadow != "" {
-		notes.WriteString(shadow)
+		notes = append(notes, shadow)
 	}
 	if len(inFlightCompleted) > 0 {
 		a.say(ctx, sess.ID, "🗜 Context limit reached, compacting: summarising completed small turns, keeping the unfinished one…\n")
@@ -47,28 +44,18 @@ func (a *agent) foldHistory(ctx context.Context, sess *Session, keepFrom int) bo
 		if note == "" {
 			note = fallbackTurnNote(inFlightCompleted)
 		}
-		if notes.Len() > 0 {
-			notes.WriteString("\n\n")
-		}
-		notes.WriteString(note)
+		notes = append(notes, note)
 	}
-	if notes.Len() == 0 {
+	if len(notes) == 0 {
 		return false
 	}
 
 	// waitSummarise above joined the background fold, so FoldedSummary is settled.
-	var b strings.Builder
 	prev, folded := sess.Summary, sess.FoldedSummary
-	base := prev
-	if folded != "" {
-		base = folded
+	if base := cmp.Or(folded, prev); base != "" {
+		notes = append([]string{base}, notes...)
 	}
-	if base != "" {
-		b.WriteString(base)
-		b.WriteString("\n\n")
-	}
-	b.WriteString(notes.String())
-	summary := b.String()
+	summary := strings.Join(notes, "\n\n")
 
 	sess.FoldedSummary = "" // consumed: it described the Summary being replaced
 	archiveID, err := sess.rotate(keepMessages, summary)
@@ -166,9 +153,6 @@ func keepImageRefs(old, folded string) string {
 // Once per completed turn, so Shadow holds one note per turn. Background ctx:
 // cancelling the next prompt must not kill a note in flight.
 func (a *agent) backgroundSummarise(sess *Session) {
-	if sess == nil {
-		return
-	}
 	prompt := a.loadPromptFile(sess.ID, "SUMMARISE.md")
 	if prompt == "" {
 		return

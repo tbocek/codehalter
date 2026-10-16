@@ -406,12 +406,7 @@ func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind strin
 }
 
 func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, content []ToolCallContent) {
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: id,
-		Status:     "completed",
-		Content:    content,
-	})
+	a.CompleteToolCallTitled(ctx, sid, id, "", content)
 }
 
 func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, title string, content []ToolCallContent) {

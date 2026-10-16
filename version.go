@@ -127,6 +127,7 @@ func latestRelease(ctx context.Context) (string, error) {
 func writeUpdateCache(c updateCache) {
 	buf, err := json.Marshal(c)
 	if err != nil {
+		slog.Debug("update: cache not encoded", "err", err)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(updateCachePath()), 0o755); err != nil {
@@ -137,10 +138,7 @@ func writeUpdateCache(c updateCache) {
 }
 
 func newerRelease(ctx context.Context, cwd string) string {
-	if os.Getenv(envUpdate) == "skip" {
-		return ""
-	}
-	if version == "dev" {
+	if os.Getenv(envUpdate) == "skip" || version == "dev" {
 		return ""
 	}
 	if s, err := loadSettings(cwd); err == nil && s.UpdateCheck != nil && !*s.UpdateCheck {
