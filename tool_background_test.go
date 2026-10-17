@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -428,5 +429,57 @@ func TestRunBackgroundRefusesARender(t *testing.T) {
 	}
 	if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo just snapshot 07-narrate"}`); strings.HasPrefix(res, "refused") {
 		t.Errorf("run_command refused a render: %s", res)
+	}
+}
+
+// A loop that polls with pgrep and sleep adds a tick or two of reaped children at every
+// sample; that is idle, not movement. Only CPU from bgBusyRate up counts, so the polling
+// job is stopped and the one that really works is left alone.
+func TestStuckWatchCountsOnlyRealCPU(t *testing.T) {
+	oldRate, oldRead := bgBusyRate, readActivity
+	bgBusyRate = 100 // a whole core: 2 ticks per 20 ms sample
+	defer func() { bgBusyRate, readActivity = oldRate, oldRead }()
+
+	for _, tc := range []struct {
+		name      string
+		perSample uint64
+		stuck     bool
+	}{
+		{"polling adds a tick a sample", 1, true},
+		{"a busy job adds five", 5, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newTerminalHarness(t)
+			var ticks atomic.Uint64
+			readActivity = func(int) procActivity {
+				return procActivity{known: true, cpu: ticks.Add(tc.perSample)}
+			}
+			job := &backgroundJob{id: 1, sid: h.sess.ID, cmdStr: "while pgrep -f \"just test\"; do sleep 5; done", started: time.Now()}
+			h.agent.registerBgJob(job)
+			stop := make(chan struct{})
+			done := make(chan struct{})
+			go func() {
+				h.agent.stuckWatch(job, stop, 300*time.Millisecond, 20*time.Millisecond)
+				close(done)
+			}()
+			select {
+			case <-done:
+				if !tc.stuck {
+					t.Fatal("a job using 25% of a core was stopped")
+				}
+			case <-time.After(800 * time.Millisecond):
+				close(stop)
+				<-done
+				if tc.stuck {
+					t.Fatal("a job adding one tick a sample was not stopped")
+				}
+			}
+			h.agent.bgMu.Lock()
+			reason := job.stuck
+			h.agent.bgMu.Unlock()
+			if tc.stuck && !strings.Contains(reason, "almost no CPU") {
+				t.Errorf("reason = %q", reason)
+			}
+		})
 	}
 }

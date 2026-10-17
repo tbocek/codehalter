@@ -189,7 +189,7 @@ func (a *agent) runningBgJobs(sid string, keep func(*backgroundJob) bool) string
 		if j.sid == sid && (keep == nil || keep(j)) {
 			state := fmt.Sprintf("%s so far", humanDuration(time.Since(j.started).Milliseconds()))
 			if quiet := time.Since(j.still); !j.still.IsZero() && quiet >= time.Minute {
-				state += fmt.Sprintf(", no CPU use or output for %s", humanDuration(quiet.Milliseconds()))
+				state += fmt.Sprintf(", idle (almost no CPU, no output) for %s", humanDuration(quiet.Milliseconds()))
 			}
 			names = append(names, fmt.Sprintf("job %d `%s` (%s)", j.id, truncate(j.cmdStr, 60), state))
 		}
@@ -360,13 +360,17 @@ const bgNoteTailCap = 3 * 1024
 
 const bgWakeRetry = 2 * time.Second
 
-// bgStuckAfter: a job whose processes used no CPU and wrote no output this long is
+// bgStuckAfter: a job whose processes used almost no CPU and wrote no output this long is
 // stuck (a deadlock, a prompt for input, a wait for something that never comes). A
 // silent build still uses CPU, and a server listens, so neither is taken for stuck.
 // Vars so tests can shorten them.
 var (
 	bgStuckAfter = 5 * time.Minute
 	bgStuckPoll  = 30 * time.Second
+	// bgBusyRate: CPU ticks a second (100 is a whole core) from which a job counts as busy; 1 is 1%.
+	bgBusyRate = 1.0
+	// readActivity is jobActivity, so a test can script what /proc would say.
+	readActivity = jobActivity
 )
 
 // watchBgJob closes stop, ending the job's stuck watcher, once the job exits.
@@ -506,14 +510,20 @@ func killOrphanedJobs() {
 	}
 }
 
-// stuckWatch stops a job once nothing in it moves for `after`: its processes use no CPU,
-// write no output (its log or a redirect target), and wait for no lock whose holder is
-// busy. A server (it listens on a socket) is never stuck, since it waits for requests by
-// design; a stopped process (state T) is, at once, since only a SIGCONT would let it go
-// on. Where /proc cannot say (not Linux), output alone decides.
+// stuckWatch stops a job once nothing in it moves for `after`: its processes use under
+// bgBusyRate of CPU, write no output (its log or a redirect target), and wait for no
+// lock whose holder is busy. A server (it listens on a socket) is never stuck, since it
+// waits for requests by design; a stopped process (state T) is, at once, since only a
+// SIGCONT would let it go on. Where /proc cannot say (not Linux), output alone decides.
 func (a *agent) stuckWatch(job *backgroundJob, stop <-chan struct{}, after, poll time.Duration) {
 	files := append([]string{job.logPath}, job.redirects...)
-	out, prev := progressSignature(files), jobActivity(job.pid)
+	out, prev := progressSignature(files), readActivity(job.pid)
+	// Any growth is not movement: a loop polling with pgrep and sleep adds a tick or two
+	// of reaped children every sample, and one such job outlived a /spec round by 6 hours.
+	busy := func(prev, now uint64) bool {
+		d := int64(now) - int64(prev)
+		return d < 0 || float64(d) >= bgBusyRate*poll.Seconds() // d < 0: a process left the tree
+	}
 	a.bgMu.Lock()
 	job.still = time.Now()
 	a.bgMu.Unlock()
@@ -525,8 +535,8 @@ func (a *agent) stuckWatch(job *backgroundJob, stop <-chan struct{}, after, poll
 			return
 		case <-ticker.C:
 		}
-		o, now := progressSignature(files), jobActivity(job.pid)
-		moved := o != out || now.known && (now.cpu != prev.cpu || now.locked && now.lockCPU != prev.lockCPU)
+		o, now := progressSignature(files), readActivity(job.pid)
+		moved := o != out || now.known && (busy(prev.cpu, now.cpu) || now.locked && busy(prev.lockCPU, now.lockCPU))
 		out, prev = o, now
 		a.bgMu.Lock()
 		job.listening = now.listening
@@ -538,7 +548,7 @@ func (a *agent) stuckWatch(job *backgroundJob, stop <-chan struct{}, after, poll
 			case now.stopped && !moved:
 				job.stuck = "one of its processes was stopped (state T, by SIGSTOP or a read from the terminal) and could not go on without a SIGCONT"
 			case time.Since(job.still) >= after:
-				job.stuck = fmt.Sprintf("its processes used no CPU and wrote no output for %s (a deadlock, a prompt for input, or a wait for something that never comes)", humanDuration(after.Milliseconds()))
+				job.stuck = fmt.Sprintf("its processes used almost no CPU (under 1%% of a core) and wrote no output for %s (a deadlock, a prompt for input, a loop polling for something that never comes)", humanDuration(after.Milliseconds()))
 			}
 		}
 		stuck := job.stuck != ""
