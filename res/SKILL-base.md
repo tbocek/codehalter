@@ -9,7 +9,7 @@ Repo you don't already know (first turn here, or the request names files/command
 
 ## Tool choice
 - Declared project task (just build, npm test, make) → run it through `run_command` (`just build`), rather than retyping what the recipe does: the recipe is where the project keeps its flags and env.
-- Reading code → `read_file`, not `sed -n`/`awk NR`/`grep -A` through the shell:
+- To read files use 'read_file' instead of cat, head, tail, or sed. Not `awk NR` or `grep -A` through the shell either:
   - lines 120-179 (what `sed -n '120,179p'` prints): `{"path": "src/cut.rs", "start_line": 120, "end_line": 179}`
   - a whole function or type by name (what `grep -n "fn wire_zoom" -A 40` tries to get): `{"path": "src/ui/window.rs", "symbol": "wire_zoom"}`
   - with line numbers in front (what `awk '{printf "%d|%s\n", NR, $0}'` gives): add `"numbered": true`

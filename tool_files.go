@@ -174,6 +174,23 @@ const (
 const maxReadsPerCall = 8
 
 func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (string, bool) {
+	// The read tools models were trained on: Qwen Code's and Claude Code's (GLM) file_path
+	// with offset and limit; SWE-agent's and OpenHands' editor (DeepSeek, GLM) path with
+	// view_range (its [start, -1] reads on in chunks like an open range). Set on args so
+	// the caller's label sees them too.
+	if args.str("path") == "" && args.str("file_path") != "" {
+		args["path"] = args["file_path"]
+	}
+	if _, ok := args["line"]; !ok {
+		// Qwen Code counts offset from 0, Claude Code from 1: one line earlier and one
+		// more serves both, and the note says which lines came back.
+		if n, ok := args.num("offset"); ok && n >= 0 {
+			args["line"] = float64(max(n, 1))
+			if l, ok := args.num("limit"); ok && l > 0 && n > 0 {
+				args["limit"] = float64(l + 1)
+			}
+		}
+	}
 	path, err := a.resolvePath(sid, args.str("path"))
 	if err != nil {
 		return "error: " + err.Error(), false
@@ -429,6 +446,10 @@ var fileTools = []Tool{
 				continue
 			}
 			ta := toolArgs(t)
+			out, failed := a.readTarget(ctx, sid, ta)
+			if !failed {
+				failedAll = false
+			}
 			what := ta.str("symbol")
 			if what == "" {
 				if n, ok := ta.num("start_line"); ok {
@@ -438,10 +459,6 @@ var fileTools = []Tool{
 				} else {
 					what = "from the top"
 				}
-			}
-			out, failed := a.readTarget(ctx, sid, ta)
-			if !failed {
-				failedAll = false
 			}
 			fmt.Fprintf(&b, "=== read %d of %d: %s %s ===\n%s\n\n", i+1, len(list), ta.str("path"), what, strings.TrimRight(out, "\n"))
 		}

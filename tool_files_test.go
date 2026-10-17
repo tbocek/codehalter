@@ -603,6 +603,19 @@ func TestReadFileStartEndLine(t *testing.T) {
 	if out := read(fmt.Sprintf(`{"reads":[{"path":%q,"start_line":30,"end_line":30}]}`, path)); !strings.Contains(out, "from line 30") || !strings.Contains(out, "L30\n") || strings.Contains(out, "L31\n") {
 		t.Errorf("reads item:\n%s", out)
 	}
+	// Qwen Code's offset counts from 0 (39 is line 40), Claude Code's from 1: both get
+	// lines 40 and 41, served with the line before for the other count.
+	for _, offset := range []int{39, 40} {
+		if out := read(fmt.Sprintf(`{"file_path":%q,"offset":%d,"limit":2}`, path, offset)); !strings.Contains(out, "L40\nL41\n") || strings.Contains(out, "L38\n") || strings.Contains(out, "L43\n") {
+			t.Errorf("file_path, offset %d, limit 2:\n%s", offset, out)
+		}
+	}
+	if out := read(fmt.Sprintf(`{"path":%q,"view_range":[45,-1]}`, path)); !strings.Contains(out, "L45\n") || !strings.Contains(out, "L50\n") || strings.Contains(out, "L44\n") {
+		t.Errorf("view_range to the end:\n%s", out)
+	}
+	if out := read(fmt.Sprintf(`{"reads":[{"file_path":%q,"offset":0,"limit":1}]}`, path)); !strings.Contains(out, "big.txt from line 1") || !strings.Contains(out, "L1\n") || strings.Contains(out, "L2\n") {
+		t.Errorf("reads item with file_path/offset:\n%s", out)
+	}
 }
 
 // Over budget, the project brief may shrink or stay, never grow; elsewhere the
