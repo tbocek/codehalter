@@ -97,14 +97,16 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, expectExit b
 	if !expectExit && renderCmdRe.MatchString(cmdStr) {
 		return nil, "refused: this renders a screen, which takes seconds. Run it with `run_command` instead: only a render through run_command attaches the picture to your view, and only then does the look count. A render in the background finishes unseen."
 	}
-	// A foreground sleep while a job runs is a guessed wait: the job wakes the
-	// model itself, and a running shell cannot be interrupted with the note.
-	if expectExit && isSleepCmd(cmdStr) {
-		if jobs := a.runningBgJobs(sid, nil); jobs != "" {
-			return nil, fmt.Sprintf("refused: do not sleep for a background job. %s still running; the moment it exits codehalter hands you its exit code and last output on its own. "+
-				"Continue with other work, or call `respond` saying you are waiting: the turn is parked, not ended, and continues here when the job reports. "+
-				"For a look at a job before it exits, give `wake_after` when you start it.", jobs)
-		}
+	// Waiting for a job by hand is never needed: the job wakes the model itself when it
+	// exits, and a running shell cannot be interrupted with the note.
+	const dontWait = "the moment a background job exits codehalter hands you its exit code and last output on its own. " +
+		"Continue with other work, or call `respond` saying you are waiting: the turn is parked, not ended, and continues here when the job reports. " +
+		"For a look at a job before it exits, give `wake_after` when you start it."
+	if pat := selfMatchingPattern(cmdStr); pat != "" {
+		return nil, fmt.Sprintf("refused: the pattern %q of `pgrep -f` or `pkill -f` matches this command's own text, because the shell running it carries that text in its command line: a wait on it never ends, and a pkill kills this command. Do not wait for a job by polling: %s", pat, dontWait)
+	}
+	if jobs := a.runningBgJobs(sid, nil); jobs != "" && (expectExit && isSleepCmd(cmdStr) || processPollRe.MatchString(cmdStr)) {
+		return nil, fmt.Sprintf("refused: do not wait for a background job yourself, with a sleep or a polling loop. %s still running; %s", jobs, dontWait)
 	}
 	verb := "Background"
 	if expectExit {

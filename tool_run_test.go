@@ -119,6 +119,50 @@ func TestRunCommandRefusesSleepForBackgroundJob(t *testing.T) {
 	}
 }
 
+// A hand-made wait for a process is refused: a pgrep -f whose pattern is in the command's own
+// text never ends (this one held a /spec round six hours), and while a job runs a polling loop
+// on a process only duplicates the note the job sends when it exits.
+func TestWaitingForProcessesByHandIsRefused(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	try := func(tool func(context.Context, *agent, string, string) (string, bool), cmd string) string {
+		t.Helper()
+		res, _ := tool(context.Background(), h.agent, h.sess.ID, `{"command":`+strconv.Quote(cmd)+`}`)
+		return res
+	}
+
+	for _, cmd := range []string{
+		`while pgrep -f "just test" >/dev/null 2>&1; do sleep 5; done; echo "suite finished"`,
+		`pkill -f cargo; cargo build`,
+	} {
+		for name, tool := range map[string]func(context.Context, *agent, string, string) (string, bool){"run_command": runCmdExecute, "run_background": runBackgroundExecute} {
+			if res := try(tool, cmd); !strings.Contains(res, "matches this command's own text") {
+				t.Errorf("%s %q: %s", name, cmd, res)
+			}
+		}
+	}
+	// -x matches the whole command line, and a bracket (`[z]yx`) keeps the pattern from matching its own text.
+	for _, cmd := range []string{`pgrep -fx 'no-such-process-xyz'; true`, `pgrep -f 'no-such-process-[z]yx'; true`} {
+		if res := try(runCmdExecute, cmd); strings.Contains(res, "refused") {
+			t.Errorf("%q must run: %s", cmd, res)
+		}
+	}
+
+	poll := `while kill -0 99999999 2>/dev/null; do sleep 1; done`
+	if res := try(runCmdExecute, poll); strings.Contains(res, "refused") {
+		t.Errorf("a loop on a process with no job running: %s", res)
+	}
+	h.agent.registerBgJob(&backgroundJob{id: 7, sid: h.sess.ID, cmdStr: "cd rust && just test > /tmp/t.log 2>&1"})
+	for _, tool := range []func(context.Context, *agent, string, string) (string, bool){runCmdExecute, runBackgroundExecute} {
+		if res := try(tool, poll); !strings.Contains(res, "refused") || !strings.Contains(res, "job 7") {
+			t.Errorf("a polling loop with job 7 running: %s", res)
+		}
+	}
+	if res := try(runCmdExecute, `until curl -s -o /dev/null http://127.0.0.1:9/; do sleep 0.01; break; done`); strings.Contains(res, "refused") {
+		t.Errorf("a wait for a server to answer is not a wait for a job: %s", res)
+	}
+}
+
 // A SIGKILL comes back as 137 through pipefail, never as a zero-value 0.
 func TestRunCommandSignalExit(t *testing.T) {
 	h := newTerminalHarness(t)
