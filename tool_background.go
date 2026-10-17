@@ -369,8 +369,9 @@ const bgWakeRetry = 2 * time.Second
 var (
 	bgStuckAfter = 5 * time.Minute
 	bgStuckPoll  = 30 * time.Second
-	// bgBusyRate: CPU ticks a second (100 is a whole core) from which a job counts as busy; 1 is 1%.
-	bgBusyRate = 1.0
+	// bgBusyRate: CPU ticks a second (100 is a whole core) from which a job counts as busy; 5 is 5%.
+	// The slowest poller measured (`until [ -f F ]; do sleep 0.2`) uses 1%; a build or compile 50 to 100%.
+	bgBusyRate = 5.0
 	// readActivity is jobActivity, so a test can script what /proc would say.
 	readActivity = jobActivity
 )
@@ -550,7 +551,7 @@ func (a *agent) stuckWatch(job *backgroundJob, stop <-chan struct{}, after, poll
 			case now.stopped && !moved:
 				job.stuck = "one of its processes was stopped (state T, by SIGSTOP or a read from the terminal) and could not go on without a SIGCONT"
 			case time.Since(job.still) >= after:
-				job.stuck = fmt.Sprintf("its processes used almost no CPU (under 1%% of a core) and wrote no output for %s (a deadlock, a prompt for input, a loop polling for something that never comes)", humanDuration(after.Milliseconds()))
+				job.stuck = fmt.Sprintf("its processes used almost no CPU (under 5%% of a core) and wrote no output for %s (a deadlock, a prompt for input, a loop polling for something that never comes)", humanDuration(after.Milliseconds()))
 			}
 		}
 		stuck := job.stuck != ""
