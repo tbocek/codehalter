@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -481,5 +482,68 @@ func TestStuckWatchCountsOnlyRealCPU(t *testing.T) {
 				t.Errorf("reason = %q", reason)
 			}
 		})
+	}
+}
+
+// A server is what the model starts with run_server: it comes back once its port
+// answers, nothing waits for it, it is never stopped as idle, and run_server stops it.
+func TestRunServer(t *testing.T) {
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("no python3 for the server")
+	}
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	oldStuck, oldPoll := bgStuckAfter, bgStuckPoll
+	bgStuckAfter, bgStuckPoll = 200*time.Millisecond, 50*time.Millisecond
+	defer func() { bgStuckAfter, bgStuckPoll = oldStuck, oldPoll }()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := l.Addr().(*net.TCPAddr).Port
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args string) string {
+		t.Helper()
+		res, _ := runServerExecute(context.Background(), h.agent, h.sess.ID, args)
+		return res
+	}
+
+	before := time.Now().Add(-time.Second)
+	start := fmt.Sprintf(`{"command":"python3 -m http.server %d --bind 127.0.0.1","port":%d}`, port, port)
+	res := run(start)
+	var id int
+	if _, err := fmt.Sscanf(res, "server job %d running", &id); err != nil || !strings.Contains(res, fmt.Sprintf("accepting connections on port %d", port)) {
+		t.Fatalf("start: %s", res)
+	}
+	if res := run(start); !strings.Contains(res, "refused: something already accepts connections") {
+		t.Errorf("a second server on a taken port: %s", res)
+	}
+	time.Sleep(600 * time.Millisecond) // three idle limits
+	h.agent.bgMu.Lock()
+	job := h.agent.bgJobs[id]
+	h.agent.bgMu.Unlock()
+	if job == nil || job.stuck != "" {
+		t.Fatalf("the idle server was stopped: %+v", job)
+	}
+	if jobs := h.agent.parkableJobs(h.sess.ID, before); jobs != "" {
+		t.Errorf("a step would wait for the server: %s", jobs)
+	}
+
+	if res := run(`{"stop":999}`); !strings.Contains(res, fmt.Sprintf("job %d", id)) {
+		t.Errorf("stopping an unknown id names no running server: %s", res)
+	}
+	if res := run(fmt.Sprintf(`{"stop":%d}`, id)); !strings.Contains(res, "stopped") {
+		t.Fatalf("stop: %s", res)
+	}
+	for deadline := time.Now().Add(5 * time.Second); portOpen(port); time.Sleep(50 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the stopped server still answers")
+		}
+	}
+
+	if res := run(`{"command":"echo cannot bind; exit 3"}`); !strings.Contains(res, "exited immediately (exit 3)") || !strings.Contains(res, "cannot bind") {
+		t.Errorf("a server that dies at start: %s", res)
 	}
 }

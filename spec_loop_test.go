@@ -75,6 +75,23 @@ func TestSpecDecideThirdAttemptOnlyWhenTheFailureMoved(t *testing.T) {
 	if _, block, _, _ := specDecide(cfg, "F0.2", red, second); !block {
 		t.Error("a third failure did not block")
 	}
+
+	// Another test failing is a failure that moved; the same test again, rebuilt and
+	// slower, is the same failure.
+	fail := func(test, hash, secs string) specRoundResult {
+		return specRoundResult{Covered: true, TestTail: "test result: FAILED. 0 passed; 1 failed; finished in " + secs + "s\n" +
+			"error: test failed, to rerun pass `--test " + test + "`\nCaused by: `target/debug/deps/" + test + "-" + hash + "` (signal: 6, SIGABRT)"}
+	}
+	cfg = &specConfig{}
+	_, _, _, first = specDecide(cfg, "F0.3", fail("sec05_cut_1_zoom_fit", "35c568ab10846a43", "0.26"), "")
+	if _, block, _, _ := specDecide(cfg, "F0.3", fail("sec05_cut_2_zoom_fit", "9218b7d91df3f684", "0.31"), first); block {
+		t.Error("a different test failing blocked at the second attempt")
+	}
+	cfg = &specConfig{}
+	_, _, _, first = specDecide(cfg, "F0.4", fail("lane_preview_widgets", "35c568ab10846a43", "0.26"), "")
+	if _, block, _, _ := specDecide(cfg, "F0.4", fail("lane_preview_widgets", "aa01c5f8e9d2b7c4", "1.92"), first); !block {
+		t.Error("the same test failing twice, rebuilt, did not block")
+	}
 }
 
 func TestSpecPaths(t *testing.T) {

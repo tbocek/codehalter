@@ -667,7 +667,7 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse, changed bool) boo
 	// same call again repeats them.
 	// The length is the answer's, without run_command's own exit line.
 	answer := strings.TrimSpace(strings.TrimPrefix(folded, "exit #"))
-	if name := tc.Function.Name; len(answer) >= repeatMinOutput && name != "edit_file" && name != "write_file" && name != "run_background" {
+	if name := tc.Function.Name; len(answer) >= repeatMinOutput && name != "edit_file" && name != "write_file" && name != "run_background" && name != "run_server" {
 		repeated = repeated || mem.seen[h]
 		if rt.stuck[h] {
 			repeated, rt.hitStuck = true, true
@@ -1109,7 +1109,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				switch name := tc.Function.Name; {
 				case isReadCall(name, tc.Function.Arguments):
 					readStreak++
-				case name == "edit_file", name == "write_file", name == "run_command", name == "run_background":
+				case name == "edit_file", name == "write_file", name == "run_command", name == "run_background", name == "run_server":
 					readStreak, readNudged = 0, false
 				}
 			}

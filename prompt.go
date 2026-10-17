@@ -688,7 +688,7 @@ func failureDigest(uses []ToolUse) string {
 		case u.Name == "run_command" && u.Changed:
 			edits++
 			runs++
-		case u.Name == "run_command", u.Name == "run_background":
+		case u.Name == "run_command", u.Name == "run_background", u.Name == "run_server":
 			runs++
 		}
 		// A short answer ("exit 0") says which call only by the call itself.

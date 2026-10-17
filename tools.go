@@ -122,7 +122,7 @@ func (r *toolRegistry) seedLocked() {
 		return
 	}
 	r.tools = make(map[string]Tool)
-	// run_command/run_background come from discovery and MCP tools from the
+	// run_command/run_background/run_server come from discovery and MCP tools from the
 	// reconciler, both through add.
 	builtin := slices.Concat(fileTools, webTools, []Tool{
 		askUserTool, submitPlanTool, respondTool,

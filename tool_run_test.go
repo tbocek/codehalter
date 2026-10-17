@@ -241,9 +241,9 @@ func TestRunCommandHandsOverAfterWait(t *testing.T) {
 	}
 }
 
-// A job is stopped only when nothing moves: no CPU, no output, no listening socket.
-// A command writing into a redirect file, a silent one busy computing and a server
-// that only listens are left to finish.
+// A job is stopped only when nothing moves: no CPU, no output. A command writing into a
+// redirect file and a silent one busy computing are left to finish; one that only listens,
+// as a test with a fake server that hangs does, is stopped like any other.
 func TestBackgroundJobStoppedOnlyWhenStuck(t *testing.T) {
 	h := newTerminalHarness(t)
 	defer h.agent.shutdownBackground()
@@ -309,11 +309,11 @@ func TestBackgroundJobStoppedOnlyWhenStuck(t *testing.T) {
 	}
 
 	if _, err := exec.LookPath("python3"); err != nil {
-		t.Skip("no python3 for the listening server")
+		t.Skip("no python3 for the listening job")
 	}
-	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"python3 -c \"import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(1.5)\""}`)
-	if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
-		t.Errorf("an idle server, which only listens, was stopped: %q", n.full)
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"python3 -c \"import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(30)\""}`)
+	if n := waitNote(); !strings.Contains(n.full, "was stopped as stuck") {
+		t.Errorf("a hung job that listens was left running: %q", n.full)
 	}
 }
 

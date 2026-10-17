@@ -194,6 +194,11 @@ type specRoundResult struct {
 // specDecide counts the attempt in cfg.Attempts, so a cancelled and resumed /spec gives no fresh budget.
 // prev is what the item's last attempt failed; fails is what this one failed.
 // A second failure of another kind earns one more attempt: the item moved.
+// testNoiseRe is what differs between two runs of the same failure: counts, timings,
+// pids, and the hash cargo puts in a test binary's name. A digit inside a name stays
+// (sec05_cut_1 and sec05_cut_2 are different tests).
+var testNoiseRe = regexp.MustCompile(`[0-9a-f]{12,}|\b\d+(?:\.\d+)?`)
+
 func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (done, block bool, reason, fails string) {
 	if r.Question != "" {
 		return false, true, "the planner asked a question instead of guessing", ""
@@ -266,7 +271,12 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 		add("noprogress", "the refactoring made no measured progress ("+r.Debt+"): one of the numbers must go down and none up")
 	}
 	if !r.TestsPass {
-		add("tests", "the test command did not pass. The end of its output:\n\n```\n"+strings.TrimSpace(r.TestTail)+"\n```")
+		// The kind carries the run's last lines, numbers and build hashes blanked: another
+		// test failing is progress, not the same failure twice (two rounds once failed on
+		// two different widget tests and the item was handed to the user as stuck).
+		lines := strings.Split(strings.TrimSpace(r.TestTail), "\n")
+		last := strings.Join(lines[max(0, len(lines)-12):], "\n")
+		add("tests:"+testNoiseRe.ReplaceAllString(last, "#"), "the test command did not pass. The end of its output:\n\n```\n"+strings.TrimSpace(r.TestTail)+"\n```")
 	}
 	if len(why) == 0 {
 		add("unfinished", "the round did not finish the item")
