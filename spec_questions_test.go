@@ -100,6 +100,12 @@ func TestSpecQuestionsFile(t *testing.T) {
 	if qs := idx.questions["F0.1"]; len(qs) != 3 || qs[2].Answer != "" || len(idx.questions["F9.9"]) != 0 || stuck.QuoteAt != "01.md:3" {
 		t.Errorf("stuck question parsed as %+v (F9.9: %v), quote at %q", qs, idx.questions["F9.9"], stuck.QuoteAt)
 	}
+
+	// A long test run keeps the causes at the start and the failure at the end.
+	long := "the test command did not pass. The end of its output:\n" + strings.Repeat("test passes ... ok\n", 300) + "panicked at tests/zoom_fit.rs:78:5"
+	if q := specStuckQuestion(idx, "spec", "F0.1", long).Stopped; len(q) > specStuckStopped+10 || !strings.HasPrefix(q, "the test command did not pass") || !strings.HasSuffix(q, "panicked at tests/zoom_fit.rs:78:5") {
+		t.Errorf("a long failure quoted as %d bytes: %q … %q", len(q), q[:60], q[len(q)-60:])
+	}
 }
 
 // A question says which codehalter asked it, so one a since-fixed bug caused can be told apart.

@@ -232,15 +232,19 @@ func appendSpecQuestion(specAbs, title string, q specQuestion) error {
 	return writeSpecQuestionFile(path, head, append(texts, b.String()))
 }
 
-// specStuckStopped caps what a stuck item's question quotes of its failure: the
-// end of a test run is enough to see why, and the file is read by a person.
+// specStuckStopped caps what a stuck item's question quotes of its failure, read by a
+// person: the start names the causes, the end of a test run says why it failed. Cut
+// from the start only, a quote once ended in passing tests, short of the failure.
 const specStuckStopped = 2000
 
 // specStuckQuestion words a stuck item's question in code: only the user can tell
 // whether its cause is gone.
 func specStuckQuestion(idx *specIndex, specDir, id, reason string) specQuestion {
 	q := specQuestion{ID: id, Question: "This item did not pass its attempts. How should the rounds go on?",
-		Stopped: clipUTF8(strings.TrimSpace(reason), specStuckStopped)}
+		Stopped: strings.TrimSpace(reason)}
+	if len(q.Stopped) > specStuckStopped {
+		q.Stopped = clipUTF8(q.Stopped, specStuckStopped/4) + "\n…\n" + tailUTF8(q.Stopped, specStuckStopped*3/4)
+	}
 	file := specDir + "/"
 	if it := idx.items[id]; it != nil {
 		q.Quote = strings.TrimSpace(strings.TrimLeft(idx.docs[it.Doc].lines[it.Line], "#"))
