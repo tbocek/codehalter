@@ -134,6 +134,7 @@ func TestWaitingForProcessesByHandIsRefused(t *testing.T) {
 	for _, cmd := range []string{
 		`while pgrep -f "just test" >/dev/null 2>&1; do sleep 5; done; echo "suite finished"`,
 		`pkill -f cargo; cargo build`,
+		`pgrep -a -f "just test" | head -3`,
 	} {
 		for name, tool := range map[string]func(context.Context, *agent, string, string) (string, bool){"run_command": runCmdExecute, "run_background": runBackgroundExecute} {
 			if res := try(tool, cmd); !strings.Contains(res, "matches this command's own text") {

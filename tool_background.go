@@ -115,7 +115,14 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, kind jobKind
 	const dontWait = "the moment a background job exits codehalter hands you its exit code and last output on its own. " +
 		"Continue with other work, or call `respond` saying you are waiting: the turn is parked, not ended, and continues here when the job reports. " +
 		"For a look at a job before it exits, give `wake_after` when you start it."
-	if pat := selfMatchingPattern(cmdStr); pat != "" {
+	// A pgrep/pkill -f pattern found in the command's own text matches the shell running it:
+	// a wait on it never ends, and a pkill kills the command. -x matches the whole line only.
+	for _, m := range pgrepRe.FindAllStringSubmatch(cmdStr, -1) {
+		pat := m[2] + m[3] + m[4]
+		re, err := regexp.Compile(pat)
+		if err != nil || !strings.Contains(m[1], "f") || strings.Contains(m[1], "x") || !re.MatchString(cmdStr) {
+			continue
+		}
 		return nil, fmt.Sprintf("refused: the pattern %q of `pgrep -f` or `pkill -f` matches this command's own text, because the shell running it carries that text in its command line: a wait on it never ends, a one-off check finds this command itself, and a pkill kills it. To look once whether something runs, write the pattern so it cannot match its own text: `pgrep -f \"[c]argo test\"`. Do not wait for a job by polling: %s", pat, dontWait)
 	}
 	ending := func(j *backgroundJob) bool { return j.kind != jobServer }
@@ -436,24 +443,21 @@ func runServerExecute(ctx context.Context, a *agent, sid string, rawArgs string)
 	if hasPort {
 		wait = bgServerReady
 	}
-	deadline := time.After(wait)
-	ready := !hasPort
-	for !ready {
+	// Until the port answers, or for the grace that catches a server dying at start.
+	deadline, poll := time.After(wait), time.NewTicker(200*time.Millisecond)
+	defer poll.Stop()
+	ready := false
+wait:
+	for {
 		select {
 		case res := <-job.exited:
 			return a.exitedAtStart(ctx, sid, job, res), false
 		case <-deadline:
-		case <-time.After(200 * time.Millisecond):
-			ready = portOpen(port)
-			continue
-		}
-		break
-	}
-	if !hasPort {
-		select {
-		case res := <-job.exited:
-			return a.exitedAtStart(ctx, sid, job, res), false
-		case <-deadline:
+			break wait
+		case <-poll.C:
+			if ready = hasPort && portOpen(port); ready {
+				break wait
+			}
 		}
 	}
 	a.handOver(job)

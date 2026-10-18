@@ -699,7 +699,40 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 	if out, err := exec.Command(rt, "ps", "-a", "--filter", "label=devcontainer.local_folder="+workspace,
 		"--format", "{{.ID}} {{.State}}").Output(); err == nil {
 		if f := strings.Fields(string(out)); len(f) >= 2 {
-			return runInEditorContainer(rt, f[0], f[1] == "running", cfg, inner, rebuild), true
+			// It is the editor's, so it is never rebuilt or stopped here.
+			id, running := f[0], f[1] == "running"
+			if rebuild {
+				fmt.Fprintf(os.Stderr, "Your editor's container %s runs this project, and --rebuild would build a second one "+
+					"beside it. Rebuild it from the editor, or remove it (%s rm -f %s) and run --rebuild again.\n", id, rt, id)
+				return 1, true
+			}
+			bold, dim, reset := ansiBold, ansiDim, ansiReset
+			if !stdoutStyled() {
+				bold, dim, reset = "", "", ""
+			}
+			fmt.Printf("%scodehalter cli%s\n%s  using the container your editor started for this project: %s%s\n", bold, reset, dim, id, reset)
+			if !running {
+				start := exec.Command(rt, "start", id)
+				start.Stdout, start.Stderr = nil, os.Stderr
+				if err := start.Run(); err != nil {
+					fmt.Fprintf(os.Stderr, "%s start %s failed: %v\n", rt, id, err)
+					return 1, true
+				}
+			}
+			if err := resolveContainerEnv(cfg.RemoteEnv, func() ([]byte, error) {
+				return exec.Command(rt, "exec", id, "env").Output()
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "reading the container's environment, which remoteEnv is written in terms of: %v\n", err)
+				return 1, true
+			}
+			args := []string{"exec", "-i"}
+			if stdinIsTTY() {
+				args = append(args, "-t")
+			}
+			args = append(append(append(args, execOpts(cfg)...), id, "codehalter", "--cli", "--cwd", cfg.WorkspaceFolder), inner...)
+			cmd := exec.Command(rt, args...)
+			cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+			return runCLIIn(cmd, cfg), true
 		}
 	}
 
@@ -817,43 +850,6 @@ func runCLIIn(cmd *exec.Cmd, cfg *devcontainerConfig) int {
 		"(see the Dockerfiles codehalter scaffolds) and re-run with --rebuild.\n",
 		filepath.Join(cfg.dir, "Dockerfile"))
 	return 127
-}
-
-// runInEditorContainer runs the CLI in the container an editor started for this project,
-// starting it first when it is stopped. It is the editor's, so it is never rebuilt or stopped here.
-func runInEditorContainer(rt, id string, running bool, cfg *devcontainerConfig, inner []string, rebuild bool) int {
-	if rebuild {
-		fmt.Fprintf(os.Stderr, "Your editor's container %s runs this project, and --rebuild would build a second one "+
-			"beside it. Rebuild it from the editor, or remove it (%s rm -f %s) and run --rebuild again.\n", id, rt, id)
-		return 1
-	}
-	bold, dim, reset := ansiBold, ansiDim, ansiReset
-	if !stdoutStyled() {
-		bold, dim, reset = "", "", ""
-	}
-	fmt.Printf("%scodehalter cli%s\n%s  using the container your editor started for this project: %s%s\n", bold, reset, dim, id, reset)
-	if !running {
-		start := exec.Command(rt, "start", id)
-		start.Stdout, start.Stderr = nil, os.Stderr
-		if err := start.Run(); err != nil {
-			fmt.Fprintf(os.Stderr, "%s start %s failed: %v\n", rt, id, err)
-			return 1
-		}
-	}
-	if err := resolveContainerEnv(cfg.RemoteEnv, func() ([]byte, error) {
-		return exec.Command(rt, "exec", id, "env").Output()
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "reading the container's environment, which remoteEnv is written in terms of: %v\n", err)
-		return 1
-	}
-	args := []string{"exec", "-i"}
-	if stdinIsTTY() {
-		args = append(args, "-t")
-	}
-	args = append(append(append(args, execOpts(cfg)...), id, "codehalter", "--cli", "--cwd", cfg.WorkspaceFolder), inner...)
-	cmd := exec.Command(rt, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return runCLIIn(cmd, cfg)
 }
 
 // read runs `env` in the started container and is only called when a value needs it.

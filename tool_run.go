@@ -111,21 +111,9 @@ func isSleepCmd(cmd string) bool {
 // hand-made wait: `while pgrep -f x; do sleep 5; done`, `until ! kill -0 $pid; ...`.
 var processPollRe = regexp.MustCompile(`\b(?:while|until)\b[^;\n]*?(?:\bpgrep\b|\bpidof\b|\bps\b|\bkill\s+-0\b|/proc/)`)
 
-// pgrepFRe finds `pgrep -f PATTERN` and `pkill -f PATTERN`, the pattern quoted or bare.
-var pgrepFRe = regexp.MustCompile(`\b(?:pgrep|pkill)\s+(-\w*f\w*)\s+(?:"([^"]*)"|'([^']*)'|(\S+))`)
-
-// selfMatchingPattern is the pgrep/pkill -f pattern that matches cmd's own text, or "".
-// The shell running cmd carries that text in its command line, so it matches itself: a
-// wait on it never ends, and a pkill kills the command. -x matches the whole line only.
-func selfMatchingPattern(cmd string) string {
-	for _, m := range pgrepFRe.FindAllStringSubmatch(cmd, -1) {
-		pat := m[2] + m[3] + m[4]
-		if re, err := regexp.Compile(pat); err == nil && !strings.Contains(m[1], "x") && re.MatchString(cmd) {
-			return pat
-		}
-	}
-	return ""
-}
+// pgrepRe finds `pgrep FLAGS PATTERN` and `pkill FLAGS PATTERN`: group 1 the flags
+// (`-f`, `-af`, `-a -f`), then the pattern quoted or bare.
+var pgrepRe = regexp.MustCompile(`\b(?:pgrep|pkill)((?:\s+-\w+)+)\s+(?:"([^"]*)"|'([^']*)'|([^\s;|&)]+))`)
 
 // shellSegments splits a command line at ; && || & and newlines outside quotes,
 // and at | too when pipes is set; without it a pipeline stays one command.
