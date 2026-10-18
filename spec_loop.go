@@ -987,7 +987,14 @@ func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) boo
 	}
 	r.sess.rt.mu.Unlock()
 	slices.SortStableFunc(evs, func(x, y event) int { return x.at.Compare(y.at) })
-	if len(evs) == 0 || !evs[len(evs)-1].green {
+	// Why a round's own run did not count, said once per round: one green run was run again
+	// though everything checked out by hand.
+	if len(evs) == 0 {
+		slog.Info("spec: test run not reused: no matching run this round", "cmd", cmd, "jobRuns", len(r.sess.rt.jobRuns))
+		return false
+	}
+	if last := evs[len(evs)-1]; !last.green {
+		slog.Info("spec: test run not reused: the last matching event is not a green run", "at", last.at, "since", last.since, "events", len(evs))
 		return false
 	}
 	// A write after the last run undoes it. Only what git keeps counts: a test run writes
@@ -996,6 +1003,7 @@ func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) boo
 	ranOn := evs[len(evs)-1].since
 	out, err := specGit(context.Background(), r.outAbs, "-c", "core.quotePath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard")
 	if err != nil {
+		slog.Info("spec: test run not reused: git ls-files failed", "err", err, "out", truncate(out, 200))
 		return false // without git, run the suite rather than guess
 	}
 	for _, rel := range strings.Split(out, "\x00") {
@@ -1004,9 +1012,11 @@ func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) boo
 		}
 		// A file deleted since counts as a change too.
 		if info, err := os.Stat(filepath.Join(r.outAbs, rel)); err != nil || info.ModTime().After(ranOn) {
+			slog.Info("spec: test run not reused: a file changed after the run started", "file", rel, "ranOn", ranOn, "statErr", err)
 			return false
 		}
 	}
+	slog.Info("spec: test run reused", "ranOn", ranOn)
 	return true
 }
 
