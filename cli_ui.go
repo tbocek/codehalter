@@ -68,7 +68,6 @@ type cliUI struct {
 
 	plan []PlanEntry
 
-	mode  string
 	used  int
 	size  int
 	busy  bool
@@ -227,9 +226,6 @@ func (u *cliUI) planLines() []string {
 
 func (u *cliUI) statusLine() string {
 	parts := []string{elapsed(time.Since(u.start))}
-	if u.mode != "" {
-		parts = append(parts, strings.ToLower(u.mode))
-	}
 	if u.size > 0 {
 		parts = append(parts, fmt.Sprintf("%s/%s ctx", short(u.used), short(u.size)))
 	} else if u.used > 0 {
@@ -491,13 +487,6 @@ func (u *cliUI) Usage(used, size int) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.used, u.size = used, size
-	u.drawLive()
-}
-
-func (u *cliUI) Mode(mode string) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.mode = mode
 	u.drawLive()
 }
 

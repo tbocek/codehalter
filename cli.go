@@ -121,7 +121,7 @@ func runCLI(argv []string) int {
 	agentIn, clientOut := io.Pipe()
 	clientIn, agentOut := io.Pipe()
 
-	a := &agent{sessions: make(map[string]*Session), mode: "Interactive", standalone: true}
+	a := &agent{sessions: make(map[string]*Session), standalone: true}
 	go killOrphanedJobs()
 	acp := NewAgentSideConnection(a, agentOut, agentIn)
 	a.conn = acp
@@ -192,8 +192,6 @@ type cliClient struct {
 	// sid is written by the input goroutine and read by the signal goroutine.
 	sidMu sync.Mutex
 	sid   string
-
-	modes []string
 
 	cmdMu    sync.Mutex
 	commands []availableCommand
@@ -284,7 +282,7 @@ func (c *cliClient) startSession() error {
 	if res.SessionId == "" {
 		return errors.New("session/new returned no session id")
 	}
-	c.adopt(res.SessionId, res.Modes)
+	c.adopt(res.SessionId)
 	return nil
 }
 
@@ -297,7 +295,7 @@ func (c *cliClient) loadSession(id string) error {
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return fmt.Errorf("session/load returned nonsense: %w", err)
 	}
-	c.adopt(id, res.Modes)
+	c.adopt(id)
 	return nil
 }
 
@@ -315,15 +313,8 @@ func (c *cliClient) storedSessions() ([]SessionInfo, error) {
 	return list.Sessions, nil
 }
 
-func (c *cliClient) adopt(sid string, modes *SessionModeState) {
+func (c *cliClient) adopt(sid string) {
 	c.setSessionID(sid)
-	c.modes = nil
-	if modes != nil {
-		for _, m := range modes.AvailableModes {
-			c.modes = append(c.modes, m.Id)
-		}
-		c.ui.Mode(modes.CurrentModeId)
-	}
 	c.ui.Usage(0, 0)
 }
 
@@ -408,8 +399,6 @@ func (c *cliClient) command(text string) (handled, quit bool) {
 		return true, true
 	case "/help":
 		c.help()
-	case "/mode":
-		c.setMode(rest)
 	case "/sessions":
 		c.printSessions()
 	case "/new":
@@ -428,7 +417,6 @@ func (c *cliClient) help() {
 	c.ui.Note(ansiBold, "\nclient commands")
 	for _, l := range []string{
 		"  /help              this list",
-		"  /mode [name]       show or switch the session mode",
 		"  /sessions          stored sessions for this directory",
 		"  /new               start a fresh session here",
 		"  /resume [id]       switch to a stored session, or pick one from a list",
@@ -447,25 +435,6 @@ func (c *cliClient) help() {
 	for _, cmd := range cmds {
 		c.ui.Note("", fmt.Sprintf("  /%-17s %s", cmd.Name, cmd.Description))
 	}
-}
-
-func (c *cliClient) setMode(mode string) {
-	if mode == "" {
-		c.ui.Note(ansiDim, "  modes: "+strings.Join(c.modes, ", "))
-		return
-	}
-	for _, m := range c.modes {
-		if strings.EqualFold(m, mode) {
-			if _, err := c.conn.request("session/set_mode", SetSessionModeRequest{SessionId: c.sessionID(), ModeId: m}); err != nil {
-				c.ui.Note(ansiRed, "  set_mode: "+err.Error())
-				return
-			}
-			c.ui.Mode(m)
-			c.ui.Note(ansiDim, "  mode "+m)
-			return
-		}
-	}
-	c.ui.Note(ansiRed, "  no such mode: "+mode+" (have: "+strings.Join(c.modes, ", ")+")")
 }
 
 func (c *cliClient) printSessions() {
@@ -638,15 +607,6 @@ func (c *cliClient) sessionUpdate(params json.RawMessage) {
 		}
 		c.ui.Usage(u.Used, u.Size)
 
-	case "current_mode_update":
-		var m struct {
-			CurrentModeId string `json:"currentModeId"`
-		}
-		if json.Unmarshal(p.Update, &m) != nil {
-			return
-		}
-		c.ui.Mode(m.CurrentModeId)
-
 	case "available_commands_update":
 		var a availableCommandsUpdate
 		if json.Unmarshal(p.Update, &a) != nil {
@@ -775,6 +735,12 @@ func (c *cliClient) askChoiceOrText(question string, labels []string, allowText 
 		line, err := c.in.ReadString('\n')
 		ans := strings.TrimSpace(line)
 		c.ui.Submitted(ans)
+		// Run from a script (-p, no terminal) whose input has run out, nobody can answer:
+		// the first option, said aloud, rather than a dismissal that ends the work.
+		if err != nil && ans == "" && !c.interactive && len(labels) > 0 {
+			c.ui.Note(ansiDim, "  no one to answer (input ended): took 1) "+labels[0])
+			return 0, ""
+		}
 		if err != nil || ans == "" {
 			return -1, ""
 		}

@@ -44,8 +44,8 @@ var defaultSpecIDPatterns = []string{
 	`\btool:[a-z][a-z0-9_]*\b`,
 }
 
-// defaultSpecOpenMarkers stop the loop unless accepted: under autopilot the model would
-// otherwise settle each open decision by whichever reading it happened to take.
+// defaultSpecOpenMarkers stop the loop unless accepted: the model would otherwise settle
+// each open decision by whichever reading it happened to take.
 var defaultSpecOpenMarkers = []string{"REVIEW", "TBD"}
 
 // defaultSpecMaxBlocked: items blocked back to back are one systemic problem, not several.
@@ -1514,7 +1514,7 @@ func renderSpecStatus(cfg *specConfig, idx *specIndex, testFiles int, testCmd st
 		b.WriteString("\nNothing left: every id is covered or waits on a question.\n")
 	}
 	if open := specOpenQuestions(idx); len(open) > 0 {
-		fmt.Fprintf(&b, "\nWaiting on your answer in `%s/%s` (write it after **Answer:**, then run /spec):\n", cfg.SpecDir, specQuestionsFile)
+		fmt.Fprintf(&b, "\nWaiting on your answer in `%s/%s` (the next /spec asks them, or write the answer after **Answer:**):\n", cfg.SpecDir, specQuestionsFile)
 		for _, q := range open {
 			fmt.Fprintf(&b, "- **%s**: %s%s\n", q.ID, q.Question, specStaleNote(q))
 		}

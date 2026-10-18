@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -282,5 +283,17 @@ func TestElicitationActionsMapToOutcomes(t *testing.T) {
 				t.Fatal("the permission request did not return")
 			}
 		})
+	}
+}
+
+// A running /spec loop has nobody to answer: ask_user is turned to the planner's question path.
+func TestAskUserDuringSpecIsParked(t *testing.T) {
+	a, s := newTestAgent(t)
+	s.setSpecFence(filepath.Join(s.Cwd, "spec"))
+	var tc toolCall
+	tc.Function.Name = "ask_user"
+	tc.Function.Arguments = `{"question":"Which store?","options":["SQLite","JSON"]}`
+	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !strings.Contains(tu.Output, "refused: during /spec") || !strings.Contains(tu.Output, "QUESTIONS.md") {
+		t.Errorf("ask_user during /spec: %q", tu.Output)
 	}
 }

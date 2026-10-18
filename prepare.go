@@ -200,10 +200,8 @@ func (a *agent) drainFixes(ctx context.Context, sid string, fixes []fixProblem) 
 const minSlotTokens = 32 * 1024
 
 // ensureLLM blocks until some [[llm]] answers and llm[0] has minSlotTokens per slot. The Retry
-// card has no Abort (codehalter cannot work without an LLM); autopilot stops after 3 tries.
+// card has no Abort (codehalter cannot work without an LLM).
 func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
-	auto := a.isAutopilot()
-	const autoCap = 3
 	ready := func() bool {
 		return a.hasReachableLLM() && a.mainSlotTokens.Load() >= minSlotTokens
 	}
@@ -236,9 +234,6 @@ func (a *agent) ensureLLM(ctx context.Context, sess *Session, sid string) {
 		stopBeat()
 		sess.llmHash = currentHash
 		if ready() {
-			return
-		}
-		if auto && attempt >= autoCap-1 {
 			return
 		}
 		var msg string

@@ -213,7 +213,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		}
 
 		// A /spec question is parked in QUESTIONS.md, and only once the spec alone can
-		// answer it: autopilot would settle it itself, and a chat answer is lost to later rounds.
+		// answer it: a chat answer is lost to later rounds.
 		if fence := sess.specFence(); fence != "" && !plan.Clear {
 			q, wrong := specQuestionFrom(plan, fence)
 			if wrong != "" {
@@ -247,11 +247,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		a.say(ctx, sid, question)
 
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
-		choice := plan.Choices[0]
-		var askErr error
-		if !a.autoAnswer(ctx, sid, choice) {
-			choice, askErr = a.askChoice(ctx, sid, tcId, question, plan.Choices)
-		}
+		choice, askErr := a.askChoice(ctx, sid, tcId, question, plan.Choices)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
 		// A new user message, never an edit: the planner's stored reply is in the server's cache.

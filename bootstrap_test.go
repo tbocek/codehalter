@@ -178,7 +178,7 @@ func TestEnsureSettingsGitignored(t *testing.T) {
 	}
 }
 
-// Autopilot answers the card with its first option, ignoring .codehalter/.
+// The user picks the card's first option, ignoring .codehalter/.
 func TestEnsureGitignore(t *testing.T) {
 	for _, c := range []struct {
 		name      string
@@ -198,7 +198,7 @@ func TestEnsureGitignore(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			a, s := newTestAgent(t)
-			a.mode = "Autopilot"
+			answerFirstOption(t, a)
 			if c.git {
 				if err := os.Mkdir(filepath.Join(s.Cwd, ".git"), 0o755); err != nil {
 					t.Fatal(err)

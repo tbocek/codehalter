@@ -54,6 +54,35 @@ func elicitingAgent(t *testing.T) (*agent, *Session, *bufio.Reader, *os.File) {
 	return a, s, bufio.NewReader(peerR), peerW
 }
 
+// answerFirstOption stands in for a user who picks every card's first option.
+func answerFirstOption(t *testing.T, a *agent) {
+	t.Helper()
+	agentW, agentR, peerW, peerR := pipePair(t)
+	a.conn = NewAgentSideConnection(a, agentW, agentR)
+	br := bufio.NewReader(peerR)
+	go func() {
+		for {
+			line, err := br.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+				Params struct {
+					Options []struct {
+						OptionId string `json:"optionId"`
+					} `json:"options"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(line, &req) != nil || req.Method != "session/request_permission" || len(req.Params.Options) == 0 {
+				continue
+			}
+			fmt.Fprintf(peerW, `{"jsonrpc":"2.0","id":%s,"result":{"outcome":{"outcome":"selected","optionId":%q}}}`+"\n", req.ID, req.Params.Options[0].OptionId)
+		}
+	}()
+}
+
 // codehalter runs no processes of its own, so this stands in for the editor: it
 // serves terminal/* with os/exec and records the wire traffic.
 type terminalHarness struct {

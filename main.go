@@ -61,7 +61,6 @@ type agent struct {
 	emptyProject bool
 	// indexDone is the latest session's startup; read it through startupDone.
 	indexDone chan struct{}
-	mode      string // "Interactive" | "Autopilot"
 	// asking counts questions waiting on the user (a card or a form): a prompt
 	// during startup is refused only while startup asks, and waits otherwise.
 	asking atomic.Int32
@@ -143,7 +142,7 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	a := &agent{sessions: make(map[string]*Session), mode: "Interactive"}
+	a := &agent{sessions: make(map[string]*Session)}
 	go killOrphanedJobs()
 	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin)
 	a.conn = conn
@@ -240,7 +239,7 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 	}
 	a.startIndexing(s.ID, cwd)
 	slog.Debug("NewSession: returning", "sid", s.ID)
-	return NewSessionResponse{SessionId: s.ID, Modes: a.sessionModes()}, nil
+	return NewSessionResponse{SessionId: s.ID}, nil
 }
 
 func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
@@ -257,7 +256,7 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 		return LoadSessionResponse{}, err
 	}
 	a.startIndexing(s.ID, cwd)
-	return LoadSessionResponse{Modes: a.sessionModes()}, nil
+	return LoadSessionResponse{}, nil
 }
 
 func (a *agent) ListSessions(_ context.Context, req ListSessionsRequest) (ListSessionsResponse, error) {
@@ -269,22 +268,6 @@ func (a *agent) ListSessions(_ context.Context, req ListSessionsRequest) (ListSe
 		sessions = []SessionInfo{}
 	}
 	return ListSessionsResponse{Sessions: sessions}, nil
-}
-
-func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) error {
-	if req.ModeId != "Interactive" && req.ModeId != "Autopilot" {
-		return nil
-	}
-	a.mu.Lock()
-	a.mode = req.ModeId
-	a.mu.Unlock()
-	// "currentModeId", not the request's "modeId": the client rejects that with -32602.
-	a.sendUpdate(ctx, req.SessionId, struct {
-		Kind          string `json:"sessionUpdate"`
-		CurrentModeId string `json:"currentModeId"`
-	}{Kind: "current_mode_update", CurrentModeId: req.ModeId})
-	a.say(ctx, req.SessionId, "Mode: "+req.ModeId+"\n\n")
-	return nil
 }
 
 // CloseSession keeps the on-disk TOML: close means the client stopped watching, not delete.
@@ -444,29 +427,6 @@ func (a *agent) startupDone() chan struct{} {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.indexDone
-}
-
-func (a *agent) sessionModes() *SessionModeState {
-	a.mu.Lock()
-	current := a.mode
-	a.mu.Unlock()
-	return &SessionModeState{
-		CurrentModeId: current,
-		AvailableModes: []struct {
-			Id          string `json:"id"`
-			Name        string `json:"name"`
-			Description string `json:"description,omitempty"`
-		}{
-			{Id: "Interactive", Name: "Interactive", Description: "Ask before setup and anything outside the container"},
-			{Id: "Autopilot", Name: "Autopilot", Description: "Auto-answer prompts: no user interruption"},
-		},
-	}
-}
-
-func (a *agent) isAutopilot() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.mode == "Autopilot"
 }
 
 func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {

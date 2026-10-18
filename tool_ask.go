@@ -8,21 +8,10 @@ import (
 	"time"
 )
 
-func (a *agent) autoAnswer(ctx context.Context, sid, answer string) bool {
-	if !a.isAutopilot() {
-		return false
-	}
-	a.say(ctx, sid, "[autopilot] "+answer+"\n\n")
-	return true
-}
-
 // askCard carries the card's title and kind in the request itself, so a client
 // that dropped the tool_call update (session-registration race) still shows it.
 func (a *agent) askCard(ctx context.Context, sid, title, kind string, options []permissionOption) (choice, tcId string, err error) {
 	tcId = a.StartToolCall(ctx, sid, title, kind, nil)
-	if len(options) > 0 && a.autoAnswer(ctx, sid, options[0].Name) {
-		return options[0].OptionId, tcId, nil
-	}
 	choice, err = a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,
 		ToolCall:  permissionToolCall{ToolCallId: tcId, Title: title, Kind: kind, Status: "in_progress"},
@@ -65,14 +54,8 @@ func choiceOptions(choices []string) []permissionOption {
 }
 
 // askFormAuto: request_permission carries only buttons, so a text box needs
-// elicitation (else errNoFreeText). Autopilot answers a text-only ask with "".
+// elicitation (else errNoFreeText).
 func (a *agent) askFormAuto(ctx context.Context, sid string, tcId, question string, options []string, allowText bool) (string, error) {
-	if len(options) > 0 && a.autoAnswer(ctx, sid, options[0]) {
-		return options[0], nil
-	}
-	if a.autoAnswer(ctx, sid, "no answer available") {
-		return "", nil
-	}
 	if !allowText || !a.clientCan("elicitation") {
 		if len(options) == 0 {
 			return "", errNoFreeText
@@ -179,6 +162,11 @@ var askUserTool = Tool{Def: map[string]any{
 	}
 	if args.Question == "" {
 		return "error: question is required", false
+	}
+	// Nobody waits by a running /spec loop: a question here stalled it until someone came back.
+	if sess := a.getSession(sid); sess != nil && sess.specFence() != "" {
+		return "refused: during /spec nobody is there to answer, and an answer given here would be lost to later rounds. If the spec decides it anywhere (the chapter's screen description, its picture, a table, another item), follow that. " +
+			"If it truly does not, decide in its spirit and write the decision in a code comment, or end this step with `respond` naming exactly what must be decided: the planner then asks it in the spec's QUESTIONS.md, and the user answers it when /spec starts next.", false
 	}
 	allowText := args.AllowText || len(args.Options) == 0
 

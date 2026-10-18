@@ -566,6 +566,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	if !r.preflight(ctx) {
 		return end, nil
 	}
+	r.askOpenQuestions(ctx)
 
 	sess.setSpecFence(filepath.Join(sess.Cwd, cfg.SpecDir))
 	defer sess.startToolLog()() // what each round did, whatever a compaction folds away
@@ -647,7 +648,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			}
 			r.say(ctx, fmt.Sprintf("\n✅ **/spec finished**: every item in `%s/` is covered by a passing test, blocked in this run, or waiting on a question.", cfg.SpecDir))
 			if open := specOpenQuestions(r.idx); len(open) > 0 {
-				r.say(ctx, fmt.Sprintf(" %d question(s) wait on your answer in `%s/%s`; answer them there and run /spec.", len(open), cfg.SpecDir, specQuestionsFile))
+				r.say(ctx, fmt.Sprintf(" %d question(s) wait on your answer in `%s/%s`; /spec asks them when it starts next.", len(open), cfg.SpecDir, specQuestionsFile))
 				stale := 0
 				for _, q := range open {
 					if specStaleNote(q) != "" {
@@ -793,10 +794,6 @@ func (r *specRun) preflight(ctx context.Context) bool {
 		return true
 	}
 	r.say(ctx, "**/spec pre-flight**\n\n- "+strings.Join(problems, "\n- ")+"\n\n")
-	if r.a.isAutopilot() {
-		r.say(ctx, "Autopilot does not start over these. Resolve them, or set `accept_open_markers = true` in `.codehalter/spec.toml` to take the open points as written, then run /spec again.\n")
-		return false
-	}
 	ok, tcId, err := r.a.askYesNoWithCard(ctx, r.sid, "Start the spec loop anyway?", "think", "Start anyway", "Stop")
 	if err != nil {
 		r.a.FailToolCall(ctx, r.sid, tcId, err.Error())
@@ -1348,7 +1345,7 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 			r.say(ctx, fmt.Sprintf("⛔ %s blocked for this run: %s\nThe question: %s\n", item, r.blocked[item], q.Q.Question))
 			break
 		}
-		r.say(ctx, fmt.Sprintf("❓ %s waits on your answer: %s\nIt is in `%s/%s` with the spec text it rests on and the options. Write the answer there, then run /spec.\n", item, q.Q.Question, cfg.SpecDir, specQuestionsFile))
+		r.say(ctx, fmt.Sprintf("❓ %s waits on your answer: %s\nIt is in `%s/%s` with the spec text it rests on and the options; the next /spec asks it, or write the answer there.\n", item, q.Q.Question, cfg.SpecDir, specQuestionsFile))
 	case block && w.Mode != specModeSetup:
 		// A stuck item becomes a question too: whether its cause is gone, or what
 		// gets past it, is the user's to say, and the item waits in the spec.

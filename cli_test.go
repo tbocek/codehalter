@@ -602,23 +602,10 @@ func TestBlockText(t *testing.T) {
 	}
 }
 
-func TestAdoptRecordsAvailableModes(t *testing.T) {
+func TestAdoptSwitchesSession(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "")
 	c.ui.Usage(4000, 8000)
-	c.adopt("s2", &SessionModeState{
-		CurrentModeId: "Interactive",
-		AvailableModes: []struct {
-			Id          string `json:"id"`
-			Name        string `json:"name"`
-			Description string `json:"description,omitempty"`
-		}{{Id: "Interactive"}, {Id: "Autopilot"}},
-	})
-	if len(c.modes) != 2 || c.modes[1] != "Autopilot" {
-		t.Errorf("modes = %v", c.modes)
-	}
-	if c.ui.mode != "Interactive" {
-		t.Errorf("ui mode = %q", c.ui.mode)
-	}
+	c.adopt("s2")
 	if c.sessionID() != "s2" {
 		t.Errorf("session id = %q", c.sessionID())
 	}
@@ -748,7 +735,7 @@ func TestOneShotExitsOnTheStopReason(t *testing.T) {
 
 func TestNewSessionSwapsTheSessionID(t *testing.T) {
 	c, p, _ := newCLIHarness(t, "")
-	c.adopt("old", nil)
+	c.adopt("old")
 	done := make(chan struct{})
 	go func() {
 		c.newSession()
@@ -767,7 +754,7 @@ func TestNewSessionSwapsTheSessionID(t *testing.T) {
 
 func TestResumeByIDLoadsThatSession(t *testing.T) {
 	c, p, _ := newCLIHarness(t, "")
-	c.adopt("old", nil)
+	c.adopt("old")
 	done := make(chan struct{})
 	go func() {
 		c.resumeSession("20260821_085603")
@@ -827,5 +814,24 @@ func TestCLIExitWordsLeave(t *testing.T) {
 	}
 	if handled, _ := c.command("exit the loop when the suite is green"); handled {
 		t.Error("a prompt starting with exit was taken as a command")
+	}
+}
+
+// With no terminal and no input left (a script running -p), a question takes its first
+// option and says so; at a terminal, or with an empty line, it is dismissed as before.
+func TestCLIQuestionWithoutAnyoneTakesTheFirstOption(t *testing.T) {
+	c, _, out := newCLIHarness(t, "")
+	if idx, _ := c.askChoiceOrText("Start the spec loop anyway?", []string{"Start anyway", "Stop"}, false); idx != 0 ||
+		!strings.Contains(out.String(), "no one to answer (input ended): took 1) Start anyway") {
+		t.Errorf("ended input: idx %d, output %q", idx, out.String())
+	}
+	c, _, _ = newCLIHarness(t, "\n")
+	if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != -1 {
+		t.Errorf("an empty answer: idx %d, want a dismissal", idx)
+	}
+	c, _, _ = newCLIHarness(t, "")
+	c.interactive = true // Ctrl+D at a terminal is the user dismissing it
+	if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != -1 {
+		t.Errorf("Ctrl+D at a terminal: idx %d, want a dismissal", idx)
 	}
 }

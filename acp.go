@@ -92,13 +92,7 @@ type (
 		McpServers []acpMCPServer `json:"mcpServers,omitempty"`
 	}
 	NewSessionResponse struct {
-		SessionId string            `json:"sessionId"`
-		Modes     *SessionModeState `json:"modes,omitempty"`
-	}
-
-	SetSessionModeRequest struct {
 		SessionId string `json:"sessionId"`
-		ModeId    string `json:"modeId"`
 	}
 
 	LoadSessionRequest struct {
@@ -106,9 +100,7 @@ type (
 		Cwd        string         `json:"cwd"`
 		McpServers []acpMCPServer `json:"mcpServers,omitempty"`
 	}
-	LoadSessionResponse struct {
-		Modes *SessionModeState `json:"modes,omitempty"`
-	}
+	LoadSessionResponse struct{}
 
 	ListSessionsRequest struct {
 		Cwd string `json:"cwd,omitempty"`
@@ -133,15 +125,6 @@ type (
 		StopReason string `json:"stopReason,omitempty"`
 	}
 )
-
-type SessionModeState struct {
-	CurrentModeId  string `json:"currentModeId"`
-	AvailableModes []struct {
-		Id          string `json:"id"`
-		Name        string `json:"name"`
-		Description string `json:"description,omitempty"`
-	} `json:"availableModes"`
-}
 
 // ContentBlock is a flat union on Type: text (Text), image (MimeType, base64 Data),
 // resource (Resource, inline content), resource_link (URI, Name, no content).
@@ -273,11 +256,6 @@ func (a *AgentSideConnection) handle(ctx context.Context, req *jsonrpcRequest) {
 
 	case "session/list":
 		serveCall(a, ctx, req, a.agent.ListSessions)
-
-	case "session/set_mode":
-		serveCall(a, ctx, req, func(ctx context.Context, p SetSessionModeRequest) (struct{}, error) {
-			return struct{}{}, a.agent.SetSessionMode(ctx, p)
-		})
 
 	case "session/close":
 		serveCall(a, ctx, req, func(ctx context.Context, p CloseSessionRequest) (struct{}, error) {

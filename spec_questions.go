@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
@@ -8,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -19,8 +22,8 @@ const specQuestionsFile = "QUESTIONS.md"
 
 const specQuestionsHead = "# Questions\n\n" +
 	"The /spec loop writes a question here when the spec does not decide something a round needs, " +
-	"and skips that item until the question has an answer. Write the answer after **Answer:**, in your " +
-	"own words or as the number of an option, then run /spec. An answered question is part of the spec " +
+	"and skips that item until the question has an answer. /spec asks the open ones when it starts; or " +
+	"write the answer after **Answer:**, in your own words or as the number of an option. An answered question is part of the spec " +
 	"until its item is built with it; then codehalter removes it from here.\n"
 
 type specOption struct {
@@ -168,6 +171,85 @@ func specOpenQuestions(idx *specIndex) []specQuestion {
 		}
 	}
 	return out
+}
+
+// specOptionRe is an option line as appendSpecQuestion writes it: "2. Choice. Example: ...".
+var specOptionRe = regexp.MustCompile(`^(\d+)\.\s+(.*?)(?:\.\s+Example:.*)?$`)
+
+// askOpenQuestions puts the questions waiting in QUESTIONS.md to the user as /spec starts,
+// the one moment someone is sure to be there. An answer is written after **Answer:** as if
+// typed there (an option by its number); a dismissed question stays open, its item skipped.
+func (r *specRun) askOpenQuestions(ctx context.Context) {
+	open := specOpenQuestions(r.idx)
+	path := filepath.Join(r.sess.Cwd, r.cfg.SpecDir, specQuestionsFile)
+	answered := 0
+	for i, q := range open {
+		var body, labels []string
+		inFence := false
+		for _, ln := range strings.Split(q.Text, "\n")[1:] { // the heading is the card's title
+			if strings.HasPrefix(strings.TrimSpace(ln), "```") {
+				inFence = !inFence
+			}
+			if !inFence && specAnswerRe.MatchString(strings.TrimSpace(ln)) {
+				break
+			}
+			if m := specOptionRe.FindStringSubmatch(strings.TrimSpace(ln)); m != nil && !inFence {
+				labels = append(labels, m[1]+". "+m[2])
+			}
+			body = append(body, ln)
+		}
+		r.say(ctx, fmt.Sprintf("\n**Question %d of %d · %s**%s\n\n%s\n", i+1, len(open), q.ID, specStaleNote(q), strings.TrimSpace(strings.Join(body, "\n"))))
+		tcId := r.a.StartToolCall(ctx, r.sid, q.ID+": "+q.Question, "think", nil)
+		answer, err := r.a.askFormAuto(ctx, r.sid, tcId, q.Question, labels, true)
+		if k := slices.Index(labels, answer); k >= 0 {
+			answer = strconv.Itoa(k + 1)
+		}
+		if err != nil || strings.TrimSpace(answer) == "" || answer == "abort" {
+			r.a.CompleteToolCall(ctx, r.sid, tcId, []ToolCallContent{TextContent("No answer: " + q.ID + " stays skipped")})
+			if err != nil && !errors.Is(err, errPermissionCancelled) {
+				r.say(ctx, fmt.Sprintf("⚠ /spec: asking %s's question failed (%v); answer it in `%s/%s`.\n", q.ID, err, r.cfg.SpecDir, specQuestionsFile))
+				break
+			}
+			continue
+		}
+		// Re-read: the user may have edited the file while the card was open.
+		data, err := os.ReadFile(path)
+		if err == nil {
+			head, secs := parseSpecQuestionFile(string(data))
+			texts, found := make([]string, len(secs)), false
+			for k, s := range secs {
+				texts[k] = s.Text
+				if found || s.ID != q.ID || s.Question != q.Question || s.Answer != "" {
+					continue
+				}
+				lines := strings.Split(s.Text, "\n")
+				for j := len(lines) - 1; j >= 0 && !found; j-- {
+					if specAnswerRe.MatchString(strings.TrimSpace(lines[j])) {
+						lines[j], found = "**Answer:** "+strings.TrimSpace(answer), true
+					}
+				}
+				texts[k] = strings.Join(lines, "\n")
+			}
+			if !found {
+				err = fmt.Errorf("it is no longer open there")
+			} else {
+				err = writeSpecQuestionFile(path, head, texts)
+			}
+		}
+		if err != nil {
+			r.a.FailToolCall(ctx, r.sid, tcId, err.Error())
+			r.say(ctx, fmt.Sprintf("⚠ /spec: writing the answer to %s's question failed: %v\n", q.ID, err))
+			continue
+		}
+		answered++
+		r.a.CompleteToolCall(ctx, r.sid, tcId, []ToolCallContent{TextContent("Answer: " + answer)})
+	}
+	if answered > 0 {
+		r.say(ctx, fmt.Sprintf("\n%d of %d question(s) answered; they are in `%s/%s`.\n", answered, len(open), r.cfg.SpecDir, specQuestionsFile))
+		if err := r.scan(); err != nil {
+			r.say(ctx, "⚠ /spec: reading the spec: "+err.Error()+"\n")
+		}
+	}
 }
 
 // specStaleNote says a question came from another codehalter than this one, whose

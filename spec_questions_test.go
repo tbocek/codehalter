@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -172,5 +173,44 @@ func TestSpecQuestionsSeparatedAndRemoved(t *testing.T) {
 	}
 	if n, _ := removeAnsweredQuestions(dir, "F0.2"); n != 0 {
 		t.Error("an unanswered question was removed")
+	}
+}
+
+// /spec asks the open questions as it starts: a picked option goes into the file by its number,
+// an answered question is not asked again, and a stuck item's question, whose output holds an
+// "Answer:" of its own, is answered on its own line.
+func TestSpecAsksOpenQuestionsAtStart(t *testing.T) {
+	a, s := newTestAgent(t)
+	answerFirstOption(t, a)
+	spec := filepath.Join(s.Cwd, "spec")
+	writeTree(t, spec, map[string]string{"01.md": "# 01\n\n### F0.1 Store\n\nKeep the notes.\n\n### F0.2 Export\n\nExport them.\n\n### F0.3 Sync\n\nSync them.\n"})
+	store := specQuestion{ID: "F0.1", Question: "Which store?", Quote: "Keep the notes.", QuoteAt: "01.md:5",
+		Options: []specOption{{Choice: "SQLite", Example: "notes.db"}, {Choice: "JSON", Example: "notes.json"}}}
+	for _, q := range []specQuestion{store, {ID: "F0.2", Question: "This item did not pass its attempts. How should the rounds go on?",
+		Stopped: "test failed\n**Answer:** 42 in the output", Options: []specOption{{Choice: "Try again", Example: "fresh attempts"}, {Choice: "Change the spec", Example: "edit 01.md"}}},
+		{ID: "F0.3", Question: "Which server?", Options: []specOption{{Choice: "Local", Example: "port 8080"}}}} {
+		if err := appendSpecQuestion(spec, q.ID, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := filepath.Join(spec, specQuestionsFile)
+	data, _ := os.ReadFile(path)
+	writeTree(t, spec, map[string]string{specQuestionsFile: strings.Replace(string(data), "**Answer:** \n", "**Answer:** JSON, in notes.json\n", 1)})
+
+	r := &specRun{a: a, sid: s.ID, sess: s, cfg: &specConfig{SpecDir: "spec"}, reasons: map[string]string{}}
+	if err := r.scan(); err != nil {
+		t.Fatal(err)
+	}
+	r.askOpenQuestions(context.Background())
+	if open := specOpenQuestions(r.idx); len(open) != 0 {
+		t.Errorf("still open after asking: %+v", open)
+	}
+	for id, want := range map[string]string{"F0.1": "JSON, in notes.json", "F0.2": "1", "F0.3": "1"} {
+		if qs := r.idx.questions[id]; len(qs) != 1 || qs[0].Answer != want {
+			t.Errorf("%s: %+v, want the answer %q", id, qs, want)
+		}
+	}
+	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "**Answer:** 42 in the output") {
+		t.Errorf("the output inside the stuck question was changed:\n%s", data)
 	}
 }

@@ -1531,7 +1531,7 @@ func TestPlanClarificationsAreBounded(t *testing.T) {
 		resp = append(resp, unclear)
 	}
 	a, s, mock := planPhaseAgent(t, resp...)
-	a.mode = "Autopilot" // answers each clarification with its first choice
+	answerFirstOption(t, a) // the user picks each clarification's first choice
 
 	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil || plan == nil || plan.Clear {
