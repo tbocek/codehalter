@@ -913,12 +913,23 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 			return next, note + " (old_text matched after removing its line-number prefixes)", ""
 		}
 	}
+	// Not "the file drifted": codehalter cannot know that, and mostly the model wrote old_text
+	// from memory (it once never saw the 58 lines it quoted, having sent them to a file with
+	// sed). The first line where its copy differs says what to fix.
 	if line, snippet, found := nearMiss(content, oldText); found {
-		return "", "", fmt.Sprintf("error: old_text not found: the file has drifted from what you remember. The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
+		differs := ""
+		fileLines, oldLines := strings.Split(snippet, "\n"), trimBlankEdges(strings.Split(oldText, "\n"))
+		for j := range min(len(fileLines), len(oldLines)) {
+			if strings.TrimRight(oldLines[j], " \t\r") != strings.TrimRight(fileLines[j], " \t\r") {
+				differs = fmt.Sprintf(" Your copy differs from the file first at line %d: you wrote %q, the file has %q.", line+j, truncate(oldLines[j], 120), truncate(fileLines[j], 120))
+				break
+			}
+		}
+		return "", "", fmt.Sprintf("error: old_text not found: it is not in the file as it is now.%s The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
 			"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT call read_file first: the text above is the file's current content. Do NOT rewrite the whole file with write_file.",
-			path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap))
+			differs, path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap))
 	}
-	return "", "", "error: old_text not found: the file differs from what you remember (reformatting, or an earlier edit), and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file."
+	return "", "", "error: old_text not found: it is not in the file as it is now, and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file."
 }
 
 var lineNumberPrefixRe = regexp.MustCompile(`^\s*\d+\|`)

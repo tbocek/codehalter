@@ -271,8 +271,8 @@ func TestNearMiss(t *testing.T) {
 	}
 }
 
-// A drifted edit_file comes back with the file's current bytes and says NOT to
-// re-read.
+// An old_text not in the file comes back with the file's current bytes, the first line
+// where the copy differs, and says NOT to re-read; it claims no drift it cannot know.
 func TestEditFileMissQuotesNearbyRegion(t *testing.T) {
 	a, s := newTestAgent(t)
 	ctx := context.Background()
@@ -295,6 +295,9 @@ func TestEditFileMissQuotesNearbyRegion(t *testing.T) {
 	}
 	if !strings.Contains(out, "Do NOT call read_file") {
 		t.Errorf("miss message still sends the model back to read_file:\n%s", out)
+	}
+	if !strings.Contains(out, `differs from the file first at line 3: you wrote "func load(path string) error {", the file has "func load(p string) error {"`) || strings.Contains(out, "drifted") {
+		t.Errorf("miss message does not name the first differing line, or claims drift:\n%s", out)
 	}
 	after, err := os.ReadFile(path)
 	if err != nil {
