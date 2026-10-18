@@ -746,6 +746,9 @@ func (c *cliClient) sessionUpdate(params json.RawMessage) {
 			return
 		}
 		c.ui.Usage(u.Used, u.Size)
+		if u.Meta != nil {
+			c.ui.Speeds(u.Meta.PromptPerSec, u.Meta.GenPerSec)
+		}
 
 	case "available_commands_update":
 		var a availableCommandsUpdate

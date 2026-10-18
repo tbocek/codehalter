@@ -543,3 +543,16 @@ func TestInputRowStaysInPlace(t *testing.T) {
 		t.Errorf("screen after typing and output:\n%s", strings.Join(rows, "\n"))
 	}
 }
+
+// The status line carries the last call's speeds; a call whose prompt all came from the
+// cache measures no prompt speed and leaves the last one shown.
+func TestStatusLineShowsTheLastSpeeds(t *testing.T) {
+	u, _ := uiFor(true, 120, 24)
+	u.Begin()
+	u.Usage(50000, 262144)
+	u.Speeds(812.4, 51.2)
+	u.Speeds(0, 48.6)
+	if line := stripANSI(u.statusLine()); !strings.Contains(line, "50.0k/262.1k ctx · 812 pp/s · 49 tg/s") {
+		t.Errorf("status line = %q", line)
+	}
+}

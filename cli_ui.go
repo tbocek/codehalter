@@ -68,11 +68,13 @@ type cliUI struct {
 
 	plan []PlanEntry
 
-	used  int
-	size  int
-	busy  bool
-	start time.Time
-	frame int
+	used int
+	size int
+	// pp and tg: the last call's prompt and generation tokens per second, 0 until known.
+	pp, tg float64
+	busy   bool
+	start  time.Time
+	frame  int
 
 	// promptStr is set while the cursor sits mid-row after an input prompt; emitLine then
 	// breaks the row first and drawLive reprints the prompt below.
@@ -331,6 +333,14 @@ func (u *cliUI) statusLine() string {
 		parts = append(parts, fmt.Sprintf("%s/%s ctx", short(u.used), short(u.size)))
 	} else if u.used > 0 {
 		parts = append(parts, short(u.used)+" ctx")
+	}
+	for _, s := range []struct {
+		rate float64
+		unit string
+	}{{u.pp, "pp/s"}, {u.tg, "tg/s"}} {
+		if s.rate > 0 {
+			parts = append(parts, short(int(s.rate+0.5))+" "+s.unit)
+		}
 	}
 	if n := len(u.order); n > 0 {
 		parts = append(parts, fmt.Sprintf("%d running", n))
@@ -642,6 +652,20 @@ func (u *cliUI) Usage(used, size int) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.used, u.size = used, size
+	u.drawLive()
+}
+
+// Speeds keeps the last call's rates; a call with nothing to measure (its whole prompt
+// came from the cache) leaves the previous one shown.
+func (u *cliUI) Speeds(pp, tg float64) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if pp > 0 {
+		u.pp = pp
+	}
+	if tg > 0 {
+		u.tg = tg
+	}
 	u.drawLive()
 }
 

@@ -526,6 +526,18 @@ func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r 
 	if pMs > 0 || gMs > 0 {
 		sess.addTurnTiming(int64(pMs), int64(gMs))
 	}
+	// Per call, not per turn: a /spec loop is one turn that runs for hours. A summary runs
+	// on its own server and says nothing of this one.
+	if size := int(a.mainSlotTokens.Load()); size > 0 && r.promptTokens > 0 && !strings.EqualFold(conn.Purpose, purposeSummary) {
+		speeds := &usageSpeeds{}
+		if pMs > 0 && r.evaluatedTokens > 0 {
+			speeds.PromptPerSec = float64(r.evaluatedTokens) * 1000 / pMs
+		}
+		if gMs > 0 && r.completionTokens > 0 {
+			speeds.GenPerSec = float64(r.completionTokens) * 1000 / gMs
+		}
+		a.sendUpdate(context.Background(), sid, usageUpdate{Kind: "usage_update", Used: r.promptTokens, Size: size, Meta: speeds})
+	}
 }
 
 // The in-band error goes first: gateways send {"error":…} and THEN drop the

@@ -786,3 +786,43 @@ func TestRequestLogDelta(t *testing.T) {
 		t.Errorf("an early change was not called out: %q", got)
 	}
 }
+
+// Every foreground call reports its context use and speeds at once: a /spec loop is one
+// turn that runs for hours, and the status line showed a number from before it. A summary
+// runs on its own server and reports nothing.
+func TestEveryCallReportsUsageAndSpeeds(t *testing.T) {
+	a, s, br, _ := elicitingAgent(t)
+	a.mainSlotTokens.Store(262144)
+	a.recordStreamStats(s.ID, "llm[1]", &LLMConnection{Purpose: "summary"}, &streamResult{promptTokens: 9000, completionTokens: 500, evaluatedTokens: 9000, cachedTokens: 0, serverPromptMs: 3000, serverGenMs: 10000})
+	a.recordStreamStats(s.ID, "llm[0]", &LLMConnection{}, &streamResult{promptTokens: 50000, completionTokens: 1020, evaluatedTokens: 1624, cachedTokens: 48376, serverPromptMs: 2000, serverGenMs: 20000})
+	got := make(chan string, 1)
+	go func() {
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if strings.Contains(line, "usage_update") {
+				got <- line
+				return
+			}
+		}
+	}()
+	select {
+	case line := <-got:
+		var msg struct {
+			Params struct {
+				Update usageUpdate `json:"update"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			t.Fatal(err)
+		}
+		u := msg.Params.Update
+		if u.Used != 50000 || u.Size != 262144 || u.Meta == nil || u.Meta.PromptPerSec != 812 || u.Meta.GenPerSec != 51 {
+			t.Errorf("first usage update = %+v %+v, want the foreground call's 50000/262144 at 812 pp/s and 51 tg/s", u, u.Meta)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no usage update")
+	}
+}

@@ -178,11 +178,19 @@ type planUpdate struct {
 }
 
 // usageUpdate drives the client's context ring: Used is the last call's
-// prompt_tokens, Size the per-slot n_ctx.
+// prompt_tokens, Size the per-slot n_ctx. Meta carries that call's speeds for the
+// CLI's status line (usageSpeeds); other clients ignore it.
 type usageUpdate struct {
-	Kind string `json:"sessionUpdate"` // "usage_update"
-	Used int    `json:"used"`
-	Size int    `json:"size"`
+	Kind string       `json:"sessionUpdate"` // "usage_update"
+	Used int          `json:"used"`
+	Size int          `json:"size"`
+	Meta *usageSpeeds `json:"_meta,omitempty"`
+}
+
+// usageSpeeds: tokens per second of one call, 0 when the call had none to measure.
+type usageSpeeds struct {
+	PromptPerSec float64 `json:"codehalter.promptPerSec,omitempty"`
+	GenPerSec    float64 `json:"codehalter.genPerSec,omitempty"`
 }
 
 // Without session_info_update Zed labels every thread with its id. Omitted fields
