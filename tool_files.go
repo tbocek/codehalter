@@ -988,9 +988,15 @@ func replaceBlock(content, start, end, newText string) (string, string, string) 
 			search()
 		}
 		// A function's last line is a bare `}`, which also closes every inner block, so the
-		// model cannot name it: it gave the bare brace or invented a marker ("} // placeholder"),
-		// and every whole-function edit failed. The block opening on the start line is meant,
-		// ended as read_file's symbol ends it.
+		// model cannot name it. A bare closer (`}`, `end`) is documented to mean the block's own
+		// closing line, found as read_file's symbol finds it.
+		//
+		// HACK: an `end` that is on no line is outside the contract (a fragment of the block's
+		// last line) and should be an error. Qwen3.8-flash-next does not follow the tool's
+		// directions here: in a replay it invented "} // placeholder-not-used" for every
+		// whole-function edit (9 of 9 failed), and steering wording, a line-range form and a
+		// symbol form changed nothing it did. So its intent is guessed: the block opening on the
+		// start line. Drop the guess once the model follows the description.
 		if e < 0 {
 			// A statement on the start line is no block to extend to.
 			if b, by, ok := blockEnd(lines, s); ok && by != "its semicolon" {
