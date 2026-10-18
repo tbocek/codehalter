@@ -160,15 +160,20 @@ func (u *cliUI) drawLive() {
 		u.out.Flush()
 		return
 	}
+	// Autowrap off while drawing: a row wider than the terminal (an emoji or CJK glyph takes
+	// two cells but counts as one) is cut at the edge instead of wrapping onto a row liveRows
+	// does not count, which left the region's top row behind on every redraw.
+	u.out.WriteString("\x1b[?7l")
 	for _, l := range u.liveLines() {
 		u.out.WriteString(l)
 		u.out.WriteString("\n")
 		u.liveRows++
 	}
+	u.out.WriteString("\x1b[?7h")
 	u.out.Flush()
 }
 
-// Each entry must be exactly one terminal row (see clip), or liveRows desyncs.
+// Each entry must be exactly one terminal row (see clip, and drawLive's autowrap), or liveRows desyncs.
 func (u *cliUI) liveLines() []string {
 	var out []string
 	if len(u.pend) > 0 {

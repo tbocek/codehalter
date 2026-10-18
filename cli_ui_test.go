@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 func uiFor(tty bool, cols, rows int) (*cliUI, *bytes.Buffer) {
@@ -364,4 +366,83 @@ func flushUI(u *cliUI) {
 	defer u.mu.Unlock()
 	u.flushRow()
 	u.drawLive()
+}
+
+// screenAfter replays out on a cols-wide terminal that knows what drawLive uses: cursor up,
+// erase below, autowrap on and off, and emoji as two cells. It returns the rows left on screen.
+func screenAfter(out string, cols int) []string {
+	rows, r, c, wrap := []string{""}, 0, 0, true
+	put := func(ch rune) {
+		w := 1
+		if ch >= 0x1F300 || ch >= 0x2600 && ch <= 0x27BF {
+			w = 2
+		}
+		if c+w > cols {
+			if !wrap {
+				return // the terminal keeps the cursor at the edge and drops the rest
+			}
+			r, c = r+1, 0
+		}
+		for len(rows) <= r {
+			rows = append(rows, "")
+		}
+		rows[r] += string(ch)
+		c += w
+	}
+	for i := 0; i < len(out); {
+		if strings.HasPrefix(out[i:], "\x1b[") {
+			j := i + 2
+			for j < len(out) && (out[j] >= '0' && out[j] <= '9' || out[j] == '?') {
+				j++
+			}
+			arg := out[i+2 : j]
+			switch out[j] {
+			case 'A':
+				n := 0
+				fmt.Sscan(arg, &n)
+				r, c = r-n, 0
+			case 'J':
+				rows = rows[:r]
+			case 'l', 'h':
+				if arg == "?7" {
+					wrap = out[j] == 'h'
+				}
+			}
+			i = j + 1
+			continue
+		}
+		ch, size := utf8.DecodeRuneInString(out[i:])
+		if ch == '\n' {
+			r, c = r+1, 0
+			for len(rows) <= r {
+				rows = append(rows, "")
+			}
+		} else {
+			put(ch)
+		}
+		i += size
+	}
+	return rows
+}
+
+// A live row wider than the terminal in cells (emoji count one each but take two) must not
+// wrap: the extra row left the region's top row, "plan 1/2", behind on every redraw.
+func TestLiveRegionLeavesNoRowsBehind(t *testing.T) {
+	u, buf := uiFor(true, 40, 24)
+	u.Begin()
+	for range 5 {
+		u.Plan([]PlanEntry{{Content: "done", Status: "completed"}, {Content: "check " + strings.Repeat("✅", 30), Status: "in_progress"}})
+	}
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, row := range screenAfter(buf.String(), u.cols) {
+		if strings.Contains(row, "plan 1/2") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("plan header on screen %d times after five redraws, want 1", n)
+	}
 }
