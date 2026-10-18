@@ -288,7 +288,7 @@ func TestShortAndElapsed(t *testing.T) {
 	for _, c := range []struct {
 		n    int
 		want string
-	}{{7, "7"}, {1500, "1.5k"}, {2_500_000, "2.5M"}} {
+	}{{7, "7"}, {1500, "2k"}, {124_200, "124k"}, {262_144, "262k"}, {2_500_000, "2.5M"}} {
 		if got := short(c.n); got != c.want {
 			t.Errorf("short(%d) = %q, want %q", c.n, got, c.want)
 		}
@@ -552,7 +552,26 @@ func TestStatusLineShowsTheLastSpeeds(t *testing.T) {
 	u.Usage(50000, 262144)
 	u.Speeds(812.4, 51.2)
 	u.Speeds(0, 48.6)
-	if line := stripANSI(u.statusLine()); !strings.Contains(line, "50.0k/262.1k ctx · 812 pp/s · 49 tg/s") {
+	if line := stripANSI(u.statusLine()); !strings.Contains(line, "50k/262k ctx · 812 pp/s · 49 tg/s") {
 		t.Errorf("status line = %q", line)
+	}
+}
+
+// codehalter's phases go into the status row, phase last, instead of plan rows; the update
+// that completes them clears it.
+func TestPhasesGoIntoTheStatusRow(t *testing.T) {
+	u, _ := uiFor(true, 160, 24)
+	u.Begin()
+	u.Usage(124200, 262144)
+	u.Speeds(812, 51)
+	u.Plan([]PlanEntry{{Content: "Planning", Status: "completed"},
+		{Content: "Executing · 1m · llm[0] ↑426kb ↓37 tok", Status: "in_progress", Meta: &planMeta{Phase: "Executing", Meter: "llm[0] ↑426kb ↓37 tok"}}})
+	rows := u.liveLines()
+	if len(rows) != 1 || !strings.HasSuffix(stripANSI(rows[0]), " · llm[0] ↑426kb ↓37 tok · 124k/262k ctx · 812 pp/s · 51 tg/s · executing") {
+		t.Errorf("live rows = %q", rows)
+	}
+	u.Plan([]PlanEntry{{Content: "Planning", Status: "completed"}, {Content: "Executing", Status: "completed"}})
+	if line := stripANSI(u.statusLine()); strings.Contains(line, "executing") || strings.Contains(line, "llm[0]") {
+		t.Errorf("after the phases: %q", line)
 	}
 }

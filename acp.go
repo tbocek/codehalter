@@ -167,9 +167,17 @@ type messageChunk struct {
 }
 
 type PlanEntry struct {
-	Content  string `json:"content"`
-	Priority string `json:"priority"`
-	Status   string `json:"status"`
+	Content  string    `json:"content"`
+	Priority string    `json:"priority"`
+	Status   string    `json:"status"`
+	Meta     *planMeta `json:"_meta,omitempty"`
+}
+
+// planMeta gives the CLI the in-progress entry's parts, for its own status row; Zed shows
+// the entry's content.
+type planMeta struct {
+	Phase string `json:"codehalter.phase,omitempty"`
+	Meter string `json:"codehalter.meter,omitempty"`
 }
 
 type planUpdate struct {

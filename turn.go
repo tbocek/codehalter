@@ -63,7 +63,7 @@ func (a *agent) holdTurn(parent context.Context, sess *Session, wait bool) (ctx 
 		sess.phaseActive = false
 		sess.phaseMu.Unlock()
 		if active {
-			a.sendUpdate(context.Background(), sess.ID, planUpdate{Kind: "plan", Entries: phaseEntries(phase, true, "")})
+			a.sendUpdate(context.Background(), sess.ID, planUpdate{Kind: "plan", Entries: phaseEntries(sess, phase, true)})
 		}
 		a.sayRunningBgJobs(sess)
 		// An idle server slot gets reclaimed and the next turn re-reads the whole

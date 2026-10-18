@@ -456,3 +456,56 @@ func TestPromptDuringStartup(t *testing.T) {
 		t.Fatal("the prompt still waits after startup ended")
 	}
 }
+
+// The phase in progress tells Zed what the CLI's status row tells: the phase, the time, what
+// runs now and the last speeds, refreshed every second while the phase lasts; its _meta gives
+// the CLI the parts. A running tool is no part of it: its card shows it.
+func TestPhaseStatus(t *testing.T) {
+	h := newTerminalHarness(t)
+	a, s := h.agent, h.sess
+	s.startTurn(time.Now().Add(-90 * time.Second))
+	inProgress := func() (string, map[string]any) {
+		ups := h.updatesOfKind("plan")
+		if len(ups) == 0 {
+			return "", nil
+		}
+		entries, _ := ups[len(ups)-1]["entries"].([]any)
+		for _, e := range entries {
+			if em, _ := e.(map[string]any); em["status"] == "in_progress" {
+				meta, _ := em["_meta"].(map[string]any)
+				return em["content"].(string), meta
+			}
+		}
+		return "", nil
+	}
+	shows := func(what string) {
+		t.Helper()
+		if !h.waitFor(func() bool { c, _ := inProgress(); return strings.Contains(c, what) }) {
+			c, _ := inProgress()
+			t.Fatalf("status %q never showed %q", c, what)
+		}
+	}
+
+	a.sendPhase(context.Background(), s.ID, 1, false)
+	shows("Executing · 1m3")
+	a.setStatus(context.Background(), s.ID, "queued")
+	shows(" · queued")
+	if c, meta := inProgress(); !strings.HasSuffix(c, " · queued") || meta["codehalter.phase"] != "Executing" || meta["codehalter.meter"] != "queued" {
+		t.Errorf("queued: %q %v", c, meta)
+	}
+	stop := a.startStatusMeter(context.Background(), s.ID, func() string { return "llm[0] ↑426kb ↓37 tok" })
+	s.phaseMu.Lock()
+	s.pp, s.tg = 812.4, 51.2
+	s.phaseMu.Unlock()
+	shows("llm[0] ↑426kb ↓37 tok · 812 pp/s · 51 tg/s") // picked up by the ticker
+	stop()
+	a.setStatus(context.Background(), s.ID, "")
+
+	a.sendPhase(context.Background(), s.ID, 1, true)
+	if !h.waitFor(func() bool { s.phaseMu.Lock(); defer s.phaseMu.Unlock(); return !s.phaseTicking }) {
+		t.Error("the ticker outlived the phase")
+	}
+	if c, meta := inProgress(); c != "" || meta != nil {
+		t.Errorf("after the phase: %q %v", c, meta)
+	}
+}

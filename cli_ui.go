@@ -72,9 +72,12 @@ type cliUI struct {
 	size int
 	// pp and tg: the last call's prompt and generation tokens per second, 0 until known.
 	pp, tg float64
-	busy   bool
-	start  time.Time
-	frame  int
+	// phase and meter: codehalter's phase in progress and what runs in it, from its plan
+	// entry's _meta; shown in the status row instead of plan rows.
+	phase, meter string
+	busy         bool
+	start        time.Time
+	frame        int
 
 	// promptStr is set while the cursor sits mid-row after an input prompt; emitLine then
 	// breaks the row first and drawLive reprints the prompt below.
@@ -327,8 +330,13 @@ func (u *cliUI) planLines() []string {
 	return out
 }
 
+// statusLine: "⠸ 67m12s · llm[0] ↑426kb ↓37 tok · 124k/262k ctx · 812 pp/s · 51 tg/s · executing",
+// the phase last as the least telling. A running tool is no part of it: its card shows it.
 func (u *cliUI) statusLine() string {
 	parts := []string{elapsed(time.Since(u.start))}
+	if u.meter != "" {
+		parts = append(parts, u.meter)
+	}
 	if u.size > 0 {
 		parts = append(parts, fmt.Sprintf("%s/%s ctx", short(u.used), short(u.size)))
 	} else if u.used > 0 {
@@ -339,11 +347,11 @@ func (u *cliUI) statusLine() string {
 		unit string
 	}{{u.pp, "pp/s"}, {u.tg, "tg/s"}} {
 		if s.rate > 0 {
-			parts = append(parts, short(int(s.rate+0.5))+" "+s.unit)
+			parts = append(parts, strconv.Itoa(int(s.rate+0.5))+" "+s.unit)
 		}
 	}
-	if n := len(u.order); n > 0 {
-		parts = append(parts, fmt.Sprintf("%d running", n))
+	if u.phase != "" {
+		parts = append(parts, strings.ToLower(u.phase))
 	}
 	return u.style(u.spin()+" "+strings.Join(parts, " · "), ansiDim)
 }
@@ -496,7 +504,7 @@ func short(n int) string {
 	case n >= 1000000:
 		return fmt.Sprintf("%.1fM", float64(n)/1e6)
 	case n >= 1000:
-		return fmt.Sprintf("%.1fk", float64(n)/1e3)
+		return strconv.Itoa((n+500)/1000) + "k"
 	default:
 		return strconv.Itoa(n)
 	}
@@ -640,6 +648,19 @@ func (u *cliUI) contentLines(cs []ToolCallContent) []string {
 func (u *cliUI) Plan(entries []PlanEntry) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	// codehalter's phases (each a phase name, or the one in progress with its parts) go into
+	// the status row, not plan rows.
+	phase := func(e PlanEntry) bool { return e.Meta != nil || slices.Contains(phaseNames, e.Content) }
+	if len(entries) > 0 && !slices.ContainsFunc(entries, func(e PlanEntry) bool { return !phase(e) }) {
+		u.plan, u.phase, u.meter = nil, "", ""
+		for _, e := range entries {
+			if e.Meta != nil && e.Status == "in_progress" {
+				u.phase, u.meter = e.Meta.Phase, e.Meta.Meter
+			}
+		}
+		u.drawLive()
+		return
+	}
 	u.plan = make([]PlanEntry, len(entries))
 	for i, e := range entries {
 		e.Content = sanitize(e.Content)

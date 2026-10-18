@@ -171,68 +171,119 @@ func isCancelled(err error) bool {
 		errors.Is(err, context.DeadlineExceeded)
 }
 
-var phaseNames = []string{"Planning", "Working", "Documenting"}
+var phaseNames = []string{"Planning", "Executing", "Documenting"}
 
-func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
+// phaseEntries: the phases so far, the current one in progress unless done. Its content is
+// Zed's status line (phaseStatus); its _meta the CLI's parts.
+func phaseEntries(sess *Session, phase int, done bool) []PlanEntry {
 	entries := make([]PlanEntry, 0, phase+1)
 	for i := 0; i <= phase; i++ {
-		status := "completed"
-		content := phaseNames[i]
+		e := PlanEntry{Content: phaseNames[i], Priority: "medium", Status: "completed"}
 		if i == phase && !done {
-			status = "in_progress"
-			content += suffix
+			e.Status = "in_progress"
+			if sess != nil {
+				var meter string
+				e.Content, meter = sess.phaseStatus(phase)
+				e.Meta = &planMeta{Phase: phaseNames[i], Meter: meter}
+			}
 		}
-		entries = append(entries, PlanEntry{Content: content, Priority: "medium", Status: status})
+		entries = append(entries, e)
 	}
 	return entries
 }
 
-// The tracked phase lets holdTurn's release complete it if the turn exits early.
-func (a *agent) sendPhase(ctx context.Context, sid string, phase int, done bool) {
-	if sess := a.getSession(sid); sess != nil { // closed mid-turn
-		sess.phaseMu.Lock()
-		sess.phaseCurrent = phase
-		sess.phaseActive = !done
-		sess.phaseMu.Unlock()
+// phaseStatus: "Executing · 67m12s · llm[0] ↑426kb ↓37 tok · 812 pp/s · 51 tg/s", the same as
+// the CLI's status row without the context (Zed draws that as its ring), and the meter alone.
+func (s *Session) phaseStatus(phase int) (string, string) {
+	s.turnMu.Lock()
+	start := s.turn.start
+	s.turnMu.Unlock()
+	s.phaseMu.Lock()
+	meter, fn, pp, tg := s.meter, s.meterFn, s.pp, s.tg
+	s.phaseMu.Unlock()
+	if fn != nil {
+		meter = fn()
 	}
-	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(phase, done, "")})
+	parts := []string{phaseNames[phase]}
+	if !start.IsZero() {
+		parts = append(parts, elapsed(time.Since(start)))
+	}
+	if meter != "" {
+		parts = append(parts, meter)
+	}
+	if pp > 0 {
+		parts = append(parts, strconv.Itoa(int(pp+0.5))+" pp/s")
+	}
+	if tg > 0 {
+		parts = append(parts, strconv.Itoa(int(tg+0.5))+" tg/s")
+	}
+	return strings.Join(parts, " · "), meter
 }
 
-// setStatus is a no-op when no phase is active, so background calls don't clobber the UI.
-func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
+// The tracked phase lets holdTurn's release complete it if the turn exits early. While a
+// phase is active one ticker per session sends its status every second, so the time moves
+// during a long tool run too; it ends itself once no phase is active.
+func (a *agent) sendPhase(ctx context.Context, sid string, phase int, done bool) {
+	sess := a.getSession(sid)
+	if sess == nil { // closed mid-turn
+		a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(nil, phase, done)})
+		return
+	}
+	sess.phaseMu.Lock()
+	sess.phaseCurrent = phase
+	sess.phaseActive = !done
+	tick := !done && !sess.phaseTicking
+	sess.phaseTicking = sess.phaseTicking || tick
+	sess.phaseMu.Unlock()
+	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(sess, phase, done)})
+	if tick {
+		go func() {
+			t := time.NewTicker(time.Second)
+			defer t.Stop()
+			for range t.C {
+				sess.phaseMu.Lock()
+				active, cur := sess.phaseActive, sess.phaseCurrent
+				sess.phaseTicking = active
+				sess.phaseMu.Unlock()
+				if !active {
+					return
+				}
+				a.sendUpdate(context.Background(), sid, planUpdate{Kind: "plan", Entries: phaseEntries(sess, cur, false)})
+			}
+		}()
+	}
+}
+
+// setStatus shows what runs now ("queued", a model call's progress), "" for nothing; a
+// no-op when no phase is active, so background calls don't clobber the UI.
+func (a *agent) setStatus(ctx context.Context, sid string, meter string) {
 	sess := a.getSession(sid)
 	if sess == nil {
 		return
 	}
 	sess.phaseMu.Lock()
+	sess.meter, sess.meterFn = meter, nil
 	active, phase := sess.phaseActive, sess.phaseCurrent
 	sess.phaseMu.Unlock()
-	if !active {
-		return
+	if active {
+		a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(sess, phase, false)})
 	}
-	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(phase, false, suffix)})
 }
 
-// stop() joins the goroutine so a late tick can't re-set a cleared row. A caller
-// that also defers setStatus(ctx, sid, "") must register that defer first.
+// startStatusMeter makes render the meter the phase ticker shows; stop() takes it away.
 func (a *agent) startStatusMeter(ctx context.Context, sid string, render func() string) (stop func()) {
-	done, stopped := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(stopped)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				a.setStatus(ctx, sid, render())
-			}
-		}
-	}()
-	return func() { close(done); <-stopped }
+	sess := a.getSession(sid)
+	if sess == nil {
+		return func() {}
+	}
+	sess.phaseMu.Lock()
+	sess.meterFn = render
+	sess.phaseMu.Unlock()
+	return func() {
+		sess.phaseMu.Lock()
+		sess.meterFn = nil
+		sess.phaseMu.Unlock()
+	}
 }
 
 const sessionTitleMax = 60

@@ -536,6 +536,14 @@ func (a *agent) recordStreamStats(sid, connLabel string, conn *LLMConnection, r 
 		if gMs > 0 && r.completionTokens > 0 {
 			speeds.GenPerSec = float64(r.completionTokens) * 1000 / gMs
 		}
+		sess.phaseMu.Lock()
+		if speeds.PromptPerSec > 0 {
+			sess.pp = speeds.PromptPerSec
+		}
+		if speeds.GenPerSec > 0 {
+			sess.tg = speeds.GenPerSec
+		}
+		sess.phaseMu.Unlock()
 		a.sendUpdate(context.Background(), sid, usageUpdate{Kind: "usage_update", Used: r.promptTokens, Size: size, Meta: speeds})
 	}
 }
@@ -695,7 +703,7 @@ func (a *agent) acquireConnSlot(ctx context.Context, sid string, conn *LLMConnec
 	select {
 	case sem <- struct{}{}:
 	default:
-		a.setStatus(ctx, sid, " (queued…)")
+		a.setStatus(ctx, sid, "queued")
 		select {
 		case sem <- struct{}{}:
 		case <-ctx.Done():
@@ -749,7 +757,7 @@ func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnecti
 	}
 
 	upLabel := humanBytes(len(body))
-	a.setStatus(ctx, sid, fmt.Sprintf(" (llm[%s] ↑%s sent…)", slotLabel, upLabel))
+	a.setStatus(ctx, sid, fmt.Sprintf("llm[%s] ↑%s sent", slotLabel, upLabel))
 	defer a.setStatus(ctx, sid, "")
 
 	// Deferred after the status clear, so LIFO stops the meter first.
@@ -758,9 +766,9 @@ func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnecti
 	defer a.startStatusMeter(ctx, sid, func() string {
 		if g := atomic.LoadInt64(&genChars); g > 0 {
 			// chars/4 approximates tokens.
-			return fmt.Sprintf(" (llm[%s] ↑%s ↓%s tok…)", slotLabel, upLabel, humanCount(int(g)/4))
+			return fmt.Sprintf("llm[%s] ↑%s ↓%s tok", slotLabel, upLabel, humanCount(int(g)/4))
 		}
-		return fmt.Sprintf(" (llm[%s] ↑%s sent… %ds)", slotLabel, upLabel, int(time.Since(meterStart).Seconds()))
+		return fmt.Sprintf("llm[%s] ↑%s sent %ds", slotLabel, upLabel, int(time.Since(meterStart).Seconds()))
 	})()
 
 	connLabel := fmt.Sprintf("llm[%s] %s model=%s", slotLabel, conn.Tag, conn.Model)

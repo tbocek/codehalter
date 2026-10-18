@@ -76,9 +76,16 @@ type Session struct {
 	Shadow   []string `toml:"shadow,omitempty"`
 	mcpOffer []acpMCPServer
 	// phaseMu, not mu: llmStream updates the status while writers hold mu.
-	phaseMu        sync.Mutex
-	phaseActive    bool
-	phaseCurrent   int
+	phaseMu      sync.Mutex
+	phaseActive  bool
+	phaseCurrent int
+	// Under phaseMu: what the status shows besides the phase. meter is what runs now (a model
+	// call's progress, "queued"), meterFn its live source; pp and tg the last call's speeds;
+	// phaseTicking, that the one-second ticker runs.
+	meter          string
+	meterFn        func() string
+	pp, tg         float64
+	phaseTicking   bool
 	planTableShown bool
 	// mu guards the persisted fields so a parallel Save never encodes a torn slice.
 	mu sync.Mutex

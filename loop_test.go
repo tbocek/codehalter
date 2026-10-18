@@ -17,42 +17,6 @@ import (
 	"time"
 )
 
-func meterCall(name, args string) toolCall {
-	tc := toolCall{ID: "tc1"}
-	tc.Function.Name = name
-	tc.Function.Arguments = args
-	return tc
-}
-
-// stop() joins the ticker goroutine promptly, also after a ctx cancel.
-func TestStartToolMeter(t *testing.T) {
-	a, s := newTestAgent(t)
-
-	stop := a.startToolMeter(context.Background(), s.ID, meterCall("web_search", `{"query":"goldmark tables"}`))
-	if stop == nil {
-		t.Fatal("startToolMeter returned a nil stop")
-	}
-	done := make(chan struct{})
-	go func() { stop(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("stop() did not return: meter goroutine leaked or deadlocked")
-	}
-
-	// A cancelled ctx also unblocks stop().
-	ctx, cancel := context.WithCancel(context.Background())
-	stop2 := a.startToolMeter(ctx, s.ID, meterCall("run_command", `{"command":"sleep 1"}`))
-	cancel()
-	done2 := make(chan struct{})
-	go func() { stop2(); close(done2) }()
-	select {
-	case <-done2:
-	case <-time.After(2 * time.Second):
-		t.Fatal("stop() after ctx cancel did not return")
-	}
-}
-
 func TestThrottledStream(t *testing.T) {
 	var emits []string
 	sink, flush := throttledStream(func(chunk string) { emits = append(emits, chunk) })
@@ -287,47 +251,6 @@ func TestStuckCallIsNotRunAgainInTheSameTurn(t *testing.T) {
 	if got := mock.request(len(step1) + 2); !strings.Contains(fmt.Sprint(got["messages"]), "not run: an earlier attempt at this task ran exactly this call") ||
 		!strings.Contains(fmt.Sprint(got["messages"]), "img/05-cut.png") {
 		t.Errorf("the refused call did not carry the note and the earlier output:\n%v", got["messages"])
-	}
-}
-
-func TestToolMeterShowsTheArgument(t *testing.T) {
-	h := newTerminalHarness(t)
-	a, s := h.agent, h.sess
-	s.phaseMu.Lock()
-	s.phaseActive, s.phaseCurrent = true, 0
-	s.phaseMu.Unlock()
-
-	long := strings.Repeat("x", 200)
-	for _, tc := range []struct {
-		name, args, want string
-	}{
-		{"run_command", `{"command":"go build ./..."}`, "run_command go build ./..."},
-		{"read_file", `{"path":"loop.go","limit":40}`, "read_file loop.go"},
-		{"web_search", `{"query":"line one\nline two"}`, "web_search line one line two"}, // no row-breaking newline
-		{"run_command", `{"command":"` + long + `"}`, "run_command " + strings.Repeat("x", toolMeterArgRunes)},
-		{"read_file", `not json at all`, "read_file"},
-	} {
-		stop := a.startToolMeter(context.Background(), s.ID, meterCall(tc.name, tc.args))
-		stop()
-		if !h.waitFor(func() bool { return len(h.updatesOfKind("plan")) > 0 }) {
-			t.Fatalf("%s: no plan update", tc.name)
-		}
-		var got string
-		for _, u := range h.updatesOfKind("plan") {
-			entries, _ := u["entries"].([]any)
-			for _, e := range entries {
-				em, _ := e.(map[string]any)
-				if em["status"] == "in_progress" {
-					got, _ = em["content"].(string)
-				}
-			}
-		}
-		if want := " (running " + tc.want + "…)"; !strings.HasSuffix(got, want) {
-			t.Errorf("%s(%s) row = %q, want it to end in %q", tc.name, tc.args, got, want)
-		}
-		h.mu.Lock()
-		h.updates = nil
-		h.mu.Unlock()
 	}
 }
 

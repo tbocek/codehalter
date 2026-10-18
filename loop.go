@@ -482,33 +482,6 @@ func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []
 	return append(messages, llmMessage{Role: "user", Content: text})
 }
 
-func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (stop func()) {
-	label := tc.Function.Name
-	// Only one argument fits the row; collapsing whitespace keeps a heredoc on one line.
-	var args map[string]any
-	if json.Unmarshal([]byte(tc.Function.Arguments), &args) == nil {
-		for _, key := range []string{"command", "query", "path", "id"} {
-			v, _ := args[key].(string)
-			if v = strings.Join(strings.Fields(v), " "); v == "" {
-				continue
-			}
-			if r := []rune(v); len(r) > toolMeterArgRunes {
-				v = string(r[:toolMeterArgRunes])
-			}
-			label += " " + v
-			break
-		}
-	}
-	start := time.Now()
-	a.setStatus(ctx, sid, " (running "+label+"…)") // immediate, before the first tick
-	return a.startStatusMeter(ctx, sid, func() string {
-		return fmt.Sprintf(" (running %s… %ds)", label, int(time.Since(start).Seconds()))
-	})
-}
-
-// Past this the phase name and the seconds counter get pushed out of view.
-const toolMeterArgRunes = 48
-
 // Repeats are keyed by the answer, not the call: a varied call (a new echo label, a
 // counter in a log name) still gets the same answer. Maps, so an interleaved revisit counts.
 type repetitionTracker struct {
@@ -1065,8 +1038,6 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				a.announceToolCall(ctx, sid, tc)
 			}
 
-			stopMeter := a.startToolMeter(ctx, sid, tc)
-
 			var tu ToolUse
 			var content any
 			denied := policy.deny[tc.Function.Name]
@@ -1087,7 +1058,6 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			default:
 				tu, content = a.runToolCall(ctx, sid, tc)
 			}
-			stopMeter()
 			res.ToolUses = append(res.ToolUses, tu)
 			// A denied call is the model's mistake, not a tool failure.
 			if tu.Failed && !denied {
