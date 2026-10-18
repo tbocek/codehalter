@@ -446,3 +446,54 @@ func TestLiveRegionLeavesNoRowsBehind(t *testing.T) {
 		t.Errorf("plan header on screen %d times after five redraws, want 1", n)
 	}
 }
+
+// Rows are measured in cells: an emoji or a CJK glyph takes two, a combining accent none.
+// Counted in runes, a row of them was twice the terminal's width and wrapped once more.
+func TestRowsAreMeasuredInCells(t *testing.T) {
+	for _, c := range []struct {
+		s     string
+		cells int
+	}{{"abc", 3}, {"→ ✓ …", 5}, {"✅🧪", 4}, {"中文", 4}, {"e\u0301", 1}, {"⚠\ufe0f", 1}} {
+		if got := visibleLen(c.s); got != c.cells {
+			t.Errorf("visibleLen(%q) = %d, want %d", c.s, got, c.cells)
+		}
+	}
+	u, buf := uiFor(false, 21, 24) // 20 cells for text
+	u.Stream("", "", strings.Repeat("✅", 15)+"\n"+strings.Repeat("中", 15)+"\n")
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	rows := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	for _, row := range rows {
+		if w := visibleLen(row); w > 20 {
+			t.Errorf("row %q is %d cells, past 20", row, w)
+		}
+	}
+	if len(rows) != 4 { // 30 cells each: a full row of 20 and the rest
+		t.Errorf("rows = %q, want two per line", rows)
+	}
+	if w := visibleLen(u.clip(strings.Repeat("🧪", 30))); w > u.cols-1 {
+		t.Errorf("a clipped row of emoji is %d cells, past %d", w, u.cols-1)
+	}
+}
+
+// While a question's prompt is open, arriving output waits for the answer instead of
+// breaking the row being typed on; the main prompt does not hold anything back.
+func TestOutputWaitsForAnOpenQuestion(t *testing.T) {
+	u, buf := uiFor(true, 60, 24)
+	u.Ask("  [1-2] ")
+	u.Note("", "background job 3 exited with code 0")
+	if strings.Contains(buf.String(), "background job 3") {
+		t.Fatalf("printed while the answer was being typed: %q", buf.String())
+	}
+	u.Submitted("1")
+	if !strings.Contains(buf.String(), "background job 3 exited with code 0\n") {
+		t.Errorf("held output not printed after the answer: %q", buf.String())
+	}
+	buf.Reset()
+	u.Prompt("\n❯ ")
+	u.Note("", "a note at the main prompt")
+	if !strings.Contains(buf.String(), "a note at the main prompt") {
+		t.Errorf("the main prompt held output back: %q", buf.String())
+	}
+}

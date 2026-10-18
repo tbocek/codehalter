@@ -732,7 +732,7 @@ func (c *cliClient) askChoiceOrText(question string, labels []string, allowText 
 	}
 
 	for attempt := 0; attempt < 3; attempt++ {
-		c.ui.Prompt(hint)
+		c.ui.Ask(hint)
 		line, err := c.in.ReadString('\n')
 		ans := strings.TrimSpace(line)
 		c.ui.Submitted(ans)

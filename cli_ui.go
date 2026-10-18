@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 )
 
 // Inline TUI: rows above the live region are printed once; the bottom liveRows rows are
@@ -78,6 +77,10 @@ type cliUI struct {
 	// breaks the row first and drawLive reprints the prompt below.
 	promptStr    string
 	promptBroken bool
+	// asking: a question's prompt is open (Ask). Lines arriving meanwhile are held and printed
+	// after the answer: in cooked mode a reprinted prompt row lost what had been typed so far.
+	asking bool
+	held   []string
 }
 
 func stdoutStyled() bool {
@@ -136,6 +139,10 @@ func (u *cliUI) eraseLive() {
 }
 
 func (u *cliUI) emitLine(s string) {
+	if u.asking {
+		u.held = append(u.held, s)
+		return
+	}
 	if u.promptStr != "" && !u.promptBroken {
 		u.out.WriteString("\n")
 		u.promptBroken = true
@@ -278,11 +285,11 @@ func (u *cliUI) clip(s string) string {
 			b.WriteRune(r)
 			continue
 		}
-		if width == limit-1 {
+		if width+runeCells(r) > limit-1 {
 			break
 		}
 		b.WriteRune(r)
-		width++
+		width += runeCells(r)
 	}
 	b.WriteString("…")
 	// Close whatever styling the truncated tail would have closed.
@@ -292,7 +299,7 @@ func (u *cliUI) clip(s string) string {
 	return b.String()
 }
 
-// Counts runes, not cells: wide (CJK) glyphs are undercounted.
+// visibleLen counts terminal cells, escapes excluded.
 func visibleLen(s string) int {
 	n, esc := 0, false
 	for _, r := range s {
@@ -303,10 +310,57 @@ func visibleLen(s string) int {
 		case r == '\x1b':
 			esc = true
 		default:
-			n++
+			n += runeCells(r)
 		}
 	}
 	return n
+}
+
+// wideRanges are drawn two cells wide: CJK, Hangul, fullwidth forms, and the emoji with
+// emoji presentation (Unicode East Asian Width W). Ambiguous characters count as one,
+// as most terminals draw them.
+var wideRanges = [][2]rune{
+	{0x1100, 0x115F}, {0x231A, 0x231B}, {0x2329, 0x232A}, {0x23E9, 0x23EC}, {0x23F0, 0x23F0},
+	{0x23F3, 0x23F3}, {0x25FD, 0x25FE}, {0x2614, 0x2615}, {0x2648, 0x2653}, {0x267F, 0x267F},
+	{0x2693, 0x2693}, {0x26A1, 0x26A1}, {0x26AA, 0x26AB}, {0x26BD, 0x26BE}, {0x26C4, 0x26C5},
+	{0x26CE, 0x26CE}, {0x26D4, 0x26D4}, {0x26EA, 0x26EA}, {0x26F2, 0x26F3}, {0x26F5, 0x26F5},
+	{0x26FA, 0x26FA}, {0x26FD, 0x26FD}, {0x2705, 0x2705}, {0x270A, 0x270B}, {0x2728, 0x2728},
+	{0x274C, 0x274C}, {0x274E, 0x274E}, {0x2753, 0x2755}, {0x2757, 0x2757}, {0x2795, 0x2797},
+	{0x27B0, 0x27B0}, {0x27BF, 0x27BF}, {0x2B1B, 0x2B1C}, {0x2B50, 0x2B50}, {0x2B55, 0x2B55},
+	{0x2E80, 0x303E}, {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xA000, 0xA4CF},
+	{0xA960, 0xA97F}, {0xAC00, 0xD7A3}, {0xF900, 0xFAFF}, {0xFE10, 0xFE19}, {0xFE30, 0xFE6F},
+	{0xFF00, 0xFF60}, {0xFFE0, 0xFFE6}, {0x1F004, 0x1F004}, {0x1F0CF, 0x1F0CF}, {0x1F18E, 0x1F18E},
+	{0x1F191, 0x1F19A}, {0x1F200, 0x1F251}, {0x1F300, 0x1F320}, {0x1F32D, 0x1F335}, {0x1F337, 0x1F37C},
+	{0x1F37E, 0x1F393}, {0x1F3A0, 0x1F3CA}, {0x1F3CF, 0x1F3D3}, {0x1F3E0, 0x1F3F0}, {0x1F3F4, 0x1F3F4},
+	{0x1F3F8, 0x1F43E}, {0x1F440, 0x1F440}, {0x1F442, 0x1F4FC}, {0x1F4FF, 0x1F53D}, {0x1F54B, 0x1F54E},
+	{0x1F550, 0x1F567}, {0x1F57A, 0x1F57A}, {0x1F595, 0x1F596}, {0x1F5A4, 0x1F5A4}, {0x1F5FB, 0x1F64F},
+	{0x1F680, 0x1F6C5}, {0x1F6CC, 0x1F6CC}, {0x1F6D0, 0x1F6D2}, {0x1F6D5, 0x1F6D7}, {0x1F6DC, 0x1F6DF},
+	{0x1F6EB, 0x1F6EC}, {0x1F6F4, 0x1F6FC}, {0x1F7E0, 0x1F7EB}, {0x1F7F0, 0x1F7F0}, {0x1F90C, 0x1F93A},
+	{0x1F93C, 0x1F945}, {0x1F947, 0x1F9FF}, {0x1FA70, 0x1FAFF}, {0x20000, 0x3FFFD},
+}
+
+// runeCells is how many terminal cells r takes: 0 for combining marks, zero-width
+// characters and variation selectors, 2 for wide ones, else 1.
+func runeCells(r rune) int {
+	switch {
+	case r >= 0x300 && r <= 0x36F, r >= 0x200B && r <= 0x200F, r >= 0x2060 && r <= 0x2064,
+		r >= 0xFE00 && r <= 0xFE0F, r >= 0xFE20 && r <= 0xFE2F, r >= 0xE0100 && r <= 0xE01EF:
+		return 0
+	case r < 0x1100:
+		return 1
+	}
+	if _, wide := slices.BinarySearchFunc(wideRanges, r, func(rg [2]rune, r rune) int {
+		switch {
+		case rg[1] < r:
+			return -1
+		case rg[0] > r:
+			return 1
+		}
+		return 0
+	}); wide {
+		return 2
+	}
+	return 1
 }
 
 // sanitize drops cursor-moving control chars from model/tool text and expands tabs (drawn up
@@ -357,14 +411,14 @@ func (u *cliUI) Stream(sty, pre, s string) {
 		u.flushRow()
 		u.pendSty, u.pendPre = sty, pre
 	}
-	width := max(u.cols-1-utf8.RuneCountInString(u.pendPre), 16)
+	width := max(u.cols-1-visibleLen(u.pendPre), 16)
 	for _, r := range s {
 		if r == '\n' {
 			u.endRow()
 			continue
 		}
 		u.pend = append(u.pend, r)
-		for len(u.pend) > width {
+		for visibleLen(string(u.pend)) > width {
 			head, tail := breakRow(u.pend, width)
 			u.emitLine(u.pendPre + u.style(string(head), u.pendSty))
 			u.pend = tail
@@ -373,13 +427,20 @@ func (u *cliUI) Stream(sty, pre, s string) {
 	u.drawLive()
 }
 
+// breakRow splits row after at most width cells, at its last space when there is one.
 func breakRow(row []rune, width int) (head, tail []rune) {
-	for i := width; i > 0; i-- {
+	fit, cells := 0, 0
+	for fit < len(row) && cells+runeCells(row[fit]) <= width {
+		cells += runeCells(row[fit])
+		fit++
+	}
+	fit = max(fit, 1) // a row always moves on, even past a glyph wider than the whole width
+	for i := fit; i > 0; i-- {
 		if row[i-1] == ' ' {
 			return row[:i-1], row[i:]
 		}
 	}
-	return row[:width], row[width:]
+	return row[:fit], row[fit:]
 }
 
 // endRow commits even an empty row, so blank markdown lines survive.
@@ -566,15 +627,28 @@ func (u *cliUI) Prompt(s string) {
 	u.out.Flush()
 }
 
+// Ask is Prompt for a question's answer: output arriving before Submitted waits for it.
+func (u *cliUI) Ask(s string) {
+	u.Prompt(s)
+	u.mu.Lock()
+	u.asking = true
+	u.mu.Unlock()
+}
+
 func (u *cliUI) Submitted(text string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.promptStr != "" && u.echoInput {
 		u.out.WriteString(text)
 		u.out.WriteString("\n")
-		u.out.Flush()
 	}
-	u.promptStr, u.promptBroken = "", false
+	u.promptStr, u.promptBroken, u.asking = "", false, false
+	for _, l := range u.held {
+		u.out.WriteString(l)
+		u.out.WriteString("\n")
+	}
+	u.held = nil
+	u.out.Flush()
 }
 
 // Trims common head and tail only (no LCS): exact for edit_file's single-region edits, no dependency.

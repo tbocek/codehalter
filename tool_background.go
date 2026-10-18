@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -570,33 +569,6 @@ func stopHint(pid int) string {
 // terminals start commands with SIGTERM ignored.
 var jobKillGrace = 3 * time.Second
 
-// killGroup: SIGTERM to pid's group (the pid alone if it leads none), SIGKILL
-// after jobKillGrace; it returns at once.
-func killGroup(pid int) {
-	target := -pid
-	if err := syscall.Kill(target, syscall.SIGTERM); err != nil {
-		target = pid
-		if err := syscall.Kill(target, syscall.SIGTERM); err != nil {
-			slog.Debug("killGroup: SIGTERM", "pid", pid, "err", err)
-			return // nothing left to stop
-		}
-	}
-	// A stopped process (state T) holds the SIGTERM until it is continued.
-	if err := syscall.Kill(target, syscall.SIGCONT); err != nil {
-		slog.Debug("killGroup: SIGCONT", "pid", pid, "err", err)
-	}
-	grace := jobKillGrace
-	go func() {
-		time.Sleep(grace)
-		if syscall.Kill(target, 0) != nil {
-			return // gone after the SIGTERM
-		}
-		if err := syscall.Kill(target, syscall.SIGKILL); err != nil {
-			slog.Debug("killGroup: SIGKILL", "pid", pid, "err", err)
-		}
-	}()
-}
-
 // killOrphanedJobs stops the jobs a dead codehalter left running. Only a wrapper
 // whose command line names its own pid file is taken, so a reused pid is safe.
 func killOrphanedJobs() {
@@ -608,7 +580,7 @@ func killOrphanedJobs() {
 	for _, f := range files {
 		var owner, id int
 		if _, err := fmt.Sscanf(filepath.Base(f), "codehalter-%d-job-%d.pid", &owner, &id); err != nil ||
-			owner == os.Getpid() || syscall.Kill(owner, 0) == nil {
+			owner == os.Getpid() || processAlive(owner) {
 			continue // not ours to judge, or its codehalter still runs
 		}
 		if pid := readPidFile(f); pid > 0 {
