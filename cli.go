@@ -321,6 +321,7 @@ func (c *cliClient) adopt(sid string) {
 // A stdin read is not interrupted by a signal, so Ctrl+C at an idle prompt only hints; a
 // second one within two seconds exits through hardQuit.
 func (c *cliClient) installSignals() {
+	c.ui.watchResize()
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt)
 	go func() {

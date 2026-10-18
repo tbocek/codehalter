@@ -100,8 +100,8 @@ func newCLIUI() *cliUI {
 	return u
 }
 
-// stty instead of a TIOCGWINSZ ioctl keeps this platform-neutral. Called per turn, not on
-// SIGWINCH, so a mid-turn resize applies from the next turn.
+// stty instead of a TIOCGWINSZ ioctl keeps this platform-neutral. Called per turn and, where
+// there is one, on SIGWINCH (watchResize).
 func (u *cliUI) refreshSize() {
 	if !u.tty {
 		return
