@@ -318,7 +318,7 @@ Four things differ from `devcontainer up` even for a config it accepts, and the 
 
 None of this is required: `devcontainer up` yourself and run `devcontainer exec --workspace-folder . codehalter --cli`, and the launcher never runs.
 
-The interface is an **inline** TUI, not a full-screen one. The transcript is plain append-only output, so your scrollback, mouse selection and copy behave exactly as they do for any other command, while a small live region at the bottom is redrawn in place with the streaming reply, the current plan, running tool cards and the last few lines of any command in flight. Redirect the output to a file and the escape sequences vanish, leaving a readable log.
+The interface is an **inline** TUI, not a full-screen one. The transcript is plain append-only output, so your scrollback, mouse selection and copy behave exactly as they do for any other command, while a small live region at the bottom is redrawn in place with the streaming reply, the current plan, running tool cards and the last few lines of any command in flight. Redirect the output to a file and the escape sequences vanish, leaving a readable log. The input row is part of that live region and stays usable while a turn runs: a line typed then goes to the agent at once and steers the running turn (`/spec stop` included), as typing does in Zed; Backspace, Ctrl+U, Ctrl+W and pasting work, Ctrl+C interrupts, Ctrl+D on an empty line leaves. A /spec loop is one turn that runs for hours, and with input read only between turns nothing could be typed during it.
 
 Client-side commands:
 

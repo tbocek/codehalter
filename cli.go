@@ -150,6 +150,9 @@ func runCLI(argv []string) int {
 		c.releaseAll()
 	}
 	c.hardQuit = func() {
+		if restore := c.restoreTTY.Load(); restore != nil {
+			(*restore)()
+		}
 		shutdown()
 		os.Exit(130)
 	}
@@ -199,9 +202,17 @@ type cliClient struct {
 	// turnActive is read by the signal handler, which must not take the UI lock.
 	turnActive atomic.Bool
 
-	// askMu is the stdin token: parallel tool calls can both ask the user, and a cancelled
-	// turn returns while its question is still parked in a read.
+	// askMu serialises questions: parallel tool calls can both ask the user.
 	askMu sync.Mutex
+
+	// inputs carries every line the repl's reader reads, once the repl runs; until then (a
+	// one-shot -p run) a question reads stdin itself. waiting is the open question's channel:
+	// the next line answers it rather than becoming a prompt.
+	inputs  chan cliLine
+	waitMu  sync.Mutex
+	waiting chan cliLine
+	// restoreTTY undoes the terminal's character mode; hardQuit calls it before exiting.
+	restoreTTY atomic.Pointer[func()]
 
 	termMu  sync.Mutex
 	terms   map[string]*cliTerminal
@@ -344,24 +355,55 @@ func (c *cliClient) installSignals() {
 	}()
 }
 
-func (c *cliClient) repl() int {
-	for {
-		// askMu, not "no turn running": a cancelled turn's question may still be reading this
-		// bufio.Reader. Held across the echo so the prompt row has one owner.
-		c.askMu.Lock()
-		c.ui.Prompt("\n❯ ")
-		text, err := c.readPrompt()
-		c.ui.Submitted(text)
-		c.askMu.Unlock()
+// cliLine is one line of input, or the error that ended input.
+type cliLine struct {
+	text string
+	err  error
+}
 
-		if err != nil {
-			if !errors.Is(err, io.EOF) {
-				c.ui.Note(ansiRed, "input: "+err.Error())
+// repl keeps reading while a turn runs: a /spec loop is one turn that runs for hours, and
+// with the read parked behind it nothing could be typed, not even `/spec stop`. A line
+// typed during a turn goes to the agent at once, which takes it as steering.
+func (c *cliClient) repl() int {
+	restore := c.ui.startInput()
+	c.restoreTTY.Store(&restore)
+	defer restore()
+	c.inputs = make(chan cliLine)
+	go c.readInput()
+	turnDone := make(chan struct{})
+	busy := false
+	for {
+		if !busy {
+			c.ui.Prompt("\n❯ ")
+		}
+		var ln cliLine
+		select {
+		case <-turnDone:
+			busy = false
+			continue
+		case ln = <-c.inputs:
+		}
+		c.waitMu.Lock()
+		waiting := c.waiting
+		c.waitMu.Unlock()
+		if waiting != nil {
+			waiting <- ln // the open question's answer
+			continue
+		}
+		c.ui.Submitted(ln.text)
+		if ln.err != nil {
+			if !errors.Is(ln.err, io.EOF) {
+				c.ui.Note(ansiRed, "input: "+ln.err.Error())
 			}
 			c.ui.Note(ansiDim, "")
 			return 0
 		}
+		text := ln.text
 		if text == "" {
+			continue
+		}
+		if name, _, _ := strings.Cut(text, " "); busy && (name == "/new" || name == "/resume") {
+			c.ui.Note(ansiYell, "  "+name+" waits until the turn has ended (Ctrl+C interrupts it)")
 			continue
 		}
 		if handled, quit := c.command(text); handled {
@@ -370,7 +412,104 @@ func (c *cliClient) repl() int {
 			}
 			continue
 		}
-		c.turn(text)
+		if busy {
+			go c.steer(text)
+			continue
+		}
+		busy = true
+		go func() {
+			c.turn(text)
+			turnDone <- struct{}{}
+		}()
+	}
+}
+
+// steer sends a line typed during a turn; the agent folds it into the running turn and
+// answers at once.
+func (c *cliClient) steer(text string) {
+	if _, err := c.conn.request("session/prompt", PromptRequest{
+		SessionId: c.sessionID(),
+		Content:   []ContentBlock{{Type: "text", Text: text}},
+	}); err != nil {
+		c.ui.Note(ansiRed, "  not delivered: "+err.Error())
+	}
+}
+
+// readInput is the one reader of stdin while the repl runs: keys on a terminal in
+// character mode, lines otherwise.
+func (c *cliClient) readInput() {
+	if !c.ui.inputActive() {
+		for {
+			text, err := c.readPrompt()
+			c.inputs <- cliLine{text, err}
+			if err != nil {
+				return
+			}
+		}
+	}
+	var buf []rune
+	paste := false
+	for {
+		r, _, err := c.in.ReadRune()
+		if err != nil {
+			c.inputs <- cliLine{err: err}
+			return
+		}
+		switch {
+		case r == 0x1b:
+			// A key's escape sequence arrives in one read; a lone ESC has nothing behind it.
+			if c.in.Buffered() == 0 {
+				continue
+			}
+			next, _, _ := c.in.ReadRune()
+			var seq []rune
+			for next == '[' && c.in.Buffered() > 0 {
+				q, _, _ := c.in.ReadRune()
+				seq = append(seq, q)
+				if q >= 0x40 && q <= 0x7e {
+					break
+				}
+			}
+			if next == 'O' && c.in.Buffered() > 0 {
+				c.in.ReadRune()
+			}
+			switch string(seq) {
+			case "200~": // bracketed paste: its newlines are text, not Enter
+				paste = true
+			case "201~":
+				paste = false
+			}
+			continue
+		case (r == '\r' || r == '\n') && paste:
+			buf = append(buf, '\n')
+		case r == '\r' || r == '\n':
+			c.inputs <- cliLine{text: strings.TrimSpace(string(buf))}
+			buf = buf[:0]
+		case r == 0x7f || r == 0x08: // backspace
+			if len(buf) > 0 {
+				buf = buf[:len(buf)-1]
+			}
+		case r == 0x04: // Ctrl+D leaves on an empty line
+			if len(buf) == 0 {
+				c.inputs <- cliLine{err: io.EOF}
+				return
+			}
+		case r == 0x15: // Ctrl+U
+			buf = buf[:0]
+		case r == 0x17: // Ctrl+W
+			buf = []rune(strings.TrimRight(string(buf), " "))
+			if i := strings.LastIndexByte(string(buf), ' '); i >= 0 {
+				buf = []rune(string(buf)[:i+1])
+			} else {
+				buf = buf[:0]
+			}
+		case r == '\t':
+			buf = append(buf, ' ')
+		case r < 0x20:
+		default:
+			buf = append(buf, r)
+		}
+		c.ui.SetInput(slices.Clone(buf))
 	}
 }
 
@@ -731,9 +870,26 @@ func (c *cliClient) askChoiceOrText(question string, labels []string, allowText 
 		hint = "  [1-" + strconv.Itoa(len(labels)) + ", or type an answer, Enter to dismiss] "
 	}
 
+	// With the repl running, its reader owns stdin and hands this question the next line.
+	next := func() (string, error) { return c.in.ReadString('\n') }
+	if c.inputs != nil {
+		ch := make(chan cliLine, 1)
+		c.waitMu.Lock()
+		c.waiting = ch
+		c.waitMu.Unlock()
+		defer func() {
+			c.waitMu.Lock()
+			c.waiting = nil
+			c.waitMu.Unlock()
+		}()
+		next = func() (string, error) {
+			ln := <-ch
+			return ln.text, ln.err
+		}
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		c.ui.Ask(hint)
-		line, err := c.in.ReadString('\n')
+		line, err := next()
 		ans := strings.TrimSpace(line)
 		c.ui.Submitted(ans)
 		// Run from a script (-p, no terminal) whose input has run out, nobody can answer:

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -371,8 +372,17 @@ func TestLocateSymbol(t *testing.T) {
 	for i := 0; i < 80; i++ {
 		broken = append(broken, "    step();")
 	}
-	if loc := locateSymbol(strings.Join(broken, "\n"), "half_written"); loc.end != symbolFallbackLines || !strings.Contains(loc.how, "fallback") {
-		t.Errorf("broken = %+v, want the 50-line fallback", loc)
+	// A `{` that never closes: its body is still told by its indentation.
+	if loc := locateSymbol(strings.Join(broken, "\n"), "half_written"); loc.end != 81 || loc.how != "indentation" {
+		t.Errorf("broken = %+v, want 1-81 by indentation", loc)
+	}
+	if loc := locateSymbol("def half_written(x,\ny = 1\n", "half_written"); !strings.Contains(loc.how, "fallback") {
+		t.Errorf("unreadable = %+v, want the fallback", loc)
+	}
+
+	ruby := "class Cut\n  def trim(t)\n    if t < 0\n      nil\n    end\n  end\n\n  def other\n  end\nend\n"
+	if loc := locateSymbol(ruby, "trim"); loc.start != 2 || loc.end != 6 || loc.how != "indentation" {
+		t.Errorf("ruby = %+v, want 2-6 by indentation, through its own end", loc)
 	}
 
 	if loc := locateSymbol("let a = helper(1);\nlet b = helper(2);\n", "helper"); loc.start != 0 || len(loc.mentions) != 2 {
@@ -427,8 +437,11 @@ func TestEditFileByAnchors(t *testing.T) {
 	if out, failed := edit(fmt.Sprintf(`{"path":%q,"start":"fn ","end":"}","new_text":"x"}`, path)); !failed || !strings.Contains(out, "on 3 lines") {
 		t.Errorf("ambiguous start = %v %s", failed, out)
 	}
-	if out, failed := edit(fmt.Sprintf(`{"path":%q,"start":"fn b()","end":"nowhere","new_text":"x"}`, path)); !failed || !strings.Contains(out, "`end`") {
-		t.Errorf("missing end = %v %s", failed, out)
+	if out, failed := edit(fmt.Sprintf(`{"path":%q,"start":"three();","end":"nowhere","new_text":"x"}`, path)); !failed || !strings.Contains(out, "`end`") {
+		t.Errorf("missing end on a line that opens no block = %v %s", failed, out)
+	}
+	if out, failed := edit(fmt.Sprintf(`{"path":%q,"start":"fn b()","end":"}","new_text":"fn b() { b(); }"}`, path)); failed || !strings.Contains(out, "lines 7-7 replaced, its end found by braces") {
+		t.Errorf("a one-line block ended by its brace = %v %s", failed, out)
 	}
 	if out, failed := edit(fmt.Sprintf(`{"path":%q,"new_text":"x"}`, path)); !failed || !strings.Contains(out, "either") {
 		t.Errorf("neither form = %v %s", failed, out)
@@ -698,5 +711,62 @@ func TestToolPathWithoutLeadingSlash(t *testing.T) {
 	rel := strings.TrimPrefix(filepath.Join(s.Cwd, "a.txt"), "/")
 	if tu := callTool(t, a, s.ID, "read_file", `{"path":"`+rel+`"}`); tu.Failed || !strings.Contains(tu.Output, "found") {
 		t.Errorf("read of %q: %q", rel, tu.Output)
+	}
+}
+
+// A function's last line is a bare `}`, which also closes its inner blocks, so the model
+// cannot name it: given the bare brace, or a marker that is on no line (the model's own
+// "} // placeholder-not-used"), the block opening on the start line is replaced through
+// its own closing line, found by braces or, for Python, by indentation.
+func TestEditFileBlockEndsWhereItCloses(t *testing.T) {
+	a, s := newTestAgent(t)
+	edit := func(name, src, args string) (string, string, bool) {
+		t.Helper()
+		path := filepath.Join(s.Cwd, name)
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var tc toolCall
+		tc.Function.Name = "edit_file"
+		tc.Function.Arguments = fmt.Sprintf(`{"path":%q,`, path) + args
+		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+		got, _ := os.ReadFile(path)
+		return tu.Output, string(got), tu.Failed
+	}
+	rs := "fn a() {}\n\npub fn trim(t: f64) -> Option<f64> {\n    if t < 0.0 {\n        return None;\n    }\n    Some(t)\n}\n\nfn b() {}\n"
+	want := "fn a() {}\n\npub fn trim(t: f64) -> Option<f64> {\n    Some(t.max(0.0))\n}\n\nfn b() {}\n"
+	for _, end := range []string{"} // placeholder-not-used", "}"} {
+		out, got, failed := edit("w.rs", rs, `"start":"pub fn trim(t: f64) -> Option<f64> {","end":`+strconv.Quote(end)+`,"new_text":"pub fn trim(t: f64) -> Option<f64> {\n    Some(t.max(0.0))\n}"}`)
+		if failed || got != want || !strings.Contains(out, "lines 3-8 replaced, its end found by braces") {
+			t.Errorf("end %q: failed=%v %s\nfile:\n%s", end, failed, out, got)
+		}
+	}
+	// Any language: the closing keyword, a body's own braces, a signature over several lines.
+	for _, c := range []struct{ name, file, src, start, end, newText, want, how string }{
+		{"ruby", "w.rb", "def a\nend\n\ndef trim(t)\n  if t < 0\n    return nil\n  end\n  t\nend\n\ndef b\nend\n",
+			"def trim(t)", "end", "def trim(t)\n  t.abs\nend", "def a\nend\n\ndef trim(t)\n  t.abs\nend\n\ndef b\nend\n", "indentation"},
+		{"lua", "w.lua", "function trim(t)\n  if t < 0 then\n    return nil\n  end\n  return t\nend\nprint(1)\n",
+			"function trim(t)", "end", "function trim(t)\n  return math.abs(t)\nend", "function trim(t)\n  return math.abs(t)\nend\nprint(1)\n", "indentation"},
+		{"shell", "w.sh", "if [ -f x ]; then\n  for f in a b; do\n    echo $f\n  done\nfi\necho end\n",
+			"if [ -f x ]", "fi", "if [ -f y ]; then\n  echo y\nfi", "if [ -f y ]; then\n  echo y\nfi\necho end\n", "indentation"},
+		{"python dict in the body", "d.py", "def f():\n    x = {\n        'a': 1,\n    }\n    return x\n\ny = 2\n",
+			"def f():", "# end f", "def f():\n    return {'a': 1}", "def f():\n    return {'a': 1}\n\ny = 2\n", "indentation"},
+		{"rust, signature over lines, braces in a char and a comment", "s.rs", "pub fn trim(\n    t: f64,\n) -> f64 {\n    let open = '{';\n    /* { */\n    t\n}\nfn b() {}\n",
+			"pub fn trim(", "}", "pub fn trim(t: f64) -> f64 {\n    t\n}", "pub fn trim(t: f64) -> f64 {\n    t\n}\nfn b() {}\n", "braces"},
+		{"c, a for loop's semicolons", "l.c", "void f(int n) {\n    for (int i = 0; i < n; i++) {\n        g(i);\n    }\n}\nint x;\n",
+			"for (int i = 0; i < n; i++) {", "}", "    for (int i = 0; i < n; i++) g(i);", "void f(int n) {\n    for (int i = 0; i < n; i++) g(i);\n}\nint x;\n", "braces"},
+		{"a bare word is a word", "w.rs", "fn f() {\n    stopwatch();\n    stop();\n    after();\n}\n",
+			"stopwatch();", "stop", "    go();", "fn f() {\n    go();\n    after();\n}\n", ""},
+	} {
+		out, got, failed := edit(c.file, c.src, `"start":`+strconv.Quote(c.start)+`,"end":`+strconv.Quote(c.end)+`,"new_text":`+strconv.Quote(c.newText)+`}`)
+		if failed || got != c.want || !strings.Contains(out, c.how) {
+			t.Errorf("%s: failed=%v %s\nfile:\n%s", c.name, failed, out, got)
+		}
+	}
+
+	py := "def a():\n    return 1\n\ndef trim(t):\n    if t < 0:\n        return None\n    return t\n\ndef b():\n    pass\n"
+	out, got, failed := edit("w.py", py, `"start":"def trim(t):","end":"# end trim","new_text":"def trim(t):\n    return max(t, 0)"}`)
+	if failed || got != "def a():\n    return 1\n\ndef trim(t):\n    return max(t, 0)\n\ndef b():\n    pass\n" || !strings.Contains(out, "indentation") {
+		t.Errorf("python block: failed=%v %s\nfile:\n%s", failed, out, got)
 	}
 }

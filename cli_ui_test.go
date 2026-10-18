@@ -400,9 +400,16 @@ func screenAfter(out string, cols int) []string {
 			case 'A':
 				n := 0
 				fmt.Sscan(arg, &n)
-				r, c = r-n, 0
+				r, c = max(r-n, 0), 0 // a terminal stops at its top row
 			case 'J':
-				rows = rows[:r]
+				for len(rows) <= r {
+					rows = append(rows, "")
+				}
+				rows = append(rows[:r], string([]rune(rows[r])[:min(c, len([]rune(rows[r])))]))
+			case 'C':
+				n := 1
+				fmt.Sscan(arg, &n)
+				c += n
 			case 'l', 'h':
 				if arg == "?7" {
 					wrap = out[j] == 'h'
@@ -412,7 +419,9 @@ func screenAfter(out string, cols int) []string {
 			continue
 		}
 		ch, size := utf8.DecodeRuneInString(out[i:])
-		if ch == '\n' {
+		if ch == '\r' {
+			c = 0
+		} else if ch == '\n' {
 			r, c = r+1, 0
 			for len(rows) <= r {
 				rows = append(rows, "")
@@ -495,5 +504,42 @@ func TestOutputWaitsForAnOpenQuestion(t *testing.T) {
 	u.Note("", "a note at the main prompt")
 	if !strings.Contains(buf.String(), "a note at the main prompt") {
 		t.Errorf("the main prompt held output back: %q", buf.String())
+	}
+}
+
+// The input row is the live region's last row with the cursor at its end: transcript lines
+// land above it, every redraw replaces it in place, and nothing typed is left behind.
+func TestInputRowStaysInPlace(t *testing.T) {
+	u, buf := uiFor(true, 40, 24)
+	u.Note("", "earlier transcript")
+	u.inputOn, u.inPrompt = true, "❯ "
+	u.Begin()
+	for _, typed := range []string{"s", "sp", "spe", "spec stop"} {
+		u.SetInput([]rune(typed))
+		u.Tick()
+	}
+	u.Note("", "a line from the turn")
+	u.Tick()
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	rows := screenAfter(buf.String(), u.cols)
+	for len(rows) > 0 && rows[len(rows)-1] == "" {
+		rows = rows[:len(rows)-1] // the row the cursor left when it went back up
+	}
+	inputs, notes := 0, 0
+	if len(rows) == 0 || rows[0] != "earlier transcript" {
+		t.Errorf("a redraw reached into the transcript above it:\n%s", strings.Join(rows, "\n"))
+	}
+	for _, row := range rows {
+		if strings.Contains(row, "❯") {
+			inputs++
+		}
+		if strings.Contains(row, "a line from the turn") {
+			notes++
+		}
+	}
+	if inputs != 1 || notes != 1 || !strings.Contains(rows[len(rows)-1], "❯ spec stop") {
+		t.Errorf("screen after typing and output:\n%s", strings.Join(rows, "\n"))
 	}
 }

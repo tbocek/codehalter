@@ -17,7 +17,7 @@ Repo you don't already know (first turn here, or the request names files/command
   Searching stays `grep -rn` through `run_command`; `read_file` reads what the search found.
 - Editing a project file → `edit_file`/`write_file` so the change hits the diff/approval UI. Raw `sed -i`, `>` or a Python script skip it:
   - small change: `{"path": "src/cut.rs", "old_text": "let zoom = 1.0;", "new_text": "let zoom = ZOOM;"}`
-  - a whole block: `{"path": "src/ui/window.rs", "start": "fn wire_zoom(", "end": "} // wire_zoom", "new_text": "..."}`
+  - a whole block: `{"path": "src/ui/window.rs", "start": "fn wire_zoom(", "end": "}", "new_text": "..."}`
   - several changes to one file, one call: `{"path": "src/ui/window.rs", "edits": [{"old_text": "...", "new_text": "..."}, {"start": "...", "end": "...", "new_text": "..."}]}`
 - Looking at a picture (a snapshot, a spec image) → `screenshot` on the file; a close look at one part: `{"path": "shots/05-cut.png", "region": [0, 560, 1500, 260]}` in its pixels. Never crop with a script.
 - No long-running service: it dies with codehalter. No daemon.

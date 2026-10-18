@@ -511,7 +511,7 @@ var fileTools = []Tool{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "edit_file",
-			"description": "Change an EXISTING file. Use it over write_file for any existing file, and ALWAYS over a Python, sed or awk script through run_command: this edit is checked, shown to the user as a diff, and counted; a script is none of that, and a wrong anchor silently rewrites the wrong span. Pick one form per call:\n(1) A small exact change: {\"path\": \"src/cut.rs\", \"old_text\": \"let zoom = 1.0;\", \"new_text\": \"let zoom = params::ZOOM;\"}. old_text must be unique in the file; copy it from a fresh read.\n(2) A whole BLOCK (a function, a test, a match arm, a widget section): {\"path\": \"src/ui/window.rs\", \"start\": \"fn wire_zoom(\", \"end\": \"} // wire_zoom\", \"new_text\": \"...\"}. Every line from the start line through the end line is replaced. Use it instead of copying forty lines into old_text.\n(3) SEVERAL changes to one file: {\"path\": \"src/ui/window.rs\", \"edits\": [{\"old_text\": \"...\", \"new_text\": \"...\"}, {\"start\": \"fn wire_zoom(\", \"end\": \"} // wire_zoom\", \"new_text\": \"...\"}]}, applied in order, all or none. Two or three changes to one file: ONE call like this.\nErrors (not found, not unique, unwritable) come back as messages: fix and retry.",
+			"description": "Change an EXISTING file. Use it over write_file for any existing file, and ALWAYS over a Python, sed or awk script through run_command: this edit is checked, shown to the user as a diff, and counted; a script is none of that, and a wrong anchor silently rewrites the wrong span. Pick one form per call:\n(1) A small exact change: {\"path\": \"src/cut.rs\", \"old_text\": \"let zoom = 1.0;\", \"new_text\": \"let zoom = params::ZOOM;\"}. old_text must be unique in the file; copy it from a fresh read.\n(2) A whole BLOCK (a function, a test, a match arm, a widget section): {\"path\": \"src/ui/window.rs\", \"start\": \"fn wire_zoom(\", \"end\": \"}\", \"new_text\": \"...\"}. Every line from the start line through the end line is replaced; an `end` of only a closing bracket means the block's own closing line, found by its braces (or indentation). Use it instead of copying forty lines into old_text.\n(3) SEVERAL changes to one file: {\"path\": \"src/ui/window.rs\", \"edits\": [{\"old_text\": \"...\", \"new_text\": \"...\"}, {\"start\": \"fn wire_zoom(\", \"end\": \"}\", \"new_text\": \"...\"}]}, applied in order, all or none. Two or three changes to one file: ONE call like this.\nErrors (not found, not unique, unwritable) come back as messages: fix and retry.",
 
 			"parameters": map[string]any{
 				"type":     "object",
@@ -534,7 +534,7 @@ var fileTools = []Tool{
 					"path":     map[string]any{"type": "string", "description": "Absolute or project-relative. `workspaces/foo` (no leading slash) is also tried as `/workspaces/foo`."},
 					"old_text": map[string]any{"type": "string", "description": "Form (1): the exact text, byte for byte (whitespace, indentation, newlines) and unique in the file: include enough context to tell it apart."},
 					"start":    map[string]any{"type": "string", "description": "Form (2): a fragment of the block's FIRST line, unique in the file (`fn cut_form_column(`)."},
-					"end":      map[string]any{"type": "string", "description": "Form (2): a fragment of the block's LAST line; the first line at or after `start` containing it ends the block (the closing `}` line, or a comment on it). Omit to replace the start line alone."},
+					"end":      map[string]any{"type": "string", "description": "Form (2): a fragment of the block's LAST line; the first line at or after `start` containing it ends the block. Only a closing bracket (`}`) means the block's own closing line, found by its braces. Omit to replace the start line alone."},
 					"new_text": map[string]any{"type": "string", "description": "Replacement: for (1) of old_text, for (2) of the whole lines start through end. An empty string deletes."},
 				},
 			},
@@ -691,12 +691,8 @@ func locateSymbol(content, symbol string) symbolLoc {
 		break
 	}
 	loc.start = top + 1
-	if end, ok := braceBlockEnd(lines, d); ok {
-		loc.end, loc.how = end+1, "braces"
-		return loc
-	}
-	if strings.HasSuffix(strings.TrimSpace(stripLineComment(lines[d])), ":") {
-		loc.end, loc.how = indentBlockEnd(lines, d)+1, "indentation"
+	if end, how, ok := blockEnd(lines, d); ok {
+		loc.end, loc.how = end+1, how
 		return loc
 	}
 	loc.end = min(d+symbolFallbackLines, len(lines))
@@ -706,14 +702,24 @@ func locateSymbol(content, symbol string) symbolLoc {
 
 // braceBlockEnd: a ';' before any '{' ends the block (a prototype), and the '{'
 // must open within the first few lines.
-func braceBlockEnd(lines []string, d int) (int, bool) {
-	depth, opened := 0, false
+// braceBlockEnd: where the brace block that opens at or after line d closes, and the line
+// its `{` is on. Strings ("…", `…`, '…' but not a Rust lifetime 'a) and comments (//, /* */)
+// do not count. Not ok when no `{` opens within three lines; a `;` ending line d first ends it there.
+func braceBlockEnd(lines []string, d int) (end, open int, ok bool) {
+	depth, opened, inBlock := 0, false, false
 	for i := d; i < len(lines); i++ {
-		ln := stripLineComment(lines[i])
+		ln := lines[i]
 		inStr := byte(0)
 		for j := 0; j < len(ln); j++ {
 			c := ln[j]
-			if inStr != 0 {
+			switch {
+			case inBlock:
+				if c == '*' && j+1 < len(ln) && ln[j+1] == '/' {
+					inBlock = false
+					j++
+				}
+				continue
+			case inStr != 0:
 				if c == '\\' {
 					j++
 				} else if c == inStr {
@@ -724,40 +730,81 @@ func braceBlockEnd(lines []string, d int) (int, bool) {
 			switch c {
 			case '"', '`':
 				inStr = c
+			case '\'':
+				// A lifetime ('a, 'static) opens nothing; a char literal or a single-quoted string does.
+				if !lifetimeRe.MatchString(ln[j:]) {
+					inStr = c
+				}
+			case '/':
+				if j+1 < len(ln) && ln[j+1] == '/' {
+					j = len(ln)
+				} else if j+1 < len(ln) && ln[j+1] == '*' {
+					inBlock = true
+					j++
+				}
 			case '{':
+				if !opened {
+					open = i
+				}
 				depth++
 				opened = true
 			case '}':
 				depth--
 				if opened && depth == 0 {
-					return i, true
+					return i, open, true
 				}
 			case ';':
-				if !opened {
-					return i, true
+				// Only a `;` that ends the line ends a declaration: not shell's `; then`, nor
+				// the ones inside a C `for (…; …; …) {`.
+				if !opened && strings.TrimSpace(stripLineComment(ln[j+1:])) == "" {
+					return i, i, true
 				}
 			}
 		}
 		if !opened && i-d >= 3 {
-			return 0, false
+			return 0, 0, false
 		}
 	}
-	return 0, false
+	return 0, 0, false
 }
 
-func indentBlockEnd(lines []string, d int) int {
+// lifetimeRe: a Rust lifetime or loop label, a quote no other quote closes.
+var lifetimeRe = regexp.MustCompile(`^'[A-Za-z_]\w*(?:[^\w']|$)`)
+
+// closerLineRe is a line that only closes a block, at the indentation the block opened at.
+var closerLineRe = regexp.MustCompile(`(?i)^(?:[)\]}]+[;,)]*|(?:end|fi|done|esac|endif|endfunction|endwhile|endfor|wend)\b.*)$`)
+
+// blockEnd: where the block opening on line d ends, in any language. Braces decide when the
+// block opens with a `{` on line d, or on a later line at d's own indentation (a signature
+// spread over lines); a `{` indented deeper belongs to the body (a dict, a hash). Otherwise
+// indentation does: the lines indented deeper than d, plus a closing line at d's own
+// indentation that only closes (`}`, `end`, `fi`, `done`). A declaration a `;` ends is its
+// own line. Not ok when no block opens on d.
+func blockEnd(lines []string, d int) (int, string, bool) {
 	base := len(leadingWS(lines[d]))
-	end := d
+	e, open, ok := braceBlockEnd(lines, d)
+	switch {
+	case ok && open == d && !strings.Contains(stripLineComment(lines[d]), "{"):
+		return e, "its semicolon", true // a declaration without a body: `fn draw(&self);`
+	case ok && (open == d || len(leadingWS(lines[open])) <= base):
+		return e, "braces", true
+	}
+	end, deeper := d, false
 	for i := d + 1; i < len(lines); i++ {
-		if strings.TrimSpace(lines[i]) == "" {
+		t := strings.TrimSpace(lines[i])
+		if t == "" {
 			continue
 		}
-		if len(leadingWS(lines[i])) <= base {
-			break
+		if len(leadingWS(lines[i])) > base {
+			end, deeper = i, true
+			continue
 		}
-		end = i
+		if deeper && len(leadingWS(lines[i])) == base && closerLineRe.MatchString(t) {
+			end = i
+		}
+		break
 	}
-	return end
+	return end, "indentation", deeper
 }
 
 // stripLineComment is good enough for block scanning; it is not a parser.
@@ -793,7 +840,7 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 		if msg != "" {
 			return "", "", "error: " + msg
 		}
-		return next, fmt.Sprintf(" (lines %s replaced)", span), ""
+		return next, fmt.Sprintf(" (lines %s)", span), ""
 	}
 	switch count := strings.Count(content, oldText); {
 	case count > 1:
@@ -871,25 +918,49 @@ func replaceBlock(content, start, end, newText string) (string, string, string) 
 		}
 		return "", "", fmt.Sprintf("`start` %q is on %d lines (%s); make it longer so it is on exactly one.", start, len(hits), joinInts(at))
 	}
-	s, e := hits[0], hits[0]
+	s, e, how := hits[0], hits[0], ""
 	if end != "" {
 		e = -1
-		for i := s; i < len(lines); i++ {
-			if strings.Contains(lines[i], end) {
-				e = i
-				break
+		// A bare word matches as a word: `end` is no part of `append`.
+		contains := func(ln string) bool { return strings.Contains(ln, end) }
+		if bareWordRe.MatchString(end) {
+			word := regexp.MustCompile(`\b` + regexp.QuoteMeta(end) + `\b`)
+			contains = word.MatchString
+		}
+		if !closingOnlyRe.MatchString(strings.TrimSpace(end)) {
+			for i := s; i < len(lines); i++ {
+				if contains(lines[i]) {
+					e = i
+					break
+				}
+			}
+		}
+		// A function's last line is a bare `}`, which also closes every inner block, so the
+		// model cannot name it: it gave the bare brace or invented a marker ("} // placeholder"),
+		// and every whole-function edit failed. The block opening on the start line is meant,
+		// ended as read_file's symbol ends it.
+		if e < 0 {
+			// A statement on the start line is no block to extend to.
+			if b, by, ok := blockEnd(lines, s); ok && by != "its semicolon" {
+				e, how = b, ", its end found by "+by
 			}
 		}
 		if e < 0 {
-			return "", "", fmt.Sprintf("`end` %q is on no line at or after line %d, where `start` is.", end, s+1)
+			return "", "", fmt.Sprintf("`end` %q is on no line at or after line %d, where `start` is, and no block opens there.", end, s+1)
 		}
 	}
 	repl := strings.Split(strings.TrimSuffix(newText, "\n"), "\n")
 	if newText == "" {
 		repl = nil
 	}
-	return strings.Join(slices.Concat(lines[:s], repl, lines[e+1:]), "\n"), fmt.Sprintf("%d-%d", s+1, e+1), ""
+	return strings.Join(slices.Concat(lines[:s], repl, lines[e+1:]), "\n"), fmt.Sprintf("%d-%d replaced%s", s+1, e+1, how), ""
 }
+
+// closingOnlyRe is an `end` that only closes (`}`, `end`, `fi`): it fits every inner block
+// too, so the block's own closing line is meant.
+var closingOnlyRe = regexp.MustCompile(`(?i)^(?:[)\]}]+[;,]?|end|fi|done|esac|endif|endfunction|endwhile|endfor|wend)$`)
+
+var bareWordRe = regexp.MustCompile(`^\w+$`)
 
 func joinInts(ns []int) string {
 	parts := make([]string, len(ns))

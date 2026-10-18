@@ -614,32 +614,90 @@ func TestAdoptSwitchesSession(t *testing.T) {
 	}
 }
 
-// A cancelled turn's question may still be reading stdin; a second reader would race it.
-func TestReplWaitsForAnOpenQuestion(t *testing.T) {
+// replFor runs the repl on piped input the test writes; it returns the writer and a
+// channel closed when the repl returns.
+func replFor(t *testing.T) (*cliClient, *peer, io.Writer, chan struct{}) {
+	t.Helper()
 	pr, pw := io.Pipe()
-	defer pw.Close()
-	c, _, _ := newCLIHarness(t, "")
+	c, p, _ := newCLIHarness(t, "")
 	c.in = bufio.NewReader(pr)
-
-	c.askMu.Lock() // stand in for the question still on screen
+	c.setSessionID("s1")
 	done := make(chan struct{})
 	go func() {
 		c.repl()
 		close(done)
 	}()
-	go pw.Write([]byte("/quit\n"))
+	t.Cleanup(func() { pw.Close() })
+	return c, p, pw, done
+}
 
+// within receives the client's next message, failing the test rather than hanging it.
+func within(t *testing.T, p *peer) map[string]any {
+	t.Helper()
+	got := make(chan map[string]any, 1)
+	go func() { got <- p.recv() }()
 	select {
-	case <-done:
-		t.Fatal("the input loop read stdin while a question owned it")
-	case <-time.After(200 * time.Millisecond):
+	case m := <-got:
+		return m
+	case <-time.After(3 * time.Second):
+		t.Fatal("the client sent nothing")
+		return nil
 	}
+}
 
-	c.askMu.Unlock()
+// A /spec loop is one turn that runs for hours: a line typed while it runs reaches the
+// agent at once, as a second prompt it folds into the turn, not after the turn ends.
+func TestTypingDuringATurnSteersIt(t *testing.T) {
+	_, p, in, done := replFor(t)
+	fmt.Fprintln(in, "/spec")
+	turn := p.recv()
+	if turn["method"] != "session/prompt" {
+		t.Fatalf("first request = %v", turn["method"])
+	}
+	fmt.Fprintln(in, "/spec stop")
+	steer := within(t, p) // the turn is still unanswered
+	text, _ := json.Marshal(steer["params"])
+	if steer["method"] != "session/prompt" || !strings.Contains(string(text), "/spec stop") {
+		t.Fatalf("typed during the turn: %v %s", steer["method"], text)
+	}
+	p.reply(steer, map[string]any{"stopReason": "end_turn"})
+	p.reply(turn, map[string]any{"stopReason": "end_turn"})
+	fmt.Fprintln(in, "/quit")
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("the input loop never took the token back")
+		t.Fatal("the repl did not leave on /quit")
+	}
+}
+
+// With the repl's reader owning stdin, the line typed while a question is open answers it
+// and starts no turn.
+func TestALineAnswersTheOpenQuestion(t *testing.T) {
+	c, p, in, done := replFor(t)
+	p.send(map[string]any{"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": map[string]any{
+		"sessionId": "s1", "toolCall": map[string]any{"toolCallId": "c1", "title": "Start the spec loop anyway?"},
+		"options": []map[string]any{{"optionId": "go", "name": "Start anyway", "kind": "allow_once"}, {"optionId": "no", "name": "Stop", "kind": "reject_once"}}}})
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		c.waitMu.Lock()
+		up := c.waiting != nil
+		c.waitMu.Unlock()
+		if up {
+			break // the question is up before the answer is typed
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the question never opened")
+		}
+	}
+	fmt.Fprintln(in, "2")
+	resp := within(t, p)
+	if out, _ := json.Marshal(resp["result"]); resp["id"] != float64(7) || !strings.Contains(string(out), `"optionId":"no"`) {
+		t.Fatalf("answer = %v %s", resp["id"], out)
+	}
+	fmt.Fprintln(in, "/quit")
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the repl did not leave on /quit")
 	}
 }
 
@@ -833,5 +891,34 @@ func TestCLIQuestionWithoutAnyoneTakesTheFirstOption(t *testing.T) {
 	c.interactive = true // Ctrl+D at a terminal is the user dismissing it
 	if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != -1 {
 		t.Errorf("Ctrl+D at a terminal: idx %d, want a dismissal", idx)
+	}
+}
+
+// In character mode the keys are edited here: backspace, Ctrl+W and Ctrl+U take text back,
+// an arrow key is ignored, and a bracketed paste keeps its newlines in one prompt.
+func TestKeysAreEditedInCharacterMode(t *testing.T) {
+	pr, pw := io.Pipe()
+	c, p, _ := newCLIHarness(t, "")
+	c.in = bufio.NewReader(pr)
+	c.setSessionID("s1")
+	c.ui.inputOn = true // what startInput sets on a terminal
+	go c.repl()
+	t.Cleanup(func() { pw.Close() })
+	for _, k := range []struct{ keys, want string }{
+		{"ab\x7fc\x1b[Ad\r", "acd"},
+		{"one two\x17three\r", "one three"},
+		{"gone\x15kept\r", "kept"},
+		{"\x1b[200~line one\nline two\x1b[201~\r", "line one\nline two"},
+	} {
+		if _, err := pw.Write([]byte(k.keys)); err != nil {
+			t.Fatal(err)
+		}
+		req := within(t, p)
+		params, _ := json.Marshal(req["params"])
+		want, _ := json.Marshal(k.want)
+		if !strings.Contains(string(params), `"text":`+string(want)) {
+			t.Errorf("keys %q sent %s, want the text %s", k.keys, params, want)
+		}
+		p.reply(req, map[string]any{"stopReason": "end_turn"})
 	}
 }

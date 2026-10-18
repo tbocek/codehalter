@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"slices"
@@ -81,6 +82,13 @@ type cliUI struct {
 	// after the answer: in cooked mode a reprinted prompt row lost what had been typed so far.
 	asking bool
 	held   []string
+
+	// inputOn: the terminal is in character mode (startInput) and the input row, inPrompt
+	// then what has been typed, is the live region's last row, the cursor at its end.
+	inputOn     bool
+	inPrompt    string
+	inBuf       []rune
+	cursorInRow bool
 }
 
 func stdoutStyled() bool {
@@ -103,15 +111,70 @@ func newCLIUI() *cliUI {
 	return u
 }
 
+// stty runs stty on the terminal itself.
+func stty(args ...string) (string, error) {
+	cmd := exec.Command("stty", args...)
+	cmd.Stdin = os.Stdin
+	out, err := cmd.Output()
+	return string(out), err
+}
+
+// startInput puts the terminal in character mode without echo, so the input row is drawn
+// here and can be typed in while a turn runs; Ctrl+C still raises SIGINT. Pasted text is
+// bracketed so its newlines stay text. It returns what undoes it, safe to call twice.
+func (u *cliUI) startInput() func() {
+	if !u.tty || !stdinIsTTY() {
+		return func() {}
+	}
+	saved, err := stty("-g")
+	if err != nil {
+		return func() {}
+	}
+	if _, err := stty("-icanon", "-echo", "min", "1", "time", "0"); err != nil {
+		return func() {}
+	}
+	u.mu.Lock()
+	u.inputOn, u.inPrompt = true, "❯ "
+	u.out.WriteString("\x1b[?2004h")
+	u.drawLive()
+	u.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			u.mu.Lock()
+			u.eraseLive()
+			u.inputOn = false
+			u.out.WriteString("\x1b[?2004l")
+			u.out.Flush()
+			u.mu.Unlock()
+			if _, err := stty(strings.TrimSpace(saved)); err != nil {
+				slog.Debug("cli: restoring the terminal", "err", err)
+			}
+		})
+	}
+}
+
+func (u *cliUI) inputActive() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.inputOn
+}
+
+// SetInput shows what is typed so far.
+func (u *cliUI) SetInput(buf []rune) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.inBuf = buf
+	u.drawLive()
+}
+
 // stty instead of a TIOCGWINSZ ioctl keeps this platform-neutral. Called per turn and, where
 // there is one, on SIGWINCH (watchResize).
 func (u *cliUI) refreshSize() {
 	if !u.tty {
 		return
 	}
-	cmd := exec.Command("stty", "size")
-	cmd.Stdin = os.Stdin
-	out, err := cmd.Output()
+	out, err := stty("size")
 	if err != nil {
 		return
 	}
@@ -129,13 +192,22 @@ func (u *cliUI) refreshSize() {
 	u.mu.Unlock()
 }
 
-// Exact because drawLive always leaves the cursor at the start of the row after the live region.
+// Exact because drawLive leaves the cursor at the start of the row after the live region,
+// or, with the input row, at the end of that row, the region's last.
 func (u *cliUI) eraseLive() {
 	if u.liveRows == 0 {
 		return
 	}
-	fmt.Fprintf(u.out, "\x1b[%dA\x1b[0J", u.liveRows)
-	u.liveRows = 0
+	if u.cursorInRow {
+		u.out.WriteString("\r")
+		if u.liveRows > 1 {
+			fmt.Fprintf(u.out, "\x1b[%dA", u.liveRows-1)
+		}
+		u.out.WriteString("\x1b[0J")
+	} else {
+		fmt.Fprintf(u.out, "\x1b[%dA\x1b[0J", u.liveRows)
+	}
+	u.liveRows, u.cursorInRow = 0, false
 }
 
 func (u *cliUI) emitLine(s string) {
@@ -171,12 +243,21 @@ func (u *cliUI) drawLive() {
 	// two cells but counts as one) is cut at the edge instead of wrapping onto a row liveRows
 	// does not count, which left the region's top row behind on every redraw.
 	u.out.WriteString("\x1b[?7l")
-	for _, l := range u.liveLines() {
+	lines := u.liveLines()
+	for _, l := range lines {
 		u.out.WriteString(l)
 		u.out.WriteString("\n")
 		u.liveRows++
 	}
 	u.out.WriteString("\x1b[?7h")
+	if u.inputOn && len(lines) > 0 {
+		// Back to the end of the input row, where the typing shows.
+		u.out.WriteString("\x1b[1A\r")
+		if col := visibleLen(lines[len(lines)-1]); col > 0 {
+			fmt.Fprintf(u.out, "\x1b[%dC", col)
+		}
+		u.cursorInRow = true
+	}
 	u.out.Flush()
 }
 
@@ -205,6 +286,14 @@ func (u *cliUI) liveLines() []string {
 	}
 	if u.busy {
 		out = append(out, u.clip(u.statusLine()))
+	}
+	if u.inputOn {
+		// The tail of what is typed, so the cursor's end of it stays in view.
+		typed := []rune(strings.ReplaceAll(string(u.inBuf), "\n", "⏎"))
+		for room := max(u.cols-1-visibleLen(u.inPrompt), 8); visibleLen(string(typed)) > room; {
+			typed = typed[1:]
+		}
+		out = append(out, u.style(u.inPrompt, ansiBold)+string(typed))
 	}
 
 	// A live region taller than the terminal would scroll its top row away and desync
@@ -621,23 +710,38 @@ func (u *cliUI) Resume() {
 func (u *cliUI) Prompt(s string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.inputOn {
+		u.inPrompt = strings.TrimLeft(s, "\n")
+		u.drawLive()
+		return
+	}
 	u.eraseLive()
 	u.promptStr, u.promptBroken = s, false
 	u.out.WriteString(u.style(s, ansiBold))
 	u.out.Flush()
 }
 
-// Ask is Prompt for a question's answer: output arriving before Submitted waits for it.
+// Ask is Prompt for a question's answer: output arriving before Submitted waits for it,
+// unless the input row is drawn apart from the output anyway.
 func (u *cliUI) Ask(s string) {
 	u.Prompt(s)
 	u.mu.Lock()
-	u.asking = true
+	u.asking = !u.inputOn
 	u.mu.Unlock()
 }
 
 func (u *cliUI) Submitted(text string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.inputOn {
+		// What was entered stays in the transcript; the row is ready for the next line.
+		if text != "" {
+			u.emitLine(u.style(u.inPrompt, ansiBold) + strings.ReplaceAll(text, "\n", "\n  "))
+		}
+		u.inBuf, u.inPrompt = nil, "❯ "
+		u.drawLive()
+		return
+	}
 	if u.promptStr != "" && u.echoInput {
 		u.out.WriteString(text)
 		u.out.WriteString("\n")
