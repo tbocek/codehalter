@@ -330,7 +330,7 @@ Client-side commands:
 | `/new` | start a fresh session in this directory |
 | `/resume [id]` | switch to a stored session, or pick one from the list |
 | `/cwd` | project directory and current session id |
-| `/quit`, `/exit` | leave (same as `Ctrl+D`) |
+| `/quit`, `/exit` | leave (same as `Ctrl+D`); a bare `exit` or `quit` does too |
 
 Anything else starting with `/` is handed to the agent, so `/commit`, `/clean`, `/settings`, `/grill-me` and your own macros work unchanged.
 

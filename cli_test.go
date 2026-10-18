@@ -815,3 +815,17 @@ func TestResumeWithoutIDPicksFromTheList(t *testing.T) {
 	p.reply(req, map[string]any{})
 	<-done
 }
+
+// exit and quit leave, as in a shell, with or without the slash; a sentence that starts with
+// the word is a prompt.
+func TestCLIExitWordsLeave(t *testing.T) {
+	c := &cliClient{}
+	for _, line := range []string{"exit", "quit", " Exit ", "/quit", "/exit"} {
+		if handled, quit := c.command(line); !handled || !quit {
+			t.Errorf("%q: handled=%v quit=%v, want it to leave", line, handled, quit)
+		}
+	}
+	if handled, _ := c.command("exit the loop when the suite is green"); handled {
+		t.Error("a prompt starting with exit was taken as a command")
+	}
+}

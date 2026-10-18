@@ -397,6 +397,10 @@ func (c *cliClient) readPrompt() (string, error) {
 // command handles client-owned commands only. Other slash commands pass through: the agent
 // parses "/name args" itself (splitMacro).
 func (c *cliClient) command(text string) (handled, quit bool) {
+	// A bare `exit` or `quit` is how a shell is left; sent as a prompt it only started a turn about it.
+	if t := strings.ToLower(strings.TrimSpace(text)); t == "exit" || t == "quit" {
+		return true, true
+	}
 	name, rest, _ := strings.Cut(text, " ")
 	rest = strings.TrimSpace(rest)
 	switch name {
@@ -429,7 +433,7 @@ func (c *cliClient) help() {
 		"  /new               start a fresh session here",
 		"  /resume [id]       switch to a stored session, or pick one from a list",
 		"  /cwd               project directory and session id",
-		"  /quit              leave (same as Ctrl+D)",
+		"  /quit, exit        leave (same as Ctrl+D)",
 	} {
 		c.ui.Note("", l)
 	}
