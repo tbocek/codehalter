@@ -529,7 +529,7 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 		outcome = "was lost (" + err.Error() + ")"
 	default:
 		outcome = fmt.Sprintf("exited with code %d", exit.code())
-		sess.recordJobRun(jobRun{cmd: job.cmdStr, code: exit.code(), started: job.started, ended: time.Now()})
+		sess.recordJobRun(jobRun{cmd: job.cmdStr, code: exit.code(), started: job.started, ended: time.Now(), log: job.logPath})
 	}
 	a.retitleToolCall(context.Background(), job.sid, job.tcId, fmt.Sprintf("%s: %s (job %d %s)", jobVerb[job.kind], job.cmdStr, job.id, outcome), "completed")
 	took := humanDuration(time.Since(job.started).Milliseconds())

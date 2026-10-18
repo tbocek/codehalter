@@ -165,6 +165,7 @@ type jobRun struct {
 	cmd            string
 	code           int
 	started, ended time.Time
+	log            string // its output, kept after the exit
 }
 
 func (s *Session) recordJobRun(j jobRun) {

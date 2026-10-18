@@ -269,16 +269,21 @@ func TestRunSpecTestsTailCarriesExitStatus(t *testing.T) {
 	}
 }
 
-// Only a bare run in the output dir, exit 0 per the terminal, nothing written in
-// it since, counts; the run may be a background job that exited this round.
+// Only a bare run in the output dir, exit 0 per the terminal or per its echoed
+// `exit=$?`, nothing git keeps written in it since, counts; the run may be a background
+// job that exited this round.
 func TestSpecRoundOwnGreenRun(t *testing.T) {
 	a, sess := newTestAgent(t)
 	out := filepath.Join(sess.Cwd, "rust")
-	if err := os.MkdirAll(filepath.Join(out, "src"), 0o755); err != nil {
-		t.Fatal(err)
+	writeTree(t, out, map[string]string{"src/lib.rs": "fn a() {}\n", ".gitignore": "/fixtures/out.mp4\n"})
+	if b, err := exec.Command("git", "-C", sess.Cwd, "init", "-q").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, b)
 	}
-	if err := os.WriteFile(filepath.Join(out, "src", "lib.rs"), []byte("fn a() {}\n"), 0o644); err != nil {
-		t.Fatal(err)
+	old := time.Now().Add(-time.Hour)
+	for _, f := range []string{"src/lib.rs", ".gitignore"} {
+		if err := os.Chtimes(filepath.Join(out, f), old, old); err != nil {
+			t.Fatal(err)
+		}
 	}
 	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: &specConfig{OutDir: "rust"}, outAbs: out}
 	round := time.Now().Add(-time.Minute)
@@ -299,6 +304,27 @@ func TestSpecRoundOwnGreenRun(t *testing.T) {
 	if !green(ran("cd rust && just test", "exit 0\n"), edit("AGENT.md", 2*time.Second)) {
 		t.Error("an edit outside the output directory undid the green run")
 	}
+	// The line's exit is the echo's; the run's is the value it echoed.
+	if !green(ran(`cd rust && just test > /tmp/t.log 2>&1; echo "exit=$?"`, "exit 0\n\nexit=0\n")) {
+		t.Error("an echoed exit=0 did not count")
+	}
+	if green(ran(`cd rust && just test > /tmp/t.log 2>&1; echo "exit=$?"`, "exit 0\n\nexit=101\n")) {
+		t.Error("an echoed exit=101 counted as green")
+	}
+	logFile := filepath.Join(t.TempDir(), "gate.log")
+	writeTree(t, filepath.Dir(logFile), map[string]string{"gate.log": "test result: ok\nSUITE_EXIT=0\n"})
+	if !green(ran(`cd rust && just test > `+logFile+` 2>&1; echo "SUITE_EXIT=$?" >> `+logFile, "exit 0\n")) {
+		t.Error("an exit echoed into the run's log file did not count")
+	}
+	// What the run itself writes where git does not look is no change.
+	writeTree(t, out, map[string]string{"fixtures/out.mp4": "rendered"})
+	later := time.Now().Add(10 * time.Second)
+	if err := os.Chtimes(filepath.Join(out, "fixtures/out.mp4"), later, later); err != nil {
+		t.Fatal(err)
+	}
+	if !green(ran("cd rust && just test", "exit 0\n")) {
+		t.Error("a git-ignored file the run wrote undid it")
+	}
 	for name, uses := range map[string][]ToolUse{
 		"wrapped, exit is the echo's": {ran("cd rust && (just test > /tmp/t.log 2>&1; echo exit=$? >> /tmp/t.log)", "exit 0\n")},
 		"red":                         {ran("cd rust && just test", "exit 101\n")},
@@ -310,7 +336,10 @@ func TestSpecRoundOwnGreenRun(t *testing.T) {
 			t.Errorf("%s: counted as green", name)
 		}
 	}
-	// A file written after the run, by whatever means.
+	// A file git keeps, written after the run by whatever means.
+	if err := os.Chtimes(filepath.Join(out, "src/lib.rs"), time.Now(), time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	uses := []ToolUse{ran("cd rust && just test", "exit 0\n")}
 	uses[0].StartedAt = time.Now().Add(-time.Minute)
 	if green(uses...) {
@@ -324,6 +353,12 @@ func TestSpecRoundOwnGreenRun(t *testing.T) {
 	sess.recordJobRun(jobRun{cmd: "cd rust && just test", code: 101, started: time.Now().Add(time.Second), ended: time.Now().Add(2 * time.Second)})
 	if green(ran("cd rust && just test", "exit 0\n")) {
 		t.Error("a red background run after the green one still counted as green")
+	}
+	jobLog := filepath.Join(t.TempDir(), "job.log")
+	writeTree(t, filepath.Dir(jobLog), map[string]string{"job.log": "exit=0\n"})
+	sess.recordJobRun(jobRun{cmd: `cd rust && just test > /tmp/t.log 2>&1; echo "exit=$?"`, code: 0, started: time.Now().Add(3 * time.Second), ended: time.Now().Add(4 * time.Second), log: jobLog})
+	if !green() {
+		t.Error("a background run whose log holds exit=0 did not count")
 	}
 }
 

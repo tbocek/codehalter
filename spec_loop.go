@@ -941,6 +941,18 @@ func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) boo
 		green bool
 		since time.Time // nothing may be written after this: a job ran on the code as it started
 	}
+	// green: the run's own exit, or, when the line echoed it, the last value it echoed.
+	green := func(echo *exitEcho, exit0 bool, out string) bool {
+		if echo == nil {
+			return exit0
+		}
+		if echo.file != "" {
+			b, _ := os.ReadFile(echo.file) // gone: no echo found, so not green
+			out = string(b)
+		}
+		m := regexp.MustCompile(`(?m)^`+regexp.QuoteMeta(echo.label)+`=(\d+)\s*$`).FindAllStringSubmatch(out, -1)
+		return len(m) > 0 && m[len(m)-1][1] == "0"
+	}
 	var evs []event
 	for _, u := range uses {
 		args := parseArgs(u.Input)
@@ -955,15 +967,22 @@ func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) boo
 				evs = append(evs, event{at: u.StartedAt})
 			}
 		// A handed-over run reports its exit as a job run.
-		case u.Name == "run_command" && strings.HasPrefix(u.Output, "exit ") && testRunMatches(args.str("command"), cmd, r.sess.Cwd, r.outAbs):
-			end := u.StartedAt.Add(time.Duration(u.DurationMs) * time.Millisecond)
-			evs = append(evs, event{at: end, green: strings.HasPrefix(u.Output, "exit 0\n"), since: end})
+		case u.Name == "run_command" && strings.HasPrefix(u.Output, "exit "):
+			if ok, echo := testRunMatches(args.str("command"), cmd, r.sess.Cwd, r.outAbs); ok {
+				end := u.StartedAt.Add(time.Duration(u.DurationMs) * time.Millisecond)
+				evs = append(evs, event{at: end, green: green(echo, strings.HasPrefix(u.Output, "exit 0\n"), u.Output), since: end})
+			}
 		}
 	}
 	r.sess.rt.mu.Lock()
 	for _, j := range r.sess.rt.jobRuns {
-		if j.ended.After(since) && testRunMatches(j.cmd, cmd, r.sess.Cwd, r.outAbs) {
-			evs = append(evs, event{at: j.ended, green: j.code == 0, since: j.started})
+		if ok, echo := testRunMatches(j.cmd, cmd, r.sess.Cwd, r.outAbs); ok && j.ended.After(since) {
+			out := ""
+			if echo != nil && echo.file == "" {
+				b, _ := os.ReadFile(j.log) // gone: no echo found, so not green
+				out = string(b)
+			}
+			evs = append(evs, event{at: j.ended, green: green(echo, j.code == 0, out), since: j.started})
 		}
 	}
 	r.sess.rt.mu.Unlock()
@@ -971,36 +990,55 @@ func (r *specRun) roundRanGreen(uses []ToolUse, cmd string, since time.Time) boo
 	if len(evs) == 0 || !evs[len(evs)-1].green {
 		return false
 	}
-	// A write after the last run undoes it; a render's own shots are no write.
-	since, written := evs[len(evs)-1].since, false
-	_ = filepath.WalkDir(r.outAbs, func(path string, d os.DirEntry, err error) error {
-		if err != nil || written {
-			return nil // the callback swallows every error, so WalkDir returns none
+	// A write after the last run undoes it. Only what git keeps counts: a test run writes
+	// its own output into the tree (a rendered video in fixtures/, a scratch project), all
+	// of it ignored, and 29 green runs were run again for it. A render's shots are no write.
+	ranOn := evs[len(evs)-1].since
+	out, err := specGit(context.Background(), r.outAbs, "-c", "core.quotePath=false", "ls-files", "-z", "--cached", "--others", "--exclude-standard")
+	if err != nil {
+		return false // without git, run the suite rather than guess
+	}
+	for _, rel := range strings.Split(out, "\x00") {
+		if rel == "" || strings.HasPrefix(rel, "shots/") {
+			continue
 		}
-		if d.IsDir() {
-			if name := d.Name(); path != r.outAbs && (skipWalkDir(name) || name == "shots") {
-				return filepath.SkipDir
-			}
-			return nil
+		// A file deleted since counts as a change too.
+		if info, err := os.Stat(filepath.Join(r.outAbs, rel)); err != nil || info.ModTime().After(ranOn) {
+			return false
 		}
-		if info, err := d.Info(); err == nil && info.ModTime().After(since) {
-			written = true
-		}
-		return nil
-	})
-	return !written
+	}
+	return true
 }
 
+// echoedExitRe is a trailing `; echo "exit=$?"`, to the output or into a file: the line's
+// own exit is then the echo's, and the run's is where the echo wrote it. 76 of 121 full
+// suites codehalter ran again were the model's green run ended this way.
+var echoedExitRe = regexp.MustCompile(`(?i);\s*echo\s+"?(\w*exit)=\$\?"?(?:\s*>>?\s*(\S+))?\s*$`)
+
+// exitEcho says where a run echoed its exit code: label, and file ("" for its output).
+type exitEcho struct{ label, file string }
+
 // testRunMatches: the terminal's cwd is the project root, so a run without `cd <out> &&`
-// only matches when the output directory is the root.
-func testRunMatches(line, cmd, cwd, outAbs string) bool {
+// only matches when the output directory is the root. echo is set when the line ends in
+// an echoed exit code.
+func testRunMatches(line, cmd, cwd, outAbs string) (ok bool, echo *exitEcho) {
 	line = strings.TrimSpace(line)
+	if m := echoedExitRe.FindStringSubmatchIndex(line); m != nil {
+		echo = &exitEcho{label: line[m[2]:m[3]]}
+		if m[4] >= 0 {
+			echo.file = line[m[4]:m[5]]
+			if !filepath.IsAbs(echo.file) {
+				echo.file = filepath.Join(outAbs, echo.file)
+			}
+		}
+		line = strings.TrimSpace(line[:m[0]])
+	}
 	dir := cwd
 	if strings.HasPrefix(line, "cd ") {
 		rest := strings.TrimSpace(line[3:])
 		i := strings.Index(rest, "&&")
 		if i < 0 {
-			return false
+			return false, nil
 		}
 		d := strings.Trim(strings.TrimSpace(rest[:i]), "'\"")
 		if !filepath.IsAbs(d) {
@@ -1010,10 +1048,10 @@ func testRunMatches(line, cmd, cwd, outAbs string) bool {
 		line = strings.TrimSpace(rest[i+2:])
 	}
 	if filepath.Clean(dir) != filepath.Clean(outAbs) {
-		return false
+		return false, nil
 	}
 	if !strings.HasPrefix(line, cmd) {
-		return false
+		return false, nil
 	}
 	tail := strings.TrimSpace(line[len(cmd):])
 	// Only redirections may follow: `> f`, `>> f`, `2>&1`, `2> f`.
@@ -1021,15 +1059,15 @@ func testRunMatches(line, cmd, cwd, outAbs string) bool {
 		switch {
 		case tok == "2>&1", strings.HasPrefix(tok, ">"), strings.HasPrefix(tok, "2>"):
 		case strings.ContainsAny(tok, ";&|(`$"):
-			return false
+			return false, nil
 		default:
 			// a redirection's file name, which must have followed a `>`
 			if !strings.Contains(tail, ">") {
-				return false
+				return false, nil
 			}
 		}
 	}
-	return true
+	return true, echo
 }
 
 // uiSourceExt keeps a README that mentions libadwaita from counting as a screen.
