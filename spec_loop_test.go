@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1252,5 +1253,132 @@ func TestSpecDropsAnswersOfBuiltItems(t *testing.T) {
 	}
 	if d := specReconcile(cfg, r.idx, nil); slices.Contains(d.Changed, "F0.1") || !slices.Contains(d.Changed, "F0.2") {
 		t.Errorf("changed = %v, want F0.2 (answered after its build) and not F0.1", d.Changed)
+	}
+}
+
+// codehalter's own check shows as a card whose last lines follow the run, so minutes of it
+// do not look stuck; cut short, it takes what it started with it.
+func TestRunSpecTestsShowsItsRun(t *testing.T) {
+	h := newTerminalHarness(t)
+	shown := func(what string) bool {
+		for _, u := range h.updatesOfKind("tool_call_update") {
+			if b, _ := json.Marshal(u); u["status"] == "in_progress" && strings.Contains(string(b), what) {
+				return true
+			}
+		}
+		return false
+	}
+	done := make(chan bool, 1)
+	go func() {
+		pass, _ := h.agent.runSpecTests(context.Background(), h.sess.ID, t.TempDir(), "rust", "echo one; echo two; sleep 2; echo three")
+		done <- pass
+	}()
+	if !h.waitFor(func() bool { return shown("one\\ntwo") }) {
+		t.Fatal("the running check never showed its lines")
+	}
+	if pass := <-done; !pass {
+		t.Fatal("the check did not pass")
+	}
+
+	// A test that leaves a process running, holding the output open: the check still ends
+	// (after WaitDelay), passes on its own exit status, and the leftover goes with it.
+	left := filepath.Join(t.TempDir(), "left")
+	go func() {
+		pass, tail := h.agent.runSpecTests(context.Background(), h.sess.ID, t.TempDir(), "rust", "sleep 600 & echo $! > "+left+"; echo ran")
+		if !pass {
+			t.Errorf("a passing run that left a process behind failed: %s", tail)
+		}
+		done <- pass
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("a process holding the output open held the check")
+	}
+	var leftover int
+	if b, err := os.ReadFile(left); err != nil || func() bool { _, e := fmt.Sscan(string(b), &leftover); return e != nil }() {
+		t.Fatalf("no leftover pid: %v", err)
+	}
+	if !h.waitFor(func() bool { return syscall.Kill(leftover, 0) != nil }) {
+		_ = syscall.Kill(leftover, syscall.SIGKILL)
+		t.Error("the process a passing run left behind is still running")
+	}
+
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		h.agent.runSpecTests(ctx, h.sess.ID, t.TempDir(), "rust", "sleep 600 & echo $! > "+pidFile+"; wait")
+		done <- false
+	}()
+	var pid int
+	if !h.waitFor(func() bool {
+		b, err := os.ReadFile(pidFile)
+		return err == nil && func() bool { _, e := fmt.Sscan(string(b), &pid); return e == nil }()
+	}) {
+		t.Fatal("the check never started its child")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the check cut short did not return: its child holds it")
+	}
+	if !h.waitFor(func() bool { return syscall.Kill(pid, 0) != nil }) {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		t.Error("a check cut short left its child running")
+	}
+}
+
+// The check is registered like a job: while it runs, a pid file names its shell, whose
+// command line carries the file's name; a codehalter that died mid-check (a restart) leaves
+// that, and the next start stops the check with what it started. One left an Xvfb for hours.
+func TestRunSpecTestsIsRegisteredLikeAJob(t *testing.T) {
+	old := jobKillGrace
+	jobKillGrace = 100 * time.Millisecond
+	defer func() { jobKillGrace = old }()
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	h := newTerminalHarness(t)
+	pidPath := filepath.Join(dir, fmt.Sprintf("codehalter-%d-job-0.pid", os.Getpid()))
+	seen := make(chan string, 1)
+	go func() {
+		h.agent.runSpecTests(context.Background(), h.sess.ID, t.TempDir(), "rust", "sleep 1")
+		seen <- ""
+	}()
+	if !h.waitFor(func() bool { return readPidFile(pidPath) > 0 }) {
+		t.Fatal("no pid file while the check runs")
+	}
+	if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", readPidFile(pidPath))); err != nil || !strings.Contains(string(b), filepath.Base(pidPath)) {
+		t.Errorf("the check's shell does not carry its pid file's name: %q %v", b, err)
+	}
+	<-seen
+	if _, err := os.Stat(pidPath); !os.IsNotExist(err) {
+		t.Errorf("the pid file outlived the check: %v", err)
+	}
+
+	// What a dead codehalter's check leaves: its shell, named so, and a child.
+	gone := exec.Command("true")
+	if err := gone.Run(); err != nil {
+		t.Fatal(err)
+	}
+	orphanFile := filepath.Join(dir, fmt.Sprintf("codehalter-%d-job-0.pid", gone.Process.Pid))
+	childFile := filepath.Join(dir, "child")
+	c := exec.Command(specShell(), "-lc", "sleep 600 & echo $! > "+childFile+"; wait\nexit $?", filepath.Base(orphanFile))
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := c.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go c.Wait() //nolint:errcheck // reaped; killed, as meant
+	if err := os.WriteFile(orphanFile, []byte(strconv.Itoa(c.Process.Pid)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !h.waitFor(func() bool { return readPidFile(childFile) > 0 }) {
+		t.Fatal("the orphaned check never started its child")
+	}
+	child := readPidFile(childFile)
+	killOrphanedJobs()
+	if !h.waitFor(func() bool { return syscall.Kill(child, 0) != nil && syscall.Kill(c.Process.Pid, 0) != nil }) {
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+		t.Error("the startup cleanup left a dead codehalter's check running")
 	}
 }

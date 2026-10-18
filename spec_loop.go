@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,7 +14,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // The whole /spec loop is one Prompt: Cancel stops it anywhere and the next /spec resumes from
@@ -1757,15 +1760,61 @@ func specOwnPictures(sl specSlice) []string {
 }
 
 // runSpecTests is codehalter's own check, so it runs directly, not in a visible terminal.
+// It shows as a card whose last lines follow the run: six minutes of a check that said
+// nothing looked like a stuck one.
 func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd string) (bool, string) {
-	a.say(ctx, sid, fmt.Sprintf("🧪 checking: `%s` in `%s/`\n", cmd, outRel))
+	tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Checking: %s in %s/", cmd, outRel), "execute", nil)
 	tctx, cancel := context.WithTimeout(ctx, specTestTimeout)
 	defer cancel()
-	c := exec.CommandContext(tctx, specShell(), "-lc", cmd)
+	// Registered like a job (id 0): a restart that killed codehalter mid-check left the check's
+	// Xvfb running for hours, and the next start stops what such a pid file names. The file's
+	// name as $0 identifies the shell; the trailing exit keeps it from exec'ing that name away.
+	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-%d-job-0.pid", os.Getpid()))
+	c := exec.CommandContext(tctx, specShell(), "-lc", cmd+"\nexit $?", filepath.Base(pidPath))
 	c.Dir = outAbs
+	ownProcessGroup(c) // cut short, it is stopped whole: the shell alone left cargo and Xvfb running
+	var buf lockedBuffer
+	c.Stdout, c.Stderr = &buf, &buf
 	start := time.Now()
-	out, err := c.CombinedOutput()
-	tail := collapseStackTraces(string(out))
+	err := c.Start()
+	if err == nil {
+		if werr := os.WriteFile(pidPath, []byte(strconv.Itoa(c.Process.Pid)), 0o644); werr != nil {
+			slog.Debug("spec: check's pid file", "err", werr)
+		}
+		defer removeJobFiles(pidPath)
+		done := make(chan error, 1)
+		go func() { done <- c.Wait() }()
+		tick := time.NewTicker(time.Second)
+		shown := ""
+	wait:
+		for {
+			select {
+			case err = <-done:
+				// A process the run left behind still held its output open: the command itself
+				// ended, and its own exit status is the verdict.
+				if errors.Is(err, exec.ErrWaitDelay) && c.ProcessState != nil && c.ProcessState.Success() {
+					err = nil
+				}
+				break wait
+			case <-tick.C:
+				if last := lastLines(buf.Tail(4096), 3); last != shown {
+					shown = last
+					a.sendUpdate(ctx, sid, toolCallUpdate{Kind: "tool_call_update", ToolCallId: tcId, Status: "in_progress", Content: []ToolCallContent{TextContent(last)}})
+				}
+			}
+		}
+		tick.Stop()
+		// What a test left running (a fake server it did not stop) goes with the check; a
+		// process holding the output open no longer holds the check (WaitDelay).
+		endProcessGroup(c)
+	}
+	out := buf.String()
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId, lastLines(out, 3))
+	} else {
+		a.CompleteToolCall(ctx, sid, tcId, nil)
+	}
+	tail := collapseStackTraces(out)
 	if len(tail) > specTestTailBytes {
 		tail = "…" + tailUTF8(tail, specTestTailBytes)
 	}
@@ -1789,6 +1838,54 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 	}
 	a.say(ctx, sid, fmt.Sprintf("🧪 tests passed in %s\n", took))
 	return true, tail
+}
+
+// lockedBuffer collects a command's output while another goroutine reads it.
+type lockedBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// Tail is the last n bytes, from a rune's start: the card shows three lines, and a suite
+// prints hundreds of KB.
+func (l *lockedBuffer) Tail(n int) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	b := l.b.Bytes() // no copy of the whole
+	if len(b) > n {
+		b = b[len(b)-n:]
+	}
+	for len(b) > 0 && !utf8.RuneStart(b[0]) {
+		b = b[1:]
+	}
+	return string(b)
+}
+
+// lastLines: the last n non-blank lines of out.
+func lastLines(out string, n int) string {
+	var keep []string
+	for _, ln := range slices.Backward(strings.Split(strings.TrimRight(out, "\n"), "\n")) {
+		if strings.TrimSpace(ln) == "" {
+			continue
+		}
+		keep = append([]string{ln}, keep...)
+		if len(keep) == n {
+			break
+		}
+	}
+	return strings.Join(keep, "\n")
 }
 
 // specShell runs with -lc: a login shell finds toolchains on the profile PATH

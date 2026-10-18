@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -920,5 +921,25 @@ func TestKeysAreEditedInCharacterMode(t *testing.T) {
 			t.Errorf("keys %q sent %s, want the text %s", k.keys, params, want)
 		}
 		p.reply(req, map[string]any{"stopReason": "end_turn"})
+	}
+}
+
+// A terminal's command leads a process group of its own, as a pty gives one in Zed: in
+// codehalter's group a job's group kill reached only its wrapper, and the Ctrl+C meant for
+// the turn reached every job.
+func TestCLITerminalLeadsItsOwnGroup(t *testing.T) {
+	requireSh(t)
+	c, _, _ := newCLIHarness(t, "")
+	id := c.mustCreate(t, "-c", "sleep 5")
+	term, err := c.terminal(idParams(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := term.cmd.Process.Pid
+	if pgid, err := syscall.Getpgid(pid); err != nil || pgid != pid {
+		t.Errorf("terminal command %d is in group %d (%v), want its own", pid, pgid, err)
+	}
+	if _, err := c.terminalRelease(idParams(id)); err != nil {
+		t.Error(err)
 	}
 }

@@ -575,3 +575,15 @@ func TestPhasesGoIntoTheStatusRow(t *testing.T) {
 		t.Errorf("after the phases: %q", line)
 	}
 }
+
+// A running card's live text (codehalter's own check) shows under it, as a job's tail does.
+func TestRunningCardShowsItsText(t *testing.T) {
+	u, _ := uiFor(true, 100, 24)
+	u.Begin()
+	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "c", Title: "Checking: just test in rust/", Status: "in_progress"})
+	u.Card(toolCallUpdate{Kind: "tool_call_update", ToolCallId: "c", Status: "in_progress", Content: []ToolCallContent{TextContent("Running tests/zoom.rs\ntest result: ok. 4 passed")}})
+	rows := strings.Join(u.liveLines(), "\n")
+	if !strings.Contains(rows, "Running tests/zoom.rs") || !strings.Contains(rows, "test result: ok. 4 passed") {
+		t.Errorf("live rows:\n%s", stripANSI(rows))
+	}
+}

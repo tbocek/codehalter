@@ -43,6 +43,7 @@ type cliCall struct {
 	status  string
 	started time.Time
 	termID  string
+	text    []string // the live text of a running card (codehalter's own test check), its last lines
 }
 
 type cliUI struct {
@@ -285,7 +286,7 @@ func (u *cliUI) liveLines() []string {
 	for _, c := range running {
 		out = append(out, u.clip(u.style(u.spin()+" "+c.title, ansiCyan)+
 			u.style(" "+elapsed(time.Since(c.started)), ansiDim)))
-		for _, l := range u.terms[c.termID] {
+		for _, l := range slices.Concat(u.terms[c.termID], c.text) {
 			out = append(out, u.clip(u.style("    "+l, ansiDim)))
 		}
 	}
@@ -595,6 +596,11 @@ func (u *cliUI) Card(up toolCallUpdate) {
 	}
 
 	if c.status != "completed" && c.status != "failed" {
+		for _, ct := range up.Content {
+			if ct.Type == "content" && ct.Content != nil && ct.Content.Type == "text" {
+				c.text = strings.Split(strings.TrimRight(sanitize(ct.Content.Text), "\n"), "\n")
+			}
+		}
 		u.drawLive()
 		return
 	}

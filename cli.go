@@ -982,6 +982,9 @@ func (c *cliClient) terminalCreate(params json.RawMessage) (any, error) {
 	// Stdin stays nil (/dev/null): os.Stdin would steal the prompt's keystrokes.
 	cmd := exec.Command(p.Command, p.Args...)
 	cmd.Dir = orElse(p.Cwd, c.cwd)
+	// A group of its own, as Zed's pty gives one: in codehalter's group a job's group kill
+	// reached only its wrapper, and the Ctrl+C meant for the turn reached every job.
+	newProcessGroup(cmd)
 
 	c.termMu.Lock()
 	c.termSeq++
