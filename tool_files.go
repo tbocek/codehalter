@@ -387,19 +387,14 @@ var fileTools = []Tool{
 	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name": "read_file",
-			"description": fmt.Sprintf("Read files. THREE WAYS, pick one per call:\n"+
-				"(1) A line range, both ends inclusive, like `sed -n '120,179p'`: {\"path\": \"src/cut.rs\", \"start_line\": 120, \"end_line\": 179}.\n"+
-				"(2) One definition by name, the whole function, type, class or test, in any language: {\"path\": \"src/ui/window.rs\", \"symbol\": \"cut_form_column\"}. Use this instead of `grep -n` followed by `sed -n`: one call, the whole block, its line range in the note.\n"+
-				"Add \"numbered\": true to any of them for `N|text` lines with line numbers, as the awk printf NR idiom gives.\n"+
-				"(3) SEVERAL reads at once, the way you put several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"src/fx_zoom.rs\", \"symbol\": \"zoom_at\"}, {\"path\": \"tests/zoom_widgets.rs\", \"start_line\": 1, \"end_line\": 40}]}. Each comes back under its own \"=== read N of M ===\" header. When you know you need two or three things, ask for them in ONE call like this, not one call each.\n"+
-				"Details: up to %d lines per read. The text comes back PLAIN, exactly as in the file, with no line-number prefixes: a snippet can be copied straight into edit_file's old_text. The note under it states which lines were served (\"showing lines 120-165\"), so you know where you are without numbering anything yourself. Prefer this to `cat`, `sed -n` or `awk 'NR>=a && NR<=b'` through run_command for a region you already know: one call, no shell quoting, and edit_file needs the text, never the numbers. Use `grep -n` through run_command only to FIND a region, not to read one. If the file continues past that, the output is marked partial and its note names the read_file call for the next part, {\"path\": ..., \"start_line\": N}, so no line math. When the output ends with an end-of-file marker you have the file through that point, so do not re-read. After edit_file/write_file on a path, re-reading IS expected. Path accepts absolute (/workspaces/foo/bar.go) or project-relative (bar.go).", readChunkLines),
+			"name":        "read_file",
+			"description": fmt.Sprintf("Read files. Pick one form per call:\n(1) A line range, both ends inclusive, like `sed -n '120,179p'`: {\"path\": \"src/cut.rs\", \"start_line\": 120, \"end_line\": 179}.\n(2) One definition by name, the whole function, type, class or test, any language: {\"path\": \"src/ui/window.rs\", \"symbol\": \"cut_form_column\"}. Replaces `grep -n` then `sed -n`: one call, the whole block, its line range in the note.\n(3) A chunk from the top, or from `line`, of `limit` lines (default %d): {\"path\": \"src/cut.rs\"}.\n(4) SEVERAL at once, like several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"tests/zoom_widgets.rs\", \"start_line\": 1, \"end_line\": 40}]}, each under its own \"=== read N of M ===\" header. Two or three things to read: ONE call like this.\nAdd \"numbered\": true to any form for `N|text` lines.\nText comes back PLAIN, as in the file, so a snippet copies straight into edit_file's old_text; the note says which lines were served (\"showing lines 120-165\"). A partial read's note names the call for the next part. An end-of-file marker means you have the rest: do not re-read, except after editing the file.", readChunkLines),
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"reads": map[string]any{
 						"type":        "array",
-						"description": fmt.Sprintf("SEVERAL reads in ONE call, instead of the fields below: a list, each item its own {path, symbol} or {path, line, limit}. Up to %d. Example: [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"tests/zoom_widgets.rs\", \"start_line\": 1, \"end_line\": 40}].", maxReadsPerCall),
+						"description": fmt.Sprintf("SEVERAL reads in ONE call, instead of the fields below: each {path, symbol} or {path, start_line, end_line}. Up to %d.", maxReadsPerCall),
 						"items": map[string]any{
 							"type":     "object",
 							"required": []string{"path"},
@@ -414,10 +409,10 @@ var fileTools = []Tool{
 							},
 						},
 					},
-					"path":       map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
-					"start_line": map[string]any{"type": "integer", "description": "First line to read, 1-based, with end_line the last, both inclusive: `sed -n '130,205p'` is start_line 130, end_line 205."},
-					"end_line":   map[string]any{"type": "integer", "description": "Last line to read, inclusive (see start_line)."},
-					"line":       map[string]any{"type": "integer", "description": "1-based start line. Omit to read from the beginning."},
+					"path":       map[string]any{"type": "string", "description": "Absolute or project-relative. `workspaces/foo` (no leading slash) is also tried as `/workspaces/foo`."},
+					"start_line": map[string]any{"type": "integer", "description": "First line, 1-based; with end_line the last, both inclusive: `sed -n '130,205p'` is 130 to 205."},
+					"end_line":   map[string]any{"type": "integer", "description": "Last line, inclusive."},
+					"line":       map[string]any{"type": "integer", "description": "1-based start line; omit to read from the top."},
 					"limit":      map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk; a partial read's note names the call for the next part.", maxReadLines, readChunkLines)},
 					"numbered":   map[string]any{"type": "boolean", "description": "true: every line comes back as `N|text` with its line number, like `awk '{printf \"%d|%s\\n\", NR, $0}'`. Works with line windows, symbol and each item of reads. For edit_file's old_text copy the text without the `N|` (edit_file strips it if you do not)."},
 					"symbol":     map[string]any{"type": "string", "description": "Read one definition instead of a line range: a function, method, type, class, trait or impl by name (`cut_form_column`, or `fn cut_form_column`). Any language: the block ends where its braces close, or where the indentation returns (Python), or after 50 lines when neither can be found (broken code). Comments and attributes directly above it come along. Replaces grep -n followed by a sed range: one call, the whole definition, its line range in the note."},
@@ -469,13 +464,13 @@ var fileTools = []Tool{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "write_file",
-			"description": "Create a NEW file (or fully regenerate a small/generated one). Do NOT use write_file to change a file you've been reading — reproducing a large existing file from memory loses content; use edit_file for targeted changes.",
+			"description": "Create a NEW file, or fully regenerate a small generated one. Not for changing a file you read: rewriting a large file from memory loses content; use edit_file.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"path", "content"},
 				"properties": map[string]any{
-					"path":    map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
-					"content": map[string]any{"type": "string", "description": "Full file content. Will replace the file entirely."},
+					"path":    map[string]any{"type": "string", "description": "Absolute or project-relative. `workspaces/foo` (no leading slash) is also tried as `/workspaces/foo`."},
+					"content": map[string]any{"type": "string", "description": "The whole file content; it replaces the file."},
 				},
 			},
 		},
@@ -515,12 +510,8 @@ var fileTools = []Tool{
 	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name": "edit_file",
-			"description": "Change an EXISTING file. Always prefer this over write_file for a file that exists, and ALWAYS over a Python, sed or awk script through run_command: this edit is checked, shown to the user as a diff, and counted as an edit; a script is none of that, and a wrong anchor in it silently rewrites the wrong span. THREE WAYS, pick one per call:\n" +
-				"(1) A small exact change: {\"path\": \"src/cut.rs\", \"old_text\": \"let zoom = 1.0;\", \"new_text\": \"let zoom = params::ZOOM;\"}. old_text must be unique in the file; copy it from a fresh read.\n" +
-				"(2) A whole BLOCK (a function, a test, a match arm, a widget section): {\"path\": \"src/ui/window.rs\", \"start\": \"fn wire_zoom(\", \"end\": \"} // wire_zoom\", \"new_text\": \"fn wire_zoom(...) {\\n    ...\\n}\"}. `start` is a fragment of the block's FIRST line, unique in the file; `end` a fragment of its LAST line (the first line containing it at or after start). Every line from start through end is replaced by new_text. Use this instead of copying forty lines into old_text.\n" +
-				"(3) SEVERAL changes to the same file at once: {\"path\": \"src/ui/window.rs\", \"edits\": [{\"old_text\": \"let zoom = 1.0;\", \"new_text\": \"let zoom = params::ZOOM;\"}, {\"start\": \"fn wire_zoom(\", \"end\": \"} // wire_zoom\", \"new_text\": \"...\"}]}. Applied in order, all or none; an error names the edit that failed. When you have two or three changes to one file, send them in ONE call like this.\n" +
-				"Errors (not found / not unique / unwritable) come back as messages: fix and retry.",
+			"name":        "edit_file",
+			"description": "Change an EXISTING file. Use it over write_file for any existing file, and ALWAYS over a Python, sed or awk script through run_command: this edit is checked, shown to the user as a diff, and counted; a script is none of that, and a wrong anchor silently rewrites the wrong span. Pick one form per call:\n(1) A small exact change: {\"path\": \"src/cut.rs\", \"old_text\": \"let zoom = 1.0;\", \"new_text\": \"let zoom = params::ZOOM;\"}. old_text must be unique in the file; copy it from a fresh read.\n(2) A whole BLOCK (a function, a test, a match arm, a widget section): {\"path\": \"src/ui/window.rs\", \"start\": \"fn wire_zoom(\", \"end\": \"} // wire_zoom\", \"new_text\": \"...\"}. Every line from the start line through the end line is replaced. Use it instead of copying forty lines into old_text.\n(3) SEVERAL changes to one file: {\"path\": \"src/ui/window.rs\", \"edits\": [{\"old_text\": \"...\", \"new_text\": \"...\"}, {\"start\": \"fn wire_zoom(\", \"end\": \"} // wire_zoom\", \"new_text\": \"...\"}]}, applied in order, all or none. Two or three changes to one file: ONE call like this.\nErrors (not found, not unique, unwritable) come back as messages: fix and retry.",
 
 			"parameters": map[string]any{
 				"type":     "object",
@@ -528,7 +519,7 @@ var fileTools = []Tool{
 				"properties": map[string]any{
 					"edits": map[string]any{
 						"type":        "array",
-						"description": "SEVERAL changes to this ONE file in ONE call, instead of old_text/start/end/new_text below: a list applied in order, each {old_text, new_text} or {start, end, new_text}. All apply or none does; an error names the one that failed.",
+						"description": "SEVERAL changes to this file in ONE call, instead of the fields below: each {old_text, new_text} or {start, end, new_text}, in order, all or none; an error names the one that failed.",
 						"items": map[string]any{
 							"type":     "object",
 							"required": []string{"new_text"},
@@ -540,11 +531,11 @@ var fileTools = []Tool{
 							},
 						},
 					},
-					"path":     map[string]any{"type": "string", "description": "Absolute path or path relative to the project root. A relative path that looks absolute-but-missing-leading-slash (e.g. `workspaces/foo`) will also be tried with `/` prepended."},
-					"old_text": map[string]any{"type": "string", "description": "Way (1): exact text to find. MUST match the file byte-for-byte (whitespace, indentation, trailing newlines included) AND must be unique in the file — include enough surrounding context to disambiguate."},
-					"start":    map[string]any{"type": "string", "description": "Way (2): a fragment of the block's FIRST line, unique in the file (for example `fn cut_form_column(`)."},
-					"end":      map[string]any{"type": "string", "description": "Way (2): a fragment of the block's LAST line; the first line at or after `start` that contains it ends the block (for example the closing `}` line's text, or a comment on it). Omit to replace the start line alone."},
-					"new_text": map[string]any{"type": "string", "description": "Replacement text: for (1) it replaces old_text, for (2) it replaces the lines from start through end, whole lines. Pass an empty string to delete."},
+					"path":     map[string]any{"type": "string", "description": "Absolute or project-relative. `workspaces/foo` (no leading slash) is also tried as `/workspaces/foo`."},
+					"old_text": map[string]any{"type": "string", "description": "Form (1): the exact text, byte for byte (whitespace, indentation, newlines) and unique in the file: include enough context to tell it apart."},
+					"start":    map[string]any{"type": "string", "description": "Form (2): a fragment of the block's FIRST line, unique in the file (`fn cut_form_column(`)."},
+					"end":      map[string]any{"type": "string", "description": "Form (2): a fragment of the block's LAST line; the first line at or after `start` containing it ends the block (the closing `}` line, or a comment on it). Omit to replace the start line alone."},
+					"new_text": map[string]any{"type": "string", "description": "Replacement: for (1) of old_text, for (2) of the whole lines start through end. An empty string deletes."},
 				},
 			},
 		},

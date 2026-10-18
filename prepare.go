@@ -641,7 +641,7 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 		b.WriteString("🟡 Firefox: not found, web_search/web_read disabled. Install firefox or set FIREFOX_PATH.\n\n")
 	}
 	// Only reachable inside a container (ensureDevcontainer), where run_command is always registered.
-	b.WriteString("✅ run_command: available (probes and test installs; `.git` is bind-mounted read-only, destructive git commands fail at the FS layer)\n\n")
+	b.WriteString("✅ run_command: available (builds, tests, probes and test installs)\n\n")
 
 	if len(sess.knownStacks) > 0 {
 		fmt.Fprintf(&b, "Stacks: %s", strings.Join(sess.knownStacks, ", "))

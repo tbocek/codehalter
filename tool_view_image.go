@@ -13,11 +13,8 @@ var viewImageTool = Tool{
 	Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name": "view_image",
-			"description": "Re-fetch a previously-attached image into the current context. " +
-				"Pass the `id` (img_<hex>) surfaced in a `[Image img_… — call view_image id=… to view]` reference. " +
-				"References appear in Summary after compaction has rotated the original user turn out, OR alongside any image still in live history when image bytes failed to read from disk. " +
-				"Only call this when you actually need to look at the image — every retrieval re-injects the full bytes into the prompt.",
+			"name":        "view_image",
+			"description": "Fetch an image attached earlier back into view, by the `id` (img_<hex>) from an `[Image img_…]` reference. Such references stand in the Summary after a compaction, or in history where the image bytes could not be read. Call it only to look again: every fetch puts the whole image back into the prompt.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"id"},

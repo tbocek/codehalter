@@ -14,20 +14,15 @@ const submitPlanToolName = "submit_plan"
 var submitPlanTool = Tool{Def: map[string]any{
 	"type": "function",
 	"function": map[string]any{
-		"name": submitPlanToolName,
-		"description": "Submit your finished plan and end the planning phase. Call this exactly " +
-			"once when you have gathered everything and decided how to proceed. Put the structured " +
-			"plan in the arguments. If the request is a pure lookup you can already answer, put the " +
-			"COMPLETE answer in the `answer` argument and call this with report_only=true and an " +
-			"empty subtasks list: your reasoning is never shown, and message text beside a tool call " +
-			"is often dropped. After this call returns, no further planning tools run.",
+		"name":        submitPlanToolName,
+		"description": "Submit the finished plan and end planning. Call it exactly once, when you have gathered everything and decided how to proceed. A pure lookup you can already answer: the COMPLETE answer in `answer`, report_only=true, no subtasks (your reasoning is never shown, and text beside a tool call is often dropped). No planning tools run after it.",
 		"parameters": map[string]any{
 			"type":     "object",
 			"required": []string{"clear", "subtasks", "report_only"},
 			"properties": map[string]any{
 				"clear": map[string]any{
 					"type":        "boolean",
-					"description": "True when the request is actionable. False when it needs clarification — then fill choices + question and leave subtasks empty.",
+					"description": "True when the request is actionable. False when it needs clarification: then fill choices and question, no subtasks.",
 				},
 				"choices": map[string]any{
 					"type":        "array",
@@ -75,7 +70,7 @@ var submitPlanTool = Tool{Def: map[string]any{
 				},
 				"report_only": map[string]any{
 					"type":        "boolean",
-					"description": "True when the whole request is informational and you already have the answer — no edits, no commands. Skips the execute-confirmation gate.",
+					"description": "True when the request is informational and you have the answer: no edits, no commands. Skips the execute-confirmation gate.",
 				},
 				"redo": map[string]any{
 					"type":        "array",
@@ -115,18 +110,15 @@ const respondToolName = "respond"
 var respondTool = Tool{Def: map[string]any{
 	"type": "function",
 	"function": map[string]any{
-		"name": respondToolName,
-		"description": "Emit your final user-facing message and end the turn. " +
-			"Call this exactly once when the task is complete; everything you " +
-			"would have written as a free-text reply goes in `message`. After " +
-			"this call returns, no further tools run.",
+		"name":        respondToolName,
+		"description": "Your final user-facing message; ends the turn. Call it exactly once, when the task is done: everything you would write as a reply goes in `message`. No tools run after it.",
 		"parameters": map[string]any{
 			"type":     "object",
 			"required": []string{"message"},
 			"properties": map[string]any{
 				"message": map[string]any{
 					"type":        "string",
-					"description": "The full user-facing message — what you would have written as the assistant's final reply.",
+					"description": "The full user-facing message, what you would write as your final reply.",
 				},
 			},
 		},

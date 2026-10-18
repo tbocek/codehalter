@@ -289,7 +289,7 @@ var webTools = []Tool{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "web_search",
-			"description": "Search the web with DuckDuckGo. Returns up to 10 results as a numbered list (title, URL, snippet) for you to triage — does NOT fetch page content. Snippets alone are NOT enough to answer factual questions: you MUST follow up by calling web_read on at least one (ideally 1-3) of the most promising URLs. Skipping web_read is only acceptable if every result is clearly off-topic, in which case you should refine the query and search again.",
+			"description": "Search the web with DuckDuckGo: up to 10 results (title, URL, snippet) to triage; page content is NOT fetched. Snippets are not enough for a factual answer: follow up with web_read on 1 to 3 of the most promising URLs. Skip that only when every result is off-topic, and then search again with a better query.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"query"},

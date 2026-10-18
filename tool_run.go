@@ -23,22 +23,19 @@ func (a *agent) discoverSandbox() {
 	a.tools.add(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name": "run_command",
-			"description": "IMPORTANT: this tool is for builds, tests, installs, git, and finding things with `grep -rn`. DO NOT use it to read or change the project's files, use the file tools: read with `read_file` (NOT cat, head, tail, sed -n or awk), change with `edit_file` (NOT sed -i, awk or a Python script), create with `write_file` (NOT echo > or cat <<EOF). " +
-				"Run a shell command inside this devcontainer and wait for it, up to two minutes. Exits in time (the normal case): you get its exit code and output. Still running after two minutes: it is NOT killed, it continues as a background job, you get what it printed so far, and the moment it exits codehalter hands you its exit code and last output by itself, before your next step; if you have nothing else to do, call `respond` saying you are waiting for it, which parks the turn (it does not end it) until the job reports. Never `sleep` or poll for it. If you already know a command runs longer than two minutes, start it with `run_background` instead and skip the wait. For a process that never exits (a dev server, a watcher, `npm run dev`) always use `run_server`, and never add a trailing `&` here: the process would survive with no pid or log recorded. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. To FIND something in the tree: `grep -rn -C3 -F '<text>' src tests` here, naming the source directories to search rather than excluding the build one, one call that returns line numbers, the match and its context (`-E` for a regex). Keep to short options: a BusyBox grep (Alpine) rejects `--include`, `--exclude` and `--exclude-dir` and prints its usage instead. To CHANGE a file: `edit_file` (with `start`/`end` for a whole block): a script is not checked, not shown as a diff, and a wrong anchor rewrites the wrong span silently. Use this for: (1) PROBE — `which <tool>`, `cargo check`, `node --version`, `apt list --installed | grep <pkg>` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install <pkg>`), first run the same install via run_command, then verify it works (e.g. `<tool> --version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which <tool>` exiting 1 means <tool> is missing, not that the tool failed. Output is auto-capped keeping the START and the END (only the middle is elided), so do NOT pipe to `head`/`tail` to shorten it: that throws away what the cap already keeps, and the most useful lines (errors, and search hits like `yay -Ss` / `apt search`) come LAST. Run the command raw; use `grep` only to filter for a specific match, never to trim length. " +
-				"For project-file edits prefer `edit_file` / `write_file` — they go through the agent's diff/approval UI, raw `>` or `sed -i` do not. " +
-				"The `.git` directory is bind-mounted read-only; destructive git commands (push, reset --hard, etc.) will fail at the filesystem layer. Read-only git is fine (clone, log, ls-remote, archive).",
+			"name":        "run_command",
+			"description": "IMPORTANT: for builds, tests, installs, git, and finding things with `grep -rn`. NOT for reading or changing project files: read with `read_file` (not cat, head, tail, sed -n, awk), change with `edit_file` (not sed -i, awk or a Python script: a script is unchecked, shows no diff, and a wrong anchor silently rewrites the wrong span), create with `write_file` (not echo > or cat <<EOF). Runs in this devcontainer and waits up to two minutes for the exit code and output. Still running then: it is NOT killed but goes on as a background job; you get its output so far, and its exit code and last output arrive by themselves before your next step. Nothing else to do: call `respond` saying you wait for it, which parks the turn until the job reports. Never `sleep` or poll for it. Known to take over two minutes: use `run_background`. Never ends (dev server, watcher, `npm run dev`): use `run_server`, and never a trailing `&` here (it would survive with no pid or log). Finding: `grep -rn -C3 -F '<text>' src tests`, naming the directories to search: one call, line numbers, match and context (`-E` for a regex). Short options only: BusyBox grep (Alpine) rejects `--include`, `--exclude` and `--exclude-dir`. The container is a throwaway sandbox: installs last until a rebuild, workspace writes are real and recoverable from git. Before proposing a Dockerfile change, run the same install here and verify it (`<tool> --version`, or the failing build again); propose the patch once that works. The exit code is in the output and title: `which <tool>` exiting 1 means the tool is missing. Output is capped keeping its START and END, so run commands raw: a pipe to `head`/`tail` throws away what the cap keeps, and errors come last. Use `grep` to filter for a match, not to trim length.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
 				"properties": map[string]any{
 					"wake_after": map[string]any{
 						"type":        "integer",
-						"description": "Optional, seconds. If the command is still running after the two-minute wait and continues in the background, wake me once at this age with its log tail (the exit is reported separately, whenever it comes).",
+						"description": "Optional, seconds: if it still runs in the background at this age, wake me once with its log tail. Its exit is reported separately.",
 					},
 					"command": map[string]any{
 						"type":        "string",
-						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Run it raw: output is auto-capped (start+end kept), so do NOT append `| head` / `| tail` to limit size. Examples: `which <tool>`, `apt-get install -y <pkg> && <tool> --version`, `cargo check 2>&1`.",
+						"description": "Shell command, run under bash -c. Examples: `which <tool>`, `apt-get install -y <pkg> && <tool> --version`, `cargo check 2>&1`.",
 					},
 				},
 			},
@@ -49,18 +46,18 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_background",
-			"description": "Start a command that ENDS on its own but takes longer than two minutes (a full test suite, a long build, a benchmark, a training run) and return at once, so run_command's wait is not spent on it. It keeps running across later tool calls; the moment it exits, codehalter hands you its exit code, log path and last output on its own, before your next step. Meanwhile do other work, or call `respond` saying you are waiting: the step is parked, not ended, and continues when the job reports. Never poll and never `sleep` for it (a foreground `sleep` is refused while a job runs); for a look before it exits, give `wake_after`. A job that uses almost no CPU and writes no output for 5 minutes is taken for stuck and stopped. A process that never ends on its own (a dev server, a watcher: `npm run dev`, `python3 -m http.server 8765`) is not for this tool: start it with `run_server`. run_background waits briefly to catch an immediate failure, then returns the pid and a log-file path, which you read with run_command (`tail`, `grep`). Stop it early with `run_command: kill -TERM -<pid>; sleep 3; kill -KILL -<pid> 2>/dev/null; true`, which stops the whole job (a plain `kill <pid>` can be ignored here). Do NOT add a trailing `&`: run_background already detaches it.",
+			"description": "Start a command that ENDS on its own but takes over two minutes (a full test suite, a long build, a benchmark) and return at once. It runs across later tool calls; when it exits, its exit code, log path and last output arrive by themselves before your next step. Meanwhile do other work, or call `respond` saying you wait: the step is parked, not ended. Never poll or `sleep` for it (a foreground `sleep` is refused while a job runs); for a look before it exits, give `wake_after`. A job using almost no CPU and writing no output for 5 minutes counts as stuck and is stopped. Never ends on its own (dev server, watcher): use `run_server`. Returns the pid and a log path to read with run_command (`tail`, `grep`). Stop it early with `run_command: kill -TERM -<pid>; sleep 3; kill -KILL -<pid> 2>/dev/null; true` (the whole job; a plain `kill <pid>` may be ignored here). No trailing `&`: it is detached already.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
 				"properties": map[string]any{
 					"wake_after": map[string]any{
 						"type":        "integer",
-						"description": "Optional, seconds. Wake me once at this age with the log tail even if the job is still running (a long run you want a mid-way look at). The exit is reported separately, whenever it comes. Without it you are woken only at exit.",
+						"description": "Optional, seconds: wake me once at this age with the log tail if it still runs (a mid-way look). The exit is reported separately.",
 					},
 					"command": map[string]any{
 						"type":        "string",
-						"description": "Shell command to run under bash -c, WITHOUT a trailing `&`. Examples: `cd rust && just test > /tmp/test.log 2>&1`, `cargo build --release`.",
+						"description": "Shell command, run under bash -c, no trailing `&`. Examples: `cd rust && just test > /tmp/test.log 2>&1`, `cargo build --release`.",
 					},
 				},
 			},
@@ -71,17 +68,17 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_server",
-			"description": "Start a process that never ends on its own: a dev server (`npm run dev`, `python3 -m http.server 8765`, `flask --app app run --port 5000`), a watcher, a daemon, a fake service a manual check talks to. It runs until you stop it with {\"stop\": <its job id>} or the session ends; no step waits for it, and it is never stopped as idle. Give `port` and the call returns once something accepts connections there (up to 60 seconds), so do not sleep or poll for it to come up. A command that ends on its own (a test suite, a build, a benchmark) is not a server: use run_command, or run_background when it takes longer than two minutes. Do NOT add a trailing `&`.",
+			"description": "Start a process that never ends on its own: a dev server (`npm run dev`, `python3 -m http.server 8765`), a watcher, a daemon, a fake service a manual check talks to. It runs until `{\"stop\": <its job id>}` or the session ends; nothing waits for it and it is never stopped as idle. With `port`, the call returns once that port accepts connections (up to 60 s): do not sleep or poll for it. A command that ends (a test suite, a build) is no server: use run_command, or run_background past two minutes. No trailing `&`.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"command": map[string]any{
 						"type":        "string",
-						"description": "Shell command to run under bash -c, WITHOUT a trailing `&`. Examples: `python3 -m http.server 8765`, `npm run dev`.",
+						"description": "Shell command, run under bash -c, no trailing `&`. Examples: `python3 -m http.server 8765`, `npm run dev`.",
 					},
 					"port": map[string]any{
 						"type":        "integer",
-						"description": "Optional. The TCP port the server listens on: the call waits until it accepts connections there.",
+						"description": "Optional: the TCP port it listens on; the call waits until it accepts connections.",
 					},
 					"stop": map[string]any{
 						"type":        "integer",
