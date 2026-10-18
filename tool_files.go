@@ -703,8 +703,8 @@ func locateSymbol(content, symbol string) symbolLoc {
 // braceBlockEnd: a ';' before any '{' ends the block (a prototype), and the '{'
 // must open within the first few lines.
 // braceBlockEnd: where the brace block that opens at or after line d closes, and the line
-// its `{` is on. Strings ("…", `…`, '…' but not a Rust lifetime 'a) and comments (//, /* */)
-// do not count. Not ok when no `{` opens within three lines; a `;` ending line d first ends it there.
+// its `{` is on. Strings ("…", `…`, '…' but not a Rust lifetime 'a) and comments (//, /* */,
+// `# `) do not count. Not ok when no `{` opens within three lines; a `;` ending line d first ends it there.
 func braceBlockEnd(lines []string, d int) (end, open int, ok bool) {
 	depth, opened, inBlock := 0, false, false
 	for i := d; i < len(lines); i++ {
@@ -742,6 +742,12 @@ func braceBlockEnd(lines []string, d int) (end, open int, ok bool) {
 					inBlock = true
 					j++
 				}
+			case '#':
+				// A shell, Python, Ruby or PHP comment: `# …` after whitespace. Not a CSS
+				// colour (#fff), a Rust attribute (#[test]), `$#` or `#define`.
+				if (j == 0 || ln[j-1] == ' ' || ln[j-1] == '\t') && (j+1 == len(ln) || ln[j+1] == ' ' || ln[j+1] == '\t') {
+					j = len(ln)
+				}
 			case '{':
 				if !opened {
 					open = i
@@ -750,7 +756,8 @@ func braceBlockEnd(lines []string, d int) (end, open int, ok bool) {
 				opened = true
 			case '}':
 				depth--
-				if opened && depth == 0 {
+				// `} else {`, `} catch (e) {`, `}).then(() => {`: the chain goes on.
+				if opened && depth == 0 && !strings.Contains(stripLineComment(ln[j+1:]), "{") {
 					return i, open, true
 				}
 			case ';':
@@ -772,7 +779,21 @@ func braceBlockEnd(lines []string, d int) (end, open int, ok bool) {
 var lifetimeRe = regexp.MustCompile(`^'[A-Za-z_]\w*(?:[^\w']|$)`)
 
 // closerLineRe is a line that only closes a block, at the indentation the block opened at.
-var closerLineRe = regexp.MustCompile(`(?i)^(?:[)\]}]+[;,)]*|(?:end|fi|done|esac|endif|endfunction|endwhile|endfor|wend)\b.*)$`)
+// A keyword closes only alone or before punctuation or a block word: `end`, `end)`,
+// `end if`, `End Sub`, not `end = 5`.
+var closerLineRe = regexp.MustCompile(`(?i)^(?:[)\]}]+[;,)]*|(?:end|fi|done|esac|endif|endfunction|endwhile|endfor|wend)(?:[\s;),.]*|\s+(?:if|do|function|sub|select|while|for|module|class|case|type|program|subroutine|loop|interface|procedure)\b.*))$`)
+
+// heredocRe opens a here-document (`<<EOF`, `<<-'END'`, Ruby's `<<~SQL`), whose body ends at
+// its word alone. The word is upper-case and follows directly, so `list << item` and `1<<x`
+// are no here-documents.
+var heredocRe = regexp.MustCompile(`<<[-~]?['"]?([A-Z_][A-Z0-9_]*)['"]?`)
+
+// tripleQuoteRe: Python's string delimiters that span lines.
+var tripleQuoteRe = regexp.MustCompile(`"""|'''`)
+
+// continueLineRe goes on a block at its own indentation: Python's `else:`, Ruby's
+// `elsif`, shell's `elif`, `except`, `rescue`.
+var continueLineRe = regexp.MustCompile(`^(?:elif|else|elsif|elseif|except|finally|rescue|ensure|catch)\b`)
 
 // blockEnd: where the block opening on line d ends, in any language. Braces decide when the
 // block opens with a `{` on line d, or on a later line at d's own indentation (a signature
@@ -781,6 +802,15 @@ var closerLineRe = regexp.MustCompile(`(?i)^(?:[)\]}]+[;,)]*|(?:end|fi|done|esac
 // indentation that only closes (`}`, `end`, `fi`, `done`). A declaration a `;` ends is its
 // own line. Not ok when no block opens on d.
 func blockEnd(lines []string, d int) (int, string, bool) {
+	// A decorator (`@cache`, `@Override`) heads the definition below it.
+	if strings.HasPrefix(strings.TrimSpace(lines[d]), "@") {
+		for i := d + 1; i < len(lines); i++ {
+			if t := strings.TrimSpace(lines[i]); t != "" && !strings.HasPrefix(t, "@") {
+				return blockEnd(lines, i)
+			}
+		}
+		return 0, "", false
+	}
 	base := len(leadingWS(lines[d]))
 	e, open, ok := braceBlockEnd(lines, d)
 	switch {
@@ -790,16 +820,34 @@ func blockEnd(lines []string, d int) (int, string, bool) {
 		return e, "braces", true
 	}
 	end, deeper := d, false
+	closeAt := "" // a here-document's word, or a triple quote: text up to it is opaque
 	for i := d + 1; i < len(lines); i++ {
 		t := strings.TrimSpace(lines[i])
-		if t == "" {
+		// A here-document's body or a triple-quoted string may sit at column 0 inside the block.
+		if closeAt != "" {
+			if t == closeAt || tripleQuoteRe.MatchString(closeAt) && strings.Contains(t, closeAt) {
+				closeAt = ""
+			}
 			continue
 		}
-		if len(leadingWS(lines[i])) > base {
+		if m := heredocRe.FindStringSubmatch(t); m != nil {
+			closeAt = m[1]
+		} else if q := tripleQuoteRe.FindAllString(t, -1); len(q)%2 == 1 {
+			closeAt = q[0]
+		}
+		// Blank lines and comments say nothing of the block: a Python comment may sit at column 0.
+		if strings.TrimSpace(stripLineComment(t)) == "" {
+			continue
+		}
+		ind := len(leadingWS(lines[i]))
+		switch {
+		case ind > base:
 			end, deeper = i, true
 			continue
-		}
-		if deeper && len(leadingWS(lines[i])) == base && closerLineRe.MatchString(t) {
+		case deeper && ind == base && continueLineRe.MatchString(t):
+			end = i // `else:`, `except E:`: the same statement goes on
+			continue
+		case deeper && ind == base && closerLineRe.MatchString(t):
 			end = i
 		}
 		break
@@ -927,13 +975,17 @@ func replaceBlock(content, start, end, newText string) (string, string, string) 
 			word := regexp.MustCompile(`\b` + regexp.QuoteMeta(end) + `\b`)
 			contains = word.MatchString
 		}
-		if !closingOnlyRe.MatchString(strings.TrimSpace(end)) {
+		search := func() {
 			for i := s; i < len(lines); i++ {
 				if contains(lines[i]) {
 					e = i
 					break
 				}
 			}
+		}
+		closer := closingOnlyRe.MatchString(strings.TrimSpace(end))
+		if !closer {
+			search()
 		}
 		// A function's last line is a bare `}`, which also closes every inner block, so the
 		// model cannot name it: it gave the bare brace or invented a marker ("} // placeholder"),
@@ -943,6 +995,8 @@ func replaceBlock(content, start, end, newText string) (string, string, string) 
 			// A statement on the start line is no block to extend to.
 			if b, by, ok := blockEnd(lines, s); ok && by != "its semicolon" {
 				e, how = b, ", its end found by "+by
+			} else if closer {
+				search() // from a line inside a block, `}` is the next line closing one
 			}
 		}
 		if e < 0 {

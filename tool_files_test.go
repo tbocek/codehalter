@@ -770,3 +770,73 @@ func TestEditFileBlockEndsWhereItCloses(t *testing.T) {
 		t.Errorf("python block: failed=%v %s\nfile:\n%s", failed, out, got)
 	}
 }
+
+// Where a block ends, across languages and the shapes that trip a naive count: else and
+// catch chains, braces in strings, char literals and comments, comments and here-documents
+// at column 0, a variable named end, decorators. "error" is a correct refusal: no block
+// opens on the start line and the end is on no line after it.
+func TestBlockEndEdgeCases(t *testing.T) {
+	for _, c := range []struct{ name, src, start, end, want string }{
+		{"ruby << append is no heredoc", "def f(list)\n  list << item\n  x = 1<<y\n  list\nend\nputs 1\n", "def f(list)", "end", "<NEW>\nputs 1\n"},
+		{"ruby squiggly heredoc", "def sql\n  <<~SQL\nselect 1\n  SQL\nend\nputs 1\n", "def sql", "end", "<NEW>\nputs 1\n"},
+		{"shell heredoc at column 0", "if [ -f x ]; then\n  cat <<EOF\nfi in text\n}\nEOF\n  echo x\nfi\necho y\n", "if [ -f x ]", "fi", "<NEW>\necho y\n"},
+		{"python docstring at column 0", "def f():\n    s = \"\"\"\nline at col 0\nend = 1\n\"\"\"\n    return s\n\ny = 2\n", "def f():", "nowhere", "<NEW>\n\ny = 2\n"},
+		{"python one-line docstring", "def f():\n    \"\"\"Doc.\"\"\"\n    return 1\n\ny = 2\n", "def f():", "nowhere", "<NEW>\n\ny = 2\n"},
+		{"js if/else chain, end }", "function f(x) {\n  if (x) {\n    a();\n  } else {\n    b();\n  }\n  c();\n}\n", "if (x) {", "}", "function f(x) {\n<NEW>\n  c();\n}\n"},
+		{"java try/catch, invented end", "void f() {\n  try {\n    a();\n  } catch (E e) {\n    b();\n  }\n  c();\n}\n", "try {", "} // end try", "void f() {\n<NEW>\n  c();\n}\n"},
+		{"do/while", "void f() {\n  do {\n    a();\n  } while (x);\n  c();\n}\n", "do {", "}", "void f() {\n<NEW>\n  c();\n}\n"},
+		{"allman braces", "void f()\n{\n    a();\n}\nvoid g() {}\n", "void f()", "}", "<NEW>\nvoid g() {}\n"},
+		{"escaped quote in string", "fn f() {\n    let s = \"a\\\"{\";\n    g();\n}\nfn h() {}\n", "fn f() {", "}", "<NEW>\nfn h() {}\n"},
+		{"char literals", "fn f() {\n    let a = '}';\n    let b = '\\'';\n    let c = '\\\\';\n}\nfn h() {}\n", "fn f() {", "}", "<NEW>\nfn h() {}\n"},
+		{"lifetimes and a label", "fn f<'a>(x: &'a str) -> &'a str {\n    'outer: loop { break 'outer; }\n    x\n}\nfn h() {}\n", "fn f<'a>", "}", "<NEW>\nfn h() {}\n"},
+		{"python comment at column 0 in body", "def f():\n    a = 1\n# note\n    return a\n\ny = 2\n", "def f():", "# end", "<NEW>\n\ny = 2\n"},
+		{"python if/else", "def f(x):\n    if x:\n        a()\n    else:\n        b()\n    c()\n", "    if x:", "nowhere", "def f(x):\n<NEW>\n    c()\n"},
+		{"python try/except/finally", "try:\n    a()\nexcept E:\n    b()\nfinally:\n    c()\nd()\n", "try:", "nowhere", "<NEW>\nd()\n"},
+		{"variable named end after a block", "def f():\n    x = 1\nend = 5\n", "def f():", "nowhere", "<NEW>\nend = 5\n"},
+		{"ruby if/elsif/else/end", "def f(x)\n  if x\n    a\n  elsif y\n    b\n  else\n    c\n  end\n  d\nend\n", "  if x", "end", "def f(x)\n<NEW>\n  d\nend\n"},
+		{"lua end)", "f(function()\n  a()\nend)\nb()\n", "f(function()", "end)", "<NEW>\nb()\n"},
+		{"python comment with brace at base", "def f():\n    a = 1\n# { stray\n    return a\n\ny = 2\n", "def f():", "nowhere", "<NEW>\n\ny = 2\n"},
+		{"css one-liners with # colours", "a {\n  color: #fff;\n}\nb { color: #000; }\n", "a {", "}", "<NEW>\nb { color: #000; }\n"},
+		{"shell comment with quote", "if [ -f x ]; then\n  # it's here {\n  echo x\nfi\necho y\n", "if [ -f x ]", "fi", "<NEW>\necho y\n"},
+		{"multi-line call, end )", "fn f() {\n    foo(\n        a,\n        b,\n    );\n    bar();\n}\n", "    foo(", ")", "fn f() {\n<NEW>\n    bar();\n}\n"},
+		{"start inside a block, end }", "fn f() {\n    let x = 1;\n    let y = 2;\n}\nfn g() {}\n", "    let x = 1;", "}", "fn f() {\n<NEW>\nfn g() {}\n"},
+		{"go multi-line string with brace", "func f() {\n\ts := `a {\nb`\n\tg()\n}\nfunc h() {}\n", "func f() {", "}", "<NEW>\nfunc h() {}\n"},
+		{"crlf", "fn f() {\r\n    a();\r\n}\r\nfn g() {}\r\n", "fn f() {", "}", "<NEW>\nfn g() {}\r\n"},
+		{"tabs", "func f() {\n\tif x {\n\t\ta()\n\t}\n}\nfunc g() {}\n", "func f() {", "}", "<NEW>\nfunc g() {}\n"},
+		{"yaml key", "a:\n  b: 1\n  c:\n    d: 2\ne: 3\n", "a:", "nowhere", "<NEW>\ne: 3\n"},
+		{"python decorator start", "@cache\ndef f():\n    return 1\n\ny = 2\n", "@cache", "nowhere", "<NEW>\n\ny = 2\n"},
+		{"elixir do/end", "defmodule M do\n  def f(x) do\n    x\n  end\nend\n", "  def f(x) do", "end", "defmodule M do\n<NEW>\nend\n"},
+		{"} then a comment with {", "fn f() {\n    a();\n} // { trailing\nfn g() {}\n", "fn f() {", "}", "<NEW>\nfn g() {}\n"},
+		{"else if chain", "if (a) {\n  x();\n} else if (b) {\n  y();\n} else {\n  z();\n}\nw();\n", "if (a) {", "}", "<NEW>\nw();\n"},
+		{"shell function, # } in a comment", "f() {\n  # } not the end\n  echo hi\n}\ng() {\n  echo\n}\n", "f() {", "}", "<NEW>\ng() {\n  echo\n}\n"},
+		{"shell case/esac", "case $x in\n  a) foo;;\n  b) bar;;\nesac\necho done\n", "case $x in", "esac", "<NEW>\necho done\n"},
+		{"ruby do block", "items.each do |x|\n  puts x\nend\nputs 1\n", "items.each do |x|", "end", "<NEW>\nputs 1\n"},
+		{"python one-line def", "def f(): return 1\ny = 2\n", "def f(): return 1", "nowhere", "error"},
+		{"rust impl inner method", "impl T {\n    fn a(&self) {\n        if x {\n            b();\n        }\n    }\n\n    fn c(&self) {}\n}\n", "    fn a(&self) {", "}", "impl T {\n<NEW>\n\n    fn c(&self) {}\n}\n"},
+		{"json-ish closings", "const o = {\n  a: {\n    b: 1,\n  },\n  c: 2,\n};\nf();\n", "const o = {", "};", "<NEW>\nf();\n"},
+		{"promise chain", "load()\n  .then(() => {\n    a();\n  })\n  .catch(() => {\n    b();\n  });\nnext();\n", "  .then(() => {", "})", "load()\n<NEW>\n  .catch(() => {\n    b();\n  });\nnext();\n"},
+		{"start on the last line", "fn f() {}\nlet x = 1;", "let x = 1;", "}", "error"},
+		{"kotlin when", "fun f(x: Int) = when (x) {\n    1 -> \"a\"\n    else -> \"b\"\n}\nfun g() {}\n", "fun f(x: Int) = when (x) {", "}", "<NEW>\nfun g() {}\n"},
+		{"swift guard else", "func f() {\n    guard x else {\n        return\n    }\n    a()\n}\nfunc g() {}\n", "func f() {", "}", "<NEW>\nfunc g() {}\n"},
+		{"c macro line with brace", "#define X {\nint f() {\n    return 1;\n}\nint g() {}\n", "int f() {", "}", "#define X {\n<NEW>\nint g() {}\n"},
+		{"php # comment with brace", "<?php\nfunction f() {\n    # } note\n    return 1;\n}\nfunction g() {}\n", "function f() {", "}", "<?php\n<NEW>\nfunction g() {}\n"},
+	} {
+		a, s := newTestAgent(t)
+		path := filepath.Join(s.Cwd, "f.src")
+		if err := os.WriteFile(path, []byte(c.src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var tc toolCall
+		tc.Function.Name = "edit_file"
+		tc.Function.Arguments = fmt.Sprintf(`{"path":%q,"start":%s,"end":%s,"new_text":"<NEW>"}`, path, strconv.Quote(c.start), strconv.Quote(c.end))
+		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+		b, _ := os.ReadFile(path)
+		got := string(b)
+		if tu.Failed {
+			got = "error"
+		}
+		if got != c.want {
+			t.Errorf("%s:\ngot  %q\nwant %q (%s)", c.name, got, c.want, tu.Output)
+		}
+	}
+}
