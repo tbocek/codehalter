@@ -693,6 +693,16 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 		return 0, false
 	}
 
+	// An editor's devcontainer (Zed, VS Code, the devcontainer CLI) carries this label. Composing
+	// a second container beside it splits the build cache and the jobs, and clashes on a fixed
+	// --name: one project's runArgs named its container, and the launcher could not start at all.
+	if out, err := exec.Command(rt, "ps", "-a", "--filter", "label=devcontainer.local_folder="+workspace,
+		"--format", "{{.ID}} {{.State}}").Output(); err == nil {
+		if f := strings.Fields(string(out)); len(f) >= 2 {
+			return runInEditorContainer(rt, f[0], f[1] == "running", cfg, inner, rebuild), true
+		}
+	}
+
 	project := composeProject(workspace)
 	files := cfg.ComposeFiles
 	if files == nil {
@@ -751,43 +761,12 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 		return 1, true
 	}
 
-	args := []string{"exec", "-w", cfg.WorkspaceFolder}
+	args := []string{"exec"}
 	if !stdinIsTTY() {
 		args = append(args, "-T")
 	}
-	if cfg.RemoteUser != "" {
-		args = append(args, "-u", cfg.RemoteUser)
-	}
-	// Sorted so the same config produces the same exec line every run.
-	for _, k := range slices.Sorted(maps.Keys(cfg.RemoteEnv)) {
-		args = append(args, "-e", k+"="+cfg.RemoteEnv[k])
-	}
-	for _, k := range []string{envLatest, envUpdate} {
-		if v := os.Getenv(k); v != "" {
-			args = append(args, "-e", k+"="+v)
-		}
-	}
-	args = append(args, cfg.service(), "codehalter", "--cli", "--cwd", cfg.WorkspaceFolder)
-
-	// Ctrl+C belongs to the CLI in the container (it arrives over the exec's tty); ignoring it
-	// here keeps the launcher from dying and leaving the child holding the terminal.
-	signal.Ignore(os.Interrupt)
-	code := 0
-	if err := compose(append(args, inner...)...).Run(); err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) {
-			code = ee.ExitCode()
-		} else {
-			fmt.Fprintf(os.Stderr, "%s compose exec failed: %v\n", rt, err)
-			code = 1
-		}
-		if code == 126 || code == 127 {
-			fmt.Fprintf(os.Stderr, "\ncodehalter is not installed in this image. Add it to %s "+
-				"(see the Dockerfiles codehalter scaffolds) and re-run with --rebuild.\n",
-				filepath.Join(cfg.dir, "Dockerfile"))
-		}
-	}
-	signal.Reset(os.Interrupt)
+	args = append(append(args, execOpts(cfg)...), cfg.service())
+	code := runCLIIn(compose(append(append(args, "codehalter", "--cli", "--cwd", cfg.WorkspaceFolder), inner...)...), cfg)
 
 	// Only the two stop values stop it; the default leaves it running so the next start is instant.
 	if cfg.ShutdownAction == "stopContainer" || cfg.ShutdownAction == "stopCompose" {
@@ -796,6 +775,85 @@ func launchInDevcontainer(workspace string, inner []string, rebuild bool) (int, 
 		}
 	}
 	return code, true
+}
+
+// execOpts are the exec flags shared by compose exec and docker exec: where, as whom, with what.
+func execOpts(cfg *devcontainerConfig) []string {
+	opts := []string{"-w", cfg.WorkspaceFolder}
+	if cfg.RemoteUser != "" {
+		opts = append(opts, "-u", cfg.RemoteUser)
+	}
+	// Sorted so the same config produces the same exec line every run.
+	for _, k := range slices.Sorted(maps.Keys(cfg.RemoteEnv)) {
+		opts = append(opts, "-e", k+"="+cfg.RemoteEnv[k])
+	}
+	for _, k := range []string{envLatest, envUpdate} {
+		if v := os.Getenv(k); v != "" {
+			opts = append(opts, "-e", k+"="+v)
+		}
+	}
+	return opts
+}
+
+// runCLIIn runs the exec of the CLI and returns its exit status.
+func runCLIIn(cmd *exec.Cmd, cfg *devcontainerConfig) int {
+	// Ctrl+C belongs to the CLI in the container (it arrives over the exec's tty); ignoring it
+	// here keeps the launcher from dying and leaving the child holding the terminal.
+	signal.Ignore(os.Interrupt)
+	defer signal.Reset(os.Interrupt)
+	err := cmd.Run()
+	if err == nil {
+		return 0
+	}
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		fmt.Fprintf(os.Stderr, "exec in the container failed: %v\n", err)
+		return 1
+	}
+	if code := ee.ExitCode(); code != 126 && code != 127 {
+		return code
+	}
+	fmt.Fprintf(os.Stderr, "\ncodehalter is not installed in this image. Add it to %s "+
+		"(see the Dockerfiles codehalter scaffolds) and re-run with --rebuild.\n",
+		filepath.Join(cfg.dir, "Dockerfile"))
+	return 127
+}
+
+// runInEditorContainer runs the CLI in the container an editor started for this project,
+// starting it first when it is stopped. It is the editor's, so it is never rebuilt or stopped here.
+func runInEditorContainer(rt, id string, running bool, cfg *devcontainerConfig, inner []string, rebuild bool) int {
+	if rebuild {
+		fmt.Fprintf(os.Stderr, "Your editor's container %s runs this project, and --rebuild would build a second one "+
+			"beside it. Rebuild it from the editor, or remove it (%s rm -f %s) and run --rebuild again.\n", id, rt, id)
+		return 1
+	}
+	bold, dim, reset := ansiBold, ansiDim, ansiReset
+	if !stdoutStyled() {
+		bold, dim, reset = "", "", ""
+	}
+	fmt.Printf("%scodehalter cli%s\n%s  using the container your editor started for this project: %s%s\n", bold, reset, dim, id, reset)
+	if !running {
+		start := exec.Command(rt, "start", id)
+		start.Stdout, start.Stderr = nil, os.Stderr
+		if err := start.Run(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s start %s failed: %v\n", rt, id, err)
+			return 1
+		}
+	}
+	if err := resolveContainerEnv(cfg.RemoteEnv, func() ([]byte, error) {
+		return exec.Command(rt, "exec", id, "env").Output()
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "reading the container's environment, which remoteEnv is written in terms of: %v\n", err)
+		return 1
+	}
+	args := []string{"exec", "-i"}
+	if stdinIsTTY() {
+		args = append(args, "-t")
+	}
+	args = append(append(append(args, execOpts(cfg)...), id, "codehalter", "--cli", "--cwd", cfg.WorkspaceFolder), inner...)
+	cmd := exec.Command(rt, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	return runCLIIn(cmd, cfg)
 }
 
 // read runs `env` in the started container and is only called when a value needs it.

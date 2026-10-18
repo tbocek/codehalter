@@ -495,3 +495,55 @@ func TestRemoteEnvReadsTheContainer(t *testing.T) {
 		t.Errorf("containerEnv: got %v, want it refused with the reason", err)
 	}
 }
+
+// A container an editor started for the project (it carries devcontainer.local_folder) is
+// reused: started when stopped, the CLI exec'd into it, nothing composed beside it, and
+// --rebuild refused rather than building a second one. Driven through a fake runtime.
+func TestEditorContainerIsReused(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh for the fake runtime")
+	}
+	ws := writeConfig(t, map[string]string{".devcontainer/devcontainer.json": `{
+	  "build": {"dockerfile": "Dockerfile"},
+	  "runArgs": ["--name", "codehalter-${localWorkspaceFolderBasename}"],
+	  "remoteUser": "dev"
+	}`, ".devcontainer/Dockerfile": "FROM alpine\n"})
+	bin, calls := t.TempDir(), filepath.Join(t.TempDir(), "calls")
+	fake := "#!/bin/sh\necho \"$*\" >> " + calls + "\n" +
+		"[ \"$1\" = ps ] && { [ -n \"$EDITOR_CONTAINER\" ] && echo \"$EDITOR_CONTAINER\"; exit 0; }\n" +
+		"case \" $* \" in *\" codehalter --cli \"*) exit 7;; esac\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	run := func(state string, rebuild bool) (int, string) {
+		t.Helper()
+		if err := os.WriteFile(calls, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("EDITOR_CONTAINER", state)
+		code, handled := launchInDevcontainer(ws, []string{"--resume"}, rebuild)
+		if !handled {
+			t.Fatal("the launcher did not handle a project with a devcontainer")
+		}
+		b, _ := os.ReadFile(calls)
+		return code, string(b)
+	}
+
+	code, log := run("526cbc7cb58c exited", false)
+	want := "-w /workspaces/" + filepath.Base(ws) + " -u dev 526cbc7cb58c codehalter --cli --cwd /workspaces/" + filepath.Base(ws) + " --resume"
+	if code != 7 || !strings.Contains(log, "start 526cbc7cb58c") || strings.Contains(log, " up ") ||
+		!strings.Contains(log, "\nexec -i ") || !strings.Contains(log, want) {
+		t.Errorf("a stopped editor container: exit %d, calls:\n%s", code, log)
+	}
+	if code, log = run("526cbc7cb58c running", false); code != 7 || strings.Contains(log, "start ") {
+		t.Errorf("a running editor container: exit %d, calls:\n%s", code, log)
+	}
+	if code, log = run("526cbc7cb58c running", true); code != 1 || strings.Contains(log, "exec ") || strings.Contains(log, " up ") {
+		t.Errorf("--rebuild beside an editor container: exit %d, calls:\n%s", code, log)
+	}
+	if code, log = run("", false); !strings.Contains(log, " up -d") || code != 7 {
+		t.Errorf("no editor container, so compose starts one: exit %d, calls:\n%s", code, log)
+	}
+}

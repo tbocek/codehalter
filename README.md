@@ -291,6 +291,8 @@ codehalter cli
   building the image first, which takes a while; later runs reuse it
 ```
 
+When an editor already started a container for the project (Zed, VS Code and the devcontainer CLI label theirs with `devcontainer.local_folder`), the launcher uses that one instead of composing a second beside it: it starts it if it is stopped and runs the CLI in it with the same user, working directory and environment, and leaves it as it found it on exit. A second container would split the build cache and the jobs, and a project whose `runArgs` give the container a fixed `--name` could not start at all. `--rebuild` is refused there, since it would build that second container; rebuild from the editor instead.
+
 Inside a container it skips all that and just starts, so the same command works in both places. `Ctrl+C` still belongs to the agent inside; the launcher ignores it and passes the child's exit status back, which keeps `-p` scriptable from the host.
 
 The container is left running when you leave, so the next `codehalter --cli` is one `compose exec` away, a tenth of a second rather than a start. Set `"shutdownAction": "stopContainer"` in the devcontainer file to have it stopped instead. Compose recreates the container by itself when the translated service changes, an image built from a `Dockerfile` is rebuilt when that `Dockerfile` changes, and `--rebuild` forces a rebuild.
