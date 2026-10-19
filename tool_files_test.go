@@ -414,6 +414,52 @@ func TestReadFileBySymbol(t *testing.T) {
 	}
 }
 
+// A symbol read says who calls the function: the tab icons naivepost defined in
+// Page::icon and never passed to the tab row looked fine until something counted
+// the calls. A field of the same name, a comment and another language's file do
+// not count as one.
+func TestReadFileSymbolSaysWhoCallsIt(t *testing.T) {
+	a, s := newTestAgent(t)
+	writeTree(t, s.Cwd, map[string]string{
+		"src/shell.rs":  "impl Page {\n    /// Spelled for the tab row.\n    pub fn icon(self) -> &'static str {\n        \"view-list-symbolic\"\n    }\n}\n\npub struct Drawn {\n    pub icon: &'static str,\n}\n",
+		"src/window.rs": "fn paint(drawn: Drawn) {\n    play.set_icon_name(drawn.icon);\n    // page.icon() names the tab\n}\n",
+		"README.md":     "Each tab shows `page.icon()`.\n",
+	})
+	gitInit(t, s.Cwd)
+	read := func(symbol string) string {
+		var tc toolCall
+		tc.Function.Name = "read_file"
+		tc.Function.Arguments = fmt.Sprintf(`{"path":"src/shell.rs","symbol":%q}`, symbol)
+		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+		if tu.Failed {
+			t.Fatalf("read %s failed: %s", symbol, tu.Output)
+		}
+		return tu.Output
+	}
+	out := read("icon")
+	for _, want := range []string{"[`icon`: lines 2-5", "NOTHING calls `icon`", "2 other lines that are not a call", "src/shell.rs:9, src/window.rs:2", "*.rs"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("no caller: missing %q in\n%s", want, out)
+		}
+	}
+	for _, not := range []string{"window.rs:3", "README", "shell.rs:3"} {
+		if strings.Contains(out, not) {
+			t.Errorf("no caller: %q counted in\n%s", not, out)
+		}
+	}
+	if !strings.Contains(out, "view-list-symbolic") {
+		t.Errorf("the definition itself is still served:\n%s", out)
+	}
+
+	writeTree(t, s.Cwd, map[string]string{"src/tabs.rs": "fn tabs(page: Page) {\n    stack.add(page.icon());\n    let all = pages.map(Page::icon);\n}\n"})
+	if out := read("icon"); !strings.Contains(out, "`icon` is called on 2 lines: src/tabs.rs:2, src/tabs.rs:3") {
+		t.Errorf("an untracked caller, by call and by path:\n%s", out)
+	}
+	if out := read("Drawn"); !strings.Contains(out, "`Drawn` is named on 1 other line: src/window.rs:1") {
+		t.Errorf("a type counts every line naming it:\n%s", out)
+	}
+}
+
 // An ambiguous start or a missing end changes nothing and says why.
 func TestEditFileByAnchors(t *testing.T) {
 	a, s := newTestAgent(t)

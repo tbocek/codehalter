@@ -1759,11 +1759,26 @@ func specOwnPictures(sl specSlice) []string {
 	return pics
 }
 
-// runSpecTests is codehalter's own check, so it runs directly, not in a visible terminal.
-// It shows as a card whose last lines follow the run: six minutes of a check that said
-// nothing looked like a stuck one.
+// runSpecTests is codehalter's own check of a /spec round.
 func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd string) (bool, string) {
-	tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Checking: %s in %s/", cmd, outRel), "execute", nil)
+	ok, tail, took := a.runCheckCommand(ctx, sid, outAbs, fmt.Sprintf("Checking: %s in %s/", cmd, outRel), cmd)
+	switch {
+	case ok:
+		a.say(ctx, sid, fmt.Sprintf("🧪 tests passed in %s\n", took))
+	case ctx.Err() != nil:
+		a.say(context.Background(), sid, fmt.Sprintf("🧪 test run cut short by `/spec abort` after %s\n", took))
+	default:
+		a.say(ctx, sid, fmt.Sprintf("🧪 tests failed after %s\n", took))
+	}
+	return ok, tail
+}
+
+// runCheckCommand runs a check of codehalter's own directly, not in a visible terminal. It
+// shows as a card whose last lines follow the run: six minutes of a check that said nothing
+// looked like a stuck one. It returns whether the command passed, the tail of its output
+// with the exit status, and how long it took.
+func (a *agent) runCheckCommand(ctx context.Context, sid, dir, title, cmd string) (bool, string, string) {
+	tcId := a.StartToolCall(ctx, sid, title, "execute", nil)
 	tctx, cancel := context.WithTimeout(ctx, specTestTimeout)
 	defer cancel()
 	// Registered like a job (id 0): a restart that killed codehalter mid-check left the check's
@@ -1771,7 +1786,7 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 	// name as $0 identifies the shell; the trailing exit keeps it from exec'ing that name away.
 	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-%d-job-0.pid", os.Getpid()))
 	c := exec.CommandContext(tctx, specShell(), "-lc", cmd+"\nexit $?", filepath.Base(pidPath))
-	c.Dir = outAbs
+	c.Dir = dir
 	ownProcessGroup(c) // cut short, it is stopped whole: the shell alone left cargo and Xvfb running
 	var buf lockedBuffer
 	c.Stdout, c.Stderr = &buf, &buf
@@ -1829,15 +1844,9 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 		default:
 			tail += fmt.Sprintf("\n[%v]", err)
 		}
-		if ctx.Err() != nil {
-			a.say(context.Background(), sid, fmt.Sprintf("🧪 test run cut short by `/spec abort` after %s\n", took))
-			return false, tail
-		}
-		a.say(ctx, sid, fmt.Sprintf("🧪 tests failed after %s\n", took))
-		return false, tail
+		return false, tail, took
 	}
-	a.say(ctx, sid, fmt.Sprintf("🧪 tests passed in %s\n", took))
-	return true, tail
+	return true, tail, took
 }
 
 // lockedBuffer collects a command's output while another goroutine reads it.

@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // A NUL in the first binarySniffLen bytes marks a file binary (the git/grep
@@ -216,7 +219,13 @@ func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (stri
 		if len(loc.others) > 0 {
 			head += fmt.Sprintf("; also declared at lines %s", joinInts(loc.others))
 		}
-		return head + "]\n" + out, failed
+		head += "]\n"
+		if sess := a.getSession(sid); sess != nil {
+			if note := symbolUses(ctx, sess.Cwd, path, loc); note != "" {
+				head += note + "\n"
+			}
+		}
+		return head + out, failed
 	}
 	start := 1
 	line, haveLine := args.num("line")
@@ -636,12 +645,15 @@ func (a *agent) commitWrite(ctx context.Context, sid, tcId, path, old, next, dri
 }
 
 // start includes leading comments and attributes; mentions is set only when no
-// declaration was found.
+// declaration was found. name is the bare declared name; function says its
+// declaration keyword is a function's (fn, func, def, function).
 type symbolLoc struct {
 	start, end int
 	how        string
 	others     []int
 	mentions   []int
+	name       string
+	function   bool
 }
 
 const symbolFallbackLines = 50
@@ -649,6 +661,9 @@ const symbolFallbackLines = 50
 // declKeywordRe matches a declaration keyword, then an optional Go receiver or
 // Rust generics, right before the name.
 var declKeywordRe = regexp.MustCompile(`(?:^|[\s(])(?:fn|func|def|class|struct|enum|trait|impl|interface|type|mod|module|macro_rules!|function|union|record|object|protocol|extension|let|const|var|val)\s+(?:\([^)]*\)\s*)?(?:<[^>]*>\s*)?`)
+
+// fnKeywordRe: the text before a declared name ends in a function's keyword.
+var fnKeywordRe = regexp.MustCompile(`(?:^|[\s(])(?:fn|func|def|function)\s+(?:\([^)]*\)\s*)?(?:<[^>]*>\s*)?$`)
 
 func locateSymbol(content, symbol string) symbolLoc {
 	name := symbol
@@ -658,7 +673,7 @@ func locateSymbol(content, symbol string) symbolLoc {
 	name = strings.TrimRight(name, "(){}:")
 	lines := strings.Split(content, "\n")
 	nameRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
-	var loc symbolLoc
+	loc := symbolLoc{name: name}
 	var decls []int
 	for i, ln := range lines {
 		idx := nameRe.FindStringIndex(ln)
@@ -680,6 +695,9 @@ func locateSymbol(content, symbol string) symbolLoc {
 		loc.others = append(loc.others, o+1)
 	}
 	loc.mentions = nil
+	if idx := nameRe.FindStringIndex(lines[d]); idx != nil {
+		loc.function = fnKeywordRe.MatchString(lines[d][:idx[0]])
+	}
 	top := d
 	for top > 0 && d-top < 20 {
 		t := strings.TrimSpace(lines[top-1])
@@ -699,6 +717,102 @@ func locateSymbol(content, symbol string) symbolLoc {
 	loc.how = fmt.Sprintf("the %d-line fallback (no block end found)", symbolFallbackLines)
 	return loc
 }
+
+// symbolUses says where else the project names a definition read by symbol: a
+// git grep of the files with the read file's extension, without comment lines and
+// without the definition's own lines. For a function the calls (`name(`, or a path
+// ending `::name`) are counted apart from the other lines with the word, because a
+// field or variable of the same name would otherwise hide a function nothing calls.
+// Empty outside a git work tree, or when git fails.
+func symbolUses(ctx context.Context, cwd, path string, loc symbolLoc) string {
+	ext := filepath.Ext(path)
+	if ext == "" || loc.name == "" {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	top, err := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		slog.Debug("read_file: symbol uses not searched", "name", loc.name, "err", err)
+		return ""
+	}
+	root := strings.TrimSpace(string(top))
+	// git names the top level with symlinks resolved; so must the definition's own path,
+	// or its `name(` line would count as a call of itself.
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		path = real
+	}
+	out, err := exec.CommandContext(ctx, "git", "-C", root, "grep", "--untracked", "-n", "-I", "-w", "-e", loc.name, "--", "*"+ext).Output()
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		out, err = nil, nil // no line names it
+	}
+	if err != nil {
+		slog.Debug("read_file: symbol uses not searched", "name", loc.name, "err", err)
+		return ""
+	}
+	base := cwd
+	if real, err := filepath.EvalSymlinks(cwd); err == nil {
+		base = real
+	}
+	callRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(loc.name) + `\s*(?:\(|::<)|::` + regexp.QuoteMeta(loc.name) + `\b`)
+	var calls, others []string
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		file, rest, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+		num, text, ok := strings.Cut(rest, ":")
+		n, err := strconv.Atoi(num)
+		if !ok || err != nil || commentLineRe.MatchString(text) {
+			continue
+		}
+		abs := filepath.Join(root, file)
+		if abs == path && n >= loc.start && n <= loc.end {
+			continue
+		}
+		rel, err := filepath.Rel(base, abs)
+		if err != nil {
+			rel = file
+		}
+		where := fmt.Sprintf("%s:%d", rel, n)
+		if loc.function && callRe.MatchString(text) {
+			calls = append(calls, where)
+		} else {
+			others = append(others, where)
+		}
+	}
+	count := func(at []string, what string) string {
+		if len(at) == 1 {
+			return "1 " + what + "line"
+		}
+		return fmt.Sprintf("%d %slines", len(at), what)
+	}
+	first := func(at []string) string {
+		if len(at) > 5 {
+			return strings.Join(at[:5], ", ") + fmt.Sprintf(" and %d more", len(at)-5)
+		}
+		return strings.Join(at, ", ")
+	}
+	scope := fmt.Sprintf("the project's *%s files, comment lines skipped; a word search, not a compiler", ext)
+	if !loc.function {
+		if len(others) == 0 {
+			return fmt.Sprintf("[`%s` is named nowhere else (%s).]", loc.name, scope)
+		}
+		return fmt.Sprintf("[`%s` is named on %s: %s (%s).]", loc.name, count(others, "other "), first(others), scope)
+	}
+	note := fmt.Sprintf("[`%s` is called on %s: %s", loc.name, count(calls, ""), first(calls))
+	if len(calls) == 0 {
+		note = fmt.Sprintf("[NOTHING calls `%s`: no `%s(` and no `::%s` outside this definition", loc.name, loc.name, loc.name)
+	}
+	if len(others) > 0 {
+		note += fmt.Sprintf("; the word is on %s that are not a call (a field, a variable, a value passed on): %s", count(others, "other "), first(others))
+	}
+	return note + fmt.Sprintf(" (%s: a trait method, a callback or a test is reached without one).]", scope)
+}
+
+// commentLineRe: a line that is only a comment, in the common comment styles.
+var commentLineRe = regexp.MustCompile(`^\s*(?://|#|/\*|\*|--|;|"""|'''|<!--)`)
 
 // braceBlockEnd: a ';' before any '{' ends the block (a prototype), and the '{'
 // must open within the first few lines.

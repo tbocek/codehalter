@@ -900,21 +900,30 @@ func skipWalkDir(name string) bool { return specSkipDirs[name] || strings.HasPre
 
 var cfgTestModRe = regexp.MustCompile(`^\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{`)
 
-// testSourceText returns a Rust file from #[cfg(test)] on, so an id in a production doc
-// comment above it does not pass for a test.
-func testSourceText(rel, content string) string {
+// isTestPath: the file's name or a directory on its path marks it a test, in the
+// conventions of the common languages.
+func isTestPath(rel string) bool {
 	base := strings.ToLower(filepath.Base(rel))
 	stem := strings.TrimSuffix(base, filepath.Ext(base))
 	switch {
 	case strings.HasSuffix(stem, "_test"), strings.HasPrefix(stem, "test_"),
 		strings.HasSuffix(stem, ".test"), strings.HasSuffix(stem, ".spec"),
 		strings.HasSuffix(stem, "_tests"), stem == "tests":
-		return content
+		return true
 	}
 	for _, part := range strings.Split(filepath.ToSlash(filepath.Dir(rel)), "/") {
 		if part == "tests" || part == "test" || part == "__tests__" {
-			return content
+			return true
 		}
+	}
+	return false
+}
+
+// testSourceText returns a Rust file from #[cfg(test)] on, so an id in a production doc
+// comment above it does not pass for a test.
+func testSourceText(rel, content string) string {
+	if isTestPath(rel) {
+		return content
 	}
 	// An inline `#[cfg(test)] mod tests {` starts the test code; the attribute on
 	// anything else (`mod tests;`, one `use` or `fn`) marks only that item.

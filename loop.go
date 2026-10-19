@@ -281,6 +281,13 @@ type subtaskOutcome struct {
 
 func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx, total int) subtaskOutcome {
 	sess := a.getSession(sid)
+	// The red-first check compares against the files as they are now. /spec rounds have
+	// their own gates, and the check would run a round's tests twice.
+	var root string
+	var before map[string]*fileState
+	if sess != nil && sess.specFence() == "" {
+		root, before = dirtyFiles(sess.Cwd)
+	}
 
 	// EXECUTE.md lives in the system prompt; repeating it would stack a copy per subtask.
 	var prompt strings.Builder
@@ -343,6 +350,10 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	}
 	if len(failed) > 0 {
 		out.Reason = "failed commands: " + strings.Join(failed, ", ")
+		return out
+	}
+	if reason := a.testShowsFault(ctx, sid, root, before, res.ToolUses); reason != "" {
+		out.Reason = reason
 		return out
 	}
 	out.Success = true
@@ -1177,4 +1188,193 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			a.say(ctx, sid, "⚠ Still repeating: switching to the thinking sampler to break out.\n")
 		}
 	}
+}
+
+// fileState is a file's content at one moment; exists is false for a file that is not there.
+type fileState struct {
+	data   []byte
+	exists bool
+}
+
+// Files above this are not kept for the red-first check; a step that changed one is not checked.
+const redFirstMaxBytes = 4 << 20
+
+// dirtyFiles reads every file git reports as changed or new, by absolute path. Empty
+// outside a git work tree; a file too large to keep is there with a nil state.
+func dirtyFiles(cwd string) (root string, files map[string]*fileState) {
+	top, err := exec.Command("git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", nil
+	}
+	root = strings.TrimSpace(string(top))
+	out, err := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all").Output()
+	if err != nil {
+		slog.Debug("red-first: git status", "err", err)
+		return "", nil
+	}
+	files = map[string]*fileState{}
+	entries := strings.Split(string(out), "\x00")
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		if len(entry) < 4 || entry[2] != ' ' {
+			continue
+		}
+		if entry[0] == 'R' || entry[0] == 'C' {
+			i++ // the old path follows as a field of its own
+		}
+		path := filepath.Join(root, entry[3:])
+		files[path] = readState(path)
+	}
+	return root, files
+}
+
+// readState is nil for a file too large to keep or unreadable.
+func readState(path string) *fileState {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &fileState{}
+	}
+	if err != nil || info.IsDir() || info.Size() > redFirstMaxBytes {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return &fileState{data: data, exists: true}
+}
+
+// headState is a clean file's content: the committed one, or none for a file git does not track.
+func headState(root, path string) *fileState {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return nil
+	}
+	out, err := exec.Command("git", "-C", root, "show", "HEAD:"+filepath.ToSlash(rel)).Output()
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return &fileState{}
+	}
+	if err != nil {
+		return nil
+	}
+	return &fileState{data: out, exists: true}
+}
+
+// testRunRe: a command line that runs tests, in the common runners.
+var testRunRe = regexp.MustCompile(`(?i)\b(?:test|tests|pytest|jest|vitest|rspec|ctest|phpunit|mocha|unittest)\b`)
+
+// docExts are not part of a fix: taking them out changes no test.
+var docExts = map[string]bool{".md": true, ".txt": true, ".rst": true, ".adoc": true}
+
+// testShowsFault is red before green. A step that changed tests and code and ended with a
+// green test run is run once more with its code changes taken out (its test changes stay).
+// A test that still passes then does not show what the step fixed or added: the cause can be
+// elsewhere, as when a model rebuilt the release packaging for tab icons that the code never
+// set, and wrote a test that passed before and after. It returns the failure reason, or "".
+// The files are put back whatever happens.
+func (a *agent) testShowsFault(ctx context.Context, sid, root string, before map[string]*fileState, uses []ToolUse) string {
+	sess := a.getSession(sid)
+	if sess == nil || root == "" {
+		return ""
+	}
+	cmd := ""
+	for i := len(uses) - 1; i >= 0 && cmd == ""; i-- {
+		if u := uses[i]; u.Name == "run_command" {
+			if c := parseArgs(u.Input).str("command"); testRunRe.MatchString(c) {
+				if u.Failed {
+					return ""
+				}
+				cmd = c
+			}
+		}
+	}
+	if cmd == "" {
+		return ""
+	}
+	_, after := dirtyFiles(sess.Cwd)
+	var code, tests []string
+	was := map[string]*fileState{}
+	for _, path := range slices.Sorted(maps.Keys(mergeKeys(before, after))) {
+		old, ok := before[path]
+		if !ok {
+			old = headState(root, path)
+		}
+		now := readState(path)
+		if old == nil || now == nil {
+			if old == nil && now == nil {
+				continue // too large to compare, and too large to take out
+			}
+			return "" // one side unknown: no clean way to take the step's change out
+		}
+		if old.exists == now.exists && bytes.Equal(old.data, now.data) {
+			continue
+		}
+		rel, _ := filepath.Rel(root, path)
+		switch {
+		case strings.HasPrefix(path, filepath.Join(sess.Cwd, ".codehalter")+string(filepath.Separator)):
+			// codehalter's own session files, written all through the step
+		case isTestPath(rel):
+			tests = append(tests, rel)
+		case !docExts[strings.ToLower(filepath.Ext(rel))]:
+			code = append(code, rel)
+			was[path] = old
+		}
+	}
+	if len(tests) == 0 || len(code) == 0 {
+		return ""
+	}
+	now := map[string]*fileState{}
+	for path := range was {
+		now[path] = readState(path)
+	}
+	defer func() {
+		for path, st := range now {
+			if err := putState(path, st); err != nil {
+				slog.Error("red-first: could not put a file back", "path", path, "err", err)
+				a.say(context.Background(), sid, fmt.Sprintf("⚠️ could not put back `%s` after the red-first check: %v\n", path, err))
+			}
+		}
+	}()
+	for path, st := range was {
+		if err := putState(path, st); err != nil {
+			slog.Warn("red-first: could not take a change out", "path", path, "err", err)
+			return ""
+		}
+	}
+	a.say(ctx, sid, fmt.Sprintf("🧪 Does the test show the fault? Running `%s` with this step's changes to %s taken out, its tests kept\n", cmd, strings.Join(code, ", ")))
+	passed, _, took := a.runCheckCommand(ctx, sid, sess.Cwd, "Checking without the fix: "+cmd, cmd)
+	slog.Info("red-first check", "cmd", cmd, "code", code, "tests", tests, "passed_without", passed, "took", took)
+	if ctx.Err() != nil || !passed {
+		if ctx.Err() == nil {
+			a.say(ctx, sid, fmt.Sprintf("🧪 it fails without the change (%s), as it should\n", took))
+		}
+		return ""
+	}
+	a.say(ctx, sid, fmt.Sprintf("🧪 it passes without the change too (%s): the test does not show the fault\n", took))
+	return fmt.Sprintf("red before green failed: `%s` passes with this step's changes to %s taken out (its test changes to %s kept), so those tests do not show what the step fixed. Either they do not check the reported fault, or the fault is elsewhere and the change does not touch it. Reproduce the fault first: a test or check that FAILS on the code as it was, then the fix that turns it green",
+		cmd, strings.Join(code, ", "), strings.Join(tests, ", "))
+}
+
+func mergeKeys(a, b map[string]*fileState) map[string]*fileState {
+	out := maps.Clone(a)
+	if out == nil {
+		out = map[string]*fileState{}
+	}
+	maps.Copy(out, b)
+	return out
+}
+
+// putState writes st back, or removes the file when st says it was not there.
+func putState(path string, st *fileState) error {
+	if !st.exists {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, st.data, 0o644)
 }

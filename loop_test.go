@@ -1560,6 +1560,62 @@ func TestToolLoopFoldsOnContextFull(t *testing.T) {
 	}
 }
 
+// Red before green: a step that changed a test and code, and ended green, runs its test
+// once more without the code change. A test that fails then shows the fault; one that
+// still passes fails the step, with the reason the planner gets. The code change is put
+// back either way, and a file the user had changed before the step is taken back to the
+// user's version, not to git's.
+func TestExecutorTestMustFailWithoutTheFix(t *testing.T) {
+	for _, tc := range []struct {
+		name, test string // the test file the step writes; "" writes none
+		reason     string
+	}{
+		{"the test shows the fault", `test "$(cat src/value.dat)" = 2`, ""},
+		{"the test passes without the fix", "true", "red before green failed: `sh tests/check.sh` passes with this step's changes to src/value.dat taken out (its test changes to tests/check.sh kept)"},
+		{"no test changed", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seen := filepath.Join(t.TempDir(), "seen.log")
+			writes := map[string]string{"src/value.dat": "2\n"}
+			if tc.test != "" {
+				writes["tests/check.sh"] = fmt.Sprintf("cat src/value.dat >> %q\n%s\n", seen, tc.test)
+			}
+			var resp []string
+			for path, body := range writes {
+				args, _ := json.Marshal(map[string]string{"path": path, "content": body})
+				resp = append(resp, sseToolCall("w"+path, "write_file", string(args)))
+			}
+			resp = append(resp, sseToolCall("t", "run_command", `{"command":"sh tests/check.sh"}`), sseToolCall("r", respondToolName, `{"message":"fixed"}`))
+			a, s, _ := planPhaseAgent(t, resp...)
+			writeTree(t, s.Cwd, map[string]string{"src/value.dat": "0\n", "tests/check.sh": "true\n", "notes.txt": "mine\n"})
+			gitInit(t, s.Cwd)
+			writeTree(t, s.Cwd, map[string]string{"src/value.dat": "1\n", "notes.txt": "mine, edited\n"}) // the user's, before the step
+			a.tools.add(
+				fakeTool("write_file", func(args string) (string, bool) {
+					p := parseArgs(args)
+					writeTree(t, s.Cwd, map[string]string{p.str("path"): p.str("content")})
+					return "written", false
+				}),
+				fakeTool("run_command", func(string) (string, bool) { return "exit 0\n\nok", false }),
+			)
+
+			out := a.runExecutePhase(context.Background(), s.ID, subtask{Description: "make value 2"}, 0, 1)
+			if out.Success != (tc.reason == "") || !strings.HasPrefix(out.Reason, tc.reason) {
+				t.Errorf("success=%v reason=%q, want reason %q", out.Success, out.Reason, tc.reason)
+			}
+			for path, want := range map[string]string{"src/value.dat": "2\n", "notes.txt": "mine, edited\n"} {
+				if got, _ := os.ReadFile(filepath.Join(s.Cwd, path)); string(got) != want {
+					t.Errorf("%s after the step = %q, want %q", path, got, want)
+				}
+			}
+			got, _ := os.ReadFile(seen)
+			if want := map[bool]string{true: "1\n", false: ""}[tc.test != ""]; string(got) != want {
+				t.Errorf("the check ran the test on value %q, want %q (the user's 1, not git's 0)", got, want)
+			}
+		})
+	}
+}
+
 // Exit codes override the executor's respond, by each call's last run: a failed
 // run_command fails the subtask, a green re-run of the same call clears it, and
 // other tools' failures are no verdict.
