@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	_ "image/jpeg"
 	"image/png"
 	"log/slog"
@@ -370,6 +371,18 @@ func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result s
 	if err != nil || len(data) == 0 || len(data) > maxScreenshotBytes {
 		return "", nil, "", ""
 	}
+	// The spec's own picture of this screen goes beside the render: told to compare in
+	// words, a round passed with the page laid out other than its picture.
+	spec := specPictureFor(sess.Cwd, png)
+	if spec != "" {
+		both, err := sideBySide(filepath.Join(sess.Cwd, spec), data)
+		if err != nil {
+			slog.Debug("attachRenderedScreen: no side by side", "spec", spec, "err", err)
+			spec = ""
+		} else {
+			data = both
+		}
+	}
 	data = downscalePNG(data, attachMaxSide)
 	rel, err := filepath.Rel(sess.Cwd, png)
 	if err != nil {
@@ -378,6 +391,9 @@ func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result s
 	rel = filepath.ToSlash(rel)
 	if same, _ := storeImage("", "image/png", data); sess.imageInView(same) {
 		a.say(ctx, sid, fmt.Sprintf("👁 the rendered screen %s is unchanged (%s): not attached again\n", rel, same))
+		if spec != "" {
+			return result + fmt.Sprintf("\n[codehalter, not the user: %s%s: the spec's picture on the left and the screen this command rendered, %s, on the right, is the same picture as %s, which is already in your view above, so it is not attached again: nothing on the screen changed. Rendering it again shows the same; change the code where the arrangement differs from the picture.]", sideBySideMark, spec, rel, same), nil, "", same
+		}
 		return result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s, is the same picture as %s, which is already in your view above, so it is not attached again: nothing on it changed. Rendering it again shows the same; change the code, or look at the spec's picture with `screenshot` and compare.]", rel, same), nil, "", same
 	}
 	id, err = storeImage(sess.Cwd, "image/png", data)
@@ -389,9 +405,106 @@ func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result s
 	if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
 		size = fmt.Sprintf(", %dx%d px as attached", cfg.Width, cfg.Height)
 	}
+	if spec != "" {
+		text = result + fmt.Sprintf("\n[codehalter, not the user: %s%s. Attached below as %s%s: on the LEFT the spec's picture %s, on the RIGHT the screen this command rendered, %s, scaled to the same height. Compare the arrangement before anything else: what sits left or right, above or below, in the header bar or under it, what is split by a divider and which way, the order of the controls, what is missing or extra. Name every difference, fix those the spec text asks for, then render again. For a closer look at one part, call screenshot on either file with \"region\": [x, y, width, height] in that file's own pixels.]", sideBySideMark, spec, id, size, spec, rel)
+		a.say(ctx, sid, fmt.Sprintf("👁 attached the rendered screen %s beside the spec's picture %s\n", rel, spec))
+		return text, imageParts(text, "image/png", data), id, ""
+	}
 	text = result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s%s, is attached below as %s. For a closer look at one part, call screenshot on that file with \"region\": [x, y, width, height] in the file's own pixels; never crop with a script. Look at it now, before anything else: is every widget the spec names on it, in the order it says; is anything empty, overlapping, cut off or unlabeled? Where the spec has its own picture of this screen (its image with the same name), look at that too with `screenshot` and compare widgets, order and labels, not pixels. Fix what you see, then render again.]", rel, size, id)
 	a.say(ctx, sid, fmt.Sprintf("👁 attached the rendered screen %s to the model's view\n", rel))
 	return text, imageParts(text, "image/png", data), id, ""
+}
+
+// sideBySideMark opens the note of a render shown beside the spec's picture; the
+// /spec gate finds a compared picture by it.
+const sideBySideMark = "side by side with the spec's picture "
+
+// specPictureFor is the spec's picture with the render's own name (shots/04-prepare.png
+// and spec/img/04-prepare.png), relative to cwd, or "". The spec folder is the /spec
+// ledger's, else `spec`.
+func specPictureFor(cwd, render string) string {
+	dir := "spec"
+	if cfg, err := loadSpecConfig(cwd); err == nil && cfg != nil && cfg.SpecDir != "" {
+		dir = cfg.SpecDir
+	}
+	stem := strings.TrimSuffix(filepath.Base(render), filepath.Ext(render))
+	found := ""
+	walkErr := filepath.WalkDir(filepath.Join(cwd, dir), func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || path == render {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if (ext == ".png" || ext == ".jpg" || ext == ".jpeg") && strings.TrimSuffix(d.Name(), filepath.Ext(path)) == stem {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if walkErr != nil || found == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(cwd, found)
+	if err != nil {
+		return ""
+	}
+	return filepath.ToSlash(rel)
+}
+
+// sideBySideGap is the grey bar between the two pictures.
+const sideBySideGap = 16
+
+// sideBySide puts the picture at specPath left of the render, the spec's scaled to the
+// render's height, as one PNG.
+func sideBySide(specPath string, render []byte) ([]byte, error) {
+	specData, err := os.ReadFile(specPath)
+	if err != nil {
+		return nil, err
+	}
+	left, _, err := image.Decode(bytes.NewReader(specData))
+	if err != nil {
+		return nil, fmt.Errorf("the spec's picture: %w", err)
+	}
+	right, _, err := image.Decode(bytes.NewReader(render))
+	if err != nil {
+		return nil, fmt.Errorf("the render: %w", err)
+	}
+	h := right.Bounds().Dy()
+	scaled := scaleToHeight(left, h)
+	lw, rw := scaled.Bounds().Dx(), right.Bounds().Dx()
+	out := image.NewRGBA(image.Rect(0, 0, lw+sideBySideGap+rw, h))
+	draw.Draw(out, out.Bounds(), &image.Uniform{color.Gray{Y: 128}}, image.Point{}, draw.Src)
+	draw.Draw(out, image.Rect(0, 0, lw, h), scaled, image.Point{}, draw.Src)
+	draw.Draw(out, image.Rect(lw+sideBySideGap, 0, lw+sideBySideGap+rw, h), right, right.Bounds().Min, draw.Src)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, out); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// scaleToHeight averages the source pixels each target pixel covers, so a downscale keeps
+// thin lines; an upscale repeats pixels.
+func scaleToHeight(src image.Image, h int) *image.RGBA {
+	b := src.Bounds()
+	w := max(1, b.Dx()*h/max(1, b.Dy()))
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		y0 := b.Min.Y + y*b.Dy()/h
+		y1 := max(y0+1, b.Min.Y+(y+1)*b.Dy()/h)
+		for x := 0; x < w; x++ {
+			x0 := b.Min.X + x*b.Dx()/w
+			x1 := max(x0+1, b.Min.X+(x+1)*b.Dx()/w)
+			var r, g, bl, al, n uint32
+			for sy := y0; sy < y1; sy++ {
+				for sx := x0; sx < x1; sx++ {
+					cr, cg, cb, ca := src.At(sx, sy).RGBA()
+					r, g, bl, al, n = r+cr, g+cg, bl+cb, al+ca, n+1
+				}
+			}
+			dst.Set(x, y, color.RGBA64{uint16(r / n), uint16(g / n), uint16(bl / n), uint16(al / n)})
+		}
+	}
+	return dst
 }
 
 // attachMaxSide halves a HiDPI (2x) snapshot back to window size, where text is

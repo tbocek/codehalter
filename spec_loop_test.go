@@ -37,6 +37,8 @@ func TestSpecDecide(t *testing.T) {
 		{"gate: lint", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Lint: []string{"src/a.rs:3: unused variable"}}, false, false, "unused variable"},
 		{"gate: oversize", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Oversize: []string{"`src/ui.rs` is 12000 lines, over the 1500-line budget"}}, false, false, "1500-line budget"},
 		{"gate: stand-in", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, StandIns: []string{"`reply_for_test` (src/a.rs:3)"}}, false, false, "is not done"},
+		{"gate: a spec picture the round never put beside a render", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Committed: true, PicturesUnseen: []string{"spec/img/04-prepare.png"}}, false, false, "spec/img/04-prepare.png"},
+		{"gate: a changed item's picture too", "F0.1", 0, specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true, Committed: true, PicturesUnseen: []string{"spec/img/03-window.png"}}, false, false, "side by side"},
 		{"refactor that shrank nothing", specRefactorID, 0, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Debt: "a -> b"}, false, false, "no measured progress"},
 		{"refactor that shrank the debt", specRefactorID, 0, specRoundResult{Mode: specModeRefactor, TestsPass: true, Committed: true, Improved: true}, true, false, ""},
 		{"change that wrote nothing", "F0.1", 0, specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true}, false, false, "no code did"},

@@ -3,8 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"net/http"
 	"net/url"
@@ -339,6 +341,61 @@ func TestRunCommandAttachesRenderedScreen(t *testing.T) {
 	tc.ID, tc.Function.Arguments = "c3", `{"command":"printf '`+png+`' > rust/shots/06-lane.png; echo wrote"}`
 	if tu, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); tu.ImageID != "" {
 		t.Error("a command that is not a render attached a picture")
+	}
+}
+
+// A render with a picture of the same name in the spec is attached beside it: the
+// spec's picture on the left at the render's height, a grey bar, the render on the
+// right. The note carries the mark the /spec gate looks for.
+func TestRenderIsAttachedBesideTheSpecPicture(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.imagesSupported.Store(true)
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
+	solid := func(path string, w, ht int, c color.Color) {
+		t.Helper()
+		img := image.NewRGBA(image.Rect(0, 0, w, ht))
+		draw.Draw(img, img.Bounds(), &image.Uniform{c}, image.Point{}, draw.Src)
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			t.Fatal(err)
+		}
+		writeTree(t, h.sess.Cwd, map[string]string{path: buf.String()})
+	}
+	red, blue := color.RGBA{255, 0, 0, 255}, color.RGBA{0, 0, 255, 255}
+	solid("spec/img/04-prepare.png", 40, 20, red)
+	solid("render.png", 30, 40, blue)
+
+	var tc toolCall
+	tc.ID, tc.Function.Name = "c1", "run_command"
+	tc.Function.Arguments = `{"command":"mkdir -p rust/shots && cp render.png rust/shots/04-prepare.png && echo 'just snapshot 04-prepare'"}`
+	tu, content := h.agent.runToolCall(context.Background(), h.sess.ID, tc)
+	if tu.ImageID == "" || !strings.Contains(tu.Output, sideBySideMark+"spec/img/04-prepare.png") || !strings.Contains(tu.Output, "on the LEFT the spec's picture") {
+		t.Fatalf("no side by side attached: %+v", tu)
+	}
+	parts, ok := content.([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %T, want text + image", content)
+	}
+	url := parts[1].(map[string]any)["image_url"].(map[string]string)["url"]
+	data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(url, "data:image/png;base64,"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 40x20 scaled to height 40 is 80 wide; then the bar, then the 30-wide render.
+	if b := img.Bounds(); b.Dx() != 80+sideBySideGap+30 || b.Dy() != 40 {
+		t.Fatalf("side by side is %v, want %dx40", b, 80+sideBySideGap+30)
+	}
+	for _, c := range []struct {
+		x    int
+		want color.Color
+	}{{5, red}, {79, red}, {80, color.Gray{Y: 128}}, {80 + sideBySideGap, blue}, {125, blue}} {
+		if r1, g1, b1, _ := img.At(c.x, 20).RGBA(); func() bool { r2, g2, b2, _ := c.want.RGBA(); return r1 != r2 || g1 != g2 || b1 != b2 }() {
+			t.Errorf("pixel at x=%d is %v, want %v", c.x, img.At(c.x, 20), c.want)
+		}
 	}
 }
 

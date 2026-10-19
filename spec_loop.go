@@ -177,11 +177,13 @@ type specRoundResult struct {
 	Committed bool
 	Question  string
 	// UIUnseen lists UI source files edited without a single screenshot.
-	UIUnseen  []string
-	TurnErr   string
-	TestsPass bool
-	TestTail  string
-	Covered   bool // a test names the item; for setup, any test source exists
+	UIUnseen []string
+	// PicturesUnseen lists the item's own spec pictures that no render was put beside.
+	PicturesUnseen []string
+	TurnErr        string
+	TestsPass      bool
+	TestTail       string
+	Covered        bool // a test names the item; for setup, any test source exists
 	// Gates on what the round wrote: functions only tests reach, lint findings in
 	// its own lines, files grown past the size budget.
 	Unreachable []string
@@ -217,12 +219,13 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 		}
 	case r.Mode == specModeChange:
 		// The test for the OLD text still covers a changed item; the commit is the evidence of work.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
+		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.PicturesUnseen) == 0 &&
+			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, "", ""
 		}
 	default:
 		// A reopened item's old test still names it: like a change, it needs a commit.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen) == 0 && (r.Committed || !r.Redo) &&
+		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen)+len(r.PicturesUnseen) == 0 && (r.Committed || !r.Redo) &&
 			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, "", ""
 		}
@@ -236,6 +239,9 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 	}
 	if len(r.UIUnseen) > 0 && r.TurnErr == "" {
 		add("ui", fmt.Sprintf("you changed the UI (%s) and never looked at it: render the screen and look at it with `screenshot`", strings.Join(r.UIUnseen, ", ")))
+	}
+	if len(r.PicturesUnseen) > 0 && r.TurnErr == "" {
+		add("picture", fmt.Sprintf("the spec has a picture of this screen (%s) and the round never put the app beside it: render that screen with the snapshot recipe under the picture's own name (add the name to the recipe if it has none), and codehalter shows the spec's picture and the render side by side; make the arrangement match where the spec text asks for it", strings.Join(r.PicturesUnseen, ", ")))
 	}
 	if r.TurnErr != "" {
 		add("error", "the round ended with an error: "+r.TurnErr)
@@ -1458,6 +1464,13 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 	// A snapshot recipe makes looking possible; only then is an unseen UI change blind.
 	if w.Mode != specModeRemove && justRecipe(r.outAbs, "snapshot") {
 		res.UIUnseen = uiEditedUnseen(uses, r.sess.Cwd)
+		// A screen item passed on a test of its tooltips while the page was laid out other than
+		// its picture: a picture the spec gives is compared, whether the round touched the UI or not.
+		for _, pic := range specOwnPictures(r.idx.slice(item, cfg.SpecDir)) {
+			if !slices.ContainsFunc(uses, func(u ToolUse) bool { return strings.Contains(u.Output, sideBySideMark+pic) }) {
+				res.PicturesUnseen = append(res.PicturesUnseen, pic)
+			}
+		}
 	}
 	covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
 	if err != nil {
@@ -1674,7 +1687,7 @@ func (r *specRun) completionCheck(ctx context.Context) (reopened []string, err e
 			it := idx.items[id]
 			line := fmt.Sprintf("- `%s` %s (`%s:%d`)", id, strings.TrimSpace(strings.TrimPrefix(it.Title, id)), b.file, it.Line+1)
 			if pics := specOwnPictures(idx.slice(id, cfg.SpecDir)); len(pics) > 0 {
-				line += "; the spec pictures it: " + strings.Join(pics, ", ")
+				line += "; the spec pictures it: `" + strings.Join(pics, "`, `") + "`"
 			}
 			list = append(list, line)
 		}
@@ -1753,7 +1766,7 @@ func specOwnPictures(sl specSlice) []string {
 	var pics []string
 	for _, img := range sl.Images {
 		if ext := strings.ToLower(filepath.Ext(img)); (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".webp") && strings.Contains(own, filepath.Base(img)) {
-			pics = append(pics, "`"+img+"`")
+			pics = append(pics, img)
 		}
 	}
 	return pics
