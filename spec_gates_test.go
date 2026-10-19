@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -57,6 +59,34 @@ func TestNamesItemCamelCase(t *testing.T) {
 		if got := namesItem(text, "F4.1"); got != want {
 			t.Errorf("namesItem(%q) = %v, want %v", text, got, want)
 		}
+	}
+}
+
+// A file moved and not yet added to git is a move, not new code: only the line the move
+// changed is the round's. naivepost's 481 test files moved into tests/suite/ counted in full,
+// and a clippy finding on a short line (`assert!(`) sent a round to rewrite old tests. The
+// repository's own index stays as it was.
+func TestSpecRoundChangesSeesAnUntrackedMove(t *testing.T) {
+	body := "use x;\nmod common;\n\n#[test]\nfn checks_the_share() {\n    assert!(\n        SHARE > 0.0,\n        \"the share is positive\"\n    );\n}\n"
+	cwd := gitRepo(t, map[string]string{"out/tests/share.rs": body})
+	if err := os.Remove(filepath.Join(cwd, "out/tests/share.rs")); err != nil {
+		t.Fatal(err)
+	}
+	writeTree(t, cwd, map[string]string{"out/tests/suite/share.rs": strings.Replace(body, "mod common;", "use crate::common;", 1)})
+	status := func() string {
+		out, err := exec.Command("git", "-C", cwd, "status", "--porcelain").Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(out)
+	}
+	before := status()
+	ch := specRoundChanges(t.Context(), cwd, "out", "HEAD")
+	if !ch.ok || !slices.Equal(ch.added["tests/suite/share.rs"], []int{2}) {
+		t.Errorf("moved file: added %v, want only line 2, the line the move changed", ch.added["tests/suite/share.rs"])
+	}
+	if after := status(); after != before {
+		t.Errorf("the index changed:\nbefore %s\nafter %s", before, after)
 	}
 }
 

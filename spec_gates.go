@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"os/exec"
@@ -277,7 +278,16 @@ func specRoundChanges(ctx context.Context, cwd, outRel, base string) specChanges
 	}
 	var addedLines []addedLine
 	deleted := map[string]bool{}
-	diff, err := specGit(ctx, cwd, "-c", "core.quotePath=false", "diff", base, "--no-color", "--no-ext-diff", "--no-prefix", "--relative", "-U0", "--", outRel)
+	// New files go into the diff as intent-to-add, in a copy of the index, so git finds a moved
+	// file the way it finds a renamed one. Listed apart, every line of a moved file was new:
+	// 481 test files moved into tests/suite/ became new code, old lint findings and all, since a
+	// short line (`assert!(`) is never matched as moved line by line.
+	env, cleanup := intentToAddIndex(ctx, cwd, outRel)
+	defer cleanup()
+	c := exec.CommandContext(ctx, "git", "-C", cwd, "-c", "core.quotePath=false", "diff", base, "--find-renames", "--no-color", "--no-ext-diff", "--no-prefix", "--relative", "-U0", "--", outRel)
+	c.Env = env
+	out, err := c.CombinedOutput()
+	diff := string(out)
 	if err != nil {
 		return ch
 	}
@@ -313,9 +323,12 @@ func specRoundChanges(ctx context.Context, cwd, outRel, base string) specChanges
 			}
 		}
 	}
-	untracked, err := specGit(ctx, cwd, "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "--", outRel)
-	if err != nil {
-		return ch
+	untracked := ""
+	if env == nil { // the diff above did not see the new files
+		untracked, err = specGit(ctx, cwd, "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "--", outRel)
+		if err != nil {
+			return ch
+		}
 	}
 	for _, p := range strings.Split(strings.TrimSpace(untracked), "\n") {
 		rel := strings.TrimPrefix(p, prefix)
@@ -340,6 +353,47 @@ func specRoundChanges(ctx context.Context, cwd, outRel, base string) specChanges
 	}
 	ch.ok = true
 	return ch
+}
+
+// intentToAddIndex is the environment of a git command that sees the new files under outRel
+// as intent-to-add, in a temporary copy of the index; the repository's own index is not
+// touched. nil when the copy cannot be made: the caller then lists the new files itself.
+func intentToAddIndex(ctx context.Context, cwd, outRel string) (env []string, cleanup func()) {
+	cleanup = func() {}
+	path, err := specGit(ctx, cwd, "rev-parse", "--path-format=absolute", "--git-path", "index")
+	if err != nil {
+		slog.Debug("spec: no index path for the round's diff", "err", err, "out", truncate(path, 200))
+		return nil, cleanup
+	}
+	tmp, err := os.CreateTemp("", "codehalter-index-*")
+	if err != nil {
+		slog.Debug("spec: no temporary index for the round's diff", "err", err)
+		return nil, cleanup
+	}
+	cleanup = func() {
+		if err := os.Remove(tmp.Name()); err != nil {
+			slog.Debug("spec: temporary index not removed", "err", err)
+		}
+	}
+	data, err := os.ReadFile(strings.TrimSpace(path))
+	if err == nil {
+		_, err = tmp.Write(data)
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		slog.Debug("spec: index not copied for the round's diff", "err", err)
+		return nil, cleanup
+	}
+	env = append(os.Environ(), "GIT_INDEX_FILE="+tmp.Name())
+	c := exec.CommandContext(ctx, "git", "-C", cwd, "add", "--intent-to-add", "--", outRel)
+	c.Env = env
+	if out, err := c.CombinedOutput(); err != nil {
+		slog.Debug("spec: new files not marked for the round's diff", "err", err, "out", truncate(string(out), 200))
+		return nil, cleanup
+	}
+	return env, cleanup
 }
 
 // movedKey is a line as a move is recognised: without its indentation, which a
