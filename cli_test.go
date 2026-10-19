@@ -629,6 +629,19 @@ func replFor(t *testing.T) (*cliClient, *peer, io.Writer, chan struct{}) {
 		close(done)
 	}()
 	t.Cleanup(func() { pw.Close() })
+	// The repl's reader runs before anything is asked: a question that came first would read
+	// stdin itself, as in a one-shot -p run.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+		c.waitMu.Lock()
+		up := c.inputs != nil
+		c.waitMu.Unlock()
+		if up {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the repl never started reading")
+		}
+	}
 	return c, p, pw, done
 }
 

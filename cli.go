@@ -207,7 +207,8 @@ type cliClient struct {
 
 	// inputs carries every line the repl's reader reads, once the repl runs; until then (a
 	// one-shot -p run) a question reads stdin itself. waiting is the open question's channel:
-	// the next line answers it rather than becoming a prompt.
+	// the next line answers it rather than becoming a prompt. waitMu guards both: a question
+	// and the repl's start race.
 	inputs  chan cliLine
 	waitMu  sync.Mutex
 	waiting chan cliLine
@@ -368,7 +369,9 @@ func (c *cliClient) repl() int {
 	restore := c.ui.startInput()
 	c.restoreTTY.Store(&restore)
 	defer restore()
+	c.waitMu.Lock()
 	c.inputs = make(chan cliLine)
+	c.waitMu.Unlock()
 	go c.readInput()
 	turnDone := make(chan struct{})
 	busy := false
@@ -875,11 +878,14 @@ func (c *cliClient) askChoiceOrText(question string, labels []string, allowText 
 
 	// With the repl running, its reader owns stdin and hands this question the next line.
 	next := func() (string, error) { return c.in.ReadString('\n') }
-	if c.inputs != nil {
-		ch := make(chan cliLine, 1)
-		c.waitMu.Lock()
+	c.waitMu.Lock()
+	repl := c.inputs != nil
+	ch := make(chan cliLine, 1)
+	if repl {
 		c.waiting = ch
-		c.waitMu.Unlock()
+	}
+	c.waitMu.Unlock()
+	if repl {
 		defer func() {
 			c.waitMu.Lock()
 			c.waiting = nil
