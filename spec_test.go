@@ -92,6 +92,47 @@ func TestScanSpecLedger(t *testing.T) {
 	}
 }
 
+// The text above a section's first flow is an item of its own, ending at the flow: naivepost's
+// header bar and tab row stood above F0.1 and went to no round. Its slice and its hash are that
+// text alone, so editing the flow redoes only the flow. A line that only introduces the flows
+// is no item.
+func TestSpecIntroAboveFlowsIsAnItem(t *testing.T) {
+	intro := "## 1. The window\n\nOne window. Header bar: New, Open, Save, the project name, the tab row as title widget, then Rescan and Settings from the right edge.\n\n"
+	flow := "### F0.1 Switch tab\n\nS1 A click shows the page.\n\n"
+	scan := func(intro, flow string) *specIndex {
+		t.Helper()
+		root := t.TempDir()
+		writeTree(t, root, map[string]string{"03-shell.md": "# 03 Shell\n\n" + intro + flow + "## 2. Flows\n\nThe flows of the run bar.\n\n### F0.2 Press\n\nS1 Press.\n"})
+		idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return idx
+	}
+	idx := scan(intro, flow)
+	it := idx.items["§03-shell#1-the-window"]
+	if it == nil || it.Kind != specDefSection || it.End != idx.items["F0.1"].Line {
+		t.Fatalf("window item = %+v, want a section item ending at F0.1 (line %d); items %v", it, idx.items["F0.1"].Line, idx.order)
+	}
+	if _, ok := idx.items["§03-shell#2-flows"]; ok {
+		t.Error("a one-line introduction to the flows became an item")
+	}
+	sl := idx.slice("§03-shell#1-the-window", "spec")
+	if !strings.Contains(sl.Text, "tab row as title widget") || strings.Contains(sl.Text, "A click shows the page") {
+		t.Errorf("slice is not the window text alone:\n%s", sl.Text)
+	}
+	if !slices.Contains(sl.Related, "spec/03-shell.md#f01-switch-tab") {
+		t.Errorf("related = %v, want the flow below named as its own item", sl.Related)
+	}
+	hash := specItemHash(idx, "§03-shell#1-the-window")
+	if got := specItemHash(scan(intro, strings.Replace(flow, "shows", "opens", 1)), "§03-shell#1-the-window"); got != hash {
+		t.Error("editing F0.1 changed the window item's hash")
+	}
+	if got := specItemHash(scan(strings.Replace(intro, "Rescan", "Refresh", 1), flow), "§03-shell#1-the-window"); got == hash {
+		t.Error("editing the window text left its hash as it was")
+	}
+}
+
 // Own section without nav, cited parameter rows, the linked section, only a pointer to another flow.
 func TestSpecSlice(t *testing.T) {
 	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)

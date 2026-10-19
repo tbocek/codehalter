@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -317,7 +318,10 @@ type specItem struct {
 	Doc   int
 	Line  int
 	Title string
-	prio  int // lower wins
+	// End, when set, ends a section item's text before its section does: at the first
+	// flow heading, for the text above the section's flows.
+	End  int
+	prio int // lower wins
 }
 
 // A heading that names the id further in still beats an index table row that merely lists it.
@@ -555,6 +559,9 @@ func githubSlug(title string) string {
 }
 
 // addSectionItems makes items of prose sections that define no id, or nothing would schedule them.
+// A section whose flows are headings of their own still has the text above the first one: the
+// window's header bar and tab row stood above F0.1 and went to no round, so that text is an item
+// of its own, ending at the flow.
 func (idx *specIndex) addSectionItems(context, skip []string) {
 	isContext := map[string]bool{}
 	for _, c := range context {
@@ -579,18 +586,63 @@ func (idx *specIndex) addSectionItems(context, skip []string) {
 			continue
 		}
 		nested := slices.ContainsFunc(chosen, func(c specSection) bool { return c.doc == s.doc && s.start > c.start && s.start < c.end })
-		if nested || defines(s.doc, s.start, s.end) {
+		if nested {
 			continue
 		}
-		text := idx.text(s.doc, s.start, s.end)
-		if idx.headingItemsIn(text, "") >= specIndexThreshold || idx.isIDTable(s) {
+		end := 0
+		if defines(s.doc, s.start, s.end) {
+			first := idx.firstHeadingItem(s.doc, s.start, s.end)
+			if first < 0 || specWords(idx.textNoNav(s.doc, s.start+1, first)) < specIntroMinWords {
+				continue
+			}
+			end = first
+		}
+		text := idx.text(s.doc, s.start, cmp.Or(end, s.end))
+		if idx.headingItemsIn(text, "") >= specIndexThreshold || end == 0 && idx.isIDTable(s) {
 			continue
 		}
 		stem := strings.TrimSuffix(d.rel, filepath.Ext(d.rel))
 		id := "§" + stem + "#" + s.slug
-		idx.items[id] = &specItem{ID: id, Kind: specDefSection, Doc: s.doc, Line: s.start, Title: s.title}
+		idx.items[id] = &specItem{ID: id, Kind: specDefSection, Doc: s.doc, Line: s.start, Title: s.title, End: end}
+		if end > 0 {
+			s.end = end
+		}
 		chosen = append(chosen, s)
 	}
+}
+
+// specIntroMinWords: above a section's first flow, a sentence or two of requirements; a line
+// that only says what the flows below are about is not one.
+const specIntroMinWords = 20
+
+// firstHeadingItem is the line of the first id heading in [start, end), or -1: a section of
+// id table rows has no prose of its own above them.
+func (idx *specIndex) firstHeadingItem(doc, start, end int) int {
+	first := -1
+	for _, it := range idx.items {
+		if it.Doc == doc && it.Line > start && it.Line < end && (first < 0 || it.Line < first) {
+			if it.Kind == specDefTableRow {
+				return -1
+			}
+			if it.Kind == specDefHeading {
+				first = it.Line
+			}
+		}
+	}
+	return first
+}
+
+// specWords counts the words of spec prose, without images and HTML comments.
+func specWords(text string) int {
+	n := 0
+	for _, ln := range strings.Split(text, "\n") {
+		t := strings.TrimSpace(ln)
+		if strings.HasPrefix(t, "![") || strings.HasPrefix(t, "<!--") {
+			continue
+		}
+		n += len(strings.Fields(t))
+	}
+	return n
 }
 
 // isIDTable: a section that is mostly id-led table rows adds nothing, the rows are items already.
@@ -671,6 +723,9 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 	switch it.Kind {
 	case specDefHeading, specDefSection:
 		primary, _ = idx.sectionAt(it.Doc, it.Line)
+		if it.End > 0 {
+			primary.end = it.End
+		}
 		primaryText = idx.textNoNav(primary.doc, primary.start, primary.end)
 	case specDefTableRow:
 		primary = specSection{doc: it.Doc, start: it.Line, end: it.Line + 1}
@@ -702,6 +757,16 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 	}
 	add(path(primary.doc)+" · "+title, primaryText)
 	seenRel[sectionKey(idx.docs[primary.doc].rel, primary.start)] = true
+	if it.End > 0 {
+		// The flows below the intro are items of their own, with rounds of their own.
+		if whole, ok := idx.sectionAt(it.Doc, it.Line); ok {
+			for _, s := range idx.sections {
+				if s.doc == it.Doc && s.start >= it.End && s.start < whole.end && len(idx.idsIn(idx.docs[s.doc].lines[s.start])) > 0 {
+					out.Related = appendUnique(out.Related, path(s.doc)+"#"+s.slug)
+				}
+			}
+		}
+	}
 
 	body := idx.textNoNav(primary.doc, primary.start, primary.end)
 
@@ -1024,7 +1089,7 @@ func specItemHash(idx *specIndex, id string) string {
 	// Not the round's slice: its linked sections would make an edit anywhere look like a change here.
 	text := ""
 	if sec, ok := idx.sectionAt(it.Doc, it.Line); ok && sec.start == it.Line {
-		text = idx.text(it.Doc, sec.start, sec.end)
+		text = idx.text(it.Doc, sec.start, cmp.Or(it.End, sec.end))
 	} else if lines := idx.docs[it.Doc].lines; it.Line >= 0 && it.Line < len(lines) {
 		text = lines[it.Line]
 	}
