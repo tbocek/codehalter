@@ -584,7 +584,12 @@ func (u *cliUI) Card(up toolCallUpdate) {
 		u.order = append(u.order, up.ToolCallId)
 	}
 	if up.Title != "" {
-		c.title = sanitize(up.Title)
+		// One row per card (liveLines): a multi-line command shows its first line and "…".
+		title, _, more := strings.Cut(strings.TrimSpace(sanitize(up.Title)), "\n")
+		if more {
+			title += " …"
+		}
+		c.title = title
 	}
 	if up.Status != "" {
 		c.status = up.Status

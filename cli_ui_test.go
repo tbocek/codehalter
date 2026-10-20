@@ -361,6 +361,42 @@ func TestCardTitleIsSanitized(t *testing.T) {
 	}
 }
 
+// A multi-line command is one live row: its first line and "…". As two rows, every
+// spinner redraw left one behind, and a single running script filled the screen.
+func TestMultiLineTitleIsOneRow(t *testing.T) {
+	u, buf := uiFor(true, 80, 24)
+	u.Begin()
+	u.Card(toolCallUpdate{ToolCallId: "t1", Title: "Run: python3 - <<'PY'\np='tests/a.rs'\nPY\n", Status: "in_progress"})
+	for range 5 {
+		flushUI(u)
+	}
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, row := range screenAfter(buf.String(), u.cols) {
+		if strings.Contains(row, "python3") {
+			n++
+			if !strings.Contains(row, "Run: python3 - <<'PY' …") {
+				t.Errorf("row = %q, want the first line and …", row)
+			}
+		}
+		if strings.Contains(row, "tests/a.rs") {
+			t.Errorf("the command's second line is on screen: %q", row)
+		}
+	}
+	if n != 1 {
+		t.Errorf("the running command is on screen %d times after five redraws, want 1", n)
+	}
+	u.Card(toolCallUpdate{ToolCallId: "t1", Status: "completed"})
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if out := stripANSI(buf.String()); !strings.Contains(out, "✓ Run: python3 - <<'PY' …") {
+		t.Errorf("the finished card lost the …: %q", out)
+	}
+}
+
 func flushUI(u *cliUI) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
