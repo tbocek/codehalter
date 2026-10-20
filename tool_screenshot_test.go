@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -396,6 +397,75 @@ func TestRenderIsAttachedBesideTheSpecPicture(t *testing.T) {
 		if r1, g1, b1, _ := img.At(c.x, 20).RGBA(); func() bool { r2, g2, b2, _ := c.want.RGBA(); return r1 != r2 || g1 != g2 || b1 != b2 }() {
 			t.Errorf("pixel at x=%d is %v, want %v", c.x, img.At(c.x, 20), c.want)
 		}
+	}
+}
+
+// A recipe that writes more than the screen (the page behind a crop as a sidecar, a second
+// screen, a picture into the spec folder) still gets the screen with a spec picture
+// compared: a sidecar written last once kept a lane screen from ever being compared.
+func TestRenderWithASpecPictureIsPickedOverNewerFiles(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.imagesSupported.Store(true)
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+		t.Fatal(err)
+	}
+	pic := buf.String()
+	buf.Reset()
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 9, 9))); err != nil {
+		t.Fatal(err)
+	}
+	// The recipes write their files from scripts, so a command names only its screen.
+	writeTree(t, h.sess.Cwd, map[string]string{
+		"spec/img/06-lane.png": pic, "spec/img/06-preview.png": pic, "spec/img/07-Narrate.png": pic, "pic.png": pic, "pic2.png": buf.String(),
+		"sidecar.sh": "mkdir -p rust/shots && cp pic.png rust/shots/06-lane.png && sleep 0.05 && cp pic.png rust/shots/06-lane.page.png\n",
+		"two.sh":     "cp pic2.png rust/shots/06-preview.png && sleep 0.05 && cp pic.png rust/shots/06-lane.png\n",
+		"case.sh":    "cp pic.png rust/shots/07-narrate.png\n",
+		"into.sh":    "cp pic.png spec/img/08-produce.png\n",
+	})
+	// sent is the text the model gets: the tool's output, or the text part beside the image.
+	var sent string
+	run := func(id, cmd string) ToolUse {
+		t.Helper()
+		var tc toolCall
+		tc.ID, tc.Function.Name, tc.Function.Arguments = id, "run_command", fmt.Sprintf("{\"command\":%q}", cmd)
+		tu, content := h.agent.runToolCall(context.Background(), h.sess.ID, tc)
+		sent = tu.Output
+		if parts, ok := content.([]any); ok {
+			sent = fmt.Sprint(parts[0])
+		}
+		return tu
+	}
+
+	// The sidecar is written after the subject's crop.
+	tu := run("c1", "sh sidecar.sh && echo 'just snapshot 06-lane'")
+	if !strings.Contains(tu.Output, sideBySideMark+"spec/img/06-lane.png") || !strings.Contains(tu.Output, "rust/shots/06-lane.png,") {
+		t.Errorf("the sidecar shadowed the screen: %s", tu.Output)
+	}
+
+	// Two screens with pictures: the one the command names is compared though older, the
+	// other is named; a file the command before wrote is not counted again.
+	tu = run("c2", "sh two.sh && echo 'just snapshot 06-preview'")
+	if tu.ImageID == "" || !strings.Contains(sent, sideBySideMark+"spec/img/06-preview.png") || !strings.Contains(sent, "also rendered rust/shots/06-lane.png (spec picture spec/img/06-lane.png);") {
+		t.Errorf("two screens: %s", tu.Output)
+	}
+	// A longer name is not this screen's: unnamed, the newest with a picture is compared.
+	tu = run("c3", "sh two.sh && echo 'just snapshot 06-preview-wide'")
+	if !strings.Contains(tu.Output, sideBySideMark+"spec/img/06-lane.png") {
+		t.Errorf("a longer name counted as the screen's: %s", tu.Output)
+	}
+
+	// A stem in another case is the same screen.
+	tu = run("c4", "sh case.sh && echo 'just snapshot 07-narrate'")
+	if !strings.Contains(tu.Output, sideBySideMark+"spec/img/07-Narrate.png") || strings.Contains(tu.Output, "also rendered") {
+		t.Errorf("case of the stem: %s", tu.Output)
+	}
+
+	// A render written into the spec folder is attached, but never beside itself.
+	tu = run("c5", "sh into.sh && echo 'just snapshot 08-produce'")
+	if tu.ImageID == "" && tu.SameImageAs == "" || strings.Contains(tu.Output, sideBySideMark) {
+		t.Errorf("a render into the spec folder: %+v", tu)
 	}
 }
 

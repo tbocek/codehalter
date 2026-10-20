@@ -20,8 +20,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Replay rebuilds a screenshot from the stored bytes (ToolUse.ImageID), never by
@@ -361,20 +364,79 @@ func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result s
 	if sess == nil {
 		return "", nil, "", ""
 	}
-	// Whole-second mtimes on some filesystems: a file written in the same
-	// second the command started must still count.
-	png := newestPNGSince(sess.Cwd, since.Truncate(time.Second).Add(-time.Nanosecond))
+	written := pngsWrittenSince(sess.Cwd, since)
+	// A recipe can write several files per screen (the subject's crop, then the page behind
+	// it as a sidecar), or several screens at once. The newest is then the sidecar, and a
+	// round that rendered 06-lane.png beside spec/img/06-lane.png never got them compared.
+	pics := specPicturesByStem(sess.Cwd)
+	specOf := func(p string) string {
+		stem := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+		for _, pic := range pics[strings.ToLower(stem)] {
+			if filepath.Join(sess.Cwd, pic) != p { // a render written into the spec folder is no picture of itself
+				return pic
+			}
+		}
+		return ""
+	}
+	// Named as a whole word: `snapshot 06-lane-wide` does not name 06-lane.
+	named := func(p string) bool {
+		stem := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+		if stem == "" {
+			return false
+		}
+		inName := func(r rune) bool {
+			return r == '-' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+		}
+		for rest, off := cmd, 0; ; {
+			i := strings.Index(rest, stem)
+			if i < 0 {
+				return false
+			}
+			at := off + i
+			before, _ := utf8.DecodeLastRuneInString(cmd[:at])
+			after, _ := utf8.DecodeRuneInString(cmd[at+len(stem):])
+			if !inName(before) && !inName(after) {
+				return true
+			}
+			rest, off = rest[i+1:], at+1
+		}
+	}
+	rank := func(p string) int {
+		switch {
+		case specOf(p) != "" && named(p):
+			return 0
+		case specOf(p) != "":
+			return 1
+		}
+		return 2
+	}
+	slices.SortStableFunc(written, func(x, y string) int { return rank(x) - rank(y) })
+	png, spec := "", ""
+	var data []byte
+	for _, p := range written {
+		if b, err := os.ReadFile(p); err == nil && len(b) > 0 && len(b) <= maxScreenshotBytes {
+			png, data = p, b
+			break
+		}
+	}
 	if png == "" {
 		return "", nil, "", ""
 	}
-	data, err := os.ReadFile(png)
-	if err != nil || len(data) == 0 || len(data) > maxScreenshotBytes {
-		return "", nil, "", ""
+	// Other screens with a picture of their own are named, so the round renders each.
+	var others []string
+	for _, p := range written {
+		if pic := specOf(p); p != png && pic != "" {
+			if rel, err := filepath.Rel(sess.Cwd, p); err == nil {
+				others = append(others, fmt.Sprintf("%s (spec picture %s)", filepath.ToSlash(rel), pic))
+			}
+		}
+	}
+	if len(others) > 0 {
+		result += fmt.Sprintf("\n[codehalter, not the user: this command also rendered %s; only one render is attached per command, so render each of those on its own to see it beside its picture.]", strings.Join(others, ", "))
 	}
 	// The spec's own picture of this screen goes beside the render: told to compare in
 	// words, a round passed with the page laid out other than its picture.
-	spec := specPictureFor(sess.Cwd, png)
-	if spec != "" {
+	if spec = specOf(png); spec != "" {
 		both, err := sideBySide(filepath.Join(sess.Cwd, spec), data)
 		if err != nil {
 			slog.Debug("attachRenderedScreen: no side by side", "spec", spec, "err", err)
@@ -419,35 +481,33 @@ func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result s
 // /spec gate finds a compared picture by it.
 const sideBySideMark = "side by side with the spec's picture "
 
-// specPictureFor is the spec's picture with the render's own name (shots/04-prepare.png
-// and spec/img/04-prepare.png), relative to cwd, or "". The spec folder is the /spec
-// ledger's, else `spec`.
-func specPictureFor(cwd, render string) string {
+// specPicturesByStem maps a lower-cased file stem to the spec's pictures of that name
+// (shots/04-prepare.png belongs with spec/img/04-prepare.png), relative to cwd, in walk
+// order. The spec folder is the /spec ledger's, else `spec`.
+func specPicturesByStem(cwd string) map[string][]string {
 	dir := "spec"
 	if cfg, err := loadSpecConfig(cwd); err == nil && cfg != nil && cfg.SpecDir != "" {
 		dir = cfg.SpecDir
 	}
-	stem := strings.TrimSuffix(filepath.Base(render), filepath.Ext(render))
-	found := ""
+	pics := map[string][]string{}
 	walkErr := filepath.WalkDir(filepath.Join(cwd, dir), func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || path == render {
+		if err != nil || d.IsDir() {
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(path))
-		if (ext == ".png" || ext == ".jpg" || ext == ".jpeg") && strings.TrimSuffix(d.Name(), filepath.Ext(path)) == stem {
-			found = path
-			return filepath.SkipAll
+		if ext != ".png" && ext != ".jpg" && ext != ".jpeg" {
+			return nil
+		}
+		if rel, err := filepath.Rel(cwd, path); err == nil {
+			stem := strings.ToLower(strings.TrimSuffix(d.Name(), filepath.Ext(path)))
+			pics[stem] = append(pics[stem], filepath.ToSlash(rel))
 		}
 		return nil
 	})
-	if walkErr != nil || found == "" {
-		return ""
+	if walkErr != nil {
+		slog.Debug("specPicturesByStem: walking the spec folder", "dir", dir, "err", walkErr)
 	}
-	rel, err := filepath.Rel(cwd, found)
-	if err != nil {
-		return ""
-	}
-	return filepath.ToSlash(rel)
+	return pics
 }
 
 // sideBySideGap is the grey bar between the two pictures.
@@ -548,8 +608,16 @@ func downscalePNG(data []byte, max int) []byte {
 	return out.Bytes()
 }
 
-func newestPNGSince(root string, t time.Time) string {
-	best, bestT := "", t
+// pngsWrittenSince lists the PNGs under root modified at or after t, newest first; equal
+// times keep walk order, so the pick is the same every run. Some filesystems keep
+// whole-second mtimes: a time with no nanoseconds counts from the start of t's second,
+// while on the rest a file the command before wrote in that same second stays out.
+func pngsWrittenSince(root string, t time.Time) []string {
+	type found struct {
+		path string
+		mod  time.Time
+	}
+	var all []found
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -563,12 +631,21 @@ func newestPNGSince(root string, t time.Time) string {
 		if !strings.EqualFold(filepath.Ext(path), ".png") {
 			return nil
 		}
-		if info, err := d.Info(); err == nil && info.ModTime().After(bestT) {
-			best, bestT = path, info.ModTime()
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if mod := info.ModTime(); !mod.Before(t) || mod.Nanosecond() == 0 && !mod.Before(t.Truncate(time.Second)) {
+			all = append(all, found{path, mod})
 		}
 		return nil
 	})
-	return best
+	slices.SortStableFunc(all, func(x, y found) int { return y.mod.Compare(x.mod) })
+	paths := make([]string, len(all))
+	for i, f := range all {
+		paths[i] = f.path
+	}
+	return paths
 }
 
 const pictureRegionMaxSide = 1400
