@@ -11,6 +11,8 @@ Below are two images:
 
 The data differs, and that is not a difference: other file names, other numbers, other counts of rows or clips, other text in the text boxes, other thumbnails or frames, another theme colour. A list with eight rows in the picture and one row in the render is the same list.
 
+The picture can be of an older version (a prototype), and the spec text below says where the program is meant to differ from it. A control the spec text calls gone, removed, replaced, or prototype only is not a difference when the render lacks it, and the control that replaces it is not a difference when the render has it. For example, if the spec text says "chain (prototype; replaced by I'm feeling lucky)", a render with an "I'm feeling lucky" button where the picture has a chain dropdown matches. Read the spec text for each control before you list it as missing or extra.
+
 ## What to compare
 
 Compare the ARRANGEMENT, region by region, starting at the top left of the spec's picture:
@@ -37,4 +39,4 @@ or
 
 {"verdict": "MISMATCH", "differences": ["<where on the screen>: <what the picture shows> but <what the render shows>", "..."]}
 
-Name every difference in arrangement you found, each with where it is, so someone who cannot see the images can fix it. A difference only in data is not listed. If the render has any part cut off, overlapping or scrolled out of view, the verdict is MISMATCH.
+Name every difference in arrangement you found, each with where it is, so someone who cannot see the images can fix it. A difference only in data is not listed, and neither is a control the spec text says the program dropped or replaced. If the render has any part cut off, overlapping or scrolled out of view, the verdict is MISMATCH.
