@@ -1222,6 +1222,35 @@ func TestSpecSplitsWhatBlocked(t *testing.T) {
 // An item finished with its answer before the answer could be dropped loses the
 // question at the next round, without counting as a spec change; an answer given
 // after the build stays for the change round, an open question stays open.
+// A spec edited and not committed is the usual change: the change round is given that edit,
+// not an empty diff that left it to pick another bullet of the section.
+func TestSpecChangeRoundSeesAnUncommittedEdit(t *testing.T) {
+	h := newTerminalHarness(t)
+	writeTree(t, h.sess.Cwd, map[string]string{".gitignore": ".codehalter/\n", "spec/01.md": "# 01\n\n### F0.1 Store\n\nS1 Keep the log under the page.\n"})
+	gitInit(t, h.sess.Cwd)
+	built, err := specGit(t.Context(), h.sess.Cwd, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	specAbs := filepath.Join(h.sess.Cwd, "spec")
+	idx, err := scanSpec(specAbs, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "true", LintCmd: "off", Items: map[string]specLedger{
+		"F0.1": {Hash: specItemHash(idx, "F0.1"), Title: idx.items["F0.1"].Title, Commit: strings.TrimSpace(built), Named: true},
+	}}
+	writeTree(t, h.sess.Cwd, map[string]string{"spec/01.md": "# 01\n\n### F0.1 Store\n\nS1 Keep the log under the page; collapsed, it takes only its header.\n"})
+	if idx, err = scanSpec(specAbs, defaultSpecIDPatterns, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	r := &specRun{a: h.agent, sid: h.sess.ID, sess: h.sess, cfg: cfg, idx: idx, outAbs: filepath.Join(h.sess.Cwd, "rust"), reasons: map[string]string{}}
+	w := r.pickWork(t.Context(), map[string]string{"F0.1": "rust/tests/a.rs"}, 1)
+	if w.Item != "F0.1" || w.Mode != specModeChange || !strings.Contains(w.Note, "+S1 Keep the log under the page; collapsed, it takes only its header.") {
+		t.Errorf("work = %+v, want a change round whose note holds the uncommitted edit", w)
+	}
+}
+
 func TestSpecDropsAnswersOfBuiltItems(t *testing.T) {
 	h := newTerminalHarness(t)
 	specAbs := filepath.Join(h.sess.Cwd, "spec")

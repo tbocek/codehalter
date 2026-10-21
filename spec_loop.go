@@ -869,9 +869,11 @@ func (r *specRun) pickWork(ctx context.Context, covered map[string]string, testF
 	case changed != "":
 		w = specWork{Item: changed, Mode: specModeChange}
 		// The edit since the item was built, so the round sees what changed, not the section again.
+		// Against the working tree, not HEAD: the user's spec edit is usually not committed yet, and a
+		// round given an empty diff built another bullet of the section instead of the edited one.
 		if commit := cfg.Items[w.Item].Commit; commit != "" {
 			doc := cfg.SpecDir + "/" + r.idx.docs[r.idx.items[w.Item].Doc].rel
-			if out, err := specGit(ctx, r.sess.Cwd, "diff", commit+"..HEAD", "--", doc); err != nil {
+			if out, err := specGit(ctx, r.sess.Cwd, "diff", commit, "--", doc); err != nil {
 				slog.Debug("spec: diff of a changed item", "item", w.Item, "err", err)
 			} else {
 				w.Note = strings.TrimSpace(clipBytes(out, specSpecDiffBytes))
