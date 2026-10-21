@@ -487,6 +487,7 @@ func (s *Session) takeDriftNote(path string) string {
 // line is for the user; full (exit code, log path, tail) is for the model.
 type bgNote struct {
 	line, full string
+	job        int // the job it reports on, so a stopped job's notes can be dropped
 }
 
 // pendingInput is the user's text typed during a turn, or a job note when note is set.
@@ -505,6 +506,13 @@ func (s *Session) addBgNote(n bgNote) {
 	s.rt.mu.Lock()
 	s.rt.pending = append(s.rt.pending, pendingInput{note: &n})
 	s.rt.mu.Unlock()
+}
+
+// dropJobNotes takes the notes of the given jobs out of the queue, the user's text staying.
+func (s *Session) dropJobNotes(jobs map[int]bool) {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	s.rt.pending = slices.DeleteFunc(s.rt.pending, func(p pendingInput) bool { return p.note != nil && jobs[p.note.job] })
 }
 
 func (s *Session) hasPending() bool {

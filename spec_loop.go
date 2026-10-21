@@ -505,6 +505,7 @@ func (r *specRun) testCmd() string {
 
 func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args string, pendingFixes []fixProblem) (PromptResponse, error) {
 	end := PromptResponse{StopReason: "end_turn"}
+	runStart := time.Now() // the jobs started from here on are the run's: an abort stops them
 	// Taken first so an early return below cannot leave it for a later turn.
 	handoff := sess.takeSpecHandoff()
 	cfg, cmd, ok := a.specResolve(ctx, sid, sess, args)
@@ -601,7 +602,11 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	// Only `/spec abort` cancels a running loop (see runSpecTurn).
 	stopped := func() (PromptResponse, error) {
 		r.save(context.Background())
-		a.say(context.Background(), sid, "⏹ **/spec aborted.** What the round in flight did so far stays in the project; `/spec` continues from it.\n")
+		jobs := ""
+		if names := a.stopJobsSince(sid, runStart); len(names) > 0 {
+			jobs = " Stopped what it ran in the background: " + strings.Join(names, ", ") + "."
+		}
+		a.say(context.Background(), sid, "⏹ **/spec aborted.** What the round in flight did so far stays in the project; `/spec` continues from it."+jobs+"\n")
 		return PromptResponse{StopReason: "cancelled"}, nil
 	}
 

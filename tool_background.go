@@ -361,6 +361,39 @@ func (a *agent) shutdownBackground() {
 	}
 }
 
+// stopJobsSince ends the session's jobs started from since on, and names them. Each is untracked
+// before it is killed, and its queued notes dropped, so neither its exit nor a wake_after starts a
+// turn: after a /spec abort a suite's wake note resumed the aborted round as a plain turn.
+func (a *agent) stopJobsSince(sid string, since time.Time) []string {
+	a.bgMu.Lock()
+	var jobs []*backgroundJob
+	for _, id := range slices.Sorted(maps.Keys(a.bgJobs)) {
+		if j := a.bgJobs[id]; j.sid == sid && !j.started.Before(since) {
+			jobs = append(jobs, j)
+			delete(a.bgJobs, id)
+		}
+	}
+	a.bgMu.Unlock()
+	if len(jobs) == 0 {
+		return nil
+	}
+	ids := map[int]bool{}
+	var names []string
+	for _, j := range jobs {
+		ids[j.id] = true
+		names = append(names, fmt.Sprintf("job %d `%s`", j.id, truncate(j.cmdStr, 60)))
+	}
+	if sess := a.getSession(sid); sess != nil {
+		sess.dropJobNotes(ids)
+	}
+	for _, j := range jobs {
+		a.killJob(j)
+		a.terminalRelease(j.sid, j.terminalId)
+		removeJobFiles(j.logPath, j.pidPath)
+	}
+	return names
+}
+
 func readLogTail(path string, max int) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -565,6 +598,7 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 	a.retitleToolCall(context.Background(), job.sid, job.tcId, fmt.Sprintf("%s: %s (job %d %s)", jobVerb[job.kind], job.cmdStr, job.id, outcome), "completed")
 	took := humanDuration(time.Since(job.started).Milliseconds())
 	sess.addBgNote(bgNote{
+		job:  job.id,
 		line: fmt.Sprintf("background job %d `%s` %s after %s", job.id, truncate(job.cmdStr, 80), outcome, took),
 		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` %s after %s. Full log: %s. Last output:]\n\n%s",
 			job.id, job.cmdStr, outcome, took, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
@@ -807,6 +841,7 @@ func (a *agent) wakeForBgJob(job *backgroundJob) {
 	}
 	age := humanDuration(time.Since(job.started).Milliseconds())
 	sess.addBgNote(bgNote{
+		job:  job.id,
 		line: fmt.Sprintf("background job %d `%s` still running after %s, as asked", job.id, truncate(job.cmdStr, 80), age),
 		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` is still running after %s; this is the wake_after you asked for, not its exit. It is reported again when it exits. Full log: %s. Last output:]\n\n%s",
 			job.id, job.cmdStr, age, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),

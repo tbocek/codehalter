@@ -1005,6 +1005,74 @@ func TestSpecStopFinishesTheRoundAndAbortDoesNot(t *testing.T) {
 	}
 }
 
+// `/spec abort` also stops what the round started in the background: the job is killed
+// and forgotten, and neither its wake_after nor its exit starts a turn afterwards. An
+// aborted round's suite once woke the model three minutes later as a plain turn.
+func TestSpecAbortStopsTheRoundsJobs(t *testing.T) {
+	old := bgJobGrace
+	bgJobGrace = 100 * time.Millisecond
+	defer func() { bgJobGrace = old }()
+	entered := make(chan struct{})
+	var once sync.Once
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(id string) bool { return id != "F0.1" },
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do it"}]}`),
+		sseToolCall("b1", "run_background", `{"command":"sleep 30","wake_after":1}`),
+		sseToolCall("w1", "wait_tool", `{}`))
+	defer rig.h.agent.shutdownBackground()
+	rig.h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_background", "parameters": map[string]any{"type": "object"}}}, Execute: runBackgroundExecute})
+	rig.h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "wait_tool", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			once.Do(func() { close(entered) })
+			<-ctx.Done()
+			return "waited", false
+		}})
+	released := make(chan struct{})
+	turnCtx, cancel := context.WithCancel(t.Context())
+	go func() {
+		_, _, _ = rig.h.agent.runSpecTurn(turnCtx, rig.h.sess.ID, rig.h.sess, "", nil, func() { close(released) })
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the round never reached its step")
+	}
+	var job *backgroundJob
+	rig.h.agent.bgMu.Lock()
+	for _, j := range rig.h.agent.bgJobs {
+		job = j
+	}
+	rig.h.agent.bgMu.Unlock()
+	if job == nil || job.pid <= 0 {
+		t.Fatalf("the round's job is not running: %+v", job)
+	}
+	cancel()
+	if !rig.h.sess.abortSpec() {
+		t.Fatal("no running loop to abort")
+	}
+	select {
+	case <-released:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the loop never ended and gave the turn back")
+	}
+	if said := rig.said(t); !strings.Contains(said, fmt.Sprintf("Stopped what it ran in the background: job %d `sleep 30`", job.id)) {
+		t.Errorf("the abort did not name the job it stopped:\n%s", said)
+	}
+	time.Sleep(1500 * time.Millisecond) // past the job's wake_after
+	rig.h.agent.bgMu.Lock()
+	left := len(rig.h.agent.bgJobs)
+	rig.h.agent.bgMu.Unlock()
+	if left != 0 || rig.h.sess.hasPending() {
+		t.Errorf("after the abort: %d job(s) tracked, a note pending: %v", left, rig.h.sess.hasPending())
+	}
+	if processAlive(job.pid) {
+		t.Errorf("the job's process %d still runs", job.pid)
+	}
+}
+
 // The check's answer names an item however the model writes it: an id with a colon
 // of its own, a long section id shortened, an id followed by its title. Six items
 // once stayed unread this way, each with a clear MISSING.
