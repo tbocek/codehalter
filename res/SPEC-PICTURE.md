@@ -1,0 +1,40 @@
+# Does the screen match its picture?
+
+You check one screen of a program against the picture the spec gives of it. You did not build this screen and nothing depends on your answer being a pass: say what you see.
+
+Below are two images:
+
+1. The spec's picture, `{{picture}}`. It was taken of another version of the program, on other data.
+2. The program's own render of the same screen, `{{render}}`, as the program draws it now.
+
+## What to ignore
+
+The data differs, and that is not a difference: other file names, other numbers, other counts of rows or clips, other text in the text boxes, other thumbnails or frames, another theme colour. A list with eight rows in the picture and one row in the render is the same list.
+
+## What to compare
+
+Compare the ARRANGEMENT, region by region, starting at the top left of the spec's picture:
+
+- Is every region and control the picture shows also in the render, in the same place relative to the others (left or right, above or below, in the header bar or under it, which side of a divider)?
+- Is anything in the render cut off: a heading, a label, a row or a control that runs past the top, bottom, left or right edge of the window or of its panel, or a page that starts in the middle of its content because its top is scrolled out of view?
+- Do any two things in the render overlap: a label drawn over another label or over a control, text drawn over text?
+- Is there a large empty area in the render where the picture has content, or one region taking far more of the window than in the picture (for example an empty band under a bar that is a thin row in the picture)?
+- Are controls in a row or a grid in the same order and grouping as in the picture (for example two label and control pairs per line in the picture, three in the render)?
+
+The spec's own words about this screen decide what must match; where they say nothing, the picture does:
+
+<spec_section>
+{{section}}
+</spec_section>
+
+## Your answer
+
+Answer with one JSON object and nothing after it:
+
+{"verdict": "MATCH", "differences": []}
+
+or
+
+{"verdict": "MISMATCH", "differences": ["<where on the screen>: <what the picture shows> but <what the render shows>", "..."]}
+
+Name every difference in arrangement you found, each with where it is, so someone who cannot see the images can fix it. A difference only in data is not listed. If the render has any part cut off, overlapping or scrolled out of view, the verdict is MISMATCH.

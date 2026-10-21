@@ -180,6 +180,8 @@ type specRoundResult struct {
 	UIUnseen []string
 	// PicturesUnseen lists the item's own spec pictures that no render was put beside.
 	PicturesUnseen []string
+	// PicturesDiffer: codehalter's own render beside a spec picture, judged not to match by a fresh look.
+	PicturesDiffer []string
 	TurnErr        string
 	TestsPass      bool
 	TestTail       string
@@ -219,13 +221,13 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 		}
 	case r.Mode == specModeChange:
 		// The test for the OLD text still covers a changed item; the commit is the evidence of work.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.PicturesUnseen) == 0 &&
+		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.PicturesUnseen)+len(r.PicturesDiffer) == 0 &&
 			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, "", ""
 		}
 	default:
 		// A reopened item's old test still names it: like a change, it needs a commit.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen)+len(r.PicturesUnseen) == 0 && (r.Committed || !r.Redo) &&
+		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen)+len(r.PicturesUnseen)+len(r.PicturesDiffer) == 0 && (r.Committed || !r.Redo) &&
 			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, "", ""
 		}
@@ -242,6 +244,10 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 	}
 	if len(r.PicturesUnseen) > 0 && r.TurnErr == "" {
 		add("picture", fmt.Sprintf("the spec has a picture of this screen (%s) and the round never put the app beside it: render that screen with the snapshot recipe under the picture's own name (add the name to the recipe if it has none), and codehalter shows the spec's picture and the render side by side; make the arrangement match where the spec text asks for it", strings.Join(r.PicturesUnseen, ", ")))
+	}
+	if len(r.PicturesDiffer) > 0 && r.TurnErr == "" {
+		add("picture-differs", "codehalter rendered the screen itself and an independent look put it beside the spec's picture: the arrangement differs. "+strings.Join(r.PicturesDiffer, "; ")+
+			". Fix each in the program, the way a user sees the screen: changing only how the snapshot stages it fixes nothing")
 	}
 	if r.TurnErr != "" {
 		add("error", "the round ended with an error: "+r.TurnErr)
@@ -1466,10 +1472,15 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 		res.UIUnseen = uiEditedUnseen(uses, r.sess.Cwd)
 		// A screen item passed on a test of its tooltips while the page was laid out other than
 		// its picture: a picture the spec gives is compared, whether the round touched the UI or not.
-		for _, pic := range specOwnPictures(r.idx.slice(item, cfg.SpecDir)) {
+		pics := specOwnPictures(r.idx.slice(item, cfg.SpecDir))
+		for _, pic := range pics {
 			if !slices.ContainsFunc(uses, func(u ToolUse) bool { return strings.Contains(u.Output, sideBySideMark+pic) }) {
 				res.PicturesUnseen = append(res.PicturesUnseen, pic)
 			}
+		}
+		// Only the final judgement looks, and only when the rest passed: a look costs a render and a call.
+		if runTests && res.TestsPass && res.TurnErr == "" && len(res.PicturesUnseen) == 0 && (w.Mode == specModeItem || w.Mode == specModeChange) {
+			res.PicturesDiffer = r.checkPictures(ctx, item, pics)
 		}
 	}
 	covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)
