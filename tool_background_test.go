@@ -411,6 +411,56 @@ func TestRunBackgroundRefusesARender(t *testing.T) {
 	}
 }
 
+// A second copy of a running job is refused, whether it is the same command (spaced
+// otherwise) or another one writing the same file, from run_background and run_command
+// alike; it names the job and how to stop it. Other work, and the same command once the
+// job is gone, still runs.
+func TestRunBackgroundRefusesASecondCopy(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	old := bgJobGrace
+	bgJobGrace = 100 * time.Millisecond
+	defer func() { bgJobGrace = old }()
+	cmd := func(c string) string {
+		b, _ := json.Marshal(map[string]string{"command": c})
+		return string(b)
+	}
+
+	first, _ := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, cmd("sleep 5 > suite.log 2>&1; echo \"exit=$?\" >> suite.log"))
+	if !strings.Contains(first, "running (pid") {
+		t.Fatalf("the first job did not start: %s", first)
+	}
+	var job *backgroundJob
+	h.agent.bgMu.Lock()
+	for _, j := range h.agent.bgJobs {
+		job = j
+	}
+	h.agent.bgMu.Unlock()
+
+	for name, res := range map[string]string{
+		"the same command": func() string {
+			r, _ := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, cmd("sleep 5  > suite.log 2>&1;  echo \"exit=$?\" >> suite.log"))
+			return r
+		}(),
+		"the same log, from run_command": func() string {
+			r, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, cmd("echo again > suite.log"))
+			return r
+		}(),
+	} {
+		if !strings.HasPrefix(res, fmt.Sprintf("refused: job %d ", job.id)) || !strings.Contains(res, fmt.Sprintf("kill -TERM -%d", job.pid)) {
+			t.Errorf("%s: %s, want a refusal naming job %d and how to stop it", name, res, job.id)
+		}
+	}
+	if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, cmd("echo other > other.log; tail -1 suite.log")); strings.HasPrefix(res, "refused") {
+		t.Errorf("other work was refused: %s", res)
+	}
+
+	h.agent.shutdownBackground()
+	if res, _ := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, cmd("sleep 5 > suite.log 2>&1; echo \"exit=$?\" >> suite.log")); strings.HasPrefix(res, "refused") {
+		t.Errorf("the same command, its job gone, was refused: %s", res)
+	}
+}
+
 // A loop that polls with pgrep and sleep adds a tick or two of reaped children at every
 // sample; that is idle, not movement. Only CPU from bgBusyRate up counts, so the polling
 // job is stopped and the one that really works is left alone.

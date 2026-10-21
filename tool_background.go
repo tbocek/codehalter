@@ -129,6 +129,12 @@ func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, kind jobKind
 	if jobs := a.runningBgJobs(sid, ending); jobs != "" && (kind == jobHandedOver && isSleepCmd(cmdStr) || processPollRe.MatchString(cmdStr)) {
 		return nil, fmt.Sprintf("refused: do not wait for a background job yourself, with a sleep or a polling loop. %s still running; %s", jobs, dontWait)
 	}
+	// A second copy of a running job fights it for the same files, and one result overwrites
+	// the other: a suite started again while the first still ran into the same log left that
+	// log reading 196 failed files, and the first run's result was gone.
+	if dup := a.jobDoingTheSame(sid, cmdStr, redirectTargets(cmdStr, sess.Cwd)); dup != "" {
+		return nil, "refused: " + dup + " " + dontWait
+	}
 	tcId := a.StartToolCall(ctx, sid, jobVerb[kind]+": "+cmdStr, "execute", nil)
 
 	a.bgMu.Lock()
@@ -218,6 +224,31 @@ func (a *agent) runningBgJobs(sid string, keep func(*backgroundJob) bool) string
 	}
 	sort.Strings(names)
 	return strings.Join(names, ", ")
+}
+
+// jobDoingTheSame names a running job of the session that runs cmd too, or writes a file cmd
+// writes, and says why a second one is refused; "" when there is none.
+func (a *agent) jobDoingTheSame(sid, cmd string, writes []string) string {
+	same := strings.Join(strings.Fields(cmd), " ")
+	a.bgMu.Lock()
+	defer a.bgMu.Unlock()
+	for _, id := range slices.Sorted(maps.Keys(a.bgJobs)) {
+		j := a.bgJobs[id]
+		if j.sid != sid {
+			continue
+		}
+		what := ""
+		if strings.Join(strings.Fields(j.cmdStr), " ") == same {
+			what = "this same command"
+		} else if i := slices.IndexFunc(writes, func(f string) bool { return slices.Contains(j.redirects, f) }); i >= 0 {
+			what = "a command that writes " + writes[i] + " too"
+		}
+		if what != "" {
+			return fmt.Sprintf("job %d `%s` (%s so far) is already running %s. A second copy would compete with it for the same files, and one result would overwrite the other. Its exit code and last output come to you when it exits; to start it again instead, %s first.",
+				j.id, truncate(j.cmdStr, 60), humanDuration(time.Since(j.started).Milliseconds()), what, stopHint(j.pid))
+		}
+	}
+	return ""
 }
 
 // sayRunningBgJobs names each job once, or a long-lived dev server would close
