@@ -426,7 +426,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
-	if err := a.runTurn(ctx, req.SessionId); err != nil {
+	if err := a.runTurn(ctx, req.SessionId, true); err != nil {
 		if isCancelled(err) {
 			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "err", err)
 			// codehalter sets no foreground deadline, so DeadlineExceeded is the client's.
@@ -512,11 +512,15 @@ func (a *agent) abortGate(ctx context.Context, sid string) error {
 	return errors.New(abort)
 }
 
-// runTurn is shared by typed prompts and accepted fix cards; the caller presents errors.
-func (a *agent) runTurn(ctx context.Context, sid string) error {
+// runTurn is shared by typed prompts and accepted fix cards; the caller presents errors. typed: the
+// user wrote the prompt, which the turn's Done line counts as an input.
+func (a *agent) runTurn(ctx context.Context, sid string, typed bool) error {
 	sess := a.getSession(sid)
 	if sess != nil {
 		sess.startTurn(time.Now())
+		if typed {
+			sess.addInput()
+		}
 		// The 400-recovery's first fold keeps this turn verbatim and folds only
 		// the completed turns before it.
 		sess.markTurnStart()
@@ -539,17 +543,27 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 		if size := int(a.mainSlotTokens.Load()); size > 0 && r.lastPrompt > 0 {
 			a.sendUpdate(ctx, sid, usageUpdate{Kind: "usage_update", Used: r.lastPrompt, Size: size})
 		}
-		var line string
+		// ◷ the turn's time, ⚙ the part spent in tools, ↑ the prompt the server had to read (not the
+		// gross total, which re-counts the cached prefix every call), ↓ generated, ≡ model replies, and
+		// ⌨ what the user typed or answered, shown only when there was some.
+		line := "\n\n✅ Done · ◷ " + humanDuration(r.activeMs)
+		if r.toolMs > 0 {
+			line += " · ⚙ " + humanDuration(min(r.toolMs, r.activeMs))
+		}
 		if r.haveServerCache {
-			// Not the gross prompt total: it re-counts the cached prefix every call.
-			line = fmt.Sprintf("\n\n✅ Done in %s · %s uncached + %s gen",
-				humanDuration(r.activeMs), humanCount(r.evaluatedPrompt), humanCount(r.completion))
-			if r.promptMs > 0 && r.evaluatedPrompt > 0 {
-				line += " · " + humanRate(r.evaluatedPrompt, r.promptMs) + " pp/s"
-			}
+			line += " · ↑ " + humanCount(r.evaluatedPrompt)
 		} else {
-			line = fmt.Sprintf("\n\n✅ Done in %s · %s ctx + %s gen",
-				humanDuration(r.activeMs), humanCount(r.lastPrompt), humanCount(r.completion))
+			line += " · ↑ " + humanCount(r.lastPrompt) + " ctx"
+		}
+		line += " · ↓ " + humanCount(r.completion)
+		if r.calls > 0 {
+			line += fmt.Sprintf(" · ≡ %d", r.calls)
+		}
+		if r.inputs > 0 {
+			line += fmt.Sprintf(" · ⌨ %d", r.inputs)
+		}
+		if r.haveServerCache && r.promptMs > 0 && r.evaluatedPrompt > 0 {
+			line += " · " + humanRate(r.evaluatedPrompt, r.promptMs) + " pp/s"
 		}
 		if r.genMs > 0 && r.completion > 0 {
 			line += " · " + humanRate(r.completion, r.genMs) + " tg/s"

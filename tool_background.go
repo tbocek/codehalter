@@ -305,6 +305,9 @@ func (a *agent) parkForJobs(ctx context.Context, sid string, since time.Time) (s
 	if items := sess.takePending(); len(items) > 0 {
 		return a.resumeWith(ctx, sid, items), nil
 	}
+	// The wait is the jobs' work, a suite in the background: the Done line counts it as tool time.
+	parked := time.Now()
+	defer func() { sess.addToolTime(time.Since(parked).Milliseconds()) }()
 	a.say(ctx, sid, "\n⏸ Waiting for "+a.parkableJobs(sid, since)+". This turn continues when it reports; type and Send Now to interject.\n")
 	for {
 		if items := sess.takePending(); len(items) > 0 {

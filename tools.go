@@ -325,6 +325,9 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		ImageID:     imageID,
 		SameImageAs: sameImage,
 	})
+	if sess := a.getSession(sid); sess != nil {
+		sess.addToolTime(tu.DurationMs)
+	}
 	if multimodal != nil {
 		return tu, multimodal
 	}

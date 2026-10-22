@@ -509,3 +509,49 @@ func TestPhaseStatus(t *testing.T) {
 		t.Errorf("after the phase: %q %v", c, meta)
 	}
 }
+
+// The Done line reads as the turn went: ◷ its time, ⚙ the part a tool took, ↑ and ↓ the tokens,
+// ≡ the model's replies, and ⌨ only when the user typed something: a typed prompt counts, a round
+// a /spec loop starts does not.
+func TestDoneLineShowsTimeToolsCallsAndInputs(t *testing.T) {
+	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do it"}]}`)
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":              "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":          "// the program\n",
+		".codehalter/DOCUMENT.md": "", // no document phase: the replies below are the whole turn
+	}, func(string) bool { return true },
+		plan, sseToolCall("s1", "slow_tool", `{}`), sseToolCall("r1", respondToolName, `{"message":"did it"}`),
+		plan, sseToolCall("r2", respondToolName, `{"message":"did it again"}`))
+	rig.h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "slow_tool", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			time.Sleep(1100 * time.Millisecond) // long enough to show as a second of tool time
+			return "done", false
+		}})
+	done := func(said string) string {
+		t.Helper()
+		i := strings.LastIndex(said, "✅ Done")
+		if i < 0 {
+			t.Fatalf("no Done line:\n%s", said)
+		}
+		line, _, _ := strings.Cut(said[i:], "\n")
+		return line
+	}
+
+	if _, err := rig.h.agent.Prompt(t.Context(), PromptRequest{SessionId: rig.h.sess.ID, Content: []ContentBlock{{Type: "text", Text: "do the thing"}}}); err != nil {
+		t.Fatal(err)
+	}
+	typed := done(rig.said(t))
+	for _, want := range []string{"✅ Done · ◷ ", " · ⚙ 1.", " · ↓ ", " · ≡ 3", " · ⌨ 1"} {
+		if !strings.Contains(typed, want) {
+			t.Errorf("typed turn: %q lacks %q", typed, want)
+		}
+	}
+
+	if err := rig.h.agent.runPromptTurn(t.Context(), rig.h.sess, "a round the loop wrote"); err != nil {
+		t.Fatal(err)
+	}
+	round := done(rig.said(t))
+	if strings.Contains(round, "⌨") || strings.Contains(round, "⚙") || !strings.Contains(round, " · ≡ 2") {
+		t.Errorf("a turn nobody typed and no tool ran: %q, want ≡ 2 and neither ⌨ nor ⚙", round)
+	}
+}

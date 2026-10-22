@@ -68,6 +68,7 @@ func (a *agent) askFormAuto(ctx context.Context, sid string, tcId, question stri
 	defer func() {
 		if sess := a.getSession(sid); sess != nil {
 			sess.addHumanWait(time.Since(start))
+			sess.addInput()
 		}
 	}()
 
@@ -243,6 +244,7 @@ func (a *agent) doPermissionRequest(ctx context.Context, r permissionRequest) (s
 	defer func() {
 		if sess := a.getSession(r.SessionId); sess != nil {
 			sess.addHumanWait(time.Since(start))
+			sess.addInput()
 		}
 	}()
 	// Every caller is asking a question, which is what elicitation is for;

@@ -144,7 +144,7 @@ func (a *agent) sayPending(ctx context.Context, sid string, items []pendingInput
 func (a *agent) runPromptTurn(ctx context.Context, sess *Session, text string) error {
 	sess.AddUser(text)
 	sess.saveOrLog()
-	return a.runTurn(ctx, sess.ID)
+	return a.runTurn(ctx, sess.ID, false)
 }
 
 // stoppedIdle: the last turn was stopped with input still queued, which waits

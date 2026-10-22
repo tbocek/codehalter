@@ -206,6 +206,7 @@ func (s *Session) startTurn(start time.Time) {
 func (s *Session) addTurnTokens(prompt, completion, evaluated int) {
 	s.turnMu.Lock()
 	st := &s.turn.stats
+	st.calls++
 	st.completion += completion
 	if prompt > 0 {
 		st.lastPrompt = prompt
@@ -286,6 +287,21 @@ func (s *Session) addTurnTiming(promptMs, genMs int64) {
 	s.turnMu.Unlock()
 }
 
+// addToolTime counts a tool call's time, and a step's wait for the background jobs it started.
+func (s *Session) addToolTime(ms int64) {
+	s.turnMu.Lock()
+	s.turn.stats.toolMs += ms
+	s.turnMu.Unlock()
+}
+
+// addInput counts something the user typed or answered in this turn: a prompt, a message sent
+// during it, a question card.
+func (s *Session) addInput() {
+	s.turnMu.Lock()
+	s.turn.stats.inputs++
+	s.turnMu.Unlock()
+}
+
 func (s *Session) addHumanWait(d time.Duration) {
 	s.turnMu.Lock()
 	s.turn.humanWaitMs += d.Milliseconds()
@@ -307,6 +323,9 @@ type turnReport struct {
 	cacheRewindsRender int
 	// wastedCompletion is decode thrown away (cap hit, truncation); it is inside completion.
 	wastedCompletion int
+	calls            int   // model replies
+	toolMs           int64 // in tool calls and in waits for their background jobs
+	inputs           int   // what the user typed or answered during the turn
 }
 
 func (s *Session) turnStats() turnReport {
@@ -500,6 +519,7 @@ func (s *Session) addSteer(text string) {
 	s.rt.mu.Lock()
 	s.rt.pending = append(s.rt.pending, pendingInput{text: text})
 	s.rt.mu.Unlock()
+	s.addInput()
 }
 
 func (s *Session) addBgNote(n bgNote) {
