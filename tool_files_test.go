@@ -497,8 +497,8 @@ func TestEditFileByAnchors(t *testing.T) {
 	}
 }
 
-// A failing read does not stop the rest; reads past the cap are named as not
-// served.
+// A failing read does not stop the rest; a search goes beside the reads; reads past the cap
+// are named as not served.
 func TestReadFileSeveralReads(t *testing.T) {
 	a, s := newTestAgent(t)
 	path := filepath.Join(s.Cwd, "w.rs")
@@ -507,18 +507,19 @@ func TestReadFileSeveralReads(t *testing.T) {
 	}
 	var tc toolCall
 	tc.Function.Name = "read_file"
-	tc.Function.Arguments = fmt.Sprintf(`{"reads":[{"path":%q,"symbol":"b"},{"path":%q,"symbol":"nope"},{"path":%q,"line":1,"limit":1}]}`, path, path, path)
+	tc.Function.Arguments = fmt.Sprintf(`{"reads":[{"path":%q,"symbol":"b"},{"path":%q,"symbol":"nope"},{"path":%q,"line":1,"limit":1},{"search":"two()","context":0}]}`, path, path, path)
 	tu, _ := a.runToolCall(context.Background(), s.ID, tc)
 	out, failed := tu.Output, tu.Failed
 	if failed {
 		t.Fatalf("reads failed: %s", out)
 	}
-	for _, want := range []string{"=== read 1 of 3: " + path + " b ===", "two();", "=== read 2 of 3:", "no definition of `nope`", "=== read 3 of 3: " + path + " from line 1 ===", "fn a() {"} {
+	for _, want := range []string{"=== read 1 of 4: " + path + " b ===", "two();", "=== read 2 of 4:", "no definition of `nope`", "=== read 3 of 4: " + path + " from line 1 ===", "fn a() {",
+		"=== read 4 of 4: search \"two()\" in the project ===\nw.rs:6:    two();\n\n1 matches in 1 files."} {
 		if !strings.Contains(out, want) {
 			t.Errorf("reads output lacks %q:\n%s", want, out)
 		}
 	}
-	if strings.Index(out, "read 1 of 3") > strings.Index(out, "read 3 of 3") {
+	if strings.Index(out, "read 1 of 4") > strings.Index(out, "read 3 of 4") {
 		t.Error("reads out of order")
 	}
 	var many []string
@@ -607,6 +608,13 @@ func TestBatchHints(t *testing.T) {
 	got, told = call("edit_file", `{"path":"w.rs","start":"fn z(","end":"} // z","new_text":"fn z() {}"}`, false)
 	if !strings.Contains(got, `{"path": "w.rs", "edits": [{"new_text":"b","old_text":"a"}, {"end":"} // z","new_text":"fn z() {}","start":"fn z("}]}`) || !strings.Contains(told, "several edits to w.rs") {
 		t.Errorf("edit hint = %q / %q", got, told)
+	}
+
+	call("run_command", `{"command":"ls"}`, false)
+	call("search", `{"pattern":"fn load","path":"src"}`, false)
+	got, told = call("search", `{"pattern":"load(","glob":"*.rs","context":0}`, false)
+	if !strings.Contains(got, `{"reads": [{"path":"src","search":"fn load"}, {"glob":"*.rs","search":"load("}]}`) || !strings.Contains(told, "several searches go in one read_file call") {
+		t.Errorf("search hint = %q / %q", got, told)
 	}
 }
 

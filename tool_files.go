@@ -397,24 +397,28 @@ var fileTools = []Tool{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "read_file",
-			"description": fmt.Sprintf("Read files. Pick one form per call:\n(1) A line range, both ends inclusive, like `sed -n '120,179p'`: {\"path\": \"src/cut.rs\", \"start_line\": 120, \"end_line\": 179}.\n(2) One definition by name, the whole function, type, class or test, any language: {\"path\": \"src/ui/window.rs\", \"symbol\": \"cut_form_column\"}. Replaces `grep -n` then `sed -n`: one call, the whole block, its line range in the note.\n(3) A chunk from the top, or from `line`, of `limit` lines (default %d): {\"path\": \"src/cut.rs\"}.\n(4) SEVERAL at once, like several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"tests/zoom_widgets.rs\", \"start_line\": 1, \"end_line\": 40}]}, each under its own \"=== read N of M ===\" header. Two or three things to read: ONE call like this.\nAdd \"numbered\": true to any form for `N|text` lines.\nText comes back PLAIN, as in the file, so a snippet copies straight into edit_file's old_text; the note says which lines were served (\"showing lines 120-165\"). A partial read's note names the call for the next part. An end-of-file marker means you have the rest: do not re-read, except after editing the file.", readChunkLines),
+			"description": fmt.Sprintf("Read files. Pick one form per call:\n(1) A line range, both ends inclusive, like `sed -n '120,179p'`: {\"path\": \"src/cut.rs\", \"start_line\": 120, \"end_line\": 179}.\n(2) One definition by name, the whole function, type, class or test, any language: {\"path\": \"src/ui/window.rs\", \"symbol\": \"cut_form_column\"}. Replaces `grep -n` then `sed -n`: one call, the whole block, its line range in the note.\n(3) A chunk from the top, or from `line`, of `limit` lines (default %d): {\"path\": \"src/cut.rs\"}.\n(4) SEVERAL at once, like several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"tests/zoom_widgets.rs\", \"start_line\": 1, \"end_line\": 40}, {\"search\": \"wire_zoom(\", \"path\": \"src\"}]}, each under its own \"=== read N of M ===\" header. A {\"search\": ...} item is the search tool's call (with its path, glob, regex, context, ignore_case). Two or three things to read or find: ONE call like this.\nAdd \"numbered\": true to any form for `N|text` lines.\nText comes back PLAIN, as in the file, so a snippet copies straight into edit_file's old_text; the note says which lines were served (\"showing lines 120-165\"). A partial read's note names the call for the next part. An end-of-file marker means you have the rest: do not re-read, except after editing the file.", readChunkLines),
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"reads": map[string]any{
 						"type":        "array",
-						"description": fmt.Sprintf("SEVERAL reads in ONE call, instead of the fields below: each {path, symbol} or {path, start_line, end_line}. Up to %d.", maxReadsPerCall),
+						"description": fmt.Sprintf("SEVERAL reads and searches in ONE call, instead of the fields below: each {path, symbol}, {path, start_line, end_line} or {search, path, glob}. Up to %d.", maxReadsPerCall),
 						"items": map[string]any{
-							"type":     "object",
-							"required": []string{"path"},
+							"type": "object",
 							"properties": map[string]any{
-								"path":       map[string]any{"type": "string"},
-								"symbol":     map[string]any{"type": "string"},
-								"start_line": map[string]any{"type": "integer"},
-								"end_line":   map[string]any{"type": "integer"},
-								"line":       map[string]any{"type": "integer"},
-								"limit":      map[string]any{"type": "integer"},
-								"numbered":   map[string]any{"type": "boolean"},
+								"search":      map[string]any{"type": "string", "description": "Find this text instead of reading: the search tool's `pattern`, `path` being where to look."},
+								"regex":       map[string]any{"type": "boolean"},
+								"glob":        map[string]any{"type": "string"},
+								"context":     map[string]any{"type": "integer"},
+								"ignore_case": map[string]any{"type": "boolean"},
+								"path":        map[string]any{"type": "string"},
+								"symbol":      map[string]any{"type": "string"},
+								"start_line":  map[string]any{"type": "integer"},
+								"end_line":    map[string]any{"type": "integer"},
+								"line":        map[string]any{"type": "integer"},
+								"limit":       map[string]any{"type": "integer"},
+								"numbered":    map[string]any{"type": "boolean"},
 							},
 						},
 					},
@@ -435,7 +439,7 @@ var fileTools = []Tool{
 			return a.readTarget(ctx, sid, args)
 		}
 		if len(list) == 0 {
-			return "error: `reads` is empty. Give one or more reads, each {\"path\": ..., \"symbol\": ...} or {\"path\": ..., \"line\": N, \"limit\": M}.", true
+			return "error: `reads` is empty. Give one or more reads, each {\"path\": ..., \"symbol\": ...}, {\"path\": ..., \"line\": N, \"limit\": M} or {\"search\": ...}.", true
 		}
 		var b strings.Builder
 		failedAll := true
@@ -446,10 +450,30 @@ var fileTools = []Tool{
 			}
 			t, ok := item.(map[string]any)
 			if !ok {
-				fmt.Fprintf(&b, "=== read %d: not an object; each read is {\"path\": ..., \"symbol\" or \"line\"/\"limit\"} ===\n\n", i+1)
+				fmt.Fprintf(&b, "=== read %d: not an object; each read is {\"path\": ..., \"symbol\" or \"line\"/\"limit\"} or {\"search\": ...} ===\n\n", i+1)
 				continue
 			}
 			ta := toolArgs(t)
+			if pattern := ta.str("search"); pattern != "" {
+				// A search beside the reads: finding where a thing is used and reading its
+				// definition were a shell line of `grep -n ...; sed -n ...`.
+				sa := toolArgs{"pattern": pattern}
+				for k, v := range ta {
+					if k != "search" {
+						sa[k] = v
+					}
+				}
+				out, failed := a.search(ctx, sid, sa)
+				if !failed {
+					failedAll = false
+				}
+				where := ta.str("path")
+				if where == "" {
+					where = "the project"
+				}
+				fmt.Fprintf(&b, "=== read %d of %d: search %q in %s ===\n%s\n\n", i+1, len(list), pattern, where, strings.TrimRight(out, "\n"))
+				continue
+			}
 			out, failed := a.readTarget(ctx, sid, ta)
 			if !failed {
 				failedAll = false
@@ -1270,6 +1294,10 @@ func (s *Session) batchHint(name, args string, failed bool) (string, string) {
 		}
 		return batchNoteLead + "read_file in a row, and each is a model call. Independent reads go in ONE call, like several commands in one shell line; these two as one: {\"reads\": [" +
 			keep(before, "path", "symbol", "start_line", "end_line", "line", "limit") + ", " + keep(cur, "path", "symbol", "start_line", "end_line", "line", "limit") + "]}. Up to 8 per call.]", "💡 told the model: several reads go in one read_file call"
+	case "search":
+		cur["search"], before["search"] = cur["pattern"], before["pattern"] // a `reads` item names it so
+		return batchNoteLead + "search in a row, and each is a model call. Independent searches go in ONE read_file call, beside reads too; these two as one: {\"reads\": [" +
+			keep(before, "search", "path", "glob", "regex") + ", " + keep(cur, "search", "path", "glob", "regex") + "]}. Up to 8 per call.]", "💡 told the model: several searches go in one read_file call"
 	case "edit_file":
 		if cur.has("edits") || before.has("edits") || cur.str("path") != before.str("path") || cur.str("path") == "" {
 			return "", ""

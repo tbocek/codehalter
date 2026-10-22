@@ -11,9 +11,10 @@ Repo you don't already know (first turn here, or the request names files/command
 - Declared project task (just build, npm test, make) → run it through `run_command` (`just build`), rather than retyping what the recipe does: the recipe is where the project keeps its flags and env.
 - Project files go through the file tools, NEVER through the shell:
   - find: `search`, not grep, rg or find: `{"pattern": "fn wire_zoom", "glob": "*.rs"}`
-  - read: `read_file`, not cat, head, tail, sed -n or awk: lines `{"path": "src/cut.rs", "start_line": 120, "end_line": 179}`, a whole definition `{"path": "src/ui/window.rs", "symbol": "wire_zoom"}`, several at once `{"reads": [...]}`; `"numbered": true` adds line numbers
+  - read: `read_file`, not cat, head, tail, sed -n or awk: lines `{"path": "src/cut.rs", "start_line": 120, "end_line": 179}`, a whole definition `{"path": "src/ui/window.rs", "symbol": "wire_zoom"}`; `"numbered": true` adds line numbers
   - change: `edit_file`, not sed -i, awk or a script: `{"path": "src/cut.rs", "old_text": "let zoom = 1.0;", "new_text": "let zoom = ZOOM;"}`, a block with `start` and `end`, several changes with `edits`
   - create: `write_file`, not echo > or cat <<EOF
+  - several finds and reads: ONE `read_file` with `reads`, where a shell line would chain them (`grep -n ...; echo ===; sed -n ...`): `{"reads": [{"search": "fn temp_dir", "path": "tests"}, {"path": "tests/common/mod.rs", "symbol": "copy_fixture"}, {"path": "src/cut.rs", "start_line": 120, "end_line": 179}]}`
   The shell is for builds, tests, installs and git.
 - Looking at a picture (a snapshot, a spec image) → `screenshot` on the file; a close look at one part: `{"path": "shots/05-cut.png", "region": [0, 560, 1500, 260]}` in its pixels. Never crop with a script.
 - No long-running service: it dies with codehalter. No daemon.

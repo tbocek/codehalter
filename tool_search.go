@@ -30,7 +30,7 @@ var searchTool = Tool{Def: map[string]any{
 	"type": "function",
 	"function": map[string]any{
 		"name":        "search",
-		"description": "Find text in the project's files: each match with its file, line number and the lines around it, in one call. Use this, never grep, rg or find through run_command. Output is grep's: `path:LINE:text` for a match, `path-LINE-text` around it. Read further with read_file.",
+		"description": "Find text in the project's files: each match with its file, line number and the lines around it, in one call. Use this, never grep, rg or find through run_command. Output is grep's: `path:LINE:text` for a match, `path-LINE-text` around it. Read further with read_file. Several searches, or searches and reads, go in ONE read_file call: {\"reads\": [{\"search\": \"fn load\"}, {\"path\": \"src/cut.rs\", \"symbol\": \"load\"}]}.",
 		"parameters": map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -48,7 +48,11 @@ var searchTool = Tool{Def: map[string]any{
 }, Execute: searchExecute}
 
 func searchExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-	args := parseArgs(rawArgs)
+	return a.search(ctx, sid, parseArgs(rawArgs))
+}
+
+// search runs one search, for the tool and for a search in read_file's `reads`.
+func (a *agent) search(ctx context.Context, sid string, args toolArgs) (string, bool) {
 	pattern := args.str("pattern")
 	if pattern == "" {
 		return "error: `pattern` is required: the text to find.", true
