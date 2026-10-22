@@ -89,6 +89,9 @@ type specConfig struct {
 	// Flaky holds the failure of a suite that failed and then passed with nothing
 	// changed; the next item round is asked to make that test deterministic first.
 	Flaky string `toml:"flaky,omitempty"`
+	// Isolation lists what codehalter's test run wrote outside its own temporary directory;
+	// the next item round makes those tests isolated first.
+	Isolation string `toml:"isolation,omitempty"`
 }
 
 type specFinal struct {

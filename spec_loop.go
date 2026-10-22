@@ -182,10 +182,12 @@ type specRoundResult struct {
 	PicturesUnseen []string
 	// PicturesDiffer: codehalter's own render beside a spec picture, judged not to match by a fresh look.
 	PicturesDiffer []string
-	TurnErr        string
-	TestsPass      bool
-	TestTail       string
-	Covered        bool // a test names the item; for setup, any test source exists
+	// TestReview: what a fresh look at the round's test changes found (only the in-round check asks).
+	TestReview []string
+	TurnErr    string
+	TestsPass  bool
+	TestTail   string
+	Covered    bool // a test names the item; for setup, any test source exists
 	// Gates on what the round wrote: functions only tests reach, lint findings in
 	// its own lines, files grown past the size budget.
 	Unreachable []string
@@ -221,13 +223,13 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 		}
 	case r.Mode == specModeChange:
 		// The test for the OLD text still covers a changed item; the commit is the evidence of work.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.PicturesUnseen)+len(r.PicturesDiffer) == 0 &&
+		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.PicturesUnseen)+len(r.PicturesDiffer)+len(r.TestReview) == 0 &&
 			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, "", ""
 		}
 	default:
 		// A reopened item's old test still names it: like a change, it needs a commit.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen)+len(r.PicturesUnseen)+len(r.PicturesDiffer) == 0 && (r.Committed || !r.Redo) &&
+		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen)+len(r.PicturesUnseen)+len(r.PicturesDiffer)+len(r.TestReview) == 0 && (r.Committed || !r.Redo) &&
 			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, "", ""
 		}
@@ -248,6 +250,10 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 	if len(r.PicturesDiffer) > 0 && r.TurnErr == "" {
 		add("picture-differs", "codehalter rendered the screen itself and an independent look put it beside the spec's picture: the arrangement differs. "+strings.Join(r.PicturesDiffer, "; ")+
 			". Fix each in the program, the way a user sees the screen: changing only how the snapshot stages it fixes nothing")
+	}
+	if len(r.TestReview) > 0 && r.TurnErr == "" {
+		add("testreview", "an independent review of the tests this round wrote found: "+strings.Join(r.TestReview, "; ")+
+			". Narrow each test to a fact this item's text states, merge or remove the repeats, wait for the event instead of a guessed time, and keep every test in its own temporary directory, on port 0 and on the display it is given")
 	}
 	if r.TurnErr != "" {
 		add("error", "the round ended with an error: "+r.TurnErr)
@@ -429,6 +435,9 @@ type specWork struct {
 	Debt     specDebt // refactor: measured when the round was picked
 	// LintMissing: why the linter did not run last round, so this one installs it.
 	LintMissing string
+	// Isolation: what codehalter's test run wrote outside its temp dir (specConfig.Isolation);
+	// this round isolates those tests first.
+	Isolation string
 	// Flaky: a test failed and then passed unchanged (specConfig.Flaky); this round
 	// makes it deterministic first.
 	Flaky string
@@ -692,7 +701,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 
 		w.LintMissing = r.lintMissing
 		if w.Mode == specModeItem || w.Mode == specModeChange {
-			w.Flaky = cfg.Flaky
+			w.Flaky, w.Isolation = cfg.Flaky, cfg.Isolation
 		}
 		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, r.testCmd(), r.lintCmd())
 		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
@@ -1390,6 +1399,9 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 			if w.Flaky != "" && cfg.Flaky == w.Flaky {
 				cfg.Flaky = "" // the round that was asked to fix it is through
 			}
+			if w.Isolation != "" && cfg.Isolation == w.Isolation {
+				cfg.Isolation = ""
+			}
 			cfg.Refactored = nil
 			// The fingerprint below is taken without the answers, so their going is no change to the spec.
 			r.dropAnswers(ctx, item)
@@ -1452,7 +1464,21 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 		res.TestsPass = true
 		r.say(ctx, fmt.Sprintf("🧪 `%s` passed in the round, after its last change; not run again\n", cmd))
 	default:
-		res.TestsPass, res.TestTail = r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd)
+		// A fresh $TMPDIR for the run, and a look at what it wrote outside it: a test on a fixed
+		// path collides with itself run beside it, and the suite cannot go parallel.
+		var watch *writeWatch
+		var env []string
+		if fresh, err := os.MkdirTemp("", "codehalter-tests-"); err != nil {
+			slog.Debug("spec: no fresh TMPDIR for the test run", "err", err)
+		} else {
+			defer func() {
+				if err := os.RemoveAll(fresh); err != nil {
+					slog.Debug("spec: removing the test run's TMPDIR", "dir", fresh, "err", err)
+				}
+			}()
+			watch, env = watchWrites(r.sess.Cwd, fresh), []string{"TMPDIR=" + fresh}
+		}
+		res.TestsPass, res.TestTail = r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd, env...)
 		if err := ctx.Err(); err != nil {
 			return nil, "", err
 		}
@@ -1460,7 +1486,7 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 		// failure. Two such tests failed thirteen rounds that never touched them.
 		if !res.TestsPass {
 			r.say(ctx, "🧪 running the suite once more, unchanged, to tell a flaky test from a real failure\n")
-			again, againTail := r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd)
+			again, againTail := r.a.runSpecTests(ctx, r.sid, r.outAbs, cfg.OutDir, cmd, env...)
 			if err := ctx.Err(); err != nil {
 				return nil, "", err
 			}
@@ -1471,6 +1497,13 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 				res.TestsPass, res.TestTail = true, ""
 			} else {
 				res.TestTail = againTail
+			}
+		}
+		// Like a flaky test, no fault of this round's: the next item round isolates them first.
+		if watch != nil {
+			if strays := watch.strays(); len(strays) > 0 {
+				cfg.Isolation = strings.Join(strays, "\n")
+				r.say(ctx, "⚠ **Tests not isolated:** the test run wrote outside its own temporary directory: "+strings.Join(strays, ", ")+". This round is not held to it; the next item round makes those tests isolated first.\n")
 			}
 		}
 	}
@@ -1517,6 +1550,10 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 		coveredBy = specNamedIn(r.outAbs, item, ch.files())
 		res.Covered = coveredBy != ""
 	}
+	// Only the in-round check reviews the tests, so what it finds costs a turn, never an attempt.
+	if !runTests && ch.ok && res.TurnErr == "" && (w.Mode == specModeItem || w.Mode == specModeChange) {
+		res.TestReview = r.reviewTests(ctx, item, base, ch)
+	}
 	if ch.ok && res.TurnErr == "" {
 		r.gates(ctx, w, ch, res)
 	}
@@ -1548,6 +1585,10 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 		previous = "## Answered in the spec's " + specQuestionsFile + "\n\nThe user answered this item's question. The answer is spec: build to it.\n\n" + w.Answered
 	case w.Reason != "":
 		previous = "## The previous round on this item did not count\n\n" + w.Reason + "\n\nFix that first."
+	}
+	if w.Isolation != "" {
+		previous = strings.TrimSpace("## First: tests that are not isolated\n\ncodehalter ran the test command with a fresh `$TMPDIR`, and the run wrote these outside it:\n\n```\n" +
+			strings.ReplaceAll(w.Isolation, "```", "` ` `") + "\n```\n\nA test that writes a fixed path collides with the same test running beside it, so the suite cannot run its test files in parallel. Before this item, find the tests that write these and make each write only into its own temporary directory (the platform's temp-dir call, which follows `$TMPDIR`); where the program itself writes to a fixed place, the test passes it a directory of its own. Delete what the runs left behind.\n\n" + previous)
 	}
 	if w.Flaky != "" {
 		previous = strings.TrimSpace("## First: a flaky test\n\ncodehalter ran the test suite twice on the same code: it failed, then passed. A test that does that fails other rounds at random, which is no fault of theirs. Before this item, find that test and make it deterministic: it must not call a live server (use the project's loopback fakes) or read a status line that other parts of the program also write (assert the state the action itself changes). The usual cause is a wait that guesses: a fixed sleep, a fixed number of event-loop turns, or \"until nothing is pending\", which runs out before a timer, a thread or a child process is done on a busy machine. Replace it with a wait for the condition itself, against a deadline in wall-clock seconds, through the shared test module's wait helper. Fix any other test that waits the same way. The failure from the run that failed:\n\n```\n" +
@@ -1790,9 +1831,9 @@ func specOwnPictures(sl specSlice) []string {
 	return pics
 }
 
-// runSpecTests is codehalter's own check of a /spec round.
-func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd string) (bool, string) {
-	ok, tail, took := a.runCheckCommand(ctx, sid, outAbs, fmt.Sprintf("Checking: %s in %s/", cmd, outRel), cmd)
+// runSpecTests is codehalter's own check of a /spec round; env is added to the command's environment.
+func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd string, env ...string) (bool, string) {
+	ok, tail, took := a.runCheckCommand(ctx, sid, outAbs, fmt.Sprintf("Checking: %s in %s/", cmd, outRel), cmd, env...)
 	switch {
 	case ok:
 		a.say(ctx, sid, fmt.Sprintf("🧪 tests passed in %s\n", took))
@@ -1808,7 +1849,7 @@ func (a *agent) runSpecTests(ctx context.Context, sid, outAbs, outRel, cmd strin
 // shows as a card whose last lines follow the run: six minutes of a check that said nothing
 // looked like a stuck one. It returns whether the command passed, the tail of its output
 // with the exit status, and how long it took.
-func (a *agent) runCheckCommand(ctx context.Context, sid, dir, title, cmd string) (bool, string, string) {
+func (a *agent) runCheckCommand(ctx context.Context, sid, dir, title, cmd string, env ...string) (bool, string, string) {
 	tcId := a.StartToolCall(ctx, sid, title, "execute", nil)
 	tctx, cancel := context.WithTimeout(ctx, specTestTimeout)
 	defer cancel()
@@ -1818,6 +1859,9 @@ func (a *agent) runCheckCommand(ctx context.Context, sid, dir, title, cmd string
 	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-%d-job-0.pid", os.Getpid()))
 	c := exec.CommandContext(tctx, specShell(), "-lc", cmd+"\nexit $?", filepath.Base(pidPath))
 	c.Dir = dir
+	if len(env) > 0 {
+		c.Env = append(os.Environ(), env...)
+	}
 	ownProcessGroup(c) // cut short, it is stopped whole: the shell alone left cargo and Xvfb running
 	var buf lockedBuffer
 	c.Stdout, c.Stderr = &buf, &buf

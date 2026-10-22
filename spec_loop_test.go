@@ -593,6 +593,7 @@ func TestSpecRoundCheckFixesBeforeJudging(t *testing.T) {
 		write("w1", "app/src/lib.rs", "pub fn helper() {}\n"),
 		write("w2", "app/tests/f0_1.rs", "#[test]\nfn f0_1_does_the_thing() {}\n"),
 		sseToolCall("r1", respondToolName, `{"message":"built"}`),
+		sseText(`{"findings": []}`), // the in-round test review
 		sseToolCall("p2", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"delete helper"}]}`),
 		write("w3", "app/src/lib.rs", "// the program\n"),
 		sseToolCall("r2", respondToolName, `{"message":"deleted"}`),
@@ -606,8 +607,8 @@ func TestSpecRoundCheckFixesBeforeJudging(t *testing.T) {
 	if !strings.Contains(said, "Before this round counts: the program does not call these functions the round added: `helper`") {
 		t.Errorf("the in-round check did not report helper:\n%s", said)
 	}
-	if rig.mock.callCount() != 8 {
-		t.Errorf("model calls = %d, want 8 (the round, the fix turn, the completion check)", rig.mock.callCount())
+	if rig.mock.callCount() != 9 {
+		t.Errorf("model calls = %d, want 9 (the round, the test review, the fix turn, the completion check)", rig.mock.callCount())
 	}
 }
 
@@ -735,12 +736,13 @@ func TestSpecCompletionCheck(t *testing.T) {
 		write("w1", "app/src/lib.rs", "// sources left, context right\n"),
 		write("w2", "app/tests/screens.rs", "#[test]\nfn f0_1_prepare_sources_left() {}\n#[test]\nfn f0_2_cut() {}\n#[test]\nfn f0_3_help() {}\n"),
 		sseToolCall("r1", respondToolName, `{"message":"swapped"}`),
+		sseText(`{"findings": []}`), // the in-round test review
 		// Run 2 checks only the rebuilt item.
 		sseToolCall("c2", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F0.1: DONE"}`),
 	)
 	said := rig.run(t)
-	if rig.mock.callCount() != 5 {
-		t.Fatalf("run 1 model calls = %d, want 5 (one check round, then the rebuild)\n%s", rig.mock.callCount(), said)
+	if rig.mock.callCount() != 6 {
+		t.Fatalf("run 1 model calls = %d, want 6 (one check round, then the rebuild and its test review)\n%s", rig.mock.callCount(), said)
 	}
 	check := rig.request(0)
 	for _, want := range []string{"`F0.1` Prepare (`spec/01.md:3`); the spec pictures it: `spec/img/prepare.png`", "`F0.2` Cut", "`spec/img/cut.png`", "`F0.3` Help (`spec/01.md:15`)"} {
@@ -765,11 +767,11 @@ func TestSpecCompletionCheck(t *testing.T) {
 	}
 
 	said = rig.run(t)
-	if rig.mock.callCount() != 6 {
-		t.Fatalf("model calls after run 2 = %d, want 6 (one check of F0.1 alone)\n%s", rig.mock.callCount(), said)
+	if rig.mock.callCount() != 7 {
+		t.Fatalf("model calls after run 2 = %d, want 7 (one check of F0.1 alone)\n%s", rig.mock.callCount(), said)
 	}
 	// This run's check prompt, not the history before it.
-	req := rig.request(5)
+	req := rig.request(6)
 	again := req[strings.LastIndex(req, "# Completion check"):]
 	if !strings.Contains(again, "`F0.1` Prepare") || strings.Contains(again, "`F0.2` Cut") {
 		t.Errorf("run 2 should check only the rebuilt item:\n%s", again)
@@ -800,6 +802,7 @@ func TestSpecQuestionWaitsInTheSpecForItsAnswer(t *testing.T) {
 		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"side by side"}]}`),
 		write("w1", "app/tests/f2_2.rs", "#[test]\nfn f2_2_play_buttons_side_by_side() {}\n"),
 		sseToolCall("r1", respondToolName, `{"message":"built"}`),
+		sseText(`{"findings": []}`), // the in-round test review
 		sseToolCall("c1", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F2.2: DONE"}`),
 		sseToolCall("f2", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"README updated"}`),
 	)
@@ -834,8 +837,8 @@ func TestSpecQuestionWaitsInTheSpecForItsAnswer(t *testing.T) {
 		t.Fatal(err)
 	}
 	said = rig.run(t)
-	if rig.mock.callCount() != 8 {
-		t.Fatalf("model calls after run 2 = %d, want 8\n%s", rig.mock.callCount(), said)
+	if rig.mock.callCount() != 9 {
+		t.Fatalf("model calls after run 2 = %d, want 9\n%s", rig.mock.callCount(), said)
 	}
 	if round := rig.request(3); !strings.Contains(round, "Answered in the spec's QUESTIONS.md") || !strings.Contains(round, "1, side by side as the toolbar line says.") {
 		t.Errorf("the round lacks the answer:\n%s", round)
@@ -1128,9 +1131,11 @@ func TestSpecFlakyTestIsNotTheRoundsFault(t *testing.T) {
 		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do it"}]}`),
 		write("w1", "app/tests/f0_1.rs", "#[test]\nfn f0_1_does_it() {}\n"),
 		sseToolCall("r1", respondToolName, `{"message":"done"}`),
+		sseText(`{"findings": []}`), // the in-round test review
 		sseToolCall("p2", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do more"}]}`),
 		write("w2", "app/tests/f0_2.rs", "#[test]\nfn f0_2_does_more() {}\n"),
 		sseToolCall("r2", respondToolName, `{"message":"done"}`),
+		sseText(`{"findings": []}`),
 		sseToolCall("c1", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F0.1: DONE\nF0.2: DONE"}`),
 	)
 	// The suite fails its first run only, as a test that hangs on a timing would.
@@ -1148,7 +1153,7 @@ func TestSpecFlakyTestIsNotTheRoundsFault(t *testing.T) {
 	if !got.done("F0.1") || !got.done("F0.2") {
 		t.Errorf("F0.1 done=%v F0.2 done=%v, want both: the flaky test is no fault of theirs\n%s", got.done("F0.1"), got.done("F0.2"), said)
 	}
-	if round2 := rig.request(3); !strings.Contains(round2, "First: a flaky test") || !strings.Contains(round2, "and the status says so") {
+	if round2 := rig.request(4); !strings.Contains(round2, "First: a flaky test") || !strings.Contains(round2, "and the status says so") {
 		t.Errorf("the next round was not asked to fix the flaky test:\n%s", round2)
 	}
 	if got.Flaky != "" {
