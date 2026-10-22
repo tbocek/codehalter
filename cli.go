@@ -450,8 +450,51 @@ func (c *cliClient) readInput() {
 			}
 		}
 	}
-	var buf []rune
-	paste := false
+	// A line editor: buf is the line, cur the cursor in it, history the lines sent so far with
+	// hist the one shown (len(history) is the line being typed, kept in draft while browsing).
+	var buf, draft []rune
+	var history [][]rune
+	cur, hist, paste := 0, 0, false
+	insert := func(rs ...rune) {
+		buf = slices.Insert(buf, cur, rs...)
+		cur += len(rs)
+	}
+	recall := func(i int) {
+		if i < 0 || i > len(history) || i == hist {
+			return
+		}
+		if hist == len(history) {
+			draft = slices.Clone(buf)
+		}
+		hist = i
+		if i == len(history) {
+			buf = slices.Clone(draft)
+		} else {
+			buf = slices.Clone(history[i])
+		}
+		cur = len(buf)
+	}
+	// wordStart and wordEnd skip the spaces next to the cursor, then the word.
+	wordStart := func() int {
+		i := cur
+		for i > 0 && buf[i-1] == ' ' {
+			i--
+		}
+		for i > 0 && buf[i-1] != ' ' {
+			i--
+		}
+		return i
+	}
+	wordEnd := func() int {
+		i := cur
+		for i < len(buf) && buf[i] == ' ' {
+			i++
+		}
+		for i < len(buf) && buf[i] != ' ' {
+			i++
+		}
+		return i
+	}
 	for {
 		r, _, err := c.in.ReadRune()
 		if err != nil {
@@ -466,53 +509,86 @@ func (c *cliClient) readInput() {
 			}
 			next, _, _ := c.in.ReadRune()
 			var seq []rune
-			for next == '[' && c.in.Buffered() > 0 {
-				q, _, _ := c.in.ReadRune()
-				seq = append(seq, q)
-				if q >= 0x40 && q <= 0x7e {
-					break
+			switch {
+			case next == '[': // CSI: parameters, then one final byte
+				for c.in.Buffered() > 0 {
+					q, _, _ := c.in.ReadRune()
+					seq = append(seq, q)
+					if q >= 0x40 && q <= 0x7e {
+						break
+					}
 				}
-			}
-			if next == 'O' && c.in.Buffered() > 0 {
-				c.in.ReadRune()
+			case next == 'O' && c.in.Buffered() > 0: // SS3: what some terminals send for arrows, Home and End
+				q, _, _ := c.in.ReadRune()
+				seq = []rune{q}
 			}
 			switch string(seq) {
 			case "200~": // bracketed paste: its newlines are text, not Enter
 				paste = true
 			case "201~":
 				paste = false
+			case "D":
+				cur = max(cur-1, 0)
+			case "C":
+				cur = min(cur+1, len(buf))
+			case "1;5D", "1;3D": // Ctrl or Alt with Left: a word back
+				cur = wordStart()
+			case "1;5C", "1;3C":
+				cur = wordEnd()
+			case "H", "1~", "7~":
+				cur = 0
+			case "F", "4~", "8~":
+				cur = len(buf)
+			case "3~": // Delete
+				if cur < len(buf) {
+					buf = slices.Delete(buf, cur, cur+1)
+				}
+			case "A":
+				recall(hist - 1)
+			case "B":
+				recall(hist + 1)
+			default:
+				continue
 			}
-			continue
 		case (r == '\r' || r == '\n') && paste:
-			buf = append(buf, '\n')
+			insert('\n')
 		case r == '\r' || r == '\n':
-			c.inputs <- cliLine{text: strings.TrimSpace(string(buf))}
-			buf = buf[:0]
+			line := strings.TrimSpace(string(buf))
+			if line != "" && (len(history) == 0 || string(history[len(history)-1]) != line) {
+				history = append(history, []rune(line))
+			}
+			c.inputs <- cliLine{text: line}
+			buf, draft, cur, hist = buf[:0], nil, 0, len(history)
 		case r == 0x7f || r == 0x08: // backspace
-			if len(buf) > 0 {
-				buf = buf[:len(buf)-1]
+			if cur > 0 {
+				buf = slices.Delete(buf, cur-1, cur)
+				cur--
 			}
 		case r == 0x04: // Ctrl+D leaves on an empty line
 			if len(buf) == 0 {
 				c.inputs <- cliLine{err: io.EOF}
 				return
 			}
-		case r == 0x15: // Ctrl+U
-			buf = buf[:0]
-		case r == 0x17: // Ctrl+W
-			buf = []rune(strings.TrimRight(string(buf), " "))
-			if i := strings.LastIndexByte(string(buf), ' '); i >= 0 {
-				buf = []rune(string(buf)[:i+1])
-			} else {
-				buf = buf[:0]
-			}
+		case r == 0x01: // Ctrl+A
+			cur = 0
+		case r == 0x05: // Ctrl+E
+			cur = len(buf)
+		case r == 0x0b: // Ctrl+K: the rest of the line
+			buf = buf[:cur]
+		case r == 0x15: // Ctrl+U: the line up to the cursor
+			buf = slices.Delete(buf, 0, cur)
+			cur = 0
+		case r == 0x17: // Ctrl+W: the word before the cursor
+			start := wordStart()
+			buf = slices.Delete(buf, start, cur)
+			cur = start
 		case r == '\t':
-			buf = append(buf, ' ')
+			insert(' ')
 		case r < 0x20:
 		default:
-			buf = append(buf, r)
+			insert(r)
 		}
-		c.ui.SetInput(slices.Clone(buf))
+		c.ui.SetInput(slices.Clone(buf), cur)
 	}
 }
 

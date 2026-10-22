@@ -90,10 +90,13 @@ type cliUI struct {
 	held   []string
 
 	// inputOn: the terminal is in character mode (startInput) and the input row, inPrompt
-	// then what has been typed, is the live region's last row, the cursor at its end.
+	// then what has been typed, is the live region's last row, the cursor at inCur in inBuf;
+	// inCol is that cursor's column on the row as last drawn.
 	inputOn     bool
 	inPrompt    string
 	inBuf       []rune
+	inCur       int
+	inCol       int
 	cursorInRow bool
 }
 
@@ -166,11 +169,11 @@ func (u *cliUI) inputActive() bool {
 	return u.inputOn
 }
 
-// SetInput shows what is typed so far.
-func (u *cliUI) SetInput(buf []rune) {
+// SetInput shows what is typed so far, the cursor at index cur of buf.
+func (u *cliUI) SetInput(buf []rune, cur int) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.inBuf = buf
+	u.inBuf, u.inCur = buf, cur
 	u.drawLive()
 }
 
@@ -257,10 +260,10 @@ func (u *cliUI) drawLive() {
 	}
 	u.out.WriteString("\x1b[?7h")
 	if u.inputOn && len(lines) > 0 {
-		// Back to the end of the input row, where the typing shows.
+		// Back to the input row, at the cursor in what is typed.
 		u.out.WriteString("\x1b[1A\r")
-		if col := visibleLen(lines[len(lines)-1]); col > 0 {
-			fmt.Fprintf(u.out, "\x1b[%dC", col)
+		if u.inCol > 0 {
+			fmt.Fprintf(u.out, "\x1b[%dC", u.inCol)
 		}
 		u.cursorInRow = true
 	}
@@ -294,12 +297,20 @@ func (u *cliUI) liveLines() []string {
 		out = append(out, u.clip(u.statusLine()))
 	}
 	if u.inputOn {
-		// The tail of what is typed, so the cursor's end of it stays in view.
+		// A window of what is typed that keeps the cursor in view: as much before it as fits,
+		// then as much after it.
 		typed := []rune(strings.ReplaceAll(string(u.inBuf), "\n", "⏎"))
-		for room := max(u.cols-1-visibleLen(u.inPrompt), 8); visibleLen(string(typed)) > room; {
-			typed = typed[1:]
+		cur := min(max(u.inCur, 0), len(typed))
+		room := max(u.cols-1-visibleLen(u.inPrompt), 8)
+		start, end := 0, cur
+		for start < cur && visibleLen(string(typed[start:cur])) > room {
+			start++
 		}
-		out = append(out, u.style(u.inPrompt, ansiBold)+string(typed))
+		for end < len(typed) && visibleLen(string(typed[start:end+1])) <= room {
+			end++
+		}
+		u.inCol = visibleLen(u.inPrompt) + visibleLen(string(typed[start:cur]))
+		out = append(out, u.style(u.inPrompt, ansiBold)+string(typed[start:end]))
 	}
 
 	// A live region taller than the terminal would scroll its top row away and desync
@@ -794,7 +805,7 @@ func (u *cliUI) Submitted(text string) {
 		if text != "" {
 			u.emitLine(u.style(u.inPrompt, ansiBold) + strings.ReplaceAll(text, "\n", "\n  "))
 		}
-		u.inBuf, u.inPrompt = nil, "❯ "
+		u.inBuf, u.inCur, u.inPrompt = nil, 0, "❯ "
 		u.drawLive()
 		return
 	}

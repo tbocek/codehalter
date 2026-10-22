@@ -543,6 +543,30 @@ func TestOutputWaitsForAnOpenQuestion(t *testing.T) {
 	}
 }
 
+// The terminal's cursor stands where the line is being edited, and a line wider than the row
+// shows the part around the cursor: its start while the cursor is near it, its end at the end.
+func TestInputRowFollowsTheCursor(t *testing.T) {
+	u, buf := uiFor(true, 40, 24)
+	u.inputOn, u.inPrompt = true, "❯ "
+	u.Begin()
+	u.SetInput([]rune("hello world"), 5)
+	if out := buf.String(); !strings.HasSuffix(out, "\x1b[1A\r\x1b[7C") {
+		t.Errorf("cursor not at column 7 (prompt 2 + 5): %q", out[max(0, len(out)-20):])
+	}
+	long := []rune("start " + strings.Repeat("x", 60) + " finish")
+	u.SetInput(long, 3)
+	if row := u.liveLines()[len(u.liveLines())-1]; !strings.Contains(stripANSI(row), "❯ start") || strings.Contains(row, "finish") {
+		t.Errorf("cursor near the start, row = %q", stripANSI(row))
+	}
+	u.SetInput(long, len(long))
+	if row := u.liveLines()[len(u.liveLines())-1]; strings.Contains(row, "start") || !strings.HasSuffix(stripANSI(row), "finish") {
+		t.Errorf("cursor at the end, row = %q", stripANSI(row))
+	}
+	if u.inCol > u.cols-1 {
+		t.Errorf("cursor column %d is past the row (%d columns)", u.inCol, u.cols)
+	}
+}
+
 // The input row is the live region's last row with the cursor at its end: transcript lines
 // land above it, every redraw replaces it in place, and nothing typed is left behind.
 func TestInputRowStaysInPlace(t *testing.T) {
@@ -551,7 +575,7 @@ func TestInputRowStaysInPlace(t *testing.T) {
 	u.inputOn, u.inPrompt = true, "❯ "
 	u.Begin()
 	for _, typed := range []string{"s", "sp", "spe", "spec stop"} {
-		u.SetInput([]rune(typed))
+		u.SetInput([]rune(typed), len([]rune(typed)))
 		u.Tick()
 	}
 	u.Note("", "a line from the turn")

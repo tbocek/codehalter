@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -877,6 +878,40 @@ func TestResumeWithoutIDPicksFromTheList(t *testing.T) {
 
 // exit and quit leave, as in a shell, with or without the slash; a sentence that starts with
 // the word is a prompt.
+// The typed line is edited at a cursor: arrows (CSI and SS3), Home and End, Delete, a word
+// at a time, and Up and Down through the lines sent, the unsent line kept while browsing.
+func TestCLILineEditing(t *testing.T) {
+	const (
+		left, right, home, end = "\x1b[D", "\x1b[C", "\x1b[H", "\x1b[F"
+		up, down, del          = "\x1b[A", "\x1b[B", "\x1b[3~"
+	)
+	keys := strings.Join([]string{
+		"helo" + left + "l\r",                                // insert in the middle
+		"world" + home + "hello " + end + "!\r",              // Home and End, CSI
+		"b\x1bOHa\x1bOF\x1bOD\x1bOC" + "\r",                  // Home, End, Left and Right, SS3
+		"abc" + home + del + "\r",                            // Delete at the cursor
+		"alpha beta\x1b[1;5D" + "X\r",                        // a word back
+		"one two three" + strings.Repeat(left, 6) + "\x17\r", // Ctrl+W before the cursor
+		"\x1bOPf1 ignored\r",                                 // an unknown key is ignored
+		"dra" + up + up + down + down + "ft\r",               // browsing keeps the unsent line
+		up + "\r",                                            // Up sends the last line again
+	}, "")
+	c, _, _ := newCLIHarness(t, keys)
+	c.ui.inputOn = true
+	c.inputs = make(chan cliLine, 32)
+	c.readInput()
+	var got []string
+	for len(c.inputs) > 0 {
+		if l := <-c.inputs; l.err == nil {
+			got = append(got, l.text)
+		}
+	}
+	want := []string{"hello", "hello world!", "ab", "bc", "alpha Xbeta", "one  three", "f1 ignored", "draft", "draft"}
+	if !slices.Equal(got, want) {
+		t.Errorf("lines = %q\nwant    %q", got, want)
+	}
+}
+
 func TestCLIExitWordsLeave(t *testing.T) {
 	c := &cliClient{}
 	for _, line := range []string{"exit", "quit", " Exit ", "/quit", "/exit"} {
