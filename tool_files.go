@@ -434,7 +434,10 @@ var fileTools = []Tool{
 		},
 	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
 		args := parseArgs(rawArgs)
-		list, isList := args["reads"].([]any)
+		list, isList, cut := args.list("reads")
+		if cut != nil && !isList {
+			return "error: " + cut.Error() + ". Nothing was read: send `reads` as a JSON array.", true
+		}
 		if !isList {
 			return a.readTarget(ctx, sid, args)
 		}
@@ -489,6 +492,9 @@ var fileTools = []Tool{
 				}
 			}
 			fmt.Fprintf(&b, "=== read %d of %d: %s %s ===\n%s\n\n", i+1, len(list), ta.str("path"), what, strings.TrimRight(out, "\n"))
+		}
+		if cut != nil {
+			fmt.Fprintf(&b, "=== %s: those are served above; send the rest in the next call, `reads` as a JSON array ===\n", cut)
 		}
 		return strings.TrimRight(b.String(), "\n") + "\n", failedAll
 	}},
@@ -586,7 +592,11 @@ var fileTools = []Tool{
 		}
 		type editSpec struct{ oldText, start, end, newText string }
 		var edits []editSpec
-		if list, ok := args["edits"].([]any); ok {
+		list, isList, err := args.list("edits")
+		if err != nil {
+			return "error: " + err.Error() + ". Nothing was written: send `edits` as a JSON array.", true
+		}
+		if isList {
 			for i, item := range list {
 				m, ok := item.(map[string]any)
 				if !ok {

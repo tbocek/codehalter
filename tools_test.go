@@ -231,3 +231,53 @@ func TestToolCardsNameTheirTool(t *testing.T) {
 		t.Errorf("a card no tool opened names %v, want none", name)
 	}
 }
+
+// An argument the schema declares a list or an object but that came as a string holding one is
+// decoded before the tool runs, at any depth the schema describes; a string that is not exactly
+// the declared JSON, or where the schema allows text, stays a string; the history keeps the call
+// as the model sent it, and arguments with nothing to fit reach the tool byte for byte.
+func TestToolArgsFitTheirSchema(t *testing.T) {
+	a, sess := newTestAgent(t)
+	obj := func(props map[string]any) map[string]any {
+		return map[string]any{"type": "object", "properties": props}
+	}
+	list := func(items map[string]any) map[string]any { return map[string]any{"type": "array", "items": items} }
+	var got string
+	withTools(a, Tool{Def: map[string]any{"type": "function", "function": map[string]any{
+		"name": "plan_trip",
+		"parameters": obj(map[string]any{
+			"stops": list(obj(map[string]any{"name": map[string]any{"type": "string"}, "hours": list(map[string]any{"type": "integer"})})),
+			"meta":  obj(map[string]any{"tags": list(map[string]any{"type": "string"})}),
+			"note":  map[string]any{"type": "string"},
+			"any":   map[string]any{},
+			"maybe": map[string]any{"type": []any{"array", "string"}},
+		}),
+	}}, Execute: func(_ context.Context, _ *agent, _ string, args string) (string, bool) {
+		got = args
+		return "ok", false
+	}})
+	call := func(args string) string {
+		t.Helper()
+		var tc toolCall
+		tc.ID, tc.Function.Name, tc.Function.Arguments = "c", "plan_trip", args
+		if tu, _ := a.runToolCall(context.Background(), sess.ID, tc); tu.Input != args {
+			t.Errorf("the history holds %s, not the call as sent %s", tu.Input, args)
+		}
+		return got
+	}
+
+	sent := `{"stops": "[{\"name\": \"a\", \"hours\": \"[1, 2]\"}]", "meta": "{\"tags\": [\"x\"]}", "note": "[1, 2]", "any": "[3]", "maybe": "[4]"}`
+	if out := call(sent); out != `{"any":"[3]","maybe":"[4]","meta":{"tags":["x"]},"note":"[1, 2]","stops":[{"hours":[1,2],"name":"a"}]}` {
+		t.Errorf("fitted to\n%s", out)
+	}
+	for _, args := range []string{
+		`{"stops": "[{\"name\": \"a\"}, {\"name\":"}`, // cut off: the tool says what is wrong
+		`{"stops": "{\"name\": \"a\"}"}`,              // an object where a list is declared
+		`{"stops": "a", "note": "x"}`,
+		`{"note":  "spaced",   "stops": []}`,
+	} {
+		if out := call(args); out != args {
+			t.Errorf("%s reached the tool as %s", args, out)
+		}
+	}
+}

@@ -194,6 +194,100 @@ func parseArgs(rawArgs string) toolArgs {
 	return args
 }
 
+// fitArgs decodes an argument the tool's schema declares an array or an object but that came as a
+// string holding one: `"reads": "[{...}]"` for `"reads": [{...}]`. Models send that now and then,
+// and the tool then took a list for a missing field (read_file answered "is a directory"). Only a
+// string that decodes WHOLE to the declared type is replaced, at any depth the schema describes; a
+// string that is not one stays a string, so a value meant as text is never reinterpreted and a
+// tool can still say what is wrong with it. The arguments come back unchanged, byte for byte, when
+// nothing was replaced.
+func fitArgs(def map[string]any, raw string) string {
+	fn, _ := def["function"].(map[string]any)
+	schema, _ := fn["parameters"].(map[string]any)
+	var args map[string]any
+	if schema == nil || json.Unmarshal([]byte(raw), &args) != nil {
+		return raw
+	}
+	if !fitObject(schema, args) {
+		return raw
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return raw
+	}
+	return string(b)
+}
+
+// fitObject fits obj's properties to schema in place and says whether any was replaced.
+func fitObject(schema, obj map[string]any) bool {
+	props, _ := schema["properties"].(map[string]any)
+	changed := false
+	for key, v := range obj {
+		if p, ok := props[key].(map[string]any); ok {
+			if fitted, ok := fitValue(p, v); ok {
+				obj[key], changed = fitted, true
+			}
+		}
+	}
+	return changed
+}
+
+// fitValue returns v fitted to schema, and whether anything in it was replaced.
+func fitValue(schema map[string]any, v any) (any, bool) {
+	changed := false
+	if str, ok := v.(string); ok && !schemaAllows(schema, "string") {
+		var decoded any
+		if json.Unmarshal([]byte(str), &decoded) != nil {
+			return v, false
+		}
+		switch decoded.(type) {
+		case []any:
+			if !schemaAllows(schema, "array") {
+				return v, false
+			}
+		case map[string]any:
+			if !schemaAllows(schema, "object") {
+				return v, false
+			}
+		default:
+			return v, false
+		}
+		v, changed = decoded, true
+	}
+	switch t := v.(type) {
+	case []any:
+		if items, ok := schema["items"].(map[string]any); ok {
+			for i, item := range t {
+				if fitted, ok := fitValue(items, item); ok {
+					t[i], changed = fitted, true
+				}
+			}
+		}
+	case map[string]any:
+		if fitObject(schema, t) {
+			changed = true
+		}
+	}
+	return v, changed
+}
+
+// schemaAllows says whether schema's `type` (one name or a list of them) includes typ. A schema
+// with no type allows anything, so nothing in it is taken for JSON.
+func schemaAllows(schema map[string]any, typ string) bool {
+	switch t := schema["type"].(type) {
+	case string:
+		return t == typ
+	case []any:
+		for _, name := range t {
+			if name == typ {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
 // str does not stringify numbers or bools: for file-content keys a coerced value
 // would clobber the file, so callers pair it with wrongType.
 func (a toolArgs) str(key string) string {
@@ -220,6 +314,34 @@ func (a toolArgs) num(key string) (int, bool) {
 		return n, err == nil
 	}
 	return 0, false
+}
+
+// list returns key's array. A whole array sent as a string is decoded before any tool runs
+// (fitArgs); a string that reaches here is one cut short (`"reads": "[{...}, {...}, {\"path\":`,
+// seen in a /spec round). items then holds the whole objects before the cut and err says where it
+// was cut; the caller decides whether a part may be used.
+func (a toolArgs) list(key string) (items []any, isList bool, err error) {
+	switch v := a[key].(type) {
+	case []any:
+		return v, true, nil
+	case string:
+		dec := json.NewDecoder(strings.NewReader(v))
+		if t, err := dec.Token(); err != nil || t != json.Delim('[') {
+			return nil, false, fmt.Errorf("`%s` must be a JSON array, [{...}, {...}], not a string", key)
+		}
+		for dec.More() {
+			var item any
+			if dec.Decode(&item) != nil {
+				return items, len(items) > 0, fmt.Errorf("`%s` came as a string holding a list cut off after %d whole items", key, len(items))
+			}
+			items = append(items, item)
+		}
+		if t, err := dec.Token(); err != nil || t != json.Delim(']') {
+			return items, len(items) > 0, fmt.Errorf("`%s` came as a string holding a list cut off after %d whole items", key, len(items))
+		}
+		return items, true, nil
+	}
+	return nil, false, nil
 }
 
 func (a toolArgs) flag(key string) bool {
@@ -261,6 +383,15 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	slog.Info("runToolCall", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 	started := time.Now()
 	ctx = withToolName(ctx, tc.Function.Name)
+	// The tool runs on arguments fitted to its schema; the history keeps what the model sent, so
+	// the wire bytes of the call never change.
+	args := tc.Function.Arguments
+	if t, ok, _ := a.tools.lookup(tc.Function.Name); ok {
+		if fitted := fitArgs(t.Def, args); fitted != args {
+			slog.Debug("runToolCall: a string argument decoded to the JSON its schema declares", "tool", tc.Function.Name, "args", fitted)
+			args = fitted
+		}
+	}
 
 	// With image support, view_image and screenshot bypass the registry to
 	// return multimodal parts in the same turn; the registered tools are text only.
@@ -270,19 +401,19 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	var imageID, sameImage string
 	switch {
 	case tc.Function.Name == "view_image" && a.imagesSupported.Load():
-		text, parts, ferr := dispatchViewImage(a.getSession(sid), tc.Function.Arguments)
+		text, parts, ferr := dispatchViewImage(a.getSession(sid), args)
 		result, failed = text, ferr
 		if !ferr {
 			multimodal = parts
 		}
 	case tc.Function.Name == "screenshot" && a.imagesSupported.Load():
-		text, parts, id, ferr := dispatchScreenshot(ctx, a, sid, tc.Function.Arguments)
+		text, parts, id, ferr := dispatchScreenshot(ctx, a, sid, args)
 		result, failed = text, ferr
 		switch sess := a.getSession(sid); {
 		case ferr:
 		case sess != nil && sess.imageInView(id):
 			// The same pixels are already in view: a note, not a second copy.
-			result, sameImage = fmt.Sprintf("[This picture of %s is the same as %s, which is already in your view above, so it is not attached again: nothing on it changed since.]", parseArgs(tc.Function.Arguments).str("path"), id), id
+			result, sameImage = fmt.Sprintf("[This picture of %s is the same as %s, which is already in your view above, so it is not attached again: nothing on it changed since.]", parseArgs(args).str("path"), id), id
 		default:
 			multimodal, imageID = parts, id
 		}
@@ -290,7 +421,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		// Execute outside the registry lock: a slow tool must not block the MCP
 		// reconciler.
 		if t, ok, names := a.tools.lookup(tc.Function.Name); ok {
-			result, failed = t.Execute(ctx, a, sid, tc.Function.Arguments)
+			result, failed = t.Execute(ctx, a, sid, args)
 		} else {
 			result = fmt.Sprintf("unknown tool %q. Use only the tools provided to you; available tools: %s",
 				tc.Function.Name, strings.Join(names, ", "))
@@ -298,7 +429,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		// Attach the rendered screen: the executor rarely calls screenshot on
 		// its own.
 		if !failed && tc.Function.Name == "run_command" && a.imagesSupported.Load() {
-			switch text, parts, id, same := a.attachRenderedScreen(ctx, sid, tc.Function.Arguments, result, started); {
+			switch text, parts, id, same := a.attachRenderedScreen(ctx, sid, args, result, started); {
 			case id != "":
 				result, multimodal, imageID = text, parts, id
 			case same != "":
@@ -309,7 +440,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 
 	if multimodal == nil {
 		if sess := a.getSession(sid); sess != nil {
-			note, told := sess.batchHint(tc.Function.Name, tc.Function.Arguments, failed)
+			note, told := sess.batchHint(tc.Function.Name, args, failed)
 			if told != "" {
 				result += note
 				a.say(ctx, sid, told+"\n")
@@ -331,7 +462,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	if multimodal != nil {
 		return tu, multimodal
 	}
-	return tu, liveToolOutput(tc.Function.Name, tc.Function.Arguments, result)
+	return tu, liveToolOutput(tc.Function.Name, args, result)
 }
 
 // denyToolCall rejects without executing. Failed is for the record only; the

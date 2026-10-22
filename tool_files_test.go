@@ -498,7 +498,7 @@ func TestEditFileByAnchors(t *testing.T) {
 }
 
 // A failing read does not stop the rest; a search goes beside the reads; reads past the cap
-// are named as not served.
+// are named as not served; the list sent as a string is read.
 func TestReadFileSeveralReads(t *testing.T) {
 	a, s := newTestAgent(t)
 	path := filepath.Join(s.Cwd, "w.rs")
@@ -529,6 +529,20 @@ func TestReadFileSeveralReads(t *testing.T) {
 	tc.Function.Arguments = `{"reads":[` + strings.Join(many, ",") + `]}`
 	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !strings.Contains(tu.Output, "not served: at most") {
 		t.Errorf("the cap was not reported:\n%s", tu.Output)
+	}
+	// The list sent as a string holding its JSON is read as the list, not as a call without a path.
+	tc.Function.Arguments = fmt.Sprintf(`{"reads":%q}`, fmt.Sprintf(`[{"path":%q,"symbol":"b"}]`, path))
+	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); tu.Failed || !strings.Contains(tu.Output, "=== read 1 of 1: "+path+" b ===") {
+		t.Errorf("reads as a string:\n%s", tu.Output)
+	}
+	// One cut off inside an item serves the whole items before the cut and says where it was cut.
+	tc.Function.Arguments = fmt.Sprintf(`{"reads":%q}`, fmt.Sprintf(`[{"path":%q,"symbol":"b"}, {"path": "w.rs", "start_line":`, path))
+	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); tu.Failed || !strings.Contains(tu.Output, "two();") || !strings.Contains(tu.Output, "cut off after 1 whole items: those are served above") {
+		t.Errorf("reads as a cut string:\n%s", tu.Output)
+	}
+	tc.Function.Arguments = `{"reads":"[{\"path\": \"w.rs\", \"start_line\":"}`
+	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !tu.Failed || !strings.Contains(tu.Output, "Nothing was read") {
+		t.Errorf("reads as a string with no whole item:\n%s", tu.Output)
 	}
 }
 
@@ -562,6 +576,16 @@ func TestEditFileSeveralEdits(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(path); string(after) != string(got) {
 		t.Errorf("a failed list changed the file:\n%s", after)
+	}
+	// The list sent as a string holding its JSON is taken as the list; one cut off writes nothing,
+	// not even its whole edits: a list is all or none.
+	out, failed = edit(fmt.Sprintf(`{"path":%q,"edits":%q}`, path, `[{"old_text":"let zoom = ZOOM;","new_text":"let zoom = 3.0;"}]`))
+	if after, _ := os.ReadFile(path); failed || !strings.Contains(string(after), "let zoom = 3.0;") {
+		t.Errorf("edits as a string = %v %s\n%s", failed, out, after)
+	}
+	out, failed = edit(fmt.Sprintf(`{"path":%q,"edits":%q}`, path, `[{"old_text":"let zoom = 3.0;","new_text":"let zoom = 4.0;"}, {"old_text": "let zoom`))
+	if after, _ := os.ReadFile(path); !failed || !strings.Contains(out, "cut off after 1 whole items. Nothing was written") || !strings.Contains(string(after), "let zoom = 3.0;") {
+		t.Errorf("edits as a cut string = %v %s\n%s", failed, out, after)
 	}
 }
 
