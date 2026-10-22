@@ -247,7 +247,7 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 		{Role: "user", Content: "do it"},
 		{Role: "assistant", Content: "running", ToolUses: []ToolUse{
 			{ID: "tu_1", Name: "read_file", Input: `{"path":"x"}`, Output: "file content"},
-			{ID: "tu_2", Name: "search", Input: `{"q":"foo"}`, Output: long},
+			{ID: "tu_2", Name: "lookup", Input: `{"q":"foo"}`, Output: long},
 		}},
 		{Role: "user", Content: "thanks"},
 		{Role: "assistant", Content: "", ToolUses: []ToolUse{
@@ -276,7 +276,7 @@ func TestBuildLLMHistoryToolUseProtocolShape(t *testing.T) {
 		asst.ToolCalls[0].Function.Name != "read_file" || asst.ToolCalls[0].Function.Arguments != `{"path":"x"}` {
 		t.Errorf("ToolCalls[0] wrong: %+v", asst.ToolCalls[0])
 	}
-	if asst.ToolCalls[1].ID != "tu_2" || asst.ToolCalls[1].Function.Name != "search" {
+	if asst.ToolCalls[1].ID != "tu_2" || asst.ToolCalls[1].Function.Name != "lookup" {
 		t.Errorf("ToolCalls[1] wrong: %+v", asst.ToolCalls[1])
 	}
 

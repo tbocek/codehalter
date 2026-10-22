@@ -523,7 +523,7 @@ func newRepeatMemory() repeatMemory {
 }
 
 // readerTools cannot change the project.
-var readerTools = map[string]bool{"read_file": true, "continue_read": true, "screenshot": true, "view_image": true,
+var readerTools = map[string]bool{"read_file": true, "search": true, "continue_read": true, "screenshot": true, "view_image": true,
 	"web_search": true, "web_read": true, "ask_user": true, respondToolName: true, submitPlanToolName: true}
 
 // wroteFile: a refused or unmatched edit says otherwise.
@@ -534,7 +534,7 @@ func wroteFile(name, output string) bool {
 // isReadCall: the call looks something up and changes nothing.
 func isReadCall(name, args string) bool {
 	switch name {
-	case "read_file", "web_search", "web_read":
+	case "read_file", "search", "web_search", "web_read":
 		return true
 	case "run_command":
 		return onlyReads(parseArgs(args).str("command"))

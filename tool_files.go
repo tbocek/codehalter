@@ -318,7 +318,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 		} else {
 			out = clipUTF8(out, readByteBudget)
 			served = 1
-			byteNote = fmt.Sprintf("[line %d is longer than %d KB and was cut there. Find the part you need with `grep -n` through run_command.]", start, readByteBudget/1024)
+			byteNote = fmt.Sprintf("[line %d is longer than %d KB and was cut there. Find the part you need with `search` on this file.]", start, readByteBudget/1024)
 		}
 	}
 	end := start
@@ -339,7 +339,7 @@ func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines
 	case more:
 		note = fmt.Sprintf("[showing lines %d-%d, the file continues. "+
 			"MORE of it: read_file {\"path\": %q, \"start_line\": %d} returns the next %d lines. "+
-			"LESS of it: `grep -n -C5 -F '<what you are looking for>' %s` through run_command returns only the lines around each hit. "+
+			"LESS of it: search {\"pattern\": \"<what you are looking for>\", \"path\": %q} returns only the lines around each hit. "+
 			"Do NOT re-read the whole file.]", start, end, path, end+1, readChunkLines, path)
 	default:
 		note = fmt.Sprintf("[end of file: line %d is the last; you have the file through line %d, do not re-read]", end, end)

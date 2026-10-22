@@ -125,7 +125,7 @@ func (r *toolRegistry) seedLocked() {
 	// run_command/run_background/run_server come from discovery and MCP tools from the
 	// reconciler, both through add.
 	builtin := slices.Concat(fileTools, webTools, []Tool{
-		askUserTool, submitPlanTool, respondTool,
+		searchTool, askUserTool, submitPlanTool, respondTool,
 		screenshotTool, viewImageTool,
 	})
 	for _, t := range builtin {
@@ -463,7 +463,7 @@ func liveToolOutput(toolName, args, content string) string {
 		if onlyReads(parseArgs(args).str("command")) {
 			return clipMiddle(toolName, args, content, liveExemptCap, liveExemptCap/4)
 		}
-	case "read_file", "continue_read", "web_search", "web_read":
+	case "read_file", "search", "continue_read", "web_search", "web_read":
 		if len(content) <= liveExemptCap {
 			return content
 		}
@@ -508,6 +508,8 @@ func truncationHint(toolName, args string) string {
 		return "To see more: re-run it with the output narrowed by `grep <pattern>`, or redirect it to a file and read the part you need with read_file (a line range). Do not pipe to head or tail: the cap already keeps the start and the end. If re-running is slow or has side effects, redirect to a file the FIRST time."
 	case "web_search":
 		return "To see more: refine the query (fewer, more specific terms) and search again, then web_read the most promising result."
+	case "search":
+		return "To see more: narrow `pattern`, `path` or `glob`, or lower `context`, and search again."
 	default:
 		return "To see more: call the tool again with narrower arguments."
 	}
