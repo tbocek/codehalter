@@ -26,7 +26,7 @@ func TestSpecRoundPictureMustMatch(t *testing.T) {
 	pic := buf.String()
 	writeTree(t, sess.Cwd, map[string]string{
 		".gitignore":             ".codehalter/\n",
-		"spec/03-shell.md":       "# 03 Shell\n\n## 1. Screen\n\nThe window, the log under the page. ![window](img/03-window.png)\n",
+		"spec/03-shell.md":       "# 03 Shell\n\n## 1. Screen\n\nThe window, the log under the page. ![window](img/03-window.png)\n\n## 2. Run bar\n\nThe prototype's chain dropdown is gone in the rewrite.\n",
 		"spec/img/03-window.png": pic,
 		"render.png":             pic,
 		"rust/justfile":          "test:\n\ttrue\n\nsnapshot name:\n\tmkdir -p shots && cp ../render.png shots/{{name}}.png && cp ../render.png shots/{{name}}.page.png\n",
@@ -83,8 +83,9 @@ func TestSpecRoundPictureMustMatch(t *testing.T) {
 			images++
 		}
 	}
-	if images != 2 || !strings.Contains(parts[0].(map[string]any)["text"].(string), "The window, the log under the page.") {
-		t.Errorf("the check got %d images and prompt %v, want the picture, the render and the section", images, parts[0])
+	// The whole chapter: a window's picture also shows what other sections describe.
+	if text := parts[0].(map[string]any)["text"].(string); images != 2 || !strings.Contains(text, "The window, the log under the page.") || !strings.Contains(text, "chain dropdown is gone in the rewrite") {
+		t.Errorf("the check got %d images and prompt %v, want the picture, the render and the whole chapter", images, parts[0])
 	}
 
 	if !round("// v3, the fix\n") {

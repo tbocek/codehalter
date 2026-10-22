@@ -15,8 +15,8 @@ import (
 // specPictureTimeout bounds one look; the main model may think before it answers.
 const specPictureTimeout = 10 * time.Minute
 
-// specPictureSectionBytes caps the spec text sent with the two images.
-const specPictureSectionBytes = 24 * 1024
+// specPictureSpecBytes caps the spec text sent with the two images: a whole chapter fits.
+const specPictureSpecBytes = 64 * 1024
 
 type specPictureVerdict struct {
 	Verdict     string   `json:"verdict"`
@@ -39,7 +39,16 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string)
 	if conn == nil {
 		return nil
 	}
-	section := clipBytes(r.idx.slice(item, r.cfg.SpecDir).Text, specPictureSectionBytes)
+	// The item's whole chapter, not only its section: a window's picture shows parts other
+	// sections describe (the run bar, a sources list whose frame-size control the rewrite drops),
+	// and the check had listed those as missing with the sentence that drops them out of sight.
+	// A chapter over the cap keeps the item's own section whole and shortens the rest.
+	doc := r.idx.docs[r.idx.items[item].Doc]
+	section := strings.Join(doc.lines, "\n")
+	if len(section) > specPictureSpecBytes {
+		own := clipBytes(r.idx.slice(item, r.cfg.SpecDir).Text, specPictureSpecBytes/2)
+		section = own + "\n\n--- the rest of " + doc.rel + ", shortened:\n\n" + clipBytes(section, specPictureSpecBytes-len(own))
+	}
 	var differs []string
 	for _, pic := range pics {
 		stem := strings.TrimSuffix(filepath.Base(pic), filepath.Ext(pic))
