@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -13,6 +14,9 @@ import (
 
 // specStrayShown caps the paths named; the rest is a count.
 const specStrayShown = 20
+
+// xDisplayFileRe: an X server's lock file and its socket directory.
+var xDisplayFileRe = regexp.MustCompile(`^\.X\d+-lock$|^\.X11-unix$`)
 
 type fileStamp struct {
 	size int64
@@ -45,8 +49,9 @@ func (w *writeWatch) strays() []string {
 	}
 	tmp := filepath.Dir(w.fresh)
 	for name := range tmpNames(tmp) {
-		// codehalter's own pid and log files live there too.
-		if !w.tmpNames[name] && name != filepath.Base(w.fresh) && !strings.HasPrefix(name, "codehalter-") {
+		// codehalter's own pid and log files live there too, and so do the lock files of virtual
+		// displays a suite starts for its GUI tests: a display pool is no test writing a fixed path.
+		if !w.tmpNames[name] && name != filepath.Base(w.fresh) && !strings.HasPrefix(name, "codehalter-") && !xDisplayFileRe.MatchString(name) {
 			out = append(out, filepath.Join(tmp, name))
 		}
 	}
