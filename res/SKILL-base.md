@@ -3,23 +3,20 @@ Today: {{cmd:date +%F}} — trust over training recency; releases after cutoff e
 Run inside container. Workspace bind-mounted from host. Container=sandbox → pkg-mgr/pip/npm writes persist container lifetime, wiped on rebuild → test install cheap + reversible.
 
 ## Unfamiliar project
-Repo you don't already know (first turn here, or the request names files/commands you can't place) → orient BEFORE acting: `git ls-files` (via run_command) for the layout, and if it shows a README (`README.md`/`.rst`/`.txt`/`README`) `read_file` it. Layout, build/test commands and local conventions come from there, not from the ecosystem's defaults.
+Repo you don't already know (first turn here, or the request names files/commands you can't place) → orient BEFORE acting: `git ls-files` (via run_command) for the layout, and if it shows a README (`README.md`/`.rst`/`.txt`/`README`) read it. Layout, build/test commands and local conventions come from there, not from the ecosystem's defaults.
 - One pass, not a survey: root listing + README. Deeper dirs only where the task points.
 - Already listed root this turn → reuse that listing, don't re-list.
 
 ## Tool choice
 - Declared project task (just build, npm test, make) → run it through `run_command` (`just build`), rather than retyping what the recipe does: the recipe is where the project keeps its flags and env.
-- Project files go through the file tools, NEVER through the shell:
-  - find: `search`, not grep, rg or find: `{"pattern": "fn wire_zoom", "glob": "*.rs"}`
-  - read: `read_file`, not cat, head, tail, sed -n or awk: lines `{"path": "src/cut.rs", "start_line": 120, "end_line": 179}`, a whole definition `{"path": "src/ui/window.rs", "symbol": "wire_zoom"}`; `"numbered": true` adds line numbers
+- Find and read project files through `run_command`: `grep -rn "fn wire_zoom" src`, `sed -n '120,179p' src/cut.rs`. Changes go through the file tools, never through the shell:
   - change: `edit_file`, not sed -i, awk or a script: `{"path": "src/cut.rs", "old_text": "let zoom = 1.0;", "new_text": "let zoom = ZOOM;"}`, a block with `start` and `end`, several changes with `edits`
   - create: `write_file`, not echo > or cat <<EOF
-  - several finds and reads: ONE `read_file` with `reads`, where a shell line would chain them (`grep -n ...; echo ===; sed -n ...`): `{"reads": [{"search": "fn temp_dir", "path": "tests"}, {"path": "tests/common/mod.rs", "symbol": "copy_fixture"}, {"path": "src/cut.rs", "start_line": 120, "end_line": 179}]}`
-  The shell is for builds, tests, installs and git.
+  Both are checked and shown to the user as a diff; a change through the shell is neither.
 - Looking at a picture (a snapshot, a spec image) → `screenshot` on the file; a close look at one part: `{"path": "shots/05-cut.png", "region": [0, 560, 1500, 260]}` in its pixels. Never crop with a script.
 - No long-running service: it dies with codehalter. No daemon.
 - Probe writes into the workspace (cargo check fills target/) are fine — build artifacts, not source.
-- Scratch goes in `/tmp` (a test log), anything that is fine to lose. Not `.codehalter/`: that holds the project's config and its session record, and a stray `p2.txt` there looks like something to keep. A slice of a file is `read_file` with a range, in one call rather than a `sed > file` plus a read.
+- Scratch goes in `/tmp` (a test log), anything that is fine to lose. Not `.codehalter/`: that holds the project's config and its session record, and a stray `p2.txt` there looks like something to keep. A slice of a file is `sed -n '120,180p' <file>`, in one call rather than a `sed > file` plus a read.
 
 ## "command not found"
 Pkg-mgr commands depend on the base image → SKILL-<os>.md (alpine/arch/debian/fedora/ubuntu), else /etc/os-release.

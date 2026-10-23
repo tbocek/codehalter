@@ -24,7 +24,7 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_command",
-			"description": "ONLY for builds, tests, installs and git. NEVER for project files: find with `search` (not grep, rg, find), read with `read_file` (not cat, head, tail, sed -n, awk), change with `edit_file` (not sed -i, awk or a script), create with `write_file` (not echo > or cat <<EOF). Runs in this devcontainer and waits up to two minutes for the exit code and output. Still running then: it is NOT killed but goes on as a background job; you get its output so far, and its exit code and last output arrive by themselves before your next step. Nothing else to do: call `respond` saying you wait for it, which parks the turn until the job reports. Never `sleep` or poll for it. Known to take over two minutes: use `run_background`. Never ends (dev server, watcher, `npm run dev`): use `run_server`, and never a trailing `&` here (it would survive with no pid or log). The container is a throwaway sandbox: installs last until a rebuild, workspace writes are real and recoverable from git. Before proposing a Dockerfile change, run the same install here and verify it (`<tool> --version`, or the failing build again); propose the patch once that works. The exit code is in the output and title: `which <tool>` exiting 1 means the tool is missing. Output is capped keeping its START and END, so run commands raw: a pipe to `head`/`tail` throws away what the cap keeps, and errors come last. Use `grep` to filter for a match, not to trim length.",
+			"description": "Run a shell command: builds, tests, installs, git, and reading or searching project files (`grep -rn`, `sed -n '120,180p' <file>`). Change a file with `edit_file` (not sed -i, awk or a script) and create one with `write_file` (not echo > or cat <<EOF): those are checked and shown to the user as a diff. Runs in this devcontainer and waits up to two minutes for the exit code and output. Still running then: it is NOT killed but goes on as a background job; you get its output so far, and its exit code and last output arrive by themselves before your next step. Nothing else to do: call `respond` saying you wait for it, which parks the turn until the job reports. Never `sleep` or poll for it. Known to take over two minutes: use `run_background`. Never ends (dev server, watcher, `npm run dev`): use `run_server`, and never a trailing `&` here (it would survive with no pid or log). The container is a throwaway sandbox: installs last until a rebuild, workspace writes are real and recoverable from git. Before proposing a Dockerfile change, run the same install here and verify it (`<tool> --version`, or the failing build again); propose the patch once that works. The exit code is in the output and title: `which <tool>` exiting 1 means the tool is missing. Output is capped keeping its START and END, so run commands raw: a pipe to `head`/`tail` throws away what the cap keeps, and errors come last. Use `grep` to filter for a match, not to trim length.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
@@ -195,7 +195,7 @@ func unquoted(seg string) string {
 var awkWritesRe = regexp.MustCompile(`system\(|\bprintf?\b[^;}]*(?:>|\|)\s*"`)
 
 // onlyReads: every segment is a file read, a search or a print, and nothing is
-// written. Such a command is served like read_file, not clipped to head and tail.
+// written. Such a command is served whole up to liveExemptCap, not clipped to head and tail.
 func onlyReads(cmd string) bool {
 	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "`") || strings.Contains(cmd, "<<") {
 		return false
@@ -376,7 +376,7 @@ func scriptEditTarget(cmd string) (string, bool) {
 func wrongToolHint(args toolArgs) string {
 	switch {
 	case args.has("reads") || args.has("symbol") || (args.has("path") && (args.has("line") || args.has("limit"))):
-		return ": these arguments are read_file's. Call read_file with them, not run_command."
+		return ": these arguments read a file, and run_command takes a `command`: {\"command\": \"sed -n '120,180p' src/cut.rs\"}."
 	case args.has("edits") || args.has("old_text") || args.has("start"):
 		return ": these arguments are edit_file's. Call edit_file with them, not run_command."
 	}

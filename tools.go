@@ -125,7 +125,7 @@ func (r *toolRegistry) seedLocked() {
 	// run_command/run_background/run_server come from discovery and MCP tools from the
 	// reconciler, both through add.
 	builtin := slices.Concat(fileTools, webTools, []Tool{
-		searchTool, askUserTool, submitPlanTool, respondTool,
+		askUserTool, submitPlanTool, respondTool,
 		screenshotTool, viewImageTool,
 	})
 	for _, t := range builtin {
@@ -195,8 +195,8 @@ func parseArgs(rawArgs string) toolArgs {
 }
 
 // fitArgs decodes an argument the tool's schema declares an array or an object but that came as a
-// string holding one: `"reads": "[{...}]"` for `"reads": [{...}]`. Models send that now and then,
-// and the tool then took a list for a missing field (read_file answered "is a directory"). Only a
+// string holding one: `"edits": "[{...}]"` for `"edits": [{...}]`. Models send that now and then,
+// and a tool then took a list for a missing field (a read answered "is a directory"). Only a
 // string that decodes WHOLE to the declared type is replaced, at any depth the schema describes; a
 // string that is not one stays a string, so a value meant as text is never reinterpreted and a
 // tool can still say what is wrong with it. The arguments come back unchanged, byte for byte, when
@@ -314,34 +314,6 @@ func (a toolArgs) num(key string) (int, bool) {
 		return n, err == nil
 	}
 	return 0, false
-}
-
-// list returns key's array. A whole array sent as a string is decoded before any tool runs
-// (fitArgs); a string that reaches here is one cut short (`"reads": "[{...}, {...}, {\"path\":`,
-// seen in a /spec round). items then holds the whole objects before the cut and err says where it
-// was cut; the caller decides whether a part may be used.
-func (a toolArgs) list(key string) (items []any, isList bool, err error) {
-	switch v := a[key].(type) {
-	case []any:
-		return v, true, nil
-	case string:
-		dec := json.NewDecoder(strings.NewReader(v))
-		if t, err := dec.Token(); err != nil || t != json.Delim('[') {
-			return nil, false, fmt.Errorf("`%s` must be a JSON array, [{...}, {...}], not a string", key)
-		}
-		for dec.More() {
-			var item any
-			if dec.Decode(&item) != nil {
-				return items, len(items) > 0, fmt.Errorf("`%s` came as a string holding a list cut off after %d whole items", key, len(items))
-			}
-			items = append(items, item)
-		}
-		if t, err := dec.Token(); err != nil || t != json.Delim(']') {
-			return items, len(items) > 0, fmt.Errorf("`%s` came as a string holding a list cut off after %d whole items", key, len(items))
-		}
-		return items, true, nil
-	}
-	return nil, false, nil
 }
 
 func (a toolArgs) flag(key string) bool {
@@ -585,7 +557,8 @@ const (
 )
 
 // liveToolOutput is also how history.go re-renders stored outputs, so a replay
-// is byte-identical to the live wire. continue_read stays listed for old sessions.
+// is byte-identical to the live wire. read_file, search and continue_read stay listed
+// for old sessions, which hold their calls.
 func liveToolOutput(toolName, args, content string) string {
 	switch toolName {
 	case "run_command":
@@ -636,7 +609,7 @@ func truncationHint(toolName, args string) string {
 		}
 		return "To see more: call this tool again with offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched."
 	case "run_command":
-		return "To see more: re-run it with the output narrowed by `grep <pattern>`, or redirect it to a file and read the part you need with read_file (a line range). Do not pipe to head or tail: the cap already keeps the start and the end. If re-running is slow or has side effects, redirect to a file the FIRST time."
+		return "To see more: re-run it with the output narrowed by `grep <pattern>`, or redirect it to a file and read the part you need (`sed -n '120,180p' <file>`). Do not pipe to head or tail: the cap already keeps the start and the end. If re-running is slow or has side effects, redirect to a file the FIRST time."
 	case "web_search":
 		return "To see more: refine the query (fewer, more specific terms) and search again, then web_read the most promising result."
 	case "search":

@@ -351,7 +351,7 @@ func TestToolHints(t *testing.T) {
 func TestRunCommandNamesTheToolItWasMeantFor(t *testing.T) {
 	h := newTerminalHarness(t)
 	res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"reads":[{"path":"a.rs","line":1,"limit":5}]}`)
-	if !strings.Contains(res, "Call read_file with them") {
+	if !strings.Contains(res, "run_command takes a `command`") {
 		t.Errorf("reads sent to run_command = %q", res)
 	}
 	res, _ = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"path":"a.rs","old_text":"x","new_text":"y"}`)

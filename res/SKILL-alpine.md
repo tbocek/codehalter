@@ -7,7 +7,7 @@ User=non-root `dev`, sudo NOPASSWD. Write ops (add/del/update) need sudo. Read p
 - apk info <pkg> → version + desc.
 
 ## grep is BusyBox
-Project files are searched with `search`, never grep. In a pipe (`just test 2>&1 | grep FAILED`) grep is BusyBox: short options only (`-n -C3 -F -E -i -w -l`); `--include`, `--exclude-dir` and the other long ones print its usage.
+grep is BusyBox unless GNU grep is installed (`grep --version`): short options only (`-n -C3 -F -E -i -w -l`); `--include`, `--exclude-dir` and the other long ones print its usage.
 
 ## Search / install
 Order: 1) apk 2) upstream site / custom repo (below) 3) lang installer.

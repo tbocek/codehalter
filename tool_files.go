@@ -4,17 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 )
 
 // A NUL in the first binarySniffLen bytes marks a file binary (the git/grep
@@ -166,203 +163,6 @@ func lineSimilarity(a, b string) float64 {
 	return float64(p+s) / float64(max(len(a), len(b)))
 }
 
-// readByteBudget leaves room under liveExemptCap for the notes after a read, so
-// liveToolOutput never clips them off.
-const (
-	readChunkLines = 150
-	maxReadLines   = 5000
-	readByteBudget = liveExemptCap - 2*1024
-)
-
-const maxReadsPerCall = 8
-
-func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (string, bool) {
-	// The read tools models were trained on: Qwen Code's and Claude Code's (GLM) file_path
-	// with offset and limit; SWE-agent's and OpenHands' editor (DeepSeek, GLM) path with
-	// view_range (its [start, -1] reads on in chunks like an open range). Set on args so
-	// the caller's label sees them too.
-	if args.str("path") == "" && args.str("file_path") != "" {
-		args["path"] = args["file_path"]
-	}
-	if _, ok := args["line"]; !ok {
-		// Qwen Code counts offset from 0, Claude Code from 1: one line earlier and one
-		// more serves both, and the note says which lines came back.
-		if n, ok := args.num("offset"); ok && n >= 0 {
-			args["line"] = float64(max(n, 1))
-			if l, ok := args.num("limit"); ok && l > 0 && n > 0 {
-				args["limit"] = float64(l + 1)
-			}
-		}
-	}
-	path, err := a.resolvePath(sid, args.str("path"))
-	if err != nil {
-		return "error: " + err.Error(), false
-	}
-	if sym := strings.TrimSpace(args.str("symbol")); sym != "" {
-		content, err := fsRead(a, ctx, sid, path, nil, nil)
-		if err != nil {
-			return "error reading file: " + err.Error(), false
-		}
-		loc := locateSymbol(content, sym)
-		if loc.start == 0 {
-			msg := fmt.Sprintf("error: no definition of `%s` found in %s.", sym, path)
-			if len(loc.mentions) > 0 {
-				msg += fmt.Sprintf(" The name appears at lines %s; read one of those with line=, or pass the exact declared name.", joinInts(loc.mentions))
-			} else {
-				msg += " The name does not appear in this file at all; find the right file with `search` first."
-			}
-			return msg, true
-		}
-		tcId := a.StartToolCall(ctx, sid, fmt.Sprintf("Reading: %s (%s)", path, sym), "read", []ToolCallLocation{{Path: path, Line: &loc.start}})
-		out, failed := a.serveRead(ctx, sid, path, loc.start, min(loc.end-loc.start+1, maxReadLines), tcId, args.flag("numbered"))
-		head := fmt.Sprintf("[`%s`: lines %d-%d, block end found by %s", sym, loc.start, loc.end, loc.how)
-		if len(loc.others) > 0 {
-			head += fmt.Sprintf("; also declared at lines %s", joinInts(loc.others))
-		}
-		head += "]\n"
-		if sess := a.getSession(sid); sess != nil {
-			if note := symbolUses(ctx, sess.Cwd, path, loc); note != "" {
-				head += note + "\n"
-			}
-		}
-		return head + out, failed
-	}
-	start := 1
-	line, haveLine := args.num("line")
-	if haveLine && line > 0 {
-		start = line
-	}
-	maxLines := readChunkLines
-	if v, ok := args.num("limit"); ok && v > 0 {
-		maxLines = v
-	}
-	// start_line/end_line (the `sed -n '130,205p'` shape) and view_range (Qwen's
-	// own file tool) are both inclusive.
-	from, to := 0, 0
-	if n, ok := args.num("start_line"); ok {
-		from = n
-		if m, ok := args.num("end_line"); ok {
-			to = m
-		}
-	}
-	if vr, ok := args["view_range"].([]any); ok && len(vr) == 2 {
-		ta := toolArgs{"a": vr[0], "b": vr[1]}
-		from, _ = ta.num("a")
-		to, _ = ta.num("b")
-	}
-	if from > 0 {
-		start, line, haveLine = from, from, true
-		if to >= from {
-			maxLines = to - from + 1
-		}
-	}
-	maxLines = min(maxLines, maxReadLines)
-	title := "Reading: " + path
-	if haveLine {
-		title = fmt.Sprintf("Reading: %s:%d", path, line)
-	}
-	tcId := a.StartToolCall(ctx, sid, title, "read", []ToolCallLocation{{Path: path}})
-	return a.serveRead(ctx, sid, path, start, maxLines, tcId, args.flag("numbered"))
-}
-
-func numberLines(content string, start int) string {
-	lines := strings.SplitAfter(content, "\n")
-	var b strings.Builder
-	for i, ln := range lines {
-		if ln == "" {
-			continue
-		}
-		fmt.Fprintf(&b, "%d|%s", start+i, ln)
-	}
-	return b.String()
-}
-
-// serveRead's output stays under readByteBudget plus its notes, so it is exactly
-// what the model sees. tcId is an already-started tool-call card.
-func (a *agent) serveRead(ctx context.Context, sid, path string, start, maxLines int, tcId string, numbered bool) (string, bool) {
-	sess := a.getSession(sid)
-
-	// One line past the window tells whether the file continues.
-	fetch := maxLines + 1
-	content, err := fsRead(a, ctx, sid, path, &start, &fetch)
-	if err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return "error: " + err.Error(), false
-	}
-	if looksBinary([]byte(content)) {
-		msg := fmt.Sprintf("%s is a binary file (NUL bytes), not shown. Reading it as text would corrupt the context. Use a shell tool to inspect its bytes if you must.", path)
-		a.CompleteToolCallTitled(ctx, sid, tcId, "Read (binary, skipped): "+path, []ToolCallContent{TextContent(msg)})
-		return msg, false
-	}
-
-	served := strings.Count(content, "\n")
-	if content != "" && !strings.HasSuffix(content, "\n") {
-		served++
-	}
-	more := served > maxLines
-	if more {
-		content = strings.Join(strings.SplitAfter(content, "\n")[:maxLines], "")
-		served = maxLines
-	}
-	out := content
-	if numbered {
-		out = numberLines(content, start)
-	}
-	byteNote := ""
-	if len(out) > readByteBudget {
-		more = true
-		if cut := strings.LastIndexByte(out[:readByteBudget], '\n'); cut >= 0 {
-			out = out[:cut+1]
-			served = strings.Count(out, "\n")
-			byteNote = fmt.Sprintf("[stopped at %d KB, the most one read returns.]", readByteBudget/1024)
-		} else {
-			out = clipUTF8(out, readByteBudget)
-			served = 1
-			byteNote = fmt.Sprintf("[line %d is longer than %d KB and was cut there. Find the part you need with `search` on this file.]", start, readByteBudget/1024)
-		}
-	}
-	end := start
-	if served > 0 {
-		end = start + served - 1
-	}
-
-	// A window from line 1 that ran out of file IS the whole file. fsRead checks
-	// only unwindowed reads, and every read_file is windowed.
-	if sess != nil && start == 1 && !more {
-		sess.checkExternalChange(path, content)
-	}
-
-	var note string
-	switch {
-	case content == "":
-		note = "[file is empty or past end of file]"
-	case more:
-		note = fmt.Sprintf("[showing lines %d-%d, the file continues. "+
-			"MORE of it: read_file {\"path\": %q, \"start_line\": %d} returns the next %d lines. "+
-			"LESS of it: search {\"pattern\": \"<what you are looking for>\", \"path\": %q} returns only the lines around each hit. "+
-			"Do NOT re-read the whole file.]", start, end, path, end+1, readChunkLines, path)
-	default:
-		note = fmt.Sprintf("[end of file: line %d is the last; you have the file through line %d, do not re-read]", end, end)
-	}
-
-	if byteNote != "" {
-		out += "\n" + byteNote
-	}
-	out += "\n" + note
-	if sess != nil {
-		out += sess.takeDriftNote(path)
-	}
-
-	title := fmt.Sprintf("Reading: %s (%d-%d)", path, start, end)
-	if more {
-		title += " (partial)"
-	} else {
-		title += " (complete)"
-	}
-	a.CompleteToolCallTitled(ctx, sid, tcId, title, []ToolCallContent{TextContent(out)})
-	return out, false
-}
-
 // hasProjectFiles applies skipWalkDir only below root, so a hidden root counts.
 func hasProjectFiles(root string, n int) bool {
 	files := 0
@@ -393,112 +193,6 @@ func hasProjectFiles(root string, n int) bool {
 }
 
 var fileTools = []Tool{
-	{Def: map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name":        "read_file",
-			"description": fmt.Sprintf("Read files. Pick one form per call:\n(1) A line range, both ends inclusive, like `sed -n '120,179p'`: {\"path\": \"src/cut.rs\", \"start_line\": 120, \"end_line\": 179}.\n(2) One definition by name, the whole function, type, class or test, any language: {\"path\": \"src/ui/window.rs\", \"symbol\": \"cut_form_column\"}. Replaces `grep -n` then `sed -n`: one call, the whole block, its line range in the note.\n(3) A chunk from the top, or from `line`, of `limit` lines (default %d): {\"path\": \"src/cut.rs\"}.\n(4) SEVERAL at once, like several commands in one shell line: {\"reads\": [{\"path\": \"src/ui/window.rs\", \"symbol\": \"wire_zoom\"}, {\"path\": \"tests/zoom_widgets.rs\", \"start_line\": 1, \"end_line\": 40}, {\"search\": \"wire_zoom(\", \"path\": \"src\"}]}, each under its own \"=== read N of M ===\" header. A {\"search\": ...} item is the search tool's call (with its path, glob, regex, context, ignore_case). Two or three things to read or find: ONE call like this.\nAdd \"numbered\": true to any form for `N|text` lines.\nText comes back PLAIN, as in the file, so a snippet copies straight into edit_file's old_text; the note says which lines were served (\"showing lines 120-165\"). A partial read's note names the call for the next part. An end-of-file marker means you have the rest: do not re-read, except after editing the file.", readChunkLines),
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"reads": map[string]any{
-						"type":        "array",
-						"description": fmt.Sprintf("SEVERAL reads and searches in ONE call, instead of the fields below: each {path, symbol}, {path, start_line, end_line} or {search, path, glob}. Up to %d.", maxReadsPerCall),
-						"items": map[string]any{
-							"type": "object",
-							"properties": map[string]any{
-								"search":      map[string]any{"type": "string", "description": "Find this text instead of reading: the search tool's `pattern`, `path` being where to look."},
-								"regex":       map[string]any{"type": "boolean"},
-								"glob":        map[string]any{"type": "string"},
-								"context":     map[string]any{"type": "integer"},
-								"ignore_case": map[string]any{"type": "boolean"},
-								"path":        map[string]any{"type": "string"},
-								"symbol":      map[string]any{"type": "string"},
-								"start_line":  map[string]any{"type": "integer"},
-								"end_line":    map[string]any{"type": "integer"},
-								"line":        map[string]any{"type": "integer"},
-								"limit":       map[string]any{"type": "integer"},
-								"numbered":    map[string]any{"type": "boolean"},
-							},
-						},
-					},
-					"path":       map[string]any{"type": "string", "description": "Absolute or project-relative. `workspaces/foo` (no leading slash) is also tried as `/workspaces/foo`."},
-					"start_line": map[string]any{"type": "integer", "description": "First line, 1-based; with end_line the last, both inclusive: `sed -n '130,205p'` is 130 to 205."},
-					"end_line":   map[string]any{"type": "integer", "description": "Last line, inclusive."},
-					"line":       map[string]any{"type": "integer", "description": "1-based start line; omit to read from the top."},
-					"limit":      map[string]any{"type": "integer", "description": fmt.Sprintf("Max lines to read (hard cap %d). Omit for the default %d-line chunk; a partial read's note names the call for the next part.", maxReadLines, readChunkLines)},
-					"numbered":   map[string]any{"type": "boolean", "description": "true: every line comes back as `N|text` with its line number, like `awk '{printf \"%d|%s\\n\", NR, $0}'`. Works with line windows, symbol and each item of reads. For edit_file's old_text copy the text without the `N|` (edit_file strips it if you do not)."},
-					"symbol":     map[string]any{"type": "string", "description": "Read one definition instead of a line range: a function, method, type, class, trait or impl by name (`cut_form_column`, or `fn cut_form_column`). Any language: the block ends where its braces close, or where the indentation returns (Python), or after 50 lines when neither can be found (broken code). Comments and attributes directly above it come along. Replaces grep -n followed by a sed range: one call, the whole definition, its line range in the note."},
-				},
-			},
-		},
-	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-		args := parseArgs(rawArgs)
-		list, isList, cut := args.list("reads")
-		if cut != nil && !isList {
-			return "error: " + cut.Error() + ". Nothing was read: send `reads` as a JSON array.", true
-		}
-		if !isList {
-			return a.readTarget(ctx, sid, args)
-		}
-		if len(list) == 0 {
-			return "error: `reads` is empty. Give one or more reads, each {\"path\": ..., \"symbol\": ...}, {\"path\": ..., \"line\": N, \"limit\": M} or {\"search\": ...}.", true
-		}
-		var b strings.Builder
-		failedAll := true
-		for i, item := range list {
-			if i == maxReadsPerCall {
-				fmt.Fprintf(&b, "=== reads %d-%d not served: at most %d per call; ask for them in the next call ===\n", i+1, len(list), maxReadsPerCall)
-				break
-			}
-			t, ok := item.(map[string]any)
-			if !ok {
-				fmt.Fprintf(&b, "=== read %d: not an object; each read is {\"path\": ..., \"symbol\" or \"line\"/\"limit\"} or {\"search\": ...} ===\n\n", i+1)
-				continue
-			}
-			ta := toolArgs(t)
-			if pattern := ta.str("search"); pattern != "" {
-				// A search beside the reads: finding where a thing is used and reading its
-				// definition were a shell line of `grep -n ...; sed -n ...`.
-				sa := toolArgs{"pattern": pattern}
-				for k, v := range ta {
-					if k != "search" {
-						sa[k] = v
-					}
-				}
-				out, failed := a.search(ctx, sid, sa)
-				if !failed {
-					failedAll = false
-				}
-				where := ta.str("path")
-				if where == "" {
-					where = "the project"
-				}
-				fmt.Fprintf(&b, "=== read %d of %d: search %q in %s ===\n%s\n\n", i+1, len(list), pattern, where, strings.TrimRight(out, "\n"))
-				continue
-			}
-			out, failed := a.readTarget(ctx, sid, ta)
-			if !failed {
-				failedAll = false
-			}
-			what := ta.str("symbol")
-			if what == "" {
-				if n, ok := ta.num("start_line"); ok {
-					what = fmt.Sprintf("from line %d", n)
-				} else if l, ok := ta.num("line"); ok {
-					what = fmt.Sprintf("from line %d", l)
-				} else {
-					what = "from the top"
-				}
-			}
-			fmt.Fprintf(&b, "=== read %d of %d: %s %s ===\n%s\n\n", i+1, len(list), ta.str("path"), what, strings.TrimRight(out, "\n"))
-		}
-		if cut != nil {
-			fmt.Fprintf(&b, "=== %s: those are served above; send the rest in the next call, `reads` as a JSON array ===\n", cut)
-		}
-		return strings.TrimRight(b.String(), "\n") + "\n", failedAll
-	}},
-
 	{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
@@ -592,11 +286,12 @@ var fileTools = []Tool{
 		}
 		type editSpec struct{ oldText, start, end, newText string }
 		var edits []editSpec
-		list, isList, err := args.list("edits")
-		if err != nil {
-			return "error: " + err.Error() + ". Nothing was written: send `edits` as a JSON array.", true
+		// A whole list sent as a string is decoded before the tool runs (fitArgs): one still a string
+		// here was cut off, and a list of edits is all or none.
+		if _, cut := args["edits"].(string); cut {
+			return "error: `edits` came as a string holding a list that is cut off. Nothing was written: send `edits` as a JSON array.", true
 		}
-		if isList {
+		if list, ok := args["edits"].([]any); ok {
 			for i, item := range list {
 				m, ok := item.(map[string]any)
 				if !ok {
@@ -676,173 +371,6 @@ func (a *agent) commitWrite(ctx context.Context, sid, tcId, path, old, next, dri
 	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{DiffContent(path, &old, next)})
 	return "", false
-}
-
-// start includes leading comments and attributes; mentions is set only when no
-// declaration was found. name is the bare declared name; function says its
-// declaration keyword is a function's (fn, func, def, function).
-type symbolLoc struct {
-	start, end int
-	how        string
-	others     []int
-	mentions   []int
-	name       string
-	function   bool
-}
-
-const symbolFallbackLines = 50
-
-// declKeywordRe matches a declaration keyword, then an optional Go receiver or
-// Rust generics, right before the name.
-var declKeywordRe = regexp.MustCompile(`(?:^|[\s(])(?:fn|func|def|class|struct|enum|trait|impl|interface|type|mod|module|macro_rules!|function|union|record|object|protocol|extension|let|const|var|val)\s+(?:\([^)]*\)\s*)?(?:<[^>]*>\s*)?`)
-
-// fnKeywordRe: the text before a declared name ends in a function's keyword.
-var fnKeywordRe = regexp.MustCompile(`(?:^|[\s(])(?:fn|func|def|function)\s+(?:\([^)]*\)\s*)?(?:<[^>]*>\s*)?$`)
-
-func locateSymbol(content, symbol string) symbolLoc {
-	name := symbol
-	if f := strings.Fields(strings.TrimRight(strings.TrimSpace(symbol), "(){}:")); len(f) > 0 {
-		name = f[len(f)-1]
-	}
-	name = strings.TrimRight(name, "(){}:")
-	lines := strings.Split(content, "\n")
-	nameRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(name) + `\b`)
-	loc := symbolLoc{name: name}
-	var decls []int
-	for i, ln := range lines {
-		idx := nameRe.FindStringIndex(ln)
-		if idx == nil {
-			continue
-		}
-		before := ln[:idx[0]]
-		if m := declKeywordRe.FindAllStringIndex(before+" ", -1); len(m) > 0 && m[len(m)-1][1] >= len(before) {
-			decls = append(decls, i)
-		} else if len(loc.mentions) < 8 {
-			loc.mentions = append(loc.mentions, i+1)
-		}
-	}
-	if len(decls) == 0 {
-		return loc
-	}
-	d := decls[0]
-	for _, o := range decls[1:min(6, len(decls))] {
-		loc.others = append(loc.others, o+1)
-	}
-	loc.mentions = nil
-	if idx := nameRe.FindStringIndex(lines[d]); idx != nil {
-		loc.function = fnKeywordRe.MatchString(lines[d][:idx[0]])
-	}
-	top := d
-	for top > 0 && d-top < 20 {
-		t := strings.TrimSpace(lines[top-1])
-		if strings.HasPrefix(t, "//") || strings.HasPrefix(t, "#[") || strings.HasPrefix(t, "#!") || strings.HasPrefix(t, "@") ||
-			strings.HasPrefix(t, "/*") || strings.HasPrefix(t, "*") || strings.HasPrefix(t, "\"\"\"") || strings.HasPrefix(t, "--") {
-			top--
-			continue
-		}
-		break
-	}
-	loc.start = top + 1
-	if end, how, ok := blockEnd(lines, d); ok {
-		loc.end, loc.how = end+1, how
-		return loc
-	}
-	loc.end = min(d+symbolFallbackLines, len(lines))
-	loc.how = fmt.Sprintf("the %d-line fallback (no block end found)", symbolFallbackLines)
-	return loc
-}
-
-// symbolUses says where else the project names a definition read by symbol: a
-// git grep of the files with the read file's extension, without comment lines and
-// without the definition's own lines. For a function the calls (`name(`, or a path
-// ending `::name`) are counted apart from the other lines with the word, because a
-// field or variable of the same name would otherwise hide a function nothing calls.
-// Empty outside a git work tree, or when git fails.
-func symbolUses(ctx context.Context, cwd, path string, loc symbolLoc) string {
-	ext := filepath.Ext(path)
-	if ext == "" || loc.name == "" {
-		return ""
-	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	top, err := exec.CommandContext(ctx, "git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		slog.Debug("read_file: symbol uses not searched", "name", loc.name, "err", err)
-		return ""
-	}
-	root := strings.TrimSpace(string(top))
-	// git names the top level with symlinks resolved; so must the definition's own path,
-	// or its `name(` line would count as a call of itself.
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		path = real
-	}
-	out, err := exec.CommandContext(ctx, "git", "-C", root, "grep", "--untracked", "-n", "-I", "-w", "-e", loc.name, "--", "*"+ext).Output()
-	var exit *exec.ExitError
-	if errors.As(err, &exit) && exit.ExitCode() == 1 {
-		out, err = nil, nil // no line names it
-	}
-	if err != nil {
-		slog.Debug("read_file: symbol uses not searched", "name", loc.name, "err", err)
-		return ""
-	}
-	base := cwd
-	if real, err := filepath.EvalSymlinks(cwd); err == nil {
-		base = real
-	}
-	callRe := regexp.MustCompile(`\b` + regexp.QuoteMeta(loc.name) + `\s*(?:\(|::<)|::` + regexp.QuoteMeta(loc.name) + `\b`)
-	var calls, others []string
-	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
-		file, rest, ok := strings.Cut(line, ":")
-		if !ok {
-			continue
-		}
-		num, text, ok := strings.Cut(rest, ":")
-		n, err := strconv.Atoi(num)
-		if !ok || err != nil || commentLineRe.MatchString(text) {
-			continue
-		}
-		abs := filepath.Join(root, file)
-		if abs == path && n >= loc.start && n <= loc.end {
-			continue
-		}
-		rel, err := filepath.Rel(base, abs)
-		if err != nil {
-			rel = file
-		}
-		where := fmt.Sprintf("%s:%d", rel, n)
-		if loc.function && callRe.MatchString(text) {
-			calls = append(calls, where)
-		} else {
-			others = append(others, where)
-		}
-	}
-	count := func(at []string, what string) string {
-		if len(at) == 1 {
-			return "1 " + what + "line"
-		}
-		return fmt.Sprintf("%d %slines", len(at), what)
-	}
-	first := func(at []string) string {
-		if len(at) > 5 {
-			return strings.Join(at[:5], ", ") + fmt.Sprintf(" and %d more", len(at)-5)
-		}
-		return strings.Join(at, ", ")
-	}
-	scope := fmt.Sprintf("the project's *%s files, comment lines skipped; a word search, not a compiler", ext)
-	if !loc.function {
-		if len(others) == 0 {
-			return fmt.Sprintf("[`%s` is named nowhere else (%s).]", loc.name, scope)
-		}
-		return fmt.Sprintf("[`%s` is named on %s: %s (%s).]", loc.name, count(others, "other "), first(others), scope)
-	}
-	note := fmt.Sprintf("[`%s` is called on %s: %s", loc.name, count(calls, ""), first(calls))
-	if len(calls) == 0 {
-		note = fmt.Sprintf("[NOTHING calls `%s`: no `%s(` and no `::%s` outside this definition", loc.name, loc.name, loc.name)
-	}
-	if len(others) > 0 {
-		note += fmt.Sprintf("; the word is on %s that are not a call (a field, a variable, a value passed on): %s", count(others, "other "), first(others))
-	}
-	return note + fmt.Sprintf(" (%s: a trait method, a callback or a test is reached without one).]", scope)
 }
 
 // commentLineRe: a line that is only a comment, in the common comment styles.
@@ -1040,7 +568,7 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 	}
 	switch count := strings.Count(content, oldText); {
 	case count > 1:
-		return "", "", fmt.Sprintf("error: old_text matches %d places; it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read_file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count)
+		return "", "", fmt.Sprintf("error: old_text matches %d places; it must be unique. Add a few more exact lines of surrounding context (copied from a fresh read of the file) so it pins exactly one spot; don't split the edit in a way that loses uniqueness.", count)
 	case count == 1:
 		return strings.Replace(content, oldText, newText, 1), "", ""
 	}
@@ -1049,7 +577,7 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 	case n == 1:
 		return tol, " (old_text matched ignoring whitespace/indentation)", ""
 	case n > 1:
-		return "", "", fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places; add a couple more lines of surrounding context (from a fresh read_file) to pin exactly one spot.", n)
+		return "", "", fmt.Sprintf("error: old_text isn't a byte-for-byte match, and ignoring whitespace it matches %d places; add a couple more lines of surrounding context (from a fresh read of the file) to pin exactly one spot.", n)
 	}
 	// A snippet copied from a numbered read still carries its `N|` prefixes.
 	if stripped, ok := stripLineNumbers(oldText); ok {
@@ -1074,10 +602,10 @@ func applyEdit(path, content, oldText, start, end, newText string) (string, stri
 			}
 		}
 		return "", "", fmt.Sprintf("error: old_text not found: it is not in the file as it is now.%s The closest region is %s lines %d-%d, which CURRENTLY reads:\n\n%s\n\n"+
-			"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT call read_file first: the text above is the file's current content. Do NOT rewrite the whole file with write_file.",
+			"Retry edit_file with old_text copied byte-for-byte from that block (a SMALL unique part of it is enough). Do NOT read the file again first: the text above is its current content. Do NOT rewrite the whole file with write_file.",
 			differs, path, line, line+strings.Count(snippet, "\n"), truncate(snippet, nearMissSnippetCap))
 	}
-	return "", "", "error: old_text not found: it is not in the file as it is now, and no similar region was found either, so it may be the wrong file. Call read_file with line= at the region you're changing for its CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read from the top, and do NOT rewrite the whole file with write_file."
+	return "", "", "error: old_text not found: it is not in the file as it is now, and no similar region was found either, so it may be the wrong file. Read the lines you are changing again (e.g. `sed -n '120,180p' <file>`) for their CURRENT exact text, then retry edit_file on a SMALL unique snippet. Do NOT re-read the whole file, and do NOT rewrite the whole file with write_file."
 }
 
 var lineNumberPrefixRe = regexp.MustCompile(`^\s*\d+\|`)
@@ -1117,7 +645,7 @@ func replaceBlock(content, start, end, newText string) (string, string, string) 
 	}
 	switch {
 	case len(hits) == 0:
-		return "", "", fmt.Sprintf("`start` %q is on no line of the file. Copy a fragment of the block's first line from a fresh read_file (read_file with `symbol` shows the whole block).", start)
+		return "", "", fmt.Sprintf("`start` %q is on no line of the file. Copy a fragment of the block's first line from a fresh read of the file.", start)
 	case len(hits) > 1:
 		var at []int
 		for _, h := range hits {
@@ -1148,7 +676,7 @@ func replaceBlock(content, start, end, newText string) (string, string, string) 
 		}
 		// A function's last line is a bare `}`, which also closes every inner block, so the
 		// model cannot name it. A bare closer (`}`, `end`) is documented to mean the block's own
-		// closing line, found as read_file's symbol finds it.
+		// closing line, found by its braces or its indentation.
 		//
 		// HACK: an `end` that is on no line is outside the contract (a fragment of the block's
 		// last line) and should be an error. Qwen3.8-flash-next does not follow the tool's
@@ -1298,16 +826,6 @@ func (s *Session) batchHint(name, args string, failed bool) (string, string) {
 		return string(b)
 	}
 	switch name {
-	case "read_file":
-		if cur.has("reads") || before.has("reads") {
-			return "", ""
-		}
-		return batchNoteLead + "read_file in a row, and each is a model call. Independent reads go in ONE call, like several commands in one shell line; these two as one: {\"reads\": [" +
-			keep(before, "path", "symbol", "start_line", "end_line", "line", "limit") + ", " + keep(cur, "path", "symbol", "start_line", "end_line", "line", "limit") + "]}. Up to 8 per call.]", "💡 told the model: several reads go in one read_file call"
-	case "search":
-		cur["search"], before["search"] = cur["pattern"], before["pattern"] // a `reads` item names it so
-		return batchNoteLead + "search in a row, and each is a model call. Independent searches go in ONE read_file call, beside reads too; these two as one: {\"reads\": [" +
-			keep(before, "search", "path", "glob", "regex") + ", " + keep(cur, "search", "path", "glob", "regex") + "]}. Up to 8 per call.]", "💡 told the model: several searches go in one read_file call"
 	case "edit_file":
 		if cur.has("edits") || before.has("edits") || cur.str("path") != before.str("path") || cur.str("path") == "" {
 			return "", ""

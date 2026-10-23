@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"unicode/utf8"
 )
 
 func writeLines(t *testing.T, path string, n int) {
@@ -25,148 +24,6 @@ func writeLines(t *testing.T, path string, n int) {
 }
 
 var nextReadRe = regexp.MustCompile(`read_file (\{"path": "[^"]*", "start_line": \d+\})`)
-
-// Follows each "file continues" note's call to EOF: window clip, partial and
-// complete markers, and the next-part call.
-func TestServeReadChunks(t *testing.T) {
-	a, s := newTestAgent(t)
-	path := filepath.Join(s.Cwd, "big.txt")
-	writeLines(t, path, 350)
-	ctx := context.Background()
-
-	out, failed := a.serveRead(ctx, s.ID, path, 1, readChunkLines, "tc1", false)
-	if failed {
-		t.Fatalf("chunk 1 failed: %s", out)
-	}
-	if !strings.Contains(out, "L1\n") || !strings.Contains(out, "L150\n") {
-		t.Errorf("chunk 1 missing lines 1-150:\n%s", out)
-	}
-	if strings.Contains(out, "L151") {
-		t.Errorf("chunk 1 leaked line 151 — window not clipped:\n%s", out)
-	}
-	if !strings.Contains(out, "the file continues") {
-		t.Errorf("chunk 1 should be marked partial:\n%s", out)
-	}
-	for i, want := range []struct {
-		start      int
-		first, end string
-	}{{151, "L151\n", "L300\n"}, {301, "L301\n", "L350\n"}} {
-		m := nextReadRe.FindStringSubmatch(out)
-		if m == nil || m[1] != fmt.Sprintf(`{"path": %q, "start_line": %d}`, path, want.start) {
-			t.Fatalf("chunk %d: the note names %v, want start_line %d:\n%s", i+1, m, want.start, out)
-		}
-		var tc toolCall
-		tc.Function.Name = "read_file"
-		tc.Function.Arguments = m[1]
-		tu, _ := a.runToolCall(ctx, s.ID, tc)
-		out = tu.Output
-		if !strings.Contains(out, want.first) || !strings.Contains(out, want.end) || strings.Contains(out, fmt.Sprintf("L%d\n", want.start-1)) {
-			t.Errorf("chunk %d should start at %q and reach %q:\n%s", i+2, want.first, want.end, out)
-		}
-	}
-	if !strings.Contains(out, "end of file") || nextReadRe.MatchString(out) {
-		t.Errorf("final chunk should be marked complete, with no next read:\n%s", out)
-	}
-}
-
-// Exactly readChunkLines lines is complete; one more is partial and names the
-// next line.
-func TestServeReadCompleteBoundary(t *testing.T) {
-	a, s := newTestAgent(t)
-	ctx := context.Background()
-
-	exact := filepath.Join(s.Cwd, "exact.txt")
-	writeLines(t, exact, readChunkLines)
-	out, _ := a.serveRead(ctx, s.ID, exact, 1, readChunkLines, "tc", false)
-	if !strings.Contains(out, "end of file") || nextReadRe.MatchString(out) {
-		t.Errorf("exactly readChunkLines should be complete:\n%s", out)
-	}
-
-	over := filepath.Join(s.Cwd, "over.txt")
-	writeLines(t, over, readChunkLines+1)
-	out, _ = a.serveRead(ctx, s.ID, over, 1, readChunkLines, "tc", false)
-	if !strings.Contains(out, "the file continues") || !strings.Contains(out, fmt.Sprintf(`"start_line": %d}`, readChunkLines+1)) {
-		t.Errorf("readChunkLines+1 should be partial, continuing at line %d:\n%s", readChunkLines+1, out)
-	}
-}
-
-// An oversized read stops on a line boundary under liveExemptCap so its note
-// survives; numbered lines count too, and a single huge line is cut inside.
-func TestServeReadByteCapKeepsNote(t *testing.T) {
-	a, s := newTestAgent(t)
-	ctx := context.Background()
-	line := strings.Repeat("x", 199) + "\n"
-	wide := filepath.Join(s.Cwd, "wide.txt")
-	if err := os.WriteFile(wide, []byte(strings.Repeat(line, 1000)), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	for _, numbered := range []bool{false, true} {
-		out, _ := a.serveRead(ctx, s.ID, wide, 1, maxReadLines, "tc", numbered)
-		if live := liveToolOutput("read_file", "{}", out); live != out {
-			t.Errorf("numbered=%v: liveToolOutput clipped the read (%d bytes)", numbered, len(out))
-		}
-		if !strings.Contains(out, "the file continues") || !nextReadRe.MatchString(out) {
-			t.Errorf("numbered=%v: the note naming the next part is missing:\n%s", numbered, out[max(0, len(out)-600):])
-		}
-	}
-	out, _ := a.serveRead(ctx, s.ID, wide, 1, maxReadLines, "tc", false)
-	n := readByteBudget / len(line)
-	if !strings.Contains(out, fmt.Sprintf("showing lines 1-%d,", n)) || !strings.Contains(out, fmt.Sprintf(`"start_line": %d}`, n+1)) {
-		t.Errorf("want whole lines 1-%d served and %d next:\n%s", n, n+1, out[max(0, len(out)-600):])
-	}
-
-	long := filepath.Join(s.Cwd, "long.txt")
-	if err := os.WriteFile(long, []byte(strings.Repeat("é", liveExemptCap)+"\nnext\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	out, _ = a.serveRead(ctx, s.ID, long, 1, readChunkLines, "tc", false)
-	if live := liveToolOutput("read_file", "{}", out); live != out || !utf8.ValidString(out) {
-		t.Errorf("a cut mega-line must fit whole and stay valid UTF-8 (%d bytes)", len(out))
-	}
-	if !strings.Contains(out, "line 1 is longer than") || !strings.Contains(out, `"start_line": 2}`) {
-		t.Errorf("the cut line should be named and the read continue at line 2:\n%s", out[max(0, len(out)-600):])
-	}
-}
-
-// JSON-number line/limit, as the schema declares them, and quoted strings both
-// take effect.
-func TestReadFileHonoursNumericLineAndLimit(t *testing.T) {
-	a, s := newTestAgent(t)
-	ctx := context.Background()
-	path := filepath.Join(s.Cwd, "big.txt")
-	writeLines(t, path, 350)
-
-	read := func(t *testing.T, rawArgs string) string {
-		t.Helper()
-		var tc toolCall
-		tc.Function.Name = "read_file"
-		tc.Function.Arguments = rawArgs
-		tu, _ := a.runToolCall(ctx, s.ID, tc)
-		out, failed := tu.Output, tu.Failed
-		if failed {
-			t.Fatalf("read_file %s failed: %s", rawArgs, out)
-		}
-		return out
-	}
-
-	numeric := read(t, fmt.Sprintf(`{"path":%q,"line":42,"limit":5}`, path))
-	if strings.Contains(numeric, "L1\n") {
-		t.Errorf("numeric line=42 read from the top instead:\n%s", numeric)
-	}
-	for _, want := range []string{"L42\n", "L46\n"} {
-		if !strings.Contains(numeric, want) {
-			t.Errorf("numeric line/limit missing %q:\n%s", want, numeric)
-		}
-	}
-	if strings.Contains(numeric, "L47\n") {
-		t.Errorf("numeric limit=5 served past line 46:\n%s", numeric)
-	}
-
-	quoted := read(t, fmt.Sprintf(`{"path":%q,"line":"200","limit":"5"}`, path))
-	if !strings.Contains(quoted, "L200\n") || strings.Contains(quoted, "L205\n") {
-		t.Errorf("quoted line/limit not honoured:\n%s", quoted)
-	}
-}
 
 // A missed old_text reports failed=true (for the fail cap) and steers to a small
 // retry, not a whole-file rewrite.
@@ -186,7 +43,7 @@ func TestEditFileMissFailsAndSteers(t *testing.T) {
 	if !failed {
 		t.Errorf("missed old_text: failed=false, want true (must feed the fail cap)")
 	}
-	for _, want := range []string{"not found", "read_file", "whole file"} {
+	for _, want := range []string{"not found", "Do NOT read the file again", "whole file"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("miss message missing %q steering:\n%s", want, out)
 		}
@@ -293,8 +150,8 @@ func TestEditFileMissQuotesNearbyRegion(t *testing.T) {
 	if !strings.Contains(out, "os.Open(p)") {
 		t.Errorf("miss message did not quote the current region:\n%s", out)
 	}
-	if !strings.Contains(out, "Do NOT call read_file") {
-		t.Errorf("miss message still sends the model back to read_file:\n%s", out)
+	if !strings.Contains(out, "Do NOT read the file again") {
+		t.Errorf("miss message still sends the model back to reading:\n%s", out)
 	}
 	if !strings.Contains(out, `differs from the file first at line 3: you wrote "func load(path string) error {", the file has "func load(p string) error {"`) || strings.Contains(out, "drifted") {
 		t.Errorf("miss message does not name the first differing line, or claims drift:\n%s", out)
@@ -336,130 +193,6 @@ func TestFsGatedOnClientCapabilities(t *testing.T) {
 	}()
 }
 
-func TestLocateSymbol(t *testing.T) {
-	rust := strings.Join([]string{
-		"use gtk::prelude::*;",              // 1
-		"",                                  // 2
-		"/// Builds the form.",              // 3
-		"#[allow(dead_code)]",               // 4
-		"pub fn cut_form_column(x: i32) {",  // 5
-		`    let s = "}{";`,                 // 6
-		"    if x > 0 {",                    // 7
-		"        println!(\"{}\", x);",      // 8
-		"    }",                             // 9
-		"}",                                 // 10
-		"fn other() { cut_form_column(1) }", // 11
-	}, "\n")
-	loc := locateSymbol(rust, "fn cut_form_column")
-	if loc.start != 3 || loc.end != 10 || loc.how != "braces" {
-		t.Errorf("rust = %+v, want 3-10 by braces", loc)
-	}
-
-	goSrc := "package x\n\nfunc (r *Runner) Step(n int) error {\n\treturn nil\n}\n"
-	if loc := locateSymbol(goSrc, "Step"); loc.start != 3 || loc.end != 5 {
-		t.Errorf("go method = %+v, want 3-5", loc)
-	}
-
-	py := "import os\n\n@cache\ndef load(path):\n    with open(path) as f:\n\n        return f.read()\n\nx = load('a')\n"
-	if loc := locateSymbol(py, "load"); loc.start != 3 || loc.end != 7 || loc.how != "indentation" {
-		t.Errorf("python = %+v, want 3-7 by indentation", loc)
-	}
-
-	proto := "trait T {\n    fn draw(&self);\n    fn size(&self) -> u32 { 1 }\n}\n"
-	if loc := locateSymbol(proto, "draw"); loc.start != 2 || loc.end != 2 {
-		t.Errorf("prototype = %+v, want line 2 alone", loc)
-	}
-
-	var broken []string
-	broken = append(broken, "fn half_written() {")
-	for i := 0; i < 80; i++ {
-		broken = append(broken, "    step();")
-	}
-	// A `{` that never closes: its body is still told by its indentation.
-	if loc := locateSymbol(strings.Join(broken, "\n"), "half_written"); loc.end != 81 || loc.how != "indentation" {
-		t.Errorf("broken = %+v, want 1-81 by indentation", loc)
-	}
-	if loc := locateSymbol("def half_written(x,\ny = 1\n", "half_written"); !strings.Contains(loc.how, "fallback") {
-		t.Errorf("unreadable = %+v, want the fallback", loc)
-	}
-
-	ruby := "class Cut\n  def trim(t)\n    if t < 0\n      nil\n    end\n  end\n\n  def other\n  end\nend\n"
-	if loc := locateSymbol(ruby, "trim"); loc.start != 2 || loc.end != 6 || loc.how != "indentation" {
-		t.Errorf("ruby = %+v, want 2-6 by indentation, through its own end", loc)
-	}
-
-	if loc := locateSymbol("let a = helper(1);\nlet b = helper(2);\n", "helper"); loc.start != 0 || len(loc.mentions) != 2 {
-		t.Errorf("undeclared = %+v, want no definition and two mentions", loc)
-	}
-}
-
-func TestReadFileBySymbol(t *testing.T) {
-	a, s := newTestAgent(t)
-	path := filepath.Join(s.Cwd, "w.rs")
-	src := "fn a() {}\n\nfn target() {\n    one();\n    two();\n}\n\nfn b() {}\n"
-	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var tc toolCall
-	tc.Function.Name = "read_file"
-	tc.Function.Arguments = fmt.Sprintf(`{"path":%q,"symbol":"target"}`, path)
-	tu, _ := a.runToolCall(context.Background(), s.ID, tc)
-	out, failed := tu.Output, tu.Failed
-	if failed || !strings.HasPrefix(out, "[`target`: lines 3-6, block end found by braces]") || !strings.Contains(out, "two();") || strings.Contains(out, "fn b()") {
-		t.Errorf("symbol read = failed %v:\n%s", failed, out)
-	}
-	tc.Function.Arguments = fmt.Sprintf(`{"path":%q,"symbol":"missing"}`, path)
-	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !tu.Failed || !strings.Contains(tu.Output, "with `search` first") {
-		t.Errorf("unknown symbol = failed %v: %s", tu.Failed, tu.Output)
-	}
-}
-
-// A symbol read says who calls the function: the tab icons naivepost defined in
-// Page::icon and never passed to the tab row looked fine until something counted
-// the calls. A field of the same name, a comment and another language's file do
-// not count as one.
-func TestReadFileSymbolSaysWhoCallsIt(t *testing.T) {
-	a, s := newTestAgent(t)
-	writeTree(t, s.Cwd, map[string]string{
-		"src/shell.rs":  "impl Page {\n    /// Spelled for the tab row.\n    pub fn icon(self) -> &'static str {\n        \"view-list-symbolic\"\n    }\n}\n\npub struct Drawn {\n    pub icon: &'static str,\n}\n",
-		"src/window.rs": "fn paint(drawn: Drawn) {\n    play.set_icon_name(drawn.icon);\n    // page.icon() names the tab\n}\n",
-		"README.md":     "Each tab shows `page.icon()`.\n",
-	})
-	gitInit(t, s.Cwd)
-	read := func(symbol string) string {
-		var tc toolCall
-		tc.Function.Name = "read_file"
-		tc.Function.Arguments = fmt.Sprintf(`{"path":"src/shell.rs","symbol":%q}`, symbol)
-		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
-		if tu.Failed {
-			t.Fatalf("read %s failed: %s", symbol, tu.Output)
-		}
-		return tu.Output
-	}
-	out := read("icon")
-	for _, want := range []string{"[`icon`: lines 2-5", "NOTHING calls `icon`", "2 other lines that are not a call", "src/shell.rs:9, src/window.rs:2", "*.rs"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("no caller: missing %q in\n%s", want, out)
-		}
-	}
-	for _, not := range []string{"window.rs:3", "README", "shell.rs:3"} {
-		if strings.Contains(out, not) {
-			t.Errorf("no caller: %q counted in\n%s", not, out)
-		}
-	}
-	if !strings.Contains(out, "view-list-symbolic") {
-		t.Errorf("the definition itself is still served:\n%s", out)
-	}
-
-	writeTree(t, s.Cwd, map[string]string{"src/tabs.rs": "fn tabs(page: Page) {\n    stack.add(page.icon());\n    let all = pages.map(Page::icon);\n}\n"})
-	if out := read("icon"); !strings.Contains(out, "`icon` is called on 2 lines: src/tabs.rs:2, src/tabs.rs:3") {
-		t.Errorf("an untracked caller, by call and by path:\n%s", out)
-	}
-	if out := read("Drawn"); !strings.Contains(out, "`Drawn` is named on 1 other line: src/window.rs:1") {
-		t.Errorf("a type counts every line naming it:\n%s", out)
-	}
-}
-
 // An ambiguous start or a missing end changes nothing and says why.
 func TestEditFileByAnchors(t *testing.T) {
 	a, s := newTestAgent(t)
@@ -494,55 +227,6 @@ func TestEditFileByAnchors(t *testing.T) {
 	}
 	if out, failed := edit(fmt.Sprintf(`{"path":%q,"new_text":"x"}`, path)); !failed || !strings.Contains(out, "either") {
 		t.Errorf("neither form = %v %s", failed, out)
-	}
-}
-
-// A failing read does not stop the rest; a search goes beside the reads; reads past the cap
-// are named as not served; the list sent as a string is read.
-func TestReadFileSeveralReads(t *testing.T) {
-	a, s := newTestAgent(t)
-	path := filepath.Join(s.Cwd, "w.rs")
-	if err := os.WriteFile(path, []byte("fn a() {\n    one();\n}\n\nfn b() {\n    two();\n}\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	var tc toolCall
-	tc.Function.Name = "read_file"
-	tc.Function.Arguments = fmt.Sprintf(`{"reads":[{"path":%q,"symbol":"b"},{"path":%q,"symbol":"nope"},{"path":%q,"line":1,"limit":1},{"search":"two()","context":0}]}`, path, path, path)
-	tu, _ := a.runToolCall(context.Background(), s.ID, tc)
-	out, failed := tu.Output, tu.Failed
-	if failed {
-		t.Fatalf("reads failed: %s", out)
-	}
-	for _, want := range []string{"=== read 1 of 4: " + path + " b ===", "two();", "=== read 2 of 4:", "no definition of `nope`", "=== read 3 of 4: " + path + " from line 1 ===", "fn a() {",
-		"=== read 4 of 4: search \"two()\" in the project ===\nw.rs:6:    two();\n\n1 matches in 1 files."} {
-		if !strings.Contains(out, want) {
-			t.Errorf("reads output lacks %q:\n%s", want, out)
-		}
-	}
-	if strings.Index(out, "read 1 of 4") > strings.Index(out, "read 3 of 4") {
-		t.Error("reads out of order")
-	}
-	var many []string
-	for i := 0; i < maxReadsPerCall+2; i++ {
-		many = append(many, fmt.Sprintf(`{"path":%q,"line":%d,"limit":1}`, path, i+1))
-	}
-	tc.Function.Arguments = `{"reads":[` + strings.Join(many, ",") + `]}`
-	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !strings.Contains(tu.Output, "not served: at most") {
-		t.Errorf("the cap was not reported:\n%s", tu.Output)
-	}
-	// The list sent as a string holding its JSON is read as the list, not as a call without a path.
-	tc.Function.Arguments = fmt.Sprintf(`{"reads":%q}`, fmt.Sprintf(`[{"path":%q,"symbol":"b"}]`, path))
-	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); tu.Failed || !strings.Contains(tu.Output, "=== read 1 of 1: "+path+" b ===") {
-		t.Errorf("reads as a string:\n%s", tu.Output)
-	}
-	// One cut off inside an item serves the whole items before the cut and says where it was cut.
-	tc.Function.Arguments = fmt.Sprintf(`{"reads":%q}`, fmt.Sprintf(`[{"path":%q,"symbol":"b"}, {"path": "w.rs", "start_line":`, path))
-	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); tu.Failed || !strings.Contains(tu.Output, "two();") || !strings.Contains(tu.Output, "cut off after 1 whole items: those are served above") {
-		t.Errorf("reads as a cut string:\n%s", tu.Output)
-	}
-	tc.Function.Arguments = `{"reads":"[{\"path\": \"w.rs\", \"start_line\":"}`
-	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !tu.Failed || !strings.Contains(tu.Output, "Nothing was read") {
-		t.Errorf("reads as a string with no whole item:\n%s", tu.Output)
 	}
 }
 
@@ -584,7 +268,7 @@ func TestEditFileSeveralEdits(t *testing.T) {
 		t.Errorf("edits as a string = %v %s\n%s", failed, out, after)
 	}
 	out, failed = edit(fmt.Sprintf(`{"path":%q,"edits":%q}`, path, `[{"old_text":"let zoom = 3.0;","new_text":"let zoom = 4.0;"}, {"old_text": "let zoom`))
-	if after, _ := os.ReadFile(path); !failed || !strings.Contains(out, "cut off after 1 whole items. Nothing was written") || !strings.Contains(string(after), "let zoom = 3.0;") {
+	if after, _ := os.ReadFile(path); !failed || !strings.Contains(out, "a list that is cut off. Nothing was written") || !strings.Contains(string(after), "let zoom = 3.0;") {
 		t.Errorf("edits as a cut string = %v %s\n%s", failed, out, after)
 	}
 }
@@ -598,24 +282,14 @@ func TestBatchHints(t *testing.T) {
 		return s.batchHint(name, args, failed)
 	}
 	s.markReplyStart()
-	s.batchHint("read_file", `{"path":"x.rs","symbol":"p"}`, false)
-	if got, _ := s.batchHint("read_file", `{"path":"y.rs","symbol":"q"}`, false); got != "" {
-		t.Errorf("a batched second read got a note: %q", got)
+	s.batchHint("edit_file", `{"path":"x.rs","old_text":"p","new_text":"q"}`, false)
+	if got, _ := s.batchHint("edit_file", `{"path":"x.rs","old_text":"r","new_text":"s"}`, false); got != "" {
+		t.Errorf("a batched second edit got a note: %q", got)
 	}
 	s.batchHint("run_command", `{"command":"ls"}`, false)
-
-	if got, _ := call("read_file", `{"path":"a.rs","symbol":"f"}`, false); got != "" {
-		t.Errorf("first read got a hint: %q", got)
-	}
-	if got, _ := call("read_file", `{"path":"a.rs","symbol":"f"}`, false); got != "" {
-		t.Errorf("an identical re-read got a batching note, which hides the repeat: %q", got)
-	}
-	got, told := call("read_file", `{"path":"b.rs","line":10,"limit":20}`, false)
-	if !strings.Contains(got, `{"reads": [{"path":"a.rs","symbol":"f"}, {"limit":20,"line":10,"path":"b.rs"}]}`) || !strings.HasPrefix(told, "💡 told the model:") {
-		t.Errorf("read hint = %q / %q", got, told)
-	}
-	if got, _ := call("read_file", `{"path":"c.rs","symbol":"g"}`, false); got == "" {
-		t.Error("the third read in a row got no hint; every occurrence gets one")
+	call("edit_file", `{"path":"y.rs","old_text":"a","new_text":"b"}`, false)
+	if got, _ := call("edit_file", `{"path":"y.rs","old_text":"a","new_text":"b"}`, false); got != "" {
+		t.Errorf("an identical repeat got a batching note, which hides the repeat: %q", got)
 	}
 
 	call("run_command", `{"command":"ls"}`, false)
@@ -629,21 +303,14 @@ func TestBatchHints(t *testing.T) {
 		t.Errorf("a failed edit got a hint: %q", got)
 	}
 	call("edit_file", `{"path":"w.rs","old_text":"a","new_text":"b"}`, false)
-	got, told = call("edit_file", `{"path":"w.rs","start":"fn z(","end":"} // z","new_text":"fn z() {}"}`, false)
+	got, told := call("edit_file", `{"path":"w.rs","start":"fn z(","end":"} // z","new_text":"fn z() {}"}`, false)
 	if !strings.Contains(got, `{"path": "w.rs", "edits": [{"new_text":"b","old_text":"a"}, {"end":"} // z","new_text":"fn z() {}","start":"fn z("}]}`) || !strings.Contains(told, "several edits to w.rs") {
 		t.Errorf("edit hint = %q / %q", got, told)
-	}
-
-	call("run_command", `{"command":"ls"}`, false)
-	call("search", `{"pattern":"fn load","path":"src"}`, false)
-	got, told = call("search", `{"pattern":"load(","glob":"*.rs","context":0}`, false)
-	if !strings.Contains(got, `{"reads": [{"path":"src","search":"fn load"}, {"glob":"*.rs","search":"load("}]}`) || !strings.Contains(told, "several searches go in one read_file call") {
-		t.Errorf("search hint = %q / %q", got, told)
 	}
 }
 
 // edit_file strips the `N|` numbers from a snippet copied with them.
-func TestReadFileNumbered(t *testing.T) {
+func TestEditFileStripsLineNumbers(t *testing.T) {
 	a, s := newTestAgent(t)
 	path := filepath.Join(s.Cwd, "w.rs")
 	if err := os.WriteFile(path, []byte("fn a() {}\n\nfn target() {\n    one();\n}\n"), 0o644); err != nil {
@@ -655,15 +322,6 @@ func TestReadFileNumbered(t *testing.T) {
 		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
 		return tu.Output, tu.Failed
 	}
-	if out, _ := run("read_file", fmt.Sprintf(`{"path":%q,"line":3,"limit":2,"numbered":true}`, path)); !strings.Contains(out, "3|fn target() {\n4|    one();\n") {
-		t.Errorf("numbered window:\n%s", out)
-	}
-	if out, _ := run("read_file", fmt.Sprintf(`{"path":%q,"symbol":"target","numbered":true}`, path)); !strings.Contains(out, "5|}") {
-		t.Errorf("numbered symbol:\n%s", out)
-	}
-	if out, _ := run("read_file", fmt.Sprintf(`{"reads":[{"path":%q,"line":1,"limit":1,"numbered":true}]}`, path)); !strings.Contains(out, "1|fn a() {}") {
-		t.Errorf("numbered reads item:\n%s", out)
-	}
 	out, failed := run("edit_file", fmt.Sprintf(`{"path":%q,"old_text":"4|    one();","new_text":"4|    two();"}`, path))
 	if failed || !strings.Contains(out, "line-number prefixes") {
 		t.Fatalf("numbered old_text = %v %s", failed, out)
@@ -673,42 +331,6 @@ func TestReadFileNumbered(t *testing.T) {
 	}
 	if _, ok := stripLineNumbers("let x = 1;\n2|y"); ok {
 		t.Error("stripped numbers from a snippet where not every line had one")
-	}
-}
-
-// Both ends inclusive, like `sed -n 'a,bp'`; view_range too.
-func TestReadFileStartEndLine(t *testing.T) {
-	a, s := newTestAgent(t)
-	path := filepath.Join(s.Cwd, "big.txt")
-	writeLines(t, path, 50)
-	read := func(args string) string {
-		var tc toolCall
-		tc.Function.Name, tc.Function.Arguments = "read_file", args
-		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
-		out := tu.Output
-		return out
-	}
-	if out := read(fmt.Sprintf(`{"path":%q,"start_line":10,"end_line":12}`, path)); !strings.Contains(out, "L10\nL11\nL12\n") || strings.Contains(out, "L13\n") {
-		t.Errorf("start/end:\n%s", out)
-	}
-	if out := read(fmt.Sprintf(`{"path":%q,"view_range":[20,21]}`, path)); !strings.Contains(out, "L20\nL21\n") || strings.Contains(out, "L22\n") {
-		t.Errorf("view_range:\n%s", out)
-	}
-	if out := read(fmt.Sprintf(`{"reads":[{"path":%q,"start_line":30,"end_line":30}]}`, path)); !strings.Contains(out, "from line 30") || !strings.Contains(out, "L30\n") || strings.Contains(out, "L31\n") {
-		t.Errorf("reads item:\n%s", out)
-	}
-	// Qwen Code's offset counts from 0 (39 is line 40), Claude Code's from 1: both get
-	// lines 40 and 41, served with the line before for the other count.
-	for _, offset := range []int{39, 40} {
-		if out := read(fmt.Sprintf(`{"file_path":%q,"offset":%d,"limit":2}`, path, offset)); !strings.Contains(out, "L40\nL41\n") || strings.Contains(out, "L38\n") || strings.Contains(out, "L43\n") {
-			t.Errorf("file_path, offset %d, limit 2:\n%s", offset, out)
-		}
-	}
-	if out := read(fmt.Sprintf(`{"path":%q,"view_range":[45,-1]}`, path)); !strings.Contains(out, "L45\n") || !strings.Contains(out, "L50\n") || strings.Contains(out, "L44\n") {
-		t.Errorf("view_range to the end:\n%s", out)
-	}
-	if out := read(fmt.Sprintf(`{"reads":[{"file_path":%q,"offset":0,"limit":1}]}`, path)); !strings.Contains(out, "big.txt from line 1") || !strings.Contains(out, "L1\n") || strings.Contains(out, "L2\n") {
-		t.Errorf("reads item with file_path/offset:\n%s", out)
 	}
 }
 
@@ -790,8 +412,11 @@ func TestToolPathWithoutLeadingSlash(t *testing.T) {
 		t.Fatal(err)
 	}
 	rel := strings.TrimPrefix(filepath.Join(s.Cwd, "a.txt"), "/")
-	if tu := callTool(t, a, s.ID, "read_file", `{"path":"`+rel+`"}`); tu.Failed || !strings.Contains(tu.Output, "found") {
-		t.Errorf("read of %q: %q", rel, tu.Output)
+	if tu := callTool(t, a, s.ID, "edit_file", `{"path":"`+rel+`","old_text":"found","new_text":"changed"}`); tu.Failed {
+		t.Errorf("edit of %q: %q", rel, tu.Output)
+	}
+	if got, _ := os.ReadFile(filepath.Join(s.Cwd, "a.txt")); string(got) != "changed\n" {
+		t.Errorf("a.txt = %q", got)
 	}
 }
 
