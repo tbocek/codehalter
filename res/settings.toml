@@ -56,6 +56,16 @@ parallel = 1                      # max concurrent calls to this server
 #
 # Qwen3.8 also reads reasoning_effort = "low"|"medium"|"xhigh" (default xhigh)
 # from the same table: same rendering cost, same rule.
+#
+# thinking_off = "enable_thinking" turns the closed-think continuation above off for
+# THIS server and sends enable_thinking = false instead. Use it where the server
+# resumes its cache poorly after a continued assistant turn: Halogen (flash-next)
+# took the prefill but restarted each executor call from its last checkpoint, a
+# median 5360 tokens re-read; with the flag 106-306. Under the default effort
+# (xhigh, whose sentence opens the system block only while reasoning is on) the
+# planner and the executor then keep a cache entry each, so a role switch re-reads
+# what the other role added since its last call. Default: "prefill".
+# thinking_off = "enable_thinking"
 params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 16384 }
 params_execute = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 8192 }
 

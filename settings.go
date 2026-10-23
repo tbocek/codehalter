@@ -58,6 +58,11 @@ type LLMConnection struct {
 	ContextSize *int `toml:"context_size,omitempty"`
 	// ImageSupport nil means probe via /props or /v1/models launch args.
 	ImageSupport *bool `toml:"image_support,omitempty"`
+	// ThinkingOff is how the execute role turns reasoning off: "prefill" (the default) continues
+	// a closed think block, "enable_thinking" sends chat_template_kwargs.enable_thinking=false.
+	// Halogen takes the prefill but resumes its cache only from its last checkpoint after one, so
+	// each executor call re-read a median 5,360 tokens there; with enable_thinking 106 to 306.
+	ThinkingOff string `toml:"thinking_off,omitempty"`
 
 	// ExtraBody is the role-resolved params, set at runtime by ConnAt.
 	ExtraBody map[string]any `toml:"-"`
@@ -253,6 +258,13 @@ func decodeSettings(path string) (Settings, error) {
 	for i := range s.LLM {
 		if p := s.LLM[i].Purpose; p != "" && !strings.EqualFold(p, purposeSummary) {
 			slog.Warn("unknown llm purpose (ignored, the only valid value is \"summary\")", "purpose", p, "llm", i, "file", path)
+		}
+		switch strings.ToLower(strings.TrimSpace(s.LLM[i].ThinkingOff)) {
+		case "", "prefill":
+		case "enable_thinking":
+			s.LLM[i].noPrefill = true
+		default:
+			slog.Warn("unknown llm thinking_off (ignored, valid are \"prefill\" and \"enable_thinking\")", "thinking_off", s.LLM[i].ThinkingOff, "llm", i, "file", path)
 		}
 	}
 	s.path = path

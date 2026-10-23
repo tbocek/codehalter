@@ -399,6 +399,35 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	}
 }
 
+// A server entry with thinking_off = "enable_thinking" gets reasoning off by the template flag
+// instead of the prefill, read from settings.toml as a user writes it.
+func TestExecutePhaseThinkingOffByFlag(t *testing.T) {
+	mock := newMockLLM(t, sseToolCall("r1", respondToolName, `{"message":"done"}`))
+	defer mock.Close()
+	t.Setenv("HOME", t.TempDir())
+	a, s := newTestAgent(t)
+	writeTree(t, s.Cwd, map[string]string{filepath.Join(sessionDir, "settings.toml"): fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"m\"\nthinking_off = \"enable_thinking\"\n", mock.ts.URL)})
+	settings, err := loadSettings(s.Cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.settings = settings
+
+	if out := a.runExecutePhase(context.Background(), s.ID, subtask{Description: "do the thing"}, 0, 1); out.Reason != "" {
+		t.Fatalf("executor error: %s", out.Reason)
+	}
+	body := mock.request(0)
+	kw, _ := body["chat_template_kwargs"].(map[string]any)
+	if _, cont := body["continue_final_message"]; cont || kw["enable_thinking"] != false || body["tool_choice"] != "auto" {
+		t.Errorf("execute call = continue_final_message %v, chat_template_kwargs %v, tool_choice %v; want the flag, no prefill, not forced",
+			body["continue_final_message"], body["chat_template_kwargs"], body["tool_choice"])
+	}
+	sent, _ := body["messages"].([]any)
+	if last, _ := sent[len(sent)-1].(map[string]any); last["role"] == "assistant" {
+		t.Errorf("the prefill went out anyway: %v", last)
+	}
+}
+
 func TestToolLoopRecordsToolUses(t *testing.T) {
 	const testToolName = "test_echo_tool_9d7f"
 	echo := fakeTool(testToolName, func(args string) (string, bool) {
