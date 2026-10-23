@@ -1161,6 +1161,36 @@ func TestSpecFlakyTestIsNotTheRoundsFault(t *testing.T) {
 	}
 }
 
+// A round whose commit changes many files no edit touched (a formatter run over the whole project)
+// is said with the count and the command to look; it is not judged, so the item still counts.
+func TestSpecRoundRewritingUneditedFilesIsSaid(t *testing.T) {
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":        "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":    "// the program\n",
+		"app/tests/base.rs": "#[test]\nfn base_builds() {}\n",
+	}, func(id string) bool { return id != "F0.1" },
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do it"}]}`),
+		sseWriteFile("w1", "app/tests/f0_1.rs", "#[test]\nfn f0_1_does_it() {}\n"),
+		sseToolCall("r1", respondToolName, `{"message":"done"}`),
+		sseText(`{"findings": []}`), // the in-round test review
+		sseToolCall("c1", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"F0.1: DONE"}`),
+	)
+	// The suite rewrites files of its own, as `cargo fmt` in a round's command would.
+	cfg := rig.ledger(t)
+	cfg.TestCmd = fmt.Sprintf(`for i in $(seq %d); do echo "// formatted" > src/f$i.rs; done`, specUneditedFilesSaid+1)
+	if err := saveSpecConfig(rig.h.sess.Cwd, cfg); err != nil {
+		t.Fatal(err)
+	}
+	said := rig.run(t)
+	if !strings.Contains(said, fmt.Sprintf("the commit of F0.1 changed %d files that no edit in the round touched", specUneditedFilesSaid+1)) {
+		// The commit holds one more file, the round's own edit, which is not among them.
+		t.Errorf("the rewritten files were not said, or the round's own edit was counted among them:\n%s", said)
+	}
+	if !rig.ledger(t).done("F0.1") {
+		t.Errorf("the item did not count; the rewrite is said, not judged:\n%s", said)
+	}
+}
+
 // Blocked items in a row mean one shared problem: the loop stops instead of burning every item.
 func TestSpecStopsAfterBlockedInARow(t *testing.T) {
 	// Turns that write nothing; the in-round check gives each round a second one.

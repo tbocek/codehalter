@@ -168,6 +168,10 @@ const (
 	specModeRefactor                 // the code's shape, no item: an over-size file blocked a round, or the run's end
 )
 
+// specUneditedFilesSaid: a round's commit changing more files than this that no edit tool touched
+// is said (a formatter run over the whole project once changed 859).
+const specUneditedFilesSaid = 50
+
 // specRefactorID is the refactor round's pseudo-item.
 const specRefactorID = "refactor"
 
@@ -182,6 +186,8 @@ type specRoundResult struct {
 	PicturesUnseen []string
 	// PicturesDiffer: codehalter's own render beside a spec picture, judged not to match by a fresh look.
 	PicturesDiffer []string
+	// PicturesBroken: a done item's screen whose render matched its picture before and differs now.
+	PicturesBroken []string
 	// TestReview: what a fresh look at the round's test changes found (only the in-round check asks).
 	TestReview []string
 	TurnErr    string
@@ -223,13 +229,13 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 		}
 	case r.Mode == specModeChange:
 		// The test for the OLD text still covers a changed item; the commit is the evidence of work.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.PicturesUnseen)+len(r.PicturesDiffer)+len(r.TestReview) == 0 &&
+		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.PicturesUnseen)+len(r.PicturesDiffer)+len(r.PicturesBroken)+len(r.TestReview) == 0 &&
 			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, "", ""
 		}
 	default:
 		// A reopened item's old test still names it: like a change, it needs a commit.
-		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen)+len(r.PicturesUnseen)+len(r.PicturesDiffer)+len(r.TestReview) == 0 && (r.Committed || !r.Redo) &&
+		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen)+len(r.PicturesUnseen)+len(r.PicturesDiffer)+len(r.PicturesBroken)+len(r.TestReview) == 0 && (r.Committed || !r.Redo) &&
 			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
 			return true, false, "", ""
 		}
@@ -249,7 +255,13 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 	}
 	if len(r.PicturesDiffer) > 0 && r.TurnErr == "" {
 		add("picture-differs", "codehalter rendered the screen itself and an independent look put it beside the spec's picture: the arrangement differs. "+strings.Join(r.PicturesDiffer, "; ")+
-			". Fix each in the program, the way a user sees the screen: changing only how the snapshot stages it fixes nothing")
+			". Fix each in the program, the way a user sees the screen: changing only how the snapshot stages it fixes nothing. "+
+			"One exception: where the picture shows something open over the window (a menu, a popover, a dialog), that is a surface of its own, and a render of the window alone does not contain it. "+
+			"The snapshot then draws the window first and the open surface on top of it, at the place it opens and at its own size; a render showing the menu alone, stretched over the whole window, is fixed in the snapshot")
+	}
+	if len(r.PicturesBroken) > 0 && r.TurnErr == "" {
+		add("picture-broken", "screens of items already done matched their pictures before and no longer do: "+strings.Join(r.PicturesBroken, "; ")+
+			". Put each back the way its picture shows, without undoing this item's own work: those items are done and their screens must stay as they were")
 	}
 	if len(r.TestReview) > 0 && r.TurnErr == "" {
 		add("testreview", "an independent review of the tests this round wrote found: "+strings.Join(r.TestReview, "; ")+
@@ -1337,6 +1349,34 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 		sha = r.a.specCommit(ctx, r.sid, r.sess.Cwd, cfg, r.idx, item, w.Mode)
 		res.Committed = sha != ""
 	}
+	// A round that reformats the whole project buries its own change: one ran `cargo fmt`, and its
+	// commit touched 859 files no edit tool had opened, every line of them then counted as the
+	// round's own by the lint gate. Said, so the user sees it; the rules ask rounds not to.
+	if sha != "" {
+		if out, err := specGit(ctx, r.sess.Cwd, "show", "--name-only", "--format=", sha); err == nil {
+			edited := map[string]bool{}
+			for _, u := range uses {
+				if u.Name != "edit_file" && u.Name != "write_file" {
+					continue
+				}
+				p := parseArgs(u.Input).str("path")
+				if rel, err := filepath.Rel(r.sess.Cwd, p); filepath.IsAbs(p) && err == nil {
+					p = rel
+				}
+				edited[filepath.ToSlash(filepath.Clean(p))] = true
+			}
+			var others []string
+			for _, f := range strings.Fields(out) {
+				if !edited[f] {
+					others = append(others, f)
+				}
+			}
+			if len(others) > specUneditedFilesSaid {
+				r.a.logSession(r.sid, "SPEC", "%s: commit %s changed %d files no edit tool touched", item, sha, len(others))
+				r.say(ctx, fmt.Sprintf("⚠ the commit of %s changed %d files that no edit in the round touched (%s, …): a command rewrote them, most likely a formatter run over the whole project. Look at `git show --stat %s`.\n", item, len(others), strings.Join(others[:3], ", "), sha[:min(len(sha), 10)]))
+			}
+		}
+	}
 	done, block, reason, fails := specDecide(cfg, item, res, r.fails[item])
 	// An over-size file the item had to grow is the code's shape, not the item: the
 	// next round splits it, and a round that failed only on it does not count. A file
@@ -1520,7 +1560,28 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 		}
 		// Only the final judgement looks, and only when the rest passed: a look costs a render and a call.
 		if runTests && res.TestsPass && res.TurnErr == "" && len(res.PicturesUnseen) == 0 && (w.Mode == specModeItem || w.Mode == specModeChange) {
-			res.PicturesDiffer = r.checkPictures(ctx, item, pics)
+			res.PicturesDiffer = r.checkPictures(ctx, item, pics, false)
+			// …and the screens of the items already done: only those whose render matched before and
+			// is different now are looked at (checkPictures).
+			seen := map[string]bool{}
+			for _, pic := range pics {
+				seen[pic] = true
+			}
+			for _, id := range slices.Sorted(maps.Keys(cfg.Items)) {
+				if _, ok := r.idx.items[id]; !ok || id == item || ctx.Err() != nil {
+					continue
+				}
+				var done []string
+				for _, pic := range specOwnPictures(r.idx.slice(id, cfg.SpecDir)) {
+					if !seen[pic] && cfg.Pictures[pic] != "" {
+						seen[pic] = true
+						done = append(done, pic)
+					}
+				}
+				for _, d := range r.checkPictures(ctx, id, done, true) {
+					res.PicturesBroken = append(res.PicturesBroken, id+"'s "+d)
+				}
+			}
 		}
 	}
 	covered, testFiles, err := specCoverage(r.outAbs, r.idx.order)

@@ -38,6 +38,7 @@ codehalter checks this itself after the round. Nothing else counts, not a summar
 - If you changed a UI source file, look at the result before you finish, whether or not the spec has a picture of it: render the screen with the `snapshot` recipe and look at the image with `screenshot`. Is every widget the text names on it, in the order it says; is nothing empty, overlapping, cut off or unlabeled? If this item's text shows a screen (the spec images listed under "Screens" at the end), look at the spec's image too and compare: widgets, their order, labels and tooltips must match; exact pixels, colours and spacing need not. Everything runs inside this container, headless: never ask for a display. A UI change without a look does not count as done.
 - Run the suite once, last, after your final edit, as its own command: `cd {{out_dir}} && {{test_cmd}}` (a redirection to a file is fine). A green run then counts as the check and codehalter does not run the suite a second time. Do not wrap it in a subshell or append `echo exit=$?`: the exit code is then the echo's and the run does not count.
 - Stay on this item. Another item's section is linked below only so you know it exists; its round will come.
+- Format only the files you changed (`rustfmt <file>`, `gofmt -w <file>`, `prettier --write <file>`), never the whole project (`cargo fmt`, `go fmt ./...`, `prettier --write .`): one round reformatted 859 files, its own change was lost among them, and every line of them was then checked as if the round had written it.
 
 {{previous}}
 

@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -23,13 +25,19 @@ type specPictureVerdict struct {
 	Differences []string `json:"differences"`
 }
 
-// checkPictures renders each of the item's own spec pictures with the snapshot recipe and asks a
+// checkPictures renders each of the item's spec pictures with the snapshot recipe and asks a
 // fresh call, which has no stake in the round, whether the render's arrangement matches. Being
 // shown the picture is not matching it: a round looked at a page cut off at the top, an empty
 // band under the run bar and labels drawn over each other, called it "content, not layout", and
 // passed. It returns one line per picture that differs; a look that could not be had is said and
 // not counted, so a broken verifier never costs the item an attempt.
-func (r *specRun) checkPictures(ctx context.Context, item string, pics []string) []string {
+//
+// A render that matches is remembered by its bytes (specConfig.Pictures). With onlyChanged, the
+// check is of a done item's screens: a picture that never matched is not rendered, and a render
+// with the bytes that last matched is not looked at, so an unchanged screen costs one render and
+// no call. Rounds on one screen had broken another (a Cut round lost the Prepare rows' ✂), and
+// only that screen's own next round saw it, which broke a third.
+func (r *specRun) checkPictures(ctx context.Context, item string, pics []string, onlyChanged bool) []string {
 	if len(pics) == 0 || !r.a.imagesSupported.Load() {
 		return nil
 	}
@@ -45,12 +53,26 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string)
 	// A chapter over the cap keeps the item's own section whole and shortens the rest.
 	doc := r.idx.docs[r.idx.items[item].Doc]
 	section := strings.Join(doc.lines, "\n")
+	// …and the sections the item links in other chapters: the Prepare screen's source rows are
+	// specified in the shell's chapter, whose "prototype: ✂ … so it is not reused" the check had
+	// not seen, and it listed the ✂ the rewrite replaces as missing.
+	sl := r.idx.slice(item, r.cfg.SpecDir)
+	if _, linked, ok := strings.Cut(sl.Text, "\n\n--- "); ok {
+		for _, block := range strings.Split("--- "+linked, "\n\n--- ") {
+			if !strings.HasPrefix(strings.TrimPrefix(block, "--- "), r.cfg.SpecDir+"/"+doc.rel+" ") {
+				section += "\n\n--- " + strings.TrimPrefix(block, "--- ")
+			}
+		}
+	}
 	if len(section) > specPictureSpecBytes {
-		own := clipBytes(r.idx.slice(item, r.cfg.SpecDir).Text, specPictureSpecBytes/2)
+		own := clipBytes(sl.Text, specPictureSpecBytes/2)
 		section = own + "\n\n--- the rest of " + doc.rel + ", shortened:\n\n" + clipBytes(section, specPictureSpecBytes-len(own))
 	}
 	var differs []string
 	for _, pic := range pics {
+		if onlyChanged && r.cfg.Pictures[pic] == "" {
+			continue
+		}
 		stem := strings.TrimSuffix(filepath.Base(pic), filepath.Ext(pic))
 		// The round's own render may be older than its last edit: this one is of the code as committed.
 		since := time.Now()
@@ -76,12 +98,26 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string)
 			renderRel = render
 		}
 		renderRel = filepath.ToSlash(renderRel)
-		v, err := r.lookAtPicture(ctx, conn, pic, renderRel, render, section)
+		renderData, err := os.ReadFile(render)
+		if err != nil {
+			r.say(ctx, fmt.Sprintf("⚠ picture check of %s could not read the render %s, so it does not count against %s: %v\n", pic, renderRel, item, err))
+			continue
+		}
+		sum := sha256.Sum256(renderData)
+		renderHash := hex.EncodeToString(sum[:])
+		if onlyChanged && r.cfg.Pictures[pic] == renderHash {
+			continue
+		}
+		v, err := r.lookAtPicture(ctx, conn, pic, renderRel, renderData, section)
 		switch {
 		case err != nil:
 			r.a.logSession(r.sid, "PICTURE", "%s beside %s: no verdict: %v", pic, renderRel, err)
 			r.say(ctx, fmt.Sprintf("⚠ picture check of %s could not be had, so it does not count against %s: %v\n", pic, item, err))
 		case strings.EqualFold(v.Verdict, "MATCH"):
+			if r.cfg.Pictures == nil {
+				r.cfg.Pictures = map[string]string{}
+			}
+			r.cfg.Pictures[pic] = renderHash
 			r.a.logSession(r.sid, "PICTURE", "%s beside %s: MATCH", pic, renderRel)
 			r.say(ctx, fmt.Sprintf("🖼 %s matches its picture %s\n", renderRel, pic))
 		default:
@@ -98,13 +134,9 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string)
 }
 
 // lookAtPicture asks for one verdict on the spec's picture and the render, both attached.
-func (r *specRun) lookAtPicture(ctx context.Context, conn *LLMConnection, pic, renderRel, renderAbs, section string) (specPictureVerdict, error) {
+func (r *specRun) lookAtPicture(ctx context.Context, conn *LLMConnection, pic, renderRel string, renderData []byte, section string) (specPictureVerdict, error) {
 	var v specPictureVerdict
 	picData, err := os.ReadFile(filepath.Join(r.sess.Cwd, pic))
-	if err != nil {
-		return v, err
-	}
-	renderData, err := os.ReadFile(renderAbs)
 	if err != nil {
 		return v, err
 	}
