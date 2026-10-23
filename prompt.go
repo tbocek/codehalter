@@ -756,9 +756,10 @@ func failureDigest(uses []ToolUse) string {
 		case u.Name == "run_command", u.Name == "run_background", u.Name == "run_server":
 			runs++
 		}
-		// A short answer ("exit 0") says which call only by the call itself.
+		// A short answer ("exit 0") says which call only by the call itself, and so does a
+		// write's: 32 different edits had been summed up as the first one "repeated 32 times".
 		h := "call " + u.Name + " " + u.Input
-		if out := repeatText(u.Input, u.Output); len(out) >= repeatMinOutput {
+		if out := repeatText(u.Input, u.Output); len(out) >= repeatMinOutput && answerRepeats(u.Name) {
 			h = "answer " + out
 		}
 		if count[h]++; first[h] == "" {

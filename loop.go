@@ -571,6 +571,12 @@ const repeatMinOutput = 24
 
 func callKey(tc toolCall) string { return tc.Function.Name + "\x00" + tc.Function.Arguments }
 
+// answerRepeats: a write's answer ("file written successfully", its error) and a job's launch
+// note read alike for any call, so only the same call again repeats them, not the same answer.
+func answerRepeats(name string) bool {
+	return name != "edit_file" && name != "write_file" && name != "run_background" && name != "run_server"
+}
+
 // repeatText is an output as compared across calls: no batching note, no lines the
 // call spelled out itself (an echo label), clock times and dates folded.
 func repeatText(args, output string) string {
@@ -649,11 +655,9 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse, changed bool) boo
 	if prev, ok := mem.bag[key]; ok && jaccard(prev, bag) >= stuckOutputSimilarity {
 		repeated = true
 	}
-	// A write's error and a job's launch note read alike for any call: only the
-	// same call again repeats them.
 	// The length is the answer's, without run_command's own exit line.
 	answer := strings.TrimSpace(strings.TrimPrefix(folded, "exit #"))
-	if name := tc.Function.Name; len(answer) >= repeatMinOutput && name != "edit_file" && name != "write_file" && name != "run_background" && name != "run_server" {
+	if len(answer) >= repeatMinOutput && answerRepeats(tc.Function.Name) {
 		repeated = repeated || mem.seen[h]
 		if rt.stuck[h] {
 			repeated, rt.hitStuck = true, true

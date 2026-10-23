@@ -357,6 +357,10 @@ func TestFailureDigest(t *testing.T) {
 		{"the same answer under new labels", []ToolUse{label("one"), label("two"), label("three")},
 			[]string{"Repeated: `echo one; grep -n prompt spec.md` 3 times."}, nil},
 		{"a long hunt", hunt, []string{"It kept looking things up"}, []string{"Repeated"}},
+		// Every edit that worked answers alike; only the same edit again is a repeat.
+		{"different edits that worked", []ToolUse{edit, {Name: "edit_file", Input: `{"path":"src/c.rs"}`, Output: edit.Output}, {Name: "edit_file", Input: `{"path":"src/d.rs"}`, Output: edit.Output}},
+			[]string{"3 edits"}, []string{"Repeated"}},
+		{"the same edit again", []ToolUse{edit, edit, edit}, []string{"Repeated: `edit_file {\"path\":\"src/a.rs\"}` 3 times."}, nil},
 	} {
 		got := failureDigest(tc.uses)
 		for _, w := range tc.want {
