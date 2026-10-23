@@ -64,6 +64,12 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string,
 			}
 		}
 	}
+	// …and the user's answers to the item's questions, which are spec as much as its text: the
+	// Cut screen's chapter does not link the shell's, and the check listed the run bar's "I'm
+	// feeling lucky", which replaces the prototype's chain, as a difference the answer had settled.
+	if ans := r.idx.answered(item); ans != "" {
+		section += "\n\n--- the user's answers to this item's questions in " + r.cfg.SpecDir + "/" + specQuestionsFile + ", spec as much as the text above ---\n\n" + ans
+	}
 	if len(section) > specPictureSpecBytes {
 		own := clipBytes(sl.Text, specPictureSpecBytes/2)
 		section = own + "\n\n--- the rest of " + doc.rel + ", shortened:\n\n" + clipBytes(section, specPictureSpecBytes-len(own))

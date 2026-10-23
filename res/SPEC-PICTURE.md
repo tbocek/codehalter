@@ -23,7 +23,7 @@ Compare the ARRANGEMENT, region by region, starting at the top left of the spec'
 - Is there a large empty area in the render where the picture has content, or one region taking far more of the window than in the picture (for example an empty band under a bar that is a thin row in the picture)?
 - Are controls in a row or a grid in the same order and grouping as in the picture (for example two label and control pairs per line in the picture, three in the render)?
 
-Below is the whole spec chapter this screen belongs to, followed by the sections of other chapters it links to (each headed `--- <file> · <title> ---`). The screen has its own section in it, and other sections describe parts the picture also shows (a bar, a list, a panel). The spec's words decide what must match, wherever in the chapter they stand; where they say nothing, the picture does. Before you list a control as missing or extra, look for it in the whole text below: a sentence in another section that calls it gone, replaced or prototype only settles it.
+Below is the whole spec chapter this screen belongs to, followed by the sections of other chapters it links to (each headed `--- <file> · <title> ---`) and the user's answers to this screen's questions, which are spec too. The screen has its own section in it, and other sections describe parts the picture also shows (a bar, a list, a panel). The spec's words decide what must match, wherever in the chapter they stand; where they say nothing, the picture does. Before you list a control as missing or extra, look for it in the whole text below: a sentence in another section that calls it gone, replaced or prototype only settles it.
 
 <spec_chapter>
 {{section}}
