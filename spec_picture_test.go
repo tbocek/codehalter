@@ -30,6 +30,8 @@ func TestSpecRoundPictureMustMatch(t *testing.T) {
 		".gitignore":             ".codehalter/\n",
 		"spec/03-shell.md":       "# 03 Shell\n\n## 1. Screen\n\nThe window, the log under the page, the [sources](02-list.md#1-sources). ![window](img/03-window.png)\n\n## 2. Run bar\n\nThe prototype's chain dropdown is gone in the rewrite.\n",
 		"spec/02-list.md":        "# 02 List\n\n## 1. Sources\n\nEach row ends in 🗣 (prototype: ✂, not reused).\n",
+		"spec/00-principles.md":  "# 00 Principles\n\nNo styles: the prototype's Style dropdown is gone.\n",
+		"spec/Readme.md":         "# The prototype\n\n" + strings.Repeat("The prototype's own manual, page after page.\n", 2000),
 		"spec/QUESTIONS.md":      "## §03-shell#1-screen · Which run bar?\n\n**Answer:** The chain dropdown in the picture is the prototype's; I'm feeling lucky replaces it.\n",
 		"spec/img/03-window.png": pic,
 		"render.png":             pic,
@@ -96,11 +98,15 @@ func TestSpecRoundPictureMustMatch(t *testing.T) {
 			images++
 		}
 	}
-	// The whole chapter, the sections it links in other chapters once each, and the item's
-	// answers: a window's picture also shows what other sections describe.
-	if text := parts[0].(map[string]any)["text"].(string); images != 2 || strings.Count(text, "The window, the log under the page") != 1 || !strings.Contains(text, "chain dropdown is gone in the rewrite") ||
-		!strings.Contains(text, "prototype: ✂, not reused") || !strings.Contains(text, "I'm feeling lucky replaces it") {
-		t.Errorf("the check got %d images and prompt %v, want the picture, the render, the whole chapter, the linked section and the answer", images, parts[0])
+	// The whole chapter, the sections it links in other chapters once each, the standing rules
+	// that fit and the item's answers: a window's picture also shows what other sections describe.
+	text := parts[0].(map[string]any)["text"].(string)
+	if images != 2 || strings.Count(text, "The window, the log under the page") != 1 || !strings.Contains(text, "chain dropdown is gone in the rewrite") ||
+		!strings.Contains(text, "prototype: ✂, not reused") || !strings.Contains(text, "I'm feeling lucky replaces it") || !strings.Contains(text, "the prototype's Style dropdown is gone") {
+		t.Errorf("the check got %d images and prompt %v, want the picture, the render, the whole chapter, the linked section, the standing rules and the answer", images, parts[0])
+	}
+	if strings.Contains(text, "The prototype's own manual") {
+		t.Error("a standing-rules file larger than the check's budget went in")
 	}
 
 	if !round("// v3, the fix\n") {

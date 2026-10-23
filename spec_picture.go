@@ -67,13 +67,33 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string,
 	// …and the user's answers to the item's questions, which are spec as much as its text: the
 	// Cut screen's chapter does not link the shell's, and the check listed the run bar's "I'm
 	// feeling lucky", which replaces the prototype's chain, as a difference the answer had settled.
+	// They are never shortened.
+	answers := ""
 	if ans := r.idx.answered(item); ans != "" {
-		section += "\n\n--- the user's answers to this item's questions in " + r.cfg.SpecDir + "/" + specQuestionsFile + ", spec as much as the text above ---\n\n" + ans
+		answers = "\n\n--- the user's answers to this item's questions in " + r.cfg.SpecDir + "/" + specQuestionsFile + ", spec as much as the text above ---\n\n" + ans
 	}
-	if len(section) > specPictureSpecBytes {
+	if len(section)+len(answers) > specPictureSpecBytes {
 		own := clipBytes(sl.Text, specPictureSpecBytes/2)
-		section = own + "\n\n--- the rest of " + doc.rel + ", shortened:\n\n" + clipBytes(section, specPictureSpecBytes-len(own))
+		section = own + "\n\n--- the rest of " + doc.rel + ", shortened:\n\n" + clipBytes(section, max(0, specPictureSpecBytes-len(own)-len(answers)))
 	}
+	// …and the spec's standing rules (specConfig.context), each whole and only while it fits: every
+	// screen's picture shows the prototype's window frame, and what the rewrite dropped from it ("No
+	// styles", the chain dropdown) is said there once, not in each screen's chapter. A file over
+	// what is left (one spec's prototype readme was 92 KB) stays out rather than half in.
+	for _, name := range r.cfg.context(r.idx) {
+		for _, d := range r.idx.docs {
+			if d.rel != name || name == doc.rel {
+				continue
+			}
+			rules := "\n\n--- " + r.cfg.SpecDir + "/" + name + ", standing rules for every screen ---\n\n" + strings.Join(d.lines, "\n")
+			if len(section)+len(answers)+len(rules) > specPictureSpecBytes {
+				r.a.logSession(r.sid, "PICTURE", "standing rules %s/%s left out of the check of %s: %d bytes, %d left", r.cfg.SpecDir, name, item, len(rules), specPictureSpecBytes-len(section)-len(answers))
+				continue
+			}
+			section += rules
+		}
+	}
+	section += answers
 	var differs []string
 	for _, pic := range pics {
 		if onlyChanged && r.cfg.Pictures[pic] == "" {
