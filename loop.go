@@ -306,8 +306,14 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 
 	// submit_plan revises the remaining plan in place (see subtaskOutcome.Upsert).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
-	// tool_choice=required: this phase ends only on a terminal tool, so prose is always a slip.
-	conn := a.connFor("execute").withThinkingDisabled().withBody("tool_choice", "required")
+	// tool_choice=auto, not required: this phase ends only on a terminal tool, so prose is a slip the
+	// phase contract corrects, but a forced call is decided before the model has weighed what it was
+	// just told. Halogen starts the call for the model under "required", and the name that comes out is
+	// the last one called: replayed 8 times each, the request after a refused edit ("read it with
+	// read_file first") resent the same edit 8/8 under required, with the refusal rewritten or a user
+	// message added too, and called read_file 8/8 under auto, reasoning off in both. The executor had
+	// made 0 read_file calls in 12 runs, and edit loops of 90 to 299 calls, under required.
+	conn := a.connFor("execute").withThinkingDisabled().withBody("tool_choice", "auto")
 	res, err := a.runToolLoop(ctx, sid, conn, policy, "execute", true, executeFailCap)
 
 	out := subtaskOutcome{Result: res}

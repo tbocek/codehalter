@@ -409,7 +409,7 @@ func TestReadFileBySymbol(t *testing.T) {
 		t.Errorf("symbol read = failed %v:\n%s", failed, out)
 	}
 	tc.Function.Arguments = fmt.Sprintf(`{"path":%q,"symbol":"missing"}`, path)
-	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !tu.Failed || !strings.Contains(tu.Output, "grep -rn") {
+	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !tu.Failed || !strings.Contains(tu.Output, "with `search` first") {
 		t.Errorf("unknown symbol = failed %v: %s", tu.Failed, tu.Output)
 	}
 }

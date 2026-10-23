@@ -209,7 +209,7 @@ func (a *agent) readTarget(ctx context.Context, sid string, args toolArgs) (stri
 			if len(loc.mentions) > 0 {
 				msg += fmt.Sprintf(" The name appears at lines %s; read one of those with line=, or pass the exact declared name.", joinInts(loc.mentions))
 			} else {
-				msg += " The name does not appear in this file at all; find the right file with `grep -rn` first."
+				msg += " The name does not appear in this file at all; find the right file with `search` first."
 			}
 			return msg, true
 		}

@@ -372,9 +372,9 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	if _, set := body["chat_template_kwargs"]; set {
 		t.Errorf("execute re-rendered the prompt instead of appending: %v", body["chat_template_kwargs"])
 	}
-	// A grammar, not a re-render, so the prefix is untouched.
-	if body["tool_choice"] != "required" {
-		t.Errorf("execute call tool_choice = %v, want required", body["tool_choice"])
+	// Not forced: a forced call is named before the model weighs what it was told.
+	if body["tool_choice"] != "auto" {
+		t.Errorf("execute call tool_choice = %v, want auto", body["tool_choice"])
 	}
 	sent, _ := body["messages"].([]any)
 	if len(sent) == 0 {
