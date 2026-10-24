@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -969,6 +970,59 @@ func TestKeysAreEditedInCharacterMode(t *testing.T) {
 			t.Errorf("keys %q sent %s, want the text %s", k.keys, params, want)
 		}
 		p.reply(req, map[string]any{"stopReason": "end_turn"})
+	}
+}
+
+// Ctrl+V attaches the clipboard's picture: a marker in the line, an image block in the prompt beside the
+// text. A marker deleted before Enter leaves its picture out, and a model that takes no images gets none.
+func TestCtrlVAttachesTheClipboardImage(t *testing.T) {
+	pr, pw := io.Pipe()
+	c, p, out := newCLIHarness(t, "")
+	c.in = bufio.NewReader(pr)
+	c.setSessionID("s1")
+	c.ui.inputOn = true
+	c.imagesAccepted.Store(true)
+	png := []byte("\x89PNG\r\n\x1a\nfake")
+	c.clipboard = func() ([]byte, string, error) { return png, "image/png", nil }
+	go c.repl()
+	t.Cleanup(func() { pw.Close() })
+
+	send := func(keys string) []ContentBlock {
+		t.Helper()
+		if _, err := pw.Write([]byte(keys)); err != nil {
+			t.Fatal(err)
+		}
+		req := within(t, p)
+		raw, _ := json.Marshal(req["params"])
+		var got PromptRequest
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		p.reply(req, map[string]any{"stopReason": "end_turn"})
+		return got.Content
+	}
+
+	content := send("what is wrong here? \x16\r")
+	if len(content) != 2 || content[0].Text != "what is wrong here? [image 1]" {
+		t.Fatalf("content = %+v, want the text with its marker and one image", content)
+	}
+	if img := content[1]; img.Type != "image" || img.MimeType != "image/png" ||
+		img.Data != base64.StdEncoding.EncodeToString(png) {
+		t.Errorf("image block = %+v, want the clipboard's PNG", img)
+	}
+
+	// The marker typed away (Ctrl+U), so the picture is not sent.
+	if content := send("\x16\x15no picture\r"); len(content) != 1 {
+		t.Errorf("a deleted marker still sent %d blocks", len(content))
+	}
+
+	// A model that cannot see: Ctrl+V says so and attaches nothing.
+	c.imagesAccepted.Store(false)
+	if content := send("\x16text only\r"); len(content) != 1 || strings.Contains(content[0].Text, "[image") {
+		t.Errorf("content = %+v, want the text alone", content)
+	}
+	if !strings.Contains(out.String(), "this model takes no images") {
+		t.Errorf("the refusal was not said: %q", out.String())
 	}
 }
 

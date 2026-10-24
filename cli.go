@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -202,6 +203,12 @@ type cliClient struct {
 	// turnActive is read by the signal handler, which must not take the UI lock.
 	turnActive atomic.Bool
 
+	// imagesAccepted is the agent's promptCapabilities.image: a model that cannot see takes no picture,
+	// so Ctrl+V says so rather than attaching one the turn would drop.
+	imagesAccepted atomic.Bool
+	// clipboard reads the image Ctrl+V attaches; nil is the system's (clipboardImage; tests set their own).
+	clipboard func() ([]byte, string, error)
+
 	// askMu serialises questions: parallel tool calls can both ask the user.
 	askMu sync.Mutex
 
@@ -233,16 +240,21 @@ func (c *cliClient) setSessionID(id string) {
 }
 
 func (c *cliClient) run(resume bool, resumeID, prompt string, oneshot bool) int {
-	if _, err := c.conn.request("initialize", map[string]any{
+	raw, err := c.conn.request("initialize", map[string]any{
 		"protocolVersion": protocolVersion,
 		"clientCapabilities": map[string]any{
 			"terminal":    true,
 			"elicitation": map[string]any{"form": map[string]any{}},
 			"fs":          map[string]any{"readTextFile": false, "writeTextFile": false},
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		fmt.Fprintf(os.Stdout, "initialize failed: %v\n", err)
 		return 1
+	}
+	var init InitializeResponse
+	if json.Unmarshal(raw, &init) == nil {
+		c.imagesAccepted.Store(init.AgentCapabilities.PromptCapabilities.Image)
 	}
 
 	if err := c.openSession(resume, resumeID); err != nil {
@@ -252,7 +264,7 @@ func (c *cliClient) run(resume bool, resumeID, prompt string, oneshot bool) int 
 	c.installSignals()
 
 	if oneshot {
-		if c.turn(prompt) {
+		if c.turn(prompt, nil) {
 			return 0
 		}
 		return 1
@@ -360,6 +372,8 @@ func (c *cliClient) installSignals() {
 type cliLine struct {
 	text string
 	err  error
+	// images are the pictures Ctrl+V attached to this line, each still named by its marker in text.
+	images []ContentBlock
 }
 
 // repl keeps reading while a turn runs: a /spec loop is one turn that runs for hours, and
@@ -416,12 +430,12 @@ func (c *cliClient) repl() int {
 			continue
 		}
 		if busy {
-			go c.steer(text)
+			go c.steer(text, ln.images)
 			continue
 		}
 		busy = true
 		go func() {
-			c.turn(text)
+			c.turn(text, ln.images)
 			turnDone <- struct{}{}
 		}()
 	}
@@ -429,10 +443,10 @@ func (c *cliClient) repl() int {
 
 // steer sends a line typed during a turn; the agent folds it into the running turn and
 // answers at once.
-func (c *cliClient) steer(text string) {
+func (c *cliClient) steer(text string, images []ContentBlock) {
 	if _, err := c.conn.request("session/prompt", PromptRequest{
 		SessionId: c.sessionID(),
-		Content:   []ContentBlock{{Type: "text", Text: text}},
+		Content:   promptBlocks(text, images),
 	}); err != nil {
 		c.ui.Note(ansiRed, "  not delivered: "+err.Error())
 	}
@@ -444,7 +458,7 @@ func (c *cliClient) readInput() {
 	if !c.ui.inputActive() {
 		for {
 			text, err := c.readPrompt()
-			c.inputs <- cliLine{text, err}
+			c.inputs <- cliLine{text: text, err: err}
 			if err != nil {
 				return
 			}
@@ -455,6 +469,9 @@ func (c *cliClient) readInput() {
 	var buf, draft []rune
 	var history [][]rune
 	cur, hist, paste := 0, 0, false
+	// attached holds the pictures Ctrl+V put on the line being typed; each is named in the line by its
+	// marker, and deleting the marker leaves the picture out of the prompt.
+	var attached []ContentBlock
 	insert := func(rs ...rune) {
 		buf = slices.Insert(buf, cur, rs...)
 		cur += len(rs)
@@ -557,8 +574,19 @@ func (c *cliClient) readInput() {
 			if line != "" && (len(history) == 0 || string(history[len(history)-1]) != line) {
 				history = append(history, []rune(line))
 			}
-			c.inputs <- cliLine{text: line}
-			buf, draft, cur, hist = buf[:0], nil, 0, len(history)
+			var images []ContentBlock
+			for i, img := range attached {
+				if strings.Contains(line, imageMarker(i)) {
+					images = append(images, img)
+				}
+			}
+			c.inputs <- cliLine{text: line, images: images}
+			buf, draft, cur, hist, attached = buf[:0], nil, 0, len(history), nil
+		case r == 0x16: // Ctrl+V: a picture from the clipboard
+			if img, ok := c.pasteImage(len(attached)); ok {
+				attached = append(attached, img)
+				insert([]rune(imageMarker(len(attached)-1) + " ")...)
+			}
 		case r == 0x7f || r == 0x08: // backspace
 			if cur > 0 {
 				buf = slices.Delete(buf, cur-1, cur)
@@ -590,6 +618,30 @@ func (c *cliClient) readInput() {
 		}
 		c.ui.SetInput(slices.Clone(buf), cur)
 	}
+}
+
+// imageMarker names the i-th picture attached to a line, in the line itself.
+func imageMarker(i int) string {
+	return fmt.Sprintf("[image %d]", i+1)
+}
+
+// pasteImage reads the clipboard's picture for Ctrl+V, saying why when there is none to attach.
+func (c *cliClient) pasteImage(n int) (ContentBlock, bool) {
+	if !c.imagesAccepted.Load() {
+		c.ui.Note(ansiYell, "  this model takes no images")
+		return ContentBlock{}, false
+	}
+	read := c.clipboard
+	if read == nil {
+		read = clipboardImage
+	}
+	data, mime, err := read()
+	if err != nil {
+		c.ui.Note(ansiYell, "  Ctrl+V: "+err.Error())
+		return ContentBlock{}, false
+	}
+	c.ui.Note(ansiDim, fmt.Sprintf("  %s: %s, %d KB", imageMarker(n), mime, (len(data)+1023)/1024))
+	return ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}, true
 }
 
 // On a terminal, input already buffered when the first line ends is a paste and joins the
@@ -713,14 +765,19 @@ func (c *cliClient) resumeSession(id string) {
 	c.ui.Note(ansiDim, "  session "+c.sessionID())
 }
 
-func (c *cliClient) turn(text string) bool {
+// promptBlocks is a prompt's content: the typed text, then the pictures attached to it.
+func promptBlocks(text string, images []ContentBlock) []ContentBlock {
+	return append([]ContentBlock{{Type: "text", Text: text}}, images...)
+}
+
+func (c *cliClient) turn(text string, images []ContentBlock) bool {
 	c.turnActive.Store(true)
 	c.ui.Begin()
 	stop := c.startTicker()
 
 	raw, err := c.conn.request("session/prompt", PromptRequest{
 		SessionId: c.sessionID(),
-		Content:   []ContentBlock{{Type: "text", Text: text}},
+		Content:   promptBlocks(text, images),
 	})
 
 	stop()

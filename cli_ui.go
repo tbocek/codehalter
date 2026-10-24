@@ -139,7 +139,9 @@ func (u *cliUI) startInput() func() {
 	if err != nil {
 		return func() {}
 	}
-	if _, err := stty("-icanon", "-echo", "min", "1", "time", "0"); err != nil {
+	// -iexten: macOS's terminal driver still takes Ctrl+V as "literal next" in this mode and eats it, so the
+	// editor's Ctrl+V (attach the clipboard's picture) never arrived; Linux passes it through either way.
+	if _, err := stty("-icanon", "-echo", "-iexten", "min", "1", "time", "0"); err != nil {
 		return func() {}
 	}
 	u.mu.Lock()
