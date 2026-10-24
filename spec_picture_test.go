@@ -140,3 +140,71 @@ func TestSpecRoundPictureMustMatch(t *testing.T) {
 		t.Errorf("%d checks, want none for a render that is the one that matched", m.callCount())
 	}
 }
+
+// A screen that draws differently twice on the same code is not looked at and does not count
+// against the item: the next item round is asked to make the snapshot deterministic first, and
+// the note stays until a round draws it the same twice.
+func TestSpecUnsteadySnapshotIsNotTheItemsFault(t *testing.T) {
+	if _, err := exec.LookPath("just"); err != nil {
+		t.Skip("no just")
+	}
+	a, sess := newTestAgent(t)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 8, 6))); err != nil {
+		t.Fatal(err)
+	}
+	writeTree(t, sess.Cwd, map[string]string{
+		".gitignore":             ".codehalter/\n",
+		"spec/03-shell.md":       "# 03 Shell\n\n## 1. Screen\n\nThe window. ![window](img/03-window.png)\n",
+		"spec/img/03-window.png": buf.String(),
+		"render.png":             buf.String(),
+		// Until ../steady exists, every render holds other bytes, as a picture taken before the screen settled.
+		"rust/justfile":   "test:\n\ttrue\n\nsnapshot name:\n\tmkdir -p shots && if [ -e ../steady ]; then cp ../render.png shots/{{name}}.png; else head -c 64 /dev/urandom > shots/{{name}}.png; fi\n",
+		"rust/src/lib.rs": "// v1\n",
+	})
+	idx, err := scanSpec(filepath.Join(sess.Cwd, "spec"), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := idx.order[0]
+	gitInit(t, sess.Cwd)
+	m := newMockLLM(t, sseText(`{"verdict": "MATCH", "differences": []}`))
+	defer m.Close()
+	a.settings = Settings{LLM: []LLMConnection{*m.conn("execute")}}
+	a.imagesSupported.Store(true)
+	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "true", LintCmd: "off", Items: map[string]specLedger{}}
+	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: cfg, idx: idx, outAbs: filepath.Join(sess.Cwd, "rust"), reasons: map[string]string{}}
+	defer sess.startToolLog()()
+	round := func(w specWork, change string) bool {
+		t.Helper()
+		// Each round's own test, so only the picture decides.
+		writeTree(t, sess.Cwd, map[string]string{"rust/src/lib.rs": change, "rust/tests/screen.rs": change + "#[test]\nfn " + specTestToken(item) + "_window() {}\n"})
+		mark := sess.toolMark()
+		a.recordToolUse(sess.ID, toolCall{ID: "c-" + change}, ToolUse{Output: "exit 0\n[codehalter, not the user: " + sideBySideMark + "spec/img/03-window.png. ...]"})
+		done, block, err := r.finishRound(t.Context(), w, nil, mark, time.Now())
+		if err != nil || block {
+			t.Fatalf("done=%v block=%v err=%v", done, block, err)
+		}
+		return done
+	}
+
+	if !round(specWork{Item: item}, "// v2\n") {
+		t.Errorf("an unsteady snapshot counted against the item: %q", r.reasons[item])
+	}
+	if m.callCount() != 0 || !strings.Contains(cfg.Snapshot, "`just snapshot 03-window` in rust/") {
+		t.Errorf("%d looks, snapshot note %q: want no look and the command named", m.callCount(), cfg.Snapshot)
+	}
+	// The next round is asked first; drawing it differently again is not a fix.
+	w := specWork{Item: item, Snapshot: cfg.Snapshot}
+	if prompt, _ := a.specRoundPrompt(sess.ID, cfg, idx, w, "true", "off"); !strings.Contains(prompt, "First: a snapshot that is not deterministic") || !strings.Contains(prompt, "`just snapshot 03-window`") {
+		t.Errorf("the next round was not asked to fix the snapshot:\n%s", prompt)
+	}
+	round(w, "// v3, not fixed\n")
+	if cfg.Snapshot == "" {
+		t.Error("the note was cleared by a round that drew the screen differently again")
+	}
+	writeTree(t, sess.Cwd, map[string]string{"steady": ""})
+	if !round(specWork{Item: item, Snapshot: cfg.Snapshot}, "// v4, the fix\n") || m.callCount() != 1 || cfg.Snapshot != "" {
+		t.Errorf("after the fix: %d looks, note %q, reason %q; want one look, no note, done", m.callCount(), cfg.Snapshot, r.reasons[item])
+	}
+}

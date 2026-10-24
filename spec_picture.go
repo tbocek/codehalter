@@ -29,23 +29,24 @@ type specPictureVerdict struct {
 // fresh call, which has no stake in the round, whether the render's arrangement matches. Being
 // shown the picture is not matching it: a round looked at a page cut off at the top, an empty
 // band under the run bar and labels drawn over each other, called it "content, not layout", and
-// passed. It returns one line per picture that differs; a look that could not be had is said and
-// not counted, so a broken verifier never costs the item an attempt.
+// passed. It returns one line per picture that differs, and one per screen whose two renders of
+// the same code differ; a look that could not be had is said and not counted, so a broken
+// verifier never costs the item an attempt.
 //
 // A render that matches is remembered by its bytes (specConfig.Pictures). With onlyChanged, the
 // check is of a done item's screens: a picture that never matched is not rendered, and a render
 // with the bytes that last matched is not looked at, so an unchanged screen costs one render and
 // no call. Rounds on one screen had broken another (a Cut round lost the Prepare rows' ✂), and
 // only that screen's own next round saw it, which broke a third.
-func (r *specRun) checkPictures(ctx context.Context, item string, pics []string, onlyChanged bool) []string {
+func (r *specRun) checkPictures(ctx context.Context, item string, pics []string, onlyChanged bool) (differs, unsteady []string) {
 	if len(pics) == 0 || !r.a.imagesSupported.Load() {
-		return nil
+		return nil, nil
 	}
 	r.a.cfgMu.RLock()
 	conn := r.a.settings.ConnAt(0, "execute")
 	r.a.cfgMu.RUnlock()
 	if conn == nil {
-		return nil
+		return nil, nil
 	}
 	// The item's whole chapter, not only its section: a window's picture shows parts other
 	// sections describe (the run bar, a sources list whose frame-size control the rewrite drops),
@@ -94,27 +95,31 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string,
 		}
 	}
 	section += answers
-	var differs []string
 	for _, pic := range pics {
 		if onlyChanged && r.cfg.Pictures[pic] == "" {
 			continue
 		}
 		stem := strings.TrimSuffix(filepath.Base(pic), filepath.Ext(pic))
-		// The round's own render may be older than its last edit: this one is of the code as committed.
-		since := time.Now()
 		cmd := "just snapshot " + stem
-		ok, tail, _ := r.a.runCheckCommand(ctx, r.sid, r.outAbs, fmt.Sprintf("Rendering %s for the picture check", stem), cmd)
-		if ctx.Err() != nil {
-			return differs
-		}
-		render := ""
-		for _, p := range pngsWrittenSince(r.outAbs, since) {
-			if strings.EqualFold(strings.TrimSuffix(filepath.Base(p), filepath.Ext(p)), stem) {
-				render = p
-				break
+		// The round's own render may be older than its last edit: this one is of the code as committed.
+		shoot := func(title string) (render, tail string) {
+			since := time.Now()
+			ok, tail, _ := r.a.runCheckCommand(ctx, r.sid, r.outAbs, title, cmd)
+			if !ok {
+				return "", tail
 			}
+			for _, p := range pngsWrittenSince(r.outAbs, since) {
+				if strings.EqualFold(strings.TrimSuffix(filepath.Base(p), filepath.Ext(p)), stem) {
+					return p, tail
+				}
+			}
+			return "", tail
 		}
-		if !ok || render == "" {
+		render, tail := shoot(fmt.Sprintf("Rendering %s for the picture check", stem))
+		if ctx.Err() != nil {
+			return differs, unsteady
+		}
+		if render == "" {
 			differs = append(differs, fmt.Sprintf("%s: `%s` in %s/ wrote no %s.png, so the screen could not be put beside its picture. Its output ends:\n```\n%s\n```",
 				pic, cmd, r.cfg.OutDir, stem, strings.TrimSpace(tailUTF8(tail, 1200))))
 			continue
@@ -132,6 +137,21 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string,
 		sum := sha256.Sum256(renderData)
 		renderHash := hex.EncodeToString(sum[:])
 		if onlyChanged && r.cfg.Pictures[pic] == renderHash {
+			continue
+		}
+		// Rendered again before it is looked at: a snapshot taken after a guessed wait caught one Cut
+		// page with its form column scrolled and the next at its top, and a done screen counted as
+		// broken by a round that never touched it. Two renders of the same code that differ are the
+		// snapshot's fault, not the item's: not looked at, and the next item round fixes it first.
+		again, _ := shoot(fmt.Sprintf("Rendering %s again, to see that the same code gives the same picture", stem))
+		if ctx.Err() != nil {
+			return differs, unsteady
+		}
+		againData, err := os.ReadFile(again)
+		if again == "" || err != nil || !bytes.Equal(againData, renderData) {
+			r.a.logSession(r.sid, "PICTURE", "%s: two renders of the same code differ", pic)
+			r.say(ctx, fmt.Sprintf("⚠ **Snapshot not deterministic:** `%s` drew %s differently twice on the same code, so it is not looked at and does not count against %s. The next item round makes it deterministic first.\n", cmd, stem, item))
+			unsteady = append(unsteady, fmt.Sprintf("`%s` in %s/ (the screen of %s)", cmd, r.cfg.OutDir, pic))
 			continue
 		}
 		v, err := r.lookAtPicture(ctx, conn, pic, renderRel, renderData, section)
@@ -156,7 +176,7 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string,
 			differs = append(differs, fmt.Sprintf("%s beside %s: %s", renderRel, pic, found))
 		}
 	}
-	return differs
+	return differs, unsteady
 }
 
 // lookAtPicture asks for one verdict on the spec's picture and the render, both attached.

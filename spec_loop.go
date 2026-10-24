@@ -188,6 +188,8 @@ type specRoundResult struct {
 	PicturesDiffer []string
 	// PicturesBroken: a done item's screen whose render matched its picture before and differs now.
 	PicturesBroken []string
+	// Unsteady: snapshot commands that drew the same code differently twice (specConfig.Snapshot).
+	Unsteady []string
 	// TestReview: what a fresh look at the round's test changes found (only the in-round check asks).
 	TestReview []string
 	TurnErr    string
@@ -453,6 +455,9 @@ type specWork struct {
 	// Flaky: a test failed and then passed unchanged (specConfig.Flaky); this round
 	// makes it deterministic first.
 	Flaky string
+	// Snapshot: snapshot commands that drew the same code differently twice
+	// (specConfig.Snapshot); this round makes them deterministic first.
+	Snapshot string
 }
 
 func (r *specRun) say(ctx context.Context, s string) { r.a.say(ctx, r.sid, s) }
@@ -713,7 +718,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 
 		w.LintMissing = r.lintMissing
 		if w.Mode == specModeItem || w.Mode == specModeChange {
-			w.Flaky, w.Isolation = cfg.Flaky, cfg.Isolation
+			w.Flaky, w.Isolation, w.Snapshot = cfg.Flaky, cfg.Isolation, cfg.Snapshot
 		}
 		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, r.testCmd(), r.lintCmd())
 		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
@@ -1442,6 +1447,9 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 			if w.Isolation != "" && cfg.Isolation == w.Isolation {
 				cfg.Isolation = ""
 			}
+			if w.Snapshot != "" && cfg.Snapshot == w.Snapshot {
+				cfg.Snapshot = ""
+			}
 			cfg.Refactored = nil
 			// The fingerprint below is taken without the answers, so their going is no change to the spec.
 			r.dropAnswers(ctx, item)
@@ -1486,6 +1494,11 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 	default:
 		r.reasons[item] = reason
 		r.say(ctx, fmt.Sprintf("↻ %s is not done yet, one more round: %s\n", item, firstLine(reason)))
+	}
+	// Set after the clearing above: a round that was asked to fix a snapshot and drew it
+	// differently again has not fixed it.
+	if len(res.Unsteady) > 0 {
+		cfg.Snapshot = strings.Join(res.Unsteady, "\n")
 	}
 	r.save(ctx)
 	return done, block, nil
@@ -1560,7 +1573,7 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 		}
 		// Only the final judgement looks, and only when the rest passed: a look costs a render and a call.
 		if runTests && res.TestsPass && res.TurnErr == "" && len(res.PicturesUnseen) == 0 && (w.Mode == specModeItem || w.Mode == specModeChange) {
-			res.PicturesDiffer = r.checkPictures(ctx, item, pics, false)
+			res.PicturesDiffer, res.Unsteady = r.checkPictures(ctx, item, pics, false)
 			// …and the screens of the items already done: only those whose render matched before and
 			// is different now are looked at (checkPictures).
 			seen := map[string]bool{}
@@ -1578,9 +1591,11 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 						done = append(done, pic)
 					}
 				}
-				for _, d := range r.checkPictures(ctx, id, done, true) {
+				broken, unsteady := r.checkPictures(ctx, id, done, true)
+				for _, d := range broken {
 					res.PicturesBroken = append(res.PicturesBroken, id+"'s "+d)
 				}
+				res.Unsteady = append(res.Unsteady, unsteady...)
 			}
 		}
 	}
@@ -1650,6 +1665,10 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 	if w.Isolation != "" {
 		previous = strings.TrimSpace("## First: tests that are not isolated\n\ncodehalter ran the test command with a fresh `$TMPDIR`, and the run wrote these outside it:\n\n```\n" +
 			strings.ReplaceAll(w.Isolation, "```", "` ` `") + "\n```\n\nA test that writes a fixed path collides with the same test running beside it, so the suite cannot run its test files in parallel. Before this item, find the tests that write these and make each write only into its own temporary directory (the platform's temp-dir call, which follows `$TMPDIR`); where the program itself writes to a fixed place, the test passes it a directory of its own. Delete what the runs left behind.\n\n" + previous)
+	}
+	if w.Snapshot != "" {
+		previous = strings.TrimSpace("## First: a snapshot that is not deterministic\n\ncodehalter ran each of these twice on the same code, and the two pictures differ:\n\n" +
+			w.Snapshot + "\n\nA screen that draws differently from run to run cannot be compared with its picture in the spec: the check judges whichever state the render happened to catch, and a screen that was right is reported broken. Before this item, make each of them write the same bytes on every run. The usual cause is a picture taken after a guess: a timer, a fixed number of frames, or the first frame, which catches a setup step (a scroll to the top, a divider placed once its widget has a size, the window taking its size, data loaded in the background) done in one run and not yet in the next. Take the picture at an event the app raises itself: each such step registers as owed when it is scheduled and as done when it ran, the screen is ready at the first painted frame where nothing shown is still owed, and the picture is taken one frame later only if no widget moved in between; otherwise the snapshot exits non-zero naming the step still owed or the widget that moved, and writes no picture. Turn animations off, and run each snapshot in a working directory of its own at a fixed path with a fresh copy of the fixture, so no run sees what an earlier one left and no temporary path shows in the picture. A clock, a random value or the machine's user name drawn on screen is fixed in snapshot mode. Prove it: run the command twice and compare the two files byte for byte (`cmp`).\n\n" + previous)
 	}
 	if w.Flaky != "" {
 		previous = strings.TrimSpace("## First: a flaky test\n\ncodehalter ran the test suite twice on the same code: it failed, then passed. A test that does that fails other rounds at random, which is no fault of theirs. Before this item, find that test and make it deterministic: it must not call a live server (use the project's loopback fakes) or read a status line that other parts of the program also write (assert the state the action itself changes). The usual cause is a wait that guesses: a fixed sleep, a fixed number of event-loop turns, or \"until nothing is pending\", which runs out before a timer, a thread or a child process is done on a busy machine. Replace it with a wait for the condition itself, against a deadline in wall-clock seconds, through the shared test module's wait helper. Fix any other test that waits the same way. The failure from the run that failed:\n\n```\n" +

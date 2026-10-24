@@ -92,6 +92,9 @@ type specConfig struct {
 	// Isolation lists what codehalter's test run wrote outside its own temporary directory;
 	// the next item round makes those tests isolated first.
 	Isolation string `toml:"isolation,omitempty"`
+	// Snapshot lists the snapshot commands whose two renders of the same code differed; the
+	// next item round makes them deterministic first.
+	Snapshot string `toml:"snapshot,omitempty"`
 	// Pictures holds, per spec picture, the sha256 of the last render judged to match it: a later
 	// round whose render of that screen differs gets it looked at again (see checkPictures).
 	Pictures map[string]string `toml:"pictures,omitempty"`
