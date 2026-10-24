@@ -1220,7 +1220,8 @@ func TestSpecStopsAfterBlockedInARow(t *testing.T) {
 	}
 }
 
-// Only the output dir and .devcontainer are committed; the user's other edits stay theirs.
+// Only the output dir and .devcontainer are committed; the user's other edits stay theirs. A build
+// tool's output git does not ignore is left out, and the next item round is asked to ignore it.
 func TestSpecCommit(t *testing.T) {
 	a, sess := newTestAgent(t)
 	cwd := sess.Cwd
@@ -1270,6 +1271,25 @@ func TestSpecCommit(t *testing.T) {
 	}
 	if got := git("status", "--porcelain"); got != "M notes.txt" {
 		t.Errorf("status after the commits = %q, want only the user's notes.txt modified", got)
+	}
+
+	// A scratch project built under the output dir: its sources go in, its build output does not.
+	writeTree(t, cwd, map[string]string{"app/main.go": "package main\n// scratch\n", "app/scratch/Cargo.toml": "[package]\n",
+		"app/scratch/target/CACHEDIR.TAG": "Signature: 8a477f597d28d172789f06886806bc55\n", "app/scratch/target/release/scratch": "\x7fELF"})
+	if a.specCommit(t.Context(), sess.ID, cwd, cfg, idx, "F0.1", specModeItem) == "" {
+		t.Fatal("no commit")
+	}
+	if got := git("show", "--name-only", "--format=", "HEAD"); got != "app/main.go\napp/scratch/Cargo.toml" || cfg.CacheDirs != "app/scratch/target" {
+		t.Errorf("committed:\n%s\nleft out: %q; want the sources without app/scratch/target", got, cfg.CacheDirs)
+	}
+	w := specWork{Item: "F0.1", CacheDirs: cfg.CacheDirs}
+	if prompt, _ := a.specRoundPrompt(sess.ID, cfg, idx, w, "true", "off"); !strings.Contains(prompt, "First: build output git does not ignore") || !strings.Contains(prompt, "app/scratch/target") {
+		t.Errorf("the next round was not asked to ignore it:\n%s", prompt)
+	}
+	// Ignored, it is no longer said.
+	writeTree(t, cwd, map[string]string{".gitignore": ".codehalter/\n/app/scratch/target/\n", "app/main.go": "package main\n// ignored\n"})
+	if a.specCommit(t.Context(), sess.ID, cwd, cfg, idx, "F0.1", specModeItem) == "" || cfg.CacheDirs != "" {
+		t.Errorf("after the ignore rule: left out %q, want nothing", cfg.CacheDirs)
 	}
 }
 

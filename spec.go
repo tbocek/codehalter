@@ -95,6 +95,9 @@ type specConfig struct {
 	// Snapshot lists the snapshot commands whose two renders of the same code differed; the
 	// next item round makes them deterministic first.
 	Snapshot string `toml:"snapshot,omitempty"`
+	// CacheDirs lists the build output directories git does not ignore, which the last commit
+	// left out; the next item round makes git ignore them first.
+	CacheDirs string `toml:"cache_dirs,omitempty"`
 	// Pictures holds, per spec picture, the sha256 of the last render judged to match it: a later
 	// round whose render of that screen differs gets it looked at again (see checkPictures).
 	Pictures map[string]string `toml:"pictures,omitempty"`

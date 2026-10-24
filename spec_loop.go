@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -458,6 +459,9 @@ type specWork struct {
 	// Snapshot: snapshot commands that drew the same code differently twice
 	// (specConfig.Snapshot); this round makes them deterministic first.
 	Snapshot string
+	// CacheDirs: build output git does not ignore, left out of the commits
+	// (specConfig.CacheDirs); this round makes git ignore it first.
+	CacheDirs string
 }
 
 func (r *specRun) say(ctx context.Context, s string) { r.a.say(ctx, r.sid, s) }
@@ -718,7 +722,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 
 		w.LintMissing = r.lintMissing
 		if w.Mode == specModeItem || w.Mode == specModeChange {
-			w.Flaky, w.Isolation, w.Snapshot = cfg.Flaky, cfg.Isolation, cfg.Snapshot
+			w.Flaky, w.Isolation, w.Snapshot, w.CacheDirs = cfg.Flaky, cfg.Isolation, cfg.Snapshot, cfg.CacheDirs
 		}
 		prompt, head := a.specRoundPrompt(sid, cfg, r.idx, w, r.testCmd(), r.lintCmd())
 		r.say(ctx, fmt.Sprintf("\n## /spec round %d · %s\n\n", round, head))
@@ -1666,6 +1670,10 @@ func (a *agent) specRoundPrompt(sid string, cfg *specConfig, idx *specIndex, w s
 		previous = strings.TrimSpace("## First: tests that are not isolated\n\ncodehalter ran the test command with a fresh `$TMPDIR`, and the run wrote these outside it:\n\n```\n" +
 			strings.ReplaceAll(w.Isolation, "```", "` ` `") + "\n```\n\nA test that writes a fixed path collides with the same test running beside it, so the suite cannot run its test files in parallel. Before this item, find the tests that write these and make each write only into its own temporary directory (the platform's temp-dir call, which follows `$TMPDIR`); where the program itself writes to a fixed place, the test passes it a directory of its own. Delete what the runs left behind.\n\n" + previous)
 	}
+	if w.CacheDirs != "" {
+		previous = strings.TrimSpace("## First: build output git does not ignore\n\ncodehalter left these directories out of the commits: each holds a `CACHEDIR.TAG`, the mark a build tool puts in the directory it builds into, and git does not ignore them:\n\n```\n" +
+			strings.ReplaceAll(w.CacheDirs, "```", "` ` `") + "\n```\n\nBuild output is never committed. Before this item, for each of them: if the program or its tests use the project it was built from, add an anchored rule for that build directory to `.gitignore` and check it with `git check-ignore -v`; if nothing uses that project (a scratch build left from trying something), delete the project and its build directory whole.\n\n" + previous)
+	}
 	if w.Snapshot != "" {
 		previous = strings.TrimSpace("## First: a snapshot that is not deterministic\n\ncodehalter ran each of these twice on the same code, and the two pictures differ:\n\n" +
 			w.Snapshot + "\n\nA screen that draws differently from run to run cannot be compared with its picture in the spec: the check judges whichever state the render happened to catch, and a screen that was right is reported broken. Before this item, make each of them write the same bytes on every run. The usual cause is a picture taken after a guess: a timer, a fixed number of frames, or the first frame, which catches a setup step (a scroll to the top, a divider placed once its widget has a size, the window taking its size, data loaded in the background) done in one run and not yet in the next. Take the picture at an event the app raises itself: each such step registers as owed when it is scheduled and as done when it ran, the screen is ready at the first painted frame where nothing shown is still owed, and the picture is taken one frame later only if no widget moved in between; otherwise the snapshot exits non-zero naming the step still owed or the widget that moved, and writes no picture. Turn animations off, and run each snapshot in a working directory of its own at a fixed path with a fresh copy of the fixture, so no run sees what an earlier one left and no temporary path shows in the picture. A clock, a random value or the machine's user name drawn on screen is fixed in snapshot mode. Prove it: run the command twice and compare the two files byte for byte (`cmp`).\n\n" + previous)
@@ -2068,6 +2076,11 @@ func specGit(ctx context.Context, cwd string, args ...string) (string, error) {
 
 // specCommit stages only the output dir and .devcontainer so a user's unrelated change does not
 // ride along. "" means nothing to commit, which is how a change round detects no code change.
+//
+// A directory git does not ignore that holds a `CACHEDIR.TAG`, the mark build tools put in their
+// output, is left out and kept in specConfig.CacheDirs, so the next item round makes git ignore
+// it: a round built a scratch project under tests/ and committed its 556 MiB `target/` (1161 files),
+// which every later `grep -r` of the tests then read.
 func (a *agent) specCommit(ctx context.Context, sid, cwd string, cfg *specConfig, idx *specIndex, item string, mode specMode) string {
 	git := func(args ...string) (string, error) { return specGit(ctx, cwd, args...) }
 	if _, err := git("rev-parse", "--is-inside-work-tree"); err != nil {
@@ -2077,7 +2090,27 @@ func (a *agent) specCommit(ctx context.Context, sid, cwd string, cfg *specConfig
 	if fileExists(cwd, ".devcontainer") {
 		paths = append(paths, ".devcontainer")
 	}
-	if out, err := git(append([]string{"add", "-A", "--"}, paths...)...); err != nil {
+	untracked, err := git(append([]string{"ls-files", "--others", "--exclude-standard", "-z", "--"}, paths...)...)
+	if err != nil {
+		a.say(ctx, sid, "⚠ /spec: listing the untracked files failed, so nothing is committed: "+firstLine(untracked)+"\n")
+		return ""
+	}
+	var caches []string
+	for _, f := range strings.Split(untracked, "\x00") {
+		if path.Base(f) == "CACHEDIR.TAG" {
+			caches = append(caches, path.Dir(f))
+		}
+	}
+	slices.Sort(caches)
+	cfg.CacheDirs = strings.Join(caches, "\n")
+	add := append([]string{"add", "-A", "--"}, paths...)
+	for _, d := range caches {
+		add = append(add, ":(exclude)"+d)
+	}
+	if len(caches) > 0 {
+		a.say(ctx, sid, "⚠ left out of the commit, as build output git does not ignore (each holds a `CACHEDIR.TAG`): "+strings.Join(caches, ", ")+". The next item round makes git ignore them.\n")
+	}
+	if out, err := git(add...); err != nil {
 		a.say(ctx, sid, "⚠ /spec: git add failed: "+firstLine(out)+"\n")
 		return ""
 	}
