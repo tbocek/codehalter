@@ -17,6 +17,9 @@ type turnControl struct {
 	running  bool
 	warmStop func()
 	stopped  bool // the last turn ended by the user's Stop; queued input waits for the next prompt
+	// waiters are prompts parked before taking the turn (awaitStartup): Stop reaches them too.
+	waiters    map[int]func()
+	nextWaiter int
 }
 
 func (s *Session) turnRunning() bool {
@@ -32,9 +35,33 @@ func (s *Session) cancelTurn() {
 	if s.ctl.running {
 		s.ctl.stopped = true
 	}
+	waiters := make([]func(), 0, len(s.ctl.waiters))
+	for _, w := range s.ctl.waiters {
+		waiters = append(waiters, w)
+	}
 	s.ctl.mu.Unlock()
 	if c != nil {
 		c()
+	}
+	for _, w := range waiters {
+		w()
+	}
+}
+
+// onCancel runs stop on the session's next Stop, for a prompt that holds no turn yet.
+func (s *Session) onCancel(stop func()) (remove func()) {
+	s.ctl.mu.Lock()
+	defer s.ctl.mu.Unlock()
+	if s.ctl.waiters == nil {
+		s.ctl.waiters = map[int]func(){}
+	}
+	id := s.ctl.nextWaiter
+	s.ctl.nextWaiter++
+	s.ctl.waiters[id] = stop
+	return func() {
+		s.ctl.mu.Lock()
+		delete(s.ctl.waiters, id)
+		s.ctl.mu.Unlock()
 	}
 }
 

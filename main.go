@@ -61,9 +61,12 @@ type agent struct {
 	emptyProject bool
 	// indexDone is the latest session's startup; read it through startupDone.
 	indexDone chan struct{}
-	// asking counts questions waiting on the user (a card or a form): a prompt
+	// asking counts questions waiting on the user (a card or a form): an editor's prompt
 	// during startup is refused only while startup asks, and waits otherwise.
 	asking atomic.Int32
+	// awaitingStartup counts prompts parked at the startup gate: startup hands them its
+	// fix cards rather than offering them ahead of the request.
+	awaitingStartup atomic.Int32
 
 	// Keyed by Server+"\x00"+Model; nil before the first prepare reads as the zero result.
 	connProbe map[string]probeResult
@@ -411,15 +414,37 @@ func (a *agent) startIndexing(sid string, cwd string) {
 			// After the checks, so the warmed bytes match turn one; before the fix
 			// cards, whose accepted turn the warm must beat to its first call.
 			go a.prewarm(sess)
-			// An accepted card runs a whole turn, so it holds the turn like a prompt.
-			if len(fixes) > 0 {
-				turnCtx, release, _ := a.holdTurn(ctx, sess, true)
-				a.drainFixes(turnCtx, sid, fixes)
-				release()
-			}
+			a.offerStartupFixes(ctx, sess, fixes)
 		}
 		slog.Debug("startIndexing: bootstrap done", "sid", sid)
 	}()
+}
+
+// offerStartupFixes offers startup's fix cards, or hands them to a prompt that arrived first
+// (`--cli -p` prompts at once): offered now, an accepted card would run its whole fix turn
+// ahead of the request. Checked before each card, so at most the one on screen goes first.
+func (a *agent) offerStartupFixes(ctx context.Context, sess *Session, fixes []fixProblem) {
+	if len(fixes) == 0 {
+		return
+	}
+	if a.awaitingStartup.Load() > 0 {
+		sess.handFixes(fixes)
+		return
+	}
+	// An accepted card runs a whole turn, so it holds the turn like a prompt. A prompt waits
+	// for startup before it takes the turn, so this cannot wait on one.
+	turnCtx, release, _ := a.holdTurn(ctx, sess, true)
+	defer release()
+	for i, p := range fixes {
+		if turnCtx.Err() != nil {
+			return
+		}
+		if i > 0 && a.awaitingStartup.Load() > 0 {
+			sess.handFixes(fixes[i:])
+			return
+		}
+		a.proposeFix(turnCtx, sess.ID, p)
+	}
 }
 
 // startupDone is closed once the latest session's startup has finished; nil before any.

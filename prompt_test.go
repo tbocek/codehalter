@@ -461,6 +461,108 @@ func TestPromptDuringStartup(t *testing.T) {
 	}
 }
 
+// `--cli -p` prompts before startup has found its fix cards. The prompt used to take the
+// turn and then wait for startup, which waited for the turn to offer the cards: neither
+// moved. Startup now hands the cards to the waiting prompt, which offers them after its turn,
+// each once even when its own checks find the same problem.
+func TestStartupHandsFixCardsToAWaitingPrompt(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.indexDone = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Prompt(context.Background(), PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: "build it"}}})
+		done <- err
+	}()
+	for deadline := time.Now().Add(3 * time.Second); a.awaitingStartup.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the prompt never waited for startup")
+		}
+	}
+	fixes := []fixProblem{{desc: "🟡 No AGENT.md", prompt: "write it"}}
+	offered := make(chan struct{})
+	go func() {
+		a.offerStartupFixes(context.Background(), s, fixes)
+		close(offered)
+	}()
+	select {
+	case <-offered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup waits on the prompt that waits on it")
+	}
+	if got := s.takeFixes([]fixProblem{{desc: "🟡 No AGENT.md"}, {desc: "🟡 install gopls"}}); len(got) != 2 {
+		t.Errorf("merged cards = %v, want the two distinct ones", got)
+	}
+	// End startup on a problem, so the prompt returns without a model.
+	a.mu.Lock()
+	a.abortReason = "setup failed: no LLM"
+	a.mu.Unlock()
+	close(a.indexDone)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the prompt still waits after startup ended")
+	}
+}
+
+// Stop while a prompt waits for startup ends that prompt. It holds no turn then, and Stop
+// also cancels startup, whose end used to let the prompt through.
+func TestStopReachesAPromptWaitingForStartup(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.indexDone = make(chan struct{})
+	done := make(chan PromptResponse, 1)
+	go func() {
+		resp, _ := a.Prompt(context.Background(), PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: "build it"}}})
+		done <- resp
+	}()
+	for deadline := time.Now().Add(3 * time.Second); a.awaitingStartup.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the prompt never waited for startup")
+		}
+	}
+	a.Cancel(context.Background(), CancelNotification{SessionId: s.ID})
+	close(a.indexDone) // what the cancelled startup does next
+	select {
+	case resp := <-done:
+		if resp.StopReason != "cancelled" {
+			t.Errorf("stop reason = %q, want cancelled", resp.StopReason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not reach the waiting prompt")
+	}
+	if len(s.Messages) != 0 {
+		t.Errorf("the stopped prompt still ran: %d messages", len(s.Messages))
+	}
+}
+
+// In the CLI a line typed while a question is open answers it, so a prompt arriving while
+// startup asks is a `-p` one, sent before anyone could answer: it waits rather than fail.
+func TestStandalonePromptWaitsWhileStartupAsks(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.standalone = true
+	a.indexDone = make(chan struct{})
+	a.asking.Add(1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Prompt(context.Background(), PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: "build it"}}})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("refused while startup asks: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	a.asking.Add(-1)
+	a.mu.Lock()
+	a.abortReason = "setup failed: no LLM"
+	a.mu.Unlock()
+	close(a.indexDone)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the prompt still waits after startup ended")
+	}
+}
+
 // The phase in progress tells Zed what the CLI's status row tells: the phase, the time, what
 // runs now and the last speeds, refreshed every second while the phase lasts; its _meta gives
 // the CLI the parts. A running tool is no part of it: its card shows it.

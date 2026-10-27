@@ -329,6 +329,24 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		return PromptResponse{}, fmt.Errorf("no session found")
 	}
 
+	// These gates refuse before the message is stored, so history gets no reply.
+	if err := a.abortGate(ctx, req.SessionId); err != nil {
+		return PromptResponse{}, err
+	}
+	// Before the turn is taken and before steering: startup takes the turn for its fix
+	// cards, and a prompt steered into that fix turn would end at once, unanswered.
+	if waited, err := a.awaitStartup(ctx, sess); err != nil {
+		if isCancelled(err) {
+			return PromptResponse{StopReason: "cancelled"}, nil
+		}
+		return PromptResponse{}, err
+	} else if waited {
+		// Startup may have ended on a problem the abort gate above did not see yet.
+		if err := a.abortGate(ctx, req.SessionId); err != nil {
+			return PromptResponse{}, err
+		}
+	}
+
 	if sess.turnRunning() && a.steerRunningTurn(ctx, sess, req.Content) {
 		return PromptResponse{StopReason: "end_turn"}, nil
 	}
@@ -340,38 +358,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 			release()
 		}
 	}()
-
-	// These gates refuse before the message is stored, so history gets no reply.
-	if err := a.abortGate(ctx, req.SessionId); err != nil {
-		return PromptResponse{}, err
-	}
-
-	// Startup still running: wait for it, unless it is asking the user something the
-	// prompt would answer past (refusing outright broke `--cli -p`, which prompts at once).
-	if startup := a.startupDone(); startup != nil {
-		select {
-		case <-startup:
-			slog.Debug("Prompt: indexDone gate passed", "sid", req.SessionId)
-		default:
-			if a.asking.Load() > 0 {
-				slog.Debug("Prompt: indexDone gate refused (startup is asking)", "sid", req.SessionId)
-				return PromptResponse{}, errors.New("Please answer the pending question above first.")
-			}
-			slog.Debug("Prompt: waiting for startup", "sid", req.SessionId)
-			a.say(ctx, req.SessionId, "⏳ Still setting up; your message runs as soon as that is done.\n")
-			select {
-			case <-startup:
-			case <-ctx.Done():
-				return PromptResponse{}, ctx.Err()
-			}
-			// Startup may have ended on a problem the abort gate above did not see yet.
-			if err := a.abortGate(ctx, req.SessionId); err != nil {
-				return PromptResponse{}, err
-			}
-		}
-	} else {
-		slog.Debug("Prompt: indexDone nil, no gate", "sid", req.SessionId)
-	}
 
 	// Seeded before prepareChecks, whose LLM calls need a system prompt.
 	isFirstMessage := len(sess.Messages) == 0 && sess.Summary == ""
@@ -385,7 +371,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 
 	// Fix cards are held until after the turn, so an accepted one can't jump
 	// ahead of the user's request.
-	pendingFixes := a.prepareChecks(ctx, sess, req.SessionId)
+	pendingFixes := sess.takeFixes(a.prepareChecks(ctx, sess, req.SessionId))
 
 	userText, images := promptContent(sess.Cwd, req.Content)
 
@@ -463,6 +449,50 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		return PromptResponse{StopReason: "cancelled"}, nil
 	}
 	return PromptResponse{StopReason: "end_turn"}, nil
+}
+
+// awaitStartup parks a prompt until startup has finished; waited reports that it had to. It
+// holds no turn meanwhile: startup takes the turn for its fix cards, so holding it here
+// would leave each waiting on the other.
+func (a *agent) awaitStartup(ctx context.Context, sess *Session) (waited bool, err error) {
+	sid := sess.ID
+	startup := a.startupDone()
+	if startup == nil {
+		slog.Debug("Prompt: indexDone nil, no gate", "sid", sid)
+		return false, nil
+	}
+	select {
+	case <-startup:
+		slog.Debug("Prompt: indexDone gate passed", "sid", sid)
+		return false, nil
+	default:
+	}
+	// In an editor a message sent while startup asks is the user answering past its card.
+	// The CLI gives a line typed then to the open question, so a prompt here is a `-p` one,
+	// sent before anyone could answer: it waits like any other.
+	if a.asking.Load() > 0 && !a.standalone {
+		slog.Debug("Prompt: indexDone gate refused (startup is asking)", "sid", sid)
+		return false, errors.New("Please answer the pending question above first.")
+	}
+	a.awaitingStartup.Add(1)
+	defer a.awaitingStartup.Add(-1)
+	// No turn to cancel yet, so Stop is wired here: it also cancels startup, which would
+	// otherwise let this prompt through.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	defer sess.onCancel(func() { cancel(errUserCancelled) })()
+	slog.Debug("Prompt: waiting for startup", "sid", sid)
+	a.say(ctx, sid, "⏳ Still setting up; your message runs as soon as that is done.\n")
+	select {
+	case <-startup:
+		// Stop cancels startup too, so both may be ready: the Stop wins.
+		if ctx.Err() != nil {
+			return true, context.Cause(ctx)
+		}
+		return true, nil
+	case <-ctx.Done():
+		return true, context.Cause(ctx)
+	}
 }
 
 // A prompt typed while a turn runs. Images cannot be queued, and the reply says

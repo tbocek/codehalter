@@ -442,6 +442,7 @@ func TestRequestPermissionSelectsByNumber(t *testing.T) {
 
 func TestRequestPermissionEmptyLineDismisses(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "\n")
+	c.interactive = true
 	params, _ := json.Marshal(permissionRequest{
 		SessionId: "s1",
 		Options:   []permissionOption{{OptionId: "yes", Name: "Allow"}},
@@ -525,6 +526,7 @@ func TestElicitDeclinesSchemasItCannotRender(t *testing.T) {
 
 func TestAskRejectsOutOfRangeThenGivesUp(t *testing.T) {
 	c, _, buf := newCLIHarness(t, "9\n0\nnope\n")
+	c.interactive = true
 	idx, typed := c.askChoiceOrText("Pick", []string{"one", "two"}, false)
 	if idx != -1 || typed != "" {
 		t.Errorf("got (%d, %q), want a dismissal", idx, typed)
@@ -925,22 +927,135 @@ func TestCLIExitWordsLeave(t *testing.T) {
 	}
 }
 
-// With no terminal and no input left (a script running -p), a question takes its first
-// option and says so; at a terminal, or with an empty line, it is dismissed as before.
+// With no terminal (a script running -p), a question with options takes its first whenever
+// the script gave no usable answer: input ended, an empty line, or a line that is no choice,
+// which is not asked again so the script's later lines stay theirs. At a terminal an empty
+// line or Ctrl+D dismisses it, and a question without options has nothing to take.
 func TestCLIQuestionWithoutAnyoneTakesTheFirstOption(t *testing.T) {
-	c, _, out := newCLIHarness(t, "")
-	if idx, _ := c.askChoiceOrText("Start the spec loop anyway?", []string{"Start anyway", "Stop"}, false); idx != 0 ||
-		!strings.Contains(out.String(), "no one to answer (input ended): took 1) Start anyway") {
-		t.Errorf("ended input: idx %d, output %q", idx, out.String())
+	for _, tc := range []struct{ name, in, note string }{
+		{"ended input", "", "no one to answer (input ended): took 1) Start anyway"},
+		{"an empty line", "\n", "no one to answer (empty line): took 1) Start anyway"},
+		{"no choice", "9\nkept\n", `no one to answer ("9" is not one of them): took 1) Start anyway`},
+	} {
+		c, _, out := newCLIHarness(t, tc.in)
+		if idx, _ := c.askChoiceOrText("Start the spec loop anyway?", []string{"Start anyway", "Stop"}, false); idx != 0 ||
+			!strings.Contains(out.String(), tc.note) {
+			t.Errorf("%s: idx %d, output %q", tc.name, idx, out.String())
+		}
+		if tc.name == "no choice" {
+			if rest, _ := c.in.ReadString('\n'); rest != "kept\n" {
+				t.Errorf("no choice: the next line went too, left %q", rest)
+			}
+		}
 	}
-	c, _, _ = newCLIHarness(t, "\n")
-	if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != -1 {
-		t.Errorf("an empty answer: idx %d, want a dismissal", idx)
+	c, _, _ := newCLIHarness(t, "2")
+	if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != 1 {
+		t.Errorf("a last answer without its newline: idx %d, want 1", idx)
 	}
 	c, _, _ = newCLIHarness(t, "")
-	c.interactive = true // Ctrl+D at a terminal is the user dismissing it
-	if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != -1 {
-		t.Errorf("Ctrl+D at a terminal: idx %d, want a dismissal", idx)
+	if idx, typed := c.askChoiceOrText("Name it", nil, true); idx != -1 || typed != "" {
+		t.Errorf("a text question at ended input: (%d, %q), want a dismissal", idx, typed)
+	}
+	for _, in := range []string{"", "\n"} {
+		c, _, _ = newCLIHarness(t, in)
+		c.interactive = true // Ctrl+D or Enter at a terminal is the user dismissing it
+		if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != -1 {
+			t.Errorf("at a terminal, input %q: idx %d, want a dismissal", in, idx)
+		}
+	}
+}
+
+// `</dev/null` is a character device, not a terminal: a script run with it got the dismissals
+// meant for a person at a keyboard.
+func TestIsTerminalLeavesOutTheNullDevice(t *testing.T) {
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	if isTerminal(null) {
+		t.Error("the null device counts as a terminal")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if isTerminal(r) {
+		t.Error("a pipe counts as a terminal")
+	}
+}
+
+// Piped into the repl, the script's input may end while its turn runs: the turn finishes,
+// its questions take their first option instead of waiting for a line that cannot come, and
+// only then does the CLI leave.
+func TestScriptedReplFinishesTheTurnAfterInputEnds(t *testing.T) {
+	c, p, in, done := replFor(t)
+	fmt.Fprintln(in, "build it")
+	prompt := within(t, p)
+	if prompt["method"] != "session/prompt" {
+		t.Fatalf("expected session/prompt, got %v", prompt["method"])
+	}
+	in.(io.Closer).Close()
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		c.waitMu.Lock()
+		ended := c.inputEnded
+		c.waitMu.Unlock()
+		select {
+		case <-ended:
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("the end of input was never noticed")
+			}
+			continue
+		}
+		break
+	}
+	select {
+	case <-done:
+		t.Fatal("the repl left with the turn still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	p.send(map[string]any{"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": map[string]any{
+		"sessionId": "s1", "toolCall": map[string]any{"toolCallId": "c1", "title": "Run /spec on spec/ now?"},
+		"options": []map[string]any{{"optionId": "yes", "name": "Run /spec", "kind": "allow_once"}, {"optionId": "no", "name": "Let me read it first", "kind": "reject_once"}}}})
+	resp := within(t, p)
+	if out, _ := json.Marshal(resp["result"]); resp["id"] != float64(7) || !strings.Contains(string(out), `"optionId":"yes"`) {
+		t.Fatalf("answer = %v %s", resp["id"], out)
+	}
+	p.reply(prompt, map[string]any{"stopReason": "end_turn"})
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the repl did not leave once the turn ended")
+	}
+}
+
+// The /resume picker runs inside the repl's own loop, which is what hands lines to a
+// question: it waited for a line nobody would pass on.
+func TestResumePickerInsideTheRepl(t *testing.T) {
+	c, p, in, done := replFor(t)
+	fmt.Fprintln(in, "/resume")
+	req := within(t, p)
+	if req["method"] != "session/list" {
+		t.Fatalf("expected session/list, got %v", req["method"])
+	}
+	p.reply(req, map[string]any{"sessions": []map[string]any{{"sessionId": "older", "updatedAt": "2026-08-01T00:00:00Z"}}})
+	fmt.Fprintln(in, "1")
+	req = within(t, p)
+	if req["method"] != "session/load" {
+		t.Fatalf("expected session/load, got %v", req["method"])
+	}
+	p.reply(req, map[string]any{})
+	fmt.Fprintln(in, "/quit")
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the repl did not leave on /quit")
+	}
+	if c.sessionID() != "older" {
+		t.Errorf("session id = %q, want older", c.sessionID())
 	}
 }
 
