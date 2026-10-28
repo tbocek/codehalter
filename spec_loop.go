@@ -204,6 +204,8 @@ type specRoundResult struct {
 	Lint        []string
 	Oversize    []string
 	Oversized   []string // the files behind Oversize
+	// Unproven: program changes the round made that the item's tests still pass without (spec_mutants.go).
+	Unproven []string
 	// Refactor: the debt shrank, and how it moved.
 	Improved bool
 	Debt     string
@@ -233,13 +235,13 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 	case r.Mode == specModeChange:
 		// The test for the OLD text still covers a changed item; the commit is the evidence of work.
 		if r.TurnErr == "" && r.Covered && r.TestsPass && r.Committed && len(r.PicturesUnseen)+len(r.PicturesDiffer)+len(r.PicturesBroken)+len(r.TestReview) == 0 &&
-			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
+			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize)+len(r.Unproven) == 0 {
 			return true, false, "", ""
 		}
 	default:
 		// A reopened item's old test still names it: like a change, it needs a commit.
 		if r.TurnErr == "" && r.Covered && r.TestsPass && len(r.UIUnseen)+len(r.PicturesUnseen)+len(r.PicturesDiffer)+len(r.PicturesBroken)+len(r.TestReview) == 0 && (r.Committed || !r.Redo) &&
-			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize) == 0 {
+			len(r.Unreachable)+len(r.StandIns)+len(r.Lint)+len(r.Oversize)+len(r.Unproven) == 0 {
 			return true, false, "", ""
 		}
 	}
@@ -296,6 +298,10 @@ func specDecide(cfg *specConfig, item string, r specRoundResult, prev string) (d
 	if len(r.StandIns) > 0 {
 		add("standin", "the program stands in for the work instead of doing it: "+strings.Join(r.StandIns, "; ")+
 			". Build the real thing the spec describes (call the service, write the format, drive the device); a test replaces it through a seam the program itself uses, such as a server URL pointed at a local fake, never through a slot only tests fill. An item whose work is a refusal or a scripted answer is not done")
+	}
+	if len(r.Unproven) > 0 {
+		add("unproven", "each of these changes was taken back out alone and the tests that name the item still passed: "+strings.Join(r.Unproven, "; ")+
+			". A test that passes without the fix proves nothing about it. For each, make a test fail without it: drive the input the way a user or the real file does (a wheel notch, an existing file, the state the fix is for) and assert what the change makes different. A change the item does not need is taken out")
 	}
 	if len(r.Lint) > 0 {
 		add("lint", "the linter reports problems in lines this round wrote:\n\n```\n"+strings.Join(r.Lint, "\n")+"\n```")
@@ -544,6 +550,9 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	}
 	r := &specRun{a: a, sid: sid, sess: sess, cfg: cfg, outAbs: filepath.Join(sess.Cwd, cfg.OutDir),
 		reasons: map[string]string{}, blocked: map[string]string{}}
+	if path := restoreSpecMutant(sess.Cwd); path != "" {
+		r.say(ctx, "🧬 put back `"+path+"`: a mutation check was stopped while it had a change of the last round taken out\n")
+	}
 	if err := r.scan(); err != nil {
 		r.say(ctx, "⚠ /spec: reading the spec: "+err.Error()+"\n")
 		return end, nil
@@ -1636,6 +1645,11 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 	}
 	if ch.ok && res.TurnErr == "" {
 		r.gates(ctx, w, ch, res)
+	}
+	// Last, and only on a round that passed everything else: it costs a filtered test run per change.
+	if runTests && res.TestsPass && res.Covered && ch.ok && res.TurnErr == "" && (w.Mode == specModeItem || w.Mode == specModeChange) &&
+		len(res.Unreachable)+len(res.StandIns)+len(res.Lint)+len(res.Oversize)+len(res.PicturesDiffer)+len(res.PicturesBroken) == 0 {
+		res.Unproven = r.unprovenHunks(ctx, item, base, coveredBy, ch)
 	}
 	return covered, coveredBy, nil
 }

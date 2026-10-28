@@ -78,6 +78,11 @@ type specConfig struct {
 	LintCmd string `toml:"lint_cmd,omitempty"`
 	// MaxFileLines: a program file over it may barely grow; 0 is the default, below 0 off.
 	MaxFileLines int `toml:"max_file_lines,omitempty"`
+	// MutationCmd runs the tests matching {filter} (the item's test token) for the mutation gate;
+	// empty derives it from the test tooling, "off" turns the gate off.
+	MutationCmd string `toml:"mutation_cmd,omitempty"`
+	// MutationHunks: how many of a round's changes the gate puts back; 0 is the default, below 0 off.
+	MutationHunks int `toml:"mutation_hunks,omitempty"`
 	// Refactor lists the over-size files a round could not grow: the next round splits them.
 	Refactor []string `toml:"refactor,omitempty"`
 	// Refactored lists the files split since an item last passed; one of them that
@@ -155,6 +160,9 @@ func saveSpecConfig(cwd string, cfg *specConfig) error {
 		"# detected linter (\"off\" skips linting). max_file_lines is the size budget of a\n" +
 		"# program file (1500, -1 off): a round that grows a file over it is followed\n" +
 		"# by a round that splits that file.\n" +
+		"# mutation_cmd runs the tests matching {filter}, the item's test token, for the\n" +
+		"# mutation check (each change of a round put back alone must fail them;\n" +
+		"# \"off\" skips it); mutation_hunks is how many changes it puts back (6, -1 off).\n" +
 		"# [items] is what the loop finished, with the spec text it was built from:\n" +
 		"# editing that section makes the next run redo the item, deleting it makes\n" +
 		"# the next run remove its code. Delete an entry to forget an item.\n\n")

@@ -36,6 +36,8 @@ func TestSpecDecide(t *testing.T) {
 		{"gate: unreachable", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Unreachable: []string{"`run` (src/a.rs:3): only tests call it"}}, false, false, "only tests call it"},
 		{"gate: lint", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Lint: []string{"src/a.rs:3: unused variable"}}, false, false, "unused variable"},
 		{"gate: oversize", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Oversize: []string{"`src/ui.rs` is 12000 lines, over the 1500-line budget"}}, false, false, "1500-line budget"},
+		{"gate: a change the item's tests pass without", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Unproven: []string{"src/a.rs:6 (`7`)"}}, false, false, "passes without the fix"},
+		{"gate: a changed item's unproven change too", "F0.1", 0, specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true, Committed: true, Unproven: []string{"src/a.rs:6 (`7`)"}}, false, false, "src/a.rs:6"},
 		{"gate: stand-in", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, StandIns: []string{"`reply_for_test` (src/a.rs:3)"}}, false, false, "is not done"},
 		{"gate: a spec picture the round never put beside a render", "F0.1", 0, specRoundResult{Covered: true, TestsPass: true, Committed: true, PicturesUnseen: []string{"spec/img/04-prepare.png"}}, false, false, "spec/img/04-prepare.png"},
 		{"gate: a changed item's picture too", "F0.1", 0, specRoundResult{Mode: specModeChange, Covered: true, TestsPass: true, Committed: true, PicturesUnseen: []string{"spec/img/03-window.png"}}, false, false, "side by side"},
