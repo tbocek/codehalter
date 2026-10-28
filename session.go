@@ -166,6 +166,8 @@ type sessionRuntime struct {
 	replyStart bool
 	// jobRuns are the background jobs that exited: a /spec gate that ran as one counts.
 	jobRuns []jobRun
+	// startupFixes are the fix cards startup handed to a prompt that was waiting on it.
+	startupFixes []fixProblem
 }
 
 type jobRun struct {
@@ -513,6 +515,28 @@ type bgNote struct {
 type pendingInput struct {
 	text string
 	note *bgNote
+}
+
+// handFixes leaves fix cards for the session's next prompt to offer after its turn.
+func (s *Session) handFixes(fixes []fixProblem) {
+	s.rt.mu.Lock()
+	s.rt.startupFixes = append(s.rt.startupFixes, fixes...)
+	s.rt.mu.Unlock()
+}
+
+// takeFixes adds the handed-over cards to fixes, each once: a check the prompt ran again
+// may have found the same problem.
+func (s *Session) takeFixes(fixes []fixProblem) []fixProblem {
+	s.rt.mu.Lock()
+	handed := s.rt.startupFixes
+	s.rt.startupFixes = nil
+	s.rt.mu.Unlock()
+	for _, f := range handed {
+		if !slices.ContainsFunc(fixes, func(g fixProblem) bool { return g.desc == f.desc }) {
+			fixes = append(fixes, f)
+		}
+	}
+	return fixes
 }
 
 func (s *Session) addSteer(text string) {

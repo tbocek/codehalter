@@ -163,9 +163,17 @@ func runCLI(argv []string) int {
 	return code
 }
 
-func stdinIsTTY() bool {
-	fi, err := os.Stdin.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+func stdinIsTTY() bool { return isTerminal(os.Stdin) }
+
+// isTerminal: the null device is a character device too, and `</dev/null` (or docker run
+// without -i) is how a script says nobody is there.
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	null, err := os.Stat(os.DevNull)
+	return err != nil || !os.SameFile(fi, null)
 }
 
 // openCLILog truncates: the log covers one run. nil on failure: a read-only project
@@ -219,6 +227,12 @@ type cliClient struct {
 	inputs  chan cliLine
 	waitMu  sync.Mutex
 	waiting chan cliLine
+	// inputEnded is closed once the repl's input has ended, so no later question waits for a
+	// line that cannot come. inCommand: the repl is parked in a client command (the /resume
+	// picker), so a question reads inputs itself. Both are guarded by waitMu.
+	inputEnded chan struct{}
+	endOnce    sync.Once
+	inCommand  bool
 	// restoreTTY undoes the terminal's character mode; hardQuit calls it before exiting.
 	restoreTTY atomic.Pointer[func()]
 
@@ -385,6 +399,7 @@ func (c *cliClient) repl() int {
 	defer restore()
 	c.waitMu.Lock()
 	c.inputs = make(chan cliLine)
+	c.inputEnded = make(chan struct{})
 	c.waitMu.Unlock()
 	go c.readInput()
 	turnDone := make(chan struct{})
@@ -399,6 +414,22 @@ func (c *cliClient) repl() int {
 			busy = false
 			continue
 		case ln = <-c.inputs:
+		case <-c.inputEnded:
+			ln = cliLine{err: io.EOF} // a question read the end itself
+		}
+		if ln.err != nil {
+			// Ended first, so an open question stops waiting and answers for itself.
+			c.endInput()
+			if !errors.Is(ln.err, io.EOF) {
+				c.ui.Note(ansiRed, "input: "+ln.err.Error())
+			}
+			// A script's input ran out mid-turn: the turn still finishes (its questions take
+			// their first option), then the CLI leaves. At a terminal Ctrl+D leaves at once.
+			if busy && !c.interactive {
+				<-turnDone
+			}
+			c.ui.Note(ansiDim, "")
+			return 0
 		}
 		c.waitMu.Lock()
 		waiting := c.waiting
@@ -408,13 +439,6 @@ func (c *cliClient) repl() int {
 			continue
 		}
 		c.ui.Submitted(ln.text)
-		if ln.err != nil {
-			if !errors.Is(ln.err, io.EOF) {
-				c.ui.Note(ansiRed, "input: "+ln.err.Error())
-			}
-			c.ui.Note(ansiDim, "")
-			return 0
-		}
 		text := ln.text
 		if text == "" {
 			continue
@@ -423,7 +447,10 @@ func (c *cliClient) repl() int {
 			c.ui.Note(ansiYell, "  "+name+" waits until the turn has ended (Ctrl+C interrupts it)")
 			continue
 		}
-		if handled, quit := c.command(text); handled {
+		c.setInCommand(true)
+		handled, quit := c.command(text)
+		c.setInCommand(false)
+		if handled {
 			if quit {
 				return 0
 			}
@@ -439,6 +466,22 @@ func (c *cliClient) repl() int {
 			turnDone <- struct{}{}
 		}()
 	}
+}
+
+func (c *cliClient) setInCommand(on bool) {
+	c.waitMu.Lock()
+	c.inCommand = on
+	c.waitMu.Unlock()
+}
+
+func (c *cliClient) endInput() {
+	c.endOnce.Do(func() {
+		c.waitMu.Lock()
+		if c.inputEnded != nil {
+			close(c.inputEnded)
+		}
+		c.waitMu.Unlock()
+	})
 }
 
 // steer sends a line typed during a turn; the agent folds it into the running turn and
@@ -458,8 +501,12 @@ func (c *cliClient) readInput() {
 	if !c.ui.inputActive() {
 		for {
 			text, err := c.readPrompt()
-			c.inputs <- cliLine{text: text, err: err}
+			// A last line without its newline is still a line, ahead of the end.
+			if err == nil || text != "" {
+				c.inputs <- cliLine{text: text}
+			}
 			if err != nil {
+				c.inputs <- cliLine{err: err}
 				return
 			}
 		}
@@ -1012,42 +1059,68 @@ func (c *cliClient) askChoiceOrText(question string, labels []string, allowText 
 	// With the repl running, its reader owns stdin and hands this question the next line.
 	next := func() (string, error) { return c.in.ReadString('\n') }
 	c.waitMu.Lock()
-	repl := c.inputs != nil
+	repl, inCommand, ended := c.inputs != nil, c.inCommand, c.inputEnded
 	ch := make(chan cliLine, 1)
-	if repl {
+	if repl && !inCommand {
 		c.waiting = ch
 	}
 	c.waitMu.Unlock()
-	if repl {
+	switch {
+	case repl && inCommand:
+		// The repl is parked in this command, so nobody else takes its lines.
+		next = func() (string, error) {
+			select {
+			case ln := <-c.inputs:
+				if ln.err != nil {
+					c.endInput()
+				}
+				return ln.text, ln.err
+			case <-ended:
+				return "", io.EOF
+			}
+		}
+	case repl:
 		defer func() {
 			c.waitMu.Lock()
 			c.waiting = nil
 			c.waitMu.Unlock()
 		}()
 		next = func() (string, error) {
-			ln := <-ch
-			return ln.text, ln.err
+			select {
+			case ln := <-ch:
+				return ln.text, ln.err
+			case <-ended:
+				return "", io.EOF
+			}
 		}
+	}
+	// Run from a script (no terminal), nobody can answer: a question with options takes the
+	// first, said aloud, rather than a dismissal that ends the work. Not asked again: a retry
+	// would spend the lines the script wrote for what comes next.
+	scripted := !c.interactive && len(labels) > 0
+	first := func(why string) (int, string) {
+		c.ui.Note(ansiDim, "  no one to answer ("+why+"): took 1) "+labels[0])
+		return 0, ""
 	}
 	for attempt := 0; attempt < 3; attempt++ {
 		c.ui.Ask(hint)
 		line, err := next()
 		ans := strings.TrimSpace(line)
 		c.ui.Submitted(ans)
-		// Run from a script (-p, no terminal) whose input has run out, nobody can answer:
-		// the first option, said aloud, rather than a dismissal that ends the work.
-		if err != nil && ans == "" && !c.interactive && len(labels) > 0 {
-			c.ui.Note(ansiDim, "  no one to answer (input ended): took 1) "+labels[0])
-			return 0, ""
-		}
-		if err != nil || ans == "" {
-			return -1, ""
-		}
 		if n, err := strconv.Atoi(ans); err == nil && n >= 1 && n <= len(labels) {
 			return n - 1, ""
 		}
-		if allowText || len(labels) == 0 {
+		switch {
+		case ans != "" && (allowText || len(labels) == 0):
 			return -1, ans
+		case scripted && ans == "" && err != nil:
+			return first("input ended")
+		case scripted && ans == "":
+			return first("empty line")
+		case scripted:
+			return first(strconv.Quote(ans) + " is not one of them")
+		case err != nil || ans == "":
+			return -1, ""
 		}
 		c.ui.Note(ansiRed, "  pick a number between 1 and "+strconv.Itoa(len(labels)))
 	}

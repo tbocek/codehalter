@@ -101,9 +101,7 @@ type cliUI struct {
 }
 
 func stdoutStyled() bool {
-	fi, err := os.Stdout.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0 &&
-		os.Getenv("TERM") != "dumb" && os.Getenv("NO_COLOR") == ""
+	return isTerminal(os.Stdout) && os.Getenv("TERM") != "dumb" && os.Getenv("NO_COLOR") == ""
 }
 
 func newCLIUI() *cliUI {
