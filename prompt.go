@@ -438,12 +438,6 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 	slog.Debug("Prompt: draining pre-turn fix cards (post-turn)", "sid", req.SessionId, "fixes", len(pendingFixes))
 	a.drainFixes(ctx, req.SessionId, pendingFixes)
 
-	if sess.specHandoffPending() {
-		resp, err, d := a.runSpecTurn(ctx, req.SessionId, sess, "", nil, release)
-		detached = d
-		return resp, err
-	}
-
 	// The stop reason is how the client tells a clean turn from an abort.
 	if ctx.Err() != nil {
 		return PromptResponse{StopReason: "cancelled"}, nil
@@ -641,8 +635,13 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	if err != nil {
 		return toolLoopResult{}, err
 	}
-	if len(p.Redo) > 0 || len(p.Spec) > 0 {
-		return a.specFromPlan(ctx, sid, sess, p)
+	sess.rt.mu.Lock()
+	audit := sess.rt.specAudit
+	sess.rt.mu.Unlock()
+	if audit && len(p.Redo) > 0 {
+		a.say(ctx, sid, fmt.Sprintf("The audit found %d item(s) recorded as done that do not deliver: %s\n\n", len(p.Redo), strings.Join(p.Redo, ", ")))
+		sess.setSpecHandoff("redo " + strings.Join(p.Redo, " "))
+		return toolLoopResult{Text: "handed over to /spec"}, nil
 	}
 	if len(p.Subtasks) == 0 {
 		if p.answer == "" {
@@ -871,8 +870,18 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	}
 
 	// Only the directories, never the moving item count: the prefix must stay stable.
-	if cfg, err := loadSpecConfig(sess.Cwd); err == nil && cfg != nil {
-		fmt.Fprintf(&b, "\n\n## This project is built with /spec\n\nThe specification in `%s/` is implemented into `%s/` item by item, each item done when a test names it and the suite passes (the item ids are in the spec files). A chat request that amounts to many rounds of work, or that says something built does not work, is not a plan here: name the spec items it concerns in submit_plan's `redo` and codehalter rebuilds them one per round. Inside a /spec round (the prompt says which item it is) the item is already chosen: plan and execute that item, and leave AGENT.md alone: it is read-only while /spec runs.\n", cfg.SpecDir, cfg.OutDir)
+	cfg, _ := loadSpecConfig(sess.Cwd)
+	specDir := ""
+	if cfg != nil {
+		specDir = cfg.SpecDir
+	} else if st, err := os.Stat(filepath.Join(sess.Cwd, "spec")); err == nil && st.IsDir() {
+		specDir = "spec"
+	}
+	if specDir != "" {
+		fmt.Fprintf(&b, "\n\n## This project has a specification\n\n`%s/` says what the program must do. Outside a /spec round, check every request against it before planning: grep it for what the request touches and read what it says there. Where it decides how something must work, the plan follows it. Where the request contradicts it, even an explicit one, do not plan the change and do not pick a side: ask the user with clear=false, with the spec line in `question` and `choices` to keep the spec or to follow the request and change the spec. A request it does not concern (a config or image change, an install) is planned as usual. Never edit the spec unless the user asks for that.\n", specDir)
+	}
+	if cfg != nil {
+		fmt.Fprintf(&b, "\nIt is implemented into `%s/` item by item by /spec, which only the user starts. Inside a /spec round (the prompt says which item it is) the item is already chosen: plan and execute that item, and leave AGENT.md alone: it is read-only while /spec runs.\n", cfg.OutDir)
 	}
 
 	// In the cached prefix, not re-sent per phase: each copy would stack in history.

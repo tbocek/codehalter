@@ -150,7 +150,7 @@ type sessionRuntime struct {
 	specAbort context.CancelFunc
 	// specFenceDir is read-only for the file tools while a /spec loop runs.
 	specFenceDir string
-	// specHandoff is a /spec command the planner asked for, run after the planning turn.
+	// specHandoff is the /spec redo audit's list of items, read when its turn ends.
 	specHandoff string
 	// specAudit: a bare /spec redo is auditing, so the planner's list is not asked about.
 	specAudit bool

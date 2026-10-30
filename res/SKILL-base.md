@@ -52,37 +52,33 @@ Borderline → not a keeper unless dropping it breaks a documented command. Say 
 - A suite whose output you want to read more than one way runs ONCE, into a file: `just test > /tmp/test.log 2>&1; echo "exit=$?"`, then grep, tail or sed that file as often as you like. `cmd | grep panic; cmd | tail` runs the whole suite twice for one answer, and the pipeline reports grep's exit status, not the suite's, so a red run looks green.
 - Tools that rewrite files across the repo (`go mod tidy`, `gofmt -w`, `go generate`, `cargo fmt`, `prettier --write`) are MUTATING → EXECUTE phase only. Their read-only twins (`go vet`, `gofmt -d`, `cargo fmt --check`, `prettier --check`) are fine while planning.
 
-## GUI application: giving the user a display
-Only when the project is a GUI (GTK, Qt, SDL, a game). The devcontainer has no display and never will: in here the app is exercised headless (`xvfb-run`, the `snapshot` recipe). The USER runs it on the host, from a container that borrows the host's Wayland socket and GPU. When you write how to run it (README, final report), give them this, adapted to the project's base image and runtime packages; do not make them guess:
+## GUI application: giving the app a display and sound
+Only when the project is a GUI (GTK, Qt, SDL, a game). The devcontainer exposes the host's Wayland socket and PulseAudio socket, so the app runs from inside it, on the user's screen and speakers. When you set up a GUI project or touch its `.devcontainer/`, make sure both files have this; merge it into what is there and keep the mounts the project already has.
+
+`devcontainer.json`:
+
+```json
+"containerEnv": {
+  "XDG_RUNTIME_DIR": "/run/user/1000",
+  "WAYLAND_DISPLAY": "${localEnv:WAYLAND_DISPLAY}",
+  "GDK_BACKEND": "wayland"
+},
+"mounts": [
+  "source=${localEnv:XDG_RUNTIME_DIR}/${localEnv:WAYLAND_DISPLAY},target=/run/user/1000/${localEnv:WAYLAND_DISPLAY},type=bind",
+  "source=${localEnv:XDG_RUNTIME_DIR}/pulse,target=/run/user/1000/pulse,type=bind"
+]
+```
+
+`.devcontainer/Dockerfile`, as root, after the `dev` user (UID 1000) exists:
 
 ```Dockerfile
-FROM <the project's base image>
-RUN <install: the app's runtime libs (e.g. GTK 4 + libadwaita), the Mesa DRI drivers, a font>
-ARG UID=1000
-RUN <create user with that UID>
-USER user
+RUN install -d -m 700 -o 1000 -g 1000 /run/user/1000
 ```
 
-The install and user lines per base image (the runtime libs are the project's own, named in its Dockerfile or manifest):
-
-| base | install | user |
-|---|---|---|
-| alpine | `apk add --no-cache <libs> mesa-dri-gallium font-dejavu` | `adduser -D -u $UID user` |
-| debian, ubuntu | `apt-get update && apt-get install -y --no-install-recommends <libs> libgl1-mesa-dri fonts-dejavu-core && rm -rf /var/lib/apt/lists/*` | `useradd -m -u $UID user` |
-| arch | `pacman -Syu --noconfirm <libs> mesa ttf-dejavu` | `useradd -m -u $UID user` |
-| fedora | `dnf install -y <libs> mesa-dri-drivers dejavu-sans-fonts && dnf clean all` | `useradd -m -u $UID user` |
-
-```sh
-docker run --rm -it \
-  -e XDG_RUNTIME_DIR=/tmp \
-  -e WAYLAND_DISPLAY=$WAYLAND_DISPLAY \
-  -e GDK_BACKEND=wayland \
-  -v $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY:/tmp/$WAYLAND_DISPLAY \
-  --device /dev/dri \
-  <image> <the binary>
-```
-
-`GDK_BACKEND=wayland` is for GTK; a Qt app needs `QT_QPA_PLATFORM=wayland` instead. The Mesa DRI drivers plus `--device /dev/dri` give it the GPU, the font keeps text from rendering as boxes, and the UID matches the host user so the socket is accessible. A non-GUI project gets none of this.
+- `GDK_BACKEND=wayland` is for GTK; a Qt app needs `QT_QPA_PLATFORM=wayland` instead. A non-GUI project gets none of this.
+- A change to these two files applies after a rebuild; say so. Until then this container has no sockets.
+- A bind mount whose host path is missing stops the container from starting: the host needs a Wayland session and PulseAudio or PipeWire's pulse socket.
+- Tests and the `snapshot` recipe stay headless, or windows open on the user's screen while they work: run them as `env -u WAYLAND_DISPLAY GDK_BACKEND=x11 GSK_RENDERER=cairo xvfb-run -a <cmd>` in the recipe (for Qt, `QT_QPA_PLATFORM=xcb`). No GPU is exposed, so GTK 4 also needs `GSK_RENDERER=cairo` when the app itself runs.
 
 ## "failed on line N" is not a diagnosis
 A script, just recipe or make target bailing with `failed on line N exit code 1` is the WRAPPER's error; the real cause was printed by a sub-process a few lines earlier in the output.

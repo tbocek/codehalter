@@ -117,12 +117,6 @@ func (s *Session) setSpecHandoff(cmd string) {
 	s.rt.mu.Unlock()
 }
 
-func (s *Session) specHandoffPending() bool {
-	s.rt.mu.Lock()
-	defer s.rt.mu.Unlock()
-	return s.rt.specHandoff != ""
-}
-
 func (s *Session) takeSpecHandoff() string {
 	s.rt.mu.Lock()
 	cmd := s.rt.specHandoff
@@ -543,7 +537,6 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	end := PromptResponse{StopReason: "end_turn"}
 	runStart := time.Now() // the jobs started from here on are the run's: an abort stops them
 	// Taken first so an early return below cannot leave it for a later turn.
-	handoff := sess.takeSpecHandoff()
 	cfg, cmd, ok := a.specResolve(ctx, sid, sess, args)
 	if !ok {
 		return end, nil
@@ -561,11 +554,8 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		r.say(ctx, fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
 		return end, nil
 	}
-	if cmd == "resume" && strings.HasPrefix(handoff, "redo ") {
-		cmd = handoff
-	}
 	if cmd == "redo" {
-		// The audit's submit_plan `redo` goes through specFromPlan, which leaves "redo <ids>" as a handoff.
+		// The audit's submit_plan `redo` goes through orchestrate, which leaves "redo <ids>" as a handoff.
 		if !r.preflight(ctx) {
 			return end, nil
 		}
@@ -580,7 +570,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		if isCancelled(turnErr) {
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
-		handoff = sess.takeSpecHandoff()
+		handoff := sess.takeSpecHandoff()
 		if !strings.HasPrefix(handoff, "redo ") {
 			r.say(ctx, "Nothing was reopened: the audit found every finished item delivering.\n")
 			return end, nil
@@ -1179,119 +1169,6 @@ func uiEditedUnseen(uses []ToolUse, cwd string) []string {
 		}
 	}
 	return files
-}
-
-type specFile struct {
-	Path    string `json:"path"`
-	Content string `json:"content"`
-}
-
-// writeSpecFiles never overwrites: the user may already have edited that spec.
-func writeSpecFiles(cwd, specDir string, files []specFile) ([]string, error) {
-	dir := filepath.Clean(filepath.Join(cwd, specDir))
-	var written []string
-	for _, f := range files {
-		rel := filepath.Clean(strings.TrimPrefix(f.Path, specDir+"/"))
-		if rel == "." || filepath.IsAbs(rel) || strings.HasPrefix(rel, "..") {
-			return written, fmt.Errorf("spec file path %q is not inside %s/", f.Path, specDir)
-		}
-		abs := filepath.Join(dir, rel)
-		if _, err := os.Stat(abs); err == nil {
-			return written, fmt.Errorf("%s exists already; the planner writes a spec only into empty space", filepath.Join(specDir, rel))
-		}
-		if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
-			return written, err
-		}
-		if err := os.WriteFile(abs, []byte(strings.TrimRight(f.Content, "\n")+"\n"), 0o644); err != nil {
-			return written, err
-		}
-		written = append(written, filepath.ToSlash(filepath.Join(specDir, rel)))
-	}
-	return written, nil
-}
-
-// specFromPlan asks the user first: a spec the model wrote is its reading of the request,
-// and dozens of rounds should not be tested against it unread.
-func (a *agent) specFromPlan(ctx context.Context, sid string, sess *Session, p *planResult) (toolLoopResult, error) {
-	if sess.specFence() != "" {
-		a.say(ctx, sid, "⚠ The planner handed this request to /spec, but a /spec loop is already running: nothing was reopened or written.\n")
-		return toolLoopResult{}, nil
-	}
-	cfg, err := loadSpecConfig(sess.Cwd)
-	if err != nil {
-		a.say(ctx, sid, "⚠ "+err.Error()+"\n")
-		return toolLoopResult{}, nil
-	}
-	if len(p.Redo) > 0 {
-		if cfg == nil {
-			a.say(ctx, sid, "⚠ The planner named spec items to redo, but this project has no /spec ledger. Run /spec first.\n")
-			return toolLoopResult{}, nil
-		}
-		ids := strings.Join(p.Redo, " ")
-		a.say(ctx, sid, fmt.Sprintf("The planner reads this request as %d item(s) of the spec that are recorded as done but do not deliver: %s\n\n", len(p.Redo), strings.Join(p.Redo, ", ")))
-		sess.rt.mu.Lock()
-		audit := sess.rt.specAudit
-		sess.rt.mu.Unlock()
-		if audit {
-			// A bare /spec redo asked for exactly this: no second question.
-			sess.setSpecHandoff("redo " + ids)
-			return toolLoopResult{Text: "handed over to /spec"}, nil
-		}
-		ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Reopen %d spec item(s) and rebuild them with /spec, one per round?", len(p.Redo)), "think", "Run /spec", "Not now")
-		if err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return toolLoopResult{}, nil
-		}
-		if !ok {
-			a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Nothing reopened")})
-			a.say(ctx, sid, "Nothing reopened. `/spec redo` finds and rebuilds them later.\n")
-			return toolLoopResult{Text: "not now"}, nil
-		}
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Handing over to /spec")})
-		sess.setSpecHandoff("redo " + ids)
-		return toolLoopResult{Text: "handed over to /spec"}, nil
-	}
-	if cfg != nil {
-		a.say(ctx, sid, fmt.Sprintf("⚠ The planner wrote a new spec, but this project already has one in `%s/`. A request this size maps onto that spec's items (`redo`), it does not get a second spec. Nothing was written.\n", cfg.SpecDir))
-		return toolLoopResult{}, nil
-	}
-	specDir := strings.Trim(filepath.ToSlash(filepath.Clean(p.SpecDir)), "/")
-	if specDir == "" || specDir == "." {
-		specDir = "spec"
-	}
-	written, err := writeSpecFiles(sess.Cwd, specDir, p.Spec)
-	if err != nil {
-		a.say(ctx, sid, "⚠ writing the spec: "+err.Error()+"\n")
-		return toolLoopResult{}, nil
-	}
-	idx, err := scanSpec(filepath.Join(sess.Cwd, specDir), defaultSpecIDPatterns, nil, nil)
-	if err != nil {
-		a.say(ctx, sid, "⚠ reading the spec back: "+err.Error()+"\n")
-		return toolLoopResult{}, nil
-	}
-	a.say(ctx, sid, fmt.Sprintf("This request is more than one round of work, so the planner wrote it down as a spec: %s, %d item(s). Read it; it is the model's reading of what you asked, and the loop will build and test exactly that.\n\n", strings.Join(written, ", "), len(idx.order)))
-	if p.OutDir != "" {
-		specRel, outRel, err := specPaths(sess.Cwd, specDir, p.OutDir)
-		if err == nil {
-			err = saveSpecConfig(sess.Cwd, &specConfig{SpecDir: specRel, OutDir: outRel, Target: p.Target})
-		}
-		if err != nil {
-			a.say(ctx, sid, "⚠ /spec: "+err.Error()+"\n")
-		}
-	}
-	ok, tcId, err := a.askYesNoWithCard(ctx, sid, fmt.Sprintf("Run /spec on %s now (%d items, one per round)?", specDir+"/", len(idx.order)), "think", "Run /spec", "Let me read it first")
-	if err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return toolLoopResult{}, nil
-	}
-	if !ok {
-		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Spec written, loop not started")})
-		a.say(ctx, sid, "The spec is in `"+specDir+"/`. Edit it as you like, then `/spec` builds it.\n")
-		return toolLoopResult{Text: "spec written"}, nil
-	}
-	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Handing over to /spec")})
-	sess.setSpecHandoff("resume")
-	return toolLoopResult{Text: "handed over to /spec"}, nil
 }
 
 const specRedoReason = "The user sent this item back with /spec redo. It was implemented and its test passes, but what was built does not do what the spec says: a screen without its widgets, a button without its wire, a flow that cannot be reached from the UI. Rebuild it against the spec text below under the rules above. Keep and extend the existing code and tests where they are right. Where AGENT.md describes the old state as the design, correct that line, in a line; do not add notes about what this round built."

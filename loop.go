@@ -63,12 +63,8 @@ type planResult struct {
 	Options   []specOption `json:"options"`
 	// Every subtask only relays findings, so the orchestrator skips the confirmation.
 	ReportOnly bool `json:"report_only"`
-	// The planner's third exit, for a request too big for one plan (see specFromPlan).
-	Redo    []string   `json:"redo"`
-	Spec    []specFile `json:"spec"`
-	SpecDir string     `json:"spec_dir"`
-	OutDir  string     `json:"out_dir"`
-	Target  string     `json:"target"`
+	// The /spec redo audit's answer: the items that fall short. Refused anywhere else.
+	Redo []string `json:"redo"`
 	// An argument because a server that forces the tool call (Halogen) returns no
 	// message text beside it.
 	Answer string `json:"answer"`
@@ -78,8 +74,9 @@ type planResult struct {
 
 // planProblem names how a planner submission missed its contract, with the
 // corrective for the one retry: invalid JSON, prose (after the loop's own
-// nudge), or a plan with neither an answer, a question nor any work.
-func planProblem(res toolLoopResult, p *planResult, parseErr error) (wrong, corrective string) {
+// nudge), a plan with neither an answer, a question nor any work, or a `redo` outside
+// the audit that asks for it (only the user starts /spec).
+func planProblem(res toolLoopResult, p *planResult, parseErr error, audit bool) (wrong, corrective string) {
 	switch {
 	case parseErr != nil && res.Terminal == "":
 		return "the planner replied in prose instead of calling submit_plan",
@@ -87,8 +84,11 @@ func planProblem(res toolLoopResult, p *planResult, parseErr error) (wrong, corr
 	case parseErr != nil:
 		return fmt.Sprintf("submit_plan's arguments were not valid JSON (%v)", parseErr),
 			fmt.Sprintf("Your `submit_plan` arguments were not valid JSON (%v). Call it again, emitting the arguments as one well-formed JSON object.", parseErr)
+	case !audit && len(p.Redo) > 0:
+		return "the planner asked to reopen spec items, which only the user's /spec redo does",
+			"`redo` applies only inside the /spec redo audit, and this is not one. Call `submit_plan` again without it: `subtasks` for the work, or the complete `answer` (report_only=true). Work too big for one plan: say so in `answer` and name `/spec`, which the user runs."
 	// Whether or not it set clear: an empty plan once ended six /spec rounds in a row.
-	case len(p.Subtasks) == 0 && p.answer == "" && len(p.Redo) == 0 && len(p.Spec) == 0 && strings.TrimSpace(p.Question) == "":
+	case len(p.Subtasks) == 0 && p.answer == "" && len(p.Redo) == 0 && strings.TrimSpace(p.Question) == "":
 		return "the planner submitted neither an answer nor any subtasks",
 			"Your `submit_plan` had neither an answer nor subtasks, so nothing reaches the user. Call it again with EITHER the complete answer in `answer` (report_only=true, no subtasks) OR the subtasks that do the work. Put the fields at the top level of the arguments, `{\"clear\": true, \"subtasks\": [...]}`, not inside another key."
 	}
@@ -195,8 +195,11 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 			return nil, err
 		}
 		plan, parseErr := planFrom(planRes)
+		sess.rt.mu.Lock()
+		audit := sess.rt.specAudit
+		sess.rt.mu.Unlock()
 		// Prose was already nudged in the loop; this retry covers what the loop cannot see.
-		if wrong, corrective := planProblem(planRes, plan, parseErr); wrong != "" {
+		if wrong, corrective := planProblem(planRes, plan, parseErr, audit); wrong != "" {
 			// Rows already on screen must be named as not final.
 			salvaged := ""
 			var partial struct {
@@ -234,6 +237,11 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		}
 
 		if plan.Clear || len(plan.Choices) == 0 {
+			// A question with no buttons is still a question: the user answers it in chat,
+			// and whatever was planned beside it waits for that answer.
+			if q := strings.TrimSpace(plan.Question); !plan.Clear && q != "" {
+				plan.Subtasks, plan.ReportOnly, plan.answer = nil, true, q
+			}
 			return plan, nil
 		}
 		if asked == maxClarifications {

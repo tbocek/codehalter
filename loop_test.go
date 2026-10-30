@@ -1220,6 +1220,7 @@ func TestPlanAnswerInArgument(t *testing.T) {
 func TestPlanRedoIsAPlan(t *testing.T) {
 	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
 		`{"clear":true,"report_only":false,"subtasks":[],"redo":["F0.9","§03-shell#1-screen"]}`))
+	s.rt.specAudit = true
 	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil {
 		t.Fatalf("runPlanPhase: %v", err)
@@ -1685,5 +1686,76 @@ func TestExecutorVerdictFromExitCodes(t *testing.T) {
 		if out.Success != (tc.reason == "") || out.Reason != tc.reason {
 			t.Errorf("%s: success=%v reason=%q, want reason %q", tc.name, out.Success, out.Reason, tc.reason)
 		}
+	}
+}
+
+// Only the user starts /spec: a `redo` from an ordinary turn is sent back, and the
+// fields that wrote a new spec are gone from the tool.
+func TestPlanRedoOutsideTheAuditRetries(t *testing.T) {
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"report_only":false,"redo":["F0.9"],"subtasks":[{"description":"add the mount"}]}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear":true,"report_only":false,"subtasks":[{"description":"add the mount"}]}`))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if mock.callCount() != 2 || plan == nil || len(plan.Redo) != 0 || len(plan.Subtasks) != 1 {
+		t.Fatalf("calls %d, plan %+v: want the retry's subtasks", mock.callCount(), plan)
+	}
+	if got := lastUserMessage(s); !strings.Contains(got, "only inside the /spec redo audit") {
+		t.Errorf("stored corrective = %q", got)
+	}
+	props := submitPlanTool.Def["function"].(map[string]any)["parameters"].(map[string]any)["properties"].(map[string]any)
+	for _, gone := range []string{"spec", "spec_dir", "out_dir", "target"} {
+		if _, ok := props[gone]; ok {
+			t.Errorf("submit_plan still offers %q", gone)
+		}
+	}
+}
+
+// A planner that insists on `redo` in an ordinary turn starts nothing.
+func TestOrchestrateIgnoresRedoOutsideTheAudit(t *testing.T) {
+	redo := `{"clear":true,"report_only":false,"redo":["F0.9"]}`
+	a, s, _ := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, redo),
+		sseToolCall("p2", submitPlanToolName, redo))
+	s.AddUser("make it work")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.takeSpecHandoff(); got != "" {
+		t.Errorf("handoff = %q, want none", got)
+	}
+}
+
+func TestOrchestrateAuditHandsOverRedo(t *testing.T) {
+	a, s, _ := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, `{"clear":true,"report_only":false,"redo":["F0.9","F1.2"]}`))
+	s.rt.specAudit = true
+	s.AddUser("audit")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.takeSpecHandoff(); got != "redo F0.9 F1.2" {
+		t.Errorf("handoff = %q", got)
+	}
+}
+
+// A contradiction with the spec, asked without buttons: the user still reads the
+// question, and the subtasks beside it do not run.
+func TestPlanQuestionWithoutChoicesReachesTheUser(t *testing.T) {
+	const q = "The spec says the mount is read-only; change the spec?"
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear":false,"question":"`+q+`","subtasks":[{"description":"make it writable"}]}`),
+		sseToolCall("x", respondToolName, `{"message":"must not run"}`))
+	s.AddUser("make the mount writable")
+	res, err := a.orchestrate(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != q {
+		t.Errorf("reply = %q, want the question", res.Text)
+	}
+	if got := mock.callCount(); got != 1 {
+		t.Errorf("LLM calls = %d, want the planner's only", got)
 	}
 }

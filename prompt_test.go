@@ -661,3 +661,29 @@ func TestDoneLineShowsTimeToolsCallsAndInputs(t *testing.T) {
 		t.Errorf("a turn nobody typed and no tool ran: %q, want ≡ 2 and neither ⌨ nor ⚙", round)
 	}
 }
+
+// A spec folder is enough for a request to be checked against it; the /spec part of
+// the paragraph needs the ledger.
+func TestSystemPromptChecksRequestsAgainstTheSpec(t *testing.T) {
+	const check, built = "check every request against it", "by /spec, which only the user starts"
+	a, s := newTestAgent(t)
+	got, err := a.systemPrompt(s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, check) {
+		t.Error("a project without a spec is told to check against one")
+	}
+	if err := os.MkdirAll(filepath.Join(s.Cwd, "spec"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = a.systemPrompt(s.ID); !strings.Contains(got, "`spec/` says") || !strings.Contains(got, check) || strings.Contains(got, built) {
+		t.Errorf("spec folder alone: check %v, built %v", strings.Contains(got, check), strings.Contains(got, built))
+	}
+	if err := saveSpecConfig(s.Cwd, &specConfig{SpecDir: "docs", OutDir: "out"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = a.systemPrompt(s.ID); !strings.Contains(got, "`docs/` says") || !strings.Contains(got, built) {
+		t.Error("with a ledger, the paragraph names its directories")
+	}
+}
