@@ -67,7 +67,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 			a.FailToolCall(ctx, sid, gtc, gerr.Error())
 		} else {
 			gitWritable = yes
-			gitconfig = yes && loadGlobalConfig().HasGitconfigInHome
+			gitconfig = yes && hostHasGitconfig()
 			done := "Not mounting .git or .gitconfig."
 			if yes {
 				done = "Will mount .git writable"
@@ -154,6 +154,15 @@ func (a *agent) ensureTerminals(ctx context.Context, sid string) bool {
 		"builds, tests, and every run_command are unavailable. Use a client with ACP terminal support (Zed does), "+
 		"then start a new Agent Thread.")
 	return false
+}
+
+func hostHasGitconfig() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(home, ".gitconfig"))
+	return err == nil
 }
 
 func hostSSHAgentAvailable() bool {

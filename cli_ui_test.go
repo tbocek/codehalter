@@ -152,7 +152,6 @@ func TestLiveRowsFitWidth(t *testing.T) {
 		Content: []ToolCallContent{{Type: "terminal", TerminalId: "t1"}},
 	})
 	u.TerminalTail("t1", []string{strings.Repeat("x", 200)})
-	u.Plan([]PlanEntry{{Content: strings.Repeat("plan ", 40), Status: "in_progress"}})
 	for _, l := range u.liveLines() {
 		if w := len([]rune(stripANSI(l))); w > u.cols-1 {
 			t.Errorf("live row is %d columns wide (max %d): %q", w, u.cols-1, stripANSI(l))
@@ -471,24 +470,24 @@ func screenAfter(out string, cols int) []string {
 }
 
 // A live row wider than the terminal in cells (emoji count one each but take two) must not
-// wrap: the extra row left the region's top row, "plan 1/2", behind on every redraw.
+// wrap: the extra row left the region's top row behind on every redraw.
 func TestLiveRegionLeavesNoRowsBehind(t *testing.T) {
 	u, buf := uiFor(true, 40, 24)
 	u.Begin()
 	for range 5 {
-		u.Plan([]PlanEntry{{Content: "done", Status: "completed"}, {Content: "check " + strings.Repeat("✅", 30), Status: "in_progress"}})
+		u.Plan([]PlanEntry{{Content: "Executing", Status: "in_progress", Meta: &planMeta{Phase: "EXECUTING", Meter: strings.Repeat("✅", 30)}}})
 	}
 	if err := u.out.Flush(); err != nil {
 		t.Fatal(err)
 	}
 	n := 0
 	for _, row := range screenAfter(buf.String(), u.cols) {
-		if strings.Contains(row, "plan 1/2") {
+		if strings.Contains(row, "✅") {
 			n++
 		}
 	}
 	if n != 1 {
-		t.Errorf("plan header on screen %d times after five redraws, want 1", n)
+		t.Errorf("status row on screen %d times after five redraws, want 1", n)
 	}
 }
 

@@ -105,6 +105,10 @@ var respondTool = Tool{Def: map[string]any{
 					"type":        "string",
 					"description": "The full user-facing message, what you would write as your final reply.",
 				},
+				"failed": map[string]any{
+					"type":        "boolean",
+					"description": "True when the task is not done: a check fails and you cannot fix it, or the task is wrong or impossible. Say why in `message`; codehalter plans again.",
+				},
 			},
 		},
 	},

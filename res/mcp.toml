@@ -1,5 +1,5 @@
-# Codehalter MCP server registry. Edit and save — codehalter reconciles it at the
-# end of every turn: starts/stops/restarts servers and registers their tools live
+# Codehalter MCP server registry. Edit and save — codehalter reconciles it before
+# every turn: starts/stops/restarts servers and registers their tools live
 # (usable on the next prompt, no Zed restart). One [[server]] per server; `name`
 # namespaces its tools as <name>__<tool>. Comment a block out to disable it.
 #

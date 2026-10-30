@@ -8,7 +8,7 @@ Scan executor's `respond` + tool-use list. EVERY touched file infra/internal →
 - `.github/**`, `.gitignore`, `.gitattributes`, `.editorconfig`
 - CI/lint/formatter configs (`.golangci.yml`, `.eslintrc*`, `.prettierrc*`)
 - Lockfiles only (`go.sum`, `package-lock.json`, `Cargo.lock`) w/ no manifest change
-Any file outside that list — or no files touched at all (pure investigation) → continue.
+Any file outside that list → continue.
 
 ## Step 1 — Need docs?
 Update ONLY for things a user/contributor must know:

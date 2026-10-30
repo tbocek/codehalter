@@ -420,42 +420,6 @@ func TestCancelRequestUnblocksWaitForExit(t *testing.T) {
 	}
 }
 
-func TestRequestPermissionSelectsByNumber(t *testing.T) {
-	c, _, _ := newCLIHarness(t, "2\n")
-	params, _ := json.Marshal(permissionRequest{
-		SessionId: "s1",
-		ToolCall:  permissionToolCall{ToolCallId: "tc1", Title: "Run `rm -rf build`?"},
-		Options: []permissionOption{
-			{OptionId: "yes", Name: "Allow", Kind: "allow_once"},
-			{OptionId: "no", Name: "Deny", Kind: "reject_once"},
-		},
-	})
-	res, err := c.requestPermission(params)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := res.(permissionResponse)
-	if got.Outcome.Outcome != "selected" || got.Outcome.OptionId != "no" {
-		t.Errorf("outcome = %#v, want selected/no", got.Outcome)
-	}
-}
-
-func TestRequestPermissionEmptyLineDismisses(t *testing.T) {
-	c, _, _ := newCLIHarness(t, "\n")
-	c.interactive = true
-	params, _ := json.Marshal(permissionRequest{
-		SessionId: "s1",
-		Options:   []permissionOption{{OptionId: "yes", Name: "Allow"}},
-	})
-	res, err := c.requestPermission(params)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := res.(permissionResponse); got.Outcome.Outcome != "cancelled" {
-		t.Errorf("outcome = %#v, want cancelled", got.Outcome)
-	}
-}
-
 func TestElicitReturnsTheChosenConst(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "3\n")
 	params, _ := json.Marshal(map[string]any{
@@ -692,9 +656,9 @@ func TestTypingDuringATurnSteersIt(t *testing.T) {
 // and starts no turn.
 func TestALineAnswersTheOpenQuestion(t *testing.T) {
 	c, p, in, done := replFor(t)
-	p.send(map[string]any{"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": map[string]any{
-		"sessionId": "s1", "toolCall": map[string]any{"toolCallId": "c1", "title": "Start the spec loop anyway?"},
-		"options": []map[string]any{{"optionId": "go", "name": "Start anyway", "kind": "allow_once"}, {"optionId": "no", "name": "Stop", "kind": "reject_once"}}}})
+	p.send(map[string]any{"jsonrpc": "2.0", "id": 7, "method": "elicitation/create", "params": map[string]any{
+		"message": "Start the spec loop anyway?", "requestedSchema": map[string]any{"properties": map[string]any{elicitChoiceKey: map[string]any{
+			"oneOf": []map[string]any{{"const": "go", "title": "Start anyway"}, {"const": "no", "title": "Stop"}}}}}}})
 	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
 		c.waitMu.Lock()
 		up := c.waiting != nil
@@ -708,7 +672,7 @@ func TestALineAnswersTheOpenQuestion(t *testing.T) {
 	}
 	fmt.Fprintln(in, "2")
 	resp := within(t, p)
-	if out, _ := json.Marshal(resp["result"]); resp["id"] != float64(7) || !strings.Contains(string(out), `"optionId":"no"`) {
+	if out, _ := json.Marshal(resp["result"]); resp["id"] != float64(7) || !strings.Contains(string(out), `"no"`) {
 		t.Fatalf("answer = %v %s", resp["id"], out)
 	}
 	fmt.Fprintln(in, "/quit")
@@ -1017,11 +981,11 @@ func TestScriptedReplFinishesTheTurnAfterInputEnds(t *testing.T) {
 		t.Fatal("the repl left with the turn still running")
 	case <-time.After(50 * time.Millisecond):
 	}
-	p.send(map[string]any{"jsonrpc": "2.0", "id": 7, "method": "session/request_permission", "params": map[string]any{
-		"sessionId": "s1", "toolCall": map[string]any{"toolCallId": "c1", "title": "Run /spec on spec/ now?"},
-		"options": []map[string]any{{"optionId": "yes", "name": "Run /spec", "kind": "allow_once"}, {"optionId": "no", "name": "Let me read it first", "kind": "reject_once"}}}})
+	p.send(map[string]any{"jsonrpc": "2.0", "id": 7, "method": "elicitation/create", "params": map[string]any{
+		"message": "Run /spec on spec/ now?", "requestedSchema": map[string]any{"properties": map[string]any{elicitChoiceKey: map[string]any{
+			"oneOf": []map[string]any{{"const": "yes", "title": "Run /spec"}, {"const": "no", "title": "Let me read it first"}}}}}}})
 	resp := within(t, p)
-	if out, _ := json.Marshal(resp["result"]); resp["id"] != float64(7) || !strings.Contains(string(out), `"optionId":"yes"`) {
+	if out, _ := json.Marshal(resp["result"]); resp["id"] != float64(7) || !strings.Contains(string(out), `"yes"`) {
 		t.Fatalf("answer = %v %s", resp["id"], out)
 	}
 	p.reply(prompt, map[string]any{"stopReason": "end_turn"})

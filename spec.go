@@ -773,7 +773,7 @@ func (idx *specIndex) slice(id, specDirRel string) specSlice {
 			cut = len(clipUTF8(primaryText, specPrimaryCap))
 		}
 		resume := primary.start + strings.Count(primaryText[:cut], "\n") + 2
-		primaryText = primaryText[:cut] + fmt.Sprintf("\n[... section continues: read_file %s line=%d]", path(primary.doc), resume)
+		primaryText = primaryText[:cut] + fmt.Sprintf("\n[... section continues in %s at line %d]", path(primary.doc), resume)
 	}
 	title := it.ID
 	if it.Title != "" {
@@ -1539,7 +1539,7 @@ func renderSpecDelta(d specDelta) string {
 		if len(d.Legacy) > 12 {
 			ids += ", …"
 		}
-		fmt.Fprintf(&b, "- %d item(s) were counted done before only a test's name counted, and no test is named after them (a comment or a string mentions them). They stay done; `/spec redo <ids>` rebuilds any of them: %s\n", len(d.Legacy), ids)
+		fmt.Fprintf(&b, "- %d item(s) were counted done before only a test's name counted, and no test is named after them (a comment or a string mentions them). They stay done; `/spec redo` finds and rebuilds what falls short: %s\n", len(d.Legacy), ids)
 	}
 	b.WriteString("\n")
 	return b.String()

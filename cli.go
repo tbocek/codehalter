@@ -967,30 +967,6 @@ func blockText(b ContentBlock) string {
 	return b.Text
 }
 
-func (c *cliClient) requestPermission(params json.RawMessage) (any, error) {
-	var p permissionRequest
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, err
-	}
-	labels := make([]string, len(p.Options))
-	for i, o := range p.Options {
-		labels[i] = o.Name
-	}
-	title := p.ToolCall.Title
-	if title == "" {
-		title = "Permission required"
-	}
-	idx, _ := c.askChoiceOrText(title, labels, false)
-	var resp permissionResponse
-	if idx < 0 {
-		resp.Outcome.Outcome = "cancelled"
-		return resp, nil
-	}
-	resp.Outcome.Outcome = "selected"
-	resp.Outcome.OptionId = p.Options[idx].OptionId
-	return resp, nil
-}
-
 // Only the choice and text fields codehalter sends are supported; any other form is declined
 // so the agent gets an answer instead of a hang.
 func (c *cliClient) elicit(params json.RawMessage) (any, error) {
@@ -1361,8 +1337,6 @@ func (c *cliConn) handle(req *jsonrpcRequest) {
 	var res any
 	var err error
 	switch req.Method {
-	case "session/request_permission":
-		res, err = c.client.requestPermission(req.Params)
 	case "elicitation/create":
 		res, err = c.client.elicit(req.Params)
 	case "terminal/create":

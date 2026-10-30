@@ -345,29 +345,15 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		out.Reason = "executor exited without calling respond"
 		return out
 	}
-	// Exit codes override the model's verdict (small models declare success over a
-	// non-zero exit), but only each call's LAST run counts: a fixed re-run is green.
-	type runKey struct{ name, input string }
-	lastFailed := map[runKey]bool{}
-	var order []runKey
-	for _, u := range res.ToolUses {
-		k := runKey{u.Name, u.Input}
-		if _, seen := lastFailed[k]; !seen {
-			order = append(order, k)
+	// A non-zero exit is no verdict (a grep that finds nothing exits 1); the executor's own word is.
+	for i := len(res.ToolUses) - 1; i >= 0; i-- {
+		if u := res.ToolUses[i]; u.Name == respondToolName {
+			if parseArgs(u.Input).flag("failed") {
+				out.Reason = "the executor reports: " + truncate(res.Text, 400)
+				return out
+			}
+			break
 		}
-		lastFailed[k] = u.Failed
-	}
-	var failed []string
-	for _, k := range order {
-		// Other tools set Failed only to feed the fail cap; they are not verdicts.
-		if lastFailed[k] && k.name == "run_command" {
-			cmd := strings.Join(strings.Fields(parseArgs(k.input).str("command")), " ")
-			failed = append(failed, "`"+truncate(cmd, 100)+"`")
-		}
-	}
-	if len(failed) > 0 {
-		out.Reason = "failed commands: " + strings.Join(failed, ", ")
-		return out
 	}
 	if reason := a.testShowsFault(ctx, sid, root, before, res.ToolUses); reason != "" {
 		out.Reason = reason
@@ -1202,7 +1188,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		}
 		messages = a.addCorrective(sid, messages,
 			"Your last tool call(s) returned output you already have, which makes no progress. Do NOT repeat them. Instead:\n"+
-				"1. If a read came back PARTIAL and you need more, make the read_file call its note names for the next part; never re-read the same window, never rewrite a whole file.\n"+
+				"1. If a read came back PARTIAL and you need more, read the next part with sed -n; never re-read the same window, never rewrite a whole file.\n"+
 				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n"+
 				"3. If you are stuck or the task is infeasible, say so and stop.")
 		if stuckRounds >= stuckEscalateRounds && escalate() && sid != "" {
@@ -1285,6 +1271,9 @@ func headState(root, path string) *fileState {
 // testRunRe: a command line that runs tests, in the common runners.
 var testRunRe = regexp.MustCompile(`(?i)\b(?:test|tests|pytest|jest|vitest|rspec|ctest|phpunit|mocha|unittest)\b`)
 
+// trailingEchoRe: a test run followed by echo exit=$? always exits 0; without the echo it tells.
+var trailingEchoRe = regexp.MustCompile("\\s*;\\s*echo\\b[^;|&]*$")
+
 // docExts are not part of a fix: taking them out changes no test.
 var docExts = map[string]bool{".md": true, ".txt": true, ".rst": true, ".adoc": true}
 
@@ -1302,12 +1291,17 @@ func (a *agent) testShowsFault(ctx context.Context, sid, root string, before map
 	cmd := ""
 	for i := len(uses) - 1; i >= 0 && cmd == ""; i-- {
 		if u := uses[i]; u.Name == "run_command" {
-			if c := parseArgs(u.Input).str("command"); testRunRe.MatchString(c) {
-				if u.Failed {
-					return ""
-				}
-				cmd = c
+			c := parseArgs(u.Input).str("command")
+			// A look at the log of an earlier run names "test" too, and is no run.
+			if !testRunRe.MatchString(c) || onlyReads(c) {
+				continue
 			}
+			// A pipeline reports its last command's exit, so it cannot tell red from green.
+			c = trailingEchoRe.ReplaceAllString(c, "")
+			if strings.Contains(c, "|") {
+				return ""
+			}
+			cmd = c
 		}
 	}
 	if cmd == "" {

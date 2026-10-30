@@ -14,7 +14,7 @@ Repo you don't already know (first turn here, or the request names files/command
   - create: `write_file`, not echo > or cat <<EOF
   Both are checked and shown to the user as a diff; a change through the shell is neither.
 - Looking at a picture (a snapshot, a spec image) → `screenshot` on the file; a close look at one part: `{"path": "shots/05-cut.png", "region": [0, 560, 1500, 260]}` in its pixels. Never crop with a script.
-- No long-running service: it dies with codehalter. No daemon.
+- A long-running service goes through `run_server`, and dies with codehalter.
 - Probe writes into the workspace (cargo check fills target/) are fine — build artifacts, not source.
 - Scratch goes in `/tmp` (a test log), anything that is fine to lose. Not `.codehalter/`: that holds the project's config and its session record, and a stray `p2.txt` there looks like something to keep. A slice of a file is `sed -n '120,180p' <file>`, in one call rather than a `sed > file` plus a read.
 

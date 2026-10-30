@@ -73,18 +73,6 @@ echo "Installed ${BINARY} to ${INSTALL_DIR}/${BINARY}"
 mkdir -p "${HOME}/.config/codehalter"
 echo "Ensured ${HOME}/.config/codehalter exists"
 
-# Record host facts codehalter reads when it scaffolds a .devcontainer. Right now
-# just whether ~/.gitconfig exists, so it only bind-mounts it when present — a
-# missing bind source would fail the container start.
-has_gitconfig=false
-[ -f "${HOME}/.gitconfig" ] && has_gitconfig=true
-cat > "${HOME}/.config/codehalter/global.toml" <<EOF
-# Host facts captured by install.sh, read by codehalter when scaffolding a
-# devcontainer. Edit if your setup changes.
-has_gitconfig_in_home = ${has_gitconfig}
-EOF
-echo "Wrote ${HOME}/.config/codehalter/global.toml (has_gitconfig_in_home=${has_gitconfig})"
-
 # Register codehalter as a Zed agent server. Zed keeps its settings at
 # ~/.config/zed/settings.json on both Linux and macOS; an existing directory is
 # the "Zed is installed" signal. The file is JSONC (Zed's default ships // header

@@ -206,24 +206,6 @@ func TestRenderKey(t *testing.T) {
 	}
 }
 
-func TestLoadGlobalConfig(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	if loadGlobalConfig().HasGitconfigInHome {
-		t.Errorf("missing global.toml → false")
-	}
-	cfg := filepath.Join(home, ".config", "codehalter")
-	if err := os.MkdirAll(cfg, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(cfg, "global.toml"), []byte("has_gitconfig_in_home = true\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !loadGlobalConfig().HasGitconfigInHome {
-		t.Errorf("global.toml has_gitconfig_in_home=true → true")
-	}
-}
-
 // An unparsable value falls back to the default rather than disabling the refresh.
 func TestKeepWarmInterval(t *testing.T) {
 	for raw, want := range map[string]time.Duration{

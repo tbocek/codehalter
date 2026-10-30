@@ -383,7 +383,7 @@ func TestOrchestrateRepeatedFailureAndReplanBudget(t *testing.T) {
 	// An executor revising the plan to nothing fails its subtask in one call, the same way each time.
 	fail := sseToolCall("e", submitPlanToolName, `{"clear":true,"subtasks":[]}`)
 	var resp []string
-	for range maxReplans {
+	for range maxSameFailure {
 		resp = append(resp, plan, fail)
 	}
 	a, s, mock := planPhaseAgent(t, resp...)
@@ -391,8 +391,8 @@ func TestOrchestrateRepeatedFailureAndReplanBudget(t *testing.T) {
 	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got := mock.callCount(); got != 2*maxReplans {
-		t.Errorf("%d model calls, want %d: the budget stops before another plan", got, 2*maxReplans)
+	if got := mock.callCount(); got != 2*maxSameFailure {
+		t.Errorf("%d model calls, want %d: the third same failure ends it", got, 2*maxSameFailure)
 	}
 	if first := fmt.Sprint(mock.request(2)["messages"]); !strings.Contains(first, "REPLAN: prior subtask failed: executor called submit_plan with no usable subtasks") || strings.Contains(first, "Same failure") {
 		t.Errorf("the first replan should carry the failure and no repeat note")
@@ -407,6 +407,7 @@ func TestSpecRoundSkipsTheDocumenter(t *testing.T) {
 	for _, fenced := range []bool{false, true} {
 		a, s, mock := planPhaseAgent(t,
 			sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`),
+			sseToolCall("w1", "write_file", `{"path":"a.rs","content":"x"}`),
 			sseToolCall("e1", respondToolName, `{"message":"changed"}`),
 			sseText("nothing to document"),
 		)
@@ -417,7 +418,7 @@ func TestSpecRoundSkipsTheDocumenter(t *testing.T) {
 		if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
 			t.Fatal(err)
 		}
-		if want := map[bool]int{false: 3, true: 2}[fenced]; mock.callCount() != want {
+		if want := map[bool]int{false: 4, true: 3}[fenced]; mock.callCount() != want {
 			t.Errorf("fenced=%v: %d model calls, want %d", fenced, mock.callCount(), want)
 		}
 	}
@@ -659,5 +660,48 @@ func TestDoneLineShowsTimeToolsCallsAndInputs(t *testing.T) {
 	round := done(rig.said(t))
 	if strings.Contains(round, "⌨") || strings.Contains(round, "⚙") || !strings.Contains(round, " · ≡ 2") {
 		t.Errorf("a turn nobody typed and no tool ran: %q, want ≡ 2 and neither ⌨ nor ⚙", round)
+	}
+}
+
+// Different failures run into the budget, and a turn that changed nothing gets no documenter.
+func TestOrchestrateReplanBudget(t *testing.T) {
+	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`)
+	var resp []string
+	for _, words := range []string{"alpha bravo", "charlie delta", "echo foxtrot", "golf hotel", "india juliet"} {
+		resp = append(resp, plan, sseToolCall("e", respondToolName, `{"message":"`+words+`","failed":true}`))
+	}
+	a, s, mock := planPhaseAgent(t, resp...)
+	s.AddUser("change a.rs")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := mock.callCount(); got != 2*maxReplans {
+		t.Errorf("%d model calls, want %d", got, 2*maxReplans)
+	}
+}
+
+func TestDocumenterRunsOnlyAfterAChange(t *testing.T) {
+	for _, wrote := range []bool{false, true} {
+		resp := []string{sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"x"}]}`)}
+		if wrote {
+			resp = append(resp, sseToolCall("w", "write_file", `{"path":"a.txt","content":"x"}`))
+		}
+		resp = append(resp, sseToolCall("r", respondToolName, `{"message":"done"}`))
+		want := len(resp)
+		if wrote {
+			want++
+			resp = append(resp, sseText("No documentation change needed."))
+		}
+		a, s, mock := planPhaseAgent(t, resp...)
+		s.AddUser("x")
+		if wrote {
+			a.tools.add(fakeTool("write_file", func(string) (string, bool) { return "file written successfully", false }))
+		}
+		if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := mock.callCount(); got != want {
+			t.Errorf("wrote %v: %d model calls, want %d", wrote, got, want)
+		}
 	}
 }

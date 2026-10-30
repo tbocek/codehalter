@@ -219,31 +219,6 @@ func loadGlobalSettings() (Settings, error) {
 	return decodeSettings(globalPath)
 }
 
-// GlobalConfig holds host facts written by install.sh to ~/.config/codehalter/global.toml.
-type GlobalConfig struct {
-	HasGitconfigInHome bool `toml:"has_gitconfig_in_home"`
-}
-
-func loadGlobalConfig() GlobalConfig {
-	var g GlobalConfig
-	path, err := globalConfigPath("global.toml")
-	if err != nil {
-		slog.Warn("loadGlobalConfig: no home directory; optional host mounts disabled", "err", err)
-		return g
-	}
-	md, err := toml.DecodeFile(path, &g)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			slog.Warn("loadGlobalConfig: unreadable global config (ignored, optional host mounts disabled)", "file", path, "err", err)
-		}
-		return GlobalConfig{}
-	}
-	for _, key := range md.Undecoded() {
-		slog.Warn("unknown global config key (ignored, check for a typo)", "key", key.String(), "file", path)
-	}
-	return g
-}
-
 func decodeSettings(path string) (Settings, error) {
 	var s Settings
 	md, err := toml.DecodeFile(path, &s)

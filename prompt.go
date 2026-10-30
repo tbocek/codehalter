@@ -18,9 +18,12 @@ import (
 	"unicode/utf8"
 )
 
-// Generous on purpose: executeFailCap bounces stuck subtasks here, and replans
-// are the only place web_search/web_read run.
-const maxReplans = 20
+// maxReplans caps the replans of one turn, maxSameFailure the times one failure may
+// come back: planning again after the third time has not changed the outcome.
+const (
+	maxReplans     = 5
+	maxSameFailure = 3
+)
 
 // maxUpserts caps mid-run submit_plan revisions, separately from maxReplans.
 const maxUpserts = 20
@@ -622,6 +625,10 @@ func (a *agent) runTurn(ctx context.Context, sid string, typed bool) error {
 	return nil
 }
 
+func changedProject(uses []ToolUse) bool {
+	return slices.ContainsFunc(uses, func(u ToolUse) bool { return u.Changed || wroteFile(u.Name, u.Output) })
+}
+
 func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
 	if sess == nil {
@@ -667,6 +674,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 	var failureBags []map[string]bool
 	replans := 0
 	upserts := 0
+	changed := false
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -686,6 +694,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 
 			outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 			lastResult = outcome.Result
+			changed = changed || changedProject(outcome.Result.ToolUses)
 
 			if outcome.Upsert != nil {
 				plan = outcome.Upsert
@@ -726,6 +735,11 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 
 		a.say(ctx, sid, fmt.Sprintf("⚠ Task %d/%d failed: %s\n", failedAt+1, len(plan.Subtasks), failedReason))
 
+		if dupCount >= maxSameFailure {
+			a.say(ctx, sid, fmt.Sprintf("⚠ The same failure came back %d times: giving up.\n", dupCount))
+			return lastResult, nil
+		}
+
 		replans++
 		if replans >= maxReplans {
 			a.say(ctx, sid, fmt.Sprintf("⚠ Replan budget (%d) exhausted: giving up.\n", maxReplans))
@@ -753,8 +767,9 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		plan = newPlan
 	}
 
-	// A /spec round plans its own docs step; a documenter after it edits past the round's test run.
-	if sess.specFence() == "" {
+	// A /spec round plans its own docs step; a documenter after it edits past the round's test
+	// run. A turn that changed nothing has nothing to document.
+	if changed && sess.specFence() == "" {
 		a.sendPhase(ctx, sid, 2, false)
 		lastResult = a.runDocumentPhase(ctx, sid, lastResult)
 	}

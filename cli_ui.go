@@ -67,8 +67,6 @@ type cliUI struct {
 	order []string
 	terms map[string][]string
 
-	plan []PlanEntry
-
 	used int
 	size int
 	// pp and tg: the last call's prompt and generation tokens per second, 0 until known.
@@ -276,7 +274,6 @@ func (u *cliUI) liveLines() []string {
 	if len(u.pend) > 0 {
 		out = append(out, u.clip(u.pendPre+u.style(string(u.pend), u.pendSty)))
 	}
-	out = append(out, u.planLines()...)
 
 	running := make([]*cliCall, 0, len(u.order))
 	for _, id := range u.order {
@@ -317,27 +314,6 @@ func (u *cliUI) liveLines() []string {
 	// liveRows. Keep the first row (streaming sentence or plan header) and the newest rows.
 	if limit := u.rows - 2; limit > 1 && len(out) > limit {
 		out = append(out[:1], out[len(out)-(limit-1):]...)
-	}
-	return out
-}
-
-func (u *cliUI) planLines() []string {
-	if len(u.plan) == 0 {
-		return nil
-	}
-	var out []string
-	done := 0
-	for _, e := range u.plan {
-		if e.Status == "completed" {
-			done++
-		}
-	}
-	out = append(out, u.clip(u.style(fmt.Sprintf("  plan %d/%d", done, len(u.plan)), ansiDim)))
-	for _, e := range u.plan {
-		if e.Status != "in_progress" {
-			continue
-		}
-		out = append(out, u.clip(u.style("  → "+e.Content, ansiYell)))
 	}
 	return out
 }
@@ -670,23 +646,14 @@ func (u *cliUI) contentLines(cs []ToolCallContent) []string {
 func (u *cliUI) Plan(entries []PlanEntry) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	// codehalter's phases (each a phase name, or the one in progress with its parts) go into
-	// the status row, not plan rows.
-	phase := func(e PlanEntry) bool { return e.Meta != nil || slices.Contains(phaseNames, e.Content) }
-	if len(entries) > 0 && !slices.ContainsFunc(entries, func(e PlanEntry) bool { return !phase(e) }) {
-		u.plan, u.phase, u.meter = nil, "", ""
+	// Every entry codehalter sends is a phase: it goes into the status row.
+	if len(entries) > 0 {
+		u.phase, u.meter = "", ""
 		for _, e := range entries {
 			if e.Meta != nil && e.Status == "in_progress" {
 				u.phase, u.meter = e.Meta.Phase, e.Meta.Meter
 			}
 		}
-		u.drawLive()
-		return
-	}
-	u.plan = make([]PlanEntry, len(entries))
-	for i, e := range entries {
-		e.Content = sanitize(e.Content)
-		u.plan[i] = e
 	}
 	u.drawLive()
 }
@@ -741,7 +708,6 @@ func (u *cliUI) End() {
 		u.emitLine(u.clip(u.style("· "+c.title+" (interrupted)", ansiDim)))
 	}
 	u.busy = false
-	u.plan = nil
 	u.terms = map[string][]string{}
 	u.eraseLive()
 	u.out.Flush()

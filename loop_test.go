@@ -1646,49 +1646,6 @@ func TestExecutorTestMustFailWithoutTheFix(t *testing.T) {
 	}
 }
 
-// Exit codes override the executor's respond, by each call's last run: a failed
-// run_command fails the subtask, a green re-run of the same call clears it, and
-// other tools' failures are no verdict.
-func TestExecutorVerdictFromExitCodes(t *testing.T) {
-	type step struct {
-		tool, cmd string
-		failed    bool
-	}
-	for _, tc := range []struct {
-		name   string
-		steps  []step
-		reason string // "" for a pass
-	}{
-		{"failed run", []step{{"run_command", "go test ./...", true}}, "failed commands: `go test ./...`"},
-		{"green re-run", []step{{"run_command", "go test ./...", true}, {"run_command", "go test ./...", false}}, ""},
-		{"another command green", []step{{"run_command", "go test ./...", true}, {"run_command", "go vet ./...", false}}, "failed commands: `go test ./...`"},
-		{"failed edit", []step{{"edit_file", "", true}}, ""},
-	} {
-		var resp []string
-		for i, st := range tc.steps {
-			args, _ := json.Marshal(map[string]string{"command": st.cmd, "path": "a.go"})
-			resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), st.tool, string(args)))
-		}
-		resp = append(resp, sseToolCall("r", respondToolName, `{"message":"all done"}`))
-		a, s, _ := planPhaseAgent(t, resp...)
-		next := 0
-		answer := func(string) (string, bool) {
-			st := tc.steps[next]
-			next++
-			if st.failed {
-				return "exit 1\n\nFAIL", true
-			}
-			return "exit 0\n\nok", false
-		}
-		a.tools.add(fakeTool("run_command", answer), fakeTool("edit_file", answer))
-
-		out := a.runExecutePhase(context.Background(), s.ID, subtask{Description: "make the tests pass"}, 0, 1)
-		if out.Success != (tc.reason == "") || out.Reason != tc.reason {
-			t.Errorf("%s: success=%v reason=%q, want reason %q", tc.name, out.Success, out.Reason, tc.reason)
-		}
-	}
-}
-
 // Only the user starts /spec: a `redo` from an ordinary turn is sent back, and the
 // fields that wrote a new spec are gone from the tool.
 func TestPlanRedoOutsideTheAuditRetries(t *testing.T) {
@@ -1774,5 +1731,72 @@ func TestOrchestrateVerifyRunsNoSubtasks(t *testing.T) {
 	}
 	if res.Text != "one contradiction" || mock.callCount() != 2 {
 		t.Errorf("reply %q, %d calls; want the report after one retry", res.Text, mock.callCount())
+	}
+}
+
+// The executor's word decides, not an exit code: a grep that finds nothing is data.
+func TestRespondFailedFailsTheSubtask(t *testing.T) {
+	for _, tc := range []struct {
+		name, respond string
+		cmdFailed     bool
+		reason        string
+	}{
+		{"done", `{"message":"all done"}`, false, ""},
+		{"non-zero exit, done", `{"message":"all done"}`, true, ""},
+		{"reports failure", `{"message":"the suite stays red","failed":true}`, false, "the executor reports: the suite stays red"},
+	} {
+		a, s, _ := planPhaseAgent(t,
+			sseToolCall("c", "run_command", `{"command":"grep nothing a.go"}`),
+			sseToolCall("r", respondToolName, tc.respond))
+		a.tools.add(fakeTool("run_command", func(string) (string, bool) { return "exit 1\n", tc.cmdFailed }))
+		out := a.runExecutePhase(context.Background(), s.ID, subtask{Description: "x"}, 0, 1)
+		if out.Reason != tc.reason || out.Success != (tc.reason == "") {
+			t.Errorf("%s: success %v, reason %q", tc.name, out.Success, out.Reason)
+		}
+	}
+}
+
+func TestTrailingEchoComesOffTheTestRun(t *testing.T) {
+	for in, want := range map[string]string{
+		`just test > /tmp/t.log 2>&1; echo "exit=$?"`: "just test > /tmp/t.log 2>&1",
+		"just test":                     "just test",
+		"just test; echo a; just build": "just test; echo a; just build",
+	} {
+		if got := trailingEchoRe.ReplaceAllString(in, ""); got != want {
+			t.Errorf("%q -> %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Red-first judges a run by its exit: the recommended echo form is run without the echo, a
+// look at the log is no run, and a pipeline cannot tell.
+func TestRedFirstReadsTheRealRun(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmds []string
+		want string // part of the reason, "" for a pass
+	}{
+		{"echo form, red without the fix", []string{`sh tests/red.sh; echo "exit=$?"`}, ""},
+		{"last look at a log is skipped", []string{"sh tests/ok.sh", "tail -5 /tmp/test.log"}, "red before green failed"},
+		{"a pipeline is not judged", []string{"sh tests/ok.sh | tail -3"}, ""},
+	} {
+		dir := gitRepo(t, map[string]string{"src/a.dat": "old\n", "tests/a_test.txt": "old\n", "tests/ok.sh": "true\n", "tests/red.sh": "grep -q fixed src/a.dat\n"})
+		a, s := newTestAgent(t)
+		s.Cwd = dir
+		_, before := dirtyFiles(dir)
+		for _, f := range []string{"src/a.dat", "tests/a_test.txt"} {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("fixed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var uses []ToolUse
+		for _, c := range tc.cmds {
+			in, _ := json.Marshal(map[string]string{"command": c})
+			uses = append(uses, ToolUse{Name: "run_command", Input: string(in)})
+		}
+		got := a.testShowsFault(context.Background(), s.ID, dir, before, uses)
+		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("%s: reason %q, want %q", tc.name, got, tc.want)
+		}
 	}
 }
