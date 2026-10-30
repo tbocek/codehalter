@@ -28,7 +28,7 @@ func TestSpecRoundTestsAreReviewed(t *testing.T) {
 	look := func(runTests bool) specRoundResult {
 		t.Helper()
 		res := specRoundResult{Mode: specModeItem, Committed: true}
-		if _, _, err := r.inspect(t.Context(), specWork{Item: "F0.1", Mode: specModeItem}, nil, time.Now(), runTests, &res); err != nil {
+		if _, _, err := r.inspect(t.Context(), specWork{Item: "F0.1", Mode: specModeItem}, nil, time.Now(), !runTests, &res); err != nil {
 			t.Fatal(err)
 		}
 		return res

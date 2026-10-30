@@ -35,7 +35,7 @@ const (
 		"3. Prove it: run the formatter in check mode over the whole tree and report how many files it would still change. A large number means the config does not describe this codebase: go back to step 1 and fix the config. Do NOT reformat the repo to match a guess.\n" +
 		"4. Only once step 3 is small: format the whole tree and commit that as ONE commit containing formatting and nothing else. If `git status` is not clean, skip this step and say so: a formatting commit must not sweep up someone's work in progress.\n" +
 		"\n" +
-		"SKILL-base.md (\"Formatter config\") has the exact config files and flags. Change no behavior anywhere in this task.\n"
+		"Config files and checks: prettier, `.prettierrc` (`tabWidth`, `useTabs`, `singleQuote`, `semi`, `trailingComma`, `printWidth`), checked with `prettier --list-different .`. clang-format, start from `clang-format --style=LLVM --dump-config > .clang-format` (or GNU, Google, WebKit), correct `IndentWidth`, `UseTab`, `BreakBeforeBraces`, `PointerAlignment`, `ColumnLimit`, checked with `clang-format --dry-run -Werror $(git ls-files \"*.c\" \"*.h\")`. gofmt, rustfmt and zig fmt have no style options. Ignore vendored and generated files (`.prettierignore`) before any write. Change no behavior anywhere in this task.\n"
 
 	// Brevity is stated without a number: given a measurable target ("under 60 lines") the
 	// model iterates against it with wc and grep instead of writing the file once.

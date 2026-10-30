@@ -54,15 +54,13 @@ func (p *planResult) UnmarshalJSON(b []byte) error {
 }
 
 type planResult struct {
-	Clear    bool      `json:"clear"`
+	Clear    bool      `json:"-"`
 	Choices  []string  `json:"choices"`
 	Question string    `json:"question"`
 	Subtasks []subtask `json:"subtasks"`
 	// A /spec round's question: the spec text that comes closest, and options with examples.
 	SpecQuote string       `json:"spec_quote"`
 	Options   []specOption `json:"options"`
-	// Every subtask only relays findings, so the orchestrator skips the confirmation.
-	ReportOnly bool `json:"report_only"`
 	// The /spec redo audit's answer: the items that fall short. Refused anywhere else.
 	Redo []string `json:"redo"`
 	// An argument because a server that forces the tool call (Halogen) returns no
@@ -86,14 +84,14 @@ func planProblem(res toolLoopResult, p *planResult, parseErr error, audit, verif
 			fmt.Sprintf("Your `submit_plan` arguments were not valid JSON (%v). Call it again, emitting the arguments as one well-formed JSON object.", parseErr)
 	case verify && len(p.Subtasks) > 0:
 		return "the planner planned changes during /spec verify, which only reports",
-			"/spec verify changes nothing. Call `submit_plan` again with report_only=true, no subtasks, and the whole report in `answer`."
+			"/spec verify changes nothing. Call `submit_plan` again with no subtasks and the whole report in `answer`."
 	case !audit && len(p.Redo) > 0:
 		return "the planner asked to reopen spec items, which only the user's /spec redo does",
-			"`redo` applies only inside the /spec redo audit, and this is not one. Call `submit_plan` again without it: `subtasks` for the work, or the complete `answer` (report_only=true). Work too big for one plan: say so in `answer` and name `/spec`, which the user runs."
+			"`redo` applies only inside the /spec redo audit, and this is not one. Call `submit_plan` again without it: `subtasks` for the work, or the complete `answer`. Work too big for one plan: say so in `answer` and name `/spec`, which the user runs."
 	// Whether or not it set clear: an empty plan once ended six /spec rounds in a row.
 	case len(p.Subtasks) == 0 && p.answer == "" && len(p.Redo) == 0 && strings.TrimSpace(p.Question) == "":
 		return "the planner submitted neither an answer nor any subtasks",
-			"Your `submit_plan` had neither an answer nor subtasks, so nothing reaches the user. Call it again with EITHER the complete answer in `answer` (report_only=true, no subtasks) OR the subtasks that do the work. Put the fields at the top level of the arguments, `{\"clear\": true, \"subtasks\": [...]}`, not inside another key."
+			"Your `submit_plan` had neither an answer nor subtasks, so nothing reaches the user. Call it again with EITHER the complete answer in `answer` (no subtasks) OR the subtasks that do the work. Put the fields at the top level of the arguments, `{\"subtasks\": [...]}`, not inside another key."
 	}
 	return "", ""
 }
@@ -110,32 +108,40 @@ func unwrapPlan(raw string) string {
 	for _, inner := range outer {
 		var text string
 		if json.Unmarshal(inner, &text) == nil {
-			inner = json.RawMessage(strings.TrimSpace(text))
+			// Text that is cut off counts too: a stringified plan lost its closing brackets
+			// and its work, with the prose beside it passing for an answer.
+			inner = json.RawMessage(repairJSON(strings.TrimSpace(text)))
 		}
 		var list []json.RawMessage
 		if json.Unmarshal(inner, &list) == nil && len(list) == 1 {
 			inner = list[0]
 		}
 		var plan map[string]json.RawMessage
-		if json.Unmarshal(inner, &plan) == nil && (plan["subtasks"] != nil || plan["clear"] != nil || plan["answer"] != nil) {
+		if json.Unmarshal(inner, &plan) == nil && (plan["subtasks"] != nil || plan["clear"] != nil || plan["answer"] != nil || plan["question"] != nil) {
 			return string(inner)
 		}
 	}
 	return raw
 }
 
-// respond as the plan terminal is a direct answer: a report_only plan with no subtasks.
+// respond as the plan terminal is a direct answer: a plan with no subtasks.
 func planFrom(res toolLoopResult) (*planResult, error) {
 	if res.Terminal == respondToolName {
-		return &planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(res.Text)}, nil
+		return &planResult{Clear: true, answer: strings.TrimSpace(res.Text)}, nil
 	}
 	var p planResult
 	if err := json.Unmarshal([]byte(unwrapPlan(trimJSON(res.Text))), &p); err != nil {
 		return nil, err
 	}
+	// A question without work is what makes a plan unclear; the old `clear` argument a model
+	// may still copy from its history is not read. Subtasks win over a question beside them: a
+	// replay lost a whole plan to a filled-in `question`.
+	p.Clear = len(p.Subtasks) > 0 || strings.TrimSpace(p.Question) == "" && len(p.Choices) == 0 && len(p.Options) == 0
 	switch {
 	case strings.TrimSpace(p.Answer) != "":
-		p.answer = strings.TrimSpace(p.Answer)
+		// A server's tool parser can leave the next argument inside this one.
+		answer, _, _ := strings.Cut(p.Answer, "<parameter=")
+		p.answer = strings.TrimSpace(answer)
 	case res.Terminal != "":
 		p.answer = strings.TrimSpace(res.Content)
 	default:
@@ -224,7 +230,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 			q, wrong := specQuestionFrom(plan, fence)
 			if wrong != "" {
 				corrective := "Your question was not recorded: " + wrong + ". Read the spec again first: a layout, a label, an order or a value it states anywhere (the chapter's screen description, its picture, a table, another item) decides it, so follow that and call `submit_plan` with the subtasks. " +
-					"Only if the spec truly does not decide it, call `submit_plan` again with clear=false, no subtasks, and: `question`, one sentence naming what the user must decide; `spec_quote`, the spec text that comes closest to deciding it, copied exactly from a spec file; `options`, 2 or 3 ways to decide it with your pick first, each a short `choice` and an `example` of what the user would see or the program would do with it (a label, a layout, a value, a line of a file)."
+					"Only if the spec truly does not decide it, call `submit_plan` again with no subtasks and: `question`, one sentence naming what the user must decide; `spec_quote`, the spec text that comes closest to deciding it, copied exactly from a spec file; `options`, 2 or 3 ways to decide it with your pick first, each a short `choice` and an `example` of what the user would see or the program would do with it (a label, a layout, a value, a line of a file)."
 				if plan, err = retry(fmt.Sprintf("\n⚠ The planner asked a question that is not answerable from the spec as asked: %s. Asking it to look again.\n", wrong), corrective); err != nil {
 					return nil, err
 				}
@@ -243,7 +249,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 			// A question with no buttons is still a question: the user answers it in chat,
 			// and whatever was planned beside it waits for that answer.
 			if q := strings.TrimSpace(plan.Question); !plan.Clear && q != "" {
-				plan.Subtasks, plan.ReportOnly, plan.answer = nil, true, q
+				plan.Subtasks, plan.answer = nil, q
 			}
 			return plan, nil
 		}
@@ -1296,9 +1302,11 @@ func (a *agent) testShowsFault(ctx context.Context, sid, root string, before map
 			if !testRunRe.MatchString(c) || onlyReads(c) {
 				continue
 			}
-			// A pipeline reports its last command's exit, so it cannot tell red from green.
+			// A pipeline or a sequence reports its last command's exit, so it cannot tell red
+			// from green: all 3 firings in a 36-run replay were a go test followed by ; echo
+			// and more, each costing a replan for nothing.
 			c = trailingEchoRe.ReplaceAllString(c, "")
-			if strings.Contains(c, "|") {
+			if strings.ContainsAny(c, "|;") {
 				return ""
 			}
 			cmd = c

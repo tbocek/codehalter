@@ -20,7 +20,7 @@ These are the steps, not the result: a later edit may have replaced an earlier o
 
 ## Answer
 
-Call `submit_plan` with `report_only=true`, no subtasks, and the whole report in `answer`:
+Call `submit_plan` with no subtasks and the whole report in `answer`:
 
 - For each contradiction: the changed file and line, what the change does, the spec file with the line quoted exactly, and the item id if the line has one.
 - Then one line naming the changes you could not place in the spec, if any.

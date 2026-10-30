@@ -27,7 +27,7 @@ func TestSpecTestRunMustStayInItsTempDir(t *testing.T) {
 	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: cfg, idx: idx, outAbs: filepath.Join(sess.Cwd, "rust"), reasons: map[string]string{}}
 
 	writeTree(t, sess.Cwd, map[string]string{"rust/tests/switch.rs": "#[test]\nfn f0_1_switches() {}\n"})
-	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now()); err != nil || !done {
+	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now(), nil); err != nil || !done {
 		t.Fatalf("done=%v err=%v reason=%q: a leaky run is no failure of this round", done, err, r.reasons["F0.1"])
 	}
 	if !strings.Contains(cfg.Isolation, "rust/fixtures/out.mp4") || !strings.Contains(cfg.Isolation, filepath.Join(sandbox, "fixed.sock")) || strings.Contains(cfg.Isolation, "scratch.txt") || strings.Contains(cfg.Isolation, ".X123-lock") {
@@ -38,7 +38,7 @@ func TestSpecTestRunMustStayInItsTempDir(t *testing.T) {
 	cfg.TestCmd = `echo scratch > "$TMPDIR/scratch.txt"`
 	writeTree(t, sess.Cwd, map[string]string{"rust/tests/switch.rs": "#[test]\nfn f0_1_switches() { let _ = 1; }\n"})
 	cfg.reopen([]string{"F0.1"})
-	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1", Redo: true, Isolation: cfg.Isolation}, nil, sess.toolMark(), time.Now()); err != nil || !done {
+	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1", Redo: true, Isolation: cfg.Isolation}, nil, sess.toolMark(), time.Now(), nil); err != nil || !done {
 		t.Fatalf("done=%v err=%v reason=%q", done, err, r.reasons["F0.1"])
 	}
 	if cfg.Isolation != "" {

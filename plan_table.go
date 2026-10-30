@@ -60,7 +60,7 @@ func repairJSON(s string) string {
 }
 
 // planTable emits a row only once its subtask object has closed, since the transcript is
-// append-only. No title: report_only, which decides it, streams after subtasks.
+// append-only. No title.
 type planTable struct {
 	buf     strings.Builder
 	emitted int

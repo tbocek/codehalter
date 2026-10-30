@@ -62,7 +62,6 @@ func TestPlanResultUnmarshalJSON(t *testing.T) {
 		{"stringified", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}]"}`, want, false, false},
 		{"stringified with a stray brace", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}]}"}`, want, false, false},
 		{"stringified without its closing bracket", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}"}`, want, false, false},
-		// report_only round-trips so renderPlan can label it "Findings:".
 		{"report only, no subtasks", `{"clear":true,"report_only":true}`, nil, true, false},
 		{"a string that is not an array", `{"clear":true,"subtasks":"do x"}`, nil, false, true},
 	} {
@@ -75,8 +74,8 @@ func TestPlanResultUnmarshalJSON(t *testing.T) {
 		if tc.wantErr {
 			continue
 		}
-		if !p.Clear || p.ReportOnly != tc.reportOnly || !reflect.DeepEqual(p.Subtasks, tc.subtasks) {
-			t.Errorf("%s: got %+v, want subtasks %+v report_only=%v", tc.name, p, tc.subtasks, tc.reportOnly)
+		if !reflect.DeepEqual(p.Subtasks, tc.subtasks) {
+			t.Errorf("%s: got %+v, want subtasks %+v", tc.name, p, tc.subtasks)
 		}
 	}
 }
@@ -1697,12 +1696,12 @@ func TestOrchestrateAuditHandsOverRedo(t *testing.T) {
 	}
 }
 
-// A contradiction with the spec, asked without buttons: the user still reads the
-// question, and the subtasks beside it do not run.
+// A question asked without buttons still reaches the user, and subtasks beside a
+// question are the plan.
 func TestPlanQuestionWithoutChoicesReachesTheUser(t *testing.T) {
 	const q = "The spec says the mount is read-only; change the spec?"
 	a, s, mock := planPhaseAgent(t,
-		sseToolCall("p1", submitPlanToolName, `{"clear":false,"question":"`+q+`","subtasks":[{"description":"make it writable"}]}`),
+		sseToolCall("p1", submitPlanToolName, `{"question":"`+q+`"}`),
 		sseToolCall("x", respondToolName, `{"message":"must not run"}`))
 	s.AddUser("make the mount writable")
 	res, err := a.orchestrate(context.Background(), s.ID)
@@ -1778,6 +1777,7 @@ func TestRedFirstReadsTheRealRun(t *testing.T) {
 	}{
 		{"echo form, red without the fix", []string{`sh tests/red.sh; echo "exit=$?"`}, ""},
 		{"last look at a log is skipped", []string{"sh tests/ok.sh", "tail -5 /tmp/test.log"}, "red before green failed"},
+		{"a sequence is not judged", []string{`sh tests/ok.sh; echo "exit=$?"; git diff --stat`}, ""},
 		{"a pipeline is not judged", []string{"sh tests/ok.sh | tail -3"}, ""},
 	} {
 		dir := gitRepo(t, map[string]string{"src/a.dat": "old\n", "tests/a_test.txt": "old\n", "tests/ok.sh": "true\n", "tests/red.sh": "grep -q fixed src/a.dat\n"})
@@ -1798,5 +1798,37 @@ func TestRedFirstReadsTheRealRun(t *testing.T) {
 		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
 			t.Errorf("%s: reason %q, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// From a replay: 8 of 39 submit_plan calls wrapped the plan, one as JSON text cut off at
+// the end. Its subtasks were lost and the prose beside it was shown as the answer.
+func TestPlanUnwrapsCutOffPlanText(t *testing.T) {
+	args, _ := json.Marshal(map[string]string{"plan": `{"clear": true, "subtasks": [{"description": "add count", "verify": ["go test"]}`})
+	a, s, mock := planPhaseAgent(t, sseContentThenToolCall("Repo is a small Go CLI.", "p1", submitPlanToolName, string(args)))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mock.callCount() != 1 || plan == nil || len(plan.Subtasks) != 1 {
+		t.Fatalf("calls %d, plan %+v: want its subtask", mock.callCount(), plan)
+	}
+}
+
+// A tool parser left the next argument inside `answer`, tag and all.
+func TestPlanAnswerDropsALeakedParameter(t *testing.T) {
+	args, _ := json.Marshal(map[string]string{"answer": "It cannot be done.\n<parameter=clear>\ntrue"})
+	a, s, _ := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, string(args)))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil || plan == nil || plan.answer != "It cannot be done." {
+		t.Fatalf("plan %+v, err %v", plan, err)
+	}
+}
+
+func TestPlanSubtasksWinOverAQuestion(t *testing.T) {
+	a, s, _ := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, `{"question":"really?","subtasks":[{"description":"do it"}]}`))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil || plan == nil || len(plan.Subtasks) != 1 {
+		t.Fatalf("plan %+v, err %v", plan, err)
 	}
 }

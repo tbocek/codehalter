@@ -140,7 +140,7 @@ func TestFinishRoundHoldsAnUnprovenChange(t *testing.T) {
 		"rust/src/lib.rs":      "pub fn v() -> i32 {\n    41\n}\n\npub fn w() -> i32 {\n    3\n}\n",
 		"rust/tests/switch.rs": "#[test]\nfn f0_1_switches() { assert_eq!(v(), 41) }\n",
 	})
-	done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now())
+	done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now(), nil)
 	if err != nil || done {
 		t.Fatalf("done=%v err=%v: w()'s change is held by no test", done, err)
 	}

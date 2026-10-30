@@ -1,0 +1,1 @@
+Add a command `inv count FILE` that prints the sum of all quantities, with a function Count in inv/inv.go and a test. Update the README usage.

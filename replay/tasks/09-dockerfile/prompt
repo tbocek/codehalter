@@ -1,0 +1,1 @@
+I see two apk add lines in the Dockerfile, merge them into one and add nodejs and npm.

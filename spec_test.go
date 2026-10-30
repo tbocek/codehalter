@@ -905,6 +905,7 @@ func TestSpecVerifyLoopsOverTheParts(t *testing.T) {
 	if asked < 2 || mock.callCount() < 2 {
 		t.Errorf("rounds %d, calls %d: want one per part", asked, mock.callCount())
 	}
+	s.waitSummarise()
 	if s.rt.specVerify {
 		t.Error("left in verify mode")
 	}

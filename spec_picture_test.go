@@ -78,7 +78,7 @@ func TestSpecRoundPictureMustMatch(t *testing.T) {
 		mark := sess.toolMark()
 		// The round put a render beside the picture, as the gate before this one asks.
 		a.recordToolUse(sess.ID, toolCall{ID: "c-" + change}, ToolUse{Output: "exit 0\n[codehalter, not the user: " + sideBySideMark + "spec/img/03-window.png. ...]"})
-		done, block, err := r.finishRound(t.Context(), specWork{Item: item}, nil, mark, time.Now())
+		done, block, err := r.finishRound(t.Context(), specWork{Item: item}, nil, mark, time.Now(), nil)
 		if err != nil || block {
 			t.Fatalf("done=%v block=%v err=%v", done, block, err)
 		}
@@ -181,7 +181,7 @@ func TestSpecUnsteadySnapshotIsNotTheItemsFault(t *testing.T) {
 		writeTree(t, sess.Cwd, map[string]string{"rust/src/lib.rs": change, "rust/tests/screen.rs": change + "#[test]\nfn " + specTestToken(item) + "_window() {}\n"})
 		mark := sess.toolMark()
 		a.recordToolUse(sess.ID, toolCall{ID: "c-" + change}, ToolUse{Output: "exit 0\n[codehalter, not the user: " + sideBySideMark + "spec/img/03-window.png. ...]"})
-		done, block, err := r.finishRound(t.Context(), w, nil, mark, time.Now())
+		done, block, err := r.finishRound(t.Context(), w, nil, mark, time.Now(), nil)
 		if err != nil || block {
 			t.Fatalf("done=%v block=%v err=%v", done, block, err)
 		}

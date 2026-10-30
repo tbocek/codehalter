@@ -15,31 +15,27 @@ var submitPlanTool = Tool{Def: map[string]any{
 	"type": "function",
 	"function": map[string]any{
 		"name":        submitPlanToolName,
-		"description": "Submit the finished plan and end planning. Call it exactly once, when you have gathered everything and decided how to proceed. A pure lookup you can already answer: the COMPLETE answer in `answer`, report_only=true, no subtasks (your reasoning is never shown, and text beside a tool call is often dropped). No planning tools run after it.",
+		"description": "Submit the finished plan and end planning. Call it exactly once, when you have gathered everything and decided how to proceed. A pure lookup you can already answer: the COMPLETE answer in `answer`, no subtasks (your reasoning is never shown, and text beside a tool call is often dropped). No planning tools run after it.",
 		"parameters": map[string]any{
 			"type":     "object",
-			"required": []string{"clear", "subtasks", "report_only"},
+			"required": []string{},
 			"properties": map[string]any{
-				"clear": map[string]any{
-					"type":        "boolean",
-					"description": "True when the request is actionable. False when it needs clarification: then fill choices and question, no subtasks.",
-				},
 				"choices": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
-					"description": "Up to 2 short interpretations, only when clear=false.",
+					"description": "Up to 2 short interpretations, with `question`.",
 				},
 				"question": map[string]any{
 					"type":        "string",
-					"description": "One sentence asking which interpretation, only when clear=false.",
+					"description": "One sentence asking which interpretation, only when you ask.",
 				},
 				"spec_quote": map[string]any{
 					"type":        "string",
-					"description": "Only in a /spec round, with clear=false: the spec text that comes closest to deciding the question, copied exactly from a spec file. codehalter checks that it is there.",
+					"description": "Only in a /spec round, when asking: the spec text that comes closest to deciding the question, copied exactly from a spec file. codehalter checks that it is there.",
 				},
 				"options": map[string]any{
 					"type":        "array",
-					"description": "Only in a /spec round, with clear=false, instead of choices: 2 or 3 ways to decide the question, your pick first.",
+					"description": "Only in a /spec round, when asking, instead of choices: 2 or 3 ways to decide the question, your pick first.",
 					"items": map[string]any{
 						"type":     "object",
 						"required": []string{"choice", "example"},
@@ -51,7 +47,7 @@ var submitPlanTool = Tool{Def: map[string]any{
 				},
 				"subtasks": map[string]any{
 					"type":        "array",
-					"description": "One or more units of work for the executor. Empty only when clear=false (clarification) or report_only with the answer in the `answer` argument.",
+					"description": "The units of work for the executor. None with `answer` or `question`.",
 					"items": map[string]any{
 						"type":     "object",
 						"required": []string{"description"},
@@ -68,10 +64,6 @@ var submitPlanTool = Tool{Def: map[string]any{
 						},
 					},
 				},
-				"report_only": map[string]any{
-					"type":        "boolean",
-					"description": "True when the request is informational and you have the answer: no edits, no commands. Skips the execute-confirmation gate.",
-				},
 				"redo": map[string]any{
 					"type":        "array",
 					"items":       map[string]any{"type": "string"},
@@ -79,7 +71,7 @@ var submitPlanTool = Tool{Def: map[string]any{
 				},
 				"answer": map[string]any{
 					"type":        "string",
-					"description": "The complete answer for the user, when report_only=true and subtasks is empty. This is what the user reads: everything you found, in full, not a promise to write it. Empty otherwise.",
+					"description": "The complete answer for the user, with no subtasks. This is what the user reads: everything you found, in full, not a promise to write it. Empty otherwise.",
 				},
 			},
 		},
@@ -107,7 +99,7 @@ var respondTool = Tool{Def: map[string]any{
 				},
 				"failed": map[string]any{
 					"type":        "boolean",
-					"description": "True when the task is not done: a check fails and you cannot fix it, or the task is wrong or impossible. Say why in `message`; codehalter plans again.",
+					"description": "True only when THIS task is not done: its change could not be made to work, or it is impossible. Codehalter then plans again. A test that was already failing, or is not about this task, is no reason.",
 				},
 			},
 		},

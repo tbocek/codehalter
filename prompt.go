@@ -663,11 +663,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		a.say(ctx, sid, p.answer+"\n\nℹ Answered directly, no code change to execute.\n")
 		return toolLoopResult{Text: p.answer}, nil
 	}
-	header := "Plan:"
-	if p.ReportOnly {
-		header = "Findings:"
-	}
-	a.renderPlan(ctx, sid, header, p.Subtasks)
+	a.renderPlan(ctx, sid, "Plan:", p.Subtasks)
 	plan := p
 
 	var lastResult toolLoopResult

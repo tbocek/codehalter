@@ -734,13 +734,19 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 		if isCancelled(turnErr) {
 			return stopped()
 		}
-		// The checks run once before the round is judged, so what they find costs a
-		// turn, not an attempt: one uncalled function once blocked a two-round item.
+		// All the checks run once before the round is judged, so what they find costs a
+		// turn, not an attempt: one uncalled function once blocked a two-round item. When
+		// they find nothing, nothing ran since, and the judgement reuses them.
+		var clean *specInspection
 		if turnErr == nil && (w.Mode == specModeItem || w.Mode == specModeChange) {
 			uses := sess.toolUsesSince(mark)
 			res := specRoundResult{Mode: w.Mode, Redo: w.Redo, Committed: true}
-			if _, _, err := r.inspect(ctx, w, uses, started, false, &res); err == nil {
-				if done, _, findings, _ := specDecide(&specConfig{}, w.Item, res, ""); !done {
+			if covered, coveredBy, err := r.inspect(ctx, w, uses, started, true, &res); isCancelled(err) {
+				return stopped()
+			} else if err == nil {
+				if done, _, findings, _ := specDecide(&specConfig{}, w.Item, res, ""); done {
+					clean = &specInspection{res, covered, coveredBy}
+				} else {
 					r.say(ctx, "🔎 Before this round counts: "+firstLine(findings)+"\n")
 					turnErr = a.runPromptTurn(ctx, sess, a.renderSpecPrompt(sid, "SPEC-CHECK.md", []string{
 						"{{id}}", w.Item, "{{findings}}", findings, "{{out_dir}}", cfg.OutDir, "{{test_cmd}}", r.testCmd()}))
@@ -758,7 +764,7 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 			r.say(ctx, fmt.Sprintf("\n⏹ **/spec paused**: the LLM request failed, so this round does not count against %s and nothing was recorded: %s\nWhen the server answers again, `/spec` resumes with the same item.\n", w.Item, firstLine(lce.Error())))
 			break
 		}
-		done, block, err := r.finishRound(ctx, w, turnErr, mark, started)
+		done, block, err := r.finishRound(ctx, w, turnErr, mark, started, clean)
 		if isCancelled(err) {
 			return stopped()
 		}
@@ -1379,20 +1385,30 @@ func (r *specRun) finalPass(ctx context.Context) error {
 
 // finishRound's err means cancelled, or a scan failure it already reported.
 // mark is the round's start in the session's tool log (toolMark).
-func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, mark int, started time.Time) (done, block bool, err error) {
+// specInspection is a pass of the checks that found nothing.
+type specInspection struct {
+	res       specRoundResult
+	covered   map[string]string
+	coveredBy string
+}
+
+func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, mark int, started time.Time, clean *specInspection) (done, block bool, err error) {
 	cfg, item := r.cfg, w.Item
 	uses := r.sess.toolUsesSince(mark)
 	res := specRoundResult{Mode: w.Mode, Redo: w.Redo}
 	var covered map[string]string
 	var coveredBy string
 	var q *specQuestionError
-	if errors.As(turnErr, &q) {
+	if clean != nil {
+		res, covered, coveredBy = clean.res, clean.covered, clean.coveredBy
+		res.Committed = false // what the commit below says
+	} else if errors.As(turnErr, &q) {
 		res.Question = q.Q.Question
 	} else {
 		if turnErr != nil {
 			res.TurnErr = turnErr.Error()
 		}
-		if covered, coveredBy, err = r.inspect(ctx, w, uses, started, true, &res); err != nil {
+		if covered, coveredBy, err = r.inspect(ctx, w, uses, started, false, &res); err != nil {
 			return false, false, err
 		}
 	}
@@ -1553,13 +1569,11 @@ func (r *specRun) finishRound(ctx context.Context, w specWork, turnErr error, ma
 	return done, block, nil
 }
 
-// inspect fills res with what decides the round; runTests is off for the in-round
-// check, which judges the other findings before the suite runs.
-func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, started time.Time, runTests bool, res *specRoundResult) (covered map[string]string, coveredBy string, err error) {
+// inspect fills res with what decides the round; review adds the test review, which runs
+// only in the in-round check, so what it finds costs a turn, never an attempt.
+func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, started time.Time, review bool, res *specRoundResult) (covered map[string]string, coveredBy string, err error) {
 	cfg, item := r.cfg, w.Item
 	switch cmd := r.testCmd(); {
-	case !runTests:
-		res.TestsPass = true // not run yet: the other checks still say what to fix
 	case cmd == "":
 		res.TestTail = "no test command found: `" + cfg.OutDir + "/` has no justfile with a test recipe, no Cargo.toml, package.json or go.mod"
 	case r.roundRanGreen(uses, cmd, started):
@@ -1621,7 +1635,7 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 			}
 		}
 		// Only the final judgement looks, and only when the rest passed: a look costs a render and a call.
-		if runTests && res.TestsPass && res.TurnErr == "" && len(res.PicturesUnseen) == 0 && (w.Mode == specModeItem || w.Mode == specModeChange) {
+		if res.TestsPass && res.TurnErr == "" && len(res.PicturesUnseen) == 0 && (w.Mode == specModeItem || w.Mode == specModeChange) {
 			res.PicturesDiffer, res.Unsteady = r.checkPictures(ctx, item, pics, false)
 			// …and the screens of the items already done: only those whose render matched before and
 			// is different now are looked at (checkPictures).
@@ -1675,15 +1689,14 @@ func (r *specRun) inspect(ctx context.Context, w specWork, uses []ToolUse, start
 		coveredBy = specNamedIn(r.outAbs, item, ch.files())
 		res.Covered = coveredBy != ""
 	}
-	// Only the in-round check reviews the tests, so what it finds costs a turn, never an attempt.
-	if !runTests && ch.ok && res.TurnErr == "" && (w.Mode == specModeItem || w.Mode == specModeChange) {
+	if review && ch.ok && res.TurnErr == "" && (w.Mode == specModeItem || w.Mode == specModeChange) {
 		res.TestReview = r.reviewTests(ctx, item, base, ch)
 	}
 	if ch.ok && res.TurnErr == "" {
 		r.gates(ctx, w, ch, res)
 	}
 	// Last, and only on a round that passed everything else: it costs a filtered test run per change.
-	if runTests && res.TestsPass && res.Covered && ch.ok && res.TurnErr == "" && (w.Mode == specModeItem || w.Mode == specModeChange) &&
+	if res.TestsPass && res.Covered && ch.ok && res.TurnErr == "" && (w.Mode == specModeItem || w.Mode == specModeChange) &&
 		len(res.Unreachable)+len(res.StandIns)+len(res.Lint)+len(res.Oversize)+len(res.PicturesDiffer)+len(res.PicturesBroken) == 0 {
 		res.Unproven = r.unprovenHunks(ctx, item, base, coveredBy, ch)
 	}

@@ -567,12 +567,12 @@ func TestSpecSecondAttemptKeepsFirstAttemptsTest(t *testing.T) {
 	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: cfg, idx: idx, outAbs: filepath.Join(sess.Cwd, "rust"), reasons: map[string]string{}}
 
 	write("rust/tests/switch.rs", "#[test]\nfn f0_1_switches() {}\n") // attempt 1: its test, and a red suite
-	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now()); err != nil || done {
+	if done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now(), nil); err != nil || done {
 		t.Fatalf("attempt 1: done=%v err=%v, want a failed attempt", done, err)
 	}
 	cfg.TestCmd = "true"
 	write("rust/src/lib.rs", "// v2, the fix\n") // attempt 2 touches only the program
-	done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now())
+	done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now(), nil)
 	if err != nil || !done {
 		t.Fatalf("attempt 2: done=%v err=%v reason=%q, want the first attempt's test to count", done, err, r.reasons["F0.1"])
 	}
@@ -1312,7 +1312,7 @@ func TestSpecSplitsWhatBlocked(t *testing.T) {
 	round := func(lines int) bool {
 		t.Helper()
 		writeTree(t, sess.Cwd, map[string]string{"rust/src/lib.rs": body(lines), "rust/tests/f0_1.rs": fmt.Sprintf("#[test]\nfn f0_1_switches() { let _ = %d; }\n", lines)})
-		done, block, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now())
+		done, block, err := r.finishRound(t.Context(), specWork{Item: "F0.1"}, nil, sess.toolMark(), time.Now(), nil)
 		if err != nil || block {
 			t.Fatalf("done=%v block=%v err=%v", done, block, err)
 		}
@@ -1536,5 +1536,24 @@ func TestRunSpecTestsIsRegisteredLikeAJob(t *testing.T) {
 	if !h.waitFor(func() bool { return syscall.Kill(child, 0) != nil && syscall.Kill(c.Process.Pid, 0) != nil }) {
 		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
 		t.Error("the startup cleanup left a dead codehalter's check running")
+	}
+}
+
+// A pass of the checks that found nothing is not run again: the judgement reuses it, with
+// a test command here that would fail if it ran.
+func TestFinishRoundReusesACleanPass(t *testing.T) {
+	a, sess := newTestAgent(t)
+	writeTree(t, sess.Cwd, map[string]string{"spec/01.md": "# 01\n\n## F0.1 thing\n\nText.\n", "rust/a.txt": "x\n"})
+	gitInit(t, sess.Cwd)
+	idx, err := scanSpec(filepath.Join(sess.Cwd, "spec"), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &specConfig{SpecDir: "spec", OutDir: "rust", TestCmd: "false", LintCmd: "off", Items: map[string]specLedger{}}
+	r := &specRun{a: a, sid: sess.ID, sess: sess, cfg: cfg, idx: idx, outAbs: filepath.Join(sess.Cwd, "rust"), reasons: map[string]string{}, blocked: map[string]string{}}
+	clean := &specInspection{res: specRoundResult{Mode: specModeItem, Covered: true, TestsPass: true}, coveredBy: "f0_1_thing"}
+	done, _, err := r.finishRound(t.Context(), specWork{Item: "F0.1", Mode: specModeItem}, nil, sess.toolMark(), time.Now(), clean)
+	if err != nil || !done {
+		t.Fatalf("done %v, err %v: want the clean pass to decide", done, err)
 	}
 }
