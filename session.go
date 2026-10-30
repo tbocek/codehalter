@@ -29,7 +29,15 @@ type Message struct {
 	// PromptTokens is the context size at the call that produced this assistant
 	// message (keepWindowStart sizes by it); 0 when unknown.
 	PromptTokens int `toml:"prompt_tokens,omitempty"`
+	// Origin marks a user message that starts work: what /spec verify tells chat from the
+	// loop and from fix cards by. Empty for messages inside a turn. Never sent to the model.
+	Origin string `toml:"origin,omitempty"`
 }
+
+const (
+	originChat = "chat"
+	originAuto = "auto"
+)
 
 type ImageData struct {
 	// The bytes live in .codehalter/images and are re-read every turn, so the wire
@@ -154,6 +162,8 @@ type sessionRuntime struct {
 	specHandoff string
 	// specAudit: a bare /spec redo is auditing, so the planner's list is not asked about.
 	specAudit bool
+	// specVerify: /spec verify is reporting, so a plan's subtasks do not run.
+	specVerify bool
 	// stuckCalls: the calls a step repeated until the loop ended it, keyed like the
 	// repetition tracker, with their output. The turn's later steps get the output
 	// back instead of a run, until they write something (see runToolLoop).
@@ -407,6 +417,15 @@ func newSession(cwd string) (*Session, error) {
 		id = fmt.Sprintf("%s_%d", base, n)
 	}
 	return newSessionWithID(cwd, id), nil
+}
+
+// addOrigin marks the message just added.
+func (s *Session) addOrigin(origin string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n := len(s.Messages); n > 0 {
+		s.Messages[n-1].Origin = origin
+	}
 }
 
 func (s *Session) AddUser(text string, images ...ImageData) {

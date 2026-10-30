@@ -1759,3 +1759,20 @@ func TestPlanQuestionWithoutChoicesReachesTheUser(t *testing.T) {
 		t.Errorf("LLM calls = %d, want the planner's only", got)
 	}
 }
+
+// /spec verify reports: subtasks are sent back, and if they come again they do not run.
+func TestOrchestrateVerifyRunsNoSubtasks(t *testing.T) {
+	work := `{"clear":true,"report_only":false,"answer":"one contradiction","subtasks":[{"description":"change it back"}]}`
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, work),
+		sseToolCall("p2", submitPlanToolName, work))
+	s.rt.specVerify = true
+	s.AddUser("verify")
+	res, err := a.orchestrate(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "one contradiction" || mock.callCount() != 2 {
+		t.Errorf("reply %q, %d calls; want the report after one retry", res.Text, mock.callCount())
+	}
+}

@@ -76,7 +76,7 @@ type planResult struct {
 // corrective for the one retry: invalid JSON, prose (after the loop's own
 // nudge), a plan with neither an answer, a question nor any work, or a `redo` outside
 // the audit that asks for it (only the user starts /spec).
-func planProblem(res toolLoopResult, p *planResult, parseErr error, audit bool) (wrong, corrective string) {
+func planProblem(res toolLoopResult, p *planResult, parseErr error, audit, verify bool) (wrong, corrective string) {
 	switch {
 	case parseErr != nil && res.Terminal == "":
 		return "the planner replied in prose instead of calling submit_plan",
@@ -84,6 +84,9 @@ func planProblem(res toolLoopResult, p *planResult, parseErr error, audit bool) 
 	case parseErr != nil:
 		return fmt.Sprintf("submit_plan's arguments were not valid JSON (%v)", parseErr),
 			fmt.Sprintf("Your `submit_plan` arguments were not valid JSON (%v). Call it again, emitting the arguments as one well-formed JSON object.", parseErr)
+	case verify && len(p.Subtasks) > 0:
+		return "the planner planned changes during /spec verify, which only reports",
+			"/spec verify changes nothing. Call `submit_plan` again with report_only=true, no subtasks, and the whole report in `answer`."
 	case !audit && len(p.Redo) > 0:
 		return "the planner asked to reopen spec items, which only the user's /spec redo does",
 			"`redo` applies only inside the /spec redo audit, and this is not one. Call `submit_plan` again without it: `subtasks` for the work, or the complete `answer` (report_only=true). Work too big for one plan: say so in `answer` and name `/spec`, which the user runs."
@@ -196,10 +199,10 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		}
 		plan, parseErr := planFrom(planRes)
 		sess.rt.mu.Lock()
-		audit := sess.rt.specAudit
+		audit, verify := sess.rt.specAudit, sess.rt.specVerify
 		sess.rt.mu.Unlock()
 		// Prose was already nudged in the loop; this retry covers what the loop cannot see.
-		if wrong, corrective := planProblem(planRes, plan, parseErr, audit); wrong != "" {
+		if wrong, corrective := planProblem(planRes, plan, parseErr, audit, verify); wrong != "" {
 			// Rows already on screen must be named as not final.
 			salvaged := ""
 			var partial struct {

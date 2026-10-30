@@ -408,6 +408,7 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		stored = emptyProjectHint + "\n---\n" + userText
 	}
 	sess.AddUser(stored, images...)
+	sess.addOrigin(originChat)
 	sess.saveOrLog()
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
@@ -636,8 +637,11 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		return toolLoopResult{}, err
 	}
 	sess.rt.mu.Lock()
-	audit := sess.rt.specAudit
+	audit, verify := sess.rt.specAudit, sess.rt.specVerify
 	sess.rt.mu.Unlock()
+	if verify {
+		p.Subtasks = nil // it reports; a plan that survived the retry must not change anything
+	}
 	if audit && len(p.Redo) > 0 {
 		a.say(ctx, sid, fmt.Sprintf("The audit found %d item(s) recorded as done that do not deliver: %s\n\n", len(p.Redo), strings.Join(p.Redo, ", ")))
 		sess.setSpecHandoff("redo " + strings.Join(p.Redo, " "))
@@ -870,18 +874,8 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	}
 
 	// Only the directories, never the moving item count: the prefix must stay stable.
-	cfg, _ := loadSpecConfig(sess.Cwd)
-	specDir := ""
-	if cfg != nil {
-		specDir = cfg.SpecDir
-	} else if st, err := os.Stat(filepath.Join(sess.Cwd, "spec")); err == nil && st.IsDir() {
-		specDir = "spec"
-	}
-	if specDir != "" {
-		fmt.Fprintf(&b, "\n\n## This project has a specification\n\n`%s/` says what the program must do. Outside a /spec round, check every request against it before planning: grep it for what the request touches and read what it says there. Where it decides how something must work, the plan follows it. Where the request contradicts it, even an explicit one, do not plan the change and do not pick a side: ask the user with clear=false, with the spec line in `question` and `choices` to keep the spec or to follow the request and change the spec. A request it does not concern (a config or image change, an install) is planned as usual. Never edit the spec unless the user asks for that.\n", specDir)
-	}
-	if cfg != nil {
-		fmt.Fprintf(&b, "\nIt is implemented into `%s/` item by item by /spec, which only the user starts. Inside a /spec round (the prompt says which item it is) the item is already chosen: plan and execute that item, and leave AGENT.md alone: it is read-only while /spec runs.\n", cfg.OutDir)
+	if cfg, err := loadSpecConfig(sess.Cwd); err == nil && cfg != nil {
+		fmt.Fprintf(&b, "\n\n## This project is built with /spec\n\n`%s/` is implemented into `%s/` item by item by /spec, which only the user starts. A chat request is done as asked, without reading the spec to check it: `/spec verify` compares such changes with the spec later, when the user runs it. Inside a /spec round (the prompt says which item it is) the item is already chosen: plan and execute that item, and leave AGENT.md alone: it is read-only while /spec runs.\n", cfg.SpecDir, cfg.OutDir)
 	}
 
 	// In the cached prefix, not re-sent per phase: each copy would stack in history.

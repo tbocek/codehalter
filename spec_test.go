@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -8,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // writeSpecFixture has nav bars, heading flows, id-less prose sections, a parameter table, an
@@ -734,5 +736,176 @@ func TestSpecReconcileVanished(t *testing.T) {
 		if d := specReconcile(cfg, idx, nil); d.Vanished != tc.want || len(d.Removed) != tc.gone {
 			t.Errorf("%d live, %d gone: vanished=%v removed=%v, want vanished=%v", tc.live, tc.gone, d.Vanished, d.Removed, tc.want)
 		}
+	}
+}
+
+func TestParseSpecArgsVerify(t *testing.T) {
+	if got, err := parseSpecArgs(" verify "); err != nil || got != "verify" {
+		t.Errorf("parseSpecArgs = %q, %v", got, err)
+	}
+	if _, err := parseSpecArgs("verify main~3"); err == nil {
+		t.Error("/spec verify takes no ref")
+	}
+}
+
+func verifySession(t *testing.T, cwd, id string, msgs ...Message) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := newSessionWithID(cwd, id)
+	s.Messages = msgs
+	s.saveOrLog()
+}
+
+// Chat edits since the check count, in every session; a /spec round, a question, the spec
+// itself, a failed edit and anything before the check do not.
+func TestSpecVerifyGoesOverSessionsSinceTheCheck(t *testing.T) {
+	cwd := t.TempDir()
+	check := time.Now().Add(-time.Hour)
+	before, after := check.Add(-time.Minute), check.Add(time.Minute)
+	edit := func(at time.Time, path string, failed bool) Message {
+		return Message{Role: "assistant", StartedAt: at, ToolUses: []ToolUse{{Name: "edit_file", Input: `{"path":"` + path + `","old_text":"8.0","new_text":"3.0"}`, Failed: failed}}}
+	}
+	user := func(at time.Time, text string) Message {
+		return Message{Role: "user", Content: text, StartedAt: at, Origin: originChat}
+	}
+	machine := func(at time.Time, text, origin string) Message {
+		return Message{Role: "user", Content: text, StartedAt: at, Origin: origin}
+	}
+	verifySession(t, cwd, "20260101_000000",
+		user(before, "old request"), edit(before, "src/old.rs", false),
+		user(after, "lower the dead air"), machine(after, "Begin the PLANNING phase: produce the plan now", ""), machine(after, "EXECUTION phase: Task 1/1", ""), edit(after, "src/a.rs", false),
+		edit(after, "src/failed.rs", true), edit(after, "spec/05-cut.md", false),
+		user(after, "what does this do?"),
+		machine(after, "# Spec round: F1.1 thing", originAuto), machine(after, "Your submit_plan was wrong", ""), edit(after, "src/round.rs", false),
+	)
+	verifySession(t, cwd, "20250101_000000", // from before origins
+		Message{Role: "user", Content: "unmarked", StartedAt: after}, edit(after, "src/unmarked.rs", false),
+	)
+	verifySession(t, cwd, "20260102_000000", user(after, "another tab"), edit(after, cwd+"/src/b.rs", false))
+
+	parts, err := specVerifyParts(cwd, "spec", check, specVerifyPartMax)
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("parts %d, err %v", len(parts), err)
+	}
+	got := parts[0]
+	for _, want := range []string{"Request: lower the dead air", "src/a.rs", "Session 20260102_000000", "Request: another tab", "src/b.rs"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	for _, not := range []string{"old request", "src/old.rs", "src/failed.rs", "05-cut.md", "what does this do", "src/round.rs", "unmarked", "PLANNING", "EXECUTION"} {
+		if strings.Contains(got, not) {
+			t.Errorf("%q should not count:\n%s", not, got)
+		}
+	}
+	if parts, _ := specVerifyParts(cwd, "spec", time.Now().Add(time.Hour), specVerifyPartMax); len(parts) != 0 {
+		t.Errorf("nothing after the last check, got %q", parts)
+	}
+}
+
+// What a compaction took is gone from the messages: its summary stands in, unless the
+// fold is older than the check.
+func TestSpecVerifyNamesAFoldedPart(t *testing.T) {
+	check := time.Now().Add(-time.Hour)
+	s := newSessionWithID(t.TempDir(), "x")
+	s.Summary = "changed the export"
+	s.Messages = []Message{{Role: "user", Content: "hi", StartedAt: check.Add(time.Minute)}}
+	if got := strings.Join(specVerifyGroups(s, "spec", check, specVerifyPartMax), ""); !strings.Contains(got, "changed the export") {
+		t.Errorf("newer fold: %q", got)
+	}
+	s.Messages[0].StartedAt = check.Add(-time.Minute)
+	if got := specVerifyGroups(s, "spec", check, specVerifyPartMax); len(got) != 0 {
+		t.Errorf("older fold: %q", got)
+	}
+}
+
+func TestSpecVerifiedAtRoundTrips(t *testing.T) {
+	cwd := t.TempDir()
+	at := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	if err := saveSpecConfig(cwd, &specConfig{SpecDir: "spec", OutDir: "out", VerifiedAt: &at}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadSpecConfig(cwd)
+	if err != nil || cfg.VerifiedAt == nil || !cfg.VerifiedAt.Equal(at) {
+		t.Fatalf("cfg = %+v, %v", cfg, err)
+	}
+}
+
+// Too much for one round splits, oldest first: every edit lands in a part, under its
+// request, and none is dropped.
+func TestSpecVerifySplitsIntoParts(t *testing.T) {
+	cwd := t.TempDir()
+	check := time.Now().Add(-time.Hour)
+	at := check.Add(time.Minute)
+	session := func(id, request string, n int) {
+		msgs := []Message{{Role: "user", Content: request, StartedAt: at, Origin: originChat}}
+		for i := range n {
+			msgs = append(msgs, Message{Role: "assistant", StartedAt: at, ToolUses: []ToolUse{{Name: "edit_file", Input: fmt.Sprintf(`{"path":"src/%s_%d.rs"}`, id, i)}}})
+		}
+		verifySession(t, cwd, id, msgs...)
+	}
+	session("20260102_000000", "newer request", 2)
+	session("20260101_000000", "older request", 8)
+	const partMax = 300
+	parts, err := specVerifyParts(cwd, "spec", check, partMax)
+	if err != nil || len(parts) < 3 {
+		t.Fatalf("parts %d, err %v: want a split", len(parts), err)
+	}
+	if !strings.Contains(parts[0], "older request") || !strings.Contains(parts[len(parts)-1], "newer request") {
+		t.Errorf("not oldest first: %q", parts)
+	}
+	all := strings.Join(parts, "")
+	for i := range 8 {
+		if want := fmt.Sprintf("- edit_file src/20260101_000000_%d.rs", i); strings.Count(all, want) != 1 {
+			t.Errorf("%s appears %d times", want, strings.Count(all, want))
+		}
+	}
+	for _, p := range parts {
+		if len(p) > partMax+1 {
+			t.Errorf("part of %d bytes", len(p))
+		}
+		if !strings.Contains(p, "Request: ") {
+			t.Errorf("a part without its request: %q", p)
+		}
+	}
+}
+
+// Every part gets a round, and the check only moves once all of them finished.
+func TestSpecVerifyLoopsOverTheParts(t *testing.T) {
+	report := sseToolCall("p", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"no contradiction"}`)
+	a, s, mock := planPhaseAgent(t, report, report, report, report, report, report)
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	huge := strings.Repeat("x", specVerifyTextMax)
+	var msgs []Message
+	at := time.Now().Add(-time.Minute)
+	msgs = append(msgs, Message{Role: "user", Content: "big change", StartedAt: at, Origin: originChat})
+	for i := range specVerifyPartMax/specVerifyTextMax + 5 {
+		msgs = append(msgs, Message{Role: "assistant", StartedAt: at, ToolUses: []ToolUse{{Name: "edit_file", Input: fmt.Sprintf(`{"path":"src/%d.rs","new_text":"%s"}`, i, huge)}}})
+	}
+	verifySession(t, s.Cwd, "20260101_000000", msgs...)
+	cfg := &specConfig{SpecDir: "spec", OutDir: "out"}
+	r := &specRun{a: a, sid: s.ID, sess: s, cfg: cfg, idx: idx, reasons: map[string]string{}, blocked: map[string]string{}}
+	if _, err := a.specVerify(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VerifiedAt == nil {
+		t.Error("the check did not move after the last part")
+	}
+	asked := 0
+	for _, m := range s.Messages {
+		if m.Origin == originAuto && strings.HasPrefix(m.Content, "# Spec verify") {
+			asked++
+		}
+	}
+	if asked < 2 || mock.callCount() < 2 {
+		t.Errorf("rounds %d, calls %d: want one per part", asked, mock.callCount())
+	}
+	if s.rt.specVerify {
+		t.Error("left in verify mode")
 	}
 }

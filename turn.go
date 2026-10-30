@@ -170,6 +170,7 @@ func (a *agent) sayPending(ctx context.Context, sid string, items []pendingInput
 // The caller must already hold the turn.
 func (a *agent) runPromptTurn(ctx context.Context, sess *Session, text string) error {
 	sess.AddUser(text)
+	sess.addOrigin(originAuto)
 	sess.saveOrLog()
 	return a.runTurn(ctx, sess.ID, false)
 }

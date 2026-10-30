@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -553,6 +554,9 @@ func (a *agent) runSpec(ctx context.Context, sid string, sess *Session, args str
 	if len(r.idx.order) == 0 {
 		r.say(ctx, fmt.Sprintf("⚠ /spec: found no requirement ids and no sections in `%s/`. The id patterns are %s; set `id_patterns` in .codehalter/spec.toml if this spec names its requirements differently.\n", cfg.SpecDir, strings.Join(cfg.idPatterns(), ", ")))
 		return end, nil
+	}
+	if cmd == "verify" {
+		return a.specVerify(ctx, r)
 	}
 	if cmd == "redo" {
 		// The audit's submit_plan `redo` goes through orchestrate, which leaves "redo <ids>" as a handoff.
@@ -1189,6 +1193,161 @@ func (a *agent) specAuditPrompt(sid string, cfg *specConfig, idx *specIndex, tes
 	}
 	return a.renderSpecPrompt(sid, "SPEC-REDO.md", append(specBaseVars(cfg, idx, testCmd, specNoTargetBuilt, "Standing rules: ", "."),
 		"{{ids}}", strings.TrimRight(ids.String(), "\n")))
+}
+
+const (
+	// A request or an edit is evidence, not the whole file: the model reads the file itself.
+	specVerifyTextMax = 800
+	// One round's worth of changes; more goes into further rounds.
+	specVerifyPartMax = 48000
+)
+
+// specVerifyGroups is what one session did in chat since the check: each request that
+// changed a file, with the changes, as pieces no bigger than a part. A request with more
+// edits than that is repeated, so no edit is read without what it was for. Edits to the
+// spec and to .codehalter are left out.
+func specVerifyGroups(s *Session, specDir string, since time.Time, partMax int) []string {
+	inside := func(path, dir string) bool {
+		rel := strings.TrimPrefix(filepath.ToSlash(path), filepath.ToSlash(s.Cwd)+"/")
+		return rel == dir || strings.HasPrefix(rel, dir+"/")
+	}
+	head := "### Session " + s.ID + "\n"
+	var groups []string
+	group, request, round := "", "", true
+	flush := func() {
+		if group != "" {
+			groups = append(groups, group)
+			group = ""
+		}
+	}
+	for _, m := range s.Messages {
+		switch m.Origin {
+		case originChat:
+			flush()
+			request, round = m.Content, false
+		case originAuto:
+			flush()
+			round = true
+		}
+		// No chat request yet: a session from before origins, whose edits cannot be told apart.
+		if m.Role == "user" || request == "" || round || !m.StartedAt.After(since) {
+			continue
+		}
+		for _, u := range m.ToolUses {
+			if u.Failed || (u.Name != "edit_file" && u.Name != "write_file") {
+				continue
+			}
+			var in struct {
+				Path string `json:"path"`
+			}
+			if json.Unmarshal([]byte(u.Input), &in) != nil || in.Path == "" || inside(in.Path, specDir) || inside(in.Path, sessionDir) {
+				continue
+			}
+			line := fmt.Sprintf("- %s %s: %s\n", u.Name, in.Path, truncate(u.Input, specVerifyTextMax))
+			if group != "" && len(group)+len(line) > partMax {
+				flush()
+			}
+			if group == "" {
+				group = fmt.Sprintf("%sRequest: %s\n", head, truncate(request, specVerifyTextMax))
+			}
+			group += line
+		}
+	}
+	flush()
+	// A fold took the messages it replaced; only one newer than the check can hide changes.
+	if s.Summary != "" && len(s.Messages) > 0 && s.Messages[0].StartedAt.After(since) {
+		groups = append([]string{fmt.Sprintf("%sEarlier in this session, the messages themselves are gone, only this summary: %s\n", head, truncate(s.Summary, specVerifyTextMax))}, groups...)
+	}
+	return groups
+}
+
+// specVerifyParts goes over the sessions newer than the last check, oldest first, and
+// packs what they changed into parts of at most partMax.
+func specVerifyParts(cwd, specDir string, since time.Time, partMax int) ([]string, error) {
+	infos, err := listSessions(cwd)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, info := range infos {
+		if st, err := os.Stat(sessionPath(cwd, info.SessionId, "toml")); err == nil && st.ModTime().After(since) {
+			ids = append(ids, info.SessionId)
+		}
+	}
+	slices.Sort(ids) // an id starts with its date
+	var parts []string
+	part := ""
+	for _, id := range ids {
+		s, err := loadSession(cwd, id)
+		if err != nil {
+			slog.Warn("spec verify: unreadable session", "id", id, "err", err)
+			continue
+		}
+		for _, g := range specVerifyGroups(s, specDir, since, partMax) {
+			if part != "" && len(part)+len(g) > partMax {
+				parts = append(parts, part)
+				part = ""
+			}
+			part += g + "\n"
+		}
+	}
+	if part != "" {
+		parts = append(parts, part)
+	}
+	return parts, nil
+}
+
+// specVerify is a report and nothing else: no fence and no preflight, since it builds
+// and changes nothing, and which side of a contradiction wins is the user's.
+func (a *agent) specVerify(ctx context.Context, r *specRun) (PromptResponse, error) {
+	end := PromptResponse{StopReason: "end_turn"}
+	r.sess.saveOrLog() // this session's own changes are read from its file
+	var since time.Time
+	if r.cfg.VerifiedAt != nil {
+		since = *r.cfg.VerifiedAt
+	}
+	parts, err := specVerifyParts(r.sess.Cwd, r.cfg.SpecDir, since, specVerifyPartMax)
+	if err != nil {
+		r.say(ctx, "⚠ /spec verify: "+err.Error()+"\n")
+		return end, nil
+	}
+	if len(parts) == 0 {
+		r.say(ctx, "Nothing to verify: no chat session changed a file since the last check.\n")
+		return end, nil
+	}
+	// Taken before the turns: a change another session makes meanwhile counts for the next check.
+	checked := time.Now()
+	r.sess.rt.mu.Lock()
+	r.sess.rt.specVerify = true
+	r.sess.rt.mu.Unlock()
+	defer func() {
+		r.sess.rt.mu.Lock()
+		r.sess.rt.specVerify = false
+		r.sess.rt.mu.Unlock()
+	}()
+	for i, changes := range parts {
+		label := ""
+		if len(parts) > 1 {
+			label = fmt.Sprintf(" · part %d of %d", i+1, len(parts))
+		}
+		r.say(ctx, "\n## /spec verify"+label+" · the chat changes since the last check against `"+r.cfg.SpecDir+"/`\n\n")
+		prompt := a.renderSpecPrompt(r.sid, "SPEC-VERIFY.md", append(specBaseVars(r.cfg, r.idx, r.testCmd(), specNoTargetBuilt, "Standing rules: ", "."),
+			"{{changes}}", changes))
+		turnErr := a.runPromptTurn(ctx, r.sess, prompt)
+		if isCancelled(turnErr) {
+			return PromptResponse{StopReason: "cancelled"}, nil
+		}
+		// The check stays where it was, so the next one reads every part again.
+		if turnErr != nil {
+			r.say(ctx, fmt.Sprintf("⚠ /spec verify stopped at part %d of %d: %v\n", i+1, len(parts), turnErr))
+			return end, nil
+		}
+	}
+	r.cfg.VerifiedAt = &checked
+	if err := saveSpecConfig(r.sess.Cwd, r.cfg); err != nil {
+		r.say(ctx, "⚠ /spec verify: "+err.Error()+"\n")
+	}
+	return end, nil
 }
 
 func (r *specRun) finalPass(ctx context.Context) error {

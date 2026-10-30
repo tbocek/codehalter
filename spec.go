@@ -72,6 +72,8 @@ type specConfig struct {
 	Redo map[string]string `toml:"redo,omitempty"`
 	// Items records the spec text each item was built from, which coverage cannot know.
 	Items map[string]specLedger `toml:"items,omitempty"`
+	// VerifiedAt: the last /spec verify; the next one goes over the sessions since.
+	VerifiedAt *time.Time `toml:"verified_at,omitempty"`
 	// Final is redone when the item or blocked count has moved since.
 	Final *specFinal `toml:"final,omitempty"`
 	// LintCmd overrides the detected linter; "off" turns the lint gate off.
@@ -224,8 +226,10 @@ func parseSpecArgs(args string) (cmd string, err error) {
 		return "stop", nil
 	case "redo":
 		return "redo", nil
+	case "verify":
+		return "verify", nil
 	}
-	return "", fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop (after the round in flight), /spec abort (at once), /spec redo")
+	return "", fmt.Errorf("usage: /spec (start or resume), /spec status, /spec stop (after the round in flight), /spec abort (at once), /spec redo, /spec verify")
 }
 
 // specRedoTargets takes an item id, a section id with a paraphrased slug, or a spec file
