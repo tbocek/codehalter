@@ -392,6 +392,10 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 	default:
 		// Execute outside the registry lock: a slow tool must not block the MCP
 		// reconciler.
+		mayRender := tc.Function.Name == "run_command" && a.imagesSupported.Load()
+		if mayRender && strings.Contains(parseArgs(args).str("command"), "snapshot") {
+			time.Sleep(mtimeTick)
+		}
 		if t, ok, names := a.tools.lookup(tc.Function.Name); ok {
 			result, failed = t.Execute(ctx, a, sid, args)
 		} else {
@@ -400,7 +404,7 @@ func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolU
 		}
 		// Attach the rendered screen: the executor rarely calls screenshot on
 		// its own.
-		if !failed && tc.Function.Name == "run_command" && a.imagesSupported.Load() {
+		if mayRender && !failed {
 			switch text, parts, id, same := a.attachRenderedScreen(ctx, sid, args, result, started); {
 			case id != "":
 				result, multimodal, imageID = text, parts, id

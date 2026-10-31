@@ -648,6 +648,11 @@ func pngsWrittenSince(root string, t time.Time) []string {
 	return paths
 }
 
+// The kernel dates a write with the clock of its last tick, so a fast render can be dated
+// before the time taken just ahead of it and be missed by pngsWrittenSince. Waiting this
+// long after taking the time rules that out: a tick at 100 Hz, doubled.
+const mtimeTick = 20 * time.Millisecond
+
 const pictureRegionMaxSide = 1400
 
 func (a *agent) viewPicture(ctx context.Context, sid string, sess *Session, rel, abs string, args toolArgs) (string, []any, string, bool) {

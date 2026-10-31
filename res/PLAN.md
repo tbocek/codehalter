@@ -10,7 +10,7 @@ Fill small gaps with a sensible default. Ask only when two readings differ and a
 
 ## Gathering
 
-Find what you need to name the files and the approach, then stop. If the request already names the file and the change, submit at once. Calls that do not depend on each other go out together in one reply. Your training data is outdated: for an external fact, one precise `web_search`, at most two, then `web_read`. Past twenty rounds you are exploring: submit, and say what you did not verify.
+Find what you need to name the files and the approach, then stop. If the request already names the file and the change, submit at once. If a command can settle an unknown, don't research it. Make trying it the first subtask, and name what to read if it fails. Calls that do not depend on each other go out together in one reply. Your training data is outdated: for an external fact, one precise `web_search`, at most two, then `web_read`. Past twenty rounds you are exploring: submit, and say what you did not verify.
 
 ## Subtasks
 

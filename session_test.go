@@ -445,7 +445,9 @@ func TestExternalChangeDrift(t *testing.T) {
 	}
 }
 
-// The repaired text must marshal to the same JSON as the broken original: same wire bytes.
+// The repaired text must decode from JSON to what the broken original did: the server
+// sees the same text. Not the same bytes: the encoder escapes a bad byte and sends
+// the valid rune raw.
 func TestLoadSessionRepairsInvalidUTF8(t *testing.T) {
 	dir := t.TempDir()
 	s, err := newSession(dir)
@@ -467,8 +469,15 @@ func TestLoadSessionRepairsInvalidUTF8(t *testing.T) {
 	}
 	was, _ := json.Marshal(broken)
 	now, _ := json.Marshal(got.Summary)
-	if string(was) != string(now) {
-		t.Errorf("wire bytes changed: before %s, after %s", was, now)
+	var wasText, nowText string
+	if err := json.Unmarshal(was, &wasText); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(now, &nowText); err != nil {
+		t.Fatal(err)
+	}
+	if wasText != nowText {
+		t.Errorf("text the server sees changed: before %q, after %q", wasText, nowText)
 	}
 	if len(got.Messages) != 1 || got.Messages[0].Content != "go on" {
 		t.Errorf("messages not restored: %+v", got.Messages)

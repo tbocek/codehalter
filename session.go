@@ -378,8 +378,9 @@ func loadSession(cwd string, id string) (*Session, error) {
 		return nil, err
 	}
 	// TOML refuses invalid UTF-8. One U+FFFD per bad byte (not per run, as
-	// ToValidUTF8 does) is what Go's JSON encoder already sent for those bytes, so
-	// the wire and the cache stay the same.
+	// ToValidUTF8 does) is what Go's JSON encoder already sent for those bytes, as
+	// an escape where this is the raw rune: the server decodes the same text, so the
+	// cache stays the same.
 	text := string(data)
 	if !utf8.ValidString(text) {
 		slog.Warn("session file has invalid UTF-8, replacing it with U+FFFD", "path", path)

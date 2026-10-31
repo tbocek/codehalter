@@ -104,6 +104,7 @@ func (r *specRun) checkPictures(ctx context.Context, item string, pics []string,
 		// The round's own render may be older than its last edit: this one is of the code as committed.
 		shoot := func(title string) (render, tail string) {
 			since := time.Now()
+			time.Sleep(mtimeTick)
 			ok, tail, _ := r.a.runCheckCommand(ctx, r.sid, r.outAbs, title, cmd)
 			if !ok {
 				return "", tail
