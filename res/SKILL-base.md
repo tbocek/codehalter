@@ -3,7 +3,6 @@ Today: {{cmd:date +%F}}. Trust it over your training: releases after your cutoff
 You run in a container with the workspace bind-mounted. Installs last until a rebuild, so a test install is cheap.
 
 ## Working in a project
-- A repo you do not know: `git ls-files` and the README, once.
 - Build, test and lint through what the project declares (a `just` recipe, a `package.json` script), not the ecosystem defaults.
 - Scratch goes in `/tmp`, not `.codehalter/`, which holds the project's config and session record.
 - Run a test suite ONCE, into a file: `just test > /tmp/test.log 2>&1; echo "exit=$?"`, then grep that file. In `cmd | grep x` the exit code is grep's, so a red run looks green.
