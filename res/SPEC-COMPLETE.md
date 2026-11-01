@@ -1,6 +1,6 @@
 # Completion check: `{{file}}`
 
-The items below of the specification in `{{spec_dir}}/` count as done: a test is named after each, and the suite passes. That does not say the program does what the spec says. A test can pass against a stand-in (a refusal, a scripted answer, a helper only tests fill), and a screen can have every widget in the wrong place. This round checks each item against its spec text. It changes nothing.
+The items below of the specification in `{{spec_dir}}/` count as done: a test names each, and the suite passes. But a test can pass against a stand-in, and a screen can have every widget in the wrong place. Check each item against its spec text, and change nothing.
 
 ## Target
 

@@ -1,6 +1,6 @@
 # Spec final pass: `{{spec_dir}}/` → `{{out_dir}}/`
 
-Every item of the specification is covered by a passing test: {{items}} items, {{blocked_count}} not done (blocked in this run, or waiting on the user's answer to a question). This round implements no item. It checks that the pieces make one program a person can build, run and try, and it writes down how.
+Every item of the specification has a passing test: {{items}} items, {{blocked_count}} not done (blocked, or waiting on the user's answer). This round implements no item. It checks that the pieces make one program a person can build, run and try, and writes down how.
 
 ## Target
 

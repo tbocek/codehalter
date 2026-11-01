@@ -1,8 +1,8 @@
 # Spec refactor round: `{{out_dir}}/`
 
-A specification in `{{spec_dir}}/` is being implemented one item per round. When a file grew too big for a round to add its code, and once at the end of a run, one round goes to the shape of the code instead of a new item. This is that round: it implements NO spec item and changes NO behaviour.
+This round improves the shape of the code in `{{out_dir}}/`. It implements NO spec item and changes NO behaviour.
 
-This round runs as your usual two phases. In the PLANNING phase, read the targets below and submit a plan of small, separate refactoring steps; the item is already chosen. In the EXECUTION phase, do the steps.
+In the PLANNING phase, read the targets below and submit a plan of small, separate steps. In the EXECUTION phase, do them.
 
 ## Target
 

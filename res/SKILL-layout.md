@@ -1,16 +1,14 @@
 # Rendered-layout skill (CSS, HTML templates)
-A stylesheet or template edit has no compile step and no unit test: CSS always parses, so a WRONG rule fails exactly like a right one, silently. "Should look better now" is not a check. It costs a user turn per attempt and answers only "still wrong", never why. Measure the rendered page instead.
+A wrong CSS rule fails as silently as a right one: it parses, and no test catches it. Measure the rendered page; "should look better now" is not a check.
 
 ## Look with `screenshot`, measure with the probe
-Two different questions, two different tools. Reach for `screenshot` first: it needs no `run_command`, so it works on a host run too.
-- `screenshot(path="out/page/index.html", selector=".grid-video-2")` renders with headless Firefox and puts the picture in front of you. `selector` lifts one block to the top of the shot, so a long page costs one block, not a poster. Use it to find WHETHER something is off and WHERE: overlap, clipping, a caption hidden behind a player, the wrong column.
-- The reply says whether the selector matched. `matched NO element` means you are looking at the top of the page, not at your block: fix the selector before reading anything into the image.
-- A picture cannot give you a distance. "Too big a gap" needs a pixel count, and that is the probe below.
-- The tool reports that this LLM takes no image input? Then you cannot see, and neither can the probe help you skip that fact: say so and use the numbers alone.
+- `screenshot(path="out/page/index.html", selector=".grid-video-2")` renders with headless Firefox and shows you the picture, with `selector` at the top. Use it to find whether and where something is off: overlap, clipping, the wrong column. It needs no `run_command`.
+- `matched NO element` in the reply means you are looking at the top of the page: fix the selector first.
+- A picture gives no distance. A gap needs a pixel count, from the probe below.
+- If this LLM takes no images, say so and use the numbers alone.
 
 ## Measure BEFORE editing, in the BUILT page
-Turn the complaint into ONE number read off the artifact the user actually sees (the generated `.html` in the output dir, NOT the source template it came from). Take it before the first edit: with no baseline you cannot tell a fix from a coincidence.
-Headless Firefox lays the page out and a small probe reports the number as TEXT. Needs `run_command` (devcontainer), `firefox` and `python3`.
+Turn the complaint into ONE number from the generated `.html`, not the source template. Take it before the first edit, or you cannot tell a fix from a coincidence. Needs `run_command`, `firefox` and `python3`.
 
 1. Receiver: prints the first request's query, then exits:
 ```
@@ -51,23 +49,21 @@ EOF
 firefox --headless --no-remote --new-instance --profile /tmp/ffp --window-size 1400,1200 \
         --screenshot /tmp/m.png file:///tmp/m.html ; cat /tmp/m.log
 ```
-- The XHR MUST stay synchronous (the `false` argument), or the request loses the race with Firefox exiting.
-- `--no-remote --new-instance --profile` or Firefox attaches to a running instance and hangs until the timeout.
-- Measuring text, not an element? `var r = document.createRange(); r.selectNodeContents(node);` then `r.getBoundingClientRect()`.
-- Report EVERY match, not the first: one bad block among 40 good ones is the whole bug.
+- Keep the XHR synchronous (the `false` argument), or it loses the race with Firefox exiting.
+- Without `--no-remote --new-instance --profile`, Firefox attaches to a running instance and hangs.
+- For text, not an element: `var r = document.createRange(); r.selectNodeContents(node);` then `r.getBoundingClientRect()`.
+- Report EVERY match: one bad block among 40 good ones is the whole bug.
 
 ## One rule per measurement
-- Change ONE rule, take the SAME number again, report both (`16.0 -> 1.9`). Never "should be better now".
-- Number unchanged? Your DIAGNOSIS was wrong, not your value. REVERT that edit before trying another. Never stack a second guess on the first.
-- A number that only proves what you were looking at: check the rest too (no overlap, nothing clipped, other pages using the same class). A metric that says "clean" for a broken layout is worse than none.
+- Change ONE rule, take the SAME number again, report both (`16.0 -> 1.9`).
+- Number unchanged: your diagnosis was wrong. REVERT that edit before trying another.
+- Then check the rest: no overlap, nothing clipped, other pages using the same class.
 
-## Space you did not write comes from something you did not look at
-Unwanted space between A and B is exactly one of: margin, padding, gap, line-height/descender, LEFTOVER TRACK SPACE. Name WHICH from the measurement before touching a property.
-- Leftover track space: the row is taller than its content because something ELSE sizes it, usually an item in a DIFFERENT column spanning those rows. `align-items: end` then drops that slack ABOVE every item, which reads as "a gap under the title".
-- So don't ask "which property adds this space", ask "which ELEMENT makes this track that tall", and measure that track's items to find it.
-- Fix the sizer, not the symptom: give the tall spanning item its own `1fr` spacer track to absorb (an item spanning a flexible track stops contributing to the intrinsic tracks it spans, CSS Grid 12.5), and put that spacer LAST or auto-placed items land in it.
-- Every child of a grid/flex container is its own item, including each inline element and each text run. A caption with `<b>` in it is 3 items, not 1.
-- A comment claiming WHY a rule works is a claim like any other: measured, or not written.
+## Space you did not write
+Unwanted space between A and B is one of: margin, padding, gap, line-height or descender, or leftover track space. Name which from the measurement before touching a property.
+- Leftover track space: something else sizes the row, usually an item in another column spanning it, and `align-items: end` drops the slack above every item. Ask which ELEMENT makes the track that tall, and measure that track's items.
+- Fix the sizer: give the tall spanning item its own `1fr` spacer track, placed LAST, or auto-placed items land in it.
+- Every child of a grid or flex container is its own item, including each inline element and text run: a caption with `<b>` in it is 3 items.
 
 ## Nothing to render with
-No `screenshot`, no `run_command`, no browser and no way to install one: say exactly that in your FIRST reply and ask how the user wants it verified. Do not guess a second time.
+No `screenshot`, `run_command` or browser, and no way to install one: say so in your FIRST reply and ask how the user wants it verified.

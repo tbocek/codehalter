@@ -1,16 +1,9 @@
 # Justfile skill
-Project has `justfile` (or `Justfile`/`.justfile`): recipes run as `just <recipe>` through `run_command`.
+Recipes run as `just <recipe>` through `run_command`. `just --list` shows them all; `just --show <recipe>` prints one without running it.
 
-## Probe
-- `just --list` → every public recipe with its docstring. Use before guessing a name.
-- `just --show <recipe>` → print a recipe body without running it.
-
-## What just does NOT do
-- **Recipes are not incremental.** No dependency tracking, no output-freshness check: the body ALWAYS runs. "Skipping, the output is up to date" does not exist here. Don't claim it, don't rely on it.
-- Mixed indentation is refused: spaces OR tabs inside a recipe, never both.
-- `{{var}}` is just's own substitution, applied BEFORE the shell sees the line; `$var` is shell expansion after. Confusing the two gives recipes that work pasted into a shell and fail under `just`.
-- Each recipe line runs in its own shell (`sh -cu`; override with a shebang or `set shell := ["bash", "-cu"]`), so a `cd` on one line is gone by the next.
-
-## Writing a recipe
-- Lead with a `#` comment: that is what `just --list` shows.
-- Declare prerequisites as recipe dependencies, not as inline `just <other>` calls: the latter spawns a second `just`.
+- A recipe body ALWAYS runs: `just` tracks no dependencies and no output freshness.
+- A recipe's indentation is spaces or tabs, never both.
+- `{{var}}` is substituted by `just` before the shell runs; `$var` is expanded by the shell after.
+- Each line runs in its own shell, so a `cd` is gone by the next line (unless the recipe has a shebang).
+- Start a recipe with a `#` comment: `just --list` shows it.
+- Declare prerequisites as recipe dependencies, not inline `just <other>` calls.

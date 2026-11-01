@@ -1,29 +1,27 @@
 # Does the screen match its picture?
 
-You check one screen of a program against the picture the spec gives of it. You did not build this screen and nothing depends on your answer being a pass: say what you see.
+Check one screen of a program against the spec's picture of it. You did not build it, and nothing depends on a pass: say what you see.
 
-Below are two images:
-
-1. The spec's picture, `{{picture}}`. It was taken of another version of the program, on other data.
-2. The program's own render of the same screen, `{{render}}`, as the program draws it now.
+1. The first image is the spec's picture, `{{picture}}`, taken of another version on other data.
+2. The second is the program's render of the same screen, `{{render}}`.
 
 ## What to ignore
 
-The data differs, and that is not a difference: other file names, other numbers, other counts of rows or clips, other text in the text boxes, other thumbnails or frames, another theme colour. A list with eight rows in the picture and one row in the render is the same list.
+Data differs and is not a difference: file names, numbers, counts of rows or clips, text in text boxes, thumbnails, theme colour. Eight rows in the picture and one in the render is the same list.
 
-The picture can be of an older version (a prototype), and the spec text below says where the program is meant to differ from it. A control the spec text calls gone, removed, replaced, or prototype only is not a difference when the render lacks it, and the control that replaces it is not a difference when the render has it. For example, if the spec text says "chain (prototype; replaced by I'm feeling lucky)", a render with an "I'm feeling lucky" button where the picture has a chain dropdown matches. Read the spec text for each control before you list it as missing or extra.
+The picture may be of a prototype. A control the spec text calls gone, removed, replaced or prototype only is not a difference when the render lacks it, and its replacement is not a difference when the render has it. Check the spec text before listing a control as missing or extra, in all of the text below.
 
 ## What to compare
 
-Compare the ARRANGEMENT, region by region, starting at the top left of the spec's picture:
+Compare the ARRANGEMENT, region by region, from the top left of the picture:
 
-- Is every region and control the picture shows also in the render, in the same place relative to the others (left or right, above or below, in the header bar or under it, which side of a divider)?
-- Is anything in the render cut off: a heading, a label, a row or a control that runs past the top, bottom, left or right edge of the window or of its panel, or a page that starts in the middle of its content because its top is scrolled out of view?
-- Do any two things in the render overlap: a label drawn over another label or over a control, text drawn over text?
-- Is there a large empty area in the render where the picture has content, or one region taking far more of the window than in the picture (for example an empty band under a bar that is a thin row in the picture)?
-- Are controls in a row or a grid in the same order and grouping as in the picture (for example two label and control pairs per line in the picture, three in the render)?
+- Is every region and control there, in the same place relative to the others (left or right, above or below, in or under the header bar, which side of a divider)?
+- Is anything cut off, or does a page start mid-content because its top is scrolled out of view?
+- Do any two things overlap?
+- Is there a large empty area where the picture has content, or a region far larger than in the picture?
+- Are controls in a row or grid in the same order and grouping?
 
-Below is the whole spec chapter this screen belongs to, followed by the sections of other chapters it links to (each headed `--- <file> · <title> ---`), the spec's standing rules for every screen, and the user's answers to this screen's questions, which are spec too. The screen has its own section in it, and other sections describe parts the picture also shows (a bar, a list, a panel). The spec's words decide what must match, wherever in the chapter they stand; where they say nothing, the picture does. Before you list a control as missing or extra, look for it in the whole text below: a sentence in another section that calls it gone, replaced or prototype only settles it.
+Below are the spec chapter, sections of other chapters it links to (headed `--- <file> · <title> ---`), the standing rules, and the user's answers, which are spec too. The spec's words decide what must match; where they say nothing, the picture does.
 
 <spec_chapter>
 {{section}}
@@ -39,4 +37,4 @@ or
 
 {"verdict": "MISMATCH", "differences": ["<where on the screen>: <what the picture shows> but <what the render shows>", "..."]}
 
-Name every difference in arrangement you found, each with where it is, so someone who cannot see the images can fix it. A difference only in data is not listed, and neither is a control the spec text says the program dropped or replaced. If the render has any part cut off, overlapping or scrolled out of view, the verdict is MISMATCH.
+Name every difference in arrangement, each with where it is, for someone who cannot see the images. Anything cut off, overlapping or scrolled out of view makes the verdict MISMATCH.
