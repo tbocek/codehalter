@@ -315,6 +315,7 @@ func TestReplanCarriesFailureDigest(t *testing.T) {
 		read, read, read,
 		sseText("done, I think"), sseText("still done"), // no respond: the subtask fails
 		sseToolCall("p2", respondToolName, `{"message":"nothing more to do"}`),
+		sseToolCall("p3", submitPlanToolName, `{"answer":"same"}`),
 	)
 	a.tools.add(fakeTool("read_file", func(string) (string, bool) { return "fn a() {}", false }))
 	s.AddUser("change a.rs")

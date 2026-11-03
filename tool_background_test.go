@@ -140,7 +140,7 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	bgJobGrace = 50 * time.Millisecond
 	defer func() { bgJobGrace = old }()
 	mock := newMockLLM(t, sseToolCall("p1", submitPlanToolName,
-		`{"clear":true,"report_only":true,"subtasks":[],"answer":"The experiment failed with code 4."}`))
+		`{"clear":true,"report_only":true,"subtasks":[],"answer":"The experiment failed with code 4."}`), sseToolCall("same", submitPlanToolName, `{"answer":"same"}`))
 	defer mock.Close()
 	h.agent.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}, KeepWarm: "off"}
 	// An empty SUMMARISE.md keeps the turn's summariser off the mock.
@@ -171,8 +171,8 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	h.agent.drainSteer(context.Background(), h.sess) // what Prompt does as the turn ends
 	h.sess.ctl.held.Unlock()
 
-	if mock.callCount() != 1 {
-		t.Fatalf("LLM calls = %d, want 1: the note should have run a turn", mock.callCount())
+	if mock.callCount() != 2 {
+		t.Fatalf("LLM calls = %d, want 2, a turn and its answer check", mock.callCount())
 	}
 	var prompt string
 	for _, m := range h.sess.Messages {

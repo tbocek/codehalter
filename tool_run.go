@@ -24,7 +24,7 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_command",
-			"description": "Run a shell command: builds, tests, installs, git, and reading or searching project files (`grep -rn`, `sed -n '120,180p' <file>`). Change a file with `edit_file` (not sed -i, awk or a script) and create one with `write_file` (not echo > or cat <<EOF): those are checked and shown to the user as a diff. Runs in this devcontainer and waits up to two minutes for the exit code and output. Still running then: it is NOT killed but goes on as a background job; you get its output so far, and its exit code and last output arrive by themselves before your next step. Nothing else to do: call `respond` saying you wait for it, which parks the turn until the job reports. Never `sleep` or poll for it. Known to take over two minutes: use `run_background`. Never ends (dev server, watcher, `npm run dev`): use `run_server`, and never a trailing `&` here (it would survive with no pid or log). The container is a throwaway sandbox: installs last until a rebuild, workspace writes are real and recoverable from git. Before proposing a Dockerfile change, run the same install here and verify it (`<tool> --version`, or the failing build again); propose the patch once that works. The exit code is in the output and title: `which <tool>` exiting 1 means the tool is missing. Output is capped keeping its START and END, so run commands raw: a pipe to `head`/`tail` throws away what the cap keeps, and errors come last. Use `grep` to filter for a match, not to trim length.",
+			"description": "Run a shell command: builds, tests, installs, git, and reading or searching files (`grep -rn`, `sed -n '120,180p' <file>`). Change files with `edit_file` and `write_file`, not the shell. Waits up to two minutes. Still running then, it goes on as a background job, and its exit code and last output arrive by themselves before your next step; if nothing else is left, call `respond` saying you wait. Over two minutes: `run_background`. Never ends (dev server, watcher): `run_server`. No trailing `&`. Output is capped keeping its START and END, so do not pipe to `head` or `tail`; use `grep` to filter for a match, not to trim length.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
@@ -46,7 +46,7 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_background",
-			"description": "Start a command that ENDS on its own but takes over two minutes (a full test suite, a long build, a benchmark) and return at once. It runs across later tool calls; when it exits, its exit code, log path and last output arrive by themselves before your next step. Meanwhile do other work, or call `respond` saying you wait: the step is parked, not ended. Never poll or `sleep` for it (a foreground `sleep` is refused while a job runs); for a look before it exits, give `wake_after`. A job using almost no CPU and writing no output for 5 minutes counts as stuck and is stopped. Never ends on its own (dev server, watcher): use `run_server`. Returns the pid and a log path to read with run_command (`tail`, `grep`). Stop it early with `run_command: kill -TERM -<pid>; sleep 3; kill -KILL -<pid> 2>/dev/null; true` (the whole job; a plain `kill <pid>` may be ignored here). No trailing `&`: it is detached already.",
+			"description": "Start a command that ENDS on its own but takes over two minutes (a full test suite, a long build) and return at once. When it exits, its exit code, log path and last output arrive by themselves before your next step. Meanwhile do other work, or call `respond` saying you wait. Never poll or `sleep` for it; for a look before it exits, give `wake_after`. A job with almost no CPU and no output for 5 minutes is stopped as stuck. Returns the pid and a log path. Stop it early with `run_command: kill -TERM -<pid>; sleep 3; kill -KILL -<pid> 2>/dev/null; true`. No trailing `&`.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
@@ -68,7 +68,7 @@ func (a *agent) discoverSandbox() {
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_server",
-			"description": "Start a process that never ends on its own: a dev server (`npm run dev`, `python3 -m http.server 8765`), a watcher, a daemon, a fake service a manual check talks to. It runs until `{\"stop\": <its job id>}` or the session ends; nothing waits for it and it is never stopped as idle. With `port`, the call returns once that port accepts connections (up to 60 s): do not sleep or poll for it. A command that ends (a test suite, a build) is no server: use run_command, or run_background past two minutes. No trailing `&`.",
+			"description": "Start a process that never ends on its own: a dev server (`npm run dev`), a watcher, a daemon, a fake service a manual check talks to. It runs until `{\"stop\": <its job id>}` or the session ends. With `port`, the call returns once that port accepts connections (up to 60 s). No trailing `&`.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{

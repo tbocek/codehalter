@@ -190,6 +190,7 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		return plan, nil
 	}
 
+	answerChecked := false
 	for asked := 0; ; asked++ {
 		sess.AddUser(marker)
 		sess.saveOrLog()
@@ -221,6 +222,18 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 				"sid", sid, "calledSubmitPlan", planRes.Terminal != "", "err", parseErr, "snippet", truncate(planRes.Text, 200))
 			if plan, err = retry(fmt.Sprintf("\n⚠ Planning went wrong! %s.%s Asking the planner to try again.\n", wrong, salvaged), corrective); err != nil {
 				return nil, err
+			}
+		}
+
+		// An answer alone ends the turn with nothing done, and the planner has called that a plan.
+		if !answerChecked && len(plan.Subtasks) == 0 && plan.answer != "" && strings.TrimSpace(plan.Question) == "" && !audit && !verify && sess.specFence() == "" {
+			answerChecked = true
+			kept := plan.answer
+			if plan, err = retry("", answerCheckText); err != nil {
+				return nil, err
+			}
+			if len(plan.Subtasks) == 0 && strings.TrimSpace(plan.Question) == "" && (plan.answer == "" || strings.EqualFold(strings.Trim(strings.TrimSpace(plan.answer), "\"."), "same")) {
+				plan.answer = kept
 			}
 		}
 
@@ -401,6 +414,11 @@ func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopR
 
 // Above the median plan, below the runaways; the executor reads what is left cheaply.
 const planRoundNudge = 20
+
+// A planner past this many generated tokens without a plan is thinking in circles: on an
+// impossible request it hunted workarounds for 13k tokens, and a JDK upgrade plan took 13 minutes.
+// Normal plans stay under it (1-3k).
+const planTokenNudge = 6000
 
 // Backstop for "different enough" calls forever; the repetition ladder catches the rest earlier.
 const maxToolLoopIterations = 100
@@ -921,6 +939,10 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 
 	// Only jobs this loop's own run_command calls handed over can park it.
 	loopStart := time.Now()
+	planStartTokens, tokenNudged := 0, false
+	if s := a.getSession(sid); s != nil {
+		planStartTokens = s.turnCompletion()
+	}
 
 	var res toolLoopResult
 	var allText strings.Builder
@@ -998,6 +1020,14 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			if items := sess.takePending(); len(items) > 0 {
 				text, _ := a.sayPending(ctx, sid, items, true)
 				messages = a.addCorrective(sid, messages, text)
+			}
+		}
+		// Naming the blocker turns a hunt for workarounds into a refusal or a different plan.
+		if phase == "plan" && sess != nil && !tokenNudged {
+			if spent := sess.turnCompletion() - planStartTokens; spent >= planTokenNudge {
+				tokenNudged = true
+				messages = a.addCorrective(sid, messages, planTokenNudgeText(spent))
+				a.say(ctx, sid, fmt.Sprintf("\n⏱ Planning at %d tokens without a plan: asked to name the blocker and change course.\n", spent))
 			}
 		}
 		// Planning rounds are the most expensive thing codehalter does.
@@ -1401,3 +1431,18 @@ func putState(path string, st *fileState) error {
 	}
 	return os.WriteFile(path, st.data, 0o644)
 }
+
+func planTokenNudgeText(spent int) string {
+	return fmt.Sprintf("You have reasoned for %d tokens in this planning phase without a plan. Stop. Name in one line what is blocking you, then decide:\n"+
+		"- The request's own conditions rule it out: say so in `answer`, naming the condition.\n"+
+		"- You are working out what a command would settle: submit a plan whose first subtask runs it.\n"+
+		"- Otherwise: drop the approach you were on, and submit a plan that takes a different one.\n"+
+		"Call `submit_plan` in your next reply.", spent)
+}
+
+// answerCheckText goes back once when a plan has only an answer: the planner has written
+// "planned a subtask that runs it" into `answer` and sent no subtasks.
+const answerCheckText = "Your `submit_plan` has an `answer` and no `subtasks`, so nothing will run and the turn ends now. Read the user's request once more:\n" +
+	"- A question: call `submit_plan` with `answer` set to \"same\" to keep the answer you wrote.\n" +
+	"- A task its own conditions rule out: call `submit_plan` with `answer` set to \"same\".\n" +
+	"- Anything to do, run, start or change: call `submit_plan` with the `subtasks` that do it."

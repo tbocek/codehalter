@@ -862,3 +862,10 @@ func (a *agent) restoreSession(ctx context.Context, cwd, sid string, mcpOffer []
 	}
 	return s, nil
 }
+
+// turnCompletion is the tokens the model generated so far this turn, reasoning included.
+func (s *Session) turnCompletion() int {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	return s.turn.stats.completion
+}

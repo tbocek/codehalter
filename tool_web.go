@@ -296,7 +296,7 @@ var webTools = []Tool{
 				"properties": map[string]any{
 					"query": map[string]any{
 						"type":        "string",
-						"description": "Keyword-style search query (NOT a natural-language sentence). Use specific technical terms, exact error messages, version numbers, or API/function names. Good: 'golang http.Client timeout context.DeadlineExceeded'. Bad: 'how do I handle timeouts in Go HTTP client'. Quote exact phrases when needed: '\"cannot find package\"'.",
+						"description": "Keywords, not a sentence: specific terms, exact error messages, versions, API names. Quote exact phrases.",
 					},
 				},
 			},

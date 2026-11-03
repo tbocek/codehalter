@@ -1203,13 +1203,14 @@ func TestToolLoopParksForBackgroundJobs(t *testing.T) {
 // Needs no message text: a server that forces the tool call returns none.
 func TestPlanAnswerInArgument(t *testing.T) {
 	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
-		`{"clear":true,"report_only":true,"subtasks":[],"answer":"Only the Prepare page builds widgets; Cut, Narrate and Produce are bare."}`))
+		`{"clear":true,"report_only":true,"subtasks":[],"answer":"Only the Prepare page builds widgets; Cut, Narrate and Produce are bare."}`),
+		sseToolCall("p2", submitPlanToolName, `{"answer":"same"}`))
 	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil {
 		t.Fatalf("runPlanPhase: %v", err)
 	}
-	if got := mock.callCount(); got != 1 {
-		t.Errorf("an answer in the argument cost %d LLM calls, want 1 (no nudge)", got)
+	if got := mock.callCount(); got != 2 {
+		t.Errorf("an answer in the argument cost %d LLM calls, want 2 (the answer and its check)", got)
 	}
 	if plan == nil || !strings.HasPrefix(plan.answer, "Only the Prepare page") || len(plan.Subtasks) != 0 {
 		t.Fatalf("plan = %+v, want the argument as the answer", plan)
@@ -1818,7 +1819,8 @@ func TestPlanUnwrapsCutOffPlanText(t *testing.T) {
 // A tool parser left the next argument inside `answer`, tag and all.
 func TestPlanAnswerDropsALeakedParameter(t *testing.T) {
 	args, _ := json.Marshal(map[string]string{"answer": "It cannot be done.\n<parameter=clear>\ntrue"})
-	a, s, _ := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, string(args)))
+	a, s, _ := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, string(args)),
+		sseToolCall("p2", submitPlanToolName, `{"answer":"same"}`))
 	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil || plan == nil || plan.answer != "It cannot be done." {
 		t.Fatalf("plan %+v, err %v", plan, err)
