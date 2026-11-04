@@ -318,3 +318,17 @@ func TestElicitationActionsMapToOutcomes(t *testing.T) {
 		})
 	}
 }
+
+// TestAskYesNoWithCardAutoNo pins that opt-in prompts (the SSH-agent forward)
+// resolve to No under autopilot, while the plain helper still auto-answers yes.
+func TestAskYesNoWithCardAutoNo(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.mode = "Autopilot"
+	ctx := context.Background()
+	if yes, _, err := a.askYesNoWithCardAuto(ctx, s.ID, "Forward SSH?", "think", "Yes", "No", false); err != nil || yes {
+		t.Errorf("autoYes=false under autopilot = (%v, %v), want (false, nil)", yes, err)
+	}
+	if yes, _, err := a.askYesNoWithCard(ctx, s.ID, "Mount .git?", "think", "Yes", "No"); err != nil || !yes {
+		t.Errorf("askYesNoWithCard under autopilot = (%v, %v), want (true, nil)", yes, err)
+	}
+}

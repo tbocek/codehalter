@@ -76,31 +76,45 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	// the container fails to start (docker --mount type=bind is strict about its
 	// source), so only ask when the source is present and only add what the user
 	// accepts. The chosen mounts apply when the user reopens in the container.
-	gitWritable, gitconfig := false, false
+	// .git needs no mount of its own: the workspace bind already carries it,
+	// read-write. A dedicated mount is only spliced in when the user asks for
+	// read-only, where it shadows the workspace copy. Default (and autopilot)
+	// is writable, so git commit/push work as in any other checkout.
+	gitReadonly := false
 	if hasGitFolder(cwd) {
-		yes, gtc, gerr := a.askYesNoWithCard(ctx, sid, "Mount your repo's .git (writable) and ~/.gitconfig (when present) into the container, so git uses your real history and identity for commit/push?", "think", "Yes, mount", "No")
+		yes, gtc, gerr := a.askYesNoWithCardAuto(ctx, sid, "Make the repo's .git read-only inside the container? By default it is writable, so git commit/push work (codehalter still only commits when you ask).", "think", "Yes, read-only", "No, keep writable", false)
 		if gerr != nil {
 			a.FailToolCall(ctx, sid, gtc, gerr.Error())
 		} else {
-			gitWritable = yes
-			// .gitconfig only when the host actually has one (global.toml, captured
-			// at install time) — a missing bind source would fail the container.
-			gitconfig = yes && loadGlobalConfig().HasGitconfigInHome
-			done := "Not mounting .git or .gitconfig."
+			gitReadonly = yes
+			done := ".git stays writable."
 			if yes {
-				done = "Will mount .git writable"
-				if gitconfig {
-					done += " and ~/.gitconfig."
-				} else {
-					done += " (no ~/.gitconfig recorded on the host, so it isn't mounted)."
-				}
+				done = "Will mount .git read-only."
 			}
 			a.CompleteToolCall(ctx, sid, gtc, []ToolCallContent{TextContent(done)})
 		}
 	}
+	// .gitconfig only when the host actually has one (global.toml, captured at
+	// install time): a missing bind source would fail the container start.
+	gitconfig := false
+	if loadGlobalConfig().HasGitconfigInHome {
+		yes, ctc, cerr := a.askYesNoWithCard(ctx, sid, "Mount your ~/.gitconfig (read-only) into the container, so git uses your identity?", "think", "Yes, mount", "No")
+		if cerr != nil {
+			a.FailToolCall(ctx, sid, ctc, cerr.Error())
+		} else {
+			gitconfig = yes
+			done := "Not mounting ~/.gitconfig."
+			if yes {
+				done = "Will mount ~/.gitconfig read-only."
+			}
+			a.CompleteToolCall(ctx, sid, ctc, []ToolCallContent{TextContent(done)})
+		}
+	}
 	sshAgent := false
 	if hostSSHAgentAvailable() {
-		yes, stc, serr := a.askYesNoWithCard(ctx, sid, "Forward your host SSH agent into the container? Lets git push / ssh use your host SSH keys.", "think", "Yes, forward SSH agent", "No")
+		// Opt-in only: autopilot / subagents answer No, since forwarding the
+		// agent hands the container every key loaded on the host.
+		yes, stc, serr := a.askYesNoWithCardAuto(ctx, sid, "Forward your host SSH agent into the container? Lets git push / ssh use your host SSH keys.", "think", "Yes, forward SSH agent", "No", false)
 		if serr != nil {
 			a.FailToolCall(ctx, sid, stc, serr.Error())
 		} else {
@@ -123,7 +137,7 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
-	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(buildDevcontainerJSON(gitWritable, gitconfig, sshAgent)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(buildDevcontainerJSON(gitReadonly, gitconfig, sshAgent)), 0o644); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
@@ -145,24 +159,25 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 // in right after it.
 const (
 	configMountAnchor = `"source=${localEnv:HOME}/.config/codehalter,target=/home/dev/.config/codehalter,type=bind,readonly"`
-	gitMount          = `"source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind"`
+	gitReadonlyMount  = `"source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind,readonly"`
 	gitconfigMount    = `"source=${localEnv:HOME}/.gitconfig,target=/home/dev/.gitconfig,type=bind,readonly"`
 	sshMount          = `"source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"`
 )
 
 // buildDevcontainerJSON renders devcontainer.json from the embedded base, adding
-// the optional mounts the user accepted: gitWritable adds the repo's .git
-// (read-write); gitconfig (only meaningful with gitWritable) adds ~/.gitconfig;
-// sshAgent adds the host SSH-agent socket AND the SSH_AUTH_SOCK env pointing at
-// it. Pure string splicing — output stays plain JSON, no parsing.
-func buildDevcontainerJSON(gitWritable, gitconfig, sshAgent bool) string {
+// the optional mounts the user accepted: gitReadonly shadows the workspace's
+// .git with a read-only bind (without it .git is writable via the workspace
+// mount, no extra line); gitconfig adds ~/.gitconfig read-only; sshAgent adds
+// the host SSH-agent socket AND the SSH_AUTH_SOCK env pointing at it. Pure
+// string splicing — output stays plain JSON, no parsing.
+func buildDevcontainerJSON(gitReadonly, gitconfig, sshAgent bool) string {
 	out := defaultDevcontainerJSON
 	var extras []string
-	if gitWritable {
-		extras = append(extras, gitMount)
-		if gitconfig {
-			extras = append(extras, gitconfigMount)
-		}
+	if gitReadonly {
+		extras = append(extras, gitReadonlyMount)
+	}
+	if gitconfig {
+		extras = append(extras, gitconfigMount)
 	}
 	if sshAgent {
 		extras = append(extras, sshMount)

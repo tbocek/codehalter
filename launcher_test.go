@@ -137,7 +137,7 @@ func TestScaffoldConfigBecomesCompose(t *testing.T) {
 		ro     bool
 	}{
 		"/workspaces/myproject":        {ws, false},
-		"/workspaces/myproject/.git":   {filepath.Join(ws, ".git"), false},
+		"/workspaces/myproject/.git":   {filepath.Join(ws, ".git"), true},
 		"/home/dev/.config/codehalter": {filepath.Join(os.Getenv("HOME"), ".config", "codehalter"), true},
 		"/home/dev/.gitconfig":         {filepath.Join(os.Getenv("HOME"), ".gitconfig"), true},
 		"/ssh-agent":                   {os.Getenv("SSH_AUTH_SOCK"), false},

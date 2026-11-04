@@ -160,10 +160,11 @@ func anyHas(ss []string, sub string) bool {
 }
 
 // TestBuildDevcontainerJSON pins the scaffold-time mount splicing: the base has
-// only the codehalter config mount; .git / .gitconfig / ssh are added only when
+// only the codehalter config mount (.git is writable through the workspace bind,
+// no line of its own); a read-only .git, .gitconfig and ssh are added only when
 // opted in, and ssh also sets the SSH_AUTH_SOCK env. Output stays valid JSON.
 func TestBuildDevcontainerJSON(t *testing.T) {
-	// Base: nothing opted in.
+	// Base: nothing opted in, so .git stays writable via the workspace mount.
 	bm, benv := devMounts(t, buildDevcontainerJSON(false, false, false))
 	if len(bm) != 1 || !anyHas(bm, "/.config/codehalter") {
 		t.Errorf("base must be just the config mount, got %v", bm)
@@ -172,19 +173,19 @@ func TestBuildDevcontainerJSON(t *testing.T) {
 		t.Errorf("base must not set SSH_AUTH_SOCK env, got %v", benv)
 	}
 
-	// git writable, no gitconfig.
+	// read-only .git only.
 	gm, _ := devMounts(t, buildDevcontainerJSON(true, false, false))
-	if !anyHas(gm, "containerWorkspaceFolder}/.git") {
-		t.Errorf("gitWritable must add the .git mount, got %v", gm)
+	if !anyHas(gm, "containerWorkspaceFolder}/.git,type=bind,readonly") {
+		t.Errorf("gitReadonly must add a readonly .git mount, got %v", gm)
 	}
 	if anyHas(gm, "/.gitconfig") || anyHas(gm, "ssh-agent") {
 		t.Errorf("git-only must not add gitconfig/ssh, got %v", gm)
 	}
 
-	// git + gitconfig.
-	gcm, _ := devMounts(t, buildDevcontainerJSON(true, true, false))
-	if !anyHas(gcm, "containerWorkspaceFolder}/.git") || !anyHas(gcm, "/.gitconfig") {
-		t.Errorf("git+gitconfig must add both, got %v", gcm)
+	// gitconfig without a .git mount.
+	cm, _ := devMounts(t, buildDevcontainerJSON(false, true, false))
+	if !anyHas(cm, "/.gitconfig") || anyHas(cm, "/.git,") {
+		t.Errorf("gitconfig-only must add just .gitconfig, got %v", cm)
 	}
 
 	// ssh only: socket mount + env, no git.

@@ -74,11 +74,24 @@ func (a *agent) askChoiceWithCard(ctx context.Context, sid, title, kind string, 
 }
 
 // askYesNoWithCard is askChoiceWithCard's two-button cousin.
+// Auto-answer modes (autopilot, subagents) pick yes.
 func (a *agent) askYesNoWithCard(ctx context.Context, sid, title, kind, yesLabel, noLabel string) (bool, string, error) {
+	return a.askYesNoWithCardAuto(ctx, sid, title, kind, yesLabel, noLabel, true)
+}
+
+// askYesNoWithCardAuto is askYesNoWithCard with an explicit auto-answer: autoYes
+// is what autopilot / subagents pick. Use autoYes=false for opt-in prompts that
+// widen what the container can reach (e.g. forwarding the host SSH agent), so
+// nobody gets them without actually clicking yes.
+func (a *agent) askYesNoWithCardAuto(ctx context.Context, sid, title, kind, yesLabel, noLabel string, autoYes bool) (bool, string, error) {
 	tcId := a.StartToolCall(ctx, sid, title, kind, nil)
 	if auto, reason := a.shouldAutoAnswer(sid); auto {
-		a.say(ctx, sid, "["+reason+"] "+yesLabel+"\n\n")
-		return true, tcId, nil
+		label := noLabel
+		if autoYes {
+			label = yesLabel
+		}
+		a.say(ctx, sid, "["+reason+"] "+label+"\n\n")
+		return autoYes, tcId, nil
 	}
 	ok, err := a.conn.AskYesNoWithCard(ctx, sid, tcId, title, kind, yesLabel, noLabel)
 	return ok, tcId, err

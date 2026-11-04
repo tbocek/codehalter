@@ -58,12 +58,17 @@ import (
 // ---------------------------------------------------------------------------
 
 // cliUsage is printed for --help and for a flag we don't know.
-const cliUsage = `usage: codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT]
+const cliUsage = `usage: codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [--list] [--autopilot] [-p PROMPT]
 
   --cli               run the standalone terminal client instead of an ACP server
   --cwd DIR           project directory (default: current directory)
   --resume [ID]       continue a stored session; without an ID, the most recent
                       one for this directory
+  --list              print the stored session IDs for this directory (newest
+                      first) and exit
+  --autopilot         start in Autopilot: auto-answer every prompt (setup
+                      cards, permission cards, ask_user). Off by default;
+                      /mode Autopilot switches to it later as well
   -p PROMPT           run one turn and exit, instead of opening a prompt. The
                       exit status is 0 only when the turn finished normally,
                       so a script can branch on it.
@@ -80,7 +85,7 @@ release over this binary, --setup reconfigures the LLM connection.
 func runCLI(argv []string) int {
 	cwd, _ := os.Getwd()
 	resumeID, prompt := "", ""
-	resume, oneshot, rebuild := false, false, false
+	resume, oneshot, rebuild, list, autopilot := false, false, false, false, false
 	for i := 0; i < len(argv); i++ {
 		switch argv[i] {
 		case "--cwd":
@@ -105,6 +110,10 @@ func runCLI(argv []string) int {
 			prompt, oneshot = argv[i], true
 		case "--rebuild":
 			rebuild = true
+		case "--list":
+			list = true
+		case "--autopilot":
+			autopilot = true
 		case "--help", "-h":
 			fmt.Print(cliUsage)
 			return 0
@@ -119,6 +128,12 @@ func runCLI(argv []string) int {
 		return 2
 	}
 	cwd = abs
+
+	// Sessions are plain files under the project, readable from the host as
+	// well as the container, so --list needs neither the container nor the agent.
+	if list {
+		return printSessionList(os.Stdout, cwd)
+	}
 
 	// Before anything is opened: an update installed here replaces this binary
 	// and re-executes, and there is no session, log or container yet to lose.
@@ -140,6 +155,9 @@ func runCLI(argv []string) int {
 			if resumeID != "" {
 				inner = append(inner, resumeID)
 			}
+		}
+		if autopilot {
+			inner = append(inner, "--autopilot")
 		}
 		if oneshot {
 			inner = append(inner, "-p", prompt)
@@ -168,7 +186,11 @@ func runCLI(argv []string) int {
 	agentIn, clientOut := io.Pipe()
 	clientIn, agentOut := io.Pipe()
 
-	a := &agent{sessions: make(map[string]*Session), mode: "Interactive", standalone: true}
+	mode := "Interactive"
+	if autopilot {
+		mode = "Autopilot"
+	}
+	a := &agent{sessions: make(map[string]*Session), mode: mode, standalone: true}
 	acp := NewAgentSideConnection(a, agentOut, agentIn)
 	a.conn = acp
 
@@ -206,6 +228,24 @@ func runCLI(argv []string) int {
 	code := c.run(resume, resumeID, prompt, oneshot)
 	shutdown()
 	return code
+}
+
+// printSessionList writes this directory's stored session IDs, newest first,
+// one per line with the last-update time, for picking an ID for --resume.
+func printSessionList(w io.Writer, cwd string) int {
+	sessions, err := listSessions(cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "listing sessions: %v\n", err)
+		return 1
+	}
+	if len(sessions) == 0 {
+		fmt.Fprintln(os.Stderr, "no stored sessions for "+cwd)
+		return 0
+	}
+	for _, s := range sessions {
+		fmt.Fprintf(w, "%s  %s\n", s.SessionId, s.UpdatedAt)
+	}
+	return 0
 }
 
 // stdinIsTTY reports whether input comes from a terminal rather than a pipe or
