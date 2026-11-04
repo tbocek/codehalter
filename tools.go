@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,10 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 )
-
-// ---------------------------------------------------------------------------
-// Path security
-// ---------------------------------------------------------------------------
 
 func (a *agent) resolvePath(sid string, path string) (string, error) {
 	sess := a.getSession(sid)
@@ -32,10 +30,8 @@ func (a *agent) resolvePath(sid string, path string) (string, error) {
 		final = filepath.Clean(path)
 	} else {
 		final = filepath.Clean(filepath.Join(sess.Cwd, path))
-		// LLMs sometimes write absolute-looking paths with a missing leading "/"
-		// (e.g. `workspaces/preveltekit/go.mod` when cwd is /workspaces/preveltekit).
-		// If the cwd-joined interpretation doesn't exist on disk but the "/"-
-		// prepended one does and stays inside cwd, prefer that.
+		// Models sometimes drop the leading "/" of an absolute path; prefer that
+		// reading when only it exists and stays inside cwd.
 		if _, err := os.Stat(final); err != nil {
 			abs := filepath.Clean("/" + path)
 			if abs != final && inside(abs) {
@@ -48,20 +44,16 @@ func (a *agent) resolvePath(sid string, path string) (string, error) {
 	if !inside(final) {
 		return "", fmt.Errorf("path %q is outside project directory", path)
 	}
-	// inside() above is a string-prefix test, which a symlink LIVING under cwd but
-	// TARGETING outside it would defeat (e.g. `ln -s /etc cwd/x` then read x/passwd).
-	// Re-check after resolving symlinks on the path's deepest existing ancestor.
+	// inside() is a string-prefix test, which an in-tree symlink to an
+	// out-of-tree target would defeat.
 	if !realInside(final, sess.Cwd) {
 		return "", fmt.Errorf("path %q resolves through a symlink outside the project directory", path)
 	}
 	return final, nil
 }
 
-// realInside reports whether p stays within cwd after symlink resolution. It
-// resolves the deepest EXISTING ancestor of p (a write target may not exist yet,
-// and a not-yet-created tail can't itself be a symlink) and re-checks the prefix
-// against the resolved cwd, so an in-tree symlink to an out-of-tree target is
-// rejected while a symlink to another in-tree path still works.
+// realInside resolves the deepest existing ancestor of p, since a write target
+// may not exist yet.
 func realInside(p, cwd string) bool {
 	rcwd, err := filepath.EvalSymlinks(cwd)
 	if err != nil {
@@ -75,174 +67,122 @@ func realInside(p, cwd string) bool {
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return false // walked to the root with nothing resolvable
+			return false
 		}
 		dir = parent
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Tool registry
-// ---------------------------------------------------------------------------
-
 type Tool struct {
 	Def map[string]any
-	// Execute returns the tool's output and a `failed` flag. `failed` is the
-	// authoritative signal that the underlying operation reported a hard
-	// failure (e.g. run_task observed a non-zero exit). It's surfaced as
-	// ToolUse.Failed so the subtask orchestrator can override an LLM
-	// "success=true" when codehalter itself saw the call fail. Most handlers
-	// return (output, false); run_task and similar truth-bearing tools set
-	// failed=true on a non-zero exit. edit_file/write_file also set it on a usage
-	// error to feed the loop's fail cap — but runExecutePhase's verdict excludes
-	// file-mutation tools, so a recovered edit doesn't condemn the subtask.
+	// Execute's failed flag becomes ToolUse.Failed and overrides the model's own
+	// "success"; edit_file/write_file also set it on usage errors for the fail cap.
 	Execute func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
 }
 
-// phasePolicy is a phase's per-call rules, enforced at DISPATCH instead of by
-// pruning the tools array — so the array stays a byte-identical superset across
-// phases (only MCP reconcile changes it) and the KV-cache prefix survives
-// plan↔execute↔document. deny rejects a call with a teaching message; terminals
-// are the tools whose call ends the loop (a phase may have several — execute
-// exits on respond OR submit_plan).
+// phasePolicy is enforced at dispatch, not by pruning the tools array, so the
+// array stays byte-identical across phases and the KV-cache prefix survives.
 type phasePolicy struct {
 	deny      map[string]bool
 	terminals map[string]bool
+	// proseEnds: a reply without a tool call is a valid exit (the documenter).
+	// Otherwise it gets one contract nudge (see contractNudge).
+	proseEnds bool
 }
 
-func (p phasePolicy) isDenied(name string) bool   { return p.deny[name] }
-func (p phasePolicy) isTerminal(name string) bool { return p.terminals[name] }
-func (p phasePolicy) hasTerminal() bool           { return len(p.terminals) > 0 }
-
-// terminalList renders the phase's terminal tools for a model-facing nudge,
-// e.g. "`respond` or `submit_plan`". Sorted for a stable message.
-func terminalList(p phasePolicy) string {
-	names := make([]string, 0, len(p.terminals))
-	for n := range p.terminals {
+// contractNudge is the one corrective for a reply that missed its phase's exit:
+// servers that ignore tool_choice (Ollama) let a small model answer in prose.
+func contractNudge(policy phasePolicy, text string) string {
+	var names []string
+	for n := range policy.terminals {
 		names = append(names, "`"+n+"`")
 	}
 	sort.Strings(names)
-	return strings.Join(names, " or ")
+	what := "Your reply ended without a tool call"
+	if strings.TrimSpace(text) == "" {
+		what = "Your reply had no tool call and no visible text (your reasoning is never shown)"
+	}
+	return fmt.Sprintf("%s, and nothing outside a tool call reaches the user. Call %s if the step is done, or the tool for the next step.", what, strings.Join(names, " or "))
 }
 
-// denyHint tells the model what to do instead of a forbidden tool, per phase.
-func denyHint(phase string) string {
-	switch phase {
-	case "plan":
-		return "planning is read-only; describe this change as a subtask in submit_plan and the executor will make it."
-	case "document":
-		return "the documentation phase only wraps up — write the note and stop, don't re-plan."
-	default:
-		return "it isn't allowed here; continue without it."
+func toolName(t Tool) string {
+	fn, _ := t.Def["function"].(map[string]any)
+	name, _ := fn["name"].(string)
+	return name
+}
+
+// The zero value holds the built-ins (seedLocked); add replaces an existing name.
+type toolRegistry struct {
+	mu    sync.Mutex
+	tools map[string]Tool
+}
+
+func (r *toolRegistry) seedLocked() {
+	if r.tools != nil {
+		return
+	}
+	r.tools = make(map[string]Tool)
+	// run_command/run_background/run_server come from discovery and MCP tools from the
+	// reconciler, both through add.
+	builtin := slices.Concat(fileTools, webTools, []Tool{
+		askUserTool, submitPlanTool, respondTool,
+		screenshotTool, viewImageTool,
+	})
+	for _, t := range builtin {
+		r.tools[toolName(t)] = t
 	}
 }
 
-// registryMu guards registeredTools. Most writes happen at init() (single
-// goroutine), but the MCP reconciler mutates the registry mid-session — both
-// on startup (parallel server bring-up) and at every turn boundary
-// (diff-and-apply after mcp.toml changed). Reconciles are ordered against
-// turns, never inside one, but they run on their own goroutine and ACP can
-// deliver SessionUpdate to other sessions concurrently, so the lock is
-// mandatory.
-var (
-	registryMu      sync.Mutex
-	registeredTools []Tool
-)
-
-func RegisterTool(t Tool) {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	registeredTools = append(registeredTools, t)
+func (r *toolRegistry) add(ts ...Tool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seedLocked()
+	for _, t := range ts {
+		r.tools[toolName(t)] = t
+	}
 }
 
-// UnregisterToolsByPrefix removes every tool whose function name starts with
-// the given prefix. Used by the MCP reconciler to drop a server's tools when
-// it shuts down or its config changes. Returns the number removed.
-func UnregisterToolsByPrefix(prefix string) int {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	kept := registeredTools[:0]
-	removed := 0
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
+func (r *toolRegistry) removePrefix(prefix string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seedLocked()
+	for name := range r.tools {
 		if strings.HasPrefix(name, prefix) {
-			removed++
-			continue
-		}
-		kept = append(kept, t)
-	}
-	// Zero the tail so closed-over goroutines (e.g. an in-flight tools/call)
-	// don't keep the old Execute closure alive through this slice.
-	for i := len(kept); i < len(registeredTools); i++ {
-		registeredTools[i] = Tool{}
-	}
-	registeredTools = kept
-	return removed
-}
-
-// hasToolPrefix reports whether any registered tool starts with the prefix.
-// Used by the MCP reconciler to detect leftover registrations.
-func hasToolPrefix(prefix string) bool {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		if strings.HasPrefix(name, prefix) {
-			return true
+			delete(r.tools, name)
 		}
 	}
-	return false
 }
 
-// llmAllToolDefinitions returns EVERY registered tool, sorted by name. Phases no
-// longer prune this — restriction is enforced at dispatch via phasePolicy — so
-// the rendered `tools` block is byte-identical across plan/execute/document and
-// the KV-cache prefix is never invalidated by a phase change (only an MCP
-// reconcile, which re-registers tools, alters it).
-func llmAllToolDefinitions() []map[string]any {
-	registryMu.Lock()
-	defer registryMu.Unlock()
-	type named struct {
-		name string
-		def  map[string]any
+func (r *toolRegistry) lookup(name string) (t Tool, ok bool, names []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seedLocked()
+	if t, ok = r.tools[name]; !ok {
+		names = slices.Sorted(maps.Keys(r.tools))
 	}
-	var got []named
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		got = append(got, named{name, t.Def})
-	}
-	// Sort by tool name so the rendered `tools` block is byte-identical
-	// turn-over-turn regardless of registration order. The MCP reconciler
-	// re-adds server tools in a non-deterministic order; without this, that
-	// reorders the tool list every reconcile, changing the prompt prefix and
-	// busting the LLM's KV cache (full reprocess) — same rule as message bytes.
-	sort.Slice(got, func(i, j int) bool { return got[i].name < got[j].name })
-	defs := make([]map[string]any, len(got))
-	for i, g := range got {
-		defs[i] = g.def
+	return t, ok, names
+}
+
+// defs is sorted by name so the tools block stays byte-identical across phases
+// and turns regardless of add order; any change would bust the KV cache.
+func (r *toolRegistry) defs() []map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seedLocked()
+	names := slices.Sorted(maps.Keys(r.tools))
+	defs := make([]map[string]any, len(names))
+	for i, n := range names {
+		defs[i] = r.tools[n].Def
 	}
 	return defs
 }
 
-// toolArgs is one decoded tool-call argument object.
-//
-// It decodes into map[string]any, NOT map[string]string, because our own tool
-// schemas declare non-string types: read_file's `line`/`limit` are integers,
-// search_text's `regex`/`multiline` are booleans, web_read's `offset`/`limit`
-// are integers. A model that obeys the schema sends `{"line": 42}` — a JSON
-// number — and decoding that into map[string]string fails the whole object with
-// a type error while leaving the offending key set to "". The tool then read
-// from line 1 and reported success, with the only trace a debug log. Keeping the
-// values as `any` and coercing per-key at the point of use is what makes the
-// schema and the decoder agree.
+// toolArgs is map[string]any because the schemas declare ints and bools, and
+// decoding those into map[string]string fails the whole object.
 type toolArgs map[string]any
 
-// parseArgs decodes a tool call's raw JSON arguments. A malformed payload
-// yields an empty (non-nil) map; each tool's own validation reports the missing
-// parameter, which is a better message than a JSON parse error.
+// parseArgs never returns nil; on malformed JSON each tool's own validation
+// reports the missing parameter.
 func parseArgs(rawArgs string) toolArgs {
 	var args toolArgs
 	if err := json.Unmarshal([]byte(rawArgs), &args); err != nil {
@@ -254,18 +194,107 @@ func parseArgs(rawArgs string) toolArgs {
 	return args
 }
 
-// str returns a string-typed argument, or "" when it's absent or some other
-// JSON type. Deliberately does NOT stringify a number or bool: for the keys that
-// carry file content (write_file's `content`, edit_file's `old_text`/`new_text`)
-// a coerced value would clobber a file, so callers pair this with wrongType.
+// fitArgs decodes an argument the tool's schema declares an array or an object but that came as a
+// string holding one: `"edits": "[{...}]"` for `"edits": [{...}]`. Models send that now and then,
+// and a tool then took a list for a missing field (a read answered "is a directory"). Only a
+// string that decodes WHOLE to the declared type is replaced, at any depth the schema describes; a
+// string that is not one stays a string, so a value meant as text is never reinterpreted and a
+// tool can still say what is wrong with it. The arguments come back unchanged, byte for byte, when
+// nothing was replaced.
+func fitArgs(def map[string]any, raw string) string {
+	fn, _ := def["function"].(map[string]any)
+	schema, _ := fn["parameters"].(map[string]any)
+	var args map[string]any
+	if schema == nil || json.Unmarshal([]byte(raw), &args) != nil {
+		return raw
+	}
+	if !fitObject(schema, args) {
+		return raw
+	}
+	b, err := json.Marshal(args)
+	if err != nil {
+		return raw
+	}
+	return string(b)
+}
+
+// fitObject fits obj's properties to schema in place and says whether any was replaced.
+func fitObject(schema, obj map[string]any) bool {
+	props, _ := schema["properties"].(map[string]any)
+	changed := false
+	for key, v := range obj {
+		if p, ok := props[key].(map[string]any); ok {
+			if fitted, ok := fitValue(p, v); ok {
+				obj[key], changed = fitted, true
+			}
+		}
+	}
+	return changed
+}
+
+// fitValue returns v fitted to schema, and whether anything in it was replaced.
+func fitValue(schema map[string]any, v any) (any, bool) {
+	changed := false
+	if str, ok := v.(string); ok && !schemaAllows(schema, "string") {
+		var decoded any
+		if json.Unmarshal([]byte(str), &decoded) != nil {
+			return v, false
+		}
+		switch decoded.(type) {
+		case []any:
+			if !schemaAllows(schema, "array") {
+				return v, false
+			}
+		case map[string]any:
+			if !schemaAllows(schema, "object") {
+				return v, false
+			}
+		default:
+			return v, false
+		}
+		v, changed = decoded, true
+	}
+	switch t := v.(type) {
+	case []any:
+		if items, ok := schema["items"].(map[string]any); ok {
+			for i, item := range t {
+				if fitted, ok := fitValue(items, item); ok {
+					t[i], changed = fitted, true
+				}
+			}
+		}
+	case map[string]any:
+		if fitObject(schema, t) {
+			changed = true
+		}
+	}
+	return v, changed
+}
+
+// schemaAllows says whether schema's `type` (one name or a list of them) includes typ. A schema
+// with no type allows anything, so nothing in it is taken for JSON.
+func schemaAllows(schema map[string]any, typ string) bool {
+	switch t := schema["type"].(type) {
+	case string:
+		return t == typ
+	case []any:
+		for _, name := range t {
+			if name == typ {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// str does not stringify numbers or bools: for file-content keys a coerced value
+// would clobber the file, so callers pair it with wrongType.
 func (a toolArgs) str(key string) string {
 	s, _ := a[key].(string)
 	return s
 }
 
-// wrongType reports whether `key` is present with a JSON type other than string.
-// write_file / edit_file reject the call on this rather than writing a
-// zero-byte file and reporting success.
 func (a toolArgs) wrongType(key string) bool {
 	v, ok := a[key]
 	if !ok {
@@ -275,9 +304,7 @@ func (a toolArgs) wrongType(key string) bool {
 	return !isStr
 }
 
-// num returns an integer argument. Accepts both the schema-correct JSON number
-// and a quoted digit string, since models emit either; ok is false when the key
-// is absent or holds neither, so callers can tell "omitted" from "passed 0".
+// num also accepts a quoted digit string, since models send either.
 func (a toolArgs) num(key string) (int, bool) {
 	switch v := a[key].(type) {
 	case float64:
@@ -289,8 +316,6 @@ func (a toolArgs) num(key string) (int, bool) {
 	return 0, false
 }
 
-// flag returns a boolean argument, accepting the JSON literal `true` and the
-// string "true" alike. Anything else, including absence, is false.
 func (a toolArgs) flag(key string) bool {
 	switch v := a[key].(type) {
 	case bool:
@@ -301,159 +326,142 @@ func (a toolArgs) flag(key string) bool {
 	return false
 }
 
-// has reports whether the key was supplied at all, whatever its type. Used
-// where the presence of an argument changes behaviour independently of its
-// value (web_read treats any `limit` as a range request).
 func (a toolArgs) has(key string) bool {
 	_, ok := a[key]
 	return ok
 }
 
-func (a *agent) executeTool(ctx context.Context, sid string, tc toolCall) (string, bool) {
-	slog.Info("executeTool", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
-
-	// Find the tool under the lock and capture just its Execute closure, so the
-	// call runs WITHOUT the lock held: Execute may take seconds (bash commands,
-	// LLM subagents) and must not block concurrent registration. Capturing the
-	// func value (not a slice index) keeps it callable even if the registry is
-	// rebuilt afterward. On a miss the scan collects the names to report.
-	registryMu.Lock()
-	var run func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool)
-	var names []string
-	for _, t := range registeredTools {
-		fn, _ := t.Def["function"].(map[string]any)
-		name, _ := fn["name"].(string)
-		if name == tc.Function.Name {
-			run = t.Execute
-			break
-		}
-		if name != "" {
-			names = append(names, name)
-		}
-	}
-	registryMu.Unlock()
-
-	if run != nil {
-		return run(ctx, a, sid, tc.Function.Arguments)
-	}
-	// Listed names go back to the model as the tool result, so it can
-	// self-correct on the next turn instead of looping on the same hallucination.
-	return fmt.Sprintf("unknown tool %q. Use only the tools provided to you; available tools: %s",
-		tc.Function.Name, strings.Join(names, ", ")), false
-}
-
-// ---------------------------------------------------------------------------
-// Tool call UI
-// ---------------------------------------------------------------------------
-
 var toolCallCounter atomic.Uint64
 
-func nextToolCallID() string {
-	return fmt.Sprintf("tc_%d", toolCallCounter.Add(1))
-}
-
-// toolUseCounter assigns each recorded ToolUse a stable per-process handle so
-// view_output can address it later without re-running the original tool.
-// Process-global rather than session-scoped — search is already scoped to one
-// session, and a single counter is simpler than tracking last-seen IDs per
-// session across restarts (where the counter resets but historical IDs in
-// session TOML survive — view_output handles "id not found" cleanly).
+// toolUseCounter ids are also the wire id when the model sends no tool_call id
+// of its own (see ToolUse.CallID).
 var toolUseCounter atomic.Uint64
 
-func nextToolUseID() string {
-	return fmt.Sprintf("tu_%d", toolUseCounter.Add(1))
+func (a *agent) recordToolUse(sid string, tc toolCall, tu ToolUse) ToolUse {
+	tu.ID = fmt.Sprintf("tu_%d", toolUseCounter.Add(1))
+	tu.CallID = tc.ID // replayed verbatim from history
+	tu.Name = tc.Function.Name
+	tu.Input = tc.Function.Arguments
+	if sess := a.getSession(sid); sess != nil {
+		sess.AppendToolUse(tu)
+		sess.saveOrLog()
+	}
+	return tu
 }
 
-// runToolCall executes one tool call and returns (a) the ToolUse recording its
-// FULL output and (b) the model-visible content. The full output is cached here
-// (in the session, saved to disk) so view_output can re-serve any portion
-// without re-running the tool; the message stream only ever carries the
-// model-visible copy. That copy is the output shrunk past truncateThreshold with
-// a view_output hint — or, for view_image, the inline multimodal parts. The
-// caller appends the returned ToolUse to its result set and the content to the
-// message stream. Truncation lives here, not in individual tools, so every tool
-// returns its complete output and this one place decides "small → whole, big →
-// truncate + cache the rest".
+// runToolCall records the FULL output in the ToolUse and returns the
+// model-visible content: truncated text, or multimodal parts.
 func (a *agent) runToolCall(ctx context.Context, sid string, tc toolCall) (ToolUse, any) {
+	slog.Info("runToolCall", "tool", tc.Function.Name, "sid", sid, "args", tc.Function.Arguments)
 	started := time.Now()
+	ctx = withToolName(ctx, tc.Function.Name)
+	// The tool runs on arguments fitted to its schema; the history keeps what the model sent, so
+	// the wire bytes of the call never change.
+	args := tc.Function.Arguments
+	if t, ok, _ := a.tools.lookup(tc.Function.Name); ok {
+		if fitted := fitArgs(t.Def, args); fitted != args {
+			slog.Debug("runToolCall: a string argument decoded to the JSON its schema declares", "tool", tc.Function.Name, "args", fitted)
+			args = fitted
+		}
+	}
 
-	// Image short-circuit: when the server supports images, deliver the bytes
-	// as multimodal tool content in the SAME turn (so the next llmStream call
-	// sees the image). The standard executeTool path returns text only. When
-	// it does NOT support images these fall through to executeTool, whose
-	// fallback says so instead of pretending bytes were delivered.
+	// With image support, view_image and screenshot bypass the registry to
+	// return multimodal parts in the same turn; the registered tools are text only.
 	var result string
 	var failed bool
 	var multimodal any
-	var imageID string
+	var imageID, sameImage string
 	switch {
-	case tc.Function.Name == "view_image" && a.imagesSupported:
-		text, parts, ferr := dispatchViewImage(a.getSession(sid), tc.Function.Arguments)
+	case tc.Function.Name == "view_image" && a.imagesSupported.Load():
+		text, parts, ferr := dispatchViewImage(a.getSession(sid), args)
 		result, failed = text, ferr
 		if !ferr {
 			multimodal = parts
 		}
-	case tc.Function.Name == "screenshot" && a.imagesSupported:
-		text, parts, id, ferr := dispatchScreenshot(ctx, a, sid, tc.Function.Arguments)
+	case tc.Function.Name == "screenshot" && a.imagesSupported.Load():
+		text, parts, id, ferr := dispatchScreenshot(ctx, a, sid, args)
 		result, failed = text, ferr
-		if !ferr {
+		switch sess := a.getSession(sid); {
+		case ferr:
+		case sess != nil && sess.imageInView(id):
+			// The same pixels are already in view: a note, not a second copy.
+			result, sameImage = fmt.Sprintf("[This picture of %s is the same as %s, which is already in your view above, so it is not attached again: nothing on it changed since.]", parseArgs(args).str("path"), id), id
+		default:
 			multimodal, imageID = parts, id
 		}
 	default:
-		result, failed = a.executeTool(ctx, sid, tc)
+		// Execute outside the registry lock: a slow tool must not block the MCP
+		// reconciler.
+		mayRender := tc.Function.Name == "run_command" && a.imagesSupported.Load()
+		if mayRender && strings.Contains(parseArgs(args).str("command"), "snapshot") {
+			time.Sleep(mtimeTick)
+		}
+		if t, ok, names := a.tools.lookup(tc.Function.Name); ok {
+			result, failed = t.Execute(ctx, a, sid, args)
+		} else {
+			result = fmt.Sprintf("unknown tool %q. Use only the tools provided to you; available tools: %s",
+				tc.Function.Name, strings.Join(names, ", "))
+		}
+		// Attach the rendered screen: the executor rarely calls screenshot on
+		// its own.
+		if mayRender && !failed {
+			switch text, parts, id, same := a.attachRenderedScreen(ctx, sid, args, result, started); {
+			case id != "":
+				result, multimodal, imageID = text, parts, id
+			case same != "":
+				result, sameImage = text, same
+			}
+		}
 	}
 
-	useID := nextToolUseID()
-	tu := ToolUse{
-		ID:         useID,
-		CallID:     tc.ID, // the model's own tool_call id — replayed verbatim from history
-		Name:       tc.Function.Name,
-		Input:      tc.Function.Arguments,
-		Output:     result,
-		Failed:     failed,
-		StartedAt:  started,
-		DurationMs: time.Since(started).Milliseconds(),
-		ImageID:    imageID,
+	if multimodal == nil {
+		if sess := a.getSession(sid); sess != nil {
+			note, told := sess.batchHint(tc.Function.Name, args, failed)
+			if told != "" {
+				result += note
+				a.say(ctx, sid, told+"\n")
+			}
+		}
 	}
-	// Cache the full output (saved incrementally so it survives a crash) for view_output.
+
+	tu := a.recordToolUse(sid, tc, ToolUse{
+		Output:      result,
+		Failed:      failed,
+		StartedAt:   started,
+		DurationMs:  time.Since(started).Milliseconds(),
+		ImageID:     imageID,
+		SameImageAs: sameImage,
+	})
 	if sess := a.getSession(sid); sess != nil {
-		sess.AppendToolUse(tu)
-		sess.saveOrLog()
+		sess.addToolTime(tu.DurationMs)
 	}
-
 	if multimodal != nil {
 		return tu, multimodal
 	}
-	return tu, liveToolOutput(useID, tc.Function.Name, tc.Function.Arguments, result)
+	return tu, liveToolOutput(tc.Function.Name, args, result)
 }
 
-// denyToolCall rejects a policy-forbidden tool WITHOUT executing it: a failed
-// tool card + a recorded rejection so the model corrects. Failed is for the
-// record only — the caller doesn't feed it to the fail cap (the repetition
-// ladder catches genuine spamming).
+// denyToolCall rejects without executing. Failed is for the record only; the
+// caller does not feed it to the fail cap.
 func (a *agent) denyToolCall(ctx context.Context, sid, phase string, tc toolCall) (ToolUse, string) {
-	msg := fmt.Sprintf("error: %s is not available during the %s phase — %s", tc.Function.Name, phase, denyHint(phase))
-	tcId := a.StartToolCall(ctx, sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
+	// Say what to do instead: a bare refusal gets the same call again.
+	hint := "it isn't allowed here; continue without it."
+	switch phase {
+	case "plan":
+		hint = "planning is read-only; describe this change as a subtask in submit_plan and the executor will make it."
+	case "document":
+		hint = "the documentation phase only wraps up: write the note and stop, don't re-plan."
+	}
+	msg := fmt.Sprintf("error: %s is not available during the %s phase: %s", tc.Function.Name, phase, hint)
+	tcId := a.StartToolCall(withToolName(ctx, tc.Function.Name), sid, tc.Function.Name+" (not allowed this phase)", "tool", nil)
 	a.FailToolCall(ctx, sid, tcId, msg)
-	tu := ToolUse{
-		ID:        nextToolUseID(),
-		CallID:    tc.ID,
-		Name:      tc.Function.Name,
-		Input:     tc.Function.Arguments,
-		Output:    msg,
-		Failed:    true,
-		StartedAt: time.Now(),
-	}
-	if sess := a.getSession(sid); sess != nil {
-		sess.AppendToolUse(tu)
-		sess.saveOrLog()
-	}
-	return tu, msg
+	return a.recordToolUse(sid, tc, ToolUse{Output: msg, Failed: true, StartedAt: time.Now()}), msg
 }
 
 type toolCallUpdate struct {
 	Kind       string             `json:"sessionUpdate"`
 	ToolCallId string             `json:"toolCallId"`
+	Name       string             `json:"name,omitempty"` // the tool the model called, beside the card's title
 	Title      string             `json:"title,omitempty"`
 	ToolKind   string             `json:"kind,omitempty"`
 	Status     string             `json:"status,omitempty"`
@@ -484,19 +492,20 @@ func DiffContent(path string, oldText *string, newText string) ToolCallContent {
 	return ToolCallContent{Type: "diff", Path: path, OldText: oldText, NewText: newText}
 }
 
-// TerminalContent embeds a terminal created with terminal/create into a tool
-// call, so the client renders its output live instead of us relaying it as
-// message chunks. Must be sent before terminal/release; the client keeps
-// showing the output afterwards.
-func TerminalContent(terminalId string) ToolCallContent {
-	return ToolCallContent{Type: "terminal", TerminalId: terminalId}
+type toolNameKey struct{}
+
+// withToolName carries the called tool to the cards its execution opens, which do not know it.
+func withToolName(ctx context.Context, name string) context.Context {
+	return context.WithValue(ctx, toolNameKey{}, name)
 }
 
 func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind string, locations []ToolCallLocation) string {
-	id := nextToolCallID()
+	id := fmt.Sprintf("tc_%d", toolCallCounter.Add(1))
+	name, _ := ctx.Value(toolNameKey{}).(string)
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call",
 		ToolCallId: id,
+		Name:       name,
 		Title:      title,
 		ToolKind:   kind,
 		Status:     "in_progress",
@@ -507,18 +516,9 @@ func (a *agent) StartToolCall(ctx context.Context, sid string, title, kind strin
 }
 
 func (a *agent) CompleteToolCall(ctx context.Context, sid string, id string, content []ToolCallContent) {
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: id,
-		Status:     "completed",
-		Content:    content,
-	})
+	a.CompleteToolCallTitled(ctx, sid, id, "", content)
 }
 
-// CompleteToolCallTitled is like CompleteToolCall but also overwrites the
-// tool-call's title. Use this to surface a result preview in the panel
-// without requiring the user to expand the disclosure (e.g. change
-// "go_symbols: Foo" → "go_symbols: Foo → router.go:27 (+1)").
 func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, title string, content []ToolCallContent) {
 	a.sendUpdate(ctx, sid, toolCallUpdate{
 		Kind:       "tool_call_update",
@@ -526,6 +526,17 @@ func (a *agent) CompleteToolCallTitled(ctx context.Context, sid string, id, titl
 		Title:      title,
 		Status:     "completed",
 		Content:    content,
+	})
+}
+
+// retitleToolCall sends no content: content would replace a card's live
+// terminal view with a static copy.
+func (a *agent) retitleToolCall(ctx context.Context, sid, id, title, status string) {
+	a.sendUpdate(ctx, sid, toolCallUpdate{
+		Kind:       "tool_call_update",
+		ToolCallId: id,
+		Title:      title,
+		Status:     status,
 	})
 }
 
@@ -538,102 +549,76 @@ func (a *agent) FailToolCall(ctx context.Context, sid string, id, errMsg string)
 	})
 }
 
-// Truncation thresholds for tool output going BACK to the LLM. Anything at or
-// under truncateThreshold passes through untouched — head/tail+marker would
-// cost more than the original content. Larger results are replaced with the
-// first truncateHeadChars + a per-tool search hint + the last truncateTailChars
-// so the cumulative prefix the model re-processes each turn stays small. The
-// full output is still preserved in ToolUse.Output on disk; only the
-// in-flight LLM message stream is shortened.
+// Tool output going back to the LLM is clipped to head + hint + tail; the full
+// output stays in ToolUse.Output.
 const (
 	truncateThreshold = 1500
 	truncateHeadChars = 600
 	truncateTailChars = 600
-	// liveExemptCap bounds the LIVE output of the truncation-exempt tools. They
-	// self-bound by COUNT (150-line chunk / 100 matches) but not by bytes — a
-	// minified file or long-line matches could blow n_ctx. ~32 KB (20× the history
-	// clip) is plenty to act on; clipped at a line boundary, never mid-line.
+	// liveExemptCap: the exempt tools bound by count, not bytes, so a minified
+	// file could still blow n_ctx.
 	liveExemptCap = 32 * 1024
 )
 
-// liveToolOutput is the model-visible content for a tool call. The content-
-// retrieval tools (read_file/continue_read/search_text + web_search/web_read/
-// web_read_raw) pass through whole (up to the line-aware liveExemptCap); every
-// other tool gets the 1.5 KB head/tail cap. history.go re-renders stored outputs
-// through THIS same function, so a replay is byte-identical to the live wire
-// (cache-warm) — re-sending a cached full read is free, whereas clipping it would
-// change the bytes and force a reprocess. n_ctx is bounded by compaction instead.
-func liveToolOutput(useID, toolName, args, content string) string {
+// liveToolOutput is also how history.go re-renders stored outputs, so a replay
+// is byte-identical to the live wire. read_file, search and continue_read stay listed
+// for old sessions, which hold their calls.
+func liveToolOutput(toolName, args, content string) string {
 	switch toolName {
-	case "read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw":
+	case "run_command":
+		// A shell read clipped to 600 + 600 chars was re-read 60% of the time, one
+		// window at a time. It gets read_file's allowance, still start and end.
+		if onlyReads(parseArgs(args).str("command")) {
+			return clipMiddle(toolName, args, content, liveExemptCap, liveExemptCap/4)
+		}
+	case "read_file", "search", "continue_read", "web_search", "web_read":
 		if len(content) <= liveExemptCap {
 			return content
 		}
-		// Line-aware clip: keep whole lines up to the cap, then a pointer to
-		// the cached full output. Falls back to a hard byte cut only if there's
-		// no newline in the kept span (a single mega-line).
 		cut := strings.LastIndexByte(content[:liveExemptCap], '\n')
 		if cut <= 0 {
 			cut = liveExemptCap
 		}
 		return fmt.Sprintf("%s\n\n[... %d of %d chars omitted (oversized output capped at %d KB). %s]",
-			content[:cut], len(content)-cut, len(content), liveExemptCap/1024, truncationHint(useID, toolName, args))
+			content[:cut], len(content)-cut, len(content), liveExemptCap/1024, truncationHint(toolName, args))
 	}
-	return truncateForLLM(useID, toolName, args, content)
+	return truncateForLLM(toolName, args, content)
 }
 
-// truncateForLLM returns content unchanged if short; otherwise emits a
-// head/tail-shaped slice with a per-tool "to see more" hint in the middle.
-// useID is the ToolUse handle the caller just assigned — embedded in the hint
-// so the model can `view_output id=useID mode=grep pattern=…` to retrieve any
-// portion of the original without re-running the underlying tool. toolName +
-// args let the hint name the exact alternate follow-up call (e.g. read_file
-// path+line, web_read url+offset) so the model doesn't have to reconstruct what
-// it just asked about. Applied by liveToolOutput to the non-exempt tools (live
-// and on history re-render alike).
-func truncateForLLM(useID, toolName, args, content string) string {
+func truncateForLLM(toolName, args, content string) string {
 	if len(content) <= truncateThreshold {
 		return content
 	}
-	omitted := len(content) - truncateHeadChars - truncateTailChars
-	head := content[:truncateHeadChars]
-	tail := content[len(content)-truncateTailChars:]
-	hint := truncationHint(useID, toolName, args)
-	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", head, omitted, len(content), hint, tail)
+	return clipMiddle(toolName, args, content, truncateHeadChars+truncateTailChars, truncateHeadChars)
 }
 
-// truncationHint returns the per-tool "to see more" pointer. Every hint
-// includes a `view_output id=<useID>` path that retrieves any portion of the
-// FULL cached output without re-running the underlying tool — critical for
-// `run_task` / `run_command` where re-running is slow or non-idempotent.
-// Tools with cheap, idempotent re-invocation paths (read_file with a different
-// line range, web_read with offset/limit) also keep that alternate hint
-// because slicing on the caller's terms is sometimes more useful than
-// grepping. parseArgs is best-effort — when args don't contain a useful key
-// the alternate-call suggestion is dropped and only view_output remains.
-func truncationHint(useID, toolName, args string) string {
+// clipMiddle keeps head bytes of the start and the rest of max from the end.
+func clipMiddle(toolName, args, content string, max, head int) string {
+	if len(content) <= max {
+		return content
+	}
+	tail := max - head
+	return fmt.Sprintf("%s\n\n[... %d of %d chars omitted. %s]\n\n%s", clipUTF8(content, head), len(content)-head-tail, len(content),
+		truncationHint(toolName, args), tailUTF8(content, tail))
+}
+
+// truncationHint: there is deliberately no tool that re-serves the cached full
+// output; advertising it cost more history than it saved.
+func truncationHint(toolName, args string) string {
 	a := parseArgs(args)
-	viewOut := fmt.Sprintf("call view_output id=%q mode=grep pattern=<regex> (or mode=head / mode=tail with lines=<n>) to retrieve the cached full output without re-running this tool", useID)
 	switch toolName {
-	case "web_read", "web_read_raw":
-		u := a["url"]
-		if u == "" {
-			return "To see more: " + viewOut + ", OR call this tool again with offset=<n> limit=<m> — the full body is cached server-side, so no re-fetch."
+	case "web_read":
+		if u := a["url"]; u != "" {
+			return fmt.Sprintf("To see more: call %s again with url=%q offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched.", toolName, u)
 		}
-		return fmt.Sprintf("To see more: %s, OR call %s again with url=%q offset=<n> limit=<m> — the full body is cached server-side, so no re-fetch.", viewOut, toolName, u)
-	case "run_command", "run_task":
-		return "To see more: " + viewOut + ". Do NOT re-run the command just to see more output — view_output reads the cached result."
-	case "list_files":
-		path := a["path"]
-		if path == "" {
-			return "To see more: " + viewOut + ", OR call list_files on a deeper subdirectory."
-		}
-		return fmt.Sprintf("To see more: %s, OR call list_files on a subdirectory of %q.", viewOut, path)
-	case "search_text":
-		return "To see more: " + viewOut + ", OR re-run search_text with a more specific pattern or narrower path."
+		return "To see more: call this tool again with offset=<n> limit=<m>. The full body is cached, so nothing is re-fetched."
+	case "run_command":
+		return "To see more: re-run it with the output narrowed by `grep <pattern>`, or redirect it to a file and read the part you need (`sed -n '120,180p' <file>`). Do not pipe to head or tail: the cap already keeps the start and the end. If re-running is slow or has side effects, redirect to a file the FIRST time."
 	case "web_search":
-		return "To see more: " + viewOut + ", OR refine the query (fewer, more specific terms) and search again — then web_read the most promising result for its full text."
+		return "To see more: refine the query (fewer, more specific terms) and search again, then web_read the most promising result."
+	case "search":
+		return "To see more: narrow `pattern`, `path` or `glob`, or lower `context`, and search again."
 	default:
-		return "To see more: " + viewOut + "."
+		return "To see more: call the tool again with narrower arguments."
 	}
 }

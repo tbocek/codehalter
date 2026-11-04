@@ -1,0 +1,1 @@
+In inv/inv.go change the Format doc comment example to use 5678 and "56.78 €", and make the separator a comma: 56,78 €. Update the test.

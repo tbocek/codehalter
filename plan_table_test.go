@@ -5,16 +5,13 @@ import (
 	"testing"
 )
 
-// planArgs is a realistic submit_plan argument payload: a pipe inside a shell
-// command, a newline inside a description, and a verify list on every subtask.
+// planArgs has a pipe in a command, a newline in a description and a verify list per subtask.
 const planArgs = `{"clear":true,"subtasks":[` +
 	`{"description":"Add humanBytes to prompt.go","verify":["go build ./...","gofmt -l ."]},` +
 	`{"description":"Count rows with grep -c x | wc -l","verify":["go vet ./..."]},` +
 	`{"description":"Wrap up\nsecond line","verify":[]}` +
 	`],"report_only":false}`
 
-// feedAll replays args one byte at a time, the worst case for the partial
-// parser, and returns everything the table emitted.
 func feedAll(t *testing.T, args string, chunk int) string {
 	t.Helper()
 	var out strings.Builder
@@ -30,9 +27,7 @@ func feedAll(t *testing.T, args string, chunk int) string {
 }
 
 func TestPlanTableStreamsSameRowsAtAnyChunkSize(t *testing.T) {
-	// The whole point of holding the tail back is that chunking must not change
-	// the result: llama.cpp delivers ~4 chars a chunk, vLLM delivers almost all
-	// of it at once, and both must render identically.
+	// llama.cpp streams a few chars a chunk, vLLM nearly everything at once.
 	want := feedAll(t, planArgs, len(planArgs))
 	for _, chunk := range []int{1, 3, 17, 64} {
 		if got := feedAll(t, planArgs, chunk); got != want {
@@ -58,7 +53,6 @@ func TestPlanTableEscapesCellsSoRowsCannotSplit(t *testing.T) {
 	if !strings.Contains(got, `go build ./...<br>gofmt -l .`) {
 		t.Errorf("verify steps should each get their own line:\n%s", got)
 	}
-	// Every emitted line must be a complete table row: same pipe count throughout.
 	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
 		if n := strings.Count(line, "|") - strings.Count(line, `\|`); n != 3 {
 			t.Errorf("line has %d structural pipes, want 3: %q", n, line)
@@ -67,8 +61,6 @@ func TestPlanTableEscapesCellsSoRowsCannotSplit(t *testing.T) {
 }
 
 func TestPlanTableHoldsTheTailUntilItsObjectCloses(t *testing.T) {
-	// Truncated mid-description: the two closed subtasks render, the third must
-	// not, because a row already sent can never be corrected.
 	cut := strings.Index(planArgs, `{"description":"Wrap up`) + 15
 	got := feedAll(t, planArgs[:cut], 1)
 	if strings.Contains(got, "Wrap up") {
@@ -80,8 +72,6 @@ func TestPlanTableHoldsTheTailUntilItsObjectCloses(t *testing.T) {
 }
 
 func TestPlanTableEmitsNothingWithoutSubtasks(t *testing.T) {
-	// The clarification path (clear=false) carries no subtasks, so no table and
-	// in particular no dangling header.
 	if got := feedAll(t, `{"clear":false,"question":"which one?","subtasks":[],"report_only":false}`, 1); got != "" {
 		t.Errorf("want no output, got %q", got)
 	}
@@ -108,8 +98,6 @@ func TestPlanCellKeepsLineStructureInsideOneRow(t *testing.T) {
 	if got := planCell("first line\nsecond line"); got != "first line<br>second line" {
 		t.Errorf("newline not turned into a break: %q", got)
 	}
-	// Whatever the input, a real line break must never reach the cell: one ends
-	// the table at that row and the rest of the plan renders as loose text.
 	for _, in := range []string{"a\nb", "a\r\nb", "a\n\n\n\nb", "\n\nlead", "trail\n\n"} {
 		if got := planCell(in); strings.ContainsAny(got, "\n\r") {
 			t.Errorf("planCell(%q) leaked a line break: %q", in, got)
@@ -121,22 +109,17 @@ func TestPlanCellKeepsLineStructureInsideOneRow(t *testing.T) {
 	if got := planCell("\n\nmiddle\n\n"); got != "middle" {
 		t.Errorf("blank lines at the edges should go: %q", got)
 	}
-	// A shell continuation ends in a backslash, which would escape the `<` of the
-	// following <br> and print the tag as text instead of breaking the line.
 	if got := planCell("cmd \\\n--flag"); got != `cmd \ <br>--flag` {
 		t.Errorf("dangling backslash not defused: %q", got)
 	}
-	// Nothing is clipped: the cell carries the full instruction.
-	long := strings.Repeat("run the command and check it ", 60) // ~1700 chars, as real plans are
+	long := strings.Repeat("run the command and check it ", 60)
 	if got := planCell(long); got != strings.TrimSpace(long) {
 		t.Errorf("cell was altered: %d chars from %d", len(got), len(long))
 	}
-	// Leading indentation survives so heredoc'd source keeps its shape, while
-	// interior runs still collapse.
+	// Leading indentation survives; interior runs still collapse.
 	if got := planCell("func f() {\n\tif x {\n\t\treturn  y\n"); got != "func f() {<br>    if x {<br>        return y" {
 		t.Errorf("indentation not preserved: %q", got)
 	}
-	// Multi-byte text passes through intact.
 	if got := planCell("überprüfen die Änderung"); got != "überprüfen die Änderung" {
 		t.Errorf("multi-byte text mangled: %q", got)
 	}

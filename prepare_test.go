@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -23,23 +22,16 @@ func hasFormatterNeed(needs []formatterNeed, bin string) bool {
 	return false
 }
 
-// TestCheckEnvInjectsMidSessionSkillNotPrompt pins the cache-safety rule: a
-// skill seeded mid-session is injected as a user message, NOT folded into the
-// system prompt (which would bust the KV prefix cache — only compaction may).
+// Changing the system prompt mid-session would bust the prefix cache.
 func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	a, s := newTestAgent(t)
 	cfgDir := filepath.Join(s.Cwd, ".codehalter")
 	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Baseline: seed the always-on skills and freeze them as "already in the
-	// prompt", so only a NEW skill counts as added mid-session.
-	if err := ensureSkills(s.Cwd, nil, readOSInfo()); err != nil {
-		t.Fatal(err)
-	}
-	const frozen = "EXISTING PROMPT — do not mutate"
+	const frozen = "EXISTING PROMPT: do not mutate"
 	s.SystemPrompt = frozen
-	s.promptSkills = skillFiles(s.Cwd)
+	s.promptSkills = skillSet(s.Cwd, nil)
 
 	body := "# Zzz skill\n\nuse the zzz tool wisely\n"
 	if err := os.WriteFile(filepath.Join(cfgDir, "SKILL-zzz.md"), []byte(body), 0o644); err != nil {
@@ -49,7 +41,7 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	a.checkEnv(s, s.ID)
 
 	if s.SystemPrompt != frozen {
-		t.Errorf("system prompt was mutated mid-session — KV cache bust")
+		t.Errorf("system prompt was mutated mid-session: KV cache bust")
 	}
 	var injected bool
 	for _, m := range s.Messages {
@@ -63,67 +55,116 @@ func TestCheckEnvInjectsMidSessionSkillNotPrompt(t *testing.T) {
 	}
 }
 
-// TestCheckEnvSetupIsOneCard pins the one-card, one-turn rule. Every accepted
-// card dispatches a full plan/execute/document cycle (~14 LLM calls), so a Go
-// project needing both a toolchain install and gopls wiring must produce a
-// SINGLE fixProblem carrying both bullets, not one card per problem. Declining
-// gopls (a commented-out entry) drops just that bullet.
+// Two stacks wanting two formatters would otherwise be two cards; runner config is not probed.
 func TestCheckEnvSetupIsOneCard(t *testing.T) {
 	a, s := newTestAgent(t)
-	// Empty PATH so every probed binary reads as missing regardless of the
-	// developer's machine.
+	// Empty PATH so every probed binary reads as missing on any machine.
 	t.Setenv("PATH", "")
-	if err := os.WriteFile(filepath.Join(s.Cwd, "go.mod"), []byte("module x\n\ngo 1.24\n"), 0o644); err != nil {
-		t.Fatal(err)
+	for name, body := range map[string]string{
+		"tsconfig.json": "{}\n",
+		"main.c":        "int main(void){return 0;}\n",
+		"justfile":      "test:\n\tgo test ./...\n",
+	} {
+		if err := os.WriteFile(filepath.Join(s.Cwd, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	cfgDir := filepath.Join(s.Cwd, sessionDir)
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
+	setup := firstCard(t, a.checkEnv(s, s.ID), "Missing dev tools:")
+	for _, want := range []string{"prettier (", "clang-format ("} {
+		if !strings.Contains(setup.prompt, want) {
+			t.Errorf("prompt lacks %q: %q", want, setup.prompt)
+		}
 	}
-
-	// go.mod makes `go` a missing runner AND makes gopls wiring wanted: two
-	// problems, one card, and the prompt has to carry both.
-	problems := a.checkEnv(s, s.ID)
-	if len(problems) != 1 {
-		t.Fatalf("setup must be one card (one turn), got %d: %+v", len(problems), problems)
+	if strings.Contains(setup.prompt, "just") {
+		t.Errorf("a runner binary was probed: %q", setup.prompt)
 	}
-	if !strings.Contains(problems[0].prompt, "Missing dev tools:") {
-		t.Errorf("prompt lost the install bullet: %q", problems[0].prompt)
-	}
-	if !strings.Contains(problems[0].prompt, "gopls") {
-		t.Errorf("prompt lost the gopls bullet: %q", problems[0].prompt)
-	}
-	// One PLAN ONLY directive, not one per bullet — that repetition was the sign
-	// of prompts being concatenated rather than merged.
-	if n := strings.Count(problems[0].prompt, "PLAN ONLY"); n != 1 {
-		t.Errorf("want exactly 1 PLAN ONLY directive, got %d: %q", n, problems[0].prompt)
-	}
-
-	// Declined (commented out) → the gopls bullet goes away, the install bullet
-	// stays, and gopls does not resurface as a "missing dev tool" either.
-	mcp := "# [[server]]\n# name = \"gopls\"\n# command = \"gopls\"\n"
-	if err := os.WriteFile(filepath.Join(cfgDir, "mcp.toml"), []byte(mcp), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	problems = a.checkEnv(s, s.ID)
-	if len(problems) != 1 {
-		t.Fatalf("still one card after declining gopls, got %d: %+v", len(problems), problems)
-	}
-	if strings.Contains(problems[0].prompt, "gopls") {
-		t.Errorf("a commented-out gopls should silence every gopls mention: %q", problems[0].prompt)
+	if n := strings.Count(setup.prompt, "PLAN ONLY"); n != 1 {
+		t.Errorf("want exactly 1 PLAN ONLY directive, got %d: %q", n, setup.prompt)
 	}
 }
 
-// TestDetectFormatters covers both drivers: detected stack (ts → prettier) and
-// formatter config files (.clang-format → clang-format, pyproject [tool.ruff] →
-// ruff), and that an empty project needs nothing.
-// TestPrepareChecksBannerAlwaysShowsOnce: the capabilities banner is all a
-// session open prints, so it must NOT be gated on something having changed
-// since the last run. A project whose settings, tools and MCP servers are
-// exactly as they were is the ordinary case, and gating on change left the
-// thread empty after the gitignore card with no way to tell setup from a
-// hang. First prepareChecks emits it; the second (settings hash unchanged,
-// probe short-circuited) adds nothing.
+// checkEnv returns several unrelated cards, so indexing [0] would depend on their order.
+func firstCard(t *testing.T, probs []fixProblem, want string) fixProblem {
+	t.Helper()
+	var found []fixProblem
+	for _, p := range probs {
+		if strings.Contains(p.prompt, want) {
+			found = append(found, p)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one card mentioning %q, got %d of %+v", want, len(found), probs)
+	}
+	return found[0]
+}
+
+// Offered once per project (checks.done), so a restart stays quiet.
+func TestCheckEnvOneTimeCards(t *testing.T) {
+	a, s := newTestAgent(t)
+	bin := filepath.Join(s.Cwd, "node_modules", ".bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for path, body := range map[string]string{
+		filepath.Join(s.Cwd, "tsconfig.json"): "{}\n",
+		filepath.Join(bin, "prettier"):        "#!/bin/sh\n",
+	} {
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(s.Cwd, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// One readable file (.git and node_modules are skipped): too little for the AGENT.md card.
+	probs := a.checkEnv(s, s.ID)
+	firstCard(t, probs, "no formatter config")
+	for _, p := range probs {
+		if strings.Contains(p.prompt, "AGENT.md") {
+			t.Fatalf("asked for an AGENT.md with one file to read: %q", p.desc)
+		}
+	}
+
+	// Re-checked live: a project that grows mid-session is asked then.
+	for _, n := range []string{"a.ts", "b.ts", "c.ts", "d.ts", "README.md"} {
+		if err := os.WriteFile(filepath.Join(s.Cwd, n), []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	probs = a.checkEnv(s, s.ID)
+	agents := firstCard(t, probs, "AGENT.md")
+	if !strings.Contains(agents.prompt, "ask_user") {
+		t.Errorf("the AGENT.md card must confirm the facts with the user: %q", agents.prompt)
+	}
+
+	for _, again := range []func() []fixProblem{
+		func() []fixProblem { return a.checkEnv(s, s.ID) },
+		func() []fixProblem {
+			b, s2 := newTestAgent(t)
+			s2.Cwd = s.Cwd
+			return b.checkEnv(s2, s2.ID)
+		},
+	} {
+		for _, p := range again() {
+			if strings.Contains(p.prompt, "no formatter config") || strings.Contains(p.prompt, "AGENT.md") {
+				t.Errorf("a one-time card was offered twice: %q", p.desc)
+			}
+		}
+	}
+
+	c, s3 := newTestAgent(t)
+	if err := os.WriteFile(filepath.Join(s3.Cwd, "AGENT.md"), []byte("# x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range c.checkEnv(s3, s3.ID) {
+		if strings.Contains(p.prompt, "AGENT.md") {
+			t.Errorf("asked for an AGENT.md that exists: %q", p.desc)
+		}
+	}
+}
+
+// The banner must not be gated on change: an unchanged setup is the ordinary case.
 func TestPrepareChecksBannerAlwaysShowsOnce(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
@@ -135,9 +176,7 @@ func TestPrepareChecksBannerAlwaysShowsOnce(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	// loadSettings prefers the project-local settings.toml over the global
-	// ~/.config/codehalter/settings.toml, so without an isolated HOME this
-	// test probes the developer's real LLM servers over the network.
+	// Isolate HOME, or the test probes the developer's real LLM servers.
 	t.Setenv("HOME", t.TempDir())
 
 	h := newTerminalHarness(t)
@@ -146,9 +185,7 @@ func TestPrepareChecksBannerAlwaysShowsOnce(t *testing.T) {
 	if err := os.MkdirAll(ch, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// A real settings file: ensureLLM reloads it each call, so the second call
-	// sees an unchanged hash plus a satisfied gate and skips the re-probe —
-	// the "nothing changed" state that used to suppress the banner entirely.
+	// The second call sees an unchanged hash and a satisfied gate, so it skips the re-probe.
 	cfg := fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"gpt-4o\"\nparallel = 1\ncontext_size = 128000\n", ts.URL)
 	if err := os.WriteFile(filepath.Join(ch, "settings.toml"), []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
@@ -202,89 +239,8 @@ func TestDetectFormatters(t *testing.T) {
 	}
 }
 
-// TestMcpServerConfigured pins lsmcp detection: no file / commented entry read
-// as not-configured (so the setup card fires), an active entry as configured.
-func TestMcpServerConfigured(t *testing.T) {
-	dir := t.TempDir()
-	if mcpServerConfigured(dir, "lsmcp") {
-		t.Error("no mcp.toml should be not-configured")
-	}
-	cfgDir := filepath.Join(dir, sessionDir)
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	mcpPath := filepath.Join(cfgDir, "mcp.toml")
-
-	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"lsmcp\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if mcpServerConfigured(dir, "lsmcp") {
-		t.Error("commented lsmcp should be not-configured")
-	}
-
-	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"lsmcp\"\ncommand = \"npx\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !mcpServerConfigured(dir, "lsmcp") {
-		t.Error("active lsmcp should be configured")
-	}
-}
-
-// TestMcpMentionsServer pins the comment-AWARE check that gates the gopls card:
-// unlike mcpServerConfigured, a commented-out entry counts as "mentioned" (the
-// user was already offered it and declined), so the card stops nagging. This is
-// the exact distinction the gopls offer relies on — and why the seed mcp.toml
-// must name no server.
-func TestMcpMentionsServer(t *testing.T) {
-	dir := t.TempDir()
-	if mcpMentionsServer(dir, "gopls") {
-		t.Error("no mcp.toml should leave gopls not-mentioned")
-	}
-	cfgDir := filepath.Join(dir, sessionDir)
-	if err := os.MkdirAll(cfgDir, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	mcpPath := filepath.Join(cfgDir, "mcp.toml")
-
-	// The crux: a commented-out gopls is NOT active (no card would mean "wired")
-	// but IS mentioned, so the offer card must NOT re-fire.
-	if err := os.WriteFile(mcpPath, []byte("# [[server]]\n# name = \"gopls\"\n# command = \"gopls\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if mcpServerConfigured(dir, "gopls") {
-		t.Error("commented gopls should NOT be configured")
-	}
-	if !mcpMentionsServer(dir, "gopls") {
-		t.Error("commented gopls SHOULD be mentioned (already offered → don't nag)")
-	}
-
-	// A project mentioning a different server but not gopls → gopls still offered.
-	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"fs\"\ncommand = \"npx\"\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if mcpMentionsServer(dir, "gopls") {
-		t.Error("a non-gopls mcp.toml should leave gopls not-mentioned")
-	}
-
-	// Active gopls → both mentioned and configured.
-	if err := os.WriteFile(mcpPath, []byte("[[server]]\nname = \"gopls\"\ncommand = \"gopls\"\nargs = [\"mcp\"]\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if !mcpMentionsServer(dir, "gopls") || !mcpServerConfigured(dir, "gopls") {
-		t.Error("active gopls should be both mentioned and configured")
-	}
-}
-
-// TestProbeAllLLMsConfigBeatsProbe asserts the precedence rule: explicit
-// context_size / image_support on the [[llm]] entry win over whatever the
-// probe discovered. This is the path OpenAI/Ollama/vLLM users rely on —
-// their /v1/models response carries no metadata, but the user declared the
-// values in settings.toml.
 func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
-	// Mock a metadata-bare /v1/models response (no status.args). Mirrors
-	// what OpenAI and Ollama return — the probe gleans model presence but
-	// nothing else, so any non-zero ContextSize / ImageSupport must come
-	// from config.
+	// Metadata-bare /v1/models, as OpenAI and Ollama return.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
 			http.NotFound(w, r)
@@ -309,18 +265,14 @@ func TestProbeAllLLMsConfigBeatsProbe(t *testing.T) {
 	}
 	a.probeAllLLMs(context.Background())
 
-	if a.mainSlotTokens != 128000 {
-		t.Errorf("mainSlotTokens: got %d, want 128000 (from settings.toml context_size)", a.mainSlotTokens)
+	if a.mainSlotTokens.Load() != 128000 {
+		t.Errorf("mainSlotTokens: got %d, want 128000 (from settings.toml context_size)", a.mainSlotTokens.Load())
 	}
-	if !a.imagesSupported {
+	if !a.imagesSupported.Load() {
 		t.Errorf("imagesSupported: got false, want true (from settings.toml image_support)")
 	}
 }
 
-// TestProbeAllLLMsUndetectedFallsThroughToFalse covers the warn path: probe
-// finds no metadata AND config declares nothing — both signals end up at
-// their safe defaults (mainSlotTokens=0, imagesSupported=false) so the
-// renderLLMStatus banner can surface the "set this in settings.toml" hint.
 func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
@@ -343,25 +295,19 @@ func TestProbeAllLLMsUndetectedFallsThroughToFalse(t *testing.T) {
 	}
 	a.probeAllLLMs(context.Background())
 
-	if a.mainSlotTokens != 0 {
-		t.Errorf("mainSlotTokens: got %d, want 0 (probe metadata-bare, no config override)", a.mainSlotTokens)
+	if a.mainSlotTokens.Load() != 0 {
+		t.Errorf("mainSlotTokens: got %d, want 0 (probe metadata-bare, no config override)", a.mainSlotTokens.Load())
 	}
-	if a.imagesSupported {
+	if a.imagesSupported.Load() {
 		t.Errorf("imagesSupported: got true, want false (probe metadata-bare, no config override)")
 	}
 }
 
-// TestRenderLLMStatusWarnsModelNotInList pins the surfaced warning for the
-// silent failure mode behind "plan not valid JSON": the server is reachable and
-// /v1/models enumerates models, but the configured id isn't among them. The
-// gateway then routes the unknown name to an empty 200, which only surfaces
-// three layers down at plan time. probeLLM used to log loaded=false and move on
-// (bare ✅ in the banner); now renderLLMStatus names the mismatch and lists the
-// ids the server actually offers.
+// Gateways route an unknown model id to an empty 200, which otherwise surfaces only at plan time.
 func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
-			http.NotFound(w, r) // /props 404s — keeps the /v1/models result
+			http.NotFound(w, r) // /props 404s, so the /v1/models result stands
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -399,23 +345,12 @@ func TestRenderLLMStatusWarnsModelNotInList(t *testing.T) {
 			t.Errorf("renderLLMStatus output missing %q.\nGot:\n%s", want, status)
 		}
 	}
-	// No bare ✅ connection line for a model we could not confirm.
 	if strings.Contains(status, "✅ llm[0]: qwopus3.6-27b") {
 		t.Errorf("renderLLMStatus showed a bare ✅ for an unconfirmed model:\n%s", status)
 	}
 }
 
-// TestRenderLLMStatusWarnsRoleRenderSplit pins the startup warning for the one
-// settings mistake that costs real time and produces no symptom at all: the two
-// roles asking the server for two different renderings of the same
-// conversation. Anything that is not a sampler is an argument to the chat
-// template, so the server keeps a prompt state per rendering and every plan <->
-// execute switch re-evaluates whatever the other role appended in between. One
-// 11.6h session paid 99582 tokens over two switches.
-//
-// The rewind detector already catches it, but only after the tokens are spent,
-// and prompt/cached alone never name the key at fault. This is the same
-// diagnosis for free, before the first call.
+// Non-sampler params differing per role re-evaluate the other role's appends at every phase switch.
 func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -433,9 +368,7 @@ func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 		return a.renderLLMStatus()
 	}
 
-	// Samplers may differ freely: they never reach the chat template, so the two
-	// roles still render identically. Warning here would be noise on a correct
-	// and quite common configuration.
+	// Samplers never reach the template, so differing ones must not warn.
 	quiet := status(t,
 		map[string]any{"temperature": 1.0, "top_p": 0.95},
 		map[string]any{"temperature": 0.6, "max_tokens": 8192})
@@ -443,7 +376,6 @@ func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 		t.Errorf("warned about a sampler-only difference:\n%s", quiet)
 	}
 
-	// A chat-template argument on one role only: the real shape of the fault.
 	loud := status(t,
 		map[string]any{"temperature": 1.0},
 		map[string]any{"temperature": 0.6, "chat_template_kwargs": map[string]any{"enable_thinking": false}})
@@ -454,12 +386,8 @@ func TestRenderLLMStatusWarnsRoleRenderSplit(t *testing.T) {
 	}
 }
 
-// TestProbeAllLLMsExplicitFalseHonoured: a model that DOES auto-detect as
-// vision-capable but the user wants disabled via image_support = false must
-// stay disabled — *bool lets us distinguish "not set" from "explicitly off".
 func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
-	// Mock /v1/models with llama-swap-style status.args carrying --mmproj —
-	// the probe would normally detect vision support here.
+	// llama-swap-style status.args with --mmproj: the probe alone would detect vision.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasSuffix(r.URL.Path, "/v1/models") {
 			http.NotFound(w, r)
@@ -483,13 +411,12 @@ func TestProbeAllLLMsExplicitFalseHonoured(t *testing.T) {
 	}
 	a.probeAllLLMs(context.Background())
 
-	if a.imagesSupported {
-		t.Errorf("imagesSupported: probe detected vision but user explicitly disabled — config must win")
+	if a.imagesSupported.Load() {
+		t.Errorf("imagesSupported: probe detected vision but user explicitly disabled, config must win")
 	}
 }
 
-// llamaCppServer mocks a llama.cpp endpoint: a bare /v1/models plus a /props
-// carrying a PER-SLOT n_ctx (default_generation_settings.n_ctx) and total_slots.
+// /props carries a per-slot n_ctx (default_generation_settings.n_ctx) and total_slots.
 func llamaCppServer(perSlotCtx, totalSlots int) *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -504,9 +431,7 @@ func llamaCppServer(perSlotCtx, totalSlots int) *httptest.Server {
 	}))
 }
 
-// TestProbeAllLLMsAutoDetectsSlots: with `parallel` unset, the slot count is
-// back-filled from /props total_slots and the per-slot n_ctx is used directly
-// (no division), so the user no longer has to declare -np in settings.toml.
+// The per-slot n_ctx is used directly, not divided by the slot count.
 func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	ts := llamaCppServer(16384, 2)
 	defer ts.Close()
@@ -517,16 +442,13 @@ func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	if got := a.settings.LLM[0].Parallel; *got != 2 {
 		t.Errorf("Parallel: got %d, want 2 (auto-detected from /props total_slots)", *got)
 	}
-	if a.mainSlotTokens != 16384 {
-		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx used directly, no division)", a.mainSlotTokens)
+	if a.mainSlotTokens.Load() != 16384 {
+		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx used directly, no division)", a.mainSlotTokens.Load())
 	}
 }
 
-// TestProbeAllLLMsRouterModelProps pins the llama.cpp router-mode fix: bare /props
-// reports n_ctx=0 (role:"router"), and the real per-slot n_ctx is only returned
-// when the request is routed to the model via ?model=<id>. The id here carries a
-// space and a semicolon ("q3 (a; b)") to prove the query is encoded — a raw ';'
-// is a query separator that would truncate the name to "model not found".
+// Router mode: bare /props reports n_ctx=0; the model's comes from ?model=<id>. The id has a
+// space and a ';' to prove the query is encoded.
 func TestProbeAllLLMsRouterModelProps(t *testing.T) {
 	const modelID = "q3 (a; b)"
 	var gotModel atomic.Pointer[string] // written from the handler goroutine
@@ -557,13 +479,11 @@ func TestProbeAllLLMsRouterModelProps(t *testing.T) {
 	if got := a.settings.LLM[0].Parallel; *got != 2 {
 		t.Errorf("Parallel: got %d, want 2 (from ?model= /props total_slots)", *got)
 	}
-	if a.mainSlotTokens != 16384 {
-		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from ?model= /props)", a.mainSlotTokens)
+	if a.mainSlotTokens.Load() != 16384 {
+		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx from ?model= /props)", a.mainSlotTokens.Load())
 	}
 }
 
-// TestProbeAllLLMsExplicitParallelWins: an explicit `parallel` is never
-// overwritten by the probed total_slots.
 func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 	ts := llamaCppServer(16384, 4)
 	defer ts.Close()
@@ -576,10 +496,6 @@ func TestProbeAllLLMsExplicitParallelWins(t *testing.T) {
 	}
 }
 
-// TestScaffoldSettings pins that the skeleton settings.toml is written from the
-// embedded default when none exists, and that a second call is a no-op (never
-// clobbers an existing, possibly user-edited, file). This is the "if there is none,
-// create a skeleton" behavior the prepare phase relies on.
 func TestScaffoldSettings(t *testing.T) {
 	a, s := newTestAgent(t)
 	path := filepath.Join(s.Cwd, sessionDir, "settings.toml")
@@ -596,49 +512,201 @@ func TestScaffoldSettings(t *testing.T) {
 		t.Errorf("skeleton doesn't match the embedded default (%d bytes)", len(data))
 	}
 
-	// Idempotent: a second call must NOT clobber an existing file.
-	os.WriteFile(path, []byte("# user edited\n"), 0o644)
+	// A second call must not clobber an existing file.
+	if err := os.WriteFile(path, []byte("# user edited\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	a.scaffoldSettings(context.Background(), s.Cwd, s.ID)
 	if again, _ := os.ReadFile(path); string(again) != "# user edited\n" {
 		t.Error("scaffoldSettings clobbered an existing settings.toml")
 	}
 }
 
-// TestProbeToolBinsMatchesInlineProbe pins that probeToolBins computes exactly the
-// per-binary presence the three reporters (envSnapshot / checkEnv /
-// notifyCapabilities) used to compute inline, so collapsing them into one helper
-// changed no behavior. It independently re-implements the original inline loops
-// and compares; both sides read the same PATH/cwd, so the result is deterministic
-// regardless of which dev tools happen to be installed.
-func TestProbeToolBinsMatchesInlineProbe(t *testing.T) {
+// Go needs no config (gofmt has no options), and an already-declared style is left alone.
+func TestFormatterConfigNeeds(t *testing.T) {
+	// A local prettier makes the installed gate pass without depending on the host PATH.
+	proj := func(t *testing.T, files ...string) string {
+		t.Helper()
+		dir := t.TempDir()
+		bin := filepath.Join(dir, "node_modules", ".bin")
+		if err := os.MkdirAll(bin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(bin, "prettier"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range files {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("{}"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return dir
+	}
+
+	tests := []struct {
+		name   string
+		stacks []string
+		files  []string
+		want   []formatterConfigNeed
+	}{
+		{
+			name:   "js project with nothing pinning its style",
+			stacks: []string{"js"},
+			want:   []formatterConfigNeed{{"prettier", ".prettierrc"}},
+		},
+		{
+			name:   "ts and css are the same prettier, asked once",
+			stacks: []string{"ts", "css"},
+			want:   []formatterConfigNeed{{"prettier", ".prettierrc"}},
+		},
+		{
+			name:   "prettier config present",
+			stacks: []string{"ts"},
+			files:  []string{".prettierrc"},
+		},
+		{
+			name:   "editorconfig counts as pinned",
+			stacks: []string{"js"},
+			files:  []string{".editorconfig"},
+		},
+		{
+			name:   "go project is already pinned by gofmt",
+			stacks: []string{"go"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatterConfigNeeds(tc.stacks, proj(t, tc.files...))
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+
+	// Skipped on a machine with a global prettier, where the gate legitimately passes.
+	t.Run("formatter not installed", func(t *testing.T) {
+		dir := t.TempDir()
+		if prettierBin(dir) != "" {
+			t.Skip("prettier is on PATH here")
+		}
+		if got := formatterConfigNeeds([]string{"js"}, dir); got != nil {
+			t.Errorf("got %+v, want nothing offered for an uninstalled formatter", got)
+		}
+	})
+
+	t.Run("c project without clang-format config", func(t *testing.T) {
+		dir := t.TempDir()
+		got := formatterConfigNeeds([]string{"c"}, dir)
+		if !onPath("clang-format") {
+			if got != nil {
+				t.Errorf("got %+v with no clang-format installed, want nothing", got)
+			}
+			return
+		}
+		want := []formatterConfigNeed{{"clang-format", ".clang-format"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("got %+v, want %+v", got, want)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".clang-format"), []byte("BasedOnStyle: GNU\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := formatterConfigNeeds([]string{"c"}, dir); got != nil {
+			t.Errorf("got %+v with a .clang-format present, want nothing", got)
+		}
+	})
+}
+
+// Nothing is scaffolded either way.
+func TestEmptyProject(t *testing.T) {
+	dir := t.TempDir()
+	if !isEmptyProject(dir) {
+		t.Fatal("expected fresh tempdir to be empty")
+	}
+
+	if _, err := newSession(dir); err != nil { // creates .codehalter/, no sources
+		t.Fatalf("newSession: %v", err)
+	}
+	if !isEmptyProject(dir) {
+		t.Error("expected dir with only .codehalter/ to still count as empty")
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "Makefile")); err == nil {
+		t.Error("bootstrap must be deferred: no Makefile should be written")
+	}
+
+	populated := t.TempDir()
+	if err := os.WriteFile(filepath.Join(populated, "main.go"), []byte("package main\n"), 0644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if isEmptyProject(populated) {
+		t.Error("expected dir with main.go to not be empty")
+	}
+}
+
+func TestRenderLLMStatusNamesPurpose(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"m"}]}`))
+	}))
+	defer ts.Close()
+	base := LLMConnection{Server: ts.URL, Model: "m", Parallel: ptr(1), ContextSize: ptr(128000)}
+	status := func(conns ...LLMConnection) string {
+		a := &agent{settings: Settings{LLM: conns}}
+		a.probeAllLLMs(context.Background())
+		return a.renderLLMStatus()
+	}
+
+	alone := status(base)
+	if !strings.Contains(alone, "llm[0]: m @ "+ts.URL+" (parallel=1) · the session (planning, execution, documentation) and the background summariser") {
+		t.Errorf("a lone entry must carry everything:\n%s", alone)
+	}
+	summ := base
+	summ.Purpose = "summary"
+	two := status(base, summ)
+	for _, want := range []string{"llm[0]: m @ " + ts.URL + " (parallel=1) · the session (planning, execution, documentation)\n", "llm[1]: m @ " + ts.URL + " (parallel=1) · background work (the summariser, side questions), off the session's cache"} {
+		if !strings.Contains(two, want) {
+			t.Errorf("missing %q:\n%s", want, two)
+		}
+	}
+	if idle := status(base, base); !strings.Contains(idle, "llm[1]: m @ "+ts.URL+" (parallel=1) · unused: nothing routes here") {
+		t.Errorf("an extra with no purpose must say it is idle:\n%s", idle)
+	}
+}
+
+// Reloading the file must keep what was learned about the server: the probed
+// parallel and a rejected closed-think continuation.
+func TestSettingsReloadKeepsWhatWasLearned(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	ts := llamaCppServer(65536, 2)
+	defer ts.Close()
 	a, s := newTestAgent(t)
-	s.knownStacks = []string{"go", "rust"}
-	s.knownRunners = []string{"make", "go", "bogus"} // make→make, go→go; bogus→"" (skipped)
-
-	gotRunners, gotFormatters := a.probeToolBins(s)
-
-	// Independent re-implementation of the pre-refactor inline probe loops.
-	var wantRunners, wantFormatters []toolPresence
-	for _, k := range s.knownRunners {
-		if bin := runnerProbeBinary(k); bin != "" {
-			_, err := exec.LookPath(bin)
-			wantRunners = append(wantRunners, toolPresence{bin: bin, label: k, present: err == nil})
+	if err := os.MkdirAll(filepath.Join(s.Cwd, ".codehalter"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"qwen\"\n", ts.URL)
+	if err := os.WriteFile(filepath.Join(s.Cwd, ".codehalter", "settings.toml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for turn := 1; turn <= 2; turn++ {
+		a.ensureLLM(context.Background(), s, s.ID)
+		if p := a.settings.LLM[0].Parallel; p == nil || *p != 2 {
+			t.Fatalf("turn %d: parallel = %v, want 2 from the probe", turn, p)
 		}
 	}
-	for _, f := range detectFormatters(s.knownStacks, s.Cwd) {
-		present := false
-		if f.bin == "prettier" {
-			present = prettierBin(s.Cwd) != ""
-		} else if _, err := exec.LookPath(f.bin); err == nil {
-			present = true
-		}
-		wantFormatters = append(wantFormatters, toolPresence{bin: f.bin, label: f.reason, present: present})
+	a.settings.LLM[0].noPrefill = true // the server refused the continuation once
+	// Opening another thread reloads the settings file; what was learned still holds.
+	other, err := newSession(s.Cwd)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	if !reflect.DeepEqual(gotRunners, wantRunners) {
-		t.Errorf("runners: got %+v, want %+v", gotRunners, wantRunners)
+	if err := a.initSession(s.Cwd, other, nil); err != nil {
+		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(gotFormatters, wantFormatters) {
-		t.Errorf("formatters: got %+v, want %+v", gotFormatters, wantFormatters)
+	a.ensureLLM(context.Background(), s, s.ID)
+	if p := a.settings.LLM[0].Parallel; p == nil || *p != 2 || cap(a.connSems[0]) != 2 {
+		t.Fatalf("after another session opened: parallel = %v, want 2 from the probe", p)
+	}
+	if !a.settings.LLM[0].noPrefill {
+		t.Error("a reload forgot that the server refuses the closed-think continuation")
 	}
 }

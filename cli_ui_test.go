@@ -3,14 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
-// uiFor builds a renderer writing into a buffer at a known geometry. Tests are
-// in-package, so pointing the fields at a buffer is the whole seam needed.
 func uiFor(tty bool, cols, rows int) (*cliUI, *bytes.Buffer) {
 	u := newCLIUI()
 	var buf bytes.Buffer
@@ -21,35 +21,22 @@ func uiFor(tty bool, cols, rows int) (*cliUI, *bytes.Buffer) {
 	return u, &buf
 }
 
-func TestBreakRow(t *testing.T) {
-	cases := []struct {
-		row                string
-		width              int
-		wantHead, wantTail string
-	}{
-		{"the quick brown fox ", 19, "the quick brown", "fox "},
-		{"hello world", 8, "hello", "world"},
-		// No space to break at: a long path is cut rather than pushed past the
-		// edge, because one over-long row desyncs the live region for good.
-		{"/very/long/path/without/spaces", 10, "/very/long", "/path/without/spaces"},
-		{"a b", 2, "a", "b"},
-	}
-	for _, c := range cases {
-		head, tail := breakRow([]rune(c.row), c.width)
-		if string(head) != c.wantHead || string(tail) != c.wantTail {
-			t.Errorf("breakRow(%q, %d) = %q, %q; want %q, %q",
-				c.row, c.width, string(head), string(tail), c.wantHead, c.wantTail)
-		}
-	}
-}
-
+// 20 columns leave 19 for text: a row breaks at its last space, or hard without one.
 func TestStreamWrapsAtWidth(t *testing.T) {
-	u, buf := uiFor(false, 20, 24)
-	u.Stream("", "", "the quick brown fox ")
-	u.Stream("", "", "jumps over the lazy dog\n")
-	want := "the quick brown\nfox jumps over the\nlazy dog\n"
-	if buf.String() != want {
-		t.Errorf("wrapped transcript:\n%q\nwant:\n%q", buf.String(), want)
+	for _, c := range []struct {
+		chunks []string
+		want   string
+	}{
+		{[]string{"the quick brown fox ", "jumps over the lazy dog\n"}, "the quick brown\nfox jumps over the\nlazy dog\n"},
+		{[]string{"/very/long/path/without/any/spaces\n"}, "/very/long/path/wit\nhout/any/spaces\n"},
+	} {
+		u, buf := uiFor(false, 20, 24)
+		for _, s := range c.chunks {
+			u.Stream("", "", s)
+		}
+		if buf.String() != c.want {
+			t.Errorf("wrapped transcript:\n%q\nwant:\n%q", buf.String(), c.want)
+		}
 	}
 }
 
@@ -61,27 +48,23 @@ func TestStreamKeepsBlankLines(t *testing.T) {
 	}
 }
 
-// A partial row is held back so more of that sentence can still arrive; Flush
-// is what commits it.
 func TestStreamHoldsPartialRow(t *testing.T) {
 	u, buf := uiFor(false, 40, 24)
 	u.Stream("", "", "half a sentence")
 	if buf.String() != "" {
 		t.Fatalf("partial row was committed early: %q", buf.String())
 	}
-	u.Flush()
+	flushUI(u)
 	if want := "half a sentence\n"; buf.String() != want {
 		t.Errorf("got %q, want %q", buf.String(), want)
 	}
 }
 
-// Switching between message and thought must break the row: the two are styled
-// differently, and one row can only carry one style.
 func TestStreamStyleChangeFlushes(t *testing.T) {
 	u, buf := uiFor(false, 40, 24)
 	u.Stream("", "", "visible")
 	u.Stream(ansiDim, "  ", "thinking")
-	u.Flush()
+	flushUI(u)
 	if want := "visible\n  thinking\n"; buf.String() != want {
 		t.Errorf("got %q, want %q", buf.String(), want)
 	}
@@ -95,8 +78,6 @@ func TestClipCountsRunesNotBytes(t *testing.T) {
 	}
 }
 
-// Escapes are zero-width and must survive clipping, or a truncated colour code
-// leaks into the rest of the screen.
 func TestClipKeepsEscapes(t *testing.T) {
 	u, _ := uiFor(true, 8, 24) // limit 7
 	got := u.clip(ansiRed + "abcdefghij" + ansiReset)
@@ -131,8 +112,7 @@ func stripANSI(s string) string {
 	return b.String()
 }
 
-// The live region is erased by moving up exactly as many rows as were drawn.
-// Off by one here eats a transcript row on every redraw.
+// Erase must move up exactly as many rows as were drawn.
 func TestLiveRegionRowAccounting(t *testing.T) {
 	u, buf := uiFor(true, 60, 24)
 	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "1", Title: "run tests", Status: "in_progress"})
@@ -163,8 +143,6 @@ func TestLiveRegionFitsScreen(t *testing.T) {
 	}
 }
 
-// Every live row must be at most cols-1 columns wide, or the terminal wraps it
-// and the erase arithmetic is wrong from then on.
 func TestLiveRowsFitWidth(t *testing.T) {
 	u, _ := uiFor(true, 30, 24)
 	u.Begin()
@@ -174,7 +152,6 @@ func TestLiveRowsFitWidth(t *testing.T) {
 		Content: []ToolCallContent{{Type: "terminal", TerminalId: "t1"}},
 	})
 	u.TerminalTail("t1", []string{strings.Repeat("x", 200)})
-	u.Plan([]PlanEntry{{Content: strings.Repeat("plan ", 40), Status: "in_progress"}})
 	for _, l := range u.liveLines() {
 		if w := len([]rune(stripANSI(l))); w > u.cols-1 {
 			t.Errorf("live row is %d columns wide (max %d): %q", w, u.cols-1, stripANSI(l))
@@ -213,8 +190,6 @@ func TestFailedCardIsMarked(t *testing.T) {
 	}
 }
 
-// A card that was announced and never finished has to reach the transcript
-// anyway: End erases the live region, and anything left only there is lost.
 func TestEndCommitsInterruptedCards(t *testing.T) {
 	u, buf := uiFor(false, 80, 24)
 	u.Begin()
@@ -228,8 +203,7 @@ func TestEndCommitsInterruptedCards(t *testing.T) {
 	}
 }
 
-// A terminal tail is keyed by terminal id, not tool-call id: dropping the card
-// must drop the right map entry or the tails accumulate for the whole session.
+// Tails are keyed by terminal id, not tool-call id.
 func TestCardDropsItsTerminalTail(t *testing.T) {
 	u, _ := uiFor(false, 80, 24)
 	u.Card(toolCallUpdate{
@@ -243,9 +217,6 @@ func TestCardDropsItsTerminalTail(t *testing.T) {
 	}
 }
 
-// An update arriving while the cursor sits on an input prompt must break the
-// prompt row first, then put the prompt back, or it lands inside what the user
-// is typing.
 func TestPromptRowSurvivesAnUpdate(t *testing.T) {
 	u, buf := uiFor(true, 60, 24)
 	u.Prompt("> ")
@@ -271,8 +242,6 @@ func TestSubmittedClearsPrompt(t *testing.T) {
 	}
 }
 
-// Piped in, nothing echoes the user's typing, so the CLI writes the submitted
-// line itself and a redirected run reads back as a conversation.
 func TestSubmittedEchoesWhenNothingElseWill(t *testing.T) {
 	u, buf := uiFor(false, 60, 24)
 	u.echoInput = true
@@ -287,7 +256,7 @@ func TestSubmittedEchoesWhenNothingElseWill(t *testing.T) {
 func TestDiffLinesTrimsCommonContext(t *testing.T) {
 	old := "a\nb\nc\nd\n"
 	nw := "a\nB\nc\nd\n"
-	got := diffLines("f.txt", &old, nw, false)
+	got := (&cliUI{}).diffLines("f.txt", &old, nw)
 	want := []string{"  f.txt +1 -1", "  - b", "  + B"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("diffLines = %#v, want %#v", got, want)
@@ -295,7 +264,7 @@ func TestDiffLinesTrimsCommonContext(t *testing.T) {
 }
 
 func TestDiffLinesNewFile(t *testing.T) {
-	got := diffLines("new.txt", nil, "one\ntwo", false)
+	got := (&cliUI{}).diffLines("new.txt", nil, "one\ntwo")
 	want := []string{"  new.txt +2 -0", "  + one", "  + two"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("diffLines = %#v, want %#v", got, want)
@@ -305,7 +274,7 @@ func TestDiffLinesNewFile(t *testing.T) {
 func TestDiffLinesCapsLongHunks(t *testing.T) {
 	old := ""
 	nw := strings.TrimRight(strings.Repeat("line\n", 40), "\n")
-	got := diffLines("big.txt", &old, nw, false)
+	got := (&cliUI{}).diffLines("big.txt", &old, nw)
 	if len(got) != 1+cliDiffLines+1 {
 		t.Fatalf("uncapped hunk: %d rows", len(got))
 	}
@@ -318,7 +287,7 @@ func TestShortAndElapsed(t *testing.T) {
 	for _, c := range []struct {
 		n    int
 		want string
-	}{{7, "7"}, {1500, "1.5k"}, {2_500_000, "2.5M"}} {
+	}{{7, "7"}, {1500, "2k"}, {124_200, "124k"}, {262_144, "262k"}, {2_500_000, "2.5M"}} {
 		if got := short(c.n); got != c.want {
 			t.Errorf("short(%d) = %q, want %q", c.n, got, c.want)
 		}
@@ -333,8 +302,6 @@ func TestShortAndElapsed(t *testing.T) {
 	}
 }
 
-// With no tty there are no escapes at all, so piping the CLI to a file gives a
-// readable log rather than a pile of cursor moves.
 func TestNonTTYEmitsNoEscapes(t *testing.T) {
 	u, buf := uiFor(false, 80, 24)
 	u.Begin()
@@ -349,9 +316,6 @@ func TestNonTTYEmitsNoEscapes(t *testing.T) {
 	}
 }
 
-// An ESC that reaches the terminal moves the cursor, and every row the live
-// region thinks it owns is then off by however far it moved. Model text and
-// tool output are printed verbatim, so they are the ones that have to be clean.
 func TestSanitizeRemovesCursorMoves(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"plain", "plain"},
@@ -371,8 +335,7 @@ func TestSanitizeRemovesCursorMoves(t *testing.T) {
 func TestStreamStripsEscapes(t *testing.T) {
 	u, buf := uiFor(true, 80, 24)
 	u.Stream("", "", "before \x1b[10Aafter\n")
-	u.Flush()
-	// The ESC is gone, so what was a cursor move is now just text.
+	flushUI(u)
 	if strings.Contains(buf.String(), "\x1b[10A") {
 		t.Errorf("model escape reached the terminal: %q", buf.String())
 	}
@@ -381,8 +344,6 @@ func TestStreamStripsEscapes(t *testing.T) {
 	}
 }
 
-// A tab counts as one rune and draws as up to eight columns, so a live row
-// holding one wraps and throws the row count off for the rest of the session.
 func TestTerminalTailExpandsTabs(t *testing.T) {
 	u, _ := uiFor(true, 80, 24)
 	u.TerminalTail("t1", []string{"ok\tPASS\tmain"})
@@ -396,5 +357,292 @@ func TestCardTitleIsSanitized(t *testing.T) {
 	u.Card(toolCallUpdate{ToolCallId: "t1", Title: "run \x1b[1;1Hls", Status: "in_progress"})
 	if got := u.calls["t1"].title; got != "run [1;1Hls" {
 		t.Errorf("title = %q", got)
+	}
+}
+
+// A multi-line command is one live row: its first line and "…". As two rows, every
+// spinner redraw left one behind, and a single running script filled the screen.
+func TestMultiLineTitleIsOneRow(t *testing.T) {
+	u, buf := uiFor(true, 80, 24)
+	u.Begin()
+	u.Card(toolCallUpdate{ToolCallId: "t1", Title: "Run: python3 - <<'PY'\np='tests/a.rs'\nPY\n", Status: "in_progress"})
+	for range 5 {
+		flushUI(u)
+	}
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, row := range screenAfter(buf.String(), u.cols) {
+		if strings.Contains(row, "python3") {
+			n++
+			if !strings.Contains(row, "Run: python3 - <<'PY' …") {
+				t.Errorf("row = %q, want the first line and …", row)
+			}
+		}
+		if strings.Contains(row, "tests/a.rs") {
+			t.Errorf("the command's second line is on screen: %q", row)
+		}
+	}
+	if n != 1 {
+		t.Errorf("the running command is on screen %d times after five redraws, want 1", n)
+	}
+	u.Card(toolCallUpdate{ToolCallId: "t1", Status: "completed"})
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if out := stripANSI(buf.String()); !strings.Contains(out, "✓ Run: python3 - <<'PY' …") {
+		t.Errorf("the finished card lost the …: %q", out)
+	}
+}
+
+func flushUI(u *cliUI) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.flushRow()
+	u.drawLive()
+}
+
+// screenAfter replays out on a cols-wide terminal that knows what drawLive uses: cursor up,
+// erase below, autowrap on and off, and emoji as two cells. It returns the rows left on screen.
+func screenAfter(out string, cols int) []string {
+	rows, r, c, wrap := []string{""}, 0, 0, true
+	put := func(ch rune) {
+		w := 1
+		if ch >= 0x1F300 || ch >= 0x2600 && ch <= 0x27BF {
+			w = 2
+		}
+		if c+w > cols {
+			if !wrap {
+				return // the terminal keeps the cursor at the edge and drops the rest
+			}
+			r, c = r+1, 0
+		}
+		for len(rows) <= r {
+			rows = append(rows, "")
+		}
+		rows[r] += string(ch)
+		c += w
+	}
+	for i := 0; i < len(out); {
+		if strings.HasPrefix(out[i:], "\x1b[") {
+			j := i + 2
+			for j < len(out) && (out[j] >= '0' && out[j] <= '9' || out[j] == '?') {
+				j++
+			}
+			arg := out[i+2 : j]
+			switch out[j] {
+			case 'A':
+				n := 0
+				fmt.Sscan(arg, &n)
+				r, c = max(r-n, 0), 0 // a terminal stops at its top row
+			case 'J':
+				for len(rows) <= r {
+					rows = append(rows, "")
+				}
+				rows = append(rows[:r], string([]rune(rows[r])[:min(c, len([]rune(rows[r])))]))
+			case 'C':
+				n := 1
+				fmt.Sscan(arg, &n)
+				c += n
+			case 'l', 'h':
+				if arg == "?7" {
+					wrap = out[j] == 'h'
+				}
+			}
+			i = j + 1
+			continue
+		}
+		ch, size := utf8.DecodeRuneInString(out[i:])
+		if ch == '\r' {
+			c = 0
+		} else if ch == '\n' {
+			r, c = r+1, 0
+			for len(rows) <= r {
+				rows = append(rows, "")
+			}
+		} else {
+			put(ch)
+		}
+		i += size
+	}
+	return rows
+}
+
+// A live row wider than the terminal in cells (emoji count one each but take two) must not
+// wrap: the extra row left the region's top row behind on every redraw.
+func TestLiveRegionLeavesNoRowsBehind(t *testing.T) {
+	u, buf := uiFor(true, 40, 24)
+	u.Begin()
+	for range 5 {
+		u.Plan([]PlanEntry{{Content: "Executing", Status: "in_progress", Meta: &planMeta{Phase: "EXECUTING", Meter: strings.Repeat("✅", 30)}}})
+	}
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, row := range screenAfter(buf.String(), u.cols) {
+		if strings.Contains(row, "✅") {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("status row on screen %d times after five redraws, want 1", n)
+	}
+}
+
+// Rows are measured in cells: an emoji or a CJK glyph takes two, a combining accent none.
+// Counted in runes, a row of them was twice the terminal's width and wrapped once more.
+func TestRowsAreMeasuredInCells(t *testing.T) {
+	for _, c := range []struct {
+		s     string
+		cells int
+	}{{"abc", 3}, {"→ ✓ …", 5}, {"✅🧪", 4}, {"中文", 4}, {"e\u0301", 1}, {"⚠\ufe0f", 1}} {
+		if got := visibleLen(c.s); got != c.cells {
+			t.Errorf("visibleLen(%q) = %d, want %d", c.s, got, c.cells)
+		}
+	}
+	u, buf := uiFor(false, 21, 24) // 20 cells for text
+	u.Stream("", "", strings.Repeat("✅", 15)+"\n"+strings.Repeat("中", 15)+"\n")
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	rows := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	for _, row := range rows {
+		if w := visibleLen(row); w > 20 {
+			t.Errorf("row %q is %d cells, past 20", row, w)
+		}
+	}
+	if len(rows) != 4 { // 30 cells each: a full row of 20 and the rest
+		t.Errorf("rows = %q, want two per line", rows)
+	}
+	if w := visibleLen(u.clip(strings.Repeat("🧪", 30))); w > u.cols-1 {
+		t.Errorf("a clipped row of emoji is %d cells, past %d", w, u.cols-1)
+	}
+}
+
+// While a question's prompt is open, arriving output waits for the answer instead of
+// breaking the row being typed on; the main prompt does not hold anything back.
+func TestOutputWaitsForAnOpenQuestion(t *testing.T) {
+	u, buf := uiFor(true, 60, 24)
+	u.Ask("  [1-2] ")
+	u.Note("", "background job 3 exited with code 0")
+	if strings.Contains(buf.String(), "background job 3") {
+		t.Fatalf("printed while the answer was being typed: %q", buf.String())
+	}
+	u.Submitted("1")
+	if !strings.Contains(buf.String(), "background job 3 exited with code 0\n") {
+		t.Errorf("held output not printed after the answer: %q", buf.String())
+	}
+	buf.Reset()
+	u.Prompt("\n❯ ")
+	u.Note("", "a note at the main prompt")
+	if !strings.Contains(buf.String(), "a note at the main prompt") {
+		t.Errorf("the main prompt held output back: %q", buf.String())
+	}
+}
+
+// The terminal's cursor stands where the line is being edited, and a line wider than the row
+// shows the part around the cursor: its start while the cursor is near it, its end at the end.
+func TestInputRowFollowsTheCursor(t *testing.T) {
+	u, buf := uiFor(true, 40, 24)
+	u.inputOn, u.inPrompt = true, "❯ "
+	u.Begin()
+	u.SetInput([]rune("hello world"), 5)
+	if out := buf.String(); !strings.HasSuffix(out, "\x1b[1A\r\x1b[7C") {
+		t.Errorf("cursor not at column 7 (prompt 2 + 5): %q", out[max(0, len(out)-20):])
+	}
+	long := []rune("start " + strings.Repeat("x", 60) + " finish")
+	u.SetInput(long, 3)
+	if row := u.liveLines()[len(u.liveLines())-1]; !strings.Contains(stripANSI(row), "❯ start") || strings.Contains(row, "finish") {
+		t.Errorf("cursor near the start, row = %q", stripANSI(row))
+	}
+	u.SetInput(long, len(long))
+	if row := u.liveLines()[len(u.liveLines())-1]; strings.Contains(row, "start") || !strings.HasSuffix(stripANSI(row), "finish") {
+		t.Errorf("cursor at the end, row = %q", stripANSI(row))
+	}
+	if u.inCol > u.cols-1 {
+		t.Errorf("cursor column %d is past the row (%d columns)", u.inCol, u.cols)
+	}
+}
+
+// The input row is the live region's last row with the cursor at its end: transcript lines
+// land above it, every redraw replaces it in place, and nothing typed is left behind.
+func TestInputRowStaysInPlace(t *testing.T) {
+	u, buf := uiFor(true, 40, 24)
+	u.Note("", "earlier transcript")
+	u.inputOn, u.inPrompt = true, "❯ "
+	u.Begin()
+	for _, typed := range []string{"s", "sp", "spe", "spec stop"} {
+		u.SetInput([]rune(typed), len([]rune(typed)))
+		u.Tick()
+	}
+	u.Note("", "a line from the turn")
+	u.Tick()
+	if err := u.out.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	rows := screenAfter(buf.String(), u.cols)
+	for len(rows) > 0 && rows[len(rows)-1] == "" {
+		rows = rows[:len(rows)-1] // the row the cursor left when it went back up
+	}
+	inputs, notes := 0, 0
+	if len(rows) == 0 || rows[0] != "earlier transcript" {
+		t.Errorf("a redraw reached into the transcript above it:\n%s", strings.Join(rows, "\n"))
+	}
+	for _, row := range rows {
+		if strings.Contains(row, "❯") {
+			inputs++
+		}
+		if strings.Contains(row, "a line from the turn") {
+			notes++
+		}
+	}
+	if inputs != 1 || notes != 1 || !strings.Contains(rows[len(rows)-1], "❯ spec stop") {
+		t.Errorf("screen after typing and output:\n%s", strings.Join(rows, "\n"))
+	}
+}
+
+// The status line carries the last call's speeds; a call whose prompt all came from the
+// cache measures no prompt speed and leaves the last one shown.
+func TestStatusLineShowsTheLastSpeeds(t *testing.T) {
+	u, _ := uiFor(true, 120, 24)
+	u.Begin()
+	u.Usage(50000, 262144)
+	u.Speeds(812.4, 51.2)
+	u.Speeds(0, 48.6)
+	if line := stripANSI(u.statusLine()); !strings.Contains(line, "50k/262k ctx · 812 pp/s · 49 tg/s") {
+		t.Errorf("status line = %q", line)
+	}
+}
+
+// codehalter's phases go into the status row, phase last, instead of plan rows; the update
+// that completes them clears it.
+func TestPhasesGoIntoTheStatusRow(t *testing.T) {
+	u, _ := uiFor(true, 160, 24)
+	u.Begin()
+	u.Usage(124200, 262144)
+	u.Speeds(812, 51)
+	u.Plan([]PlanEntry{{Content: "Planning", Status: "completed"},
+		{Content: "Executing · 1m · llm[0] ↑426kb ↓37 tok", Status: "in_progress", Meta: &planMeta{Phase: "Executing", Meter: "llm[0] ↑426kb ↓37 tok"}}})
+	rows := u.liveLines()
+	if len(rows) != 1 || !strings.HasSuffix(stripANSI(rows[0]), " · llm[0] ↑426kb ↓37 tok · 124k/262k ctx · 812 pp/s · 51 tg/s · executing") {
+		t.Errorf("live rows = %q", rows)
+	}
+	u.Plan([]PlanEntry{{Content: "Planning", Status: "completed"}, {Content: "Executing", Status: "completed"}})
+	if line := stripANSI(u.statusLine()); strings.Contains(line, "executing") || strings.Contains(line, "llm[0]") {
+		t.Errorf("after the phases: %q", line)
+	}
+}
+
+// A running card's live text (codehalter's own check) shows under it, as a job's tail does.
+func TestRunningCardShowsItsText(t *testing.T) {
+	u, _ := uiFor(true, 100, 24)
+	u.Begin()
+	u.Card(toolCallUpdate{Kind: "tool_call", ToolCallId: "c", Title: "Checking: just test in rust/", Status: "in_progress"})
+	u.Card(toolCallUpdate{Kind: "tool_call_update", ToolCallId: "c", Status: "in_progress", Content: []ToolCallContent{TextContent("Running tests/zoom.rs\ntest result: ok. 4 passed")}})
+	rows := strings.Join(u.liveLines(), "\n")
+	if !strings.Contains(rows, "Running tests/zoom.rs") || !strings.Contains(rows, "test result: ok. 4 passed") {
+		t.Errorf("live rows:\n%s", stripANSI(rows))
 	}
 }

@@ -5,7 +5,7 @@ build:
     go build -o codehalter .
 
 lint:
-    go vet
+    go vet ./...
 
 test:
     go test ./...

@@ -1,0 +1,1 @@
+go test -run "TestParse" ./inv >/dev/null 2>&1; printf 'a,2,100\nb,5,50\n' > /tmp/rq$$; printf 'a,-1,1\n' > /tmp/rn$$; go run ./cmd/inv total /tmp/rn$$ 2>&1 | grep -q negative && grep -q negative inv/inv_test.go && go run ./cmd/inv cheapest /tmp/rq$$ | grep -q '^b'

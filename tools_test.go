@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"slices"
@@ -8,13 +9,12 @@ import (
 	"testing"
 )
 
-// TestResolvePathSymlinkEscape pins the symlink-aware sandbox: a symlink living
-// under cwd but TARGETING outside it must be rejected (a plain string-prefix check
-// would pass it), while plain in-tree files and in-tree symlinks still resolve.
+// An in-tree symlink to an out-of-tree target is rejected; in-tree files and
+// in-tree symlinks still resolve.
 func TestResolvePathSymlinkEscape(t *testing.T) {
 	a, s := newTestAgent(t)
 
-	outside := t.TempDir() // a directory OUTSIDE the session cwd
+	outside := t.TempDir()
 	if err := os.WriteFile(filepath.Join(outside, "secret.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +25,6 @@ func TestResolvePathSymlinkEscape(t *testing.T) {
 		t.Error("resolvePath followed a symlink out of cwd (sandbox escape)")
 	}
 
-	// A plain in-tree file resolves.
 	if err := os.WriteFile(filepath.Join(s.Cwd, "ok.txt"), []byte("y"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -33,11 +32,7 @@ func TestResolvePathSymlinkEscape(t *testing.T) {
 		t.Errorf("in-tree file rejected: %v", err)
 	}
 
-	// An in-tree symlink to another in-tree path still works.
-	if err := os.MkdirAll(filepath.Join(s.Cwd, "real"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	os.WriteFile(filepath.Join(s.Cwd, "real", "f.txt"), []byte("z"), 0o644)
+	writeTree(t, s.Cwd, map[string]string{"real/f.txt": "z"})
 	if err := os.Symlink(filepath.Join(s.Cwd, "real"), filepath.Join(s.Cwd, "alias")); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
@@ -46,24 +41,21 @@ func TestResolvePathSymlinkEscape(t *testing.T) {
 	}
 }
 
-// TestArgsWrongType pins the guard that stops a non-string tool argument from
-// clobbering a file: a real string (incl. the empty string) passes, every
-// non-string JSON value is flagged so write_file/edit_file can reject the call
-// instead of writing "".
+// A string, even "", passes; every non-string JSON value is flagged.
 func TestArgsWrongType(t *testing.T) {
 	cases := []struct {
 		raw  string
 		want bool
 	}{
-		{`{"content":"hi"}`, false},   // string
-		{`{"content":""}`, false},     // empty string is STILL a string
-		{`{"content":123}`, true},     // number
-		{`{"content":null}`, true},    // null
-		{`{"content":{"a":1}}`, true}, // object
-		{`{"content":["x"]}`, true},   // array
-		{`{"content":true}`, true},    // bool
-		{`{"path":"x"}`, false},       // key absent
-		{`not json`, false},           // not a JSON object
+		{`{"content":"hi"}`, false},
+		{`{"content":""}`, false},
+		{`{"content":123}`, true},
+		{`{"content":null}`, true},
+		{`{"content":{"a":1}}`, true},
+		{`{"content":["x"]}`, true},
+		{`{"content":true}`, true},
+		{`{"path":"x"}`, false},
+		{`not json`, false},
 	}
 	for _, c := range cases {
 		if got := parseArgs(c.raw).wrongType("content"); got != c.want {
@@ -72,109 +64,63 @@ func TestArgsWrongType(t *testing.T) {
 	}
 }
 
-// TestArgsTypedAccessors pins the bug this type exists to prevent: our own tool
-// schemas declare `line`/`limit` as integers and `regex` as a boolean, so a
-// schema-obedient model sends JSON numbers and booleans. Decoding those into
-// map[string]string dropped them to "" and the tool ran with its defaults while
-// reporting success — read_file silently read from line 1. Both the
-// schema-correct form and the quoted form a sloppier model emits must work.
+// Numbers and flags arrive as JSON values or as quoted strings; anything else,
+// bad JSON included, reads as absent.
 func TestArgsTypedAccessors(t *testing.T) {
-	t.Run("num from JSON number", func(t *testing.T) {
-		a := parseArgs(`{"path":"x.go","line":42,"limit":10}`)
-		if got := a.str("path"); got != "x.go" {
-			t.Errorf("str(path) = %q, want x.go", got)
+	for _, c := range []struct {
+		raw   string
+		num   int
+		numOK bool
+		flag  bool
+	}{
+		{`{"v":42}`, 42, true, false},
+		{`{"v":"42"}`, 42, true, false},
+		{`{"v":"abc"}`, 0, false, false},
+		{`{}`, 0, false, false},
+		{`not json`, 0, false, false},
+		{`{"v":true}`, 0, false, true},
+		{`{"v":"TRUE"}`, 0, false, true},
+		{`{"v":false}`, 0, false, false},
+		{`{"v":"no"}`, 0, false, false},
+	} {
+		a := parseArgs(c.raw)
+		if n, ok := a.num("v"); n != c.num || ok != c.numOK {
+			t.Errorf("%s: num = %d,%v, want %d,%v", c.raw, n, ok, c.num, c.numOK)
 		}
-		if got, ok := a.num("line"); !ok || got != 42 {
-			t.Errorf("num(line) = %d,%v, want 42,true", got, ok)
+		if got := a.flag("v"); got != c.flag {
+			t.Errorf("%s: flag = %v, want %v", c.raw, got, c.flag)
 		}
-		if got, ok := a.num("limit"); !ok || got != 10 {
-			t.Errorf("num(limit) = %d,%v, want 10,true", got, ok)
-		}
-	})
-	t.Run("num from quoted digits", func(t *testing.T) {
-		a := parseArgs(`{"line":"42"}`)
-		if got, ok := a.num("line"); !ok || got != 42 {
-			t.Errorf("num(line) = %d,%v, want 42,true", got, ok)
-		}
-	})
-	t.Run("num absent or unparseable", func(t *testing.T) {
-		a := parseArgs(`{"line":"abc"}`)
-		if _, ok := a.num("line"); ok {
-			t.Error("num(line) on non-numeric text: ok = true, want false")
-		}
-		if _, ok := a.num("missing"); ok {
-			t.Error("num(missing): ok = true, want false")
-		}
-	})
-	t.Run("flag from JSON bool and string", func(t *testing.T) {
-		for _, raw := range []string{`{"regex":true}`, `{"regex":"true"}`, `{"regex":"TRUE"}`} {
-			if !parseArgs(raw).flag("regex") {
-				t.Errorf("flag(regex) on %s = false, want true", raw)
-			}
-		}
-		for _, raw := range []string{`{"regex":false}`, `{"regex":"no"}`, `{}`} {
-			if parseArgs(raw).flag("regex") {
-				t.Errorf("flag(regex) on %s = true, want false", raw)
-			}
-		}
-	})
-	t.Run("str refuses to coerce", func(t *testing.T) {
-		if got := parseArgs(`{"content":123}`).str("content"); got != "" {
-			t.Errorf("str on a number = %q, want \"\" (the caller rejects via wrongType)", got)
-		}
-	})
-	t.Run("has is type-blind", func(t *testing.T) {
-		a := parseArgs(`{"limit":0}`)
-		if !a.has("limit") {
-			t.Error("has(limit) = false for a supplied zero, want true")
-		}
-		if a.has("offset") {
-			t.Error("has(offset) = true for an absent key, want false")
-		}
-	})
-	t.Run("one bad key does not drop the others", func(t *testing.T) {
-		// The original failure mode: a type error aborted the whole decode.
-		a := parseArgs(`{"path":"x.go","line":42}`)
-		if a.str("path") != "x.go" {
-			t.Errorf("str(path) = %q, want x.go", a.str("path"))
-		}
-	})
+	}
 }
 
-// TestLiveToolOutput pins the size policy used in BOTH the live call and the
-// history re-render (identical now → a replay is byte-faithful → cache stays
-// warm): content-retrieval tools pass through whole, every other tool gets the
-// head/tail clip. truncateForLLM is that clip, exercised directly below.
+// Content-retrieval tools pass through whole; every other tool gets the clip.
 func TestLiveToolOutput(t *testing.T) {
 	big := strings.Repeat("x", truncateThreshold*3)
 
-	for _, tool := range []string{"read_file", "continue_read", "search_text", "web_search", "web_read", "web_read_raw"} {
-		if got := liveToolOutput("tu_1", tool, "{}", big); got != big {
+	for _, tool := range []string{"read_file", "continue_read", "web_search", "web_read"} {
+		if got := liveToolOutput(tool, "{}", big); got != big {
 			t.Errorf("liveToolOutput(%s) clipped a size-managing tool (len %d, want %d)", tool, len(got), len(big))
 		}
 	}
-	if got := liveToolOutput("tu_1", "run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
+	if got := liveToolOutput("run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
 		t.Errorf("liveToolOutput(run_command) should clip a non-exempt tool")
 	}
-	if got := truncateForLLM("tu_1", "run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
+	if got := truncateForLLM("run_command", "{}", big); got == big || !strings.Contains(got, "chars omitted") {
 		t.Errorf("truncateForLLM must clip a long non-exempt output")
 	}
-	if got := truncateForLLM("tu_1", "run_command", "{}", "small"); got != "small" {
+	if got := truncateForLLM("run_command", "{}", "small"); got != "small" {
 		t.Errorf("short content should pass through, got %q", got)
 	}
 }
 
-// TestLiveExemptCap pins the per-call byte ceiling on the content tools: even
-// the "pass through whole" tools can't blow n_ctx in one call — an oversized
-// output is clipped at a line boundary, reports how much was omitted, and the
-// kept span ends on a newline (no mid-line cut).
+// An oversized exempt output is clipped at a line boundary, never mid-line.
 func TestLiveExemptCap(t *testing.T) {
 	line := strings.Repeat("a", 80) + "\n"
-	huge := strings.Repeat(line, liveExemptCap/len(line)+50) // comfortably over the cap
+	huge := strings.Repeat(line, liveExemptCap/len(line)+50)
 
-	got := liveToolOutput("tu_1", "search_text", "{}", huge)
+	got := liveToolOutput("read_file", "{}", huge)
 	if got == huge {
-		t.Fatal("oversized search_text output should be capped, not passed whole")
+		t.Fatal("oversized read_file output should be capped, not passed whole")
 	}
 	if !strings.Contains(got, "chars omitted") || !strings.Contains(got, "capped") {
 		t.Errorf("capped output must report the omission, got tail %q", got[max(0, len(got)-160):])
@@ -185,16 +131,6 @@ func TestLiveExemptCap(t *testing.T) {
 	body := got[:strings.Index(got, "\n\n[...")]
 	if !strings.HasSuffix(body, "a") { // last kept char is real content, cut on a line boundary
 		t.Errorf("clip not line-aware: body ends %q", body[max(0, len(body)-5):])
-	}
-}
-
-// TestWebSearchRefineHint pins that web_search overflow steers the model to
-// refine the query (not just view_output) — the "ask to refine" half of the
-// truncation contract.
-func TestWebSearchRefineHint(t *testing.T) {
-	hint := truncationHint("tu_1", "web_search", `{"query":"x"}`)
-	if !strings.Contains(hint, "refine the query") {
-		t.Errorf("web_search hint should suggest refining the query, got %q", hint)
 	}
 }
 
@@ -218,9 +154,7 @@ func toolNames(defs []map[string]any) []string {
 	return names
 }
 
-// TestResolvePath covers the sandbox boundary: relative paths are joined to
-// sess.Cwd; absolute paths must already live inside it; `..` that would escape
-// the root is rejected.
+// Relative paths join cwd, absolute ones must be inside it, and `..` escapes fail.
 func TestResolvePath(t *testing.T) {
 	a, s := newTestAgent(t)
 	cwd := s.Cwd
@@ -263,68 +197,87 @@ func TestResolvePath(t *testing.T) {
 	}
 }
 
-// TestAllToolDefinitions pins the cache invariant that replaced per-phase
-// pruning: llmAllToolDefinitions returns EVERY registered tool, sorted by name
-// (NOT registration order), so the rendered `tools` block is byte-identical
-// across phases and turns. (Registered out of order on purpose.)
+// defs is sorted by name, not registration order (registered out of order here).
 func TestAllToolDefinitions(t *testing.T) {
-	withFreshToolRegistry(t)
-	RegisterTool(Tool{Def: toolDef("read")})
-	RegisterTool(Tool{Def: toolDef("write")})
-	RegisterTool(Tool{Def: toolDef("other")})
+	a := &agent{}
+	withTools(a, Tool{Def: toolDef("read")}, Tool{Def: toolDef("write")}, Tool{Def: toolDef("other")})
 
-	if got, want := toolNames(llmAllToolDefinitions()), []string{"other", "read", "write"}; !slices.Equal(got, want) {
+	if got, want := toolNames(a.tools.defs()), []string{"other", "read", "write"}; !slices.Equal(got, want) {
 		t.Errorf("got %v, want %v (all tools, sorted)", got, want)
 	}
 }
 
-// TestPhasePolicy covers the dispatch-gate predicates that replaced array
-// pruning: deny rejects a call, terminals end the loop, both independent of the
-// (now full) tools array.
-func TestPhasePolicy(t *testing.T) {
-	p := phasePolicy{
-		deny:      map[string]bool{"edit_file": true},
-		terminals: map[string]bool{"respond": true, "submit_plan": true},
+// A card a tool opens names the tool the model called; a card no tool opened names none.
+func TestToolCardsNameTheirTool(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "lookup", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid, args string) (string, bool) {
+			a.StartToolCall(ctx, sid, "Looking it up", "read", nil)
+			return "ok", false
+		}})
+	callTool(t, h.agent, h.sess.ID, "lookup", `{}`)
+	h.agent.StartToolCall(context.Background(), h.sess.ID, "Clarification needed", "think", nil)
+	got := map[any]any{}
+	h.waitFor(func() bool {
+		for _, u := range h.updatesOfKind("tool_call") {
+			got[u["title"]] = u["name"]
+		}
+		return len(got) == 2
+	})
+	if got["Looking it up"] != "lookup" {
+		t.Errorf("the tool's card names %v, want lookup", got["Looking it up"])
 	}
-	if !p.isDenied("edit_file") || p.isDenied("read_file") {
-		t.Error("isDenied wrong")
-	}
-	if !p.isTerminal("respond") || !p.isTerminal("submit_plan") || p.isTerminal("edit_file") {
-		t.Error("isTerminal wrong")
-	}
-	if !p.hasTerminal() || (phasePolicy{}).hasTerminal() {
-		t.Error("hasTerminal wrong")
-	}
-	if got := terminalList(p); got != "`respond` or `submit_plan`" {
-		t.Errorf("terminalList: %q", got)
+	if name, ok := got["Clarification needed"]; !ok || name != nil {
+		t.Errorf("a card no tool opened names %v, want none", name)
 	}
 }
 
-func TestParseArgs(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want map[string]string
-	}{
-		{name: "valid flat", in: `{"key":"value","a":"b"}`, want: map[string]string{"key": "value", "a": "b"}},
-		{name: "empty object", in: `{}`, want: map[string]string{}},
-		{name: "empty string", in: ``, want: map[string]string{}},
-		{name: "invalid JSON", in: `not json`, want: map[string]string{}},
+// An argument the schema declares a list or an object but that came as a string holding one is
+// decoded before the tool runs, at any depth the schema describes; a string that is not exactly
+// the declared JSON, or where the schema allows text, stays a string; the history keeps the call
+// as the model sent it, and arguments with nothing to fit reach the tool byte for byte.
+func TestToolArgsFitTheirSchema(t *testing.T) {
+	a, sess := newTestAgent(t)
+	obj := func(props map[string]any) map[string]any {
+		return map[string]any{"type": "object", "properties": props}
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got := parseArgs(tc.in)
-			if got == nil {
-				t.Fatalf("parseArgs must never return nil")
-			}
-			if len(got) != len(tc.want) {
-				t.Errorf("got %v, want %v", got, tc.want)
-			}
-			for k, v := range tc.want {
-				if got.str(k) != v {
-					t.Errorf("key %q: got %q, want %q", k, got.str(k), v)
-				}
-			}
-		})
+	list := func(items map[string]any) map[string]any { return map[string]any{"type": "array", "items": items} }
+	var got string
+	withTools(a, Tool{Def: map[string]any{"type": "function", "function": map[string]any{
+		"name": "plan_trip",
+		"parameters": obj(map[string]any{
+			"stops": list(obj(map[string]any{"name": map[string]any{"type": "string"}, "hours": list(map[string]any{"type": "integer"})})),
+			"meta":  obj(map[string]any{"tags": list(map[string]any{"type": "string"})}),
+			"note":  map[string]any{"type": "string"},
+			"any":   map[string]any{},
+			"maybe": map[string]any{"type": []any{"array", "string"}},
+		}),
+	}}, Execute: func(_ context.Context, _ *agent, _ string, args string) (string, bool) {
+		got = args
+		return "ok", false
+	}})
+	call := func(args string) string {
+		t.Helper()
+		var tc toolCall
+		tc.ID, tc.Function.Name, tc.Function.Arguments = "c", "plan_trip", args
+		if tu, _ := a.runToolCall(context.Background(), sess.ID, tc); tu.Input != args {
+			t.Errorf("the history holds %s, not the call as sent %s", tu.Input, args)
+		}
+		return got
+	}
+
+	sent := `{"stops": "[{\"name\": \"a\", \"hours\": \"[1, 2]\"}]", "meta": "{\"tags\": [\"x\"]}", "note": "[1, 2]", "any": "[3]", "maybe": "[4]"}`
+	if out := call(sent); out != `{"any":"[3]","maybe":"[4]","meta":{"tags":["x"]},"note":"[1, 2]","stops":[{"hours":[1,2],"name":"a"}]}` {
+		t.Errorf("fitted to\n%s", out)
+	}
+	for _, args := range []string{
+		`{"stops": "[{\"name\": \"a\"}, {\"name\":"}`, // cut off: the tool says what is wrong
+		`{"stops": "{\"name\": \"a\"}"}`,              // an object where a list is declared
+		`{"stops": "a", "note": "x"}`,
+		`{"note":  "spaced",   "stops": []}`,
+	} {
+		if out := call(args); out != args {
+			t.Errorf("%s reached the tool as %s", args, out)
+		}
 	}
 }

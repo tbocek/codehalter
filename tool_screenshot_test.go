@@ -1,7 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/png"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,12 +18,11 @@ import (
 	"testing"
 )
 
-// TestScreenshotRejectsBadPaths: the two ways a path argument can be wrong
-// (absent, or pointing outside the project) both fail with a message the model
-// can act on, and neither launches a browser.
+// Absent and outside-project paths fail with an actionable message and launch no
+// browser.
 func TestScreenshotRejectsBadPaths(t *testing.T) {
 	a, s := newTestAgent(t)
-	a.imagesSupported = true
+	a.imagesSupported.Store(true)
 
 	cases := []struct {
 		name string
@@ -44,30 +50,7 @@ func TestScreenshotRejectsBadPaths(t *testing.T) {
 	}
 }
 
-// TestScreenshotNoVisionTellsTheUser: with an LLM that takes no images the
-// dispatcher never intercepts, so the call lands in the fallback. That path has
-// to say so in the TRANSCRIPT, because "your model has no vision" is a
-// settings.toml fact only the user can act on.
-func TestScreenshotNoVisionTellsTheUser(t *testing.T) {
-	a, s := newTestAgent(t)
-	a.imagesSupported = false
-
-	text, failed := screenshotExecuteFallback(context.Background(), a, s.ID, `{"path":"out/index.html"}`)
-	if !failed {
-		t.Fatalf("failed=false, text=%q", text)
-	}
-	// The model is told what to do instead, not just that it went wrong.
-	if !strings.Contains(text, "NUMBER") {
-		t.Errorf("model-facing text should point at numeric verification, got %q", text)
-	}
-	if !strings.Contains(text, "the user has been told") {
-		t.Errorf("model-facing text should say the user was informed, got %q", text)
-	}
-}
-
-// TestWriteInstrumentedInjects: the instrumented copy gets a <base> pointing at
-// the ORIGINAL directory (or its relative CSS breaks) and the probe script, and
-// the original file is left untouched.
+// <base> points at the ORIGINAL directory, and the original file is untouched.
 func TestWriteInstrumentedInjects(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "page.html")
 	original := `<html><head><title>t</title></head><body><p class="x">hi</p></body></html>`
@@ -112,8 +95,7 @@ func TestWriteInstrumentedInjects(t *testing.T) {
 	}
 }
 
-// TestWriteInstrumentedFragment: a file with no <head> and no </body> (a bare
-// SVG or an HTML fragment) still gets both injections, at the ends.
+// No <head> and no </body>: both injections still land, at the ends.
 func TestWriteInstrumentedFragment(t *testing.T) {
 	src := filepath.Join(t.TempDir(), "frag.html")
 	if err := os.WriteFile(src, []byte(`<p class="x">hi</p>`), 0o600); err != nil {
@@ -136,9 +118,6 @@ func TestWriteInstrumentedFragment(t *testing.T) {
 	}
 }
 
-// TestSelectorNoteReportsAMiss: a selector that matched nothing is the trap
-// this note exists to close. Without it the model gets the top of the page and
-// no reason to doubt it's looking at what it asked for.
 func TestSelectorNoteReportsAMiss(t *testing.T) {
 	cases := []struct {
 		name, report, want string
@@ -160,9 +139,6 @@ func TestSelectorNoteReportsAMiss(t *testing.T) {
 	}
 }
 
-// TestClampDimension: absent/zero/negative fall back to the default, oversized
-// gets capped rather than rejected (a capped shot is still useful, and the
-// reply states the size actually used).
 func TestClampDimension(t *testing.T) {
 	cases := []struct {
 		args string
@@ -171,7 +147,7 @@ func TestClampDimension(t *testing.T) {
 		{`{}`, screenshotDefaultWidth},
 		{`{"width":0}`, screenshotDefaultWidth},
 		{`{"width":-5}`, screenshotDefaultWidth},
-		{`{"width":"nope"}`, screenshotDefaultWidth}, // junk → default, not a crash
+		{`{"width":"nope"}`, screenshotDefaultWidth},
 		{`{"width":800}`, 800},
 		{`{"width":"800"}`, 800}, // toolArgs.num takes a numeric string: models emit them
 		{`{"width":99999}`, screenshotMaxWidth},
@@ -184,8 +160,6 @@ func TestClampDimension(t *testing.T) {
 	}
 }
 
-// TestBeaconRoundTrip: the beacon is how a number leaves a headless Firefox
-// that has no --dump-dom. Anything that can GET the URL can report through it.
 func TestBeaconRoundTrip(t *testing.T) {
 	b, err := startBeacon()
 	if err != nil {
@@ -208,21 +182,17 @@ func TestBeaconRoundTrip(t *testing.T) {
 	}
 }
 
-// TestScreenshotEndToEnd drives the real browser: the only way to know the
-// flags still work and that the selector shift lands. Skipped where Firefox
-// isn't installed (CI, a slim container) rather than failing the suite.
 func TestScreenshotEndToEnd(t *testing.T) {
-	if _, err := firefoxPath(); err != nil {
+	if _, err := findFirefox(); err != nil {
 		t.Skipf("no firefox: %v", err)
 	}
 	if testing.Short() {
 		t.Skip("launches a browser")
 	}
 	a, s := newTestAgent(t)
-	a.imagesSupported = true
+	a.imagesSupported.Store(true)
 	page := filepath.Join(s.Cwd, "page.html")
-	// A tall spacer so the target is well below the fold: without the
-	// translateY shift the capture would start at the top and miss it.
+	// Well below the fold: without the translateY shift the capture misses it.
 	body := `<html><head><style>body{margin:0}#pad{height:3000px;background:#eee}
 	  #target{height:200px;background:#f0f}</style></head>
 	  <body><div id="pad"></div><div id="target"></div></body></html>`
@@ -243,8 +213,7 @@ func TestScreenshotEndToEnd(t *testing.T) {
 	if !strings.Contains(text, "top=3000px") {
 		t.Errorf("selector note should carry the measured offset, got %q", text)
 	}
-	// The bytes must be in the store under the reported id, because that is
-	// the ONLY thing replay has: it never re-renders.
+	// The stored bytes are the ONLY thing replay has: it never re-renders.
 	data, mime, err := readImageFile(s.Cwd, id)
 	if err != nil {
 		t.Fatalf("readImageFile(%s): %v", id, err)
@@ -254,15 +223,11 @@ func TestScreenshotEndToEnd(t *testing.T) {
 	}
 }
 
-// TestScreenshotReplayUsesStoredBytes: replay must rebuild the parts from
-// ImageID, never by re-running the tool. Re-rendering a page that changed since
-// would put different bytes in the middle of the prompt and reprocess every
-// message behind them.
 func TestScreenshotReplayUsesStoredBytes(t *testing.T) {
 	a, s := newTestAgent(t)
-	a.imagesSupported = true
-	id := "img_deadbeef"
-	if err := writeImageFile(s.Cwd, id, "image/png", []byte("stored pixels")); err != nil {
+	a.imagesSupported.Store(true)
+	id, err := storeImage(s.Cwd, "image/png", []byte("stored pixels"))
+	if err != nil {
 		t.Fatal(err)
 	}
 	tu := ToolUse{
@@ -278,13 +243,13 @@ func TestScreenshotReplayUsesStoredBytes(t *testing.T) {
 	if !ok {
 		t.Fatalf("replay returned %T, want multimodal parts", got)
 	}
-	// parts[0] is the STORED output verbatim, not a re-derived truncation
-	// hint: anything else changes wire bytes the model already saw.
+	// parts[0] is the stored output verbatim: anything else changes bytes the
+	// model already saw.
 	if want := imageParts(tu.Output, "image/png", []byte("stored pixels")); !reflect.DeepEqual(parts, want) {
 		t.Errorf("replayed parts differ from a live call:\ngot  %v\nwant %v", parts, want)
 	}
 
-	// Bytes deleted out from under us → fall back to text, don't fail the turn.
+	// Bytes gone from the store: fall back to text, do not fail the turn.
 	matches, err := filepath.Glob(filepath.Join(s.Cwd, ".codehalter", "images", id+".*"))
 	if err != nil || len(matches) == 0 {
 		t.Fatalf("glob stored image: %v %v", matches, err)
@@ -297,14 +262,12 @@ func TestScreenshotReplayUsesStoredBytes(t *testing.T) {
 	}
 }
 
-// TestScreenshotFallbackWhenModelIsBlind: with imagesSupported=false the
-// registered tool still exists (the tools array is a byte-identical superset
-// across phases), but dispatching it takes the fallback and fails loudly
-// instead of burning a browser launch to deliver something the model cannot
-// see. Goes through executeTool so the registration itself is covered.
+// Without vision the tool says what is missing, points at numeric checks and says
+// the user was told (only they can fix settings.toml); through runToolCall, so
+// the registration is covered too.
 func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 	a, s := newTestAgent(t)
-	a.imagesSupported = false
+	a.imagesSupported.Store(false)
 	page := filepath.Join(s.Cwd, "page.html")
 	if err := os.WriteFile(page, []byte("<p>hi</p>"), 0o600); err != nil {
 		t.Fatal(err)
@@ -313,14 +276,303 @@ func TestScreenshotFallbackWhenModelIsBlind(t *testing.T) {
 	tc := toolCall{}
 	tc.Function.Name = "screenshot"
 	tc.Function.Arguments = `{"path":"page.html"}`
-	text, failed := a.executeTool(context.Background(), s.ID, tc)
+	tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+	text, failed := tu.Output, tu.Failed
 	if !failed {
 		t.Fatalf("failed=false, text=%q", text)
 	}
 	if strings.Contains(text, "unknown tool") {
 		t.Fatalf("screenshot is not registered: %q", text)
 	}
-	if !strings.Contains(text, "image inputs") {
-		t.Errorf("text = %q, want it to name the missing capability", text)
+	for _, want := range []string{"image inputs", "NUMBER", "the user has been told"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text = %q, want %q", text, want)
+		}
+	}
+}
+
+// A failed render, or a command that is not a render, attaches nothing.
+func TestRunCommandAttachesRenderedScreen(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.imagesSupported.Store(true)
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
+	shots := filepath.Join(h.sess.Cwd, "rust", "shots")
+	if err := os.MkdirAll(shots, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Any bytes will do: the attachment is the file's content, unread.
+	png := "PNG-BYTES"
+	var tc toolCall
+	tc.ID, tc.Function.Name = "c1", "run_command"
+	tc.Function.Arguments = `{"command":"printf '` + png + `' > rust/shots/05-cut.png; echo 'just snapshot 05-cut -> rust/shots/05-cut.png'"}`
+	tu, content := h.agent.runToolCall(context.Background(), h.sess.ID, tc)
+	if tu.ImageID == "" || !strings.Contains(tu.Output, "attached below as "+tu.ImageID) || !strings.Contains(tu.Output, "rust/shots/05-cut.png") {
+		t.Fatalf("no render attached: %+v", tu)
+	}
+	parts, ok := content.([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %T %v, want text + image parts", content, content)
+	}
+	if got := uiEditedUnseen([]ToolUse{{Name: "edit_file", Input: `{"path":"rust/src/ui.rs"}`}, tu}, h.sess.Cwd); got != nil {
+		t.Errorf("an attached render did not count as a look: %v", got)
+	}
+
+	// The same pixels again are a note, not a second copy, and still a look.
+	first := tu.ImageID
+	tc.ID, tc.Function.Arguments = "c1b", `{"command":"printf '`+png+`' > rust/shots/05-cut.png; echo 'just snapshot 05-cut again'"}`
+	again, content := h.agent.runToolCall(context.Background(), h.sess.ID, tc)
+	if again.ImageID != "" || again.SameImageAs != first || !strings.Contains(again.Output, "is the same picture as "+first) {
+		t.Errorf("an unchanged render was attached again: %+v", again)
+	}
+	if _, isText := content.(string); !isText {
+		t.Errorf("an unchanged render sent %T, want text only", content)
+	}
+	if got := uiEditedUnseen([]ToolUse{{Name: "edit_file", Input: `{"path":"rust/src/ui.rs"}`}, again}, h.sess.Cwd); got != nil {
+		t.Errorf("an unchanged render did not count as a look: %v", got)
+	}
+	tc.ID, tc.Function.Arguments = "c1c", `{"command":"printf 'OTHER-BYTES' > rust/shots/05-cut.png; echo 'just snapshot 05-cut'"}`
+	if changed, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); changed.ImageID == "" || changed.ImageID == first {
+		t.Errorf("a changed render was not attached: %+v", changed)
+	}
+
+	tc.ID, tc.Function.Arguments = "c2", `{"command":"echo snapshot failed; exit 1"}`
+	if tu, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); tu.ImageID != "" {
+		t.Error("a failed render attached a picture")
+	}
+	tc.ID, tc.Function.Arguments = "c3", `{"command":"printf '`+png+`' > rust/shots/06-lane.png; echo wrote"}`
+	if tu, _ := h.agent.runToolCall(context.Background(), h.sess.ID, tc); tu.ImageID != "" {
+		t.Error("a command that is not a render attached a picture")
+	}
+}
+
+// A render with a picture of the same name in the spec is attached beside it: the
+// spec's picture on the left at the render's height, a grey bar, the render on the
+// right. The note carries the mark the /spec gate looks for.
+func TestRenderIsAttachedBesideTheSpecPicture(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.imagesSupported.Store(true)
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
+	solid := func(path string, w, ht int, c color.Color) {
+		t.Helper()
+		img := image.NewRGBA(image.Rect(0, 0, w, ht))
+		draw.Draw(img, img.Bounds(), &image.Uniform{c}, image.Point{}, draw.Src)
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			t.Fatal(err)
+		}
+		writeTree(t, h.sess.Cwd, map[string]string{path: buf.String()})
+	}
+	red, blue := color.RGBA{255, 0, 0, 255}, color.RGBA{0, 0, 255, 255}
+	solid("spec/img/04-prepare.png", 40, 20, red)
+	solid("render.png", 30, 40, blue)
+
+	var tc toolCall
+	tc.ID, tc.Function.Name = "c1", "run_command"
+	tc.Function.Arguments = `{"command":"mkdir -p rust/shots && cp render.png rust/shots/04-prepare.png && echo 'just snapshot 04-prepare'"}`
+	tu, content := h.agent.runToolCall(context.Background(), h.sess.ID, tc)
+	if tu.ImageID == "" || !strings.Contains(tu.Output, sideBySideMark+"spec/img/04-prepare.png") || !strings.Contains(tu.Output, "on the LEFT the spec's picture") {
+		t.Fatalf("no side by side attached: %+v", tu)
+	}
+	parts, ok := content.([]any)
+	if !ok || len(parts) != 2 {
+		t.Fatalf("content = %T, want text + image", content)
+	}
+	url := parts[1].(map[string]any)["image_url"].(map[string]string)["url"]
+	data, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(url, "data:image/png;base64,"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 40x20 scaled to height 40 is 80 wide; then the bar, then the 30-wide render.
+	if b := img.Bounds(); b.Dx() != 80+sideBySideGap+30 || b.Dy() != 40 {
+		t.Fatalf("side by side is %v, want %dx40", b, 80+sideBySideGap+30)
+	}
+	for _, c := range []struct {
+		x    int
+		want color.Color
+	}{{5, red}, {79, red}, {80, color.Gray{Y: 128}}, {80 + sideBySideGap, blue}, {125, blue}} {
+		if r1, g1, b1, _ := img.At(c.x, 20).RGBA(); func() bool { r2, g2, b2, _ := c.want.RGBA(); return r1 != r2 || g1 != g2 || b1 != b2 }() {
+			t.Errorf("pixel at x=%d is %v, want %v", c.x, img.At(c.x, 20), c.want)
+		}
+	}
+}
+
+// A recipe that writes more than the screen (the page behind a crop as a sidecar, a second
+// screen, a picture into the spec folder) still gets the screen with a spec picture
+// compared: a sidecar written last once kept a lane screen from ever being compared.
+func TestRenderWithASpecPictureIsPickedOverNewerFiles(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.imagesSupported.Store(true)
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 8, 8))); err != nil {
+		t.Fatal(err)
+	}
+	pic := buf.String()
+	buf.Reset()
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 9, 9))); err != nil {
+		t.Fatal(err)
+	}
+	// The recipes write their files from scripts, so a command names only its screen.
+	writeTree(t, h.sess.Cwd, map[string]string{
+		"spec/img/06-lane.png": pic, "spec/img/06-preview.png": pic, "spec/img/07-Narrate.png": pic, "pic.png": pic, "pic2.png": buf.String(),
+		"sidecar.sh": "mkdir -p rust/shots && cp pic.png rust/shots/06-lane.png && sleep 0.05 && cp pic.png rust/shots/06-lane.page.png\n",
+		"two.sh":     "cp pic2.png rust/shots/06-preview.png && sleep 0.05 && cp pic.png rust/shots/06-lane.png\n",
+		"case.sh":    "cp pic.png rust/shots/07-narrate.png\n",
+		"into.sh":    "cp pic.png spec/img/08-produce.png\n",
+	})
+	// sent is the text the model gets: the tool's output, or the text part beside the image.
+	var sent string
+	run := func(id, cmd string) ToolUse {
+		t.Helper()
+		var tc toolCall
+		tc.ID, tc.Function.Name, tc.Function.Arguments = id, "run_command", fmt.Sprintf("{\"command\":%q}", cmd)
+		tu, content := h.agent.runToolCall(context.Background(), h.sess.ID, tc)
+		sent = tu.Output
+		if parts, ok := content.([]any); ok {
+			sent = fmt.Sprint(parts[0])
+		}
+		return tu
+	}
+
+	// The sidecar is written after the subject's crop.
+	tu := run("c1", "sh sidecar.sh && echo 'just snapshot 06-lane'")
+	if !strings.Contains(tu.Output, sideBySideMark+"spec/img/06-lane.png") || !strings.Contains(tu.Output, "rust/shots/06-lane.png,") {
+		t.Errorf("the sidecar shadowed the screen: %s", tu.Output)
+	}
+
+	// Two screens with pictures: the one the command names is compared though older, the
+	// other is named; a file the command before wrote is not counted again.
+	tu = run("c2", "sh two.sh && echo 'just snapshot 06-preview'")
+	if tu.ImageID == "" || !strings.Contains(sent, sideBySideMark+"spec/img/06-preview.png") || !strings.Contains(sent, "also rendered rust/shots/06-lane.png (spec picture spec/img/06-lane.png);") {
+		t.Errorf("two screens: %s", tu.Output)
+	}
+	// A longer name is not this screen's: unnamed, the newest with a picture is compared.
+	tu = run("c3", "sh two.sh && echo 'just snapshot 06-preview-wide'")
+	if !strings.Contains(tu.Output, sideBySideMark+"spec/img/06-lane.png") {
+		t.Errorf("a longer name counted as the screen's: %s", tu.Output)
+	}
+
+	// A stem in another case is the same screen.
+	tu = run("c4", "sh case.sh && echo 'just snapshot 07-narrate'")
+	if !strings.Contains(tu.Output, sideBySideMark+"spec/img/07-Narrate.png") || strings.Contains(tu.Output, "also rendered") {
+		t.Errorf("case of the stem: %s", tu.Output)
+	}
+
+	// A render written into the spec folder is attached, but never beside itself.
+	tu = run("c5", "sh into.sh && echo 'just snapshot 08-produce'")
+	if tu.ImageID == "" && tu.SameImageAs == "" || strings.Contains(tu.Output, sideBySideMark) {
+		t.Errorf("a render into the spec folder: %+v", tu)
+	}
+}
+
+// A 2x render comes back at exactly half; a small image and a non-PNG untouched.
+func TestDownscalePNG(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 40, 30))
+	for y := 0; y < 30; y++ {
+		for x := 0; x < 40; x++ {
+			if (x+y)%2 == 0 {
+				img.Set(x, y, color.White)
+			} else {
+				img.Set(x, y, color.Black)
+			}
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	out := downscalePNG(buf.Bytes(), 20)
+	got, err := png.Decode(bytes.NewReader(out))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := got.Bounds(); b.Dx() != 20 || b.Dy() != 15 {
+		t.Errorf("scaled to %dx%d, want 20x15", b.Dx(), b.Dy())
+	}
+	if r, _, _, _ := got.At(3, 3).RGBA(); r < 0x7000 || r > 0x9000 {
+		t.Errorf("a 2x2 checker box averaged to %x, want mid grey", r)
+	}
+	if same := downscalePNG(buf.Bytes(), 100); !bytes.Equal(same, buf.Bytes()) {
+		t.Error("a small image was re-encoded")
+	}
+	if same := downscalePNG([]byte("PNG-BYTES"), 20); string(same) != "PNG-BYTES" {
+		t.Error("undecodable bytes were changed")
+	}
+}
+
+// A region outside the picture says how big the picture is.
+func TestScreenshotPictureRegion(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.imagesSupported.Store(true)
+	img := image.NewRGBA(image.Rect(0, 0, 300, 200))
+	for y := 0; y < 200; y++ {
+		for x := 0; x < 300; x++ {
+			if y >= 100 {
+				img.Set(x, y, color.Black)
+			} else {
+				img.Set(x, y, color.White)
+			}
+		}
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(h.sess.Cwd, "shot.png"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	text, parts, id, failed := dispatchScreenshot(context.Background(), h.agent, h.sess.ID, `{"path":"shot.png"}`)
+	if failed || id == "" || len(parts) != 2 || !strings.Contains(text, "shot.png (300x200 px)") {
+		t.Fatalf("whole picture = %q %v", text, failed)
+	}
+	text, _, id, failed = dispatchScreenshot(context.Background(), h.agent, h.sess.ID, `{"path":"shot.png","region":[0,90,100,20]}`)
+	if failed || !strings.Contains(text, "region x 0-100, y 90-110, enlarged 14x") {
+		t.Fatalf("region = %q %v", text, failed)
+	}
+	data, _, err := readImageFile(h.sess.Cwd, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := png.Decode(bytes.NewReader(data))
+	if b := got.Bounds(); b.Dx() != 1400 || b.Dy() != 280 {
+		t.Errorf("region size = %v, want 1400x280", b)
+	}
+	if r, _, _, _ := got.At(5, 5).RGBA(); r != 0xffff {
+		t.Error("top of the region should be white")
+	}
+	if r, _, _, _ := got.At(5, 275).RGBA(); r != 0 {
+		t.Error("bottom of the region should be black")
+	}
+	if text, _, _, failed := dispatchScreenshot(context.Background(), h.agent, h.sess.ID, `{"path":"shot.png","region":[500,500,10,10]}`); !failed || !strings.Contains(text, "300x200") {
+		t.Errorf("region outside = %q %v", text, failed)
+	}
+}
+
+// Looking at the same picture again gets a note: the pixels are already in view.
+func TestScreenshotOfAPictureAlreadyInView(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.imagesSupported.Store(true)
+	img := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(s.Cwd, "shot.png"), buf.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var tc toolCall
+	tc.ID, tc.Function.Name, tc.Function.Arguments = "s1", "screenshot", `{"path":"shot.png"}`
+	first, content := a.runToolCall(context.Background(), s.ID, tc)
+	if _, isParts := content.([]any); first.ImageID == "" || !isParts {
+		t.Fatalf("the first look sent no picture: %+v", first)
+	}
+	tc.ID = "s2"
+	again, content := a.runToolCall(context.Background(), s.ID, tc)
+	if _, isText := content.(string); !isText || again.ImageID != "" || again.SameImageAs != first.ImageID || !strings.Contains(again.Output, "already in your view") {
+		t.Errorf("the same picture was sent again: %+v (%T)", again, content)
 	}
 }

@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	_ "image/jpeg"
+	"image/png"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,107 +20,89 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
-// screenshot renders a file from the workspace with headless Firefox and hands
-// the PNG to the model in the SAME turn, the way view_image does: runToolCall
-// intercepts the call and appends a multimodal Role:"tool" message instead of
-// the usual text one, so the next llmStream call already sees the picture.
-//
-// The bytes go into the content-addressed store and the id is recorded on the
-// ToolUse (ImageID). Replay rebuilds the parts from THAT, and never re-renders:
-// the page may have changed since, and a different image in the middle of the
-// prompt reprocesses every message behind it.
-//
-// Firefox and not Chromium because that's what the user has. Firefox has no
-// --dump-dom, so there is no text channel out of the page; `selector` gets its
-// answer back over a loopback beacon instead (see startBeacon).
+// Replay rebuilds a screenshot from the stored bytes (ToolUse.ImageID), never by
+// re-rendering: a changed image mid-prompt would reprocess everything after it.
 
 const (
 	screenshotDefaultWidth  = 1400
 	screenshotDefaultHeight = 1200
 	screenshotMaxWidth      = 2560
 	screenshotMaxHeight     = 4000
-	// A 1400x6000 shot of a real lecture page measured 2.6MB, so 4MB is roughly
-	// "one very tall page". Past that the model should be scoping with
-	// `selector` rather than pushing a poster into the prompt.
+	// Past this the model should scope with `selector`; it bounds an attached
+	// render too.
 	maxScreenshotBytes = 4 << 20
 	screenshotTimeout  = 90 * time.Second
-	// Page pixels left above a `selector` element, so it doesn't sit flush
-	// against the top edge with no context.
+	// Page pixels left above a `selector` element.
 	screenshotMargin = 40
 )
-
-// firefoxBinaries are the names Firefox ships under across distros (Debian and
-// Ubuntu package the ESR line as firefox-esr; some tarball installs land as
-// firefox-bin).
-var firefoxBinaries = []string{"firefox", "firefox-esr", "firefox-bin"}
 
 var (
 	headOpenRe  = regexp.MustCompile(`(?i)<head[^>]*>`)
 	bodyCloseRe = regexp.MustCompile(`(?i)</body>`)
 )
 
-func init() {
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": "screenshot",
-				"description": "Render a local HTML/SVG/image file with headless Firefox and look at the result. " +
-					"Use it to CHECK a rendering you changed (CSS, template, generated page) instead of asking the user whether it looks right. " +
-					"Point `path` at the BUILT file the user sees, not the source template it was generated from. " +
-					"`selector` puts one element at the top of the shot: that is how you inspect a block of a long page without pushing a huge image into the prompt. " +
-					"A screenshot tells you WHETHER something is off, not by how much: for a distance, measure it as a number instead.",
-				"parameters": map[string]any{
-					"type":     "object",
-					"required": []string{"path"},
-					"properties": map[string]any{
-						"path": map[string]any{
-							"type":        "string",
-							"description": "Project-relative path of the file to render, e.g. `out/index.html`. Must be inside the project; there is no URL mode.",
-						},
-						"selector": map[string]any{
-							"type":        "string",
-							"description": "Optional CSS selector. Its first match is scrolled to the top of the shot, and the reply says whether it matched and where it sits.",
-						},
-						"width": map[string]any{
-							"type":        "integer",
-							"description": fmt.Sprintf("Viewport width in px. Default %d, max %d.", screenshotDefaultWidth, screenshotMaxWidth),
-						},
-						"height": map[string]any{
-							"type":        "integer",
-							"description": fmt.Sprintf("Viewport height in px. Default %d, max %d. A taller shot captures more of the page and costs more; prefer `selector`.", screenshotDefaultHeight, screenshotMaxHeight),
-						},
+var screenshotTool = Tool{
+	Def: map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name": "screenshot",
+			"description": "Render a local HTML/SVG/image file with headless Firefox and look at the result. " +
+				"Use it to CHECK a rendering you changed (CSS, template, generated page) instead of asking the user whether it looks right. " +
+				"Point `path` at the BUILT file the user sees, not the source template it was generated from. " +
+				"`selector` puts one element at the top of the shot: that is how you inspect a block of a long page without pushing a huge image into the prompt. " +
+				"A screenshot tells you WHETHER something is off, not by how much: for a distance, measure it as a number instead.",
+			"parameters": map[string]any{
+				"type":     "object",
+				"required": []string{"path"},
+				"properties": map[string]any{
+					"path": map[string]any{
+						"type":        "string",
+						"description": "Project-relative path of the file to render, e.g. `out/index.html`. Must be inside the project; there is no URL mode.",
+					},
+					"region": map[string]any{
+						"type":        "array",
+						"items":       map[string]any{"type": "integer"},
+						"description": "Only for a picture file (.png, .jpg): [x, y, width, height] in the picture's own pixels, returned enlarged, for a close look at one part of a screen: {\"path\": \"shots/06-lane.png\", \"region\": [0, 560, 1500, 260]}. The reply for a whole picture states its size in pixels. Use this instead of cropping with a script.",
+					},
+					"selector": map[string]any{
+						"type":        "string",
+						"description": "Optional CSS selector. Its first match is scrolled to the top of the shot, and the reply says whether it matched and where it sits.",
+					},
+					"width": map[string]any{
+						"type":        "integer",
+						"description": fmt.Sprintf("Viewport width in px. Default %d, max %d.", screenshotDefaultWidth, screenshotMaxWidth),
+					},
+					"height": map[string]any{
+						"type":        "integer",
+						"description": fmt.Sprintf("Viewport height in px. Default %d, max %d. A taller shot captures more of the page and costs more; prefer `selector`.", screenshotDefaultHeight, screenshotMaxHeight),
 					},
 				},
 			},
 		},
-		// Execute is the fallback path, same shape as view_image's: real
-		// success goes through dispatchScreenshot and never reaches here.
-		Execute: screenshotExecuteFallback,
-	})
+	},
+	// Only a fallback: real success goes through dispatchScreenshot.
+	Execute: screenshotExecuteFallback,
 }
 
-// screenshotExecuteFallback runs when the dispatcher declined to intercept,
-// which in practice means the LLM takes no image input. Rendering a page the
-// model then cannot see would burn a browser launch to deliver nothing, so it
-// fails loudly instead, and tells the USER, since "my model has no vision" is
-// a configuration fact they can act on and the model cannot.
+// screenshotExecuteFallback is reached when the LLM takes no images: tell the
+// user, who can fix the config, rather than burn a browser launch.
 func screenshotExecuteFallback(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-	if !a.imagesSupported {
+	if !a.imagesSupported.Load() {
 		a.say(ctx, sid, "❕ The model asked for a screenshot, but this LLM reports no image support, so it can't be shown one. If your model does accept images, set `image_support = true` on its [[llm]] entry in settings.toml.\n")
 		return "screenshot: this LLM doesn't accept image inputs, so the rendering can't be delivered (the user has been told). Verify it as a NUMBER instead: render the page and print the measurement as text.", true
 	}
 	return "screenshot: internal: dispatch missed the intercept. Try once more; if it persists, verify the rendering as a number instead.", true
 }
 
-// dispatchScreenshot renders the page and returns (textForToolUseOutput,
-// multimodalParts, imageID, failed). The text is what lands in ToolUse.Output
-// AND is parts[0], so a replay built from the stored output plus the stored
-// bytes is byte-identical to the live call.
+// dispatchScreenshot's text is both ToolUse.Output and parts[0], so a replay
+// from the stored output and bytes is byte-identical to the live call.
 func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs string) (string, []any, string, bool) {
 	sess := a.getSession(sid)
 	if sess == nil {
@@ -134,7 +120,11 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 	if info, err := os.Stat(abs); err != nil || info.IsDir() {
 		return fmt.Sprintf("screenshot: %s is not a readable file. Only files inside the project can be rendered; there is no URL mode.", rel), nil, "", true
 	}
-	bin, err := firefoxPath()
+	switch strings.ToLower(filepath.Ext(abs)) {
+	case ".png", ".jpg", ".jpeg":
+		return a.viewPicture(ctx, sid, sess, rel, abs, args)
+	}
+	bin, err := findFirefox()
 	if err != nil {
 		return "screenshot: " + err.Error() + ". Install it (the OS skill has the package name) and call screenshot again, or verify the rendering as a number instead.", nil, "", true
 	}
@@ -151,11 +141,8 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 		a.FailToolCall(ctx, sid, tcID, msg)
 		return msg, nil, "", true
 	}
-	// Content-addressed, same scheme as a pasted image: identical pixels reuse
-	// the same id, so re-shooting an unchanged page doesn't grow the store.
-	sum := sha256.Sum256(png)
-	id := "img_" + hex.EncodeToString(sum[:8])
-	if err := writeImageFile(sess.Cwd, id, "image/png", png); err != nil {
+	id, err := storeImage(sess.Cwd, "image/png", png)
+	if err != nil {
 		msg := "screenshot: rendered but could not be stored: " + err.Error()
 		a.FailToolCall(ctx, sid, tcID, msg)
 		return msg, nil, "", true
@@ -165,49 +152,30 @@ func dispatchScreenshot(ctx context.Context, a *agent, sid string, rawArgs strin
 	return text, imageParts(text, "image/png", png), id, false
 }
 
-// imageParts is the multimodal Role:"tool" content: the text the model reads
-// plus the bytes it looks at. Live dispatch and history replay both build the
-// parts HERE from the same (text, mime, bytes), which is what keeps a replayed
-// turn byte-identical to the original and the prefix cache intact.
+// imageParts is shared by live dispatch and history replay, which keeps a
+// replayed turn byte-identical and the prefix cache intact.
 func imageParts(text, mime string, data []byte) []any {
-	return []any{
-		map[string]any{"type": "text", "text": text},
-		map[string]any{
-			"type": "image_url",
-			"image_url": map[string]string{
-				"url": fmt.Sprintf("data:%s;base64,%s", mime, base64.StdEncoding.EncodeToString(data)),
-			},
+	return []any{map[string]any{"type": "text", "text": text}, imageURLPart(mime, data)}
+}
+
+func imageURLPart(mime string, data []byte) map[string]any {
+	return map[string]any{
+		"type": "image_url",
+		"image_url": map[string]string{
+			"url": fmt.Sprintf("data:%s;base64,%s", mime, base64.StdEncoding.EncodeToString(data)),
 		},
 	}
 }
 
-func firefoxPath() (string, error) {
-	for _, name := range firefoxBinaries {
-		if p, err := exec.LookPath(name); err == nil {
-			return p, nil
-		}
-	}
-	return "", fmt.Errorf("no Firefox on PATH (tried %s)", strings.Join(firefoxBinaries, ", "))
-}
-
-// clampDimension reads a pixel argument, falling back to def when absent and
-// capping at max. A model that asks for 20000px gets the cap, not a failure:
-// the shot is still useful and the reply states the size actually used.
 func clampDimension(args toolArgs, key string, def, max int) int {
 	n, ok := args.num(key)
 	if !ok || n <= 0 {
 		return def
 	}
-	if n > max {
-		return max
-	}
-	return n
+	return min(n, max)
 }
 
-// renderPage drives Firefox once and returns the PNG plus a note about the
-// selector (empty when none was asked for). Everything it writes lives in one
-// temp dir that goes away with the call: the project tree is never touched,
-// not even to instrument the page.
+// renderPage never writes to the project tree, not even to instrument the page.
 func renderPage(ctx context.Context, bin, page, selector string, width, height int) ([]byte, string, error) {
 	tmp, err := os.MkdirTemp("", "codehalter-shot-")
 	if err != nil {
@@ -218,9 +186,8 @@ func renderPage(ctx context.Context, bin, page, selector string, width, height i
 			slog.Debug("screenshot: could not remove temp dir", "dir", tmp, "err", err)
 		}
 	}()
-	// A pre-created profile dir is not optional: without --profile (and
-	// --no-remote --new-instance) Firefox tries to attach to an already-running
-	// instance and hangs until the timeout instead of rendering.
+	// Without its own --profile (and --no-remote --new-instance) Firefox attaches
+	// to an already-running instance and hangs until the timeout.
 	profile := filepath.Join(tmp, "profile")
 	if err := os.Mkdir(profile, 0o700); err != nil {
 		return nil, "", err
@@ -249,8 +216,7 @@ func renderPage(ctx context.Context, bin, page, selector string, width, height i
 		"--window-size", fmt.Sprintf("%d,%d", width, height),
 		"--screenshot", shot,
 		"file://"+target)
-	// HOME into the temp dir so a first run can't scatter ~/.mozilla state into
-	// the user's home; the profile is throwaway anyway.
+	// HOME in the temp dir, so a first run cannot scatter ~/.mozilla state.
 	cmd.Env = append(os.Environ(), "HOME="+tmp, "MOZ_HEADLESS=1")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return nil, "", fmt.Errorf("firefox failed: %v (%s)", err, truncate(strings.TrimSpace(string(out)), 300))
@@ -273,10 +239,8 @@ func renderPage(ctx context.Context, bin, page, selector string, width, height i
 	return data, note, nil
 }
 
-// selectorNote turns the beacon payload into the sentence the model reads. A
-// selector that matched nothing is the trap this exists to close: without it
-// the model gets the top of the page and no reason to doubt it's looking at
-// what it asked for.
+// selectorNote exists for the selector that matched nothing: otherwise the model
+// gets the top of the page with no reason to doubt it.
 func selectorNote(selector, report string) string {
 	switch {
 	case strings.HasPrefix(report, "matched=1"):
@@ -288,11 +252,6 @@ func selectorNote(selector, report string) string {
 	}
 }
 
-// writeInstrumented copies the page into dir with two additions: a <base> so
-// its relative CSS, fonts and images still resolve from the original
-// directory, and a load handler that shifts the selector's element to the top
-// and reports back over the beacon. The copy is why the project tree stays
-// untouched.
 func writeInstrumented(dir, page, selector, beaconURL string) (string, error) {
 	raw, err := os.ReadFile(page)
 	if err != nil {
@@ -313,11 +272,8 @@ func writeInstrumented(dir, page, selector, beaconURL string) (string, error) {
 	} else {
 		html = base + html
 	}
-	// translateY on the root element instead of scrollTop: a transform doesn't
-	// reflow, so the shift is exactly the measured offset, and --screenshot
-	// renders from the top of the document however the page was scrolled.
-	// The XHR is SYNCHRONOUS on purpose: an async one loses the race with
-	// Firefox exiting right after the screenshot.
+	// translateY, not scrollTop: --screenshot renders from the document top
+	// however it was scrolled. The XHR is synchronous so it beats Firefox's exit.
 	script := fmt.Sprintf(`<script>window.addEventListener('load', function () {
   var el = document.querySelector(%s), out = 'matched=0';
   if (el) {
@@ -341,9 +297,8 @@ func writeInstrumented(dir, page, selector, beaconURL string) (string, error) {
 	return out, nil
 }
 
-// beacon is the way a number gets out of a headless Firefox that has no
-// --dump-dom: the page GETs a loopback URL and the query string is the payload.
-// Port 0 so concurrent screenshots never collide.
+// beacon gets a value out of headless Firefox, which has no --dump-dom: the page
+// GETs a loopback URL with the payload as its query string.
 type beacon struct {
 	ln net.Listener
 	ch chan string
@@ -360,14 +315,13 @@ func startBeacon() (*beacon, error) {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			select {
 			case b.ch <- r.URL.RawQuery:
-			default: // first report wins; a page that beacons twice is not an error
+			default: // first report wins
 			}
 			w.Header().Set("Content-Length", "0")
 			w.WriteHeader(http.StatusOK)
 		}),
 	}
 	go func() {
-		// Serve always ends with an error; the expected one is the Close below.
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, net.ErrClosed) {
 			slog.Debug("screenshot beacon stopped", "err", err)
 		}
@@ -383,9 +337,8 @@ func (b *beacon) Close() {
 	}
 }
 
-// report reads what the page sent, or "" if it sent nothing. Non-blocking:
-// the XHR is synchronous, so by the time Firefox has exited the payload is
-// already in the channel.
+// report does not block: the XHR is synchronous, so once Firefox has exited the
+// payload is already in the channel.
 func (b *beacon) report() string {
 	select {
 	case q := <-b.ch:
@@ -397,4 +350,365 @@ func (b *beacon) report() string {
 	default:
 		return ""
 	}
+}
+
+// attachRenderedScreen returns an empty id when there is nothing to attach. It
+// stores and builds parts like screenshot, so replay rebuilds the same message.
+// sameAs is set instead of id when the render is a picture already in view.
+func (a *agent) attachRenderedScreen(ctx context.Context, sid, rawArgs, result string, since time.Time) (text string, parts []any, id, sameAs string) {
+	cmd := parseArgs(rawArgs).str("command")
+	if !strings.Contains(cmd, "snapshot") || !strings.HasPrefix(result, "exit 0\n") {
+		return "", nil, "", ""
+	}
+	sess := a.getSession(sid)
+	if sess == nil {
+		return "", nil, "", ""
+	}
+	written := pngsWrittenSince(sess.Cwd, since)
+	// A recipe can write several files per screen (the subject's crop, then the page behind
+	// it as a sidecar), or several screens at once. The newest is then the sidecar, and a
+	// round that rendered 06-lane.png beside spec/img/06-lane.png never got them compared.
+	pics := specPicturesByStem(sess.Cwd)
+	specOf := func(p string) string {
+		stem := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+		for _, pic := range pics[strings.ToLower(stem)] {
+			if filepath.Join(sess.Cwd, pic) != p { // a render written into the spec folder is no picture of itself
+				return pic
+			}
+		}
+		return ""
+	}
+	// Named as a whole word: `snapshot 06-lane-wide` does not name 06-lane.
+	named := func(p string) bool {
+		stem := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+		if stem == "" {
+			return false
+		}
+		inName := func(r rune) bool {
+			return r == '-' || r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+		}
+		for rest, off := cmd, 0; ; {
+			i := strings.Index(rest, stem)
+			if i < 0 {
+				return false
+			}
+			at := off + i
+			before, _ := utf8.DecodeLastRuneInString(cmd[:at])
+			after, _ := utf8.DecodeRuneInString(cmd[at+len(stem):])
+			if !inName(before) && !inName(after) {
+				return true
+			}
+			rest, off = rest[i+1:], at+1
+		}
+	}
+	rank := func(p string) int {
+		switch {
+		case specOf(p) != "" && named(p):
+			return 0
+		case specOf(p) != "":
+			return 1
+		}
+		return 2
+	}
+	slices.SortStableFunc(written, func(x, y string) int { return rank(x) - rank(y) })
+	png, spec := "", ""
+	var data []byte
+	for _, p := range written {
+		if b, err := os.ReadFile(p); err == nil && len(b) > 0 && len(b) <= maxScreenshotBytes {
+			png, data = p, b
+			break
+		}
+	}
+	if png == "" {
+		return "", nil, "", ""
+	}
+	// Other screens with a picture of their own are named, so the round renders each.
+	var others []string
+	for _, p := range written {
+		if pic := specOf(p); p != png && pic != "" {
+			if rel, err := filepath.Rel(sess.Cwd, p); err == nil {
+				others = append(others, fmt.Sprintf("%s (spec picture %s)", filepath.ToSlash(rel), pic))
+			}
+		}
+	}
+	if len(others) > 0 {
+		result += fmt.Sprintf("\n[codehalter, not the user: this command also rendered %s; only one render is attached per command, so render each of those on its own to see it beside its picture.]", strings.Join(others, ", "))
+	}
+	// The spec's own picture of this screen goes beside the render: told to compare in
+	// words, a round passed with the page laid out other than its picture.
+	if spec = specOf(png); spec != "" {
+		both, err := sideBySide(filepath.Join(sess.Cwd, spec), data)
+		if err != nil {
+			slog.Debug("attachRenderedScreen: no side by side", "spec", spec, "err", err)
+			spec = ""
+		} else {
+			data = both
+		}
+	}
+	data = downscalePNG(data, attachMaxSide)
+	rel, err := filepath.Rel(sess.Cwd, png)
+	if err != nil {
+		rel = png
+	}
+	rel = filepath.ToSlash(rel)
+	if same, _ := storeImage("", "image/png", data); sess.imageInView(same) {
+		a.say(ctx, sid, fmt.Sprintf("👁 the rendered screen %s is unchanged (%s): not attached again\n", rel, same))
+		if spec != "" {
+			return result + fmt.Sprintf("\n[codehalter, not the user: %s%s: the spec's picture on the left and the screen this command rendered, %s, on the right, is the same picture as %s, which is already in your view above, so it is not attached again: nothing on the screen changed. Rendering it again shows the same; change the code where the arrangement differs from the picture.]", sideBySideMark, spec, rel, same), nil, "", same
+		}
+		return result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s, is the same picture as %s, which is already in your view above, so it is not attached again: nothing on it changed. Rendering it again shows the same; change the code, or look at the spec's picture with `screenshot` and compare.]", rel, same), nil, "", same
+	}
+	id, err = storeImage(sess.Cwd, "image/png", data)
+	if err != nil {
+		slog.Debug("attachRenderedScreen: could not store the render", "png", png, "err", err)
+		return "", nil, "", ""
+	}
+	size := ""
+	if cfg, _, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		size = fmt.Sprintf(", %dx%d px as attached", cfg.Width, cfg.Height)
+	}
+	if spec != "" {
+		text = result + fmt.Sprintf("\n[codehalter, not the user: %s%s. Attached below as %s%s: on the LEFT the spec's picture %s, on the RIGHT the screen this command rendered, %s, scaled to the same height. Compare the arrangement before anything else: what sits left or right, above or below, in the header bar or under it, what is split by a divider and which way, the order of the controls, what is missing or extra. Name every difference, fix those the spec text asks for, then render again. For a closer look at one part, call screenshot on either file with \"region\": [x, y, width, height] in that file's own pixels.]", sideBySideMark, spec, id, size, spec, rel)
+		a.say(ctx, sid, fmt.Sprintf("👁 attached the rendered screen %s beside the spec's picture %s\n", rel, spec))
+		return text, imageParts(text, "image/png", data), id, ""
+	}
+	text = result + fmt.Sprintf("\n[codehalter, not the user: the screen this command rendered, %s%s, is attached below as %s. For a closer look at one part, call screenshot on that file with \"region\": [x, y, width, height] in the file's own pixels; never crop with a script. Look at it now, before anything else: is every widget the spec names on it, in the order it says; is anything empty, overlapping, cut off or unlabeled? Where the spec has its own picture of this screen (its image with the same name), look at that too with `screenshot` and compare widgets, order and labels, not pixels. Fix what you see, then render again.]", rel, size, id)
+	a.say(ctx, sid, fmt.Sprintf("👁 attached the rendered screen %s to the model's view\n", rel))
+	return text, imageParts(text, "image/png", data), id, ""
+}
+
+// sideBySideMark opens the note of a render shown beside the spec's picture; the
+// /spec gate finds a compared picture by it.
+const sideBySideMark = "side by side with the spec's picture "
+
+// specPicturesByStem maps a lower-cased file stem to the spec's pictures of that name
+// (shots/04-prepare.png belongs with spec/img/04-prepare.png), relative to cwd, in walk
+// order. The spec folder is the /spec ledger's, else `spec`.
+func specPicturesByStem(cwd string) map[string][]string {
+	dir := "spec"
+	if cfg, err := loadSpecConfig(cwd); err == nil && cfg != nil && cfg.SpecDir != "" {
+		dir = cfg.SpecDir
+	}
+	pics := map[string][]string{}
+	walkErr := filepath.WalkDir(filepath.Join(cwd, dir), func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext != ".png" && ext != ".jpg" && ext != ".jpeg" {
+			return nil
+		}
+		if rel, err := filepath.Rel(cwd, path); err == nil {
+			stem := strings.ToLower(strings.TrimSuffix(d.Name(), filepath.Ext(path)))
+			pics[stem] = append(pics[stem], filepath.ToSlash(rel))
+		}
+		return nil
+	})
+	if walkErr != nil {
+		slog.Debug("specPicturesByStem: walking the spec folder", "dir", dir, "err", walkErr)
+	}
+	return pics
+}
+
+// sideBySideGap is the grey bar between the two pictures.
+const sideBySideGap = 16
+
+// sideBySide puts the picture at specPath left of the render, the spec's scaled to the
+// render's height, as one PNG.
+func sideBySide(specPath string, render []byte) ([]byte, error) {
+	specData, err := os.ReadFile(specPath)
+	if err != nil {
+		return nil, err
+	}
+	left, _, err := image.Decode(bytes.NewReader(specData))
+	if err != nil {
+		return nil, fmt.Errorf("the spec's picture: %w", err)
+	}
+	right, _, err := image.Decode(bytes.NewReader(render))
+	if err != nil {
+		return nil, fmt.Errorf("the render: %w", err)
+	}
+	h := right.Bounds().Dy()
+	scaled := scaleToHeight(left, h)
+	lw, rw := scaled.Bounds().Dx(), right.Bounds().Dx()
+	out := image.NewRGBA(image.Rect(0, 0, lw+sideBySideGap+rw, h))
+	draw.Draw(out, out.Bounds(), &image.Uniform{color.Gray{Y: 128}}, image.Point{}, draw.Src)
+	draw.Draw(out, image.Rect(0, 0, lw, h), scaled, image.Point{}, draw.Src)
+	draw.Draw(out, image.Rect(lw+sideBySideGap, 0, lw+sideBySideGap+rw, h), right, right.Bounds().Min, draw.Src)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, out); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// scaleToHeight averages the source pixels each target pixel covers, so a downscale keeps
+// thin lines; an upscale repeats pixels.
+func scaleToHeight(src image.Image, h int) *image.RGBA {
+	b := src.Bounds()
+	w := max(1, b.Dx()*h/max(1, b.Dy()))
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	for y := 0; y < h; y++ {
+		y0 := b.Min.Y + y*b.Dy()/h
+		y1 := max(y0+1, b.Min.Y+(y+1)*b.Dy()/h)
+		for x := 0; x < w; x++ {
+			x0 := b.Min.X + x*b.Dx()/w
+			x1 := max(x0+1, b.Min.X+(x+1)*b.Dx()/w)
+			var r, g, bl, al, n uint32
+			for sy := y0; sy < y1; sy++ {
+				for sx := x0; sx < x1; sx++ {
+					cr, cg, cb, ca := src.At(sx, sy).RGBA()
+					r, g, bl, al, n = r+cr, g+cg, bl+cb, al+ca, n+1
+				}
+			}
+			dst.Set(x, y, color.RGBA64{uint16(r / n), uint16(g / n), uint16(bl / n), uint16(al / n)})
+		}
+	}
+	return dst
+}
+
+// attachMaxSide halves a HiDPI (2x) snapshot back to window size, where text is
+// still sharp, at a quarter of the vision cost.
+const attachMaxSide = 1600
+
+// downscalePNG uses a whole factor, so a 2x render comes back at exactly 1x.
+func downscalePNG(data []byte, max int) []byte {
+	src, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return data
+	}
+	b := src.Bounds()
+	w, h := b.Dx(), b.Dy()
+	f := 1
+	for (w+f-1)/f > max || (h+f-1)/f > max {
+		f++
+	}
+	if f == 1 {
+		return data
+	}
+	nw, nh := w/f, h/f
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	n := uint32(f * f)
+	for y := 0; y < nh; y++ {
+		for x := 0; x < nw; x++ {
+			var r, g, bl, a uint32
+			for dy := 0; dy < f; dy++ {
+				for dx := 0; dx < f; dx++ {
+					cr, cg, cb, ca := src.At(b.Min.X+x*f+dx, b.Min.Y+y*f+dy).RGBA()
+					r, g, bl, a = r+cr, g+cg, bl+cb, a+ca
+				}
+			}
+			dst.Set(x, y, color.RGBA64{uint16(r / n), uint16(g / n), uint16(bl / n), uint16(a / n)})
+		}
+	}
+	var out bytes.Buffer
+	if err := png.Encode(&out, dst); err != nil {
+		return data
+	}
+	return out.Bytes()
+}
+
+// pngsWrittenSince lists the PNGs under root modified at or after t, newest first; equal
+// times keep walk order, so the pick is the same every run. Some filesystems keep
+// whole-second mtimes: a time with no nanoseconds counts from the start of t's second,
+// while on the rest a file the command before wrote in that same second stays out.
+func pngsWrittenSince(root string, t time.Time) []string {
+	type found struct {
+		path string
+		mod  time.Time
+	}
+	var all []found
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path != root && skipWalkDir(d.Name()) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.EqualFold(filepath.Ext(path), ".png") {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		if mod := info.ModTime(); !mod.Before(t) || mod.Nanosecond() == 0 && !mod.Before(t.Truncate(time.Second)) {
+			all = append(all, found{path, mod})
+		}
+		return nil
+	})
+	slices.SortStableFunc(all, func(x, y found) int { return y.mod.Compare(x.mod) })
+	paths := make([]string, len(all))
+	for i, f := range all {
+		paths[i] = f.path
+	}
+	return paths
+}
+
+// The kernel dates a write with the clock of its last tick, so a fast render can be dated
+// before the time taken just ahead of it and be missed by pngsWrittenSince. Waiting this
+// long after taking the time rules that out: a tick at 100 Hz, doubled.
+const mtimeTick = 20 * time.Millisecond
+
+const pictureRegionMaxSide = 1400
+
+func (a *agent) viewPicture(ctx context.Context, sid string, sess *Session, rel, abs string, args toolArgs) (string, []any, string, bool) {
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return "screenshot: " + err.Error(), nil, "", true
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return fmt.Sprintf("screenshot: %s could not be decoded as an image: %v", rel, err), nil, "", true
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	what := fmt.Sprintf("%s (%dx%d px)", rel, w, h)
+	var src image.Image = img
+	r, hasRegion := args["region"].([]any)
+	if hasRegion {
+		if len(r) != 4 {
+			return "screenshot: `region` is [x, y, width, height] in the picture's pixels, four numbers.", nil, "", true
+		}
+		ta := toolArgs{"x": r[0], "y": r[1], "w": r[2], "h": r[3]}
+		x, _ := ta.num("x")
+		y, _ := ta.num("y")
+		rw, _ := ta.num("w")
+		rh, _ := ta.num("h")
+		cut := image.Rect(x, y, x+rw, y+rh).Intersect(image.Rect(0, 0, w, h))
+		if cut.Empty() {
+			return fmt.Sprintf("screenshot: region %v lies outside %s; the picture is %dx%d.", r, rel, w, h), nil, "", true
+		}
+		f := 1
+		for (f+1)*max(cut.Dx(), cut.Dy()) <= pictureRegionMaxSide {
+			f++
+		}
+		dst := image.NewRGBA(image.Rect(0, 0, cut.Dx()*f, cut.Dy()*f))
+		for yy := 0; yy < dst.Bounds().Dy(); yy++ {
+			for xx := 0; xx < dst.Bounds().Dx(); xx++ {
+				dst.Set(xx, yy, img.At(b.Min.X+cut.Min.X+xx/f, b.Min.Y+cut.Min.Y+yy/f))
+			}
+		}
+		src = dst
+		what = fmt.Sprintf("%s, region x %d-%d, y %d-%d, enlarged %dx", what, cut.Min.X, cut.Max.X, cut.Min.Y, cut.Max.Y, f)
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, src); err != nil {
+		return "screenshot: " + err.Error(), nil, "", true
+	}
+	out := buf.Bytes()
+	if !hasRegion {
+		out = downscalePNG(out, attachMaxSide)
+	}
+	id, err := storeImage(sess.Cwd, "image/png", out)
+	if err != nil {
+		return "screenshot: could not be stored: " + err.Error(), nil, "", true
+	}
+	text := fmt.Sprintf("[Picture %s attached as %s. For a closer look at one part, pass \"region\": [x, y, width, height] in these pixels; it comes back enlarged.]", what, id)
+	tcID := a.StartToolCall(ctx, sid, "Picture: "+what, "read", []ToolCallLocation{{Path: rel}})
+	a.CompleteToolCall(ctx, sid, tcID, []ToolCallContent{TextContent(id)})
+	return text, imageParts(text, "image/png", out), id, false
 }

@@ -2,185 +2,402 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
 	"time"
 )
 
-// discoverSandbox registers `run_command` whenever we're inside a container.
-// The container itself is the sandbox: it's throwaway, the host workspace is
-// bind-mounted (the LLM can already write to those files via edit_file), and
-// apt-get/dpkg/pip writes are scoped to the container's lifetime. Devcontainers
-// are expected to bind-mount `.git` read-only so destructive git commands fail
-// at the OS layer; we no longer install a PATH shim for `git`.
+// discoverSandbox registers run_command only inside a container, which is the
+// sandbox; devcontainers are expected to bind-mount .git read-only.
 func (a *agent) discoverSandbox() {
-	// Only register run_command inside a container — the container IS the
-	// sandbox. Outside one, ensureDevcontainer aborts the session before any
-	// prompt runs, so there is no "running on host with run_command disabled"
-	// state to report; just skip registration.
 	if containerKind() == "" {
 		slog.Info("run_command: not registered (not inside a container)")
 		return
 	}
 
-	RegisterTool(Tool{Def: map[string]any{
+	a.tools.add(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
-			"name": "run_command",
-			"description": "Run a shell command that EXITS ON ITS OWN inside this devcontainer and wait for it to finish. For a long-running / never-exits process (a dev server, watcher, `python3 -m http.server`, `npm run dev`) use `run_background` instead — started here it stalls the turn until the idle timeout kills it, and adding a trailing `&` is worse: the process then survives with no pid or log recorded, so nothing can read or stop it afterwards. The container is the sandbox: it's throwaway, so apt-get/dpkg/pip writes persist for the container's lifetime (wiped on rebuild) and workspace writes are real but recoverable from `.git/`. Use this for: (1) PROBE — `which <tool>`, `cargo check`, `node --version`, `apt list --installed | grep <pkg>` — confirm what exists. (2) TEST INSTALL — when you're about to propose a Dockerfile edit (e.g. `RUN apt-get install <pkg>`), first run the same install via run_command, then verify it works (e.g. `<tool> --version` or re-running the failing build). If the install + verification succeed, propose the Dockerfile patch with confidence; if they fail, debug here before editing the Dockerfile. Exit code is always in the output and title — `which <tool>` exiting 1 means <tool> is missing, not that the tool failed. Output is auto-capped keeping the START and the END (only the middle is elided), so do NOT pipe to `head`/`tail` to shorten it: that throws away what the cap already keeps, and the most useful lines (errors, and search hits like `yay -Ss` / `apt search`) come LAST. Run the command raw; use `grep` only to filter for a specific match, never to trim length. " +
-				"For project-file edits prefer `edit_file` / `write_file` — they go through the agent's diff/approval UI, raw `>` or `sed -i` do not. " +
-				"The `.git` directory is bind-mounted read-only; destructive git commands (push, reset --hard, etc.) will fail at the filesystem layer. Read-only git is fine (clone, log, ls-remote, archive).",
+			"name":        "run_command",
+			"description": "Run a shell command: builds, tests, installs, git, and reading or searching files (`grep -rn`, `sed -n '120,180p' <file>`). Change files with `edit_file` and `write_file`, not the shell. Waits up to two minutes. Still running then, it goes on as a background job, and its exit code and last output arrive by themselves before your next step; if nothing else is left, call `respond` saying you wait. Over two minutes: `run_background`. Never ends (dev server, watcher): `run_server`. No trailing `&`. Output is capped keeping its START and END, so do not pipe to `head` or `tail`; use `grep` to filter for a match, not to trim length.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
 				"properties": map[string]any{
+					"wake_after": map[string]any{
+						"type":        "integer",
+						"description": "Optional, seconds: if it still runs in the background at this age, wake me once with its log tail. Its exit is reported separately.",
+					},
 					"command": map[string]any{
 						"type":        "string",
-						"description": "Shell command to run under bash -c. Be precise — this is not a chat. Run it raw: output is auto-capped (start+end kept), so do NOT append `| head` / `| tail` to limit size. Examples: `which <tool>`, `apt-get install -y <pkg> && <tool> --version`, `cargo check 2>&1`.",
+						"description": "Shell command, run under bash -c. Examples: `which <tool>`, `apt-get install -y <pkg> && <tool> --version`, `cargo check 2>&1`.",
 					},
 				},
 			},
 		},
 	}, Execute: runCmdExecute})
 
-	RegisterTool(Tool{Def: map[string]any{
+	a.tools.add(Tool{Def: map[string]any{
 		"type": "function",
 		"function": map[string]any{
 			"name":        "run_background",
-			"description": "Start a LONG-RUNNING / background process (a dev server, watcher, daemon) inside this devcontainer and return immediately, leaving it running. Use this INSTEAD of run_command for anything that does not exit on its own: `python3 -m http.server 8765`, `npm run dev`, `vite`, `flask run`, a file watcher. run_command WAITS for the command to finish, so starting a server there (even with a trailing `&`) hangs the turn. run_background launches the command, waits briefly to catch an immediate failure (e.g. port already in use), then returns the pid and a log-file path. The process keeps running across later tool calls, so a following run_command can probe it (e.g. `curl -s localhost:8765`). Its output streams to the log file, which you read with run_command (`cat`/`tail`). Stop it with `run_command: kill <pid>`. Do NOT add a trailing `&` — run_background already detaches it.",
+			"description": "Start a command that ENDS on its own but takes over two minutes (a full test suite, a long build) and return at once. When it exits, its exit code, log path and last output arrive by themselves before your next step. Meanwhile do other work, or call `respond` saying you wait. Never poll or `sleep` for it; for a look before it exits, give `wake_after`. A job with almost no CPU and no output for 5 minutes is stopped as stuck. Returns the pid and a log path. Stop it early with `run_command: kill -TERM -<pid>; sleep 3; kill -KILL -<pid> 2>/dev/null; true`. No trailing `&`.",
 			"parameters": map[string]any{
 				"type":     "object",
 				"required": []string{"command"},
 				"properties": map[string]any{
+					"wake_after": map[string]any{
+						"type":        "integer",
+						"description": "Optional, seconds: wake me once at this age with the log tail if it still runs (a mid-way look). The exit is reported separately.",
+					},
 					"command": map[string]any{
 						"type":        "string",
-						"description": "Shell command to run under bash -c, WITHOUT a trailing `&`. Examples: `python3 -m http.server 8765`, `npm run dev`, `flask --app app run --port 5000`.",
+						"description": "Shell command, run under bash -c, no trailing `&`. Examples: `cd rust && just test > /tmp/test.log 2>&1`, `cargo build --release`.",
 					},
 				},
 			},
 		},
 	}, Execute: runBackgroundExecute})
+
+	a.tools.add(Tool{Def: map[string]any{
+		"type": "function",
+		"function": map[string]any{
+			"name":        "run_server",
+			"description": "Start a process that never ends on its own: a dev server (`npm run dev`), a watcher, a daemon, a fake service a manual check talks to. It runs until `{\"stop\": <its job id>}` or the session ends. With `port`, the call returns once that port accepts connections (up to 60 s). No trailing `&`.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"command": map[string]any{
+						"type":        "string",
+						"description": "Shell command, run under bash -c, no trailing `&`. Examples: `python3 -m http.server 8765`, `npm run dev`.",
+					},
+					"port": map[string]any{
+						"type":        "integer",
+						"description": "Optional: the TCP port it listens on; the call waits until it accepts connections.",
+					},
+					"stop": map[string]any{
+						"type":        "integer",
+						"description": "Instead of command: the job id of a server you started, to stop it.",
+					},
+				},
+			},
+		},
+	}, Execute: runServerExecute})
 }
 
-// cmdIdleTimeout reaps a run_command that prints NOTHING for this long: no
-// output, no IO, nothing on the console. It is an IDLE timeout and deliberately
-// not a total one. A command that keeps producing output is making progress and
-// runs unbounded, however long that takes: a `grep -rln` over an archived
-// lecture site (thousands of files, gigabytes of video) took 9 minutes here and
-// exited 0 with the 14 matches that answered the question. A total cap would
-// have killed that at the 5 minute mark and thrown the answer away, while the
-// case it is supposed to catch, a hung command, is silent and this already
-// catches it. Only a user Stop overrides.
-//
-// 120s rather than 60s because "quiet" is not "hung": a compile step, a
-// download that buffers, or a walk over a slow bind mount can all go a full
-// minute without printing.
-var cmdIdleTimeout = 120 * time.Second
+// isSleepCmd matches a line that starts with `sleep` (optionally after `cd`); a
+// sleep later in the line is not a wait for a job.
+func isSleepCmd(cmd string) bool {
+	first := strings.TrimSpace(cmd)
+	if i := strings.IndexAny(first, ";&|\n"); i >= 0 {
+		head := strings.TrimSpace(first[:i])
+		if strings.HasPrefix(head, "cd ") {
+			first = strings.TrimSpace(first[i+1:])
+			first = strings.TrimLeft(first, "&|; ")
+		}
+	}
+	return first == "sleep" || strings.HasPrefix(first, "sleep ")
+}
 
-// cmdOutputCap bounds how many bytes of a command's output we hand the model.
-// The idle watchdog only fires on SILENCE, so a steadily-printing command
-// (`find /`, a chatty build, `journalctl`) would otherwise dump megabytes into a
-// weak, small-context model. We keep a head + tail window and elide the middle,
-// so a long run's start AND its trailing error both survive. A var so tests can
-// shrink it.
+// processPollRe finds a loop whose condition asks about a process, the shape of a
+// hand-made wait: `while pgrep -f x; do sleep 5; done`, `until ! kill -0 $pid; ...`.
+var processPollRe = regexp.MustCompile(`\b(?:while|until)\b[^;\n]*?(?:\bpgrep\b|\bpidof\b|\bps\b|\bkill\s+-0\b|/proc/)`)
+
+// pgrepRe finds `pgrep FLAGS PATTERN` and `pkill FLAGS PATTERN`: group 1 the flags
+// (`-f`, `-af`, `-a -f`), then the pattern quoted or bare.
+var pgrepRe = regexp.MustCompile(`\b(?:pgrep|pkill)((?:\s+-\w+)+)\s+(?:"([^"]*)"|'([^']*)'|([^\s;|&)]+))`)
+
+// shellSegments splits a command line at ; && || & and newlines outside quotes,
+// and at | too when pipes is set; without it a pipeline stays one command.
+func shellSegments(cmd string, pipes bool) []string {
+	var segs []string
+	var cur strings.Builder
+	var quote byte
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			segs = append(segs, s)
+		}
+		cur.Reset()
+	}
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case quote != 0:
+			if c == '\\' && quote == '"' && i+1 < len(cmd) {
+				cur.WriteByte(c)
+				i++
+				c = cmd[i]
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '\\' && i+1 < len(cmd):
+			cur.WriteByte(c)
+			i++
+			c = cmd[i]
+		case c == '\'' || c == '"':
+			quote = c
+		// A redirect's & (2>&1, &>f, |&) joins, it does not split.
+		case c == '&' && (i > 0 && (cmd[i-1] == '>' || cmd[i-1] == '|') || i+1 < len(cmd) && cmd[i+1] == '>'):
+		case c == '|' && !pipes && (i+1 >= len(cmd) || cmd[i+1] != '|') && (i == 0 || cmd[i-1] != '|'):
+		case c == ';' || c == '\n' || c == '|' || c == '&':
+			flush()
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	flush()
+	return segs
+}
+
+// readOnlyTools only read files or print; git and find are checked further below.
+var readOnlyTools = map[string]bool{
+	"cat": true, "head": true, "tail": true, "sed": true, "awk": true, "grep": true, "egrep": true,
+	"fgrep": true, "rg": true, "nl": true, "wc": true, "ls": true, "find": true, "git": true,
+	"tree": true, "stat": true, "diff": true, "sort": true, "uniq": true, "cut": true, "tr": true,
+	"cd": false, "echo": false, "printf": false, "pwd": false, "true": false,
+}
+
+var readOnlyGit = map[string]bool{
+	"log": true, "show": true, "diff": true, "status": true, "ls-files": true, "grep": true,
+	"blame": true, "rev-parse": true, "shortlog": true, "cat-file": true, "ls-tree": true,
+}
+
+// unquoted blanks each quoted span to a pair of quotes, so a > or a flag inside an
+// argument is not seen as one.
+func unquoted(seg string) string {
+	var b strings.Builder
+	var quote byte
+	for i := 0; i < len(seg); i++ {
+		c := seg[i]
+		switch {
+		case quote != 0:
+			if c == '\\' && quote == '"' {
+				i++
+			} else if c == quote {
+				quote = 0
+				b.WriteString("''")
+			}
+		case c == '\'' || c == '"':
+			quote = c
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// awkWritesRe: an awk program that runs a command or prints into a file or a pipe.
+var awkWritesRe = regexp.MustCompile(`system\(|\bprintf?\b[^;}]*(?:>|\|)\s*"`)
+
+// onlyReads: every segment is a file read, a search or a print, and nothing is
+// written. Such a command is served whole up to liveExemptCap, not clipped to head and tail.
+func onlyReads(cmd string) bool {
+	if strings.Contains(cmd, "$(") || strings.Contains(cmd, "`") || strings.Contains(cmd, "<<") {
+		return false
+	}
+	reads := false
+	for _, seg := range shellSegments(cmd, true) {
+		fields := strings.Fields(unquoted(seg))
+		if len(fields) == 0 {
+			continue
+		}
+		tool := fields[0]
+		reader, known := readOnlyTools[tool]
+		if !known {
+			return false
+		}
+		reads = reads || reader
+		sub := ""
+		for i, f := range fields[1:] {
+			switch {
+			case strings.Contains(f, ">") && f != "2>&1" && f != "2>/dev/null" && f != ">/dev/null" && f != "&>/dev/null":
+				return false
+			case tool == "sed" && (strings.HasPrefix(f, "--in-place") || !strings.HasPrefix(f, "--") && strings.HasPrefix(f, "-") && strings.Contains(f, "i")),
+				tool == "awk" && f == "-i",
+				tool == "find" && (strings.HasPrefix(f, "-exec") || strings.HasPrefix(f, "-ok") || strings.HasPrefix(f, "-fprint") || f == "-fls" || f == "-delete"),
+				tool == "sort" && (strings.HasPrefix(f, "--output") || !strings.HasPrefix(f, "--") && strings.HasPrefix(f, "-") && strings.Contains(f, "o")),
+				tool == "tree" && f == "-o",
+				strings.HasPrefix(f, "--output"):
+				return false
+			case tool == "git" && sub == "" && !strings.HasPrefix(f, "-") && (i == 0 || fields[i] != "-C" && fields[i] != "-c"):
+				sub = f
+			}
+		}
+		if tool == "git" && !readOnlyGit[sub] || tool == "awk" && awkWritesRe.MatchString(seg) {
+			return false
+		}
+		// `uniq in out` writes its second name.
+		if tool == "uniq" && len(slices.DeleteFunc(slices.Clone(fields[1:]), func(f string) bool { return strings.HasPrefix(f, "-") })) > 1 {
+			return false
+		}
+	}
+	return reads
+}
+
+// cmdOutputCap bounds what run_command returns; the terminal itself keeps up to
+// terminalOutputLimit. A var so tests can shrink it.
 var cmdOutputCap = 64 * 1024
 
-// boundedOutput captures a byte stream in at most headCap+tailCap bytes: the
-// first headCap as a frozen head, the most recent tailCap as a ring tail, the
-// middle elided. It bounds memory for an unbounded command while keeping both
-// ends (head shows how the run started; tail preserves the error verify reads).
-// Not safe for concurrent use.
-type boundedOutput struct {
-	headCap, tailCap int
-	head, tail       []byte
-	total            int
-}
+// cmdHandoverWait is when run_command hands a still-running command to the
+// background; nothing is killed. A var so tests can shorten it.
+var cmdHandoverWait = 120 * time.Second
 
-func newBoundedOutput(capBytes int) *boundedOutput {
-	h := capBytes / 4
-	return &boundedOutput{headCap: h, tailCap: capBytes - h}
-}
-
-// Write appends p, freezing the head once full and holding the tail to at most
-// 2*tailCap (trimmed back to tailCap when it crosses, so it's an amortised
-// O(1)/byte ring); String trims the residual to exactly the last tailCap bytes.
-func (b *boundedOutput) Write(p []byte) {
-	b.total += len(p)
-	if len(b.head) < b.headCap {
-		n := b.headCap - len(b.head)
-		if n > len(p) {
-			n = len(p)
-		}
-		b.head = append(b.head, p[:n]...)
+// boundedCapture keeps the first quarter and the last three quarters; the byte
+// cuts may split a rune, which ToValidUTF8 drops.
+func boundedCapture(out string) string {
+	if len(out) <= cmdOutputCap {
+		return out
 	}
-	b.tail = append(b.tail, p...)
-	if len(b.tail) > 2*b.tailCap {
-		b.tail = append(b.tail[:0], b.tail[len(b.tail)-b.tailCap:]...)
-	}
-}
-
-// String reassembles the captured window: the whole stream when it fit, else
-// head + an "[... N bytes omitted ...]" marker + the last tailCap bytes, stitched
-// so the overlap case neither duplicates nor drops bytes.
-func (b *boundedOutput) String() string {
-	tail := b.tail
-	if len(tail) > b.tailCap {
-		tail = tail[len(tail)-b.tailCap:]
-	}
-	switch {
-	case b.total <= b.tailCap:
-		return string(tail) // everything fit in the tail
-	case b.total <= b.headCap+b.tailCap:
-		overlap := b.headCap + b.tailCap - b.total // bytes head and tail share
-		return string(b.head) + string(tail[overlap:])
-	default:
-		omitted := b.total - b.headCap - b.tailCap
-		return string(b.head) + fmt.Sprintf("\n[... %d bytes omitted ...]\n", omitted) + string(tail)
-	}
+	head := cmdOutputCap / 4
+	tail := cmdOutputCap - head
+	return strings.ToValidUTF8(out[:head], "") +
+		fmt.Sprintf("\n[... %d bytes omitted ...]\n", len(out)-head-tail) +
+		strings.ToValidUTF8(out[len(out)-tail:], "")
 }
 
 func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-	args := parseArgs(rawArgs)
-	cmdStr := args.str("command")
-	if cmdStr == "" {
-		return "error: command is required", false
+	job, refusal := a.launchJob(ctx, sid, rawArgs, jobHandedOver)
+	if job == nil {
+		return refusal, false
 	}
-	sess := a.getSession(sid)
-	if sess == nil {
-		return "error: no session", false
-	}
-
-	tcId := a.StartToolCall(ctx, sid, "Run: "+cmdStr, "execute", nil)
-
-	out, exit, started, err := a.runTerminalCmd(ctx, sid, tcId, "bash", []string{"-c", cmdStr}, sess.Cwd, cmdIdleTimeout)
-	if !started {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return "error starting terminal: " + err.Error(), false
+	hint := func() string {
+		note, told := toolHints(job.cmdStr)
+		if told != "" {
+			a.say(ctx, sid, told+"\n")
+		}
+		return note
 	}
 
-	// Always surface the exit code. run_command is a probe: non-zero is data, not
-	// failure. Title and result both carry "(exit N)" so the model can read either
-	// and act on it. Failed is always false here: a probe exiting non-zero
-	// shouldn't fail the turn.
-	exitCode := exit.code()
-	if err != nil {
-		// Killed by the idle watchdog, cancelled by the user, or the client broke
-		// mid-command. -1 plus the error text lets the model tell "the command
-		// exited 1" apart from "the command never got to finish".
-		exitCode = -1
-		out += fmt.Sprintf("\n[terminal error: %s]\n", err)
+	select {
+	case res := <-job.exited:
+		out, oerr := a.terminalOutput(ctx, sid, job.terminalId)
+		a.endJob(job)
+		if res.err != nil {
+			// -1 tells "never got to finish" apart from a real exit 1.
+			a.FailToolCall(ctx, sid, job.tcId, res.err.Error())
+			return fmt.Sprintf("exit -1\n\n%s\n[terminal error: %s]\n", boundedCapture(out), res.err), false
+		}
+		if oerr != nil {
+			slog.Debug("run_command: output read failed", "job", job.id, "err", oerr)
+		}
+		// A non-zero exit is data, not failure, so failed stays false.
+		exitCode := res.exit.code()
+		a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Run: %s (exit %d)", job.cmdStr, exitCode), "completed")
+		return fmt.Sprintf("exit %d\n\n%s", exitCode, boundedCapture(out)) + hint(), false
+	case <-ctx.Done():
+		out, oerr := a.terminalOutput(context.Background(), sid, job.terminalId)
+		if oerr != nil {
+			slog.Debug("run_command: output read after cancel failed", "job", job.id, "err", oerr)
+		}
+		a.killJob(job)
+		a.endJob(job)
+		a.FailToolCall(ctx, sid, job.tcId, ctx.Err().Error())
+		return fmt.Sprintf("exit -1\n\n%s\n[terminal error: %s]\n", boundedCapture(out), ctx.Err()), false
+	case <-time.After(cmdHandoverWait):
 	}
 
-	result := fmt.Sprintf("exit %d\n\n%s", exitCode, out)
-	// The card already holds the terminal, which the client keeps rendering after
-	// release. Sending text content here would replace that live view with a
-	// static copy, so retitle only: a nil Content is omitted from the update, and
-	// an absent field leaves the existing content alone.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: tcId,
-		Title:      fmt.Sprintf("Run: %s (exit %d)", cmdStr, exitCode),
-		Status:     "completed",
-	})
-	return result, false
+	wake := a.handOver(job)
+	waited := humanDuration(cmdHandoverWait.Milliseconds())
+	a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Run: %s (still running after %s, continues as job %d)", job.cmdStr, waited, job.id), "in_progress")
+	return hint() + "\n" + fmt.Sprintf("still running after %s: it continues as background job %d (pid %d), nothing was killed. "+
+		"When it exits, codehalter hands you its exit code and last output by itself, before your next step.%s "+
+		"Do other work meanwhile if there is any; if not, call `respond` saying you are waiting for job %d: that parks the turn, it does not end it, and you continue here the moment the job reports. "+
+		"Never sleep or poll for it. Read its output any time with `run_command: cat %s`; %s. Output so far:\n\n%s",
+		waited, job.id, job.pid, wake, job.id, job.logPath, stopHint(job.pid), readLogTail(job.logPath, bgLogTailCap)), false
+}
+
+// toolHints returns (note for the model, chat line for the user). There are
+// deliberately no notes after grep or sed reads: the executor ignored them.
+func toolHints(cmd string) (string, string) {
+	if note, told := bgSleepHint(cmd); note != "" {
+		return note, told
+	}
+	target, ok := scriptEditTarget(cmd)
+	if !ok {
+		return "", ""
+	}
+	return "\n[codehalter: that script edited " + target + ". " + scriptEditPreview(cmd, target) +
+			" edit_file checks that old_text (or start) matches exactly one place, applies the change, shows the user a diff, and answers `file written successfully` or says exactly why not; a script does none of that. Use edit_file for the next change.]",
+		"💡 told the model: edit_file instead of a script on " + target
+}
+
+var pyReplaceRe = regexp.MustCompile(`\.replace\(\s*(` + pyStr + `)\s*,\s*(` + pyStr + `)\s*[,)]`)
+
+const pyStr = `"""(?s:.*?)"""|'''(?s:.*?)'''|"(?:[^"\\\n]|\\.)*"|'(?:[^'\\\n]|\\.)*'`
+
+func scriptEditPreview(cmd, target string) string {
+	ms := pyReplaceRe.FindAllStringSubmatch(cmd, -1)
+	if len(ms) == 0 {
+		return fmt.Sprintf("edit_file does the same as a block: {\"path\": %q, \"start\": \"<fragment of the block's first line>\", \"end\": \"<fragment of its last line>\", \"new_text\": \"<the new block>\"}, or several changes at once as {\"path\": %q, \"edits\": [...]}.", target, target)
+	}
+	// quote decodes a Python literal well enough for a preview, not exactly.
+	quote := func(lit string) string {
+		s := lit
+		switch {
+		case len(lit) >= 6 && (strings.HasPrefix(lit, `"""`) && strings.HasSuffix(lit, `"""`) || strings.HasPrefix(lit, `'''`) && strings.HasSuffix(lit, `'''`)):
+			s = lit[3 : len(lit)-3]
+		case len(lit) >= 2:
+			s = strings.NewReplacer(`\n`, "\n", `\t`, "\t", `\"`, `"`, `\'`, `'`, `\\`, `\`).Replace(lit[1 : len(lit)-1])
+		}
+		b, _ := json.Marshal(truncate(s, 160))
+		return string(b)
+	}
+	pair := fmt.Sprintf(`"old_text": %s, "new_text": %s`, quote(ms[0][1]), quote(ms[0][2]))
+	if len(ms) == 1 {
+		return fmt.Sprintf(`Its replace is exactly this edit_file call: {"path": %q, %s}.`, target, pair)
+	}
+	return fmt.Sprintf(`Its %d replaces are ONE edit_file call with an edits list: {"path": %q, "edits": [{%s}, ...the others likewise]}.`, len(ms), target, pair)
+}
+
+// A Python heredoc or -c that splices a file and writes it back. Scripts that
+// only compute or generate get no note.
+var (
+	scriptEditRe   = regexp.MustCompile(`python3?\s+(-\s*<<|-c\b)`)
+	scriptSpliceRe = regexp.MustCompile(`\.replace\(|\.index\(|\.find\(`)
+	scriptWriteRe  = regexp.MustCompile(`open\([^)]*['"][wa]\+?['"]|\.write_text\(`)
+	scriptPathRe   = regexp.MustCompile(`['"]([\w./-]+\.(rs|go|py|ts|tsx|js|jsx|c|cc|cpp|h|hpp|java|kt|swift|rb|vue|svelte|css|scss|html|toml|yaml|yml|md))['"]`)
+)
+
+func scriptEditTarget(cmd string) (string, bool) {
+	if !scriptEditRe.MatchString(cmd) || !scriptSpliceRe.MatchString(cmd) || !scriptWriteRe.MatchString(cmd) {
+		return "", false
+	}
+	if m := scriptPathRe.FindStringSubmatch(cmd); m != nil {
+		return m[1], true
+	}
+	return "", false
+}
+
+func wrongToolHint(args toolArgs) string {
+	switch {
+	case args.has("reads") || args.has("symbol") || (args.has("path") && (args.has("line") || args.has("limit"))):
+		return ": these arguments read a file, and run_command takes a `command`: {\"command\": \"sed -n '120,180p' src/cut.rs\"}."
+	case args.has("edits") || args.has("old_text") || args.has("start"):
+		return ": these arguments are edit_file's. Call edit_file with them, not run_command."
+	}
+	return ""
+}
+
+// bgSleepRe finds `cmd & sleep N` inside a longer line, which isSleepCmd does
+// not see. Group 1 is a backgrounded (subshell), group 2 the seconds.
+var bgSleepRe = regexp.MustCompile(`(?:\(([^()]*)\)\s*&|(?:^|[^&])&)\s*(?:;\s*)?sleep\s+(\d+)`)
+
+func bgSleepHint(cmd string) (string, string) {
+	m := bgSleepRe.FindStringSubmatch(cmd)
+	if m == nil {
+		return "", ""
+	}
+	job := strings.TrimSpace(m[1])
+	if job == "" {
+		job = "<the command you put in the background>"
+	}
+	return "\n[codehalter: that line put a command in the background with `&` and slept " + m[2] + " s to wait for it, which is a guess, and the backgrounded command also kept this terminal open. " +
+			"run_background does it properly, and tells you the exit code and the last output the moment it finishes, with nothing to poll: {\"command\": " + strconv.Quote(job) + "}" +
+			" (add \"wake_after\": seconds only if you want a look before it finishes). Meanwhile do other work, or call `respond` saying you are waiting.]",
+		"💡 told the model: run_background instead of `& sleep`"
 }

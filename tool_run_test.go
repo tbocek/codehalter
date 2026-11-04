@@ -2,54 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
-// TestBoundedOutput pins the head+tail capture: small streams come back verbatim,
-// streams up to headCap+tailCap stitch without duplicating or dropping the
-// overlap, and larger streams keep the head and the last tailCap with an elision
-// marker for the middle.
-func TestBoundedOutput(t *testing.T) {
-	// cap 16 → headCap 4, tailCap 12.
-
-	// Fits entirely (<= tailCap): verbatim, not truncated.
-	b := newBoundedOutput(16)
-	b.Write([]byte("abcdefghij")) // 10
-	if got := b.String(); got != "abcdefghij" {
-		t.Errorf("fit: got %q", got)
-	}
-	// tailCap < total <= headCap+tailCap: head+tail stitched, no marker, no dup/gap.
-	b = newBoundedOutput(16)
-	b.Write([]byte("abcdefghijklmn")) // 14
-	if got := b.String(); got != "abcdefghijklmn" {
-		t.Errorf("stitch: got %q (want full 14, no marker)", got)
-	}
-	// Past the cap: head + marker + last tailCap, middle elided.
-	b = newBoundedOutput(16)
-	b.Write([]byte("abcdefghijklmnopqrst")) // 20
-	if got := b.String(); got != "abcd\n[... 4 bytes omitted ...]\nijklmnopqrst" {
-		t.Errorf("over: got %q", got)
-	}
-	// Byte-at-a-time matches one-shot, and the ring keeps exactly the last tailCap
-	// even after crossing the 2*tailCap trim point.
-	b = newBoundedOutput(16)
-	for _, c := range "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" { // 36 bytes
-		b.Write([]byte{byte(c)})
-	}
-	got := b.String()
-	if !strings.HasPrefix(got, "0123") || !strings.HasSuffix(got, "OPQRSTUVWXYZ") {
-		t.Errorf("ring: got %q (want head 0123… tail …OPQRSTUVWXYZ)", got)
-	}
-	if !strings.Contains(got, "bytes omitted") {
-		t.Errorf("ring: missing elision marker: %q", got)
-	}
-}
-
-// TestRunCommandEndToEnd pins what run_command hands back and what it leaves in
-// the card: the exit code leads the result (a probe exiting non-zero is data,
-// not a failure), the output is there, and the card keeps the live terminal
-// instead of a static text copy of it.
+// The exit code leads the result (non-zero is data) and the card keeps the live
+// terminal rather than a text copy.
 func TestRunCommandEndToEnd(t *testing.T) {
 	h := newTerminalHarness(t)
 
@@ -79,9 +44,7 @@ func TestRunCommandEndToEnd(t *testing.T) {
 	}
 }
 
-// TestRunCommandIsAShellLine pins that the model's command keeps shell
-// semantics. terminal/create takes an argv, so run_command has to wrap it in
-// bash -c; without that, every pipe, redirect and `&&` would break.
+// terminal/create takes an argv, so run_command must wrap the line in bash -c.
 func TestRunCommandIsAShellLine(t *testing.T) {
 	h := newTerminalHarness(t)
 
@@ -92,10 +55,8 @@ func TestRunCommandIsAShellLine(t *testing.T) {
 	}
 }
 
-// TestRunCommandCapsHugeOutput pins the total-output cap: a command that prints
-// far more than cmdOutputCap comes back as a bounded head+tail with an elision
-// marker, so it can't poison a small-context model — while still running to
-// completion, with both its first and last lines intact.
+// Output past cmdOutputCap comes back as head+tail with a marker, the command
+// still running to completion.
 func TestRunCommandCapsHugeOutput(t *testing.T) {
 	h := newTerminalHarness(t)
 	saved := cmdOutputCap
@@ -123,12 +84,398 @@ func TestRunCommandCapsHugeOutput(t *testing.T) {
 	}
 }
 
-// TestRunCommandRequiresCommand pins the empty-args guard, which the local
-// models hit often enough to matter.
+// Both executors refuse an empty command; separators alone once crashed the job classifier.
 func TestRunCommandRequiresCommand(t *testing.T) {
 	h := newTerminalHarness(t)
-	res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{}`)
-	if failed || !strings.Contains(res, "command is required") {
-		t.Fatalf("expected command-required error, got: %s (failed=%v)", res, failed)
+	for name, run := range map[string]func(context.Context, *agent, string, string) (string, bool){"run_command": runCmdExecute, "run_background": runBackgroundExecute} {
+		for _, args := range []string{`{}`, `{"command":" ; "}`, `{"command":"\n"}`} {
+			if res, failed := run(context.Background(), h.agent, h.sess.ID, args); failed || !strings.Contains(res, "command is required") {
+				t.Errorf("%s %s: %s (failed=%v), want command-required", name, args, res, failed)
+			}
+		}
+	}
+}
+
+// With no job running a sleep is ordinary, and a sleep inside other work is not
+// a wait.
+func TestRunCommandRefusesSleepForBackgroundJob(t *testing.T) {
+	h := newTerminalHarness(t)
+	res, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 0.01"}`)
+	if failed || strings.Contains(res, "refused") {
+		t.Fatalf("sleep with no job running: %s (failed=%v)", res, failed)
+	}
+	h.agent.registerBgJob(&backgroundJob{id: 7, sid: h.sess.ID, cmdStr: "cd rust && just test > /tmp/t.log 2>&1"})
+	for _, cmd := range []string{"sleep 120", "sleep 90 && tail -20 /tmp/t.log", "cd /workspaces/x; sleep 60", "sleep"} {
+		res, failed = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":`+strconv.Quote(cmd)+`}`)
+		if !strings.Contains(res, "refused") || !strings.Contains(res, "job 7") {
+			t.Errorf("%q with job 7 running: %s (failed=%v)", cmd, res, failed)
+		}
+	}
+	for _, cmd := range []string{"tail -20 /tmp/t.log", "for i in 1; do sleep 0.01; done", "echo hi; sleep 0.01"} {
+		res, failed = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":`+strconv.Quote(cmd)+`}`)
+		if failed || strings.Contains(res, "refused") {
+			t.Errorf("%q must run: %s (failed=%v)", cmd, res, failed)
+		}
+	}
+}
+
+// A hand-made wait for a process is refused: a pgrep -f whose pattern is in the command's own
+// text never ends (this one held a /spec round six hours), and while a job runs a polling loop
+// on a process only duplicates the note the job sends when it exits.
+func TestWaitingForProcessesByHandIsRefused(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	try := func(tool func(context.Context, *agent, string, string) (string, bool), cmd string) string {
+		t.Helper()
+		res, _ := tool(context.Background(), h.agent, h.sess.ID, `{"command":`+strconv.Quote(cmd)+`}`)
+		return res
+	}
+
+	for _, cmd := range []string{
+		`while pgrep -f "just test" >/dev/null 2>&1; do sleep 5; done; echo "suite finished"`,
+		`pkill -f cargo; cargo build`,
+		`pgrep -a -f "just test" | head -3`,
+	} {
+		for name, tool := range map[string]func(context.Context, *agent, string, string) (string, bool){"run_command": runCmdExecute, "run_background": runBackgroundExecute} {
+			if res := try(tool, cmd); !strings.Contains(res, "matches this command's own text") {
+				t.Errorf("%s %q: %s", name, cmd, res)
+			}
+		}
+	}
+	// -x matches the whole command line, and a bracket (`[z]yx`) keeps the pattern from matching its own text.
+	for _, cmd := range []string{`pgrep -fx 'no-such-process-xyz'; true`, `pgrep -f 'no-such-process-[z]yx'; true`} {
+		if res := try(runCmdExecute, cmd); strings.Contains(res, "refused") {
+			t.Errorf("%q must run: %s", cmd, res)
+		}
+	}
+
+	poll := `while kill -0 99999999 2>/dev/null; do sleep 1; done`
+	if res := try(runCmdExecute, poll); strings.Contains(res, "refused") {
+		t.Errorf("a loop on a process with no job running: %s", res)
+	}
+	h.agent.registerBgJob(&backgroundJob{id: 7, sid: h.sess.ID, cmdStr: "cd rust && just test > /tmp/t.log 2>&1"})
+	for _, tool := range []func(context.Context, *agent, string, string) (string, bool){runCmdExecute, runBackgroundExecute} {
+		if res := try(tool, poll); !strings.Contains(res, "refused") || !strings.Contains(res, "job 7") {
+			t.Errorf("a polling loop with job 7 running: %s", res)
+		}
+	}
+	if res := try(runCmdExecute, `until curl -s -o /dev/null http://127.0.0.1:9/; do sleep 0.01; break; done`); strings.Contains(res, "refused") {
+		t.Errorf("a wait for a server to answer is not a wait for a job: %s", res)
+	}
+}
+
+// A SIGKILL comes back as 137 through pipefail, never as a zero-value 0.
+func TestRunCommandSignalExit(t *testing.T) {
+	h := newTerminalHarness(t)
+	result, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"kill -9 $$"}`)
+	if !strings.HasPrefix(result, "exit 137\n") {
+		t.Errorf("result = %q, want exit 137 for a signal death", result)
+	}
+	if !h.sawMethod("terminal/release") {
+		t.Errorf("terminal was never released; got %v", h.sentMethods())
+	}
+}
+
+// The command is also killed and leaves no job behind.
+func TestRunCommandCancelReportsPartialOutput(t *testing.T) {
+	h := newTerminalHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+	}()
+	result, _ := runCmdExecute(ctx, h.agent, h.sess.ID, `{"command":"echo early; sleep 30"}`)
+	if !strings.Contains(result, "early") || !strings.Contains(result, "terminal error") {
+		t.Errorf("result = %q, want the output produced before the cancel and the error", result)
+	}
+	if left := h.agent.runningBgJobs(h.sess.ID, nil); left != "" {
+		t.Errorf("a cancelled command stayed tracked: %s", left)
+	}
+}
+
+// The command is not killed; its exit later arrives as a note with the code and
+// log tail, as for run_background.
+func TestRunCommandHandsOverAfterWait(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	old := cmdHandoverWait
+	cmdHandoverWait = 300 * time.Millisecond
+	defer func() { cmdHandoverWait = old }()
+	h.sess.ctl.held.Lock() // a turn is running, so the note queues instead of starting a turn
+	defer h.sess.ctl.held.Unlock()
+
+	result, failed := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo started; sleep 1; echo finished; exit 3","wake_after":60}`)
+	if failed {
+		t.Fatal("a handover must not fail the turn")
+	}
+	for _, want := range []string{"still running after", "background job 1", "nothing was killed", "started", "parks the turn", "woken after 1m"} {
+		if !strings.Contains(result, want) {
+			t.Errorf("handover result lacks %q: %q", want, result)
+		}
+	}
+	if jobs := h.agent.parkableJobs(h.sess.ID, time.Time{}); !strings.Contains(jobs, "job 1") {
+		t.Errorf("the handed-over command is not a parkable job: %q", jobs)
+	}
+	if h.sawMethod("terminal/kill") {
+		t.Error("the command was killed at the handover")
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !h.sess.hasPending() {
+		if time.Now().After(deadline) {
+			t.Fatal("the job never reported its exit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	note := h.sess.takePending()[0].note
+	logName := "codehalter-" + strconv.Itoa(os.Getpid()) + "-job-1.log"
+	for _, want := range []string{"exited with code 3", "finished", logName} {
+		if !strings.Contains(note.full, want) {
+			t.Errorf("exit note lacks %q: %q", want, note.full)
+		}
+	}
+	if jobs := h.agent.parkableJobs(h.sess.ID, time.Time{}); jobs != "" {
+		t.Errorf("finished job still parkable: %s", jobs)
+	}
+	if b, err := os.ReadFile(filepath.Join(os.TempDir(), logName)); err != nil || !strings.Contains(string(b), "finished") {
+		t.Errorf("the log the model is pointed at is not there or incomplete: %v %q", err, b)
+	}
+}
+
+// A job is stopped only when nothing moves: no CPU, no output. A command writing into a
+// redirect file and a silent one busy computing are left to finish; one that only listens,
+// as a test with a fake server that hangs does, is stopped like any other.
+func TestBackgroundJobStoppedOnlyWhenStuck(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	oldWait, oldStuck, oldPoll := cmdHandoverWait, bgStuckAfter, bgStuckPoll
+	cmdHandoverWait, bgStuckAfter, bgStuckPoll = 100*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
+	defer func() { cmdHandoverWait, bgStuckAfter, bgStuckPoll = oldWait, oldStuck, oldPoll }()
+	h.sess.ctl.held.Lock()
+	defer h.sess.ctl.held.Unlock()
+	var notes []bgNote // two jobs that end together queue two notes at once
+	waitNote := func() bgNote {
+		t.Helper()
+		for deadline := time.Now().Add(5 * time.Second); len(notes) == 0; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatal("no note")
+			}
+			for _, item := range h.sess.takePending() {
+				if item.note != nil {
+					notes = append(notes, *item.note)
+				}
+			}
+		}
+		n := notes[0]
+		notes = notes[1:]
+		return n
+	}
+
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"echo start; sleep 30"}`)
+	if n := waitNote(); !strings.Contains(n.full, "was stopped as stuck") {
+		t.Errorf("hung command's note: %q", n.full)
+	}
+
+	log := filepath.Join(t.TempDir(), "suite.log")
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"(for i in 1 2 3 4 5 6 7 8 9 10; do echo tick $i; sleep 0.1; done) > `+log+` 2>&1; echo exit=$? >> `+log+`"}`)
+	if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
+		t.Errorf("a suite writing into its file was not left alone: %q", n.full)
+	}
+
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done; echo counted"}`)
+	if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
+		t.Errorf("a silent job busy computing was stopped: %q", n.full)
+	}
+
+	// A process that stopped itself cannot go on: stopped at once, long before the idle
+	// limit (read at the handover), and the note says why.
+	bgStuckAfter = 30 * time.Second
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sh -c 'kill -STOP $$; echo never'"}`)
+	bgStuckAfter = 400 * time.Millisecond
+	if n := waitNote(); !strings.Contains(n.full, "state T") {
+		t.Errorf("a stopped process was not named: %q", n.full)
+	}
+
+	// A job waiting for a lock whose holder is busy is not stuck, however idle it is itself.
+	if _, err := exec.LookPath("flock"); err == nil {
+		lock := filepath.Join(t.TempDir(), "build.lock")
+		runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"flock `+lock+` sh -c 'i=0; while [ $i -lt 1500000 ]; do i=$((i+1)); done'"}`)
+		time.Sleep(200 * time.Millisecond)
+		runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"flock `+lock+` true"}`)
+		for range 2 {
+			if n := waitNote(); !strings.Contains(n.full, "exited with code 0") {
+				t.Errorf("the lock's holder or its waiter was stopped: %q", n.full)
+			}
+		}
+	}
+
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("no python3 for the listening job")
+	}
+	runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"python3 -c \"import socket,time; s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); time.sleep(30)\""}`)
+	if n := waitNote(); !strings.Contains(n.full, "was stopped as stuck") {
+		t.Errorf("a hung job that listens was left running: %q", n.full)
+	}
+}
+
+// Scripts that compute or generate, reads and builds get no note.
+func TestToolHints(t *testing.T) {
+	edit := "cd rust && python3 - <<'PY'\np='tests/zoom_widgets.rs'\ns=open(p).read()\nopen(p,'w').write(s.replace('a','b'))\nPY"
+	if target, ok := scriptEditTarget(edit); !ok || target != "tests/zoom_widgets.rs" {
+		t.Errorf("heredoc edit = %q %v", target, ok)
+	}
+	for _, cmd := range []string{
+		"python3 - <<'PY'\nprint(open('src/a.rs').read().count('fn '))\nPY",
+		"python3 - <<'PY'\nimport json\njson.dump({'a': 1}, open('fixtures/demo.toml','w'))\nPY",
+		"cargo test",
+		"cd rust && sed -n '1,5p' src/a.rs; grep -n 'fn a' -A 8 src/a.rs",
+	} {
+		if note, _ := toolHints(cmd); note != "" {
+			t.Errorf("%q got a note: %q", cmd, note)
+		}
+	}
+	first, told := toolHints(edit)
+	if !strings.Contains(first, `Its replace is exactly this edit_file call: {"path": "tests/zoom_widgets.rs", "old_text": "a", "new_text": "b"}`) || !strings.Contains(told, "edit_file instead of a script on tests/zoom_widgets.rs") {
+		t.Errorf("hint = %q / %q", first, told)
+	}
+	multi := "python3 - <<'PY'\np='src/ui/window.rs'\ns=open(p).read()\ns=s.replace(\"\"\"let zoom = 1.0;\"\"\", \"\"\"let zoom = ZOOM;\"\"\")\ns=s.replace('old()', 'new()')\nopen(p,'w').write(s)\nPY"
+	if got := scriptEditPreview(multi, "src/ui/window.rs"); !strings.Contains(got, "Its 2 replaces are ONE edit_file call with an edits list") {
+		t.Errorf("multi preview = %q", got)
+	}
+	splice := "python3 - <<'PY'\np='src/a.rs'\ns=open(p).read()\ni=s.index('fn a(')\nopen(p,'w').write(s[:i])\nPY"
+	if got := scriptEditPreview(splice, "src/a.rs"); !strings.Contains(got, `"start": "<fragment of the block's first line>"`) {
+		t.Errorf("splice preview = %q", got)
+	}
+}
+
+func TestRunCommandNamesTheToolItWasMeantFor(t *testing.T) {
+	h := newTerminalHarness(t)
+	res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"reads":[{"path":"a.rs","line":1,"limit":5}]}`)
+	if !strings.Contains(res, "run_command takes a `command`") {
+		t.Errorf("reads sent to run_command = %q", res)
+	}
+	res, _ = runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"path":"a.rs","old_text":"x","new_text":"y"}`)
+	if !strings.Contains(res, "Call edit_file with them") {
+		t.Errorf("an edit sent to run_command = %q", res)
+	}
+}
+
+// A plain sleep, a plain background start and ordinary lines get nothing.
+func TestBgSleepHint(t *testing.T) {
+	cmd := `ps aux | grep -c x; cd rust && (xvfb-run -a cargo test --test deco > /tmp/d.log 2>&1; echo "exit=$?" >> /tmp/d.log) & sleep 45; tail -6 /tmp/d.log`
+	note, told := bgSleepHint(cmd)
+	if !strings.Contains(note, "slept 45 s") || !strings.Contains(note, `xvfb-run -a cargo test --test deco`) || !strings.Contains(told, "run_background") {
+		t.Errorf("note = %q / %q", note, told)
+	}
+	if note, _ := bgSleepHint("cargo build & sleep 10"); !strings.Contains(note, "<the command you put in the background>") {
+		t.Errorf("unparenthesised = %q", note)
+	}
+	for _, c := range []string{"sleep 3", "npm run dev &", "cargo test 2>&1 | tail", "echo a && sleep 1"} {
+		if note, _ := bgSleepHint(c); note != "" {
+			t.Errorf("%q got a note: %q", c, note)
+		}
+	}
+}
+
+// A read of files, a search or a print is served whole; anything that writes,
+// runs or hides a command is not.
+func TestOnlyReads(t *testing.T) {
+	for cmd, want := range map[string]bool{
+		`cd rust && awk 'NR>=90 && NR<=200 {printf "%d|%s\n", NR, $0}' src/a.rs`: true,
+		`sed -n '10,40p' src/a.rs; echo "=== b ==="; sed -n '1,9p' src/b.rs`:     true,
+		`grep -rn -C3 -F 'fn run' src tests | head -50`:                          true,
+		`cat a.rs 2>/dev/null || echo missing`:                                   true,
+		`git --no-pager log -3 --oneline && git -C rust show HEAD:src/a.rs`:      true,
+		`find src -name '*.rs' | sort`:                                           true,
+		`echo hi`:                                                                false,
+		`sed -i 's/a/b/' src/a.rs`:                                               false,
+		`cat a.rs > /tmp/copy`:                                                   false,
+		`cargo test 2>&1 | tail -20`:                                             false,
+		`grep -n x $(git ls-files)`:                                              false,
+		`python3 - <<'EOF'` + "\nprint(1)\nEOF":                                  false,
+		`git checkout src/a.rs`:                                                  false,
+		`find . -name '*.tmp' -delete`:                                           false,
+		`awk 'BEGIN { system("rm -rf x") }' a.rs`:                                false,
+		`sed -Ei 's/a/b/' src/a.rs`:                                              false,
+		`sed --in-place=.bak 's/a/b/' src/a.rs`:                                  false,
+		`awk '{print > "out.txt"}' a.rs`:                                         false,
+		`find . -name x -fprint list`:                                            false,
+		`sort -o sorted.txt a.txt`:                                               false,
+		`git diff --output=d.patch`:                                              false,
+	} {
+		if got := onlyReads(cmd); got != want {
+			t.Errorf("onlyReads(%q) = %v, want %v", cmd, got, want)
+		}
+	}
+}
+
+// A shell read is served like read_file, whole up to its cap; a build is still
+// clipped to head and tail.
+func TestLiveToolOutputServesShellReadsWhole(t *testing.T) {
+	body := strings.Repeat("let x = 1;\n", 400)
+	read := `{"command":"sed -n '1,400p' src/a.rs"}`
+	if got := liveToolOutput("run_command", read, "exit 0\n\n"+body); !strings.HasSuffix(got, body) {
+		t.Errorf("a shell read was clipped: %d of %d chars", len(got), len(body))
+	}
+	build := `{"command":"cargo build"}`
+	if got := liveToolOutput("run_command", build, "exit 0\n\n"+body); !strings.Contains(got, "chars omitted") {
+		t.Error("a build's long output was not clipped")
+	}
+	// Past the allowance a read keeps its end too: a failing suite's log ends in its summary.
+	log := strings.Repeat("running a test\n", 4000) + "test result: FAILED. 3 failed\n"
+	got := liveToolOutput("run_command", `{"command":"cat /tmp/job.log"}`, log)
+	if len(got) > liveExemptCap+1024 || !strings.HasSuffix(got, "3 failed\n") || !strings.HasPrefix(got, "running a test") {
+		t.Errorf("an oversized shell read: %d chars, start or end lost", len(got))
+	}
+}
+
+// An inline script or an image tool on a picture is refused with the way to
+// look at it; a project's own script and a plain listing are not.
+func TestRunCommandRefusesPictureScripts(t *testing.T) {
+	h := newTerminalHarness(t)
+	for _, cmd := range []string{
+		"cd rust && python3 -c \"from PIL import Image\nim = Image.open('shots/08-produce.png')\"",
+		"python3 - <<'PY'\nfrom PIL import Image\nImage.open('a.png').crop((0,0,9,9)).save('/tmp/c.png')\nPY",
+		"convert shots/a.png -crop 800x400+0+0 /tmp/b.png",
+	} {
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, string(b))
+		if !strings.HasPrefix(res, "refused:") || !strings.Contains(res, `"region"`) {
+			t.Errorf("%q: %q, want the refusal naming screenshot's region", cmd, res)
+		}
+	}
+	for _, cmd := range []string{"ls -l shots/a.png", "python3 tools/icons.py assets/a.png"} {
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		if res, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, string(b)); strings.HasPrefix(res, "refused:") {
+			t.Errorf("%q was refused: %q", cmd, res)
+		}
+	}
+}
+
+// What a command leaves running is swept when it exits: two green suites each
+// left an Xvfb behind, and the next `xvfb-run -a` took the next display number.
+func TestRunCommandSweepsWhatItLeftBehind(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	log := filepath.Join(t.TempDir(), "child.pid")
+	out, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 30 & echo $! > `+log+`; echo left a child"}`)
+	if !strings.HasPrefix(out, "exit 0\n") {
+		t.Fatalf("command: %q", out)
+	}
+	pidText, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, _ := strconv.Atoi(strings.TrimSpace(string(pidText)))
+	if pid <= 0 {
+		t.Fatalf("child pid %q", pidText)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for syscall.Kill(pid, 0) == nil {
+		if time.Now().After(deadline) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+			t.Fatalf("the child (pid %d) survived the command's exit", pid)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

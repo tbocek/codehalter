@@ -3,20 +3,21 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// syncBuf is the UI's output while a serve goroutine is writing to it and the
-// test is reading it.
 type syncBuf struct {
 	mu sync.Mutex
 	b  bytes.Buffer
@@ -34,9 +35,7 @@ func (s *syncBuf) String() string {
 	return s.b.String()
 }
 
-// peer is the other end of the wire: it stands in for the agent, so the client
-// is exercised over real line-delimited JSON-RPC rather than by calling its
-// methods directly.
+// peer stands in for the agent, so the client is tested over real line-delimited JSON-RPC.
 type peer struct {
 	t  *testing.T
 	w  io.Writer
@@ -89,13 +88,11 @@ func (p *peer) sendRaw(s string) {
 	}
 }
 
-// reply answers a request the client sent us, echoing its id back.
 func (p *peer) reply(req map[string]any, result any) {
 	p.t.Helper()
 	p.send(map[string]any{"jsonrpc": "2.0", "id": req["id"], "result": result})
 }
 
-// recv reads one message the client sent us.
 func (p *peer) recv() map[string]any {
 	p.t.Helper()
 	line, err := p.br.ReadString('\n')
@@ -108,10 +105,6 @@ func (p *peer) recv() map[string]any {
 	}
 	return m
 }
-
-// ---------------------------------------------------------------------------
-// Framing
-// ---------------------------------------------------------------------------
 
 func TestCLIConnRequestUsesACPWireShape(t *testing.T) {
 	c, p, _ := newCLIHarness(t, "")
@@ -131,9 +124,7 @@ func TestCLIConnRequestUsesACPWireShape(t *testing.T) {
 	if msg["method"] != "session/new" {
 		t.Errorf("method = %v", msg["method"])
 	}
-	// The agent quotes its ids and matches replies by the string inside the
-	// quotes; a client numbering them as JSON numbers would still work, but
-	// mirroring the agent keeps one convention on the wire.
+	// String ids, mirroring the agent's convention.
 	id, ok := msg["id"].(string)
 	if !ok {
 		t.Fatalf("id = %#v, want a quoted string", msg["id"])
@@ -172,8 +163,6 @@ func TestCLIConnSurfacesRPCErrors(t *testing.T) {
 	}
 }
 
-// A closed connection must fail every waiting request rather than hanging: at a
-// prompt that is the difference between "the agent died" and a frozen terminal.
 func TestCLIConnFailsPendingOnClose(t *testing.T) {
 	clientR, peerW := io.Pipe()
 	peerR, clientW := io.Pipe()
@@ -219,10 +208,6 @@ func TestCLIConnRejectsUnknownMethod(t *testing.T) {
 	}
 }
 
-// Streamed chunks must reach the screen in the order they were sent. Handling
-// them in goroutines (as the agent does for its own inbound requests) would
-// shuffle a sentence into nonsense, which is why session/update is handled on
-// the read loop.
 func TestSessionUpdatesRenderInOrder(t *testing.T) {
 	_, p, buf := newCLIHarness(t, "")
 	const n = 300
@@ -271,10 +256,6 @@ func TestSessionUpdateIgnoresGarbage(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Terminals
-// ---------------------------------------------------------------------------
-
 func requireSh(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("sh"); err != nil {
@@ -318,7 +299,6 @@ func TestCLITerminalRunsAndReportsExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := out.(map[string]any)
-	// stdout and stderr are one stream here, exactly as in a real terminal.
 	if got := m["output"].(string); !strings.Contains(got, "out") || !strings.Contains(got, "err") {
 		t.Errorf("output = %q, want both streams", got)
 	}
@@ -342,16 +322,12 @@ func TestCLITerminalKillReportsSignal(t *testing.T) {
 	if exit.Signal == "" {
 		t.Errorf("exit = %#v, want a signal name", exit)
 	}
-	// The id stays valid after a kill: run_command's idle watchdog kills first
-	// and reads the output afterwards.
+	// The id stays valid after a kill: run_command's idle watchdog kills first and reads after.
 	if _, err := c.terminalOutput(idParams(id)); err != nil {
 		t.Errorf("output after kill: %v", err)
 	}
 }
 
-// The agent asks for a byte cap and expects the client to enforce it by keeping
-// the TAIL (see terminalOutputLimit), because it does its own head+tail elision
-// on top.
 func TestCLITerminalKeepsTailAtLimit(t *testing.T) {
 	requireSh(t)
 	c, _, _ := newCLIHarness(t, "")
@@ -377,8 +353,6 @@ func TestCLITerminalKeepsTailAtLimit(t *testing.T) {
 	}
 }
 
-// A command must not inherit the user's terminal: one that reads stdin would
-// swallow the keystrokes meant for the prompt.
 func TestCLITerminalStdinIsEmpty(t *testing.T) {
 	requireSh(t)
 	c, _, _ := newCLIHarness(t, "this line belongs to the prompt\n")
@@ -421,9 +395,6 @@ func TestCLITerminalReleaseIsIdempotent(t *testing.T) {
 	}
 }
 
-// $/cancel_request has to reach a handler that blocks on something other than
-// the user, or an interrupted turn leaves the client waiting on a command the
-// agent has already given up on.
 func TestCancelRequestUnblocksWaitForExit(t *testing.T) {
 	requireSh(t)
 	c, p, _ := newCLIHarness(t, "")
@@ -450,47 +421,6 @@ func TestCancelRequestUnblocksWaitForExit(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Asking the user
-// ---------------------------------------------------------------------------
-
-func TestRequestPermissionSelectsByNumber(t *testing.T) {
-	c, _, _ := newCLIHarness(t, "2\n")
-	params, _ := json.Marshal(permissionRequest{
-		SessionId: "s1",
-		ToolCall:  permissionToolCall{ToolCallId: "tc1", Title: "Run `rm -rf build`?"},
-		Options: []permissionOption{
-			{OptionId: "yes", Name: "Allow", Kind: "allow_once"},
-			{OptionId: "no", Name: "Deny", Kind: "reject_once"},
-		},
-	})
-	res, err := c.requestPermission(params)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := res.(permissionResponse)
-	if got.Outcome.Outcome != "selected" || got.Outcome.OptionId != "no" {
-		t.Errorf("outcome = %#v, want selected/no", got.Outcome)
-	}
-}
-
-func TestRequestPermissionEmptyLineDismisses(t *testing.T) {
-	c, _, _ := newCLIHarness(t, "\n")
-	params, _ := json.Marshal(permissionRequest{
-		SessionId: "s1",
-		Options:   []permissionOption{{OptionId: "yes", Name: "Allow"}},
-	})
-	res, err := c.requestPermission(params)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := res.(permissionResponse); got.Outcome.Outcome != "cancelled" {
-		t.Errorf("outcome = %#v, want cancelled", got.Outcome)
-	}
-}
-
-// The option ids, not the labels, are what the agent maps back to its own
-// choices (see doElicitation).
 func TestElicitReturnsTheChosenConst(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "3\n")
 	params, _ := json.Marshal(map[string]any{
@@ -521,8 +451,6 @@ func TestElicitReturnsTheChosenConst(t *testing.T) {
 	}
 }
 
-// ask_user's free-text form is the reason the CLI advertises elicitation at
-// all: without it the agent fails those with errNoFreeText.
 func TestElicitAcceptsTypedText(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "use the staging bucket\n")
 	params, _ := json.Marshal(map[string]any{
@@ -556,8 +484,6 @@ func TestElicitDeclinesSchemasItCannotRender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Declining is the point: an unanswerable form must not leave the agent
-	// blocked on a dialog the CLI never showed.
 	if got := res.(map[string]any)["action"]; got != "decline" {
 		t.Errorf("action = %v, want decline", got)
 	}
@@ -565,6 +491,7 @@ func TestElicitDeclinesSchemasItCannotRender(t *testing.T) {
 
 func TestAskRejectsOutOfRangeThenGivesUp(t *testing.T) {
 	c, _, buf := newCLIHarness(t, "9\n0\nnope\n")
+	c.interactive = true
 	idx, typed := c.askChoiceOrText("Pick", []string{"one", "two"}, false)
 	if idx != -1 || typed != "" {
 		t.Errorf("got (%d, %q), want a dismissal", idx, typed)
@@ -573,10 +500,6 @@ func TestAskRejectsOutOfRangeThenGivesUp(t *testing.T) {
 		t.Errorf("no complaint about the bad input: %q", buf.String())
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Client-side commands and content
-// ---------------------------------------------------------------------------
 
 func TestCommandRouting(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "")
@@ -589,8 +512,7 @@ func TestCommandRouting(t *testing.T) {
 		{"/exit", true, true},
 		{"/help", true, false},
 		{"/cwd", true, false},
-		// Not ours: the agent parses "/name args" itself, so swallowing an
-		// unknown slash command would break every TEMPLATE-*.md macro.
+		// Not ours: the agent parses these itself.
 		{"/clean", false, false},
 		{"/settings", false, false},
 		{"/some-macro with args", false, false},
@@ -639,8 +561,6 @@ func TestBlockText(t *testing.T) {
 		want string
 	}{
 		{ContentBlock{Type: "text", Text: "hello"}, "hello"},
-		// An image the terminal cannot draw is named, not dropped: a screenshot
-		// that renders as nothing looks like a tool that did nothing.
 		{ContentBlock{Type: "image", MimeType: "image/png"}, "[image image/png]"},
 		{ContentBlock{Type: "resource_link", URI: "file:///a.go"}, "[file:///a.go]"},
 		{ContentBlock{Type: "resource", Resource: &EmbeddedResource{Text: "inline"}}, "inline"},
@@ -652,70 +572,118 @@ func TestBlockText(t *testing.T) {
 	}
 }
 
-func TestAdoptRecordsAvailableModes(t *testing.T) {
+func TestAdoptSwitchesSession(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "")
 	c.ui.Usage(4000, 8000)
-	c.adopt("s2", &SessionModeState{
-		CurrentModeId: "Interactive",
-		AvailableModes: []struct {
-			Id          string `json:"id"`
-			Name        string `json:"name"`
-			Description string `json:"description,omitempty"`
-		}{{Id: "Interactive"}, {Id: "Autopilot"}},
-	})
-	if len(c.modes) != 2 || c.modes[1] != "Autopilot" {
-		t.Errorf("modes = %v", c.modes)
-	}
-	if c.ui.mode != "Interactive" {
-		t.Errorf("ui mode = %q", c.ui.mode)
-	}
+	c.adopt("s2")
 	if c.sessionID() != "s2" {
 		t.Errorf("session id = %q", c.sessionID())
 	}
-	// The meter described the conversation we just left.
 	if c.ui.used != 0 || c.ui.size != 0 {
 		t.Errorf("usage carried over: %d/%d", c.ui.used, c.ui.size)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Input ownership and prompts
-// ---------------------------------------------------------------------------
-
-// A cancelled turn returns while its question is still parked in a read on
-// stdin. Without the token, the input loop starts a second read on the same
-// bufio.Reader, which is a data race and hands the user's line to whichever
-// goroutine wins.
-func TestReplWaitsForAnOpenQuestion(t *testing.T) {
+// replFor runs the repl on piped input the test writes; it returns the writer and a
+// channel closed when the repl returns.
+func replFor(t *testing.T) (*cliClient, *peer, io.Writer, chan struct{}) {
+	t.Helper()
 	pr, pw := io.Pipe()
-	defer pw.Close()
-	c, _, _ := newCLIHarness(t, "")
+	c, p, _ := newCLIHarness(t, "")
 	c.in = bufio.NewReader(pr)
-
-	c.askMu.Lock() // stand in for the question still on screen
+	c.setSessionID("s1")
 	done := make(chan struct{})
 	go func() {
 		c.repl()
 		close(done)
 	}()
-	go pw.Write([]byte("/quit\n"))
-
-	select {
-	case <-done:
-		t.Fatal("the input loop read stdin while a question owned it")
-	case <-time.After(200 * time.Millisecond):
+	t.Cleanup(func() { pw.Close() })
+	// The repl's reader runs before anything is asked: a question that came first would read
+	// stdin itself, as in a one-shot -p run.
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(time.Millisecond) {
+		c.waitMu.Lock()
+		up := c.inputs != nil
+		c.waitMu.Unlock()
+		if up {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the repl never started reading")
+		}
 	}
+	return c, p, pw, done
+}
 
-	c.askMu.Unlock()
+// within receives the client's next message, failing the test rather than hanging it.
+func within(t *testing.T, p *peer) map[string]any {
+	t.Helper()
+	got := make(chan map[string]any, 1)
+	go func() { got <- p.recv() }()
 	select {
-	case <-done:
+	case m := <-got:
+		return m
 	case <-time.After(3 * time.Second):
-		t.Fatal("the input loop never took the token back")
+		t.Fatal("the client sent nothing")
+		return nil
 	}
 }
 
-// A paste arrives as one chunk, so every line of it is one prompt. Without
-// this, pasting a ten-line stack trace runs ten turns.
+// A /spec loop is one turn that runs for hours: a line typed while it runs reaches the
+// agent at once, as a second prompt it folds into the turn, not after the turn ends.
+func TestTypingDuringATurnSteersIt(t *testing.T) {
+	_, p, in, done := replFor(t)
+	fmt.Fprintln(in, "/spec")
+	turn := p.recv()
+	if turn["method"] != "session/prompt" {
+		t.Fatalf("first request = %v", turn["method"])
+	}
+	fmt.Fprintln(in, "/spec stop")
+	steer := within(t, p) // the turn is still unanswered
+	text, _ := json.Marshal(steer["params"])
+	if steer["method"] != "session/prompt" || !strings.Contains(string(text), "/spec stop") {
+		t.Fatalf("typed during the turn: %v %s", steer["method"], text)
+	}
+	p.reply(steer, map[string]any{"stopReason": "end_turn"})
+	p.reply(turn, map[string]any{"stopReason": "end_turn"})
+	fmt.Fprintln(in, "/quit")
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the repl did not leave on /quit")
+	}
+}
+
+// With the repl's reader owning stdin, the line typed while a question is open answers it
+// and starts no turn.
+func TestALineAnswersTheOpenQuestion(t *testing.T) {
+	c, p, in, done := replFor(t)
+	p.send(map[string]any{"jsonrpc": "2.0", "id": 7, "method": "elicitation/create", "params": map[string]any{
+		"message": "Start the spec loop anyway?", "requestedSchema": map[string]any{"properties": map[string]any{elicitChoiceKey: map[string]any{
+			"oneOf": []map[string]any{{"const": "go", "title": "Start anyway"}, {"const": "no", "title": "Stop"}}}}}}})
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		c.waitMu.Lock()
+		up := c.waiting != nil
+		c.waitMu.Unlock()
+		if up {
+			break // the question is up before the answer is typed
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the question never opened")
+		}
+	}
+	fmt.Fprintln(in, "2")
+	resp := within(t, p)
+	if out, _ := json.Marshal(resp["result"]); resp["id"] != float64(7) || !strings.Contains(string(out), `"no"`) {
+		t.Fatalf("answer = %v %s", resp["id"], out)
+	}
+	fmt.Fprintln(in, "/quit")
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the repl did not leave on /quit")
+	}
+}
+
 func TestPasteIsOnePrompt(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "why does this fail\npanic: nil map\n\tmain.go:12\n")
 	c.interactive = true
@@ -729,8 +697,6 @@ func TestPasteIsOnePrompt(t *testing.T) {
 	}
 }
 
-// Piped input is buffered exactly the same way, but there each line is its own
-// command: joining would turn a two-command script into one nonsense prompt.
 func TestPipedLinesStaySeparate(t *testing.T) {
 	c, _, _ := newCLIHarness(t, "/mode\n/quit\n")
 	c.interactive = false
@@ -745,8 +711,6 @@ func TestPipedLinesStaySeparate(t *testing.T) {
 	}
 }
 
-// The first Ctrl+C at an idle prompt says how to leave, because a blocked read
-// on stdin cannot be unblocked; the second one within the window means it.
 func TestSecondInterruptLeaves(t *testing.T) {
 	c, _, buf := newCLIHarness(t, "")
 	quit := make(chan struct{})
@@ -779,12 +743,6 @@ func TestSecondInterruptLeaves(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Sessions and one-shot
-// ---------------------------------------------------------------------------
-
-// -p is what a script runs, so the exit status has to mean something: 0 only
-// when the turn actually finished.
 func TestOneShotExitsOnTheStopReason(t *testing.T) {
 	for _, tc := range []struct {
 		stop string
@@ -810,7 +768,6 @@ func TestOneShotExitsOnTheStopReason(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("stopReason %q never returned", tc.stop)
 		}
-		// No banner and no prompt row: the output is the turn and nothing else.
 		if strings.Contains(buf.String(), "codehalter cli") || strings.Contains(buf.String(), "❯") {
 			t.Errorf("one-shot printed session chrome: %q", buf.String())
 		}
@@ -819,7 +776,7 @@ func TestOneShotExitsOnTheStopReason(t *testing.T) {
 
 func TestNewSessionSwapsTheSessionID(t *testing.T) {
 	c, p, _ := newCLIHarness(t, "")
-	c.adopt("old", nil)
+	c.adopt("old")
 	done := make(chan struct{})
 	go func() {
 		c.newSession()
@@ -838,7 +795,7 @@ func TestNewSessionSwapsTheSessionID(t *testing.T) {
 
 func TestResumeByIDLoadsThatSession(t *testing.T) {
 	c, p, _ := newCLIHarness(t, "")
-	c.adopt("old", nil)
+	c.adopt("old")
 	done := make(chan struct{})
 	go func() {
 		c.resumeSession("20260821_085603")
@@ -860,7 +817,6 @@ func TestResumeByIDLoadsThatSession(t *testing.T) {
 	}
 }
 
-// /resume with no id offers the list, newest first, and loads the pick.
 func TestResumeWithoutIDPicksFromTheList(t *testing.T) {
 	c, p, _ := newCLIHarness(t, "2\n")
 	done := make(chan struct{})
@@ -905,5 +861,287 @@ func TestPrintSessionList(t *testing.T) {
 	}
 	if got := buf.String(); !strings.HasPrefix(got, "abc  ") || strings.Count(got, "\n") != 1 {
 		t.Errorf("list = %q, want just abc", got)
+	}
+}
+
+// exit and quit leave, as in a shell, with or without the slash; a sentence that starts with
+// the word is a prompt.
+// The typed line is edited at a cursor: arrows (CSI and SS3), Home and End, Delete, a word
+// at a time, and Up and Down through the lines sent, the unsent line kept while browsing.
+func TestCLILineEditing(t *testing.T) {
+	const (
+		left, right, home, end = "\x1b[D", "\x1b[C", "\x1b[H", "\x1b[F"
+		up, down, del          = "\x1b[A", "\x1b[B", "\x1b[3~"
+	)
+	keys := strings.Join([]string{
+		"helo" + left + "l\r",                                // insert in the middle
+		"world" + home + "hello " + end + "!\r",              // Home and End, CSI
+		"b\x1bOHa\x1bOF\x1bOD\x1bOC" + "\r",                  // Home, End, Left and Right, SS3
+		"abc" + home + del + "\r",                            // Delete at the cursor
+		"alpha beta\x1b[1;5D" + "X\r",                        // a word back
+		"one two three" + strings.Repeat(left, 6) + "\x17\r", // Ctrl+W before the cursor
+		"\x1bOPf1 ignored\r",                                 // an unknown key is ignored
+		"dra" + up + up + down + down + "ft\r",               // browsing keeps the unsent line
+		up + "\r",                                            // Up sends the last line again
+	}, "")
+	c, _, _ := newCLIHarness(t, keys)
+	c.ui.inputOn = true
+	c.inputs = make(chan cliLine, 32)
+	c.readInput()
+	var got []string
+	for len(c.inputs) > 0 {
+		if l := <-c.inputs; l.err == nil {
+			got = append(got, l.text)
+		}
+	}
+	want := []string{"hello", "hello world!", "ab", "bc", "alpha Xbeta", "one  three", "f1 ignored", "draft", "draft"}
+	if !slices.Equal(got, want) {
+		t.Errorf("lines = %q\nwant    %q", got, want)
+	}
+}
+
+func TestCLIExitWordsLeave(t *testing.T) {
+	c := &cliClient{}
+	for _, line := range []string{"exit", "quit", " Exit ", "/quit", "/exit"} {
+		if handled, quit := c.command(line); !handled || !quit {
+			t.Errorf("%q: handled=%v quit=%v, want it to leave", line, handled, quit)
+		}
+	}
+	if handled, _ := c.command("exit the loop when the suite is green"); handled {
+		t.Error("a prompt starting with exit was taken as a command")
+	}
+}
+
+// With no terminal (a script running -p), a question with options takes its first whenever
+// the script gave no usable answer: input ended, an empty line, or a line that is no choice,
+// which is not asked again so the script's later lines stay theirs. At a terminal an empty
+// line or Ctrl+D dismisses it, and a question without options has nothing to take.
+func TestCLIQuestionWithoutAnyoneTakesTheFirstOption(t *testing.T) {
+	for _, tc := range []struct{ name, in, note string }{
+		{"ended input", "", "no one to answer (input ended): took 1) Start anyway"},
+		{"an empty line", "\n", "no one to answer (empty line): took 1) Start anyway"},
+		{"no choice", "9\nkept\n", `no one to answer ("9" is not one of them): took 1) Start anyway`},
+	} {
+		c, _, out := newCLIHarness(t, tc.in)
+		if idx, _ := c.askChoiceOrText("Start the spec loop anyway?", []string{"Start anyway", "Stop"}, false); idx != 0 ||
+			!strings.Contains(out.String(), tc.note) {
+			t.Errorf("%s: idx %d, output %q", tc.name, idx, out.String())
+		}
+		if tc.name == "no choice" {
+			if rest, _ := c.in.ReadString('\n'); rest != "kept\n" {
+				t.Errorf("no choice: the next line went too, left %q", rest)
+			}
+		}
+	}
+	c, _, _ := newCLIHarness(t, "2")
+	if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != 1 {
+		t.Errorf("a last answer without its newline: idx %d, want 1", idx)
+	}
+	c, _, _ = newCLIHarness(t, "")
+	if idx, typed := c.askChoiceOrText("Name it", nil, true); idx != -1 || typed != "" {
+		t.Errorf("a text question at ended input: (%d, %q), want a dismissal", idx, typed)
+	}
+	for _, in := range []string{"", "\n"} {
+		c, _, _ = newCLIHarness(t, in)
+		c.interactive = true // Ctrl+D or Enter at a terminal is the user dismissing it
+		if idx, _ := c.askChoiceOrText("Which?", []string{"a", "b"}, false); idx != -1 {
+			t.Errorf("at a terminal, input %q: idx %d, want a dismissal", in, idx)
+		}
+	}
+}
+
+// `</dev/null` is a character device, not a terminal: a script run with it got the dismissals
+// meant for a person at a keyboard.
+func TestIsTerminalLeavesOutTheNullDevice(t *testing.T) {
+	null, err := os.Open(os.DevNull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer null.Close()
+	if isTerminal(null) {
+		t.Error("the null device counts as a terminal")
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	if isTerminal(r) {
+		t.Error("a pipe counts as a terminal")
+	}
+}
+
+// Piped into the repl, the script's input may end while its turn runs: the turn finishes,
+// its questions take their first option instead of waiting for a line that cannot come, and
+// only then does the CLI leave.
+func TestScriptedReplFinishesTheTurnAfterInputEnds(t *testing.T) {
+	c, p, in, done := replFor(t)
+	fmt.Fprintln(in, "build it")
+	prompt := within(t, p)
+	if prompt["method"] != "session/prompt" {
+		t.Fatalf("expected session/prompt, got %v", prompt["method"])
+	}
+	in.(io.Closer).Close()
+	for deadline := time.Now().Add(3 * time.Second); ; time.Sleep(5 * time.Millisecond) {
+		c.waitMu.Lock()
+		ended := c.inputEnded
+		c.waitMu.Unlock()
+		select {
+		case <-ended:
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("the end of input was never noticed")
+			}
+			continue
+		}
+		break
+	}
+	select {
+	case <-done:
+		t.Fatal("the repl left with the turn still running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	p.send(map[string]any{"jsonrpc": "2.0", "id": 7, "method": "elicitation/create", "params": map[string]any{
+		"message": "Run /spec on spec/ now?", "requestedSchema": map[string]any{"properties": map[string]any{elicitChoiceKey: map[string]any{
+			"oneOf": []map[string]any{{"const": "yes", "title": "Run /spec"}, {"const": "no", "title": "Let me read it first"}}}}}}})
+	resp := within(t, p)
+	if out, _ := json.Marshal(resp["result"]); resp["id"] != float64(7) || !strings.Contains(string(out), `"yes"`) {
+		t.Fatalf("answer = %v %s", resp["id"], out)
+	}
+	p.reply(prompt, map[string]any{"stopReason": "end_turn"})
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the repl did not leave once the turn ended")
+	}
+}
+
+// The /resume picker runs inside the repl's own loop, which is what hands lines to a
+// question: it waited for a line nobody would pass on.
+func TestResumePickerInsideTheRepl(t *testing.T) {
+	c, p, in, done := replFor(t)
+	fmt.Fprintln(in, "/resume")
+	req := within(t, p)
+	if req["method"] != "session/list" {
+		t.Fatalf("expected session/list, got %v", req["method"])
+	}
+	p.reply(req, map[string]any{"sessions": []map[string]any{{"sessionId": "older", "updatedAt": "2026-08-01T00:00:00Z"}}})
+	fmt.Fprintln(in, "1")
+	req = within(t, p)
+	if req["method"] != "session/load" {
+		t.Fatalf("expected session/load, got %v", req["method"])
+	}
+	p.reply(req, map[string]any{})
+	fmt.Fprintln(in, "/quit")
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the repl did not leave on /quit")
+	}
+	if c.sessionID() != "older" {
+		t.Errorf("session id = %q, want older", c.sessionID())
+	}
+}
+
+// In character mode the keys are edited here: backspace, Ctrl+W and Ctrl+U take text back,
+// an arrow key is ignored, and a bracketed paste keeps its newlines in one prompt.
+func TestKeysAreEditedInCharacterMode(t *testing.T) {
+	pr, pw := io.Pipe()
+	c, p, _ := newCLIHarness(t, "")
+	c.in = bufio.NewReader(pr)
+	c.setSessionID("s1")
+	c.ui.inputOn = true // what startInput sets on a terminal
+	go c.repl()
+	t.Cleanup(func() { pw.Close() })
+	for _, k := range []struct{ keys, want string }{
+		{"ab\x7fc\x1b[Ad\r", "acd"},
+		{"one two\x17three\r", "one three"},
+		{"gone\x15kept\r", "kept"},
+		{"\x1b[200~line one\nline two\x1b[201~\r", "line one\nline two"},
+	} {
+		if _, err := pw.Write([]byte(k.keys)); err != nil {
+			t.Fatal(err)
+		}
+		req := within(t, p)
+		params, _ := json.Marshal(req["params"])
+		want, _ := json.Marshal(k.want)
+		if !strings.Contains(string(params), `"text":`+string(want)) {
+			t.Errorf("keys %q sent %s, want the text %s", k.keys, params, want)
+		}
+		p.reply(req, map[string]any{"stopReason": "end_turn"})
+	}
+}
+
+// Ctrl+V attaches the clipboard's picture: a marker in the line, an image block in the prompt beside the
+// text. A marker deleted before Enter leaves its picture out, and a model that takes no images gets none.
+func TestCtrlVAttachesTheClipboardImage(t *testing.T) {
+	pr, pw := io.Pipe()
+	c, p, out := newCLIHarness(t, "")
+	c.in = bufio.NewReader(pr)
+	c.setSessionID("s1")
+	c.ui.inputOn = true
+	c.imagesAccepted.Store(true)
+	png := []byte("\x89PNG\r\n\x1a\nfake")
+	c.clipboard = func() ([]byte, string, error) { return png, "image/png", nil }
+	go c.repl()
+	t.Cleanup(func() { pw.Close() })
+
+	send := func(keys string) []ContentBlock {
+		t.Helper()
+		if _, err := pw.Write([]byte(keys)); err != nil {
+			t.Fatal(err)
+		}
+		req := within(t, p)
+		raw, _ := json.Marshal(req["params"])
+		var got PromptRequest
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Fatal(err)
+		}
+		p.reply(req, map[string]any{"stopReason": "end_turn"})
+		return got.Content
+	}
+
+	content := send("what is wrong here? \x16\r")
+	if len(content) != 2 || content[0].Text != "what is wrong here? [image 1]" {
+		t.Fatalf("content = %+v, want the text with its marker and one image", content)
+	}
+	if img := content[1]; img.Type != "image" || img.MimeType != "image/png" ||
+		img.Data != base64.StdEncoding.EncodeToString(png) {
+		t.Errorf("image block = %+v, want the clipboard's PNG", img)
+	}
+
+	// The marker typed away (Ctrl+U), so the picture is not sent.
+	if content := send("\x16\x15no picture\r"); len(content) != 1 {
+		t.Errorf("a deleted marker still sent %d blocks", len(content))
+	}
+
+	// A model that cannot see: Ctrl+V says so and attaches nothing.
+	c.imagesAccepted.Store(false)
+	if content := send("\x16text only\r"); len(content) != 1 || strings.Contains(content[0].Text, "[image") {
+		t.Errorf("content = %+v, want the text alone", content)
+	}
+	if !strings.Contains(out.String(), "this model takes no images") {
+		t.Errorf("the refusal was not said: %q", out.String())
+	}
+}
+
+// A terminal's command leads a process group of its own, as a pty gives one in Zed: in
+// codehalter's group a job's group kill reached only its wrapper, and the Ctrl+C meant for
+// the turn reached every job.
+func TestCLITerminalLeadsItsOwnGroup(t *testing.T) {
+	requireSh(t)
+	c, _, _ := newCLIHarness(t, "")
+	id := c.mustCreate(t, "-c", "sleep 5")
+	term, err := c.terminal(idParams(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := term.cmd.Process.Pid
+	if pgid, err := syscall.Getpgid(pid); err != nil || pgid != pid {
+		t.Errorf("terminal command %d is in group %d (%v), want its own", pid, pgid, err)
+	}
+	if _, err := c.terminalRelease(idParams(id)); err != nil {
+		t.Error(err)
 	}
 }

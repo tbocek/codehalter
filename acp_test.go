@@ -11,9 +11,6 @@ import (
 	"time"
 )
 
-// pipePair returns two os.Pipe halves wired so writes on agentW arrive on
-// peerR, and writes on peerW arrive on agentR. Kernel-buffered, so small
-// writes don't deadlock the writer when no reader is yet waiting.
 func pipePair(t *testing.T) (agentW *os.File, agentR *os.File, peerW *os.File, peerR *os.File) {
 	t.Helper()
 	var err error
@@ -44,32 +41,25 @@ func readLine(t *testing.T, r io.Reader) []byte {
 	return []byte(strings.TrimRight(line, "\r\n"))
 }
 
-func TestJsonrpcRequestEncoding(t *testing.T) {
-	id := json.RawMessage(`"7"`)
-	req := jsonrpcRequest{JSONRPC: "2.0", ID: &id, Method: "session/prompt", Params: json.RawMessage(`{"x":1}`)}
-	b, err := json.Marshal(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	got := string(b)
-	want := `{"jsonrpc":"2.0","id":"7","method":"session/prompt","params":{"x":1}}`
-	if got != want {
-		t.Fatalf("got %s\nwant %s", got, want)
-	}
-
-	// Notification: no id field on the wire.
-	notif := jsonrpcRequest{JSONRPC: "2.0", Method: "session/update", Params: json.RawMessage(`{}`)}
-	b, _ = json.Marshal(notif)
-	if strings.Contains(string(b), `"id"`) {
-		t.Fatalf("notification leaked id field: %s", b)
-	}
-}
-
-func TestContentBlockOmitsEmptyFields(t *testing.T) {
-	b, _ := json.Marshal(ContentBlock{Type: "text", Text: "hello"})
-	got := string(b)
-	if got != `{"type":"text","text":"hello"}` {
-		t.Fatalf("text block leaked optional fields: %s", got)
+// ACP requires `text` on a text block (Zed rejects it otherwise), and history
+// replay uses an empty text chunk to separate two same-role messages.
+func TestContentBlockJSON(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		block ContentBlock
+		want  string
+	}{
+		{"text leaks no optional fields", ContentBlock{Type: "text", Text: "hello"}, `{"type":"text","text":"hello"}`},
+		{"empty text keeps its text field", ContentBlock{Type: "text"}, `{"type":"text","text":""}`},
+		{"an image grows no text field", ContentBlock{Type: "image", MimeType: "image/png", Data: "AA=="}, `{"type":"image","mimeType":"image/png","data":"AA=="}`},
+	} {
+		b, err := json.Marshal(c.block)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != c.want {
+			t.Errorf("%s: got %s, want %s", c.name, b, c.want)
+		}
 	}
 }
 
@@ -105,7 +95,6 @@ func TestSendRequestRoundtrip(t *testing.T) {
 	agentW, agentR, peerW, peerR := pipePair(t)
 	c := NewAgentSideConnection(nil, agentW, agentR)
 
-	// Fake peer: read the request, echo back a result keyed to its id.
 	go func() {
 		line := readLine(t, peerR)
 		var probe struct {
@@ -148,7 +137,6 @@ func TestUnknownMethodRepliesMethodNotFound(t *testing.T) {
 	c := NewAgentSideConnection(nil, agentW, agentR)
 	_ = c
 
-	// Send a request whose method doesn't match any case in handle().
 	req := jsonrpcRequest{JSONRPC: "2.0", ID: ptrRaw(`"99"`), Method: "no/such/method"}
 	b, _ := json.Marshal(req)
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
@@ -171,21 +159,14 @@ func ptrRaw(s string) *json.RawMessage {
 	return &m
 }
 
-// TestCancelRequestAnswersImmediately pins $/cancel_request: the named request
-// gets -32800 right away (not whenever the handler notices), its context is
-// cancelled, and the handler's own late reply is then suppressed — two
-// responses for one id would corrupt the client's pending map.
+// The handler's late reply must be suppressed: two responses for one id would
+// corrupt the client's pending map.
 func TestCancelRequestAnswersImmediately(t *testing.T) {
 	agentW, agentR, peerW, peerR := pipePair(t)
 	c := NewAgentSideConnection(nil, agentW, agentR)
 
-	// Stand in for a handler that has registered itself and is still running.
-	entry := &inflightRequest{}
-	ctx, cancel := context.WithCancel(context.Background())
-	entry.cancel = cancel
-	c.inflightMu.Lock()
-	c.inflight[`"7"`] = entry
-	c.inflightMu.Unlock()
+	ctx, untrack := c.track(context.Background(), ptrRaw(`"7"`))
+	defer untrack()
 
 	cancelReq := jsonrpcRequest{JSONRPC: "2.0", Method: "$/cancel_request", Params: json.RawMessage(`{"requestId":"7"}`)}
 	b, _ := json.Marshal(cancelReq)
@@ -211,12 +192,10 @@ func TestCancelRequestAnswersImmediately(t *testing.T) {
 		t.Error("handler context was not cancelled")
 	}
 	if c.claimReply(ptrRaw(`"7"`)) {
-		t.Error("handler could still reply after -32800 — that would be a second response for one id")
+		t.Error("handler could still reply after -32800: that would be a second response for one id")
 	}
 }
 
-// TestCancelRequestUnknownIdIsIgnored: a cancel that races a finished handler
-// must not answer an id nobody is waiting on.
 func TestCancelRequestUnknownIdIsIgnored(t *testing.T) {
 	agentW, agentR, peerW, peerR := pipePair(t)
 	NewAgentSideConnection(nil, agentW, agentR)
@@ -225,8 +204,7 @@ func TestCancelRequestUnknownIdIsIgnored(t *testing.T) {
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
 		t.Fatal(err)
 	}
-	// Then a request we know produces a reply — if the cancel wrote anything,
-	// this read returns that instead of the -32601.
+	// If the cancel wrote anything, this read returns it instead of the -32601.
 	b, _ = json.Marshal(jsonrpcRequest{JSONRPC: "2.0", ID: ptrRaw(`"1"`), Method: "no/such/method"})
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
 		t.Fatal(err)
@@ -240,9 +218,7 @@ func TestCancelRequestUnknownIdIsIgnored(t *testing.T) {
 	}
 }
 
-// TestSendRequestCancelsOutboundOnCtxDone pins the other direction: when we
-// abandon a request we told the client to drop it. Without this an open
-// permission/elicitation dialog stays on screen after the turn is cancelled.
+// Without the outbound cancel an open permission dialog outlives the cancelled turn.
 func TestSendRequestCancelsOutboundOnCtxDone(t *testing.T) {
 	agentW, agentR, _, peerR := pipePair(t)
 	c := NewAgentSideConnection(nil, agentW, agentR)

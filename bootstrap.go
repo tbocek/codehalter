@@ -8,15 +8,8 @@ import (
 	"strings"
 )
 
-// ---------------------------------------------------------------------------
-// .devcontainer
-// ---------------------------------------------------------------------------
-
-// ensureDevcontainer gates the whole session on running inside a container.
-// Returns true only when we're already inside one. Otherwise it scaffolds
-// .devcontainer/ (prompting for the base OS if no template exists yet), sets
-// a.abortReason so Prompt refuses every turn, and returns false — codehalter
-// does not run unsandboxed.
+// ensureDevcontainer returns true only inside a container. Otherwise it scaffolds
+// .devcontainer/ and aborts the session: codehalter does not run unsandboxed.
 func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) bool {
 	if containerKind() != "" {
 		return true
@@ -26,12 +19,9 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	dirInfo, statErr := os.Stat(dir)
 	hasDevcontainer := statErr == nil && dirInfo.IsDir()
 
-	// Both hints name a concrete next action, which differs by front end: an
-	// editor user reopens the window inside the container, a --cli user re-runs
-	// the binary. A standalone run only lands here when the launcher declined,
-	// which for an existing .devcontainer means no runtime with compose on PATH,
-	// so that hint names what to install rather than repeating the same command.
-	reopen := "Reopen the project in the container to continue. In Zed, press Ctrl-Alt-Shift-O and choose \"Connect Dev Container\"."
+	// Standalone only lands here when the launcher declined, which for an existing
+	// .devcontainer means no docker/podman with the compose plugin on PATH.
+	reopen := "Reopen the project in the container to continue. In Zed, press Ctrl-Shift-P and type \"open dev container\"."
 	restart := "Start a new Agent Thread (the + button at the top) to re-open the devcontainer setup menu."
 	if a.standalone {
 		reopen = "codehalter --cli starts that container itself once docker or podman with the compose plugin is on PATH. " +
@@ -47,42 +37,36 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	a.say(ctx, sid, "codehalter must run inside a container. I can scaffold "+
 		".devcontainer/Dockerfile and .devcontainer/devcontainer.json for you to edit, then you can reopen the project in the container.\n\n")
 
-	choice, tcId, err := a.askChoiceWithCard(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"})
-	if err != nil {
+	distros := []string{"Alpine", "Arch", "Debian", "Fedora", "Ubuntu"}
+	choice, tcId, err := a.askCard(ctx, sid, "Write .devcontainer/Dockerfile and devcontainer.json?", "think", choiceOptions(distros))
+	fail := func(err error) bool {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
 		return false
 	}
-
-	var dockerfile string
-	switch choice {
-	case "Alpine":
-		dockerfile = defaultDevcontainerDockerfileAlpine
-	case "Arch":
-		dockerfile = defaultDevcontainerDockerfileArch
-	case "Debian":
-		dockerfile = defaultDevcontainerDockerfileDebian
-	case "Fedora":
-		dockerfile = defaultDevcontainerDockerfileFedora
-	case "Ubuntu":
-		dockerfile = defaultDevcontainerDockerfileUbuntu
-	default:
+	if err != nil {
+		return fail(err)
+	}
+	if !slices.Contains(distros, choice) {
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Skipped")})
 		a.sendUpdateAndAbort(ctx, sid, "Devcontainer setup cancelled. "+restart)
 		return false
 	}
+	dockerfile, err := devcontainerDockerfiles.ReadFile("res/Dockerfile.devcontainer." + strings.ToLower(choice))
+	if err != nil {
+		return fail(err)
+	}
 
-	// Offer the optional host bind mounts. Each source must exist on the host or
-	// the container fails to start (docker --mount type=bind is strict about its
-	// source), so only ask when the source is present and only add what the user
-	// accepts. The chosen mounts apply when the user reopens in the container.
+	// A bind mount whose host source is missing fails the container start, so only
+	// offer mounts whose source exists.
 	// .git needs no mount of its own: the workspace bind already carries it,
-	// read-write. A dedicated mount is only spliced in when the user asks for
-	// read-only, where it shadows the workspace copy. Default (and autopilot)
-	// is writable, so git commit/push work as in any other checkout.
+	// read-write. A dedicated mount is only added when the user asks for
+	// read-only, where it shadows the workspace copy. No is listed first, so a
+	// scripted run (first option) keeps .git writable.
 	gitReadonly := false
-	if hasGitFolder(cwd) {
-		yes, gtc, gerr := a.askYesNoWithCardAuto(ctx, sid, "Make the repo's .git read-only inside the container? By default it is writable, so git commit/push work (codehalter still only commits when you ask).", "think", "Yes, read-only", "No, keep writable", false)
+	// Only a .git directory: a .git file (worktree/submodule link) can't back the bind mount.
+	if info, err := os.Stat(filepath.Join(cwd, ".git")); err == nil && info.IsDir() {
+		yes, gtc, gerr := a.askNoYesWithCard(ctx, sid, "Make the repo's .git read-only inside the container? By default it is writable, so git commit/push work (codehalter still only commits when you ask).", "think", "Yes, read-only", "No, keep writable")
 		if gerr != nil {
 			a.FailToolCall(ctx, sid, gtc, gerr.Error())
 		} else {
@@ -94,10 +78,8 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 			a.CompleteToolCall(ctx, sid, gtc, []ToolCallContent{TextContent(done)})
 		}
 	}
-	// .gitconfig only when the host actually has one (global.toml, captured at
-	// install time): a missing bind source would fail the container start.
 	gitconfig := false
-	if loadGlobalConfig().HasGitconfigInHome {
+	if hostHasGitconfig() {
 		yes, ctc, cerr := a.askYesNoWithCard(ctx, sid, "Mount your ~/.gitconfig (read-only) into the container, so git uses your identity?", "think", "Yes, mount", "No")
 		if cerr != nil {
 			a.FailToolCall(ctx, sid, ctc, cerr.Error())
@@ -112,9 +94,9 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	}
 	sshAgent := false
 	if hostSSHAgentAvailable() {
-		// Opt-in only: autopilot / subagents answer No, since forwarding the
-		// agent hands the container every key loaded on the host.
-		yes, stc, serr := a.askYesNoWithCardAuto(ctx, sid, "Forward your host SSH agent into the container? Lets git push / ssh use your host SSH keys.", "think", "Yes, forward SSH agent", "No", false)
+		// Opt-in, No first: forwarding the agent hands the container every key
+		// loaded on the host, so a scripted run must not pick it.
+		yes, stc, serr := a.askNoYesWithCard(ctx, sid, "Forward your host SSH agent into the container? Lets git push / ssh use your host SSH keys.", "think", "Yes, forward SSH agent", "No")
 		if serr != nil {
 			a.FailToolCall(ctx, sid, stc, serr.Error())
 		} else {
@@ -128,35 +110,24 @@ func (a *agent) ensureDevcontainer(ctx context.Context, cwd string, sid string) 
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
-		return false
+		return fail(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
-		return false
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), dockerfile, 0o644); err != nil {
+		return fail(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "devcontainer.json"), []byte(buildDevcontainerJSON(gitReadonly, gitconfig, sshAgent)), 0o644); err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		a.sendUpdateAndAbort(ctx, sid, "codehalter requires a sandbox. "+restart)
-		return false
+		return fail(err)
 	}
 
-	// Per-stack dev-tool installs are handled by the prepare phase on the
-	// next session (inside the container) — it asks the user, installs live,
-	// persists in this Dockerfile, and wires MCP. Nothing to seed here.
+	// Per-stack dev tools are installed later by the prepare phase inside the container.
 	note := "Wrote .devcontainer/Dockerfile (" + choice + ") and .devcontainer/devcontainer.json, the mounts you chose apply once you (re)start the container. " + reopen
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
 	a.sendUpdateAndAbort(ctx, sid, note)
 	return false
 }
 
-// Optional devcontainer bind mounts codehalter offers at scaffold time. Kept OUT
-// of res/devcontainer.json (a bind whose source is missing fails the container
-// start) and spliced in only when the user opts in and the source exists.
-// configMountAnchor is the always-on mount already in the template; the extras go
-// in right after it.
+// Optional bind mounts, kept out of res/devcontainer.json because a missing bind
+// source fails the container start. Extras are spliced in after configMountAnchor.
 const (
 	configMountAnchor = `"source=${localEnv:HOME}/.config/codehalter,target=/home/dev/.config/codehalter,type=bind,readonly"`
 	gitReadonlyMount  = `"source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind,readonly"`
@@ -164,12 +135,8 @@ const (
 	sshMount          = `"source=${localEnv:SSH_AUTH_SOCK},target=/ssh-agent,type=bind"`
 )
 
-// buildDevcontainerJSON renders devcontainer.json from the embedded base, adding
-// the optional mounts the user accepted: gitReadonly shadows the workspace's
-// .git with a read-only bind (without it .git is writable via the workspace
-// mount, no extra line); gitconfig adds ~/.gitconfig read-only; sshAgent adds
-// the host SSH-agent socket AND the SSH_AUTH_SOCK env pointing at it. Pure
-// string splicing — output stays plain JSON, no parsing.
+// buildDevcontainerJSON adds the mounts the user accepted. Without gitReadonly
+// .git stays writable through the workspace mount and gets no line of its own.
 func buildDevcontainerJSON(gitReadonly, gitconfig, sshAgent bool) string {
 	out := defaultDevcontainerJSON
 	var extras []string
@@ -183,10 +150,7 @@ func buildDevcontainerJSON(gitReadonly, gitconfig, sshAgent bool) string {
 		extras = append(extras, sshMount)
 	}
 	if len(extras) > 0 {
-		ins := configMountAnchor
-		for _, m := range extras {
-			ins += ",\n    " + m
-		}
+		ins := strings.Join(append([]string{configMountAnchor}, extras...), ",\n    ")
 		out = strings.Replace(out, configMountAnchor, ins, 1)
 	}
 	if sshAgent {
@@ -195,16 +159,8 @@ func buildDevcontainerJSON(gitReadonly, gitconfig, sshAgent bool) string {
 	return out
 }
 
-// ensureTerminals gates the session on the client being able to run commands
-// for us. Every command codehalter runs — run_command, run_background, run_task
-// — goes out as an ACP terminal, so a client that didn't advertise
-// clientCapabilities.terminal leaves the agent with no shell at all. Rather than
-// discover that at the first `go build`, say so up front and refuse the session,
-// the same way ensureDevcontainer refuses to run unsandboxed.
-//
-// There is deliberately no in-process fallback. Running the commands ourselves
-// is the duplicate implementation this replaced, and a silent fallback would
-// also mean the user never learns their client is the thing that needs fixing.
+// ensureTerminals refuses the session when the client lacks ACP terminal support.
+// Every command runs as an ACP terminal; there is deliberately no in-process fallback.
 func (a *agent) ensureTerminals(ctx context.Context, sid string) bool {
 	if a.clientCan("terminal") {
 		return true
@@ -216,17 +172,15 @@ func (a *agent) ensureTerminals(ctx context.Context, sid string) bool {
 	return false
 }
 
-// hasGitFolder reports whether cwd has a .git directory (a normal clone). A .git
-// FILE (worktree/submodule link) doesn't count — the bind mount targets a dir.
-func hasGitFolder(cwd string) bool {
-	info, err := os.Stat(filepath.Join(cwd, ".git"))
-	return err == nil && info.IsDir()
+func hostHasGitconfig() bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(home, ".gitconfig"))
+	return err == nil
 }
 
-// hostSSHAgentAvailable reports whether a host SSH agent is reachable: SSH_AUTH_SOCK
-// is set AND the socket it names exists. Gates whether to even offer agent
-// forwarding — and an unset SSH_AUTH_SOCK would resolve to an empty bind source
-// that fails the container start.
 func hostSSHAgentAvailable() bool {
 	sock := os.Getenv("SSH_AUTH_SOCK")
 	if sock == "" {
@@ -236,55 +190,38 @@ func hostSSHAgentAvailable() bool {
 	return err == nil
 }
 
-// ---------------------------------------------------------------------------
-// .gitignore
-// ---------------------------------------------------------------------------
-
-// gitignoreSettingsEntry is the one path codehalter always keeps out of git: the
-// project-local settings.toml can hold an api_key. Added whenever settings.toml
-// is scaffolded, independent of the whole-dir ignore/track choice in
-// ensureGitignore — so a team that TRACKS .codehalter/ (to share PLAN.md/skills)
-// still never commits the secrets file.
+// Always ignored, even when .codehalter/ is tracked: the project settings.toml can hold an api_key.
 const gitignoreSettingsEntry = sessionDir + "/settings.toml"
 
-// ensureSettingsGitignored appends gitignoreSettingsEntry to cwd/.gitignore when
-// absent (creating the file if the project is a git repo), returning whether the
-// entry is now present. Best-effort and non-interactive: it runs at scaffold
-// time so the secrets file is excluded before the user fills in real values. No
-// point in a non-git project, so it no-ops there.
+// .git is a directory in a clone, a "gitdir:" file in a linked worktree or submodule.
+func gitManaged(cwd string) bool { return fileExists(cwd, ".git") }
+
+// appendGitignore adds entry as its own line after content, the file's current text.
+func appendGitignore(cwd, content, entry string) error {
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		entry = "\n" + entry
+	}
+	return appendFile(filepath.Join(cwd, ".gitignore"), entry+"\n")
+}
+
 func ensureSettingsGitignored(cwd string) bool {
-	gitInfo, gerr := os.Stat(filepath.Join(cwd, ".git"))
-	hasGit := gerr == nil && gitInfo.IsDir()
-	gitignorePath := filepath.Join(cwd, ".gitignore")
-	data, rerr := os.ReadFile(gitignorePath)
-	if !hasGit && rerr != nil {
-		return false // not a git repo and no existing .gitignore — nothing to do
+	data, rerr := os.ReadFile(filepath.Join(cwd, ".gitignore"))
+	if !gitManaged(cwd) && rerr != nil {
+		return false
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.TrimSpace(line) == gitignoreSettingsEntry {
-			return true // already ignored
+			return true
 		}
 	}
-	sep := ""
-	if len(data) > 0 && !strings.HasSuffix(string(data), "\n") {
-		sep = "\n"
-	}
-	return os.WriteFile(gitignorePath, []byte(string(data)+sep+gitignoreSettingsEntry+"\n"), 0o644) == nil
+	return appendGitignore(cwd, string(data), gitignoreSettingsEntry) == nil
 }
 
-// ensureGitignore makes sure .gitignore mentions .codehalter/ (as an ignore
-// line or a tracked-on-purpose marker). Asks once per repo — later sessions
-// short-circuit on the existing entry. Skipped outside git-managed dirs
-// (requires .git/ or an existing .gitignore).
 func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	gitignorePath := filepath.Join(cwd, ".gitignore")
-	// .git is a DIR in a normal repo but a FILE (a "gitdir:" pointer) in a linked
-	// worktree or a submodule — both are git-managed, so any successful stat counts.
-	_, gitErr := os.Stat(filepath.Join(cwd, ".git"))
-	hasGit := gitErr == nil
 	ignoreInfo, ignoreErr := os.Stat(gitignorePath)
 	hasGitignore := ignoreErr == nil && !ignoreInfo.IsDir()
-	if !hasGit && !hasGitignore {
+	if !gitManaged(cwd) && !hasGitignore {
 		return
 	}
 
@@ -297,8 +234,7 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 		}
 		content = string(data)
 		for _, line := range strings.Split(content, "\n") {
-			// The settings-only ignore (added when settings.toml is scaffolded) is
-			// NOT the whole-dir decision — skip it so this prompt still fires.
+			// The settings-only entry is not the whole-dir decision and must not suppress the prompt.
 			if strings.TrimSpace(line) == gitignoreSettingsEntry {
 				continue
 			}
@@ -311,10 +247,10 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 	title := "Add .codehalter/ to .gitignore?"
 	labels := []string{"Ignore, add '.codehalter' to .gitignore", "Track, add '#.codehalter' to .gitignore"}
 	if !hasGitignore {
-		title = "No .gitignore found — create one for .codehalter/?"
+		title = "No .gitignore found: create one for .codehalter/?"
 		labels = []string{"Add .gitignore, ignore .codehalter", "Add .gitignore, track .codehalter"}
 	}
-	choice, tcId, err := a.askChoiceWithCard(ctx, sid, title, "think", labels)
+	choice, tcId, err := a.askCard(ctx, sid, title, "think", choiceOptions(labels))
 	if err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return
@@ -331,57 +267,27 @@ func (a *agent) ensureGitignore(ctx context.Context, cwd string, sid string) {
 		return
 	}
 
-	if hasGitignore {
-		sep := ""
-		if !strings.HasSuffix(content, "\n") {
-			sep = "\n"
-		}
-		f, err := os.OpenFile(gitignorePath, os.O_APPEND|os.O_WRONLY, 0o644)
-		if err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return
-		}
-		_, writeErr := f.WriteString(sep + entry + "\n")
-		closeErr := f.Close()
-		if writeErr != nil {
-			a.FailToolCall(ctx, sid, tcId, writeErr.Error())
-			return
-		}
-		if closeErr != nil {
-			a.FailToolCall(ctx, sid, tcId, closeErr.Error())
-			return
-		}
-	} else {
-		if err := os.WriteFile(gitignorePath, []byte(entry+"\n"), 0o644); err != nil {
-			a.FailToolCall(ctx, sid, tcId, err.Error())
-			return
-		}
+	if err := appendGitignore(cwd, content, entry); err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		return
 	}
 	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent(note)})
 	a.say(ctx, sid, note+"\n")
 }
 
-// ---------------------------------------------------------------------------
-// Stack detection
-// ---------------------------------------------------------------------------
-
-// detectStacks returns the language/stack identifiers active in cwd, in a
-// fixed order (load-bearing: tests assert it, and ensureSkills walks it).
-// Used to seed only the relevant SKILL files.
+// detectStacks returns stacks in a fixed order that skillSet relies on.
 func detectStacks(cwd string) []string {
 	var stacks []string
 
-	if _, err := os.Stat(filepath.Join(cwd, "go.mod")); err == nil {
+	if fileExists(cwd, "go.mod") {
 		stacks = append(stacks, "go")
 	}
 
-	_, pkgErr := os.Stat(filepath.Join(cwd, "package.json"))
-	_, tsconfigErr := os.Stat(filepath.Join(cwd, "tsconfig.json"))
-	hasTS := tsconfigErr == nil || hasFileWithExt(cwd, ".ts", ".tsx")
+	hasTS := fileExists(cwd, "tsconfig.json") || hasFileWithExt(cwd, ".ts", ".tsx")
 	if hasTS {
 		stacks = append(stacks, "ts")
 	}
-	if pkgErr == nil && !hasTS {
+	if fileExists(cwd, "package.json") && !hasTS {
 		stacks = append(stacks, "js")
 	}
 
@@ -389,43 +295,25 @@ func detectStacks(cwd string) []string {
 		stacks = append(stacks, "css")
 	}
 
-	for _, n := range []string{"pom.xml", "build.gradle", "build.gradle.kts"} {
-		if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
-			stacks = append(stacks, "java")
-			break
-		}
+	if fileExists(cwd, "pom.xml") || fileExists(cwd, "build.gradle") || fileExists(cwd, "build.gradle.kts") {
+		stacks = append(stacks, "java")
 	}
 
-	if _, err := os.Stat(filepath.Join(cwd, "Cargo.toml")); err == nil {
+	if fileExists(cwd, "Cargo.toml") {
 		stacks = append(stacks, "rust")
 	}
 
-	for _, n := range []string{"build.zig", "build.zig.zon"} {
-		if _, err := os.Stat(filepath.Join(cwd, n)); err == nil {
-			stacks = append(stacks, "zig")
-			break
-		}
+	if fileExists(cwd, "build.zig") || fileExists(cwd, "build.zig.zon") {
+		stacks = append(stacks, "zig")
 	}
 
-	_, cmakeErr := os.Stat(filepath.Join(cwd, "CMakeLists.txt"))
-	if cmakeErr == nil || hasFileWithExt(cwd, ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx") {
+	if fileExists(cwd, "CMakeLists.txt") || hasFileWithExt(cwd, ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hxx") {
 		stacks = append(stacks, "c")
-	}
-
-	if hasFileWithExt(cwd, ".sh", ".bash") {
-		stacks = append(stacks, "bash")
-	}
-
-	if info, err := os.Stat(filepath.Join(cwd, ".devcontainer")); err == nil && info.IsDir() {
-		stacks = append(stacks, "devcontainer")
 	}
 
 	return stacks
 }
 
-// hasFileWithExt reports whether cwd contains a file (non-recursive) with one
-// of the given extensions. Root-only by design — deeper detection is the
-// user's job to override.
 func hasFileWithExt(cwd string, exts ...string) bool {
 	entries, err := os.ReadDir(cwd)
 	if err != nil {
@@ -442,13 +330,6 @@ func hasFileWithExt(cwd string, exts ...string) bool {
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// Environment detection
-// ---------------------------------------------------------------------------
-
-// containerKind reports the sandbox kind codehalter is running inside ("" when
-// on the bare host). discoverSandbox gates run_command on this, and
-// ensureDevcontainer aborts the session when it's empty.
 func containerKind() string {
 	if os.Getenv("REMOTE_CONTAINERS") == "true" || os.Getenv("DEVCONTAINER") == "true" {
 		return "devcontainer"
@@ -465,21 +346,12 @@ func containerKind() string {
 	return ""
 }
 
-// osInfo holds the result of parsing /etc/os-release. ID is the
-// supported-distro slug we use to pick a SKILL-*.md (one of "alpine",
-// "arch", "debian", "fedora", "ubuntu"; "" when missing/unsupported).
-// Fields is every key=value pair from the file (un-lowercased values,
-// quotes stripped) — the ID/ID_LIKE resolution below reads it. The per-OS
-// skill bodies get their os-release values via {{cmd:...}} seed-time
-// expansion (skills.go) instead, so nothing else consumes the map today.
+// ID is set only for distros with a shipped SKILL-<id>.md, else "".
 type osInfo struct {
 	ID     string
 	Fields map[string]string
 }
 
-// readOSInfo parses /etc/os-release. ID_LIKE is consulted as a fallback
-// so Linux Mint maps to ubuntu, Manjaro to arch, etc. Cheap file read —
-// safe to call from prepare on every turn.
 func readOSInfo() osInfo {
 	info := osInfo{Fields: map[string]string{}}
 	data, err := os.ReadFile("/etc/os-release")
@@ -496,14 +368,10 @@ func readOSInfo() osInfo {
 		v := strings.Trim(line[eq+1:], `"'`)
 		info.Fields[k] = v
 	}
-	supported := map[string]bool{"alpine": true, "arch": true, "debian": true, "fedora": true, "ubuntu": true}
-	if id := strings.ToLower(info.Fields["ID"]); supported[id] {
-		info.ID = id
-		return info
-	}
-	for _, alt := range strings.Fields(strings.ToLower(info.Fields["ID_LIKE"])) {
-		if supported[alt] {
-			info.ID = alt
+	ids := append([]string{strings.ToLower(info.Fields["ID"])}, strings.Fields(strings.ToLower(info.Fields["ID_LIKE"]))...)
+	for _, id := range ids {
+		if id != "" && shipped("SKILL-"+id+".md") {
+			info.ID = id
 			return info
 		}
 	}

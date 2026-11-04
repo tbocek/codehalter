@@ -4,7 +4,11 @@
 # Top-level keys must stay ABOVE the [[llm]] tables.
 
 # prewarm = true    # warm the server's prefix cache at session open (default on)
-# skills = "inline" # put every language SKILL in the prompt up front (default "auto": defer until first touch)
+# keep_warm = "3m"  # while the session is idle, and while a long tool runs, re-send
+                    # the conversation as a 1-token call so the server does not reclaim
+                    # the slot holding its prefix. "off" for a hosted endpoint, which
+                    # caches on its own and bills per request. Default 3m, stops 30min
+                    # after the last real call.
 # update_check = false # never ask GitHub whether a newer release exists (default on, at most once a day)
 
 [[llm]]
@@ -52,12 +56,22 @@ parallel = 1                      # max concurrent calls to this server
 #
 # Qwen3.8 also reads reasoning_effort = "low"|"medium"|"xhigh" (default xhigh)
 # from the same table: same rendering cost, same rule.
+#
+# thinking_off = "enable_thinking" turns the closed-think continuation above off for
+# THIS server and sends enable_thinking = false instead. Use it where the server
+# resumes its cache poorly after a continued assistant turn: Halogen (flash-next)
+# took the prefill but restarted each executor call from its last checkpoint, a
+# median 5360 tokens re-read; with the flag 106-306. Under the default effort
+# (xhigh, whose sentence opens the system block only while reasoning is on) the
+# planner and the executor then keep a cache entry each, so a role switch re-reads
+# what the other role added since its last call. Default: "prefill".
+# thinking_off = "enable_thinking"
 params_thinking = { temperature = 1.0, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 16384 }
 params_execute = { temperature = 0.6, top_p = 0.95, top_k = 20, min_p = 0.0, presence_penalty = 0.0, max_tokens = 8192 }
 
-# More [[llm]] entries fan out subagents. Add purpose = "summary" to one of them
-# to move the per-turn summariser off llm[0] as well; without it, summarising
-# runs on llm[0] (extending the foreground prefix rather than evicting it).
+# A second [[llm]] entry with purpose = "summary" moves the per-turn summariser
+# off llm[0]; without it, summarising runs on llm[0] (extending the foreground
+# prefix rather than evicting it).
 # [[llm]]
 # server = "http://other-server:9001"
 # model = "your-larger-model-id"

@@ -3,61 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"slices"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
 
-// meterCall builds the one tool call shape startToolMeter reads: a name and a
-// raw JSON argument string.
-func meterCall(name, args string) toolCall {
-	tc := toolCall{ID: "tc1"}
-	tc.Function.Name = name
-	tc.Function.Arguments = args
-	return tc
-}
-
-// TestStartToolMeter pins the tool status meter's lifecycle: stop() halts the
-// ticker and joins its goroutine promptly (no deadlock, no leak), and a cancelled
-// ctx also lets stop() return. It does not assert the 1s-tick text: that is
-// startStatusMeter's, and it is time-based.
-func TestStartToolMeter(t *testing.T) {
-	a, s := newTestAgent(t)
-
-	// Normal stop joins quickly.
-	stop := a.startToolMeter(context.Background(), s.ID, meterCall("web_search", `{"query":"goldmark tables"}`))
-	if stop == nil {
-		t.Fatal("startToolMeter returned a nil stop")
-	}
-	done := make(chan struct{})
-	go func() { stop(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("stop() did not return: meter goroutine leaked or deadlocked")
-	}
-
-	// A cancelled ctx also unblocks stop().
-	ctx, cancel := context.WithCancel(context.Background())
-	stop2 := a.startToolMeter(ctx, s.ID, meterCall("run_command", `{"command":"sleep 1"}`))
-	cancel()
-	done2 := make(chan struct{})
-	go func() { stop2(); close(done2) }()
-	select {
-	case <-done2:
-	case <-time.After(2 * time.Second):
-		t.Fatal("stop() after ctx cancel did not return")
-	}
-}
-
-// TestThrottledStream pins the token batcher that keeps per-token streaming from
-// flooding the editor at high tg/s: the first token emits immediately, tokens
-// within the interval batch into one emit, and flush drains the tail (and is a
-// no-op when nothing is buffered).
 func TestThrottledStream(t *testing.T) {
 	var emits []string
 	sink, flush := throttledStream(func(chunk string) { emits = append(emits, chunk) })
@@ -81,136 +40,68 @@ func TestThrottledStream(t *testing.T) {
 	}
 }
 
-// TestPlanResultSubtasksDeserialize ensures the planner's JSON output (an
-// array of `{description, verify}` objects under `subtasks`) round-trips into
-// the planResult / subtask structs the orchestrator consumes. This is the
-// contract between PLAN.md and runExecutePhase.
-func TestPlanResultSubtasksDeserialize(t *testing.T) {
-	raw := `{
-		"clear": true,
-		"subtasks": [
-			{"description": "refactor storage", "verify": ["go build ./...", "go test ./storage/..."]},
-			{"description": "update API", "verify": ["curl /healthz"]},
-			{"description": "write migration"}
-		]
-	}`
-	var p planResult
-	if err := json.Unmarshal([]byte(raw), &p); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if len(p.Subtasks) != 3 {
-		t.Fatalf("subtasks: want 3, got %d", len(p.Subtasks))
-	}
-	if p.Subtasks[0].Description != "refactor storage" {
-		t.Errorf("subtasks[0].Description = %q", p.Subtasks[0].Description)
-	}
-	if !slices.Equal(p.Subtasks[0].Verify, []string{"go build ./...", "go test ./storage/..."}) {
-		t.Errorf("subtasks[0].Verify = %v", p.Subtasks[0].Verify)
-	}
-	if len(p.Subtasks[2].Verify) != 0 {
-		t.Errorf("subtasks[2].Verify should be empty (omitempty), got %v", p.Subtasks[2].Verify)
-	}
+// fakeTool is a test tool with an object schema; run answers each call.
+func fakeTool(name string, run func(args string) (string, bool)) Tool {
+	return Tool{Def: map[string]any{"type": "function", "function": map[string]any{
+		"name": name, "description": "test tool", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, args string) (string, bool) { return run(args) }}
+}
 
-	// report_only round-trips so renderPlan can label it "Findings:".
-	rawReport := `{"clear": true, "report_only": true, "subtasks": [{"description": "summarise X"}]}`
-	var p2 planResult
-	if err := json.Unmarshal([]byte(rawReport), &p2); err != nil {
-		t.Fatalf("unmarshal report_only: %v", err)
-	}
-	if !p2.ReportOnly {
-		t.Errorf("expected report_only=true")
+// The contract between PLAN.md and runExecutePhase, including the shapes planners
+// send: subtasks serialised into a string, with a stray brace after it.
+func TestPlanResultUnmarshalJSON(t *testing.T) {
+	want := []subtask{{Description: "do x", Verify: []string{"just test"}}}
+	for _, tc := range []struct {
+		name, raw  string
+		subtasks   []subtask
+		reportOnly bool
+		wantErr    bool
+	}{
+		{"array", `{"clear":true,"subtasks":[{"description":"do x","verify":["just test"]}]}`, want, false, false},
+		{"no verify", `{"clear":true,"subtasks":[{"description":"do x"}]}`, []subtask{{Description: "do x"}}, false, false},
+		{"stringified", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}]"}`, want, false, false},
+		{"stringified with a stray brace", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}]}"}`, want, false, false},
+		{"stringified without its closing bracket", `{"clear":true,"subtasks":"[{\"description\":\"do x\",\"verify\":[\"just test\"]}"}`, want, false, false},
+		{"report only, no subtasks", `{"clear":true,"report_only":true}`, nil, true, false},
+		{"a string that is not an array", `{"clear":true,"subtasks":"do x"}`, nil, false, true},
+	} {
+		var p planResult
+		err := json.Unmarshal([]byte(tc.raw), &p)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, want error %v", tc.name, err, tc.wantErr)
+			continue
+		}
+		if tc.wantErr {
+			continue
+		}
+		if !reflect.DeepEqual(p.Subtasks, tc.subtasks) {
+			t.Errorf("%s: got %+v, want subtasks %+v", tc.name, p, tc.subtasks)
+		}
 	}
 }
 
-// TestIssueBagTokenisation pins the bag-of-words tokeniser used for fuzzy
-// failure matching: lowercase, punctuation-stripped, order-independent. The
-// reworded-near-duplicate case ("missing import" vs "import is missing") is
-// the one that motivates the fuzzy approach over exact key matching.
-func TestIssueBagTokenisation(t *testing.T) {
-	// Casing, punctuation and word order are all discarded.
-	a := issueBag([]string{"Missing import!", "Syntax error."})
-	b := issueBag([]string{"syntax  ERROR", "missing\timport"})
-	if !slices.Equal(sortedKeys(a), sortedKeys(b)) {
-		t.Errorf("expected equivalent bags, got %v vs %v", sortedKeys(a), sortedKeys(b))
-	}
-
-	// Adjacent non-alphanumeric runs collapse to a single separator (no empty
-	// tokens leak into the bag).
-	bag := issueBag([]string{"foo--bar...baz"})
-	want := []string{"bar", "baz", "foo"}
-	if !slices.Equal(sortedKeys(bag), want) {
-		t.Errorf("got %v, want %v", sortedKeys(bag), want)
-	}
-}
-
-func sortedKeys(m map[string]bool) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	slices.Sort(out)
-	return out
-}
-
-// TestJaccardSimilarity covers the failure-loop bail decision. The reworded
-// near-duplicate must score above the configured threshold so the retry
-// loop bails; unrelated failures must stay below.
-func TestJaccardSimilarity(t *testing.T) {
-	// Two empty bags are treated as identical (degenerate but well-defined).
-	if got := jaccard(map[string]bool{}, map[string]bool{}); got != 1 {
-		t.Errorf("empty/empty: got %v, want 1", got)
-	}
-
-	// Reworded duplicate: {"missing","import"} vs {"import","is","missing"}.
-	// |∩|=2, |∪|=3 → 0.666… → must exceed the threshold so a retry bails.
-	a := issueBag([]string{"missing import"})
-	b := issueBag([]string{"import is missing"})
-	if s := jaccard(a, b); s < failureSimilarityThreshold {
-		t.Errorf("reworded duplicate: got %v, want >= %v", s, failureSimilarityThreshold)
-	}
-
-	// Unrelated failures must NOT collapse — exact wording chosen so the
-	// Jaccard score is comfortably under the threshold.
-	c := issueBag([]string{"missing import in foo.go"})
-	d := issueBag([]string{"unused variable x"})
-	if s := jaccard(c, d); s >= failureSimilarityThreshold {
-		t.Errorf("disjoint issues: got %v, want < %v", s, failureSimilarityThreshold)
-	}
-
-	// Symmetric.
-	if jaccard(a, b) != jaccard(b, a) {
-		t.Errorf("expected jaccard to be symmetric")
-	}
-}
-
-// TestCapHitLadder pins the cap-hit recovery in runToolLoopSeeded: a generation
-// truncated AT max_tokens first retries with a be-concise nudge appended to the
-// wire context, then once more on a doubled cap, and a response that then
-// succeeds ends the loop normally. Discarded partials never reach the result.
+// A cap hit retries with a be-concise nudge; the discarded partial never reaches the result.
 func TestCapHitLadder(t *testing.T) {
 	mock := newMockLLM(t,
 		sseTruncatedContent("way too long", 1000, defaultMaxTokens),
-		sseTruncatedContent("still too long", 1000, defaultMaxTokens),
 		sseText("done"),
 	)
 	defer mock.Close()
 	a, s := newTestAgent(t)
-	a.mainSlotTokens = 85248 // ample n_ctx room: these are cap hits, not the ceiling
+	a.mainSlotTokens.Store(85248) // ample n_ctx room: these are cap hits, not the ceiling
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
 	if err != nil {
 		t.Fatalf("ladder should recover: %v", err)
 	}
-	if got := mock.callCount(); got != 3 {
-		t.Fatalf("callCount = %d, want 3 (cap, nudged cap, success)", got)
+	if got := mock.callCount(); got != 2 {
+		t.Fatalf("callCount = %d, want 2 (cap, nudged success)", got)
 	}
 	if res.Text != "done" {
 		t.Errorf("res.Text = %q, want the successful reply only (partials discarded)", res.Text)
 	}
 
-	// Rung 1: the second request must carry the be-concise nudge as the
-	// trailing user message.
 	req2 := mock.request(1)
 	msgs, _ := req2["messages"].([]any)
 	if len(msgs) == 0 {
@@ -223,17 +114,36 @@ func TestCapHitLadder(t *testing.T) {
 	if mt, ok := req2["max_tokens"].(float64); !ok || int(mt) != defaultMaxTokens {
 		t.Errorf("second request max_tokens = %v, want unchanged %d", req2["max_tokens"], defaultMaxTokens)
 	}
+}
 
-	// Rung 2: the third request runs on the doubled cap.
-	req3 := mock.request(2)
-	if mt, ok := req3["max_tokens"].(float64); !ok || int(mt) != 2*defaultMaxTokens {
-		t.Errorf("third request max_tokens = %v, want doubled %d", req3["max_tokens"], 2*defaultMaxTokens)
+// A reply that needs more than the cap (a large file) survives the nudge; one
+// retry on a doubled cap gets it through.
+func TestCapHitLadderDoubles(t *testing.T) {
+	mock := newMockLLM(t,
+		sseTruncatedContent("big file", 1000, defaultMaxTokens),
+		sseTruncatedContent("big file", 1000, defaultMaxTokens),
+		sseText("done"),
+	)
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.mainSlotTokens.Store(85248)
+
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
+	if err != nil {
+		t.Fatalf("the doubled cap should recover: %v", err)
+	}
+	if got := mock.callCount(); got != 3 || res.Text != "done" {
+		t.Fatalf("callCount = %d, text = %q; want 3 calls ending in the doubled retry's reply", got, res.Text)
+	}
+	if mt, _ := mock.request(2)["max_tokens"].(float64); int(mt) != 2*defaultMaxTokens {
+		t.Errorf("third request max_tokens = %v, want %d", mock.request(2)["max_tokens"], 2*defaultMaxTokens)
+	}
+	if mt, _ := mock.request(1)["max_tokens"].(float64); int(mt) != defaultMaxTokens {
+		t.Errorf("the nudged request max_tokens = %v, want the unchanged %d", mock.request(1)["max_tokens"], defaultMaxTokens)
 	}
 }
 
-// TestCapHitLadderExhausted pins the ladder's exit: a third consecutive cap hit
-// stops retrying and surfaces the cap error into the normal failure path
-// (replan), instead of doubling forever.
 func TestCapHitLadderExhausted(t *testing.T) {
 	mock := newMockLLM(t,
 		sseTruncatedContent("too long", 1000, defaultMaxTokens),
@@ -242,41 +152,28 @@ func TestCapHitLadderExhausted(t *testing.T) {
 	)
 	defer mock.Close()
 	a, s := newTestAgent(t)
-	a.mainSlotTokens = 85248
+	a.mainSlotTokens.Store(85248)
 
 	_, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
-	if asCapHit(err) == nil {
+	var ce *capHitError
+	if !errors.As(err, &ce) {
 		t.Fatalf("exhausted ladder should surface the cap error, got: %v", err)
 	}
 	if got := mock.callCount(); got != 3 {
-		t.Errorf("callCount = %d, want 3 (no retries past the ladder)", got)
+		t.Errorf("callCount = %d, want 3 (cap, nudge, doubled cap, then give up)", got)
 	}
 }
 
-// TestStuckLadderFuzzyOutput pins the Jaccard extension of the repetition
-// ladder: a re-issued identical call whose output differs only in noise (an
-// elapsed-time / attempt counter, i.e. a timestamped failing build) counts as
-// reproduced, so the loop bails at stuckBailRounds instead of spinning while
-// the exact output hash keeps changing.
+// Output differing only in noise (a timestamped failing build) counts as reproduced.
 func TestStuckLadderFuzzyOutput(t *testing.T) {
 	const toolName = "noisy_probe_test_tool"
 	attempt := 0
-	RegisterTool(Tool{Def: map[string]any{
-		"type": "function",
-		"function": map[string]any{
-			"name":        toolName,
-			"description": "test-only failing probe with noisy output",
-			"parameters":  map[string]any{"type": "object"},
-		},
-	}, Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+	probe := fakeTool(toolName, func(string) (string, bool) {
 		attempt++
-		// Long fixed error text + two noise tokens (elapsed, attempt) → Jaccard
-		// ≈ 0.93 between consecutive outputs: above stuckOutputSimilarity while
-		// the fnv hash differs every time.
+		// Jaccard ≈ 0.93 between outputs: above stuckOutputSimilarity, a new hash every time.
 		return fmt.Sprintf("build FAILED: cannot load package example.com/foo/bar: import cycle not allowed in dependency graph involving widget factory manager controller service repository handler adapter transport codec parser lexer scanner tokenizer emitter renderer scheduler dispatcher broker queue worker pool cache index shard replica leader follower quorum consensus journal snapshot compaction segment (elapsed %dms, attempt %d)", 1200+attempt*7, attempt), true
-	}})
-	t.Cleanup(func() { UnregisterToolsByPrefix(toolName) })
+	})
 
 	call := sseToolCall("c1", toolName, `{}`)
 	responses := make([]string, 12)
@@ -286,74 +183,77 @@ func TestStuckLadderFuzzyOutput(t *testing.T) {
 	mock := newMockLLM(t, responses...)
 	defer mock.Close()
 	a, s := newTestAgent(t)
-	a.mainSlotTokens = 85248
+	a.tools.add(probe)
+	a.mainSlotTokens.Store(85248)
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
 	if err != nil {
 		t.Fatalf("stuck bail is a graceful exit, got error: %v", err)
 	}
-	if res.RespondCalled {
+	if res.Terminal != "" {
 		t.Errorf("bail must not report a terminal exit")
 	}
-	// Round 1 registers the first output; rounds 2-6 are fuzzy-reproduced stuck
-	// rounds, and the ladder bails at stuckBailRounds — 6 calls total.
+	// Round 1 is new output; rounds 2-6 are stuck, and the ladder bails.
 	if got := mock.callCount(); got != 1+stuckBailRounds {
 		t.Errorf("callCount = %d, want %d (bail at stuckBailRounds via fuzzy match)", got, 1+stuckBailRounds)
 	}
 }
 
-// TestToolMeterShowsTheArgument pins what the status row is FOR: "run_command"
-// sitting at 77s says something is slow but not what, and the arguments have
-// scrolled away in the transcript by then. The row carries the command itself.
-func TestToolMeterShowsTheArgument(t *testing.T) {
-	h := newTerminalHarness(t)
-	a, s := h.agent, h.sess
-	s.phaseMu.Lock()
-	s.phaseActive, s.phaseCurrent = true, 0
-	s.phaseMu.Unlock()
-
-	long := strings.Repeat("x", 200)
-	for _, tc := range []struct {
-		name, args, want string
-	}{
-		{"run_command", `{"command":"go build ./..."}`, "run_command go build ./..."},
-		{"run_task", `{"task":"just:build"}`, "run_task just:build"},
-		{"search_text", `{"query":"LoadAll","path":"src"}`, "search_text LoadAll"}, // query wins over path
-		{"read_file", `{"path":"loop.go","limit":40}`, "read_file loop.go"},
-		{"web_search", `{"query":"line one\nline two"}`, "web_search line one line two"}, // no row-breaking newline
-		{"launch_subagent", `{"tasks":[{"instructions":"go"}]}`, "launch_subagent"},      // no string arg → bare name
-		{"run_command", `{"command":"` + long + `"}`, "run_command " + strings.Repeat("x", toolMeterArgRunes)},
-		{"read_file", `not json at all`, "read_file"},
-	} {
-		stop := a.startToolMeter(context.Background(), s.ID, meterCall(tc.name, tc.args))
-		stop()
-		if !h.waitFor(func() bool { return len(h.updatesOfKind("plan")) > 0 }) {
-			t.Fatalf("%s: no plan update", tc.name)
+// A step ended for repeating one call hands it on: the turn's next step gets
+// that call's output back instead of a run, until it writes something. On one
+// /spec item five replanned steps each opened with the grep that ended the one before.
+func TestStuckCallIsNotRunAgainInTheSameTurn(t *testing.T) {
+	const toolName = "same_probe_test_tool"
+	runs := 0
+	a, s := newTestAgent(t)
+	a.tools.add(fakeTool(toolName, func(string) (string, bool) {
+		runs++
+		return "13:![The Cut page](img/05-cut.png)", false
+	}))
+	a.mainSlotTokens.Store(85248)
+	call := sseToolCall("c1", toolName, `{}`)
+	var step1 []string
+	for range 1 + stuckBailRounds {
+		step1 = append(step1, call)
+	}
+	write, _ := json.Marshal(map[string]string{"path": "note.txt", "content": "changed\n"})
+	mock := newMockLLM(t, append(step1,
+		sseToolCall("v1", toolName, `{"log":"snap73"}`), // varied: runs, and its answer is the stuck one
+		call, // the same call again: not run
+		sseToolCall("w1", "write_file", string(write)),
+		call, // after a write it is a re-check: runs
+		sseToolCall("r1", respondToolName, `{"message":"done"}`),
+	)...)
+	defer mock.Close()
+	step := func() toolLoopResult {
+		t.Helper()
+		res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "look at the picture"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", false, 0)
+		if err != nil {
+			t.Fatal(err)
 		}
-		var got string
-		for _, u := range h.updatesOfKind("plan") {
-			entries, _ := u["entries"].([]any)
-			for _, e := range entries {
-				em, _ := e.(map[string]any)
-				if em["status"] == "in_progress" {
-					got, _ = em["content"].(string)
-				}
-			}
-		}
-		if want := " (running " + tc.want + "…)"; !strings.HasSuffix(got, want) {
-			t.Errorf("%s(%s) row = %q, want it to end in %q", tc.name, tc.args, got, want)
-		}
-		h.mu.Lock()
-		h.updates = nil
-		h.mu.Unlock()
+		return res
+	}
+	if res := step(); res.Terminal != "" || runs != 1+stuckBailRounds {
+		t.Fatalf("step 1: terminal=%q runs=%d, want ended after %d runs", res.Terminal, runs, 1+stuckBailRounds)
+	}
+	if res := step(); res.Terminal != respondToolName {
+		t.Fatalf("step 2 did not finish: %+v", res)
+	}
+	if runs != 3+stuckBailRounds {
+		t.Errorf("runs = %d, want %d: the varied call ran, the same one was refused once, then ran after the write", runs, 3+stuckBailRounds)
+	}
+	if got := mock.request(len(step1) + 1); !strings.Contains(fmt.Sprint(got["messages"]), "Changing the command does not change the answer") {
+		t.Errorf("the varied call with the stuck answer got no note:\n%v", got["messages"])
+	}
+	if got := mock.request(len(step1) + 2); !strings.Contains(fmt.Sprint(got["messages"]), "not run: an earlier attempt at this task ran exactly this call") ||
+		!strings.Contains(fmt.Sprint(got["messages"]), "img/05-cut.png") {
+		t.Errorf("the refused call did not carry the note and the earlier output:\n%v", got["messages"])
 	}
 }
 
-// TestAddCorrectiveSurvivesRebuild pins the invariant that cost one turn 9998 of
-// 15346 re-evaluated tokens: a corrective turn appended to the wire only is
-// gone from the next runToolLoop rebuild, which drops it out of the MIDDLE of
-// history and shifts everything after it. The wire and a rebuild must agree.
+// A wire-only corrective would drop out of the MIDDLE of history on the next rebuild.
 func TestAddCorrectiveSurvivesRebuild(t *testing.T) {
 	a, s := newTestAgent(t)
 	s.AddUser("do the thing")
@@ -363,7 +263,7 @@ func TestAddCorrectiveSurvivesRebuild(t *testing.T) {
 
 	rebuilt := a.buildLLMContext(s)
 	if len(rebuilt) != len(wire) {
-		t.Fatalf("rebuild has %d messages, wire had %d — the corrective did not persist", len(rebuilt), len(wire))
+		t.Fatalf("rebuild has %d messages, wire had %d: the corrective did not persist", len(rebuilt), len(wire))
 	}
 	for i := range wire {
 		if rebuilt[i].Role != wire[i].Role || fmt.Sprint(rebuilt[i].Content) != fmt.Sprint(wire[i].Content) {
@@ -373,28 +273,13 @@ func TestAddCorrectiveSurvivesRebuild(t *testing.T) {
 	}
 }
 
-// TestPlanRecoversFromMalformedSubmitPlanArguments pins the recovery hole: a
-// planner that CALLS submit_plan but writes arguments which aren't valid JSON
-// used to skip the corrective retry entirely (the guard also demanded
-// !RespondCalled) and fail the whole turn on the first malformed argument list.
 func TestPlanRecoversFromMalformedSubmitPlanArguments(t *testing.T) {
 	broken := sseToolCall("c1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do the thing"`)
 	fixed := sseToolCall("c2", submitPlanToolName,
 		`{"clear":true,"subtasks":[{"description":"do the thing","verify":["go build ./..."]}],"report_only":false}`)
-	mock := newMockLLM(t, broken, fixed)
-	defer mock.Close()
-	a, s := newTestAgent(t)
-	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-	// An empty PLAN.md disables planning outright, so seed one: the content is
-	// irrelevant here, only its presence gates the phase.
-	if err := os.MkdirAll(filepath.Join(s.Cwd, ".codehalter"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(s.Cwd, ".codehalter", "PLAN.md"), []byte("plan things"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	a, s, _ := planPhaseAgent(t, broken, fixed)
 
-	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil {
 		t.Fatalf("malformed arguments should recover via the corrective retry, got: %v", err)
 	}
@@ -403,39 +288,56 @@ func TestPlanRecoversFromMalformedSubmitPlanArguments(t *testing.T) {
 	}
 }
 
-// planPhaseAgent wires a mock LLM to a session and seeds a PLAN.md, the two
-// things runPlanPhase needs before it will run at all: no [[llm]] is an error
-// and an empty PLAN.md disables planning outright. The PLAN.md content is
-// irrelevant to these tests, only its presence gates the phase.
+// The shapes Qwen3.8 sent six rounds in a row: the plan inside a `plan` key, as
+// an object or as JSON text holding a list. They are the plan, with no retry.
+func TestPlanUnwrapsAWrappedPlan(t *testing.T) {
+	for _, args := range []string{
+		`{"plan": {"clear": true, "report_only": false, "subtasks": [{"description": "fix the compile break"}]}}`,
+		`{"plan": "[{\"clear\": true, \"report_only\": false, \"subtasks\": [{\"description\": \"fix the compile break\"}]}]"}`,
+	} {
+		a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, args))
+		plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+		if err != nil || plan == nil || len(plan.Subtasks) != 1 || plan.Subtasks[0].Description != "fix the compile break" {
+			t.Errorf("%s: plan=%+v err=%v, want the wrapped subtask", args, plan, err)
+		}
+		if mock.callCount() != 1 {
+			t.Errorf("%s: %d calls, want 1 (no retry)", args, mock.callCount())
+		}
+	}
+}
+
+// A plan with nothing in it gets the one retry even without clear set.
+func TestPlanRetriesAnEmptyPlan(t *testing.T) {
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear": false, "report_only": false}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear": true, "subtasks": [{"description": "do it"}]}`),
+	)
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil || plan == nil || len(plan.Subtasks) != 1 {
+		t.Fatalf("plan=%+v err=%v, want the retry's subtask", plan, err)
+	}
+	if mock.callCount() != 2 || !strings.Contains(fmt.Sprint(mock.request(1)["messages"]), "not inside another key") {
+		t.Errorf("%d calls, want 2 with the corrective", mock.callCount())
+	}
+}
+
 func planPhaseAgent(t *testing.T, responses ...string) (*agent, *Session, *mockLLM) {
 	t.Helper()
 	mock := newMockLLM(t, responses...)
 	t.Cleanup(mock.Close)
 	a, s := newTestAgent(t)
 	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-	if err := os.MkdirAll(filepath.Join(s.Cwd, ".codehalter"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(s.Cwd, ".codehalter", "PLAN.md"), []byte("plan things"), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	return a, s, mock
 }
 
-// TestPlanPreambleIsNotAnAnswer pins the detector's good path: prose written
-// alongside subtasks with report_only=false is a PREAMBLE, and preambles cost
-// nothing. orchestrate already drops that prose (it surfaces answer only when
-// there are no subtasks), so there is nothing to pick between and no reason to
-// spend a corrective round trip asking. Measured on two real sessions: 10 of 35
-// plan submissions looked exactly like this one, every one report_only=false,
-// every one nudged for a plan it had already submitted.
+// Prose beside subtasks is a preamble and costs no corrective round trip.
 func TestPlanPreambleIsNotAnAnswer(t *testing.T) {
 	args := `{"clear":true,"report_only":false,"subtasks":[{"description":"delete out/test and rebuild","verify":["go build ./..."]}]}`
 	a, s, mock := planPhaseAgent(t, sseContentThenToolCall(
 		"The request is clear: delete the out/test build output and recompile the site.",
 		"p1", submitPlanToolName, args))
 
-	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil {
 		t.Fatalf("runPlanPhase: %v", err)
 	}
@@ -447,42 +349,7 @@ func TestPlanPreambleIsNotAnAnswer(t *testing.T) {
 	}
 }
 
-// TestPlanReportOnlyProseStillNudges pins the other side: report_only=true IS
-// the real fork. Those subtasks only relay findings, so prose alongside them
-// may already have delivered the answer the subtasks would go re-derive. The
-// planner has to pick, and the corrective round is what makes it.
-func TestPlanReportOnlyProseStillNudges(t *testing.T) {
-	ambiguous := sseContentThenToolCall(
-		"The three helpers live in a.go, b.go and c.go.",
-		"p1", submitPlanToolName,
-		`{"clear":true,"report_only":true,"subtasks":[{"description":"list the helpers","verify":["ls"]}]}`)
-	picked := sseContentThenToolCall(
-		"The three helpers live in a.go, b.go and c.go.",
-		"p2", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[]}`)
-	a, s, mock := planPhaseAgent(t, ambiguous, picked)
-
-	plan, _, err := a.runPlanPhase(context.Background(), s.ID, "")
-	if err != nil {
-		t.Fatalf("runPlanPhase: %v", err)
-	}
-	if got := mock.callCount(); got != 2 {
-		t.Errorf("an answer + report_only subtasks cost %d LLM calls, want 2 (the nudge)", got)
-	}
-	if plan == nil || len(plan.Subtasks) != 0 {
-		t.Fatalf("plan = %+v, want the corrected answer-only submission", plan)
-	}
-}
-
-// TestExecutePhaseTurnsReasoningOff pins how the execute role stops reasoning:
-// the connection carries the closed-<think> prefill, so the wire ends in an
-// assistant message the server is told to continue, and every earlier token is
-// untouched.
-//
-// It used to be a "/no_think" suffix glued onto the STORED subtask prompt. That
-// bought nothing twice over: 237 of 388 execute responses carrying it reasoned
-// anyway over one 11.6h session, and the suffix then rode the history for the
-// rest of it. So the stored turn is asserted too — it must be the prompt and
-// nothing else.
+// Via the closed-think prefill on the wire; the stored turn is the prompt and nothing else.
 func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	mock := newMockLLM(t, sseToolCall("r1", respondToolName, `{"message":"done"}`))
 	defer mock.Close()
@@ -503,6 +370,10 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	}
 	if _, set := body["chat_template_kwargs"]; set {
 		t.Errorf("execute re-rendered the prompt instead of appending: %v", body["chat_template_kwargs"])
+	}
+	// Not forced: a forced call is named before the model weighs what it was told.
+	if body["tool_choice"] != "auto" {
+		t.Errorf("execute call tool_choice = %v, want auto", body["tool_choice"])
 	}
 	sent, _ := body["messages"].([]any)
 	if len(sent) == 0 {
@@ -527,40 +398,43 @@ func TestExecutePhaseTurnsReasoningOff(t *testing.T) {
 	}
 }
 
-// TestToolLoopRecordsToolUses verifies that when the LLM returns a tool call,
-// the tool loop executes it, appends the ToolUse to the session, and persists
-// to disk — before the second LLM turn produces the final text.
+// A server entry with thinking_off = "enable_thinking" gets reasoning off by the template flag
+// instead of the prefill, read from settings.toml as a user writes it.
+func TestExecutePhaseThinkingOffByFlag(t *testing.T) {
+	mock := newMockLLM(t, sseToolCall("r1", respondToolName, `{"message":"done"}`))
+	defer mock.Close()
+	t.Setenv("HOME", t.TempDir())
+	a, s := newTestAgent(t)
+	writeTree(t, s.Cwd, map[string]string{filepath.Join(sessionDir, "settings.toml"): fmt.Sprintf("[[llm]]\nserver = %q\nmodel = \"m\"\nthinking_off = \"enable_thinking\"\n", mock.ts.URL)})
+	settings, err := loadSettings(s.Cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.settings = settings
+
+	if out := a.runExecutePhase(context.Background(), s.ID, subtask{Description: "do the thing"}, 0, 1); out.Reason != "" {
+		t.Fatalf("executor error: %s", out.Reason)
+	}
+	body := mock.request(0)
+	kw, _ := body["chat_template_kwargs"].(map[string]any)
+	if _, cont := body["continue_final_message"]; cont || kw["enable_thinking"] != false || body["tool_choice"] != "auto" {
+		t.Errorf("execute call = continue_final_message %v, chat_template_kwargs %v, tool_choice %v; want the flag, no prefill, not forced",
+			body["continue_final_message"], body["chat_template_kwargs"], body["tool_choice"])
+	}
+	sent, _ := body["messages"].([]any)
+	if last, _ := sent[len(sent)-1].(map[string]any); last["role"] == "assistant" {
+		t.Errorf("the prefill went out anyway: %v", last)
+	}
+}
+
 func TestToolLoopRecordsToolUses(t *testing.T) {
-	// Isolate from the package-level registry so the synthetic `respond` tool
-	// (registered in tool_respond.go init) isn't in scope — its presence would
-	// flip the loop's empty-tool-call branch from "exit with allText" to a
-	// nudge, which is a different code path tested elsewhere.
-	withFreshToolRegistry(t)
-	// Register a stub tool inline so we don't depend on filesystem tool
-	// implementations. This runs at init in package-level registeredTools.
 	const testToolName = "test_echo_tool_9d7f"
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name":        testToolName,
-				"description": "echoes the input.msg field (test only)",
-				"parameters": map[string]any{
-					"type":       "object",
-					"properties": map[string]any{"msg": map[string]any{"type": "string"}},
-				},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			args := parseArgs(rawArgs)
-			return "echo: " + args.str("msg"), false
-		},
+	echo := fakeTool(testToolName, func(args string) (string, bool) {
+		return "echo: " + parseArgs(args).str("msg"), false
 	})
 
 	mock := newMockLLM(t,
-		// Turn 1: LLM asks to call the stub tool.
 		sseToolCall("call_1", testToolName, `{"msg":"hello"}`),
-		// Turn 2: LLM produces the final assistant text.
 		sseText("All done."),
 	)
 	defer mock.Close()
@@ -578,6 +452,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	a := &agent{
 		sessions: map[string]*Session{s.ID: s},
 	}
+	withTools(a, echo)
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "please echo hello"}}, phasePolicy{}, "execute", true, 0)
@@ -595,10 +470,7 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 		t.Errorf("ToolUse output: got %q", res.ToolUses[0].Output)
 	}
 
-	// The loop now stores each assistant turn VERBATIM (cache-faithful replay):
-	// [user, assistant{tool turn: echo}, assistant{text turn: "All done."}].
-	// The tool turn carries the tool use; the final text turn carries the text —
-	// no merge, no post-hoc patch.
+	// Each assistant turn is stored verbatim, never merged: user, tool turn, text turn.
 	if got := len(s.Messages); got != 3 {
 		t.Fatalf("session messages: got %d, want 3", got)
 	}
@@ -609,7 +481,6 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 		t.Errorf("msg[2]: want assistant content %q, got role=%q content=%q", "All done.", s.Messages[2].Role, s.Messages[2].Content)
 	}
 
-	// Persistence: the turns are on disk from the incremental Save in the loop.
 	loaded, err := loadSession(dir, s.ID)
 	if err != nil {
 		t.Fatalf("loadSession: %v", err)
@@ -629,14 +500,8 @@ func TestToolLoopRecordsToolUses(t *testing.T) {
 	}
 }
 
-// TestToolLoopRespondExits verifies that when the model calls the synthetic
-// `respond` terminal tool, the loop exits with the message arg as res.Text on
-// the same iteration — no second LLM round-trip to "produce final text".
-// This is the post-respond exit semantic (vs the legacy "empty tool_calls
-// means done" path covered by TestToolLoopRecordsToolUses with a fresh
-// registry).
+// respond exits on the same iteration, with no second round trip.
 func TestToolLoopRespondExits(t *testing.T) {
-	// Use the real package registry so respond is in scope (no withFreshToolRegistry).
 	mock := newMockLLM(t,
 		sseToolCall("call_1", respondToolName, `{"message":"final answer"}`),
 	)
@@ -671,21 +536,9 @@ func TestToolLoopRespondExits(t *testing.T) {
 	}
 }
 
-// TestRunToolLoopDenyGate pins the dispatch gate that replaced array pruning: a
-// tool the phase policy denies is REJECTED without executing, recorded as a
-// failed tool use with a teaching message, and the loop continues so the model
-// can correct. (The tool is still in the array — only dispatch blocks it.)
+// A denied tool stays in the array; dispatch rejects it and the loop continues.
 func TestRunToolLoopDenyGate(t *testing.T) {
-	withFreshToolRegistry(t)
 	var execs int
-	RegisterTool(Tool{
-		Def: map[string]any{"type": "function", "function": map[string]any{
-			"name": "mutate", "description": "x", "parameters": map[string]any{"type": "object"}}},
-		Execute: func(ctx context.Context, a *agent, sid string, raw string) (string, bool) {
-			execs++
-			return "did it", false
-		},
-	})
 	mock := newMockLLM(t,
 		sseToolCall("c1", "mutate", `{}`),
 		sseText("ok"),
@@ -693,6 +546,10 @@ func TestRunToolLoopDenyGate(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
+	withTools(a, fakeTool("mutate", func(string) (string, bool) {
+		execs++
+		return "did it", false
+	}))
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
 		[]llmMessage{{Role: "user", Content: "go"}},
 		phasePolicy{deny: map[string]bool{"mutate": true}}, "plan", true, 0)
@@ -710,10 +567,6 @@ func TestRunToolLoopDenyGate(t *testing.T) {
 	}
 }
 
-// TestRunToolLoopMultiTerminalUpsert pins multi-terminal exit: in an execute
-// loop exposing BOTH respond and submit_plan, calling submit_plan ends the loop
-// with Terminal=submit_plan and the plan JSON in res.Text — the signal the
-// orchestrator reads as a plan-upsert.
 func TestRunToolLoopMultiTerminalUpsert(t *testing.T) {
 	planArgs := `{"clear":true,"subtasks":[{"description":"do y"}]}`
 	mock := newMockLLM(t, sseToolCall("c1", submitPlanToolName, planArgs))
@@ -734,10 +587,6 @@ func TestRunToolLoopMultiTerminalUpsert(t *testing.T) {
 	}
 }
 
-// TestToolLoopNoTerminalKeepsTextExit verifies that a policy with NO terminals
-// keeps the legacy text-only exit: a no-tool-calls turn returns immediately
-// instead of nudging. (Phases set their terminals explicitly now; an empty
-// phasePolicy is the no-terminal case.)
 func TestToolLoopNoTerminalKeepsTextExit(t *testing.T) {
 	mock := newMockLLM(t,
 		sseText(`{"clear": true, "steps": ["do x"]}`),
@@ -770,11 +619,7 @@ func TestToolLoopNoTerminalKeepsTextExit(t *testing.T) {
 	}
 }
 
-// TestPlanSubmitPlanSeparatesAnswer verifies the plan phase's terminal split:
-// when the planner writes a direct answer AND calls submit_plan, the structured
-// plan lands in res.Text (submit_plan's echoed args) while the user-facing prose
-// lands in res.Content — the two channels never mix, so the old "answer mashed
-// into the plan JSON" bug can't recur.
+// The plan lands in res.Text, the prose beside it in res.Content.
 func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 	planArgs := `{"clear":true,"subtasks":[],"report_only":true}`
 	mock := newMockLLM(t, sseContentThenToolCall("Active servers: gopls.", "tc1", submitPlanToolName, planArgs))
@@ -793,8 +638,8 @@ func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
-	if !res.RespondCalled {
-		t.Errorf("RespondCalled: got false, want true (submit_plan is the plan terminal)")
+	if res.Terminal != submitPlanToolName {
+		t.Errorf("Terminal: got %q, want submit_plan (the plan terminal)", res.Terminal)
 	}
 	if !strings.Contains(res.Text, `"report_only":true`) {
 		t.Errorf("res.Text should carry the submit_plan args (the plan JSON): got %q", res.Text)
@@ -804,106 +649,46 @@ func TestPlanSubmitPlanSeparatesAnswer(t *testing.T) {
 	}
 }
 
-// TestToolLoopNoDedup verifies that identical tool calls in the same tool
-// loop each execute the underlying tool. The dedup cache used to suppress
-// the second call, which broke read-after-write: a mutator (sed via
-// run_command) would change state, then a re-issued read returned the
-// pre-mutation cached value and the model concluded the mutation failed.
-// Now every call executes; the model gets a fresh result every time.
-func TestToolLoopNoDedup(t *testing.T) {
-	withFreshToolRegistry(t)
-	const readName = "test_read"
-	const writeName = "test_write"
-	var reads, writes int
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": readName, "description": "read",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			reads++
-			return "read-ok", false
-		},
-	})
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": writeName, "description": "write",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			writes++
-			return "wrote", false
-		},
-	})
-
-	mock := newMockLLM(t,
-		sseToolCall("c1", readName, `{}`),
-		sseToolCall("c2", readName, `{}`),
-		sseToolCall("c3", writeName, `{}`),
-		sseToolCall("c4", writeName, `{}`),
-		sseText("done"),
-	)
-	defer mock.Close()
-
+// An execute loop that only reads is nudged and moved to the thinking sampler at
+// readStreakEscalate, and ends at readStreakBail with a reason the replan sees.
+func TestToolLoopEndsAReadOnlyStreak(t *testing.T) {
 	a, s := newTestAgent(t)
-	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
-	if err != nil {
-		t.Fatalf("runToolLoop: %v", err)
+	withTools(a, fakeTool("read_file", func(args string) (string, bool) {
+		return "the text of " + parseArgs(args).str("path"), false
+	}))
+	var resp []string
+	for i := range readStreakBail + 5 {
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "read_file", fmt.Sprintf(`{"path":"file%c%c.rs"}`, 'a'+i/26, 'a'+i%26)))
 	}
-	if reads != 2 {
-		t.Errorf("read tool executed %d times, want 2 (no dedup)", reads)
+	mock := newMockLLM(t, resp...)
+	defer mock.Close()
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m",
+		ParamsExecute: map[string]any{"temperature": 0.3}, ParamsThinking: map[string]any{"temperature": 1.0}}}}
+
+	_, err := a.runToolLoopSeeded(context.Background(), s.ID, a.connFor("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+	if err == nil || !strings.Contains(err.Error(), "in a row without an edit") {
+		t.Fatalf("err = %v, want the read-streak bail", err)
 	}
-	if writes != 2 {
-		t.Errorf("write tool executed %d times, want 2 (no dedup)", writes)
+	if got := mock.callCount(); got != readStreakBail {
+		t.Errorf("model calls = %d, want %d", got, readStreakBail)
 	}
-	if len(res.ToolUses) != 4 {
-		t.Fatalf("ToolUses: got %d, want 4", len(res.ToolUses))
+	next := mock.request(readStreakEscalate)
+	if fmt.Sprint(next["messages"]) == "" || !strings.Contains(fmt.Sprint(next["messages"]), "You have read for 20 calls") {
+		t.Error("the call after the escalate threshold carries no nudge")
 	}
-	for i, tu := range res.ToolUses {
-		if strings.HasPrefix(tu.Output, "[deduped:") {
-			t.Errorf("ToolUses[%d] should not be deduped, got %q", i, tu.Output)
-		}
+	if next["temperature"] != 1.0 || mock.request(readStreakEscalate - 1)["temperature"] != 0.3 {
+		t.Errorf("temperature before/after the threshold = %v/%v, want 0.3/1.0 (the thinking sampler)",
+			mock.request(readStreakEscalate - 1)["temperature"], next["temperature"])
 	}
 }
 
-// TestToolLoopRepeatNudgeAndBail covers the repetition recovery path: the
-// second consecutive identical tool call still executes (read-after-write
-// must keep working) but appends a user-role nudge; the third identical
-// call bails before executing. ~3 iterations of stuck behavior fails
-// fast instead of waiting for the 50-iter cap.
-// TestToolLoopRepetitionLadder exercises the unified repeat ladder end to end: a
-// tool that returns identical output every call makes no progress, so consecutive
-// rounds climb ONE ladder — a corrective nudge each stuck round, a one-shot swap
-// to the thinking sampler at stuckEscalateRounds, then a GRACEFUL bail (nil error,
-// RespondCalled=false) at stuckBailRounds. Replaces the old separate
-// signature-nudge/bail and per-name-escalation guards.
+// A nudge each stuck round, a swap to the thinking sampler (keeping a forced
+// tool_choice) at stuckEscalateRounds, a graceful bail at stuckBailRounds.
 func TestToolLoopRepetitionLadder(t *testing.T) {
-	withFreshToolRegistry(t)
 	const toolName = "test_probe_a3f"
 	var execs int
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": toolName, "description": "probe",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			execs++
-			return "same result", false
-		},
-	})
 
-	// Identical call every round → identical output → stuck from round 2 on.
-	// 8 queued is more than enough; the loop bails at round 6 (stuckBailRounds).
 	var resp []string
 	for i := 0; i < 8; i++ {
 		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), toolName, `{}`))
@@ -912,6 +697,10 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
+	withTools(a, fakeTool(toolName, func(string) (string, bool) {
+		execs++
+		return "same result", false
+	}))
 	a.settings = Settings{
 		LLM: []LLMConnection{{
 			Server:         mock.ts.URL,
@@ -920,28 +709,27 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 			ParamsThinking: map[string]any{"temperature": 1.0},
 		}},
 	}
-	conn := a.connForSession(context.Background(), s.ID, "execute")
+	conn := a.connFor("execute")
 	if conn == nil {
-		t.Fatalf("connForSession(execute) returned nil")
+		t.Fatalf("connFor(execute) returned nil")
 	}
+	conn = conn.withBody("tool_choice", "required")
 
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: want graceful nil error, got %v", err)
 	}
-	if res.RespondCalled {
-		t.Errorf("RespondCalled: got true, want false (the loop bailed, never called respond)")
+	if res.Terminal != "" {
+		t.Errorf("Terminal: got %q, want none (the loop bailed, never called respond)", res.Terminal)
 	}
-	// round 1 is productive (first output); rounds 2-6 are stuck; the 5th stuck
-	// round (round 6) hits stuckBailRounds and bails after executing.
+	// Round 1 is productive; the 5th stuck round (round 6) bails.
 	if mock.callCount() != 6 {
 		t.Errorf("LLM calls: got %d, want 6 (bail at stuckBailRounds)", mock.callCount())
 	}
 	if execs != 6 {
 		t.Errorf("tool execs: got %d, want 6", execs)
 	}
-	// Corrective shows up once a round goes stuck (request index 2 onward).
 	var found bool
 	for i := 2; i < mock.callCount(); i++ {
 		msgs, _ := mock.request(i)["messages"].([]any)
@@ -957,8 +745,7 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 	if !found {
 		t.Errorf("no repeat-corrective user message found in the stuck rounds")
 	}
-	// stuckEscalateRounds=3: the swap fires at the END of round 4 (stuckRounds
-	// hits 3), so requests 0-3 use the execute sampler (0.3), 4-5 use thinking (1.0).
+	// The swap fires at the END of round 4 (stuckRounds reaches 3).
 	for i := 0; i < 4; i++ {
 		if temp, _ := mock.request(i)["temperature"].(float64); temp != 0.3 {
 			t.Errorf("request %d temperature: got %v, want 0.3 (pre-escalation)", i, temp)
@@ -969,43 +756,41 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 			t.Errorf("request %d temperature: got %v, want 1.0 (post-escalation)", i, temp)
 		}
 	}
+	for i := 0; i < 6; i++ {
+		if tc := mock.request(i)["tool_choice"]; tc != "required" {
+			t.Errorf("request %d tool_choice: got %v, want required on both sides of the swap", i, tc)
+		}
+	}
 }
 
-// TestRepetitionLadderExemptsSuccessfulRunTask pins the build/test re-verify
-// carve-out: re-running run_task with identical SUCCESSFUL output (e.g. just:build
-// green both times after an edit) is NOT counted as no-progress, so the loop never
-// nudges or bails on it — unlike the generic repeating tool in the ladder test.
-func TestRepetitionLadderExemptsSuccessfulRunTask(t *testing.T) {
-	withFreshToolRegistry(t)
-	var execs int
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": "run_task", "description": "probe",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			execs++
-			return "go build -o codehalter .", false // identical green output, success
-		},
-	})
+// A green re-run after an edit is a re-verify, never a repeat.
+func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
+	var execs, edits int
+	a, s := newTestAgent(t)
+	withTools(a, fakeTool("run_command", func(string) (string, bool) {
+		execs++
+		return "go build -o codehalter .", false // identical green output, success
+	}), fakeTool("edit_file", func(string) (string, bool) {
+		// A real change on disk: codehalter looks, it does not take the tool's word.
+		edits++
+		if err := os.WriteFile(filepath.Join(s.Cwd, "a.go"), []byte(strings.Repeat("x", edits)), 0o644); err != nil {
+			return err.Error(), true
+		}
+		return "edited", false
+	}))
 
-	// Six identical successful run_task calls, then a plain-text exit.
 	var resp []string
 	for i := 0; i < 6; i++ {
-		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "run_task", `{"task":"just:build"}`))
+		resp = append(resp, sseToolCall(fmt.Sprintf("e%d", i), "edit_file", fmt.Sprintf(`{"path":"a.go","old_text":"%d","new_text":"%d"}`, i, i+1)))
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "run_command", `{"command":"just build"}`))
 	}
 	resp = append(resp, sseText("all green, done"))
 	mock := newMockLLM(t, resp...)
 	defer mock.Close()
-
-	a, s := newTestAgent(t)
 	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
-	conn := a.connForSession(context.Background(), s.ID, "execute")
+	conn := a.connFor("execute")
 	if conn == nil {
-		t.Fatalf("connForSession(execute) returned nil")
+		t.Fatalf("connFor(execute) returned nil")
 	}
 
 	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
@@ -1013,45 +798,24 @@ func TestRepetitionLadderExemptsSuccessfulRunTask(t *testing.T) {
 		t.Fatalf("runToolLoop: %v", err)
 	}
 	if execs != 6 {
-		t.Errorf("tool execs: got %d, want 6 (no early bail on successful run_task re-runs)", execs)
+		t.Errorf("tool execs: got %d, want 6 (no early bail on successful run_command re-runs)", execs)
 	}
 	for i := 0; i < mock.callCount(); i++ {
 		msgs, _ := mock.request(i)["messages"].([]any)
 		for _, m := range msgs {
 			mm, _ := m.(map[string]any)
 			if c, _ := mm["content"].(string); mm["role"] == "user" && strings.Contains(c, "makes no progress") {
-				t.Errorf("request %d carried a repeat-corrective for a successful run_task re-run", i)
+				t.Errorf("request %d carried a repeat-corrective for a successful run_command re-run", i)
 			}
 		}
 	}
 }
 
-// TestToolLoopDoesNotEscalateOnDistinctArgs verifies that legitimate fan-out
-// across distinct arguments (e.g. read_file on go.mod, examples/go.mod, …
-// when surveying a multi-module repo) never climbs the repetition ladder: each
-// call returns NEW output, so no round is "stuck", the sampler stays on the
-// execute role, and the loop never bails.
+// Fan-out over distinct arguments returns new output each call, so no round is stuck.
 func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
-	withFreshToolRegistry(t)
 	const toolName = "test_grep_q9z"
 	var execs int
-	RegisterTool(Tool{
-		Def: map[string]any{
-			"type": "function",
-			"function": map[string]any{
-				"name": toolName, "description": "grep",
-				"parameters": map[string]any{"type": "object"},
-			},
-		},
-		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-			execs++
-			return "no match", false
-		},
-	})
 
-	// 5 tool calls with *different* args (the surveying-pattern that used
-	// to trip the old per-name counter). With distinct-args counting, none
-	// of these count as redundant, so no escalation should fire.
 	mock := newMockLLM(t,
 		sseToolCall("c1", toolName, `{"q":"x1"}`),
 		sseToolCall("c2", toolName, `{"q":"x2"}`),
@@ -1063,6 +827,10 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	defer mock.Close()
 
 	a, s := newTestAgent(t)
+	withTools(a, fakeTool(toolName, func(string) (string, bool) {
+		execs++
+		return "no match", false
+	}))
 	a.settings = Settings{
 		LLM: []LLMConnection{{
 			Server:         mock.ts.URL,
@@ -1072,9 +840,9 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		}},
 	}
 
-	conn := a.connForSession(context.Background(), s.ID, "execute")
+	conn := a.connFor("execute")
 	if conn == nil {
-		t.Fatalf("connForSession(execute) returned nil")
+		t.Fatalf("connFor(execute) returned nil")
 	}
 	_, err := a.runToolLoopSeeded(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
@@ -1089,7 +857,6 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 		t.Errorf("LLM calls: got %d, want 6", mock.callCount())
 	}
 
-	// Every call must still use the execute sampler — no escalation.
 	for i := 0; i < mock.callCount(); i++ {
 		req := mock.request(i)
 		if req == nil {
@@ -1102,27 +869,968 @@ func TestToolLoopDoesNotEscalateOnDistinctArgs(t *testing.T) {
 	}
 }
 
-// TestToolLoopNudgesReasonedButEmpty pins the "calculated a lot, then nothing"
-// guard: a turn with a big reasoning block but EMPTY visible content (no tool
-// call) is nudged to write the answer as plain text, not silently accepted as an
-// empty result. After the nudge the model writes the answer and it's returned.
-func TestToolLoopNudgesReasonedButEmpty(t *testing.T) {
+// The phase contract: prose is an exit only where the phase allows it
+// (the documenter); elsewhere it gets one nudge naming the terminal, and a
+// second prose reply in a row ends the loop without a Terminal.
+func TestPhaseContractNudge(t *testing.T) {
+	run := func(t *testing.T, policy phasePolicy, responses ...string) (toolLoopResult, *mockLLM, *Session) {
+		t.Helper()
+		mock := newMockLLM(t, responses...)
+		t.Cleanup(mock.Close)
+		a, s := newTestAgent(t)
+		res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "go"}}, policy, "execute", true, 0)
+		if err != nil {
+			t.Fatalf("runToolLoop: %v", err)
+		}
+		return res, mock, s
+	}
+	execPolicy := phasePolicy{terminals: map[string]bool{respondToolName: true}}
+
+	t.Run("documenter prose ends the loop", func(t *testing.T) {
+		res, mock, _ := run(t, phasePolicy{terminals: map[string]bool{respondToolName: true}, proseEnds: true},
+			sseText("No documentation change needed."))
+		if mock.callCount() != 1 || res.Text != "No documentation change needed." {
+			t.Errorf("calls %d, res %+v: want one call and the prose", mock.callCount(), res)
+		}
+	})
+	t.Run("prose then respond", func(t *testing.T) {
+		res, mock, s := run(t, execPolicy,
+			sseText("Done, the file is fixed."),
+			sseToolCall("c1", respondToolName, `{"message":"Done."}`))
+		if mock.callCount() != 2 || res.Terminal != respondToolName {
+			t.Fatalf("calls %d, terminal %q: want the nudge and then respond", mock.callCount(), res.Terminal)
+		}
+		if got := lastUserMessage(s); !strings.Contains(got, "Call `respond` if the step is done") {
+			t.Errorf("stored nudge = %q", got)
+		}
+	})
+	t.Run("prose twice ends the loop", func(t *testing.T) {
+		res, mock, _ := run(t, execPolicy, sseText("one"), sseText("two"))
+		if mock.callCount() != 2 || res.Terminal != "" {
+			t.Errorf("calls %d, terminal %q: want one nudge only, then the loop ends", mock.callCount(), res.Terminal)
+		}
+	})
+}
+
+// Picked up before the next model call as an ordinary, stored user message.
+func TestSteeringLandsBetweenRounds(t *testing.T) {
+	a, s := newTestAgent(t)
 	mock := newMockLLM(t,
-		sseReasoning(strings.Repeat("thinking hard. ", 80)), // ~1.1 KB reasoning, empty content, no calls
-		sseText("here is the answer"),                       // after the nudge, the visible answer
+		sseToolCall("c1", "probe", `{}`),
+		sseToolCall("c2", respondToolName, `{"message":"done"}`),
 	)
 	defer mock.Close()
+	withTools(a, fakeTool("probe", func(string) (string, bool) {
+		s.addSteer("also update the README")
+		return "probed", false
+	}), respondTool)
 
-	a, s := newTestAgent(t)
 	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
-		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0)
+		[]llmMessage{{Role: "user", Content: "go"}},
+		phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
 	if err != nil {
 		t.Fatalf("runToolLoop: %v", err)
 	}
-	if mock.callCount() != 2 {
-		t.Errorf("calls: got %d, want 2 (reasoned-but-empty must be nudged, not accepted)", mock.callCount())
+	if res.Terminal != respondToolName {
+		t.Fatalf("the loop did not finish: %+v", res)
 	}
-	if res.Text != "here is the answer" {
-		t.Errorf("res.Text: got %q, want the post-nudge answer", res.Text)
+	if mock.callCount() != 2 {
+		t.Fatalf("LLM calls: got %d, want 2", mock.callCount())
+	}
+
+	msgs, _ := mock.request(1)["messages"].([]any)
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	if last["role"] != "user" || last["content"] != "also update the README" {
+		t.Errorf("the steer should be the last message of the next round, got %v", last)
+	}
+	found := false
+	for _, m := range s.Messages {
+		found = found || (m.Role == "user" && m.Content == "also update the README")
+	}
+	if !found {
+		t.Error("the steer was not stored in the session")
+	}
+	if q := s.takePending(); len(q) != 0 {
+		t.Errorf("the queue should be empty after it was picked up, got %v", q)
+	}
+}
+
+func TestBackgroundNoteReachesTheLoopMidTurn(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a, fakeTool("run_command", func(string) (string, bool) {
+		// The job finishes while this round's tool is still running.
+		s.addBgNote(bgNote{line: "background job 7 `just test` exited with code 0 after 2m20s",
+			full: "[codehalter, not the user: background job 7 `just test` exited with code 0 after 2m20s. Last output:]\n\ntest result: ok. 12 passed"})
+		return "edited", false
+	}))
+	mock := newMockLLM(t, sseToolCall("c1", "run_command", `{"command":"sed -i s/a/b/ x.rs"}`), sseText("done"))
+	defer mock.Close()
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
+
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, a.connFor("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", true, 0); err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if mock.callCount() != 2 {
+		t.Fatalf("calls = %d, want 2", mock.callCount())
+	}
+	msgs, _ := mock.request(1)["messages"].([]any)
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	if c, _ := last["content"].(string); last["role"] != "user" || !strings.Contains(c, "12 passed") {
+		t.Fatalf("the finished job's note did not reach the model before its next call; last message: %v", last)
+	}
+	if s.hasPending() {
+		t.Error("the note was delivered but left queued, so the turn end would deliver it again")
+	}
+}
+
+// The note came first, so it leads: arrival order, not one kind before the other.
+func TestSteerAndNoteShareOneMessage(t *testing.T) {
+	a, s := newTestAgent(t)
+	note := bgNote{line: "background job 7 `just test` exited with code 0 after 2m20s",
+		full: "[codehalter, not the user: background job 7 `just test` exited with code 0 after 2m20s. Last output:]\n\ntest result: ok. 12 passed"}
+	withTools(a, fakeTool("probe", func(string) (string, bool) {
+		s.addBgNote(note)
+		s.addSteer("also update the README")
+		return "probed", false
+	}), respondTool)
+	mock := newMockLLM(t,
+		sseToolCall("c1", "probe", `{}`),
+		sseToolCall("c2", respondToolName, `{"message":"done"}`),
+	)
+	defer mock.Close()
+
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "go"}},
+		phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0); err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if mock.callCount() != 2 {
+		t.Fatalf("LLM calls: got %d, want 2", mock.callCount())
+	}
+
+	want := note.full + "\n\nalso update the README"
+	msgs, _ := mock.request(1)["messages"].([]any)
+	last, _ := msgs[len(msgs)-1].(map[string]any)
+	prev, _ := msgs[len(msgs)-2].(map[string]any)
+	if last["role"] != "user" || last["content"] != want {
+		t.Errorf("the next round should end on one user message, note then steer; got %v", last)
+	}
+	if prev["role"] != "tool" {
+		t.Errorf("the note and the steer reached the model as separate messages; before the last: %v", prev)
+	}
+	stored := 0
+	for _, m := range s.Messages {
+		if m.Role == "user" && m.Content == want {
+			stored++
+		}
+	}
+	if stored != 1 {
+		t.Errorf("the joined message was stored %d times, want 1", stored)
+	}
+}
+
+// Once, as a user message; the execute phase never sees it.
+func TestPlanRoundNudgeAsksToSubmit(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a, fakeTool("read_file", func(string) (string, bool) { return "hit", false }))
+	var resp []string
+	for i := 0; i <= planRoundNudge+1; i++ {
+		resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "read_file", fmt.Sprintf(`{"path":"f%d.rs"}`, i)))
+	}
+	resp = append(resp, sseText("done"))
+	mock := newMockLLM(t, resp...)
+	defer mock.Close()
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "test-model"}}}
+
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, a.connFor("thinking"),
+		[]llmMessage{{Role: "user", Content: "plan"}}, phasePolicy{}, "plan", false, 0); err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	nudges := 0
+	for i := 0; i < mock.callCount(); i++ {
+		msgs, _ := mock.request(i)["messages"].([]any)
+		last, _ := msgs[len(msgs)-1].(map[string]any)
+		if c, _ := last["content"].(string); last["role"] == "user" && strings.Contains(c, "Call `submit_plan` NOW") {
+			nudges++
+			if i != planRoundNudge {
+				t.Errorf("nudge arrived before call %d, want before call %d", i, planRoundNudge)
+			}
+		}
+	}
+	if nudges != 1 {
+		t.Errorf("nudges = %d, want exactly 1", nudges)
+	}
+}
+
+// User input resumes the parked loop, which may park again; only after the job
+// exits does a respond end the turn.
+func TestToolLoopParksOnRespondWhileJobRuns(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	oldWait, oldPoll := cmdHandoverWait, parkPoll
+	cmdHandoverWait, parkPoll = 100*time.Millisecond, 20*time.Millisecond
+	defer func() { cmdHandoverWait, parkPoll = oldWait, oldPoll }()
+
+	mock := newMockLLM(t,
+		sseToolCall("c1", "run_command", `{"command":"sleep 1.2; echo suite-green"}`),
+		sseToolCall("c2", respondToolName, `{"message":"Waiting for job 1."}`),
+		sseToolCall("c3", respondToolName, `{"message":"Still waiting, as you asked."}`),
+		sseToolCall("c4", respondToolName, `{"message":"final: suite green"}`),
+	)
+	defer mock.Close()
+	h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_command", "parameters": map[string]any{"type": "object"}}}, Execute: runCmdExecute})
+
+	// The user interjects once the turn is parked.
+	go func() {
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			for _, u := range h.updatesOfKind(KindAgentMessage) {
+				if c, _ := u["content"].(map[string]any); c != nil && strings.Contains(fmt.Sprint(c["text"]), "⏸ Waiting for job 1") {
+					h.sess.addSteer("how is it going?")
+					return
+				}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	res, err := h.agent.runToolLoopSeeded(context.Background(), h.sess.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "run the suite and report"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+	if err != nil {
+		t.Fatalf("runToolLoop: %v", err)
+	}
+	if res.Text != "final: suite green" {
+		t.Errorf("res.Text = %q, want the respond that came after the job reported", res.Text)
+	}
+	if mock.callCount() != 4 {
+		t.Errorf("LLM calls = %d, want 4: run, park, resume on the user's text and park again, resume on the exit", mock.callCount())
+	}
+	var users []string
+	for _, m := range h.sess.Messages {
+		if m.Role == "user" {
+			users = append(users, m.Content)
+		}
+	}
+	joined := strings.Join(users, "\n")
+	for _, want := range []string{"how is it going?", "exited with code 0", "suite-green", "Continue the work that was waiting"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("the resumes did not reach the model as user messages; missing %q in:\n%s", want, joined)
+		}
+	}
+	if strings.Index(joined, "how is it going?") > strings.Index(joined, "exited with code 0") {
+		t.Error("the user's interjection must arrive before the job's exit, not after")
+	}
+}
+
+// What arrives while the model writes its respond (a job's exit, the user's text)
+// goes to the model before the step ends: the respond was written without it.
+func TestToolLoopRespondDoesNotEndOverQueuedInput(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.sess.ctl.held.Lock()
+	defer h.sess.ctl.held.Unlock()
+	mock := newMockLLM(t,
+		sseToolCall("c1", respondToolName, `{"message":"the suite is still running"}`),
+		sseToolCall("c2", respondToolName, `{"message":"the suite passed"}`))
+	defer mock.Close()
+	arrived := false
+	h.agent.tools.add(fakeTool(respondToolName, func(args string) (string, bool) {
+		if !arrived {
+			arrived = true
+			h.sess.addBgNote(bgNote{line: "background job 1 exited with code 0", full: "[codehalter, not the user: background job 1 exited with code 0]"})
+		}
+		return parseArgs(args).str("message"), false
+	}))
+	res, err := h.agent.runToolLoopSeeded(context.Background(), h.sess.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "run the suite"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0)
+	if err != nil || res.Text != "the suite passed" || mock.callCount() != 2 {
+		t.Errorf("res=%q err=%v calls=%d, want the second respond, written after the job's exit", res.Text, err, mock.callCount())
+	}
+	if !strings.Contains(lastUserMessage(h.sess), "exited with code 0") {
+		t.Errorf("the exit note did not reach the model: %q", lastUserMessage(h.sess))
+	}
+}
+
+// A respond waits for every job the step started, whatever the command looks
+// like; one that stays silent while the step waits is stopped, and a job from an
+// earlier turn never holds the step.
+func TestToolLoopParksForBackgroundJobs(t *testing.T) {
+	oldGrace, oldPoll, oldStuck, oldStuckPoll := bgJobGrace, parkPoll, bgStuckAfter, bgStuckPoll
+	bgJobGrace, parkPoll, bgStuckAfter, bgStuckPoll = 50*time.Millisecond, 20*time.Millisecond, 400*time.Millisecond, 50*time.Millisecond
+	defer func() { bgJobGrace, parkPoll, bgStuckAfter, bgStuckPoll = oldGrace, oldPoll, oldStuck, oldStuckPoll }()
+	run := func(t *testing.T, h *terminalHarness, responses ...string) (*mockLLM, string) {
+		t.Helper()
+		h.sess.ctl.held.Lock() // a turn is running, so a job's note waits for it
+		defer h.sess.ctl.held.Unlock()
+		mock := newMockLLM(t, responses...)
+		defer mock.Close()
+		h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "run_background", "parameters": map[string]any{"type": "object"}}}, Execute: runBackgroundExecute})
+		if _, err := h.agent.runToolLoopSeeded(context.Background(), h.sess.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "run it"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", true, 0); err != nil {
+			t.Fatal(err)
+		}
+		return mock, lastUserMessage(h.sess)
+	}
+	for _, c := range []struct{ name, cmd, resumedWith string }{
+		{"report after the run", `sleep 0.2 > /dev/null 2>&1; echo "exit=$?"`, "exited with code 0"},
+		{"a stuck job", "sleep 30", "was stopped as stuck"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newTerminalHarness(t)
+			defer h.agent.shutdownBackground()
+			mock, resumed := run(t, h,
+				sseToolCall("c1", "run_background", fmt.Sprintf(`{"command":%q}`, c.cmd)),
+				sseToolCall("c2", respondToolName, `{"message":"Waiting for job 1."}`),
+				sseToolCall("c3", respondToolName, `{"message":"final"}`))
+			if mock.callCount() != 3 || !strings.Contains(resumed, c.resumedWith) {
+				t.Errorf("%d model calls, resumed with %q; want 3 and %q", mock.callCount(), resumed, c.resumedWith)
+			}
+		})
+	}
+	t.Run("a job from an earlier turn", func(t *testing.T) {
+		h := newTerminalHarness(t)
+		defer h.agent.shutdownBackground()
+		if _, failed := runBackgroundExecute(context.Background(), h.agent, h.sess.ID, `{"command":"sleep 30"}`); failed {
+			t.Fatal("the earlier job did not start")
+		}
+		if mock, _ := run(t, h, sseToolCall("c1", respondToolName, `{"message":"done"}`)); mock.callCount() != 1 {
+			t.Errorf("%d model calls, want the respond to end the step", mock.callCount())
+		}
+	})
+}
+
+// Needs no message text: a server that forces the tool call returns none.
+func TestPlanAnswerInArgument(t *testing.T) {
+	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
+		`{"clear":true,"report_only":true,"subtasks":[],"answer":"Only the Prepare page builds widgets; Cut, Narrate and Produce are bare."}`),
+		sseToolCall("p2", submitPlanToolName, `{"answer":"same"}`))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if got := mock.callCount(); got != 2 {
+		t.Errorf("an answer in the argument cost %d LLM calls, want 2 (the answer and its check)", got)
+	}
+	if plan == nil || !strings.HasPrefix(plan.answer, "Only the Prepare page") || len(plan.Subtasks) != 0 {
+		t.Fatalf("plan = %+v, want the argument as the answer", plan)
+	}
+}
+
+func TestPlanRedoIsAPlan(t *testing.T) {
+	a, s, mock := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName,
+		`{"clear":true,"report_only":false,"subtasks":[],"redo":["F0.9","§03-shell#1-screen"]}`))
+	s.rt.specAudit = true
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if got := mock.callCount(); got != 1 {
+		t.Errorf("a redo submission cost %d LLM calls, want 1", got)
+	}
+	if plan == nil || strings.Join(plan.Redo, ",") != "F0.9,§03-shell#1-screen" {
+		t.Fatalf("plan = %+v, want the redo ids", plan)
+	}
+}
+
+// read A, read B, read B: the first B carries a batching note the second does
+// not, and the second must still count as a repeat.
+func TestStuckLadderSeesRepeatPastBatchNote(t *testing.T) {
+	a, s := newTestAgent(t)
+	rt := newRepetitionTracker("", nil)
+	for _, name := range []string{"a.toml", "b.toml"} {
+		if err := os.WriteFile(filepath.Join(s.Cwd, name), []byte("k = 1\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := func(path string) bool {
+		s.markReplyStart()
+		var tc toolCall
+		tc.Function.Name = "read_file"
+		tc.Function.Arguments = fmt.Sprintf(`{"path":%q}`, path)
+		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+		return rt.sawAgain(tc, tu, false)
+	}
+	read("a.toml")
+	read("b.toml")
+	if !read("b.toml") {
+		t.Error("the first identical re-read after a batching note did not count as a repeat")
+	}
+}
+
+// Repeats are judged by what came back, so a varied call with the same answer is
+// caught with no parsing of the command: a new echo label, a counter or a letter in
+// a log name (renders of one screen ran 98, 135 and 93 times that way).
+func TestStuckLadderJudgesByTheAnswer(t *testing.T) {
+	rt := newRepetitionTracker("", nil)
+	run := func(cmd, out string) bool {
+		var tc toolCall
+		tc.Function.Name = "run_command"
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		tc.Function.Arguments = string(b)
+		return rt.sawAgain(tc, ToolUse{Name: "run_command", Output: "exit 0\n\n" + out}, false)
+	}
+	grep := "12:the prompt is assembled from the spec slice"
+	run(`echo "=== the prompt ==="; grep -n prompt spec/09.md | head -3`, "=== the prompt ===\n"+grep)
+	if !run(`echo "=== system message ==="; grep -n prompt spec/09.md | head -3`, "=== system message ===\n"+grep) {
+		t.Error("the same grep under a new echo label did not count as a repeat")
+	}
+	shot := "exit=0\n-rw-r--r-- 1 dev dev 158790 Sep 29 12:54 shots/07-narrate.png"
+	for i, log := range []string{"f47-snap36", "f47-snap37", "snap-fa", "snap-fb"} {
+		if got := run("rm -f shots/07-narrate.png; just snapshot 07-narrate > /tmp/"+log+".log 2>&1; echo \"exit=$?\"; ls -la shots/07-narrate.png", shot); got != (i > 0) {
+			t.Errorf("render into %s: repeat = %v, want %v", log, got, i > 0)
+		}
+	}
+	run(`sed -n '10,20p' src/a.rs`, "ten to twenty")
+	run(`sed -n '30,40p' src/a.rs`, "thirty to forty")
+	if !run(`sed -n '10,20p' src/a.rs`, "ten to twenty") {
+		t.Error("a range read again after another range did not count as a repeat")
+	}
+	heredoc := "python3 - <<'EOF'\nprint(open('a.rs').read().count('fn'))\nEOF"
+	run(heredoc, "7")
+	if !run(heredoc, "7") {
+		t.Error("the same short-answered script run twice did not count as a repeat")
+	}
+	// A short answer shared by different calls says nothing: many probes fail alike.
+	run(`echo "hello" | ./parse`, "error: bad input")
+	if run(`echo '{"a":1}' | ./parse`, "error: bad input") {
+		t.Error("two different inputs with the same short error counted as one call")
+	}
+}
+
+// A change to the project makes a command's answer new (a re-check), not a read's.
+func TestStuckLadderResetsOnAChange(t *testing.T) {
+	rt := newRepetitionTracker("", nil)
+	mk := func(name, args string) toolCall {
+		var tc toolCall
+		tc.Function.Name, tc.Function.Arguments = name, args
+		return tc
+	}
+	test := mk("run_command", `{"command":"cargo test"}`)
+	red := ToolUse{Name: "run_command", Output: "exit 101\n\ntest a::b ... FAILED: expected 3, got 4"}
+	read := mk("read_file", `{"path":"src/b.rs"}`)
+	body := ToolUse{Name: "read_file", Output: "fn b() -> u32 { 4 } // the other file, untouched"}
+	rt.sawAgain(test, red, false)
+	rt.sawAgain(read, body, false)
+	if !rt.sawAgain(test, red, false) {
+		t.Error("the same red test with nothing changed did not count as a repeat")
+	}
+	if rt.sawAgain(mk("edit_file", `{"path":"src/a.rs"}`), ToolUse{Name: "edit_file", Output: "file written successfully"}, true) {
+		t.Error("a change is never a repeat")
+	}
+	if rt.sawAgain(test, red, false) {
+		t.Error("the test after a change is a re-check, not a repeat")
+	}
+	if !rt.sawAgain(read, body, false) {
+		t.Error("re-reading a file the change did not touch still says nothing new")
+	}
+	// An edit that fails the same way is only a repeat as the same edit, and a job's
+	// launch note only for the same job.
+	fail := ToolUse{Name: "edit_file", Output: "error: old_text not found, the file differs from what you remember"}
+	rt.sawAgain(mk("edit_file", `{"path":"a.rs","old_text":"x"}`), fail, false)
+	if rt.sawAgain(mk("edit_file", `{"path":"a.rs","old_text":"y"}`), fail, false) {
+		t.Error("a different edit failing with the same message counted as a repeat")
+	}
+	if !rt.sawAgain(mk("edit_file", `{"path":"a.rs","old_text":"x"}`), fail, false) {
+		t.Error("the same failing edit again did not count as a repeat")
+	}
+	launch := func(cmd string) bool {
+		b, _ := json.Marshal(map[string]string{"command": cmd})
+		return rt.sawAgain(mk("run_background", string(b)), ToolUse{Name: "run_background", Output: "background job 7 running (pid 4242). It keeps running across tool calls."}, false)
+	}
+	launch("just test > /tmp/a.log")
+	if launch("just snapshot 05-cut > /tmp/b.log") {
+		t.Error("two different jobs counted as one because their launch notes read alike")
+	}
+}
+
+// The fingerprint goes by content: rewriting the same bytes (a render of the same
+// screen) changes nothing, other bytes or a new file do; outside git too.
+func TestProjectSig(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	for _, withGit := range []bool{true, false} {
+		dir := t.TempDir()
+		if withGit {
+			if out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v %s", err, out)
+			}
+		}
+		write := func(name, body string) {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write("shot.png", "pixels")
+		before, exact := projectSig(dir)
+		if exact != withGit {
+			t.Errorf("git=%v: exact = %v", withGit, exact)
+		}
+		write("shot.png", "pixels")
+		if same, _ := projectSig(dir); withGit && same != before {
+			t.Errorf("git: the same bytes written again changed the fingerprint")
+		}
+		write("shot.png", "other pixels")
+		changed, _ := projectSig(dir)
+		if changed == before {
+			t.Errorf("git=%v: new content did not change the fingerprint", withGit)
+		}
+		write("new.rs", "fn x() {}")
+		if again, _ := projectSig(dir); again == changed {
+			t.Errorf("git=%v: a new file did not change the fingerprint", withGit)
+		}
+	}
+}
+
+// A clear submit_plan with neither an answer nor any work gets the one
+// planner retry, and the retry's plan is taken.
+func TestPlanNeitherAnswerNorWorkRetries(t *testing.T) {
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"report_only":false,"subtasks":[]}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear":true,"report_only":false,"subtasks":[{"description":"fix it","verify":["go test ./..."]}]}`))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if mock.callCount() != 2 || plan == nil || len(plan.Subtasks) != 1 {
+		t.Fatalf("calls %d, plan %+v: want the retry's subtask", mock.callCount(), plan)
+	}
+	if got := lastUserMessage(s); !strings.Contains(got, "neither an answer nor subtasks") {
+		t.Errorf("stored corrective = %q", got)
+	}
+}
+
+// A server that refuses connections is waited for with growing pauses, and the
+// call goes through once it listens again; past the patience it is an error.
+func TestToolLoopWaitsForARestartingServer(t *testing.T) {
+	oldBackoff, oldPatience := transientStreamBackoff, serverDownPatience
+	transientStreamBackoff, serverDownPatience = 20*time.Millisecond, 5*time.Second
+	defer func() { transientStreamBackoff, serverDownPatience = oldBackoff, oldPatience }()
+
+	mock := newMockLLM(t, sseText("back"))
+	defer mock.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	ln.Close()
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		if ln, err := net.Listen("tcp", addr); err == nil {
+			go http.Serve(ln, mock.ts.Config.Handler)
+			t.Cleanup(func() { ln.Close() })
+		}
+	}()
+	a, s := newTestAgent(t)
+	conn := &LLMConnection{Server: "http://" + addr, Model: "m", Tag: "execute"}
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, conn, []llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0)
+	if err != nil || res.Text != "back" {
+		t.Fatalf("res=%q err=%v, want the reply once the server listens again", res.Text, err)
+	}
+
+	serverDownPatience = 50 * time.Millisecond
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	conn.Server = "http://" + closed.Addr().String()
+	if _, err := a.runToolLoopSeeded(context.Background(), s.ID, conn, []llmMessage{{Role: "user", Content: "go"}}, phasePolicy{}, "execute", false, 0); err == nil || !strings.Contains(err.Error(), "refused connections") {
+		t.Errorf("err = %v, want the give-up after the patience", err)
+	}
+}
+
+// A step still editing and building at the call cap gets one extension to finish;
+// one that did not edit hits the cap as before.
+func TestToolLoopExtendsAProductiveStepOnce(t *testing.T) {
+	fake := func(name, out string) Tool {
+		return fakeTool(name, func(args string) (string, bool) { return out + args, false })
+	}
+	run := func(editing bool) (toolLoopResult, error, int) {
+		var resp []string
+		for i := range maxToolLoopIterations {
+			switch {
+			case editing && i%2 == 0:
+				resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "edit_file", fmt.Sprintf(`{"path":"src/f%d.rs"}`, i)))
+			default:
+				resp = append(resp, sseToolCall(fmt.Sprintf("c%d", i), "run_command", fmt.Sprintf(`{"command":"cargo build --bin b%d"}`, i)))
+			}
+		}
+		resp = append(resp, sseToolCall("done", respondToolName, `{"message":"page built"}`))
+		mock := newMockLLM(t, resp...)
+		defer mock.Close()
+		a, s := newTestAgent(t)
+		withTools(a, fake("edit_file", "file written successfully "), fake("run_command", "exit 0\n\nbuilt "))
+		res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"),
+			[]llmMessage{{Role: "user", Content: "build the page"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", false, 0)
+		return res, err, mock.callCount()
+	}
+	if res, err, calls := run(true); err != nil || res.Terminal != respondToolName || calls != maxToolLoopIterations+1 {
+		t.Errorf("editing step: terminal=%q err=%v calls=%d, want it to finish on the extension", res.Terminal, err, calls)
+	}
+	if _, err, calls := run(false); err == nil || !strings.Contains(err.Error(), "exceeded") || calls != maxToolLoopIterations {
+		t.Errorf("step without edits: err=%v calls=%d, want the cap", err, calls)
+	}
+}
+
+// A planner that never gets clear is asked at most maxClarifications times; then
+// its last plan goes on instead of another round.
+func TestPlanClarificationsAreBounded(t *testing.T) {
+	unclear := sseToolCall("p", submitPlanToolName, `{"clear":false,"question":"Which one?","choices":["the CLI","the server"]}`)
+	var resp []string
+	for range maxClarifications + 1 {
+		resp = append(resp, unclear)
+	}
+	a, s, mock := planPhaseAgent(t, resp...)
+	answerFirstOption(t, a) // the user picks each clarification's first choice
+
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil || plan == nil || plan.Clear {
+		t.Fatalf("plan=%+v err=%v, want the last unclear plan", plan, err)
+	}
+	if got := mock.callCount(); got != maxClarifications+1 {
+		t.Errorf("planner calls = %d, want %d", got, maxClarifications+1)
+	}
+	asked := 0
+	for _, m := range s.Messages {
+		if m.Role == "user" && m.Content == "User chose: the CLI" {
+			asked++
+		}
+	}
+	if asked != maxClarifications {
+		t.Errorf("clarifications answered = %d, want %d", asked, maxClarifications)
+	}
+}
+
+// ctxFull, queued in refusingLLM, answers that call with the server's context-full refusal.
+const ctxFull = "\x00context-full"
+
+func refusingLLM(t *testing.T, responses ...string) *mockLLM {
+	t.Helper()
+	m := &mockLLM{resps: responses, t: t}
+	m.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("refusingLLM: decode request body: %v", err)
+		}
+		m.mu.Lock()
+		m.reqs = append(m.reqs, body)
+		m.mu.Unlock()
+		switch i := int(m.idx.Add(1)) - 1; {
+		case i >= len(m.resps):
+			t.Errorf("refusingLLM: unexpected call %d", i+1)
+			http.Error(w, "no response queued", http.StatusInternalServerError)
+		case m.resps[i] == ctxFull:
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":{"message":"the request exceeds the available context size","type":"exceed_context_size_error"}}`)
+		default:
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, m.resps[i])
+		}
+	}))
+	t.Cleanup(m.ts.Close)
+	return m
+}
+
+// The server's context-full refusal folds history and retries the call: first
+// keeping the turn's recent steps (keepWindowStart), then from the last assistant
+// message. Only plan and execute recover; another phase gets the error.
+func TestToolLoopFoldsOnContextFull(t *testing.T) {
+	setup := func(t *testing.T) (*agent, *Session) {
+		a, s := newTestAgent(t)
+		s.AddUser("old question")
+		s.AddAssistant("old answer")
+		s.appendShadow("Goal: old\nProgress: answered the old question")
+		s.AddUser("new question")
+		s.markTurnStart()
+		s.AddAssistant("step one")
+		s.AddAssistant("step two")
+		// Real prompt sizes, so the first rung keeps both steps.
+		s.Messages[3].PromptTokens, s.Messages[4].PromptTokens = 1000, 2000
+		return a, s
+	}
+	assistants := func(req map[string]any) []string {
+		var out []string
+		msgs, _ := req["messages"].([]any)
+		for _, m := range msgs {
+			if mm, _ := m.(map[string]any); mm["role"] == "assistant" {
+				out = append(out, fmt.Sprint(mm["content"]))
+			}
+		}
+		return out
+	}
+
+	a, s := setup(t)
+	mock := refusingLLM(t, ctxFull, ctxFull, sseText("done"))
+	res, err := a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("execute"), a.buildLLMContext(s), phasePolicy{}, "execute", false, 0)
+	if err != nil || res.Text != "done" || mock.callCount() != 3 {
+		t.Fatalf("res=%q err=%v calls=%d, want the reply after two folds", res.Text, err, mock.callCount())
+	}
+	for i, want := range [][]string{{"old answer", "step one", "step two"}, {"step one", "step two"}, {"step two"}} {
+		if got := assistants(mock.request(i)); !reflect.DeepEqual(got, want) {
+			t.Errorf("call %d sent assistant turns %q, want %q", i, got, want)
+		}
+	}
+	if wire := fmt.Sprint(mock.request(2)["messages"]); !strings.Contains(wire, "answered the old question") || !strings.Contains(wire, "step one") {
+		t.Errorf("the retry does not carry the folded turns in its summary:\n%s", wire)
+	}
+
+	a, s = setup(t)
+	mock = refusingLLM(t, ctxFull)
+	_, err = a.runToolLoopSeeded(context.Background(), s.ID, mock.conn("document"), a.buildLLMContext(s), phasePolicy{}, "document", false, 0)
+	if !isContextFull(err) || mock.callCount() != 1 || s.Summary != "" || len(s.Messages) != 5 {
+		t.Errorf("document phase: err=%v calls=%d summary=%q messages=%d, want the refusal and no fold", err, mock.callCount(), s.Summary, len(s.Messages))
+	}
+}
+
+// Red before green: a step that changed a test and code, and ended green, runs its test
+// once more without the code change. A test that fails then shows the fault; one that
+// still passes fails the step, with the reason the planner gets. The code change is put
+// back either way, and a file the user had changed before the step is taken back to the
+// user's version, not to git's.
+func TestExecutorTestMustFailWithoutTheFix(t *testing.T) {
+	for _, tc := range []struct {
+		name, test string // the test file the step writes; "" writes none
+		reason     string
+	}{
+		{"the test shows the fault", `test "$(cat src/value.dat)" = 2`, ""},
+		{"the test passes without the fix", "true", "red before green failed: `sh tests/check.sh` passes with this step's changes to src/value.dat taken out (its test changes to tests/check.sh kept)"},
+		{"no test changed", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			seen := filepath.Join(t.TempDir(), "seen.log")
+			writes := map[string]string{"src/value.dat": "2\n"}
+			if tc.test != "" {
+				writes["tests/check.sh"] = fmt.Sprintf("cat src/value.dat >> %q\n%s\n", seen, tc.test)
+			}
+			var resp []string
+			for path, body := range writes {
+				args, _ := json.Marshal(map[string]string{"path": path, "content": body})
+				resp = append(resp, sseToolCall("w"+path, "write_file", string(args)))
+			}
+			resp = append(resp, sseToolCall("t", "run_command", `{"command":"sh tests/check.sh"}`), sseToolCall("r", respondToolName, `{"message":"fixed"}`))
+			a, s, _ := planPhaseAgent(t, resp...)
+			writeTree(t, s.Cwd, map[string]string{"src/value.dat": "0\n", "tests/check.sh": "true\n", "notes.txt": "mine\n"})
+			gitInit(t, s.Cwd)
+			writeTree(t, s.Cwd, map[string]string{"src/value.dat": "1\n", "notes.txt": "mine, edited\n"}) // the user's, before the step
+			a.tools.add(
+				fakeTool("write_file", func(args string) (string, bool) {
+					p := parseArgs(args)
+					writeTree(t, s.Cwd, map[string]string{p.str("path"): p.str("content")})
+					return "written", false
+				}),
+				fakeTool("run_command", func(string) (string, bool) { return "exit 0\n\nok", false }),
+			)
+
+			out := a.runExecutePhase(context.Background(), s.ID, subtask{Description: "make value 2"}, 0, 1)
+			if out.Success != (tc.reason == "") || !strings.HasPrefix(out.Reason, tc.reason) {
+				t.Errorf("success=%v reason=%q, want reason %q", out.Success, out.Reason, tc.reason)
+			}
+			for path, want := range map[string]string{"src/value.dat": "2\n", "notes.txt": "mine, edited\n"} {
+				if got, _ := os.ReadFile(filepath.Join(s.Cwd, path)); string(got) != want {
+					t.Errorf("%s after the step = %q, want %q", path, got, want)
+				}
+			}
+			got, _ := os.ReadFile(seen)
+			if want := map[bool]string{true: "1\n", false: ""}[tc.test != ""]; string(got) != want {
+				t.Errorf("the check ran the test on value %q, want %q (the user's 1, not git's 0)", got, want)
+			}
+		})
+	}
+}
+
+// Only the user starts /spec: a `redo` from an ordinary turn is sent back, and the
+// fields that wrote a new spec are gone from the tool.
+func TestPlanRedoOutsideTheAuditRetries(t *testing.T) {
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"report_only":false,"redo":["F0.9"],"subtasks":[{"description":"add the mount"}]}`),
+		sseToolCall("p2", submitPlanToolName, `{"clear":true,"report_only":false,"subtasks":[{"description":"add the mount"}]}`))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatalf("runPlanPhase: %v", err)
+	}
+	if mock.callCount() != 2 || plan == nil || len(plan.Redo) != 0 || len(plan.Subtasks) != 1 {
+		t.Fatalf("calls %d, plan %+v: want the retry's subtasks", mock.callCount(), plan)
+	}
+	if got := lastUserMessage(s); !strings.Contains(got, "only inside the /spec redo audit") {
+		t.Errorf("stored corrective = %q", got)
+	}
+	props := submitPlanTool.Def["function"].(map[string]any)["parameters"].(map[string]any)["properties"].(map[string]any)
+	for _, gone := range []string{"spec", "spec_dir", "out_dir", "target"} {
+		if _, ok := props[gone]; ok {
+			t.Errorf("submit_plan still offers %q", gone)
+		}
+	}
+}
+
+// A planner that insists on `redo` in an ordinary turn starts nothing.
+func TestOrchestrateIgnoresRedoOutsideTheAudit(t *testing.T) {
+	redo := `{"clear":true,"report_only":false,"redo":["F0.9"]}`
+	a, s, _ := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, redo),
+		sseToolCall("p2", submitPlanToolName, redo))
+	s.AddUser("make it work")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.takeSpecHandoff(); got != "" {
+		t.Errorf("handoff = %q, want none", got)
+	}
+}
+
+func TestOrchestrateAuditHandsOverRedo(t *testing.T) {
+	a, s, _ := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, `{"clear":true,"report_only":false,"redo":["F0.9","F1.2"]}`))
+	s.rt.specAudit = true
+	s.AddUser("audit")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.takeSpecHandoff(); got != "redo F0.9 F1.2" {
+		t.Errorf("handoff = %q", got)
+	}
+}
+
+// A question asked without buttons still reaches the user, and subtasks beside a
+// question are the plan.
+func TestPlanQuestionWithoutChoicesReachesTheUser(t *testing.T) {
+	const q = "The spec says the mount is read-only; change the spec?"
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"question":"`+q+`"}`),
+		sseToolCall("x", respondToolName, `{"message":"must not run"}`))
+	s.AddUser("make the mount writable")
+	res, err := a.orchestrate(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != q {
+		t.Errorf("reply = %q, want the question", res.Text)
+	}
+	if got := mock.callCount(); got != 1 {
+		t.Errorf("LLM calls = %d, want the planner's only", got)
+	}
+}
+
+// /spec verify reports: subtasks are sent back, and if they come again they do not run.
+func TestOrchestrateVerifyRunsNoSubtasks(t *testing.T) {
+	work := `{"clear":true,"report_only":false,"answer":"one contradiction","subtasks":[{"description":"change it back"}]}`
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, work),
+		sseToolCall("p2", submitPlanToolName, work))
+	s.rt.specVerify = true
+	s.AddUser("verify")
+	res, err := a.orchestrate(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Text != "one contradiction" || mock.callCount() != 2 {
+		t.Errorf("reply %q, %d calls; want the report after one retry", res.Text, mock.callCount())
+	}
+}
+
+// The executor's word decides, not an exit code: a grep that finds nothing is data.
+func TestRespondFailedFailsTheSubtask(t *testing.T) {
+	for _, tc := range []struct {
+		name, respond string
+		cmdFailed     bool
+		reason        string
+	}{
+		{"done", `{"message":"all done"}`, false, ""},
+		{"non-zero exit, done", `{"message":"all done"}`, true, ""},
+		{"reports failure", `{"message":"the suite stays red","failed":true}`, false, "the executor reports: the suite stays red"},
+	} {
+		a, s, _ := planPhaseAgent(t,
+			sseToolCall("c", "run_command", `{"command":"grep nothing a.go"}`),
+			sseToolCall("r", respondToolName, tc.respond))
+		a.tools.add(fakeTool("run_command", func(string) (string, bool) { return "exit 1\n", tc.cmdFailed }))
+		out := a.runExecutePhase(context.Background(), s.ID, subtask{Description: "x"}, 0, 1)
+		if out.Reason != tc.reason || out.Success != (tc.reason == "") {
+			t.Errorf("%s: success %v, reason %q", tc.name, out.Success, out.Reason)
+		}
+	}
+}
+
+func TestTrailingEchoComesOffTheTestRun(t *testing.T) {
+	for in, want := range map[string]string{
+		`just test > /tmp/t.log 2>&1; echo "exit=$?"`: "just test > /tmp/t.log 2>&1",
+		"just test":                     "just test",
+		"just test; echo a; just build": "just test; echo a; just build",
+	} {
+		if got := trailingEchoRe.ReplaceAllString(in, ""); got != want {
+			t.Errorf("%q -> %q, want %q", in, got, want)
+		}
+	}
+}
+
+// Red-first judges a run by its exit: the recommended echo form is run without the echo, a
+// look at the log is no run, and a pipeline cannot tell.
+func TestRedFirstReadsTheRealRun(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cmds []string
+		want string // part of the reason, "" for a pass
+	}{
+		{"echo form, red without the fix", []string{`sh tests/red.sh; echo "exit=$?"`}, ""},
+		{"last look at a log is skipped", []string{"sh tests/ok.sh", "tail -5 /tmp/test.log"}, "red before green failed"},
+		{"a sequence is not judged", []string{`sh tests/ok.sh; echo "exit=$?"; git diff --stat`}, ""},
+		{"a pipeline is not judged", []string{"sh tests/ok.sh | tail -3"}, ""},
+	} {
+		dir := gitRepo(t, map[string]string{"src/a.dat": "old\n", "tests/a_test.txt": "old\n", "tests/ok.sh": "true\n", "tests/red.sh": "grep -q fixed src/a.dat\n"})
+		a, s := newTestAgent(t)
+		s.Cwd = dir
+		_, before := dirtyFiles(dir)
+		for _, f := range []string{"src/a.dat", "tests/a_test.txt"} {
+			if err := os.WriteFile(filepath.Join(dir, f), []byte("fixed\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var uses []ToolUse
+		for _, c := range tc.cmds {
+			in, _ := json.Marshal(map[string]string{"command": c})
+			uses = append(uses, ToolUse{Name: "run_command", Input: string(in)})
+		}
+		got := a.testShowsFault(context.Background(), s.ID, dir, before, uses)
+		if (tc.want == "") != (got == "") || !strings.Contains(got, tc.want) {
+			t.Errorf("%s: reason %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// From a replay: 8 of 39 submit_plan calls wrapped the plan, one as JSON text cut off at
+// the end. Its subtasks were lost and the prose beside it was shown as the answer.
+func TestPlanUnwrapsCutOffPlanText(t *testing.T) {
+	args, _ := json.Marshal(map[string]string{"plan": `{"clear": true, "subtasks": [{"description": "add count", "verify": ["go test"]}`})
+	a, s, mock := planPhaseAgent(t, sseContentThenToolCall("Repo is a small Go CLI.", "p1", submitPlanToolName, string(args)))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mock.callCount() != 1 || plan == nil || len(plan.Subtasks) != 1 {
+		t.Fatalf("calls %d, plan %+v: want its subtask", mock.callCount(), plan)
+	}
+}
+
+// A tool parser left the next argument inside `answer`, tag and all.
+func TestPlanAnswerDropsALeakedParameter(t *testing.T) {
+	args, _ := json.Marshal(map[string]string{"answer": "It cannot be done.\n<parameter=clear>\ntrue"})
+	a, s, _ := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, string(args)),
+		sseToolCall("p2", submitPlanToolName, `{"answer":"same"}`))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil || plan == nil || plan.answer != "It cannot be done." {
+		t.Fatalf("plan %+v, err %v", plan, err)
+	}
+}
+
+func TestPlanSubtasksWinOverAQuestion(t *testing.T) {
+	a, s, _ := planPhaseAgent(t, sseToolCall("p1", submitPlanToolName, `{"question":"really?","subtasks":[{"description":"do it"}]}`))
+	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
+	if err != nil || plan == nil || len(plan.Subtasks) != 1 {
+		t.Fatalf("plan %+v, err %v", plan, err)
 	}
 }

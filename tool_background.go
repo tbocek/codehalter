@@ -2,65 +2,202 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"maps"
+	"net"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// bgJobGrace is how long run_background waits after launch before returning, to
-// capture startup output and catch a command that exits straight away (a server
-// that can't bind, a typo). A process still running after this keeps running
-// across later tool calls. A var so tests can shorten it.
+// bgJobGrace catches a command that exits straight away (a server that cannot
+// bind, a typo). A var so tests can shorten it.
 var bgJobGrace = 700 * time.Millisecond
 
-// bgLogTailCap bounds how many trailing bytes of a job's log we fold into the
-// tool result; the model reads the full log via run_command.
 const bgLogTailCap = 8 * 1024
 
-// backgroundJob tracks one long-lived job so the agent can release its terminal
-// at shutdown (releasing kills the process, which is exactly what we want then,
-// and skipping it would leave a dev server holding a port for the container's
-// life) and so the grace-period check can tell "still running" from "exited
-// immediately".
+// backgroundJob is tracked so shutdown can release, and thereby kill, its
+// terminal; otherwise a dev server would hold its port for the container's life.
 type backgroundJob struct {
 	id         int
-	sid        string // the session that launched it; terminal calls are addressed by it
+	sid        string
+	tcId       string
 	cmdStr     string
 	pid        int
 	logPath    string
 	pidPath    string
 	terminalId string
+	started    time.Time
+	wakeAfter  time.Duration
+	announced  bool // under bgMu
+	kind       jobKind
+	redirects  []string // growth counts as progress
+	// Under bgMu, written by stuckWatch: stuck is why it stopped the job, "" while it runs;
+	// still is when its processes last moved.
+	stuck  string
+	still  time.Time
+	exited chan jobExit
 }
 
-// bgScript wraps the model's command so the job keeps the two handles the model
-// already knows how to use: a log file it reads with `run_command: cat …` and a
-// pid it stops with `run_command: kill …`. Neither is available from an ACP
-// terminal — the client owns the process and only ever tells us a terminal id —
-// so the shell inside the terminal produces them instead.
-//
-// This works because the client's terminal and codehalter share a filesystem
-// (Zed's dev-container flow runs both inside the container), which is the same
-// assumption run_command makes when the model cats a file a command just wrote.
-//
-// `cmd &` then `$!` rather than `$$` + exec: for a simple command bash execs it
-// directly into the backgrounded child, so `$!` is the real process, and for a
-// compound one (`cd x && npm run dev`) it's the subshell — the same pid the
-// old exec.Command path recorded. `wait` keeps the shell alive so the terminal
-// exits when the job does, which is what the grace check reads.
-func bgScript(cmdStr, logPath, pidPath string) string {
-	return fmt.Sprintf("exec > %s 2>&1\n%s &\necho $! > %s\nwait $!", logPath, cmdStr, pidPath)
+// jobKind is what the model said a job is. Only a server never ends on its own: the
+// others are waited for and stopped when stuck. Guessed from a listening socket
+// instead, a test suite whose tests start fake servers was taken for a server and
+// stopped being waited for, 19 times in one session.
+type jobKind int
+
+const (
+	jobBackground jobKind = iota // run_background
+	jobHandedOver                // a run_command still running at its wait, handed over
+	jobServer                    // run_server
+)
+
+var jobVerb = map[jobKind]string{jobBackground: "Background", jobHandedOver: "Run", jobServer: "Server"}
+
+// jobExit is delivered once per job, to run_command's wait or, after handover,
+// to watchBgJob.
+type jobExit struct {
+	exit terminalExit
+	err  error
 }
 
-// nextBgID reserves the next sequential job id (used to name the log file before
-// the job is registered).
-func (a *agent) nextBgID() int {
+// jobSweepFn signals every process in the wrapper's process group, and in its
+// session when it leads one; it succeeds when it signalled something. /proc, not
+// pkill: BusyBox and GNU differ, /proc/<pid>/stat does not.
+const jobSweepFn = `sweep() {
+  local sig=$1 me=$$ own p line n=0
+  read -r line < /proc/$me/stat; set -- ${line##*) }; own=$4
+  for p in /proc/[0-9]*; do
+    p=${p#/proc/}; [ "$p" = "$me" ] && continue
+    read -r line < /proc/$p/stat 2>/dev/null || continue
+    set -- ${line##*) }
+    if [ "$3" = "$me" ] || { [ "$own" = "$me" ] && [ "$4" = "$me" ]; }; then kill -$sig $p 2>/dev/null && n=$((n+1)); fi
+  done
+  [ $n -gt 0 ]
+}`
+
+// ACP terminals expose no pid or log, so the wrapper writes its pid (a process
+// group under a pty, killed whole by its trap) and tees the output to a log.
+func (a *agent) launchJob(ctx context.Context, sid, rawArgs string, kind jobKind) (*backgroundJob, string) {
+	args := parseArgs(rawArgs)
+	cmdStr := args.str("command")
+	cmds := shellSegments(cmdStr, false)
+	if len(cmds) == 0 {
+		return nil, "error: command is required" + wrongToolHint(args)
+	}
+	sess := a.getSession(sid)
+	if sess == nil {
+		return nil, "error: no session"
+	}
+	secs, ok := args.num("wake_after")
+	if args.has("wake_after") && (!ok || secs < 0) {
+		return nil, "error: wake_after must be a number of seconds, 0 or absent for none"
+	}
+	// An inline script on a picture file shows the model nothing: one step wrote 40
+	// PIL crops of a snapshot and never looked at one.
+	if pic := pictureRe.FindString(cmdStr); pic != "" && pictureScriptRe.MatchString(cmdStr) {
+		return nil, fmt.Sprintf("refused: this works on a picture with a script, and a script cannot show it to you: only `screenshot` puts a picture in front of you. "+
+			"Look at it with `screenshot` on the file; for a close look at one part, give `region` [x, y, width, height] in its pixels and that part comes back enlarged: "+
+			`{"path": %q, "region": [0, 0, 800, 400]}. The reply for the whole picture states its size.`, strings.Trim(pic, `'" `))
+	}
+	// Only a foreground render attaches its picture, so only it counts as a look.
+	if kind != jobHandedOver && renderCmdRe.MatchString(cmdStr) {
+		return nil, "refused: this renders a screen, which takes seconds. Run it with `run_command` instead: only a render through run_command attaches the picture to your view, and only then does the look count. A render in the background finishes unseen."
+	}
+	// Waiting for a job by hand is never needed: the job wakes the model itself when it
+	// exits, and a running shell cannot be interrupted with the note.
+	const dontWait = "the moment a background job exits codehalter hands you its exit code and last output on its own. " +
+		"Continue with other work, or call `respond` saying you are waiting: the turn is parked, not ended, and continues here when the job reports. " +
+		"For a look at a job before it exits, give `wake_after` when you start it."
+	// A pgrep/pkill -f pattern found in the command's own text matches the shell running it:
+	// a wait on it never ends, and a pkill kills the command. -x matches the whole line only.
+	for _, m := range pgrepRe.FindAllStringSubmatch(cmdStr, -1) {
+		pat := m[2] + m[3] + m[4]
+		re, err := regexp.Compile(pat)
+		if err != nil || !strings.Contains(m[1], "f") || strings.Contains(m[1], "x") || !re.MatchString(cmdStr) {
+			continue
+		}
+		return nil, fmt.Sprintf("refused: the pattern %q of `pgrep -f` or `pkill -f` matches this command's own text, because the shell running it carries that text in its command line: a wait on it never ends, a one-off check finds this command itself, and a pkill kills it. To look once whether something runs, write the pattern so it cannot match its own text: `pgrep -f \"[c]argo test\"`. Do not wait for a job by polling: %s", pat, dontWait)
+	}
+	ending := func(j *backgroundJob) bool { return j.kind != jobServer }
+	if jobs := a.runningBgJobs(sid, ending); jobs != "" && (kind == jobHandedOver && isSleepCmd(cmdStr) || processPollRe.MatchString(cmdStr)) {
+		return nil, fmt.Sprintf("refused: do not wait for a background job yourself, with a sleep or a polling loop. %s still running; %s", jobs, dontWait)
+	}
+	// A second copy of a running job fights it for the same files, and one result overwrites
+	// the other: a suite started again while the first still ran into the same log left that
+	// log reading 196 failed files, and the first run's result was gone.
+	if dup := a.jobDoingTheSame(sid, cmdStr, redirectTargets(cmdStr, sess.Cwd)); dup != "" {
+		return nil, "refused: " + dup + " " + dontWait
+	}
+	tcId := a.StartToolCall(ctx, sid, jobVerb[kind]+": "+cmdStr, "execute", nil)
+
 	a.bgMu.Lock()
-	defer a.bgMu.Unlock()
 	a.bgSeq++
-	return a.bgSeq
+	id := a.bgSeq
+	a.bgMu.Unlock()
+	job := &backgroundJob{
+		id: id, sid: sid, tcId: tcId, cmdStr: cmdStr, started: time.Now(),
+		// Our pid in the name: ids restart at 1 in every codehalter process.
+		logPath:   filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-%d-job-%d.log", os.Getpid(), id)),
+		pidPath:   filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-%d-job-%d.pid", os.Getpid(), id)),
+		wakeAfter: time.Duration(secs) * time.Second,
+		kind:      kind,
+		redirects: redirectTargets(cmdStr, sess.Cwd),
+		exited:    make(chan jobExit, 1),
+	}
+	// pipefail + wait: the exit status is the command's, not tee's. Leftovers are
+	// swept on every exit, by group and by session (timeout moves its command out
+	// of the group; an xvfb-run suite left its Xvfb behind).
+	quoted := "'" + strings.ReplaceAll(cmdStr, "'", `'\''`) + "'"
+	script := fmt.Sprintf("echo $$ > %s\nset -o pipefail\n%s\ntrap 'trap - TERM INT HUP; sweep TERM; exit 143' TERM INT HUP\n( exec bash -c %s ) 2>&1 | tee %s &\nwait $!\nrc=$?\ntrap '' TERM\nif sweep TERM; then sleep 3; sweep KILL; fi\nexit $rc",
+		job.pidPath, jobSweepFn, quoted, job.logPath)
+	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", script}, sess.Cwd)
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		return nil, "error starting terminal: " + err.Error()
+	}
+	job.terminalId = tid
+	// Registered first so a shutdown racing the launch still releases the
+	// terminal instead of orphaning the process.
+	a.registerBgJob(job)
+	a.sendUpdate(ctx, sid, toolCallUpdate{
+		Kind:       "tool_call_update",
+		ToolCallId: tcId,
+		Status:     "in_progress",
+		Content:    []ToolCallContent{{Type: "terminal", TerminalId: tid}},
+	})
+	go func() {
+		var e terminalExit
+		raw, err := a.conn.sendRequest(context.Background(), "terminal/wait_for_exit", map[string]any{"sessionId": sid, "terminalId": tid})
+		if err == nil {
+			err = json.Unmarshal(raw, &e)
+		}
+		job.exited <- jobExit{e, err}
+	}()
+	return job, ""
+}
+
+// handOver returns the wake_after sentence for the result, or "".
+func (a *agent) handOver(job *backgroundJob) string {
+	job.pid = readPidFile(job.pidPath)
+	stop := make(chan struct{})
+	// Limits read here, not in the watcher, which may outlive a test that shortened them.
+	// A server waits for requests by design, so it is never stuck.
+	if job.kind != jobServer {
+		go a.stuckWatch(job, stop, bgStuckAfter, bgStuckPoll)
+	}
+	go a.watchBgJob(job, stop)
+	if job.wakeAfter <= 0 {
+		return ""
+	}
+	go a.wakeForBgJob(job)
+	return fmt.Sprintf(" You asked to be woken after %s if it is still running by then.", humanDuration(job.wakeAfter.Milliseconds()))
 }
 
 func (a *agent) registerBgJob(job *backgroundJob) {
@@ -72,51 +209,206 @@ func (a *agent) registerBgJob(job *backgroundJob) {
 	a.bgJobs[job.id] = job
 }
 
-// forgetBgJob drops a job from the table and removes its scratch files. Used
-// both for a job that never stayed up and, via shutdownBackground, at exit.
-func (a *agent) forgetBgJob(job *backgroundJob) {
+func (a *agent) runningBgJobs(sid string, keep func(*backgroundJob) bool) string {
+	a.bgMu.Lock()
+	defer a.bgMu.Unlock()
+	var names []string
+	for _, j := range a.bgJobs {
+		if j.sid == sid && (keep == nil || keep(j)) {
+			state := fmt.Sprintf("%s so far", humanDuration(time.Since(j.started).Milliseconds()))
+			if quiet := time.Since(j.still); !j.still.IsZero() && quiet >= time.Minute {
+				state += fmt.Sprintf(", idle (almost no CPU, no output) for %s", humanDuration(quiet.Milliseconds()))
+			}
+			names = append(names, fmt.Sprintf("job %d `%s` (%s)", j.id, truncate(j.cmdStr, 60), state))
+		}
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// jobDoingTheSame names a running job of the session that runs cmd too, or writes a file cmd
+// writes, and says why a second one is refused; "" when there is none.
+func (a *agent) jobDoingTheSame(sid, cmd string, writes []string) string {
+	same := strings.Join(strings.Fields(cmd), " ")
+	a.bgMu.Lock()
+	defer a.bgMu.Unlock()
+	for _, id := range slices.Sorted(maps.Keys(a.bgJobs)) {
+		j := a.bgJobs[id]
+		if j.sid != sid {
+			continue
+		}
+		what := ""
+		if strings.Join(strings.Fields(j.cmdStr), " ") == same {
+			what = "this same command"
+		} else if i := slices.IndexFunc(writes, func(f string) bool { return slices.Contains(j.redirects, f) }); i >= 0 {
+			what = "a command that writes " + writes[i] + " too"
+		}
+		if what != "" {
+			return fmt.Sprintf("job %d `%s` (%s so far) is already running %s. A second copy would compete with it for the same files, and one result would overwrite the other. Its exit code and last output come to you when it exits; to start it again instead, %s first.",
+				j.id, truncate(j.cmdStr, 60), humanDuration(time.Since(j.started).Milliseconds()), what, stopHint(j.pid))
+		}
+	}
+	return ""
+}
+
+// sayRunningBgJobs names each job once, or a long-lived dev server would close
+// every turn with the same line.
+func (a *agent) sayRunningBgJobs(sess *Session) {
+	a.bgMu.Lock()
+	var jobs, servers []string
+	for _, j := range a.bgJobs {
+		if j.sid == sess.ID && !j.announced {
+			j.announced = true
+			name := fmt.Sprintf("job %d `%s`", j.id, truncate(j.cmdStr, 60))
+			if j.kind == jobServer {
+				servers = append(servers, name)
+			} else {
+				jobs = append(jobs, name)
+			}
+		}
+	}
+	a.bgMu.Unlock()
+	sort.Strings(jobs)
+	sort.Strings(servers)
+	if len(jobs) > 0 {
+		a.say(context.Background(), sess.ID, "\n⏳ Running in the background: "+strings.Join(jobs, ", ")+". When it exits I pick up the work that was waiting on it and tell you; you can carry on meanwhile.\n")
+	}
+	if len(servers) > 0 {
+		a.say(context.Background(), sess.ID, "\n🖧 Server running: "+strings.Join(servers, ", ")+". It keeps running until it is stopped or the session ends.\n")
+	}
+}
+
+// A picture file, and an inline script or an image tool that would crop or
+// measure it. A project's own script file (`python3 tools/icons.py a.png`) is not
+// inline and stays allowed.
+var (
+	pictureRe       = regexp.MustCompile(`[\w./-]+\.(?i:png|jpe?g|webp|gif|bmp)\b`)
+	pictureScriptRe = regexp.MustCompile(`\b(?:python3?|node|perl|ruby)\s+(?:-c\b|-e\b|-\s*<<)|\b(?:convert|magick|mogrify|pngtopnm|pnmcut|ffmpeg)\s`)
+)
+
+// parkableJobs: every job this step started that will end; a server and a job from
+// an earlier turn never park it.
+func (a *agent) parkableJobs(sid string, since time.Time) string {
+	return a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.started.After(since) && j.kind != jobServer })
+}
+
+var parkPoll = 500 * time.Millisecond
+
+// parkForJobs returns what resumes a parked turn: the queued job notes and the
+// user's text, in arrival order. Without parking, a gate that ended on a
+// "waiting" respond got its result in another subtask.
+func (a *agent) parkForJobs(ctx context.Context, sid string, since time.Time) (string, error) {
+	sess := a.getSession(sid)
+	if sess == nil {
+		return "", fmt.Errorf("no session")
+	}
+	if items := sess.takePending(); len(items) > 0 {
+		return a.resumeWith(ctx, sid, items), nil
+	}
+	// The wait is the jobs' work, a suite in the background: the Done line counts it as tool time.
+	parked := time.Now()
+	defer func() { sess.addToolTime(time.Since(parked).Milliseconds()) }()
+	a.say(ctx, sid, "\n⏸ Waiting for "+a.parkableJobs(sid, since)+". This turn continues when it reports; type and Send Now to interject.\n")
+	for {
+		if items := sess.takePending(); len(items) > 0 {
+			return a.resumeWith(ctx, sid, items), nil
+		}
+		if a.parkableJobs(sid, since) == "" && !sess.hasPending() {
+			// Every job is gone without a note (a session teardown took them):
+			// resume rather than hang.
+			return "[codehalter, not the user: the background job you were waiting for is gone without a report (the session took it down); check its log.]", nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(parkPoll):
+		}
+	}
+}
+
+func (a *agent) resumeWith(ctx context.Context, sid string, items []pendingInput) string {
+	text, hasNote := a.sayPending(ctx, sid, items, true)
+	if hasNote {
+		text += "\n\nContinue the work that was waiting on this."
+	}
+	return text
+}
+
+func (a *agent) endJob(job *backgroundJob) {
+	a.terminalRelease(job.sid, job.terminalId)
 	a.bgMu.Lock()
 	delete(a.bgJobs, job.id)
 	a.bgMu.Unlock()
-	_ = os.Remove(job.logPath)
-	_ = os.Remove(job.pidPath)
+	removeJobFiles(job.logPath, job.pidPath)
 }
 
-// shutdownBackground releases every still-tracked job's terminal on app exit —
-// which kills the process, since that is what release does — and removes their
-// scratch files. Called from main after the connection closes, alongside
-// shutdownMCP.
+func removeJobFiles(files ...string) {
+	for _, f := range files {
+		if err := os.Remove(f); err != nil && !os.IsNotExist(err) {
+			slog.Debug("background job: file not removed", "file", f, "err", err)
+		}
+	}
+}
+
 func (a *agent) shutdownBackground() {
 	a.bgMu.Lock()
-	jobs := make([]*backgroundJob, 0, len(a.bgJobs))
-	for _, j := range a.bgJobs {
-		jobs = append(jobs, j)
-	}
+	jobs := slices.Collect(maps.Values(a.bgJobs))
 	a.bgJobs = nil
 	a.bgMu.Unlock()
 	for _, j := range jobs {
 		if j.terminalId != "" && a.conn != nil {
+			a.killJob(j)
 			a.terminalRelease(j.sid, j.terminalId)
 		}
-		_ = os.Remove(j.logPath)
-		_ = os.Remove(j.pidPath)
+		removeJobFiles(j.logPath, j.pidPath)
 	}
 }
 
-// readLogTail returns the last max bytes of a job log (the whole file when
-// smaller), prefixed with a marker when truncated. "" if the log can't be read.
+// stopJobsSince ends the session's jobs started from since on, and names them. Each is untracked
+// before it is killed, and its queued notes dropped, so neither its exit nor a wake_after starts a
+// turn: after a /spec abort a suite's wake note resumed the aborted round as a plain turn.
+func (a *agent) stopJobsSince(sid string, since time.Time) []string {
+	a.bgMu.Lock()
+	var jobs []*backgroundJob
+	for _, id := range slices.Sorted(maps.Keys(a.bgJobs)) {
+		if j := a.bgJobs[id]; j.sid == sid && !j.started.Before(since) {
+			jobs = append(jobs, j)
+			delete(a.bgJobs, id)
+		}
+	}
+	a.bgMu.Unlock()
+	if len(jobs) == 0 {
+		return nil
+	}
+	ids := map[int]bool{}
+	var names []string
+	for _, j := range jobs {
+		ids[j.id] = true
+		names = append(names, fmt.Sprintf("job %d `%s`", j.id, truncate(j.cmdStr, 60)))
+	}
+	if sess := a.getSession(sid); sess != nil {
+		sess.dropJobNotes(ids)
+	}
+	for _, j := range jobs {
+		a.killJob(j)
+		a.terminalRelease(j.sid, j.terminalId)
+		removeJobFiles(j.logPath, j.pidPath)
+	}
+	return names
+}
+
 func readLogTail(path string, max int) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
-	if len(data) > max {
-		return "[... earlier output truncated ...]\n" + string(data[len(data)-max:])
+	out := collapseStackTraces(string(data))
+	if len(out) > max {
+		return "[... earlier output truncated ...]\n" + tailUTF8(out, max)
 	}
-	return string(data)
+	return out
 }
 
-// readPidFile returns the pid bgScript recorded, or 0 if it isn't there yet.
 func readPidFile(path string) int {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -129,103 +421,454 @@ func readPidFile(path string) int {
 	return pid
 }
 
-// runBackgroundExecute starts a long-running command in a client terminal that
-// outlives this tool call, waits a short grace period to catch an immediate
-// crash, then returns the pid + log path while the process keeps running.
-// Cleanup happens at session exit (shutdownBackground) or when the model kills
-// the pid via run_command.
 func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
-	args := parseArgs(rawArgs)
-	cmdStr := args.str("command")
-	if cmdStr == "" {
-		return "error: command is required", false
-	}
-	sess := a.getSession(sid)
-	if sess == nil {
-		return "error: no session", false
+	job, refusal := a.launchJob(ctx, sid, rawArgs, jobBackground)
+	if job == nil {
+		return refusal, false
 	}
 
-	tcId := a.StartToolCall(ctx, sid, "Background: "+cmdStr, "execute", nil)
-
-	id := a.nextBgID()
-	logPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.log", id))
-	pidPath := filepath.Join(os.TempDir(), fmt.Sprintf("codehalter-bg-%d.pid", id))
-	job := &backgroundJob{id: id, sid: sid, cmdStr: cmdStr, logPath: logPath, pidPath: pidPath}
-
-	tid, err := a.terminalCreate(ctx, sid, "bash", []string{"-c", bgScript(cmdStr, logPath, pidPath)}, sess.Cwd)
-	if err != nil {
-		a.FailToolCall(ctx, sid, tcId, err.Error())
-		return "error starting terminal: " + err.Error(), false
-	}
-	job.terminalId = tid
-	// Registered before the grace wait so a shutdown racing the launch still
-	// releases the terminal instead of orphaning the process.
-	a.registerBgJob(job)
-
-	// The terminal is NOT released here: release kills the process, and this job
-	// is meant to outlive the tool call. It stays embedded in the card, so the
-	// user watches the dev server's output live for as long as it runs.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: tcId,
-		Status:     "in_progress",
-		Content:    []ToolCallContent{TerminalContent(tid)},
-	})
-
-	// Grace window: catch an immediate exit (failed bind, bad command) before
-	// reporting the job as running. Polled rather than a flat sleep so a fast
-	// crash is reported without making every healthy launch wait it out.
-	var exit *terminalExit
-	deadline := time.Now().Add(bgJobGrace)
-	for {
-		_, _, status, oerr := a.terminalOutput(ctx, sid, tid)
-		if oerr != nil {
-			a.forgetBgJob(job)
-			a.terminalRelease(sid, tid)
-			a.FailToolCall(ctx, sid, tcId, oerr.Error())
-			return "error reading terminal: " + oerr.Error(), false
-		}
-		if status != nil {
-			exit = status
-			break
-		}
-		if remaining := time.Until(deadline); remaining <= 0 {
-			break
-		} else if remaining > 50*time.Millisecond {
-			time.Sleep(50 * time.Millisecond)
-		} else {
-			time.Sleep(remaining)
-		}
+	select {
+	case res := <-job.exited:
+		return a.exitedAtStart(ctx, sid, job, res), false
+	case <-time.After(bgJobGrace):
 	}
 
-	tail := readLogTail(logPath, bgLogTailCap)
-	if exit != nil {
-		// It already exited, so there's nothing to keep alive: release the terminal
-		// and drop the job (its output is in the result below).
-		a.terminalRelease(sid, tid)
-		a.forgetBgJob(job)
-		result := fmt.Sprintf("background job %d exited immediately (exit %d) — it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", id, exit.code(), tail)
-		a.CompleteToolCallTitled(ctx, sid, tcId, fmt.Sprintf("Background: %s (exited %d)", cmdStr, exit.code()), []ToolCallContent{TextContent(result)})
-		return result, false
-	}
-
-	job.pid = readPidFile(pidPath)
-	stop := fmt.Sprintf("stop it with `run_command: kill %d`", job.pid)
-	if job.pid == 0 {
-		// bgScript writes the pid before anything slow happens, so an empty file
-		// here means the shell died oddly. Say so rather than printing "kill 0",
-		// which would signal the whole process group.
-		stop = "its pid was not recorded, so it can only be stopped by ending the session"
-	}
-	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls. Read its output with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
-		id, job.pid, logPath, stop, tail)
-	// Retitle only: the card is holding the live terminal, and text content here
-	// would replace it with a static snapshot taken at second one of a dev server.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: tcId,
-		Title:      fmt.Sprintf("Background: %s (pid %d)", cmdStr, job.pid),
-		Status:     "completed",
-	})
+	wake := a.handOver(job)
+	stop := stopHint(job.pid)
+	idle := fmt.Sprintf("call `respond` saying you are waiting for job %d: that parks this step, it does not end it, and you continue here the moment the job reports. "+
+		"A job whose processes neither use CPU nor write output for %s is stuck and gets stopped; a server or a watcher, which never ends on its own, belongs in `run_server`", job.id, humanDuration(bgStuckAfter.Milliseconds()))
+	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, %s.%s Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
+		job.id, job.pid, idle, wake, job.logPath, stop, readLogTail(job.logPath, bgLogTailCap))
+	a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Background: %s (pid %d)", job.cmdStr, job.pid), "completed")
 	return result, false
+}
+
+// exitedAtStart reports a job that ended before run_background or run_server returned.
+func (a *agent) exitedAtStart(ctx context.Context, sid string, job *backgroundJob, res jobExit) string {
+	tail := readLogTail(job.logPath, bgLogTailCap)
+	a.endJob(job)
+	if res.err != nil {
+		a.FailToolCall(ctx, sid, job.tcId, res.err.Error())
+		return "error reading terminal: " + res.err.Error()
+	}
+	result := fmt.Sprintf("background job %d exited immediately (exit %d): it did not stay running. Likely a startup error (port already in use, bad command, missing file). Output:\n\n%s", job.id, res.exit.code(), tail)
+	a.CompleteToolCallTitled(ctx, sid, job.tcId, fmt.Sprintf("%s: %s (exited %d)", jobVerb[job.kind], job.cmdStr, res.exit.code()), []ToolCallContent{TextContent(result)})
+	return result
+}
+
+// bgServerReady bounds run_server's wait for its port. A var so tests can shorten it.
+var bgServerReady = 60 * time.Second
+
+func portOpen(port int) bool {
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", port), 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	if err := c.Close(); err != nil {
+		slog.Debug("portOpen: close", "port", port, "err", err)
+	}
+	return true
+}
+
+func runServerExecute(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+	args := parseArgs(rawArgs)
+	if args.has("stop") {
+		id, _ := args.num("stop")
+		a.bgMu.Lock()
+		job := a.bgJobs[id]
+		if job == nil || job.sid != sid || job.kind != jobServer {
+			a.bgMu.Unlock()
+			servers := a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.kind == jobServer })
+			if servers == "" {
+				servers = "none"
+			}
+			return fmt.Sprintf("error: no server with job id %v runs in this session. Servers running: %s.", args["stop"], servers), false
+		}
+		// Forgotten first, so its exit is not reported as news.
+		delete(a.bgJobs, id)
+		a.bgMu.Unlock()
+		a.killJob(job)
+		a.terminalRelease(sid, job.terminalId)
+		tail := readLogTail(job.logPath, bgNoteTailCap)
+		removeJobFiles(job.logPath, job.pidPath)
+		a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Server: %s (job %d stopped)", job.cmdStr, job.id), "completed")
+		return fmt.Sprintf("server job %d stopped. Its last output:\n\n%s", job.id, tail), false
+	}
+	port, hasPort := args.num("port")
+	if args.has("port") && (!hasPort || port <= 0 || port > 65535) {
+		return "error: port must be a TCP port number, or absent", false
+	}
+	// Otherwise the old process would answer and the new server would look ready.
+	if hasPort && portOpen(port) {
+		return fmt.Sprintf("refused: something already accepts connections on port %d. Stop it first (a server of yours: run_server {\"stop\": <its job id>}), or use another port.", port), false
+	}
+	job, refusal := a.launchJob(ctx, sid, rawArgs, jobServer)
+	if job == nil {
+		return refusal, false
+	}
+	wait := bgJobGrace
+	if hasPort {
+		wait = bgServerReady
+	}
+	// Until the port answers, or for the grace that catches a server dying at start.
+	deadline, poll := time.After(wait), time.NewTicker(200*time.Millisecond)
+	defer poll.Stop()
+	ready := false
+wait:
+	for {
+		select {
+		case res := <-job.exited:
+			return a.exitedAtStart(ctx, sid, job, res), false
+		case <-deadline:
+			break wait
+		case <-poll.C:
+			if ready = hasPort && portOpen(port); ready {
+				break wait
+			}
+		}
+	}
+	a.handOver(job)
+	state := ""
+	switch {
+	case hasPort && ready:
+		state = fmt.Sprintf(", accepting connections on port %d", port)
+	case hasPort:
+		state = fmt.Sprintf(", but nothing accepts connections on port %d after %s: check its output below", port, humanDuration(wait.Milliseconds()))
+	}
+	result := fmt.Sprintf("server job %d running (pid %d)%s. It keeps running across tool calls and turns until you stop it with run_server {\"stop\": %d} or the session ends; nothing waits for it and it is never stopped as idle. If it ends by itself, codehalter tells you with its last output. Read its log any time with `run_command: tail -50 %s`. Output so far:\n\n%s",
+		job.id, job.pid, state, job.id, job.logPath, readLogTail(job.logPath, bgLogTailCap))
+	a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Server: %s (pid %d)", job.cmdStr, job.pid), "completed")
+	return result, false
+}
+
+// bgNoteTailCap is smaller than bgLogTailCap: the note stays in the
+// conversation for good.
+const bgNoteTailCap = 3 * 1024
+
+const bgWakeRetry = 2 * time.Second
+
+// bgStuckAfter: a job whose processes used almost no CPU and wrote no output this long is
+// stuck (a deadlock, a prompt for input, a wait for something that never comes). A
+// silent build still uses CPU, so it is not taken for stuck; a server is not watched.
+// Vars so tests can shorten them.
+var (
+	bgStuckAfter = 5 * time.Minute
+	bgStuckPoll  = 30 * time.Second
+	// bgBusyRate: CPU ticks a second (100 is a whole core) from which a job counts as busy; 5 is 5%.
+	// The slowest poller measured (`until [ -f F ]; do sleep 0.2`) uses 1%; a build or compile 50 to 100%.
+	bgBusyRate = 5.0
+	// readActivity is jobActivity, so a test can script what /proc would say.
+	readActivity = jobActivity
+)
+
+// watchBgJob closes stop, ending the job's stuck watcher, once the job exits.
+func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
+	defer close(stop)
+	res := <-job.exited
+	exit, err := res.exit, res.err
+	// Untracked means shutdown killed it: nothing to report, nobody to report to.
+	a.bgMu.Lock()
+	_, tracked := a.bgJobs[job.id]
+	stuck := job.stuck
+	a.bgMu.Unlock()
+	if !tracked {
+		return
+	}
+	// Forgotten only once its note is queued: a parked step that saw neither would
+	// resume without the exit code.
+	forget := func() {
+		a.bgMu.Lock()
+		delete(a.bgJobs, job.id)
+		a.bgMu.Unlock()
+	}
+	a.terminalRelease(job.sid, job.terminalId)
+	removeJobFiles(job.pidPath) // the log stays: the note points the model at it
+	sess := a.getSession(job.sid)
+	if sess == nil {
+		forget()
+		return
+	}
+	var outcome string
+	switch {
+	case stuck != "":
+		outcome = "was stopped as stuck: " + stuck
+	case err != nil:
+		outcome = "was lost (" + err.Error() + ")"
+	default:
+		outcome = fmt.Sprintf("exited with code %d", exit.code())
+		sess.recordJobRun(jobRun{cmd: job.cmdStr, code: exit.code(), started: job.started, ended: time.Now(), log: job.logPath})
+	}
+	a.retitleToolCall(context.Background(), job.sid, job.tcId, fmt.Sprintf("%s: %s (job %d %s)", jobVerb[job.kind], job.cmdStr, job.id, outcome), "completed")
+	took := humanDuration(time.Since(job.started).Milliseconds())
+	sess.addBgNote(bgNote{
+		job:  job.id,
+		line: fmt.Sprintf("background job %d `%s` %s after %s", job.id, truncate(job.cmdStr, 80), outcome, took),
+		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` %s after %s. Full log: %s. Last output:]\n\n%s",
+			job.id, job.cmdStr, outcome, took, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
+	})
+	forget()
+	a.deliverBgNotesWhenIdle(sess)
+}
+
+// killJob signals the process group directly, since codehalter shares the
+// container, rather than relying on what the client's kill reaches.
+func (a *agent) killJob(job *backgroundJob) {
+	if job.pid == 0 {
+		job.pid = readPidFile(job.pidPath)
+	}
+	if job.pid > 0 {
+		killGroup(job.pid)
+	}
+	if err := a.terminalKill(context.Background(), job.sid, job.terminalId); err != nil {
+		slog.Debug("terminal kill failed", "job", job.id, "err", err)
+	}
+}
+
+// renderCmdRe is a run of the project's snapshot recipe, the render the setup
+// round adds (SPEC-SETUP.md), or the app's own --snapshot flag.
+var renderCmdRe = regexp.MustCompile(`(?:^|[\s;&|(])(?:just|make|task)\s+snapshot\b|\b(?:npm|pnpm|yarn)\s+(?:run\s+)?snapshot\b|\s--snapshot\b`)
+
+// stopHint tells the model how to stop a job: its whole group, SIGKILL if
+// SIGTERM is ignored. Never `kill -0`, which signals the caller's own group.
+func stopHint(pid int) string {
+	if pid <= 0 {
+		return "its pid was not recorded, so it can only be stopped by ending the session"
+	}
+	return fmt.Sprintf("stop it with `run_command: kill -TERM -%d; sleep 3; kill -KILL -%d 2>/dev/null; true` (the whole job; here a plain kill can be ignored)", pid, pid)
+}
+
+// jobKillGrace: a job still there this long after SIGTERM gets SIGKILL. Zed's
+// terminals start commands with SIGTERM ignored.
+var jobKillGrace = 3 * time.Second
+
+// killOrphanedJobs stops the jobs a dead codehalter left running. Only a wrapper
+// whose command line names its own pid file is taken, so a reused pid is safe.
+func killOrphanedJobs() {
+	files, err := filepath.Glob(filepath.Join(os.TempDir(), "codehalter-*-job-*.pid"))
+	if err != nil {
+		slog.Debug("killOrphanedJobs: glob", "err", err)
+		return
+	}
+	for _, f := range files {
+		var owner, id int
+		if _, err := fmt.Sscanf(filepath.Base(f), "codehalter-%d-job-%d.pid", &owner, &id); err != nil ||
+			owner == os.Getpid() || processAlive(owner) {
+			continue // not ours to judge, or its codehalter still runs
+		}
+		if pid := readPidFile(f); pid > 0 {
+			cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+			if err == nil && strings.Contains(string(cmdline), filepath.Base(f)) {
+				slog.Info("killing a job an earlier codehalter left running", "pidfile", f, "pid", pid)
+				killGroup(pid)
+			}
+		}
+		if err := os.Remove(f); err != nil {
+			slog.Debug("killOrphanedJobs: remove", "file", f, "err", err)
+		}
+	}
+}
+
+// stuckWatch stops a job once nothing in it moves for `after`: its processes use under
+// bgBusyRate of CPU, write no output (its log or a redirect target), and wait for no
+// lock whose holder is busy. A stopped process (state T) is stuck at once, since only a
+// SIGCONT would let it go on. Where /proc cannot say (not Linux), output alone decides.
+func (a *agent) stuckWatch(job *backgroundJob, stop <-chan struct{}, after, poll time.Duration) {
+	files := append([]string{job.logPath}, job.redirects...)
+	out, prev := progressSignature(files), readActivity(job.pid)
+	// Any growth is not movement: a loop polling with pgrep and sleep adds a tick or two
+	// of reaped children every sample, and one such job outlived a /spec round by 6 hours.
+	busy := func(prev, now uint64) bool {
+		d := int64(now) - int64(prev)
+		return d < 0 || float64(d) >= bgBusyRate*poll.Seconds() // d < 0: a process left the tree
+	}
+	a.bgMu.Lock()
+	job.still = time.Now()
+	a.bgMu.Unlock()
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
+		o, now := progressSignature(files), readActivity(job.pid)
+		moved := o != out || now.known && (busy(prev.cpu, now.cpu) || now.locked && busy(prev.lockCPU, now.lockCPU))
+		out, prev = o, now
+		a.bgMu.Lock()
+		if moved {
+			job.still = time.Now()
+		}
+		if _, tracked := a.bgJobs[job.id]; tracked {
+			switch {
+			case now.stopped && !moved:
+				job.stuck = "one of its processes was stopped (state T, by SIGSTOP or a read from the terminal) and could not go on without a SIGCONT"
+			case time.Since(job.still) >= after:
+				job.stuck = fmt.Sprintf("its processes used almost no CPU (under 5%% of a core) and wrote no output for %s (a deadlock, a prompt for input, a loop polling for something that never comes; a server or a watcher belongs in run_server)", humanDuration(after.Milliseconds()))
+			}
+		}
+		stuck := job.stuck != ""
+		a.bgMu.Unlock()
+		if stuck {
+			a.killJob(job)
+			return
+		}
+	}
+}
+
+// procActivity is what /proc says about a job's process tree at one moment.
+type procActivity struct {
+	known   bool   // false where /proc cannot say
+	cpu     uint64 // ticks the tree used so far, children it reaped included
+	stopped bool   // a process in it is stopped (state T) and cannot go on without SIGCONT
+	locked  bool   // a process in it waits for a file lock held outside the tree
+	lockCPU uint64 // ticks the holders of those locks, with their children, used so far
+}
+
+type proc struct {
+	ppid  int
+	state string
+	cpu   uint64
+}
+
+// procTable reads every process's parent, state and CPU ticks (its reaped children's included).
+func procTable() map[int]proc {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	procs := map[int]proc{}
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		data, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// The fields after the command, which may itself hold spaces and parentheses.
+		f := strings.Fields(string(data[strings.LastIndexByte(string(data), ')')+1:]))
+		if len(f) < 15 {
+			continue
+		}
+		ppid, _ := strconv.Atoi(f[1])
+		var ticks uint64
+		for _, field := range f[11:15] { // utime, stime, cutime, cstime
+			n, _ := strconv.ParseUint(field, 10, 64)
+			ticks += n
+		}
+		procs[pid] = proc{ppid, f[0], ticks}
+	}
+	return procs
+}
+
+// treeUnder: root and every descendant in procs.
+func treeUnder(procs map[int]proc, root int) map[int]bool {
+	tree := map[int]bool{root: true}
+	for grew := true; grew; {
+		grew = false
+		for pid, p := range procs {
+			if !tree[pid] && tree[p.ppid] {
+				tree[pid], grew = true, true
+			}
+		}
+	}
+	return tree
+}
+
+func jobActivity(root int) procActivity {
+	procs := procTable()
+	if _, alive := procs[root]; !alive || root <= 0 {
+		return procActivity{}
+	}
+	tree := treeUnder(procs, root)
+	act := procActivity{known: true}
+	for pid := range tree {
+		act.cpu += procs[pid].cpu
+		act.stopped = act.stopped || procs[pid].state == "T"
+	}
+	// A holder's work may run in a child (flock's does).
+	for _, holder := range lockHolders(tree) {
+		act.locked = true
+		for pid := range treeUnder(procs, holder) {
+			act.lockCPU += procs[pid].cpu
+		}
+	}
+	return act
+}
+
+// lockHolders: the processes outside the tree holding a file lock (flock, fcntl) a
+// process in the tree waits for. In /proc/locks a waiter's line carries "->" and the
+// same lock number as its holder's.
+func lockHolders(tree map[int]bool) []int {
+	data, err := os.ReadFile("/proc/locks")
+	if err != nil {
+		return nil
+	}
+	holder := map[string]int{}
+	var waits []string
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		switch {
+		case len(f) > 5 && f[1] == "->":
+			if pid, _ := strconv.Atoi(f[5]); tree[pid] {
+				waits = append(waits, f[0])
+			}
+		case len(f) > 4:
+			if pid, _ := strconv.Atoi(f[4]); pid > 0 {
+				holder[f[0]] = pid
+			}
+		}
+	}
+	var out []int
+	for _, lock := range waits {
+		if pid := holder[lock]; pid > 0 && !tree[pid] && !slices.Contains(out, pid) {
+			out = append(out, pid)
+		}
+	}
+	return out
+}
+
+func (a *agent) wakeForBgJob(job *backgroundJob) {
+	time.Sleep(job.wakeAfter)
+	a.bgMu.Lock()
+	_, tracked := a.bgJobs[job.id]
+	a.bgMu.Unlock()
+	if !tracked {
+		return
+	}
+	sess := a.getSession(job.sid)
+	if sess == nil {
+		return
+	}
+	age := humanDuration(time.Since(job.started).Milliseconds())
+	sess.addBgNote(bgNote{
+		job:  job.id,
+		line: fmt.Sprintf("background job %d `%s` still running after %s, as asked", job.id, truncate(job.cmdStr, 80), age),
+		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` is still running after %s; this is the wake_after you asked for, not its exit. It is reported again when it exits. Full log: %s. Last output:]\n\n%s",
+			job.id, job.cmdStr, age, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
+	})
+	a.deliverBgNotesWhenIdle(sess)
+}
+
+// deliverBgNotesWhenIdle never interrupts a turn: a running one takes the queue
+// between rounds and drains it at its end; the retry covers a turn past its drain,
+// or stopped before it, that still holds the lock.
+func (a *agent) deliverBgNotesWhenIdle(sess *Session) {
+	for sess.hasPending() {
+		// After a Stop, no turn starts on its own: the note rides the next prompt.
+		if sess.stoppedIdle() {
+			a.say(context.Background(), sess.ID, "\n🔔 a background job reported; it reaches the model with your next message.\n")
+			return
+		}
+		ctx, release, ok := a.holdTurn(context.Background(), sess, false)
+		if !ok {
+			time.Sleep(bgWakeRetry)
+			continue
+		}
+		a.drainSteer(ctx, sess)
+		release()
+		return
+	}
 }

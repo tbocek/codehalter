@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,98 +16,70 @@ import (
 	"time"
 )
 
-func TestTrimJSON(t *testing.T) {
-	cases := []struct {
-		name string
-		in   string
-		want string
+// Only a `purpose = "summary"` entry takes background work off llm[0]. Slot is the
+// display index: background work on a 2-slot llm[0] shows as llm[1].
+func TestConnForBackgroundLLM(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		llm        []LLMConnection
+		saturate   int // an entry whose every slot is taken; 0 for none
+		wantServer string
+		wantSlot   int
+		wantOnMain bool
 	}{
-		{name: "plain", in: `{"ok":true}`, want: `{"ok":true}`},
-		{name: "leading whitespace", in: "  \n{\"ok\":true}\n  ", want: `{"ok":true}`},
-		{name: "json fence", in: "```json\n{\"ok\":true}\n```", want: `{"ok":true}`},
-		{name: "bare fence", in: "```\n{\"ok\":true}\n```", want: `{"ok":true}`},
-		{name: "prose prefix", in: "Sure, here's the JSON:\n{\"ok\":true}", want: `{"ok":true}`},
-		{name: "prose suffix", in: "{\"ok\":true}\nLet me know if you need more.", want: `{"ok":true}`},
-		{name: "prose both sides", in: "Here you go: {\"ok\":true} — that's it!", want: `{"ok":true}`},
-		{name: "nested", in: "noise {\"a\":{\"b\":1}} noise", want: `{"a":{"b":1}}`},
-		{name: "brace in string", in: `{"s":"} not the end"}`, want: `{"s":"} not the end"}`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := trimJSON(tc.in); got != tc.want {
-				t.Errorf("got %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestBackgroundSlotLabel pins the display-slot routing AND the onMain flag
-// that switches background prompts to prefix-extension mode: the foreground
-// turn reads llm[0]; background work on a single [[llm]] entry falls back to
-// llm[0] (onMain=true — its KV holds the conversation, so extend it), labelled
-// llm[1] for display when parallel >= 2; an entry marked `purpose = "summary"`
-// routes background to llm[1] proper (onMain=false — fresh prompt, no cache to
-// protect there). An unmarked extra entry is a subagent fan-out target only and
-// must NOT quietly absorb the summariser.
-func TestBackgroundSlotLabel(t *testing.T) {
-	// Single entry, parallel=2 → foreground llm[0], background llm[1] (same conn).
-	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2)}}}}
-	a.buildConnSems()
-	if fg := a.settings.MainLLM("execute"); fg == nil || fg.Slot != 0 {
-		t.Fatalf("MainLLM.Slot = %v, want 0", fg)
-	}
-	bg, onMain := a.connForBackgroundLLM()
-	if bg == nil || bg.Slot != 1 || bg.Server != "u" || bg.Model != "m" || !onMain {
-		t.Fatalf("connForBackgroundLLM = %+v onMain=%v, want Slot 1 on u/m, onMain", bg, onMain)
-	}
-
-	// Single entry, parallel=1 → no second slot to label; background stays llm[0].
-	a1 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(1)}}}}
-	a1.buildConnSems()
-	if bg, onMain := a1.connForBackgroundLLM(); bg == nil || bg.Slot != 0 || !onMain {
-		t.Fatalf("single-slot connForBackgroundLLM = %+v onMain=%v, want Slot 0, onMain", bg, onMain)
-	}
-
-	// Two entries, neither designated → the extra is a fan-out target only, so
-	// background stays on llm[0] where it can extend the foreground prefix.
-	a2 := &agent{settings: Settings{LLM: []LLMConnection{
-		{Server: "u0", Model: "m0", Parallel: ptr(1)},
-		{Server: "u1", Model: "m1", Parallel: ptr(1)},
-	}}}
-	a2.buildConnSems()
-	if bg, onMain := a2.connForBackgroundLLM(); bg == nil || bg.Server != "u0" || !onMain {
-		t.Fatalf("undesignated extra entry = %+v onMain=%v, want u0 onMain — it must not absorb the summariser", bg, onMain)
-	}
-
-	// Third entry designated → background routes there, past the undesignated one.
-	a3 := &agent{settings: Settings{LLM: []LLMConnection{
-		{Server: "u0", Model: "m0", Parallel: ptr(1)},
-		{Server: "u1", Model: "m1", Parallel: ptr(1)},
-		{Server: "u2", Model: "m2", Parallel: ptr(1), Purpose: "summary"},
-	}}}
-	a3.buildConnSems()
-	if bg, onMain := a3.connForBackgroundLLM(); bg == nil || bg.Slot != 2 || bg.Server != "u2" || onMain {
-		t.Fatalf("designated connForBackgroundLLM = %+v onMain=%v, want Slot 2 on u2, NOT onMain", bg, onMain)
-	}
-
-	// Designated but saturated → fall back to llm[0] rather than queue behind it.
-	a3.connSems[2] <- struct{}{}
-	if bg, onMain := a3.connForBackgroundLLM(); bg == nil || bg.Server != "u0" || !onMain {
-		t.Fatalf("saturated summary conn = %+v onMain=%v, want u0 onMain", bg, onMain)
-	}
-
-	// purpose on llm[0] is the same as no purpose: the fallback already lands there.
-	a4 := &agent{settings: Settings{LLM: []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2), Purpose: "summary"}}}}
-	a4.buildConnSems()
-	if bg, onMain := a4.connForBackgroundLLM(); bg == nil || bg.Slot != 1 || !onMain {
-		t.Fatalf("purpose on llm[0] = %+v onMain=%v, want Slot 1 onMain", bg, onMain)
+		{
+			name:       "two slots on llm[0]",
+			llm:        []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2)}},
+			wantServer: "u", wantSlot: 1, wantOnMain: true,
+		},
+		{
+			name:       "one slot on llm[0]",
+			llm:        []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(1)}},
+			wantServer: "u", wantSlot: 0, wantOnMain: true,
+		},
+		{
+			name:       "an undesignated extra entry does not absorb the summariser",
+			llm:        []LLMConnection{{Server: "u0", Model: "m0", Parallel: ptr(1)}, {Server: "u1", Model: "m1", Parallel: ptr(1)}},
+			wantServer: "u0", wantSlot: 0, wantOnMain: true,
+		},
+		{
+			name: "the designated summariser",
+			llm: []LLMConnection{
+				{Server: "u0", Model: "m0", Parallel: ptr(1)},
+				{Server: "u1", Model: "m1", Parallel: ptr(1)},
+				{Server: "u2", Model: "m2", Parallel: ptr(1), Purpose: "summary"},
+			},
+			wantServer: "u2", wantSlot: 2, wantOnMain: false,
+		},
+		{
+			name: "a saturated summariser falls back rather than queue",
+			llm: []LLMConnection{
+				{Server: "u0", Model: "m0", Parallel: ptr(1)},
+				{Server: "u2", Model: "m2", Parallel: ptr(1), Purpose: "summary"},
+			},
+			saturate:   1,
+			wantServer: "u0", wantSlot: 0, wantOnMain: true,
+		},
+		{
+			name:       "purpose on llm[0] is no purpose",
+			llm:        []LLMConnection{{Server: "u", Model: "m", Parallel: ptr(2), Purpose: "summary"}},
+			wantServer: "u", wantSlot: 1, wantOnMain: true,
+		},
+	} {
+		a := &agent{settings: Settings{LLM: c.llm}}
+		a.buildConnSems()
+		if c.saturate > 0 {
+			a.connSems[c.saturate] <- struct{}{}
+		}
+		bg, onMain := a.connForBackgroundLLM()
+		if bg == nil || bg.Server != c.wantServer || bg.Slot != c.wantSlot || onMain != c.wantOnMain {
+			t.Errorf("%s: got %+v onMain=%v, want %s slot %d onMain=%v", c.name, bg, onMain, c.wantServer, c.wantSlot, c.wantOnMain)
+		}
 	}
 }
 
-// TestBuildConnSemsIdempotent pins the fix for the connSems release deadlock: an
-// unchanged settings reload must NOT swap the slot channels, or an in-flight
-// llmStream (which captured the old channel at acquire) would release into a new
-// empty channel and block forever. A real cap change DOES rebuild.
+// An in-flight llmStream releases on the channel it acquired, so an unchanged
+// reload must not swap it.
 func TestBuildConnSemsIdempotent(t *testing.T) {
 	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: "s", Model: "m"}}}}
 	a.buildConnSems()
@@ -114,10 +87,9 @@ func TestBuildConnSemsIdempotent(t *testing.T) {
 
 	a.buildConnSems() // same shape → must reuse the same channel
 	if a.connSems[0] != first {
-		t.Fatal("buildConnSems swapped the channel on an unchanged reload — would orphan in-flight permits")
+		t.Fatal("buildConnSems swapped the channel on an unchanged reload: would orphan in-flight permits")
 	}
 
-	// A cap change rebuilds.
 	v := cap(first) + 3
 	a.settings.LLM[0].Parallel = &v
 	a.buildConnSems()
@@ -126,14 +98,9 @@ func TestBuildConnSemsIdempotent(t *testing.T) {
 	}
 }
 
-// TestCfgConcurrentReloadAndRead exercises the cfgMu guard: a foreground "prepare"
-// reassigns a.settings + rebuilds a.connSems while background goroutines resolve
-// connections through connForBackgroundLLM / connForSession (as the summariser and
-// git-commit drafter do). Before cfgMu these raced the settings struct and the
-// connSems slice header; the test is meaningful under -race, where an
-// unsynchronised access on either side reports a failure.
+// Only meaningful under -race.
 func TestCfgConcurrentReloadAndRead(t *testing.T) {
-	a, s := newTestAgent(t)
+	a, _ := newTestAgent(t)
 	reload := func(p int) {
 		a.cfgMu.Lock()
 		a.settings = Settings{LLM: []LLMConnection{
@@ -171,7 +138,7 @@ func TestCfgConcurrentReloadAndRead(t *testing.T) {
 					return
 				default:
 					_, _ = a.connForBackgroundLLM()
-					_ = a.connForSession(context.Background(), s.ID, "execute")
+					_ = a.connFor("execute")
 				}
 			}
 		}()
@@ -182,78 +149,85 @@ func TestCfgConcurrentReloadAndRead(t *testing.T) {
 	wg.Wait()
 }
 
+// A 400 is a full context only when the body says so.
 func TestIsContextFull(t *testing.T) {
-	cases := []struct {
+	for _, tc := range []struct {
 		name string
 		err  error
 		want bool
 	}{
-		{"400 reject", &llmHTTPError{Status: 400}, true},
-		{"context ceiling", fmt.Errorf("ceiling: %w", errContextCeiling), true},
-		{"500 error", &llmHTTPError{Status: 500}, false},
-		{"plain error", errors.New("boom"), false},
+		{"llama.cpp overflow", &llmHTTPError{Status: 400, Body: "request (262314 tokens) exceeds the available context size (262144 tokens), try increasing it"}, true},
+		{"llama.cpp structured type", &llmHTTPError{Status: 400, Type: "exceed_context_size_error", Body: "n/a"}, true},
+		{"halogen: prompt + max_tokens over the window", &llmHTTPError{Status: 400, Body: "max_tokens 32768 does not fit: prompt is 255003 tokens and the context is 262144, leaving room for 7141"}, true},
+		{"vLLM / OpenAI wording", &llmHTTPError{Status: 400, Body: "This model's maximum context length is 8192 tokens. However, you requested 9000 tokens"}, true},
+		{"vLLM 0.20 wording", &llmHTTPError{Status: 400, Body: "This model's maximum context length is 128000 tokens. However, you requested 65535 output tokens and your prompt contains at least 62466 input tokens, for a total of at least 128001 tokens."}, true},
+		{"vLLM: a budget over the whole window", &llmHTTPError{Status: 400, Body: "max_tokens=300000 cannot be greater than max_total_tokens=262144. Please request fewer output tokens."}, false},
+		{"halogen 0.18.4: prompt over the window", &llmHTTPError{Status: 400, Body: "the prompt does not fit: it is 270000 tokens"}, true},
+		{"halogen: a budget over its cap", &llmHTTPError{Status: 400, Body: "max_tokens 131072 exceeds this server's cap of 65536"}, false},
+		{"SGLang input", &llmHTTPError{Status: 400, Body: "The input (270000 tokens) is longer than the model's context length (262144 tokens)."}, true},
+		{"SGLang input + completion", &llmHTTPError{Status: 400, Body: "Requested token count exceeds the model's maximum context length of 262144 tokens. You requested a total of 270000 tokens"}, true},
+		{"TGI total", &llmHTTPError{Status: 422, Body: "Input validation error: `inputs` tokens + `max_new_tokens` must be <= 8192. Given: 8000 `inputs` tokens and 1024 `max_new_tokens`"}, true},
+		{"TGI input", &llmHTTPError{Status: 422, Body: "Input validation error: `inputs` must have less than 8192 tokens. Given: 9000"}, true},
+		{"422 for something else", &llmHTTPError{Status: 422, Body: "Input validation error: `temperature` must be strictly positive"}, false},
+		{"413", &llmHTTPError{Status: 413, Body: "payload too large"}, true},
+		{"ceiling truncation", errContextCeiling, true},
+		{"llama.cpp cannot continue", &llmHTTPError{Status: 400, Body: "Cannot continue an assistant message that contains tool calls."}, false},
+		{"halogen prefill shape", &llmHTTPError{Status: 400, Body: "continue_final_message cannot be combined with a forced tool choice: one resumes the assistant turn already in the history, the other starts a new call"}, false},
+		{"500 mentioning context", &llmHTTPError{Status: 500, Body: "context size"}, false},
+		{"bare 400, no reason given", &llmHTTPError{Status: 400}, false},
+		{"500 error", &llmHTTPError{Status: 500, Body: "boom"}, false},
+		{"wrapped ceiling", fmt.Errorf("ceiling: %w", errContextCeiling), true},
+		{"transport", errors.New("dial tcp: connection refused"), false},
 		{"nil", nil, false},
-	}
-	for _, c := range cases {
-		if got := isContextFull(c.err); got != c.want {
-			t.Errorf("%s: isContextFull=%v, want %v", c.name, got, c.want)
+		// Halogen refuses a request over its picture limit in the stream.
+		{"halogen picture limit", &llmStreamError{Msg: "the engine refused this request: IMG count outside 0..64"}, true},
+		{"another in-stream refusal", &llmStreamError{Msg: "the engine refused this request: bad grammar"}, false},
+	} {
+		if got := isContextFull(tc.err); got != tc.want {
+			t.Errorf("%s: isContextFull = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
 
-// TestFinishLengthClassification pins the finish=length split: truncation BELOW
-// the cap is the n_ctx ceiling (fold + retry); reasoning-only AT the cap is a
-// <think> stall (thinking-off retry); content AT the cap is a genuine, not-
-// recoverable verbose/looping cap.
+// BELOW the cap is the n_ctx ceiling; AT the cap, reasoning or content, is a cap hit.
 func TestFinishLengthClassification(t *testing.T) {
 	run := func(sse string) error {
 		t.Helper()
 		mock := newMockLLM(t, sse)
 		defer mock.Close()
-		a, s := newTestAgent(t)
+		a, _ := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-		a.mainSlotTokens = 85248
-		conn := a.connForSession(context.Background(), s.ID, "thinking")
+		a.mainSlotTokens.Store(85248)
+		conn := a.connFor("thinking")
 		if conn == nil {
-			t.Fatalf("connForSession returned nil")
+			t.Fatalf("connFor returned nil")
 		}
-		// sid="" disables session logging; the finish=length classification works
-		// off the locally-parsed usage tokens regardless.
 		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil)
 		return err
 	}
 
-	// Reasoning truncated BELOW the cap → n_ctx ceiling (recover by folding).
-	if err := run(sseTruncated("thinking", 82393, 2854)); err == nil || !isContextFull(err) || isStuckThinking(err) {
+	var ce *capHitError
+	if err := run(sseTruncated("thinking", 82393, 2854)); err == nil || !isContextFull(err) || errors.As(err, &ce) {
 		t.Errorf("below-cap truncation should be a context ceiling, got: %v", err)
 	}
-	// completion_tokens omitted (0) but prompt+max_tokens overruns n_ctx (85248)
-	// → still the ceiling, detected from prompt size, not the missing completion.
+	// completion_tokens omitted, but prompt+max_tokens overruns n_ctx: still the ceiling.
 	if err := run(sseTruncated("thinking", 80000, 0)); err == nil || !isContextFull(err) {
 		t.Errorf("no-room truncation with unreported completion should be a ceiling, got: %v", err)
 	}
-	// Reasoning-only AT the cap → stuck in <think> (recover by a thinking-off retry).
-	if err := run(sseTruncated("thinking", 1000, defaultMaxTokens)); err == nil || !isStuckThinking(err) || isContextFull(err) {
-		t.Errorf("reasoning-only cap should be a stuck-thinking stall, got: %v", err)
-	}
-	// Message CONTENT at the cap → a typed cap hit carrying the request's
-	// max_tokens, so the tool loop's cap ladder (be-concise nudge, then a
-	// doubled cap) can recover it.
-	err := run(sseTruncatedContent("verbose output", 1000, defaultMaxTokens))
-	if err == nil || isStuckThinking(err) || isContextFull(err) {
-		t.Errorf("content at the cap should be a cap hit, got: %v", err)
-	}
-	if ce := asCapHit(err); ce == nil {
-		t.Errorf("content at the cap should classify as capHitError, got: %v", err)
-	} else if ce.Cap != defaultMaxTokens {
-		t.Errorf("capHitError.Cap = %d, want %d", ce.Cap, defaultMaxTokens)
+	for name, sse := range map[string]string{
+		"reasoning only": sseTruncated("thinking", 1000, defaultMaxTokens),
+		"content":        sseTruncatedContent("verbose output", 1000, defaultMaxTokens),
+	} {
+		err := run(sse)
+		if !errors.As(err, &ce) || isContextFull(err) {
+			t.Errorf("%s at the cap should be a cap hit, got: %v", name, err)
+		} else if ce.Cap != defaultMaxTokens {
+			t.Errorf("%s: capHitError.Cap = %d, want %d", name, ce.Cap, defaultMaxTokens)
+		}
 	}
 }
 
-// TestReasoningArrivesUnderEitherSpelling pins the two names the chain-of-thought
-// channel travels under. llama.cpp sends the OpenAI-compatible reasoning_content;
-// the user's vLLM-backed llmhub sends reasoning, and reading only the former
-// silently dropped every thinking token that backend produced.
+// llama.cpp sends reasoning_content, vLLM sends reasoning.
 func TestReasoningArrivesUnderEitherSpelling(t *testing.T) {
 	sse := func(field string) string {
 		c, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
@@ -263,12 +237,12 @@ func TestReasoningArrivesUnderEitherSpelling(t *testing.T) {
 	}
 	for _, field := range []string{"reasoning_content", "reasoning"} {
 		mock := newMockLLM(t, sse(field))
-		a, s := newTestAgent(t)
+		a, _ := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-		conn := a.connForSession(context.Background(), s.ID, "thinking")
+		conn := a.connFor("thinking")
 		if conn == nil {
 			mock.Close()
-			t.Fatalf("%s: connForSession returned nil", field)
+			t.Fatalf("%s: connFor returned nil", field)
 		}
 		var streamed strings.Builder
 		_, _, reasoning, err := a.llmStream(context.Background(), "", conn,
@@ -287,9 +261,6 @@ func TestReasoningArrivesUnderEitherSpelling(t *testing.T) {
 	}
 }
 
-// TestIsTransientStreamError pins the mid-response-drop detector that drives the
-// retry: EOF / reset / network errors are transient (retry), while a deliberate
-// cancel, a clean LLM error, and nil are not.
 func TestIsTransientStreamError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -315,11 +286,6 @@ func TestIsTransientStreamError(t *testing.T) {
 	}
 }
 
-// TestThinkingOn pins the guard deciding whether a <think> stall is recoverable:
-// thinking counts as ON unless the request already suppressed it, so the retry
-// can't loop. Two ways it can be suppressed: the user's own
-// chat_template_kwargs.enable_thinking=false, or codehalter's own retry
-// continuing a prefilled closed <think></think> (continue_final_message).
 func TestThinkingOn(t *testing.T) {
 	cases := []struct {
 		name string
@@ -343,48 +309,7 @@ func TestThinkingOn(t *testing.T) {
 	}
 }
 
-// TestWithThinkingDisabled pins the retry conn copy: it arms the prefill and
-// leaves ExtraBody alone, so the two calls still render the same way. Routing
-// fields survive and the original is untouched.
-//
-// ExtraBody is what renderKey fingerprints. If the retry wrote
-// chat_template_kwargs (as it once did), the server would re-render the whole
-// conversation and hand back cached=0; the append leaves every earlier token in
-// place. Measured against ai.jos.li on the same 13,972-token prompt: kwargs
-// cached=0, prefill cached=13,968 of 13,978, reasoning suppressed either way.
-func TestWithThinkingDisabled(t *testing.T) {
-	orig := &LLMConnection{Server: "s", Model: "m", Slot: 2, ExtraBody: map[string]any{
-		"temperature":          0.7,
-		"chat_template_kwargs": map[string]any{"preserve_thinking": true},
-	}}
-	off := orig.withThinkingDisabled()
-
-	if off.Server != "s" || off.Model != "m" || off.Slot != 2 {
-		t.Errorf("routing fields changed: %+v", off)
-	}
-	if !off.noThinkPrefill {
-		t.Error("withThinkingDisabled did not arm the prefill")
-	}
-	if renderKey(off.ExtraBody) != renderKey(orig.ExtraBody) {
-		t.Errorf("the retry changed the rendering: %s vs %s",
-			renderKey(off.ExtraBody), renderKey(orig.ExtraBody))
-	}
-	if _, set := off.ExtraBody["chat_template_kwargs"].(map[string]any)["enable_thinking"]; set {
-		t.Errorf("the retry still writes enable_thinking: %+v", off.ExtraBody)
-	}
-	if off.ExtraBody["temperature"] != 0.7 {
-		t.Errorf("sibling params dropped: %+v", off.ExtraBody)
-	}
-	if orig.noThinkPrefill {
-		t.Error("withThinkingDisabled mutated the original conn")
-	}
-}
-
-// TestPrefillIsAppendedNotRendered pins what goes on the wire for the stall
-// retry: the closed think block arrives as a trailing assistant message the
-// server is told to continue, the earlier messages are untouched (that is the
-// whole point: an append keeps the prefix cache, a re-render does not), and the
-// caller's slice is not mutated.
+// Earlier messages and the caller's slice stay untouched: an append keeps the prefix cache.
 func TestPrefillIsAppendedNotRendered(t *testing.T) {
 	mock := newMockLLM(t, sseText("done"))
 	defer mock.Close()
@@ -420,79 +345,58 @@ func TestPrefillIsAppendedNotRendered(t *testing.T) {
 	}
 }
 
-// TestWithMaxTokens pins the prewarm conn copy: max_tokens is forced in a
-// copied ExtraBody (overriding the role default, since llmStream copies
-// ExtraBody into the request first), sibling params and routing fields
-// survive, and the original conn keeps its own cap.
-func TestWithMaxTokens(t *testing.T) {
-	orig := &LLMConnection{Server: "s", Model: "m", Slot: 1, ExtraBody: map[string]any{
-		"max_tokens":  8192,
-		"temperature": 0.7,
-	}}
-	capped := orig.withMaxTokens(1)
-
-	if capped.Server != "s" || capped.Model != "m" || capped.Slot != 1 {
-		t.Errorf("routing fields changed: %+v", capped)
+// The turn stats count only evaluated prompt tokens; a warm call counts nothing.
+func TestLLMStreamRecordsTurnStats(t *testing.T) {
+	frames := func(extra map[string]any) string {
+		text, _ := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"content": "ok"}}}})
+		tail := map[string]any{"choices": []any{}}
+		maps.Copy(tail, extra)
+		stats, _ := json.Marshal(tail)
+		return fmt.Sprintf("data: %s\n\ndata: %s\n\ndata: [DONE]\n\n", text, stats)
 	}
-	if capped.ExtraBody["max_tokens"] != 1 || capped.ExtraBody["temperature"] != 0.7 {
-		t.Errorf("ExtraBody: got %+v, want max_tokens=1 + temperature kept", capped.ExtraBody)
+	usage := func(cached int) map[string]any {
+		u := map[string]any{"prompt_tokens": 1000, "completion_tokens": 20}
+		if cached >= 0 {
+			u["prompt_tokens_details"] = map[string]any{"cached_tokens": cached}
+		}
+		return map[string]any{"usage": u}
 	}
-	if orig.ExtraBody["max_tokens"] != 8192 {
-		t.Error("withMaxTokens mutated the original conn")
+	for _, c := range []struct {
+		name           string
+		sse            string
+		warm           bool
+		wantEvaluated  int
+		wantCompletion int
+		wantCacheSplit bool
+	}{
+		{"usage cached_tokens: evaluated is the rest", frames(usage(900)), false, 100, 20, true},
+		{"timings win over usage", frames(map[string]any{
+			"usage":   usage(900)["usage"],
+			"timings": map[string]any{"prompt_n": 50, "cache_n": 950},
+		}), false, 50, 20, true},
+		{"no cache split reported", frames(usage(-1)), false, 0, 20, false},
+		{"a warm call counts nothing", frames(usage(900)), true, 0, 0, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			mock := newMockLLM(t, c.sse)
+			defer mock.Close()
+			a, s := newTestAgent(t)
+			s.startTurn(time.Now())
+			conn := mock.conn("execute")
+			conn.noTurnStats = c.warm
+			if _, _, _, err := a.llmStream(context.Background(), s.ID, conn, []llmMessage{{Role: "user", Content: "hi"}}, nil, nil, nil, nil); err != nil {
+				t.Fatalf("llmStream: %v", err)
+			}
+			r := s.turnStats()
+			if r.evaluatedPrompt != c.wantEvaluated || r.completion != c.wantCompletion || r.haveServerCache != c.wantCacheSplit {
+				t.Errorf("evaluated=%d completion=%d cacheSplit=%v, want %d %d %v",
+					r.evaluatedPrompt, r.completion, r.haveServerCache, c.wantEvaluated, c.wantCompletion, c.wantCacheSplit)
+			}
+		})
 	}
 }
 
-// TestStreamRulesOnlyFireWhenArmed pins the gate that keeps stream rules from
-// breaking the callers that can't recover from them. llmStream is shared by the
-// tool loop (which has a retry ladder) and by the background summariser and
-// prewarm (which do not, and which pass the foreground's full tools array for
-// prefix-cache reasons). Only an explicitly armed connection may abort.
-func TestStreamRulesOnlyFireWhenArmed(t *testing.T) {
-	run := func(arm bool) error {
-		t.Helper()
-		mock := newMockLLM(t, sseText("here you go\n<tool_call>{\"name\":\"read_file\"}"))
-		defer mock.Close()
-		a, s := newTestAgent(t)
-		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
-		a.streamRules = compileStreamRules(defaultStreamRules)
-		conn := a.connForSession(context.Background(), s.ID, "execute")
-		if conn == nil {
-			t.Fatal("connForSession returned nil")
-		}
-		if arm {
-			conn = conn.forToolLoop()
-		}
-		_, _, _, err := a.llmStream(context.Background(), "", conn, []llmMessage{{Role: "user", Content: "go"}}, llmAllToolDefinitions(), nil, nil, nil)
-		return err
-	}
-
-	err := run(true)
-	sr := asStreamRule(err)
-	if sr == nil {
-		t.Fatalf("armed conn: err = %v, want a streamRuleError", err)
-	}
-	if sr.Rule != "tool_call_as_text" {
-		t.Errorf("armed conn: fired %q, want tool_call_as_text", sr.Rule)
-	}
-	if sr.Reminder == "" {
-		t.Error("armed conn: error carries no reminder for the retry")
-	}
-
-	if err := run(false); err != nil {
-		t.Errorf("unarmed conn: err = %v, want nil (the summariser must not be aborted)", err)
-	}
-}
-
-// TestWarnsWhenServerIgnoresThinkingOff pins the detector for the failure mode
-// that has no error attached to it: an OpenAI-compatible server accepts
-// chat_template_kwargs, drops it, and reasons anyway. The answers stay correct
-// and arrive at half speed, so nothing surfaces: it took a log analysis over an
-// 11.6h session to spot it the first time. Fires once per Server+Model
-// (LoadOrStore), since it is a property of the deployment, not of the call.
-//
-// Only a user who wrote enable_thinking=false into a params table gets this;
-// codehalter never sets it itself (paramsFor), so an unconfigured connection
-// has nothing to be disappointed about.
+// Fires once per Server+Model, and only for a user-set enable_thinking=false.
 func TestWarnsWhenServerIgnoresThinkingOff(t *testing.T) {
 	reasoned, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
 		"delta": map[string]any{"reasoning_content": "still thinking about it"},
@@ -506,9 +410,9 @@ func TestWarnsWhenServerIgnoresThinkingOff(t *testing.T) {
 		a, s := newTestAgent(t)
 		a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m",
 			ParamsExecute: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}}}}
-		conn := a.connForSession(context.Background(), s.ID, role)
+		conn := a.connFor(role)
 		if conn == nil {
-			t.Fatalf("connForSession(%s) returned nil", role)
+			t.Fatalf("connFor(%s) returned nil", role)
 		}
 		if _, _, _, err := a.llmStream(context.Background(), s.ID, conn,
 			[]llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil); err != nil {
@@ -526,17 +430,11 @@ func TestWarnsWhenServerIgnoresThinkingOff(t *testing.T) {
 	if warned(t, "thinking", sseReasoned) {
 		t.Error("warned about reasoning on the role that requested it")
 	}
-	// execute with an obedient server: nothing to say.
 	if warned(t, "execute", sseText("done")) {
 		t.Error("warned although the server produced no reasoning")
 	}
 }
 
-// TestRejectedChatTemplateKwargsNamesTheSetting pins that a backend refusing the
-// field (the OpenAI API answers 400 unrecognized_keys) produces an error naming
-// where it came from. chat_template_kwargs is a llama.cpp / vLLM extension that
-// only reaches the wire from a params_* table, quite possibly written months
-// earlier against a different server.
 func TestRejectedChatTemplateKwargsNamesTheSetting(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"error":{"message":"Unrecognized request argument supplied: chat_template_kwargs"}}`, http.StatusBadRequest)
@@ -546,9 +444,9 @@ func TestRejectedChatTemplateKwargsNamesTheSetting(t *testing.T) {
 	a, s := newTestAgent(t)
 	a.settings = Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "gpt-x",
 		ParamsExecute: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": false}}}}}
-	conn := a.connForSession(context.Background(), s.ID, "execute")
+	conn := a.connFor("execute")
 	if conn == nil {
-		t.Fatal("connForSession returned nil")
+		t.Fatal("connFor returned nil")
 	}
 	_, _, _, err := a.llmStream(context.Background(), s.ID, conn,
 		[]llmMessage{{Role: "user", Content: "go"}}, nil, nil, nil, nil)
@@ -560,26 +458,20 @@ func TestRejectedChatTemplateKwargsNamesTheSetting(t *testing.T) {
 	}
 }
 
-// TestLLMStreamParsesTextAndTools verifies the SSE parser collects streamed
-// text and tool calls correctly from the mock server.
 func TestLLMStreamParsesTextAndTools(t *testing.T) {
-	// Build an SSE body that mixes text + a tool call, split across chunks.
 	var b strings.Builder
-	// Chunk 1: text delta.
 	c1, _ := json.Marshal(map[string]any{
 		"choices": []map[string]any{{
 			"delta": map[string]any{"content": "Hello "},
 		}},
 	})
 	fmt.Fprintf(&b, "data: %s\n\n", c1)
-	// Chunk 2: more text.
 	c2, _ := json.Marshal(map[string]any{
 		"choices": []map[string]any{{
 			"delta": map[string]any{"content": "world"},
 		}},
 	})
 	fmt.Fprintf(&b, "data: %s\n\n", c2)
-	// Chunk 3: tool call start (has id).
 	c3, _ := json.Marshal(map[string]any{
 		"choices": []map[string]any{{
 			"delta": map[string]any{
@@ -592,7 +484,7 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 		}},
 	})
 	fmt.Fprintf(&b, "data: %s\n\n", c3)
-	// Chunk 4: tool args continuation (no id → appends to last call).
+	// No id: appends to the last call.
 	c4, _ := json.Marshal(map[string]any{
 		"choices": []map[string]any{{
 			"delta": map[string]any{
@@ -640,13 +532,7 @@ func TestLLMStreamParsesTextAndTools(t *testing.T) {
 	}
 }
 
-// TestLLMStreamSurfacesInStreamError pins the fix for the swallowed gateway
-// error. Some servers (llama.cpp, llama-swap, the llmhub gateway) return HTTP
-// 200 and put the failure in an {"error":…} SSE chunk with empty choices — e.g.
-// when the prompt exceeds the model's real context length. That chunk used to
-// be skipped at the empty-choices guard, so the whole call looked like a silent
-// "(empty response)" and surfaced three layers up as "plan not valid JSON:
-// unexpected end of JSON input". llmStream must now raise the server's message.
+// An {"error":…} chunk under HTTP 200 must raise the server's message, not read as empty.
 func TestLLMStreamSurfacesInStreamError(t *testing.T) {
 	cases := []struct {
 		name string
@@ -684,5 +570,259 @@ func TestLLMStreamSurfacesInStreamError(t *testing.T) {
 				t.Errorf("error should be framed as a mid-stream failure, got: %v", err)
 			}
 		})
+	}
+}
+
+// Unreachable at the probe, or struck out until summaryCooldown: back to llm[0].
+func TestBackgroundSkipsDeadSummariser(t *testing.T) {
+	newAgent := func() *agent {
+		a := &agent{settings: Settings{LLM: []LLMConnection{
+			{Server: "u0", Model: "m0", Parallel: ptr(1)},
+			{Server: "sum", Model: "ms", Parallel: ptr(1), Purpose: "summary"},
+		}}}
+		a.buildConnSems()
+		return a
+	}
+	wantSummariser := func(t *testing.T, a *agent, why string) {
+		t.Helper()
+		if bg, onMain := a.connForBackgroundLLM(); bg == nil || bg.Server != "sum" || onMain {
+			t.Fatalf("%s: got %+v onMain=%v, want the summariser at sum", why, bg, onMain)
+		}
+	}
+	wantMain := func(t *testing.T, a *agent, why string) {
+		t.Helper()
+		if bg, onMain := a.connForBackgroundLLM(); bg == nil || bg.Server != "u0" || !onMain {
+			t.Fatalf("%s: got %+v onMain=%v, want llm[0] at u0 with onMain", why, bg, onMain)
+		}
+	}
+
+	// No probe result yet (nil map) is not evidence of a dead server.
+	wantSummariser(t, newAgent(), "unprobed")
+
+	a := newAgent()
+	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: true}}
+	wantSummariser(t, a, "probe says reachable")
+
+	a = newAgent()
+	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: false}}
+	wantMain(t, a, "probe says unreachable")
+
+	// A probe result for some OTHER endpoint must not take this one out.
+	a = newAgent()
+	a.connProbe = map[string]probeResult{"elsewhere\x00mx": {Reachable: false}}
+	wantSummariser(t, a, "unrelated unreachable endpoint")
+
+	a = newAgent()
+	a.summaryStrikes.Store(summaryMaxStrikes)
+	a.summaryStruckAt.Store(time.Now().UnixNano())
+	wantMain(t, a, "struck out")
+
+	// Struck out is not forever: after the cooldown it gets another call.
+	a = newAgent()
+	a.summaryStrikes.Store(summaryMaxStrikes)
+	a.summaryStruckAt.Store(time.Now().Add(-summaryCooldown - time.Second).UnixNano())
+	wantSummariser(t, a, "cooldown over")
+
+	a = newAgent()
+	a.summaryStrikes.Store(summaryMaxStrikes - 1)
+	wantSummariser(t, a, "one strike short")
+}
+
+func TestKeepWarmRefreshesUntilStopped(t *testing.T) {
+	mock := newMockLLM(t, sseText("."), sseText("."), sseText("."), sseText("."))
+	defer mock.Close()
+
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}, KeepWarm: "20ms"}
+	msgs := []llmMessage{{Role: "user", Content: "the conversation so far"}}
+
+	stop := a.keepWarm(s, mock.conn("execute"), func() []llmMessage { return msgs })
+	deadline := time.Now().Add(2 * time.Second)
+	for mock.callCount() == 0 {
+		if time.Now().After(deadline) {
+			stop()
+			t.Fatal("keepWarm never refreshed the prefix")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	stop()
+
+	// More than one token costs generation; anything but the conversation seeds another prefix.
+	body := mock.request(0)
+	if body["max_tokens"] != float64(1) {
+		t.Errorf("refresh max_tokens = %v, want 1", body["max_tokens"])
+	}
+	sent, _ := body["messages"].([]any)
+	if len(sent) != 1 {
+		t.Fatalf("refresh sent %d messages, want the conversation", len(sent))
+	}
+	if m, _ := sent[0].(map[string]any); m["content"] != "the conversation so far" {
+		t.Errorf("refresh sent %v, want the conversation", m)
+	}
+
+	settled := mock.callCount()
+	time.Sleep(80 * time.Millisecond)
+	if got := mock.callCount(); got != settled {
+		t.Errorf("stop() did not end the refreshes: %d -> %d", settled, got)
+	}
+	// A refresh is not the turn's work, so it must not land in the turn stats.
+	if r := s.turnStats(); r.completion != 0 || r.evaluatedPrompt != 0 {
+		t.Errorf("a refresh was counted against the turn: %+v", r)
+	}
+}
+
+// A hosted endpoint caches on its own and bills per request.
+func TestKeepWarmOff(t *testing.T) {
+	mock := newMockLLM(t, sseText("."))
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}, KeepWarm: "off"}
+	stop := a.keepWarm(s, mock.conn("execute"), func() []llmMessage { return []llmMessage{{Role: "user", Content: "x"}} })
+	defer stop()
+	time.Sleep(60 * time.Millisecond)
+	if mock.callCount() != 0 {
+		t.Errorf("keep_warm=off still called the model %d time(s)", mock.callCount())
+	}
+}
+
+// Halogen: the refused continuation is retried with the forced tool choice alone,
+// and the entry remembers, so a later call that forces nothing uses enable_thinking.
+func TestLLMStreamDropsPrefillWhenRejected(t *testing.T) {
+	var mu sync.Mutex
+	var reqs []map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode: %v", err)
+		}
+		mu.Lock()
+		reqs = append(reqs, body)
+		mu.Unlock()
+		// Like Halogen: the prefill shape is refused every time, not just once.
+		if body["continue_final_message"] == true {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"continue_final_message cannot be combined with a forced tool choice: one resumes the assistant turn already in the history, the other starts a new call","type":"invalid_request_error"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(sseText("ok")))
+	}))
+	defer ts.Close()
+
+	a := &agent{settings: Settings{LLM: []LLMConnection{{Server: ts.URL, Model: "m"}}}}
+	conn := a.settings.ConnAt(0, "execute").withThinkingDisabled().withBody("tool_choice", "required")
+	msgs := []llmMessage{{Role: "user", Content: "go"}}
+	if _, _, _, err := a.llmStream(context.Background(), "", conn, msgs, nil, nil, nil, nil); err != nil {
+		t.Fatalf("llmStream: %v", err)
+	}
+	if len(reqs) != 2 {
+		t.Fatalf("calls = %d, want the rejected one and the retry", len(reqs))
+	}
+	first, retry := reqs[0], reqs[1]
+	if first["continue_final_message"] != true || first["add_generation_prompt"] != false {
+		t.Errorf("first call did not carry the prefill shape: %v", first)
+	}
+	if _, has := retry["continue_final_message"]; has {
+		t.Error("the retry still carried continue_final_message")
+	}
+	if retry["tool_choice"] != "required" {
+		t.Errorf("the retry lost tool_choice: %v", retry["tool_choice"])
+	}
+	if _, has := retry["chat_template_kwargs"]; has {
+		t.Error("the retry added a thinking flag beside a forced choice, a third rendering")
+	}
+	if msgsOut := retry["messages"].([]any); len(msgsOut) != len(msgs) {
+		t.Errorf("the retry still carried the prefill message: %d messages", len(msgsOut))
+	}
+
+	// Every copy must know, even one taken from the original pointer before the 400.
+	for name, c := range map[string]*LLMConnection{"the reused connection": conn, "a fresh copy of the original": conn.withBody("max_tokens", 1)} {
+		before := len(reqs)
+		if _, _, _, err := a.llmStream(context.Background(), "", c, msgs, nil, nil, nil, nil); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(reqs) != before+1 {
+			t.Fatalf("%s: %d requests, want 1 (must skip the prefill without a refusal)", name, len(reqs)-before)
+		}
+		if _, has := reqs[len(reqs)-1]["continue_final_message"]; has {
+			t.Errorf("%s sent the prefill again", name)
+		}
+	}
+
+	// Remembered on the entry: a call that forces nothing now uses the flag.
+	next := a.settings.ConnAt(0, "thinking").withThinkingDisabled()
+	req := buildChatRequest(next, msgs, nil)
+	if _, has := req["continue_final_message"]; has {
+		t.Error("the entry did not remember the rejection")
+	}
+	if kw, _ := req["chat_template_kwargs"].(map[string]any); kw["enable_thinking"] != false {
+		t.Errorf("a call that forces nothing must use enable_thinking=false here, got %v", req["chat_template_kwargs"])
+	}
+	// And thinking ON stays exactly what it was: no flag, no continuation.
+	on := buildChatRequest(a.settings.ConnAt(0, "thinking"), msgs, nil)
+	if _, has := on["chat_template_kwargs"]; has {
+		t.Errorf("a thinking-on call grew a flag: %v", on["chat_template_kwargs"])
+	}
+}
+
+func TestRequestLogDelta(t *testing.T) {
+	first := []byte(`{"max_tokens":8192,"messages":[{"role":"user","content":"hi"}]}`)
+	if got := requestLogDelta(nil, first); got != string(first) {
+		t.Errorf("first request logged as %q", got)
+	}
+	// A new wrapper over the same messages plus one is not a lost prefix.
+	second := []byte(`{"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16384,"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"yo"}]}`)
+	got := requestLogDelta(first, second)
+	if !strings.HasPrefix(got, `{"chat_template_kwargs":{"enable_thinking":false},"max_tokens":16384,`+requestLogSame+"42 of ") ||
+		!strings.HasSuffix(got, `,{"role":"assistant","content":"yo"}]}`) || strings.Contains(got, "ONLY") {
+		t.Errorf("appended request logged as %q", got)
+	}
+	changed := []byte(`{"max_tokens":8192,"messages":[{"role":"system","content":"new"}]}`)
+	if got := requestLogDelta(second, changed); !strings.Contains(got, "ONLY: a change this early") {
+		t.Errorf("an early change was not called out: %q", got)
+	}
+}
+
+// Every foreground call reports its context use and speeds at once: a /spec loop is one
+// turn that runs for hours, and the status line showed a number from before it. A summary
+// runs on its own server and reports nothing.
+func TestEveryCallReportsUsageAndSpeeds(t *testing.T) {
+	a, s, br, _ := elicitingAgent(t)
+	a.mainSlotTokens.Store(262144)
+	a.recordStreamStats(s.ID, "llm[1]", &LLMConnection{Purpose: "summary"}, &streamResult{promptTokens: 9000, completionTokens: 500, evaluatedTokens: 9000, cachedTokens: 0, serverPromptMs: 3000, serverGenMs: 10000})
+	a.recordStreamStats(s.ID, "llm[0]", &LLMConnection{}, &streamResult{promptTokens: 50000, completionTokens: 1020, evaluatedTokens: 1624, cachedTokens: 48376, serverPromptMs: 2000, serverGenMs: 20000})
+	got := make(chan string, 1)
+	go func() {
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			if strings.Contains(line, "usage_update") {
+				got <- line
+				return
+			}
+		}
+	}()
+	select {
+	case line := <-got:
+		var msg struct {
+			Params struct {
+				Update usageUpdate `json:"update"`
+			} `json:"params"`
+		}
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			t.Fatal(err)
+		}
+		u := msg.Params.Update
+		if u.Used != 50000 || u.Size != 262144 || u.Meta == nil || u.Meta.PromptPerSec != 812 || u.Meta.GenPerSec != 51 {
+			t.Errorf("first usage update = %+v %+v, want the foreground call's 50000/262144 at 812 pp/s and 51 tg/s", u, u.Meta)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no usage update")
 	}
 }

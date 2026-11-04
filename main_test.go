@@ -15,20 +15,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
 
-// ptr returns a pointer to v, for struct literals with *int/*bool fields
-// (Settings.Parallel and friends, which distinguish unset from zero).
 func ptr[T any](v T) *T { return &v }
 
-// lineageClock hands out call times one second apart. Most of the lineage
-// tests do not care when their calls happened, but noteCacheLineage records the
-// gap between them now, and feeding it one frozen instant everywhere would
-// leave that arithmetic exercised nowhere. A second is a healthy tool-loop
-// cadence, so every call these tests make reads as "too soon to be an idle
-// eviction" unless a test says otherwise.
+// One second apart: a healthy tool-loop cadence, never read as an idle eviction.
 func lineageClock() func() time.Time {
 	at := time.Date(2026, 8, 21, 22, 0, 0, 0, time.UTC)
 	return func() time.Time {
@@ -37,8 +31,7 @@ func lineageClock() func() time.Time {
 	}
 }
 
-// newTestAgent returns an agent with one session rooted at a fresh tempdir.
-// a.conn is left nil so sendUpdate becomes a no-op (covered by the nil-check).
+// a.conn is left nil, so sendUpdate is a no-op.
 func newTestAgent(t *testing.T) (*agent, *Session) {
 	t.Helper()
 	s, err := newSession(t.TempDir())
@@ -48,10 +41,7 @@ func newTestAgent(t *testing.T) (*agent, *Session) {
 	return &agent{sessions: map[string]*Session{s.ID: s}}, s
 }
 
-// elicitingAgent wires an agent to a pipe-backed connection and advertises
-// form elicitation, so a caller that prefers elicitation (Ask*, the MCP import)
-// takes the elicitation/create path. Returns the peer end for the test to read
-// the request off and answer it.
+// elicitingAgent advertises form elicitation; the test reads and answers on the returned peer end.
 func elicitingAgent(t *testing.T) (*agent, *Session, *bufio.Reader, *os.File) {
 	t.Helper()
 	a, s := newTestAgent(t)
@@ -64,17 +54,37 @@ func elicitingAgent(t *testing.T) (*agent, *Session, *bufio.Reader, *os.File) {
 	return a, s, bufio.NewReader(peerR), peerW
 }
 
-// ---------------------------------------------------------------------------
-// Fake ACP client with terminals
-// ---------------------------------------------------------------------------
+// answerFirstOption stands in for a user who picks every card's first option.
+func answerFirstOption(t *testing.T, a *agent) {
+	t.Helper()
+	agentW, agentR, peerW, peerR := pipePair(t)
+	a.conn = NewAgentSideConnection(a, agentW, agentR)
+	br := bufio.NewReader(peerR)
+	go func() {
+		for {
+			line, err := br.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			var req struct {
+				ID     json.RawMessage `json:"id"`
+				Method string          `json:"method"`
+				Params struct {
+					Options []struct {
+						OptionId string `json:"optionId"`
+					} `json:"options"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(line, &req) != nil || req.Method != "session/request_permission" || len(req.Params.Options) == 0 {
+				continue
+			}
+			fmt.Fprintf(peerW, `{"jsonrpc":"2.0","id":%s,"result":{"outcome":{"outcome":"selected","optionId":%q}}}`+"\n", req.ID, req.Params.Options[0].OptionId)
+		}
+	}()
+}
 
-// terminalHarness wires an agent to a pipe-backed connection, advertises the
-// terminal capability, and serves terminal/* by actually running the command
-// with os/exec. codehalter runs no processes of its own any more (see
-// terminal.go), so without a client that can, nothing in a test executes at all
-// — this stands in for the editor. It also records every method the agent sent
-// and every session/update it emitted, so a test can assert on the wire traffic
-// and on what the tool-call card ended up holding.
+// codehalter runs no processes of its own, so this stands in for the editor: it
+// serves terminal/* with os/exec and records the wire traffic.
 type terminalHarness struct {
 	agent *agent
 	sess  *Session
@@ -86,7 +96,7 @@ type terminalHarness struct {
 	updates []map[string]any
 }
 
-// fakeTerminal is one running command. exit is valid once done is closed.
+// exit is valid once done is closed.
 type fakeTerminal struct {
 	cmd  *exec.Cmd
 	out  bytes.Buffer // guarded by terminalHarness.mu
@@ -94,8 +104,6 @@ type fakeTerminal struct {
 	exit terminalExit
 }
 
-// termWriter funnels a command's output into the harness buffer under the
-// harness lock, so terminal/output can read it while the command is writing.
 type termWriter struct {
 	h *terminalHarness
 	t *fakeTerminal
@@ -147,9 +155,8 @@ func newTerminalHarness(t *testing.T) *terminalHarness {
 			h.mu.Lock()
 			h.methods = append(h.methods, msg.Method)
 			h.mu.Unlock()
-			// Serve off the read loop: terminal/wait_for_exit blocks until the
-			// command finishes, and a later terminal/kill is what finishes some of
-			// them, so handling inline would deadlock the harness against itself.
+			// Off the read loop: wait_for_exit blocks until a later terminal/kill
+			// may finish the command, so inline would deadlock.
 			go func(id json.RawMessage, method string, params json.RawMessage) {
 				body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "result": h.serve(method, params)})
 				if err != nil {
@@ -177,6 +184,8 @@ func (h *terminalHarness) serve(method string, params json.RawMessage) any {
 	case "terminal/create":
 		cmd := exec.Command(p.Command, p.Args...)
 		cmd.Dir = p.Cwd
+		// Own process group, as under a pty: the job wrapper's group kill needs a leader.
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		term := &fakeTerminal{cmd: cmd, done: make(chan struct{})}
 		cmd.Stdout = termWriter{h, term}
 		cmd.Stderr = termWriter{h, term}
@@ -223,8 +232,10 @@ func (h *terminalHarness) serve(method string, params json.RawMessage) any {
 		return term.exit
 
 	case "terminal/kill":
+		// SIGHUP to the leader only, as a pty delivers: the wrapper's trap must take
+		// the group down, or a child holding the pipe blocks cmd.Wait.
 		if term := h.term(p.TerminalId); term != nil && term.cmd.Process != nil {
-			_ = term.cmd.Process.Kill()
+			_ = term.cmd.Process.Signal(syscall.SIGHUP)
 		}
 		return map[string]any{}
 
@@ -244,8 +255,6 @@ func (h *terminalHarness) serve(method string, params json.RawMessage) any {
 	return map[string]any{}
 }
 
-// exitOf converts a cmd.Wait error into the ACP exit status: a code for a
-// normal exit, a signal name (and no code) for a kill.
 func exitOf(err error) terminalExit {
 	if err == nil {
 		zero := 0
@@ -272,8 +281,6 @@ func (h *terminalHarness) outputOf(t *fakeTerminal) string {
 	return t.out.String()
 }
 
-// killAll reaps anything a test left running (a background job, a command
-// killed mid-flight) so a failing assertion can't leak a process.
 func (h *terminalHarness) killAll() {
 	h.mu.Lock()
 	terms := make([]*fakeTerminal, 0, len(h.terms))
@@ -301,9 +308,7 @@ func (h *terminalHarness) sentUpdates() []map[string]any {
 	return append([]map[string]any(nil), h.updates...)
 }
 
-// sawMethod waits briefly for the agent to send method. Polling rather than a
-// straight read because the harness records off its own goroutine: the last
-// message of a tool call is often still in the pipe when the call has returned.
+// Polls: a call's last message is often still in the pipe when the call returns.
 func (h *terminalHarness) sawMethod(method string) bool {
 	return h.waitFor(func() bool {
 		for _, m := range h.sentMethods() {
@@ -315,8 +320,6 @@ func (h *terminalHarness) sawMethod(method string) bool {
 	})
 }
 
-// waitForStatus waits for a tool-call update with the given status and returns
-// it, or nil if none arrived.
 func (h *terminalHarness) waitForStatus(status string) map[string]any {
 	var found map[string]any
 	h.waitFor(func() bool {
@@ -331,7 +334,6 @@ func (h *terminalHarness) waitForStatus(status string) map[string]any {
 	return found
 }
 
-// updatesOfKind returns every session/update with the given sessionUpdate kind.
 func (h *terminalHarness) updatesOfKind(kind string) []map[string]any {
 	var out []map[string]any
 	for _, u := range h.sentUpdates() {
@@ -342,8 +344,6 @@ func (h *terminalHarness) updatesOfKind(kind string) []map[string]any {
 	return out
 }
 
-// waitForKind waits for an update of the given kind and returns the first one,
-// or nil if none arrived.
 func (h *terminalHarness) waitForKind(kind string) map[string]any {
 	h.waitFor(func() bool { return len(h.updatesOfKind(kind)) > 0 })
 	if got := h.updatesOfKind(kind); len(got) > 0 {
@@ -352,7 +352,6 @@ func (h *terminalHarness) waitForKind(kind string) map[string]any {
 	return nil
 }
 
-// embeddedTerminal reports whether any update put a terminal in the card.
 func (h *terminalHarness) embeddedTerminal() bool {
 	for _, u := range h.sentUpdates() {
 		content, _ := u["content"].([]any)
@@ -375,28 +374,18 @@ func (h *terminalHarness) waitFor(cond func() bool) bool {
 	return false
 }
 
-// withFreshToolRegistry saves and restores the package-global registeredTools
-// around a test body, so registering fake tools doesn't leak into other tests.
-func withFreshToolRegistry(t *testing.T) {
-	t.Helper()
-	saved := registeredTools
-	registeredTools = nil
-	t.Cleanup(func() { registeredTools = saved })
+func withTools(a *agent, ts ...Tool) {
+	a.tools.tools = map[string]Tool{}
+	a.tools.add(ts...)
 }
 
-// ---------------------------------------------------------------------------
-// Fake LLM server
-// ---------------------------------------------------------------------------
-
-// mockLLM stands up an httptest server that accepts OpenAI chat-completions
-// requests and returns a queued SSE response for each call. Tests queue one
-// response per LLM call they expect; an unexpected call fails the test.
+// mockLLM serves one queued SSE response per call; an unexpected call fails the test.
 type mockLLM struct {
 	ts    *httptest.Server
 	resps []string
 
 	mu   sync.Mutex
-	reqs []map[string]any // captured request bodies, in order
+	reqs []map[string]any
 	idx  atomic.Int32
 	t    *testing.T
 }
@@ -405,9 +394,7 @@ func newMockLLM(t *testing.T, responses ...string) *mockLLM {
 	t.Helper()
 	m := &mockLLM{resps: responses, t: t}
 	m.ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Runtime callers probe /slots before each LLM call. Mock doesn't
-		// implement it — 404 lets connForSession treat the server as "unknown,
-		// assume available" so the chat-completions path still runs.
+		// A 404 on /slots makes connFor treat the server as available.
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
 			return
@@ -452,7 +439,6 @@ func (m *mockLLM) request(i int) map[string]any {
 	return m.reqs[i]
 }
 
-// sseText builds an SSE body with a single text-delta chunk followed by [DONE].
 func sseText(text string) string {
 	chunk := map[string]any{
 		"choices": []map[string]any{{
@@ -463,8 +449,6 @@ func sseText(text string) string {
 	return fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", data)
 }
 
-// sseTruncated emits a reasoning delta with finish_reason="length", then a usage
-// chunk, then [DONE] — a generation that truncated at a length limit.
 func sseTruncated(reasoning string, promptTokens, completionTokens int) string {
 	var b strings.Builder
 	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
@@ -481,9 +465,7 @@ func sseTruncated(reasoning string, promptTokens, completionTokens int) string {
 	return b.String()
 }
 
-// sseTruncatedContent is sseTruncated's cousin where the truncated output is
-// message content (not reasoning) — a verbose/looping generation rather than a
-// <think> stall, so it classifies as a genuine max_tokens cap (not recoverable).
+// Content, not reasoning: classifies as a genuine max_tokens cap, not a recoverable stall.
 func sseTruncatedContent(content string, promptTokens, completionTokens int) string {
 	var b strings.Builder
 	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{
@@ -500,9 +482,6 @@ func sseTruncatedContent(content string, promptTokens, completionTokens int) str
 	return b.String()
 }
 
-// sseToolCall builds an SSE body that emits a single tool call with the given
-// name + JSON args, then [DONE]. First chunk carries the tool-call id (triggers
-// append); the second delta extends arguments (per the llmStream protocol).
 func sseToolCall(id, name, args string) string {
 	var b strings.Builder
 	first := map[string]any{
@@ -525,9 +504,6 @@ func sseToolCall(id, name, args string) string {
 	return b.String()
 }
 
-// sseContentThenToolCall emits a content delta (assistant prose) followed by a
-// single tool call, then [DONE] — the shape a planner produces when it writes a
-// direct answer AND calls submit_plan in the same turn.
 func sseContentThenToolCall(text, id, name, args string) string {
 	var b strings.Builder
 	c1, _ := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": map[string]any{"content": text}}}})
@@ -540,24 +516,6 @@ func sseContentThenToolCall(text, id, name, args string) string {
 	return b.String()
 }
 
-// sseReasoning emits a reasoning_content delta with NO visible content and no
-// tool call — a thinking model that dumped everything into its (never-shown)
-// reasoning channel.
-func sseReasoning(reasoning string) string {
-	chunk := map[string]any{
-		"choices": []map[string]any{{
-			"delta": map[string]any{"reasoning_content": reasoning},
-		}},
-	}
-	data, _ := json.Marshal(chunk)
-	return fmt.Sprintf("data: %s\n\ndata: [DONE]\n\n", data)
-}
-
-// TestCwdOrDefaultAbsolutes pins the contract that sess.Cwd is always an
-// absolute path. A client may send Cwd: "." over ACP, and an unresolved
-// "." breaks resolvePath's prefix check (filepath.Clean drops the leading
-// "./" so "go.mod" matches neither "./" nor "."). resolvePath then rejects
-// every project-relative path with "outside project directory".
 func TestCwdOrDefaultAbsolutes(t *testing.T) {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -574,9 +532,6 @@ func TestCwdOrDefaultAbsolutes(t *testing.T) {
 	}
 }
 
-// TestCwdAvailable pins the guard that stops session/new and session/load from
-// scaffolding .codehalter under a workspace root that isn't mounted here — the
-// case where Zed restores an agent thread pinned to another project's cwd.
 func TestCwdAvailable(t *testing.T) {
 	dir := t.TempDir()
 	if err := cwdAvailable(dir); err != nil {
@@ -599,7 +554,6 @@ func TestCwdAvailable(t *testing.T) {
 
 func TestHeartbeatDotsThenClosesLine(t *testing.T) {
 	h := newTerminalHarness(t)
-	// Real pacing is seconds; the goroutine is the same either way.
 	old := heartbeatEvery
 	heartbeatEvery = 5 * time.Millisecond
 	t.Cleanup(func() { heartbeatEvery = old })
@@ -620,8 +574,7 @@ func TestHeartbeatDotsThenClosesLine(t *testing.T) {
 	}
 	stop()
 
-	// stop() joins the ticker goroutine, but the notifications it wrote are
-	// still in flight over the pipe, so wait for the closing newline to land.
+	// stop() joins the goroutine, but its notifications may still be in the pipe.
 	last := func() string {
 		c := chunks()
 		if len(c) == 0 {
@@ -643,7 +596,6 @@ func TestHeartbeatDotsThenClosesLine(t *testing.T) {
 		}
 	}
 
-	// stop() joins the ticker goroutine, so nothing follows the newline.
 	n := len(got)
 	time.Sleep(20 * time.Millisecond)
 	if after := len(chunks()); after != n {
@@ -651,8 +603,6 @@ func TestHeartbeatDotsThenClosesLine(t *testing.T) {
 	}
 }
 
-// TestHeartbeatSilentWhenFast pins the no-op case: work that finishes inside
-// one interval must not leave a stray newline in the thread.
 func TestHeartbeatSilentWhenFast(t *testing.T) {
 	h := newTerminalHarness(t)
 	old := heartbeatEvery
@@ -664,4 +614,95 @@ func TestHeartbeatSilentWhenFast(t *testing.T) {
 	if got := h.updatesOfKind("agent_message_chunk"); len(got) != 0 {
 		t.Errorf("heartbeat that never ticked emitted %d chunk(s)", len(got))
 	}
+}
+
+func TestSayLandsInSessionLog(t *testing.T) {
+	h := newTerminalHarness(t)
+	h.agent.say(context.Background(), h.sess.ID, "🧪 `just test` passed in the round, after its last change; not run again\n")
+	h.agent.say(context.Background(), h.sess.ID, "  \n")
+	data, err := os.ReadFile(sessionPath(h.sess.Cwd, h.sess.ID, "log"))
+	if err != nil {
+		t.Fatalf("no session log: %v", err)
+	}
+	if !strings.Contains(string(data), "[SAY] ===\n🧪 `just test` passed in the round") {
+		t.Errorf("the line is not in the log:\n%s", data)
+	}
+	if strings.Count(string(data), "[SAY]") != 1 {
+		t.Errorf("a blank line was logged:\n%s", data)
+	}
+}
+
+// callTool runs one tool call the way the loop does and returns what it recorded.
+func callTool(t *testing.T, a *agent, sid, name, args string) ToolUse {
+	t.Helper()
+	var tc toolCall
+	tc.ID, tc.Function.Name, tc.Function.Arguments = "c-"+name, name, args
+	tu, _ := a.runToolCall(context.Background(), sid, tc)
+	return tu
+}
+
+// writeTree writes files under dir, making their directories.
+func writeTree(t *testing.T, dir string, files map[string]string) {
+	t.Helper()
+	for rel, body := range files {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// writeFiles creates empty files.
+func writeFiles(t *testing.T, dir string, names ...string) {
+	t.Helper()
+	files := map[string]string{}
+	for _, n := range names {
+		files[n] = ""
+	}
+	writeTree(t, dir, files)
+}
+
+// gitInit makes dir a repository with an identity for later commits, and commits what it holds.
+func gitInit(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	for _, args := range [][]string{{"init", "-q"}, {"config", "user.email", "t@t"}, {"config", "user.name", "t"}, {"add", "-A"}, {"commit", "-q", "-m", "base"}} {
+		if out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+}
+
+// gitRepo is a new repository holding files, committed.
+func gitRepo(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	writeTree(t, dir, files)
+	gitInit(t, dir)
+	return dir
+}
+
+// sseWriteFile is a scripted write_file call.
+func sseWriteFile(id, path, content string) string {
+	b, err := json.Marshal(map[string]string{"path": path, "content": content})
+	if err != nil {
+		panic(err)
+	}
+	return sseToolCall(id, "write_file", string(b))
+}
+
+func lastUserMessage(s *Session) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].Role == "user" {
+			return s.Messages[i].Content
+		}
+	}
+	return ""
 }

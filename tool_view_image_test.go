@@ -7,14 +7,13 @@ import (
 	"testing"
 )
 
-// TestDispatchViewImageHappyPath: a known image id returns the text receipt
-// and a 2-part multimodal slice (text + image_url data URL with correct mime).
+// Two parts: the text receipt and an image_url data URL with the right mime.
 func TestDispatchViewImageHappyPath(t *testing.T) {
 	dir := t.TempDir()
 	payload := []byte("PNG bytes here")
-	id := "img_test_happy"
-	if err := writeImageFile(dir, id, "image/png", payload); err != nil {
-		t.Fatalf("writeImageFile: %v", err)
+	id, err := storeImage(dir, "image/png", payload)
+	if err != nil {
+		t.Fatalf("storeImage: %v", err)
 	}
 	sess := &Session{Cwd: dir}
 
@@ -41,7 +40,6 @@ func TestDispatchViewImageHappyPath(t *testing.T) {
 	if !strings.HasPrefix(url["url"], wantPrefix) {
 		t.Errorf("url prefix: got %q, want prefix %q", url["url"], wantPrefix)
 	}
-	// Decode the embedded base64 and confirm bytes round-trip.
 	gotB64 := strings.TrimPrefix(url["url"], wantPrefix)
 	got, err := base64.StdEncoding.DecodeString(gotB64)
 	if err != nil {
@@ -52,45 +50,21 @@ func TestDispatchViewImageHappyPath(t *testing.T) {
 	}
 }
 
-// TestDispatchViewImageMissingID: a hallucinated id produces a clean,
-// model-readable error with no multimodal parts.
-func TestDispatchViewImageMissingID(t *testing.T) {
-	dir := t.TempDir()
-	sess := &Session{Cwd: dir}
-
-	text, parts, failed := dispatchViewImage(sess, `{"id":"img_doesnotexist"}`)
-	if !failed {
-		t.Errorf("expected failed=true on missing id, got false")
-	}
-	if parts != nil {
-		t.Errorf("expected nil parts on miss, got %+v", parts)
-	}
-	if !strings.Contains(text, "img_doesnotexist") {
-		t.Errorf("error text missing id: %q", text)
-	}
-}
-
-// TestDispatchViewImageBadArgs covers two argument failures: malformed JSON,
-// and an empty id. Both must fail loudly rather than silently doing nothing.
-func TestDispatchViewImageBadArgs(t *testing.T) {
+// Every way a view_image call can fail says why and returns no picture.
+func TestDispatchViewImageRefusals(t *testing.T) {
 	sess := &Session{Cwd: t.TempDir()}
-
-	if text, _, failed := dispatchViewImage(sess, "not json"); !failed || !strings.Contains(text, "invalid arguments") {
-		t.Errorf("bad JSON: failed=%v text=%q", failed, text)
-	}
-	if text, _, failed := dispatchViewImage(sess, `{}`); !failed || !strings.Contains(text, "missing `id`") {
-		t.Errorf("empty id: failed=%v text=%q", failed, text)
-	}
-}
-
-// TestDispatchViewImageNoSession: defensive — a nil session must fail cleanly,
-// not panic.
-func TestDispatchViewImageNoSession(t *testing.T) {
-	text, _, failed := dispatchViewImage(nil, `{"id":"img_anything"}`)
-	if !failed {
-		t.Errorf("expected failed=true with nil session")
-	}
-	if !strings.Contains(text, "no session") {
-		t.Errorf("nil-session error text: %q", text)
+	for _, c := range []struct {
+		sess       *Session
+		args, want string
+	}{
+		{sess, `{"id":"img_doesnotexist"}`, "img_doesnotexist"},
+		{sess, "not json", "invalid arguments"},
+		{sess, `{}`, "missing `id`"},
+		{nil, `{"id":"img_anything"}`, "no session"},
+	} {
+		text, parts, failed := dispatchViewImage(c.sess, c.args)
+		if !failed || parts != nil || !strings.Contains(text, c.want) {
+			t.Errorf("%s: failed=%v parts=%v text=%q, want a failure naming %q", c.args, failed, parts != nil, text, c.want)
+		}
 	}
 }

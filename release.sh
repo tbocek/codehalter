@@ -11,13 +11,28 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-# Get the latest tag, default to v0 if none exist
-latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0")
+# A release is a tag on a commit, so a commit that already carries one has
+# nothing to release: tagging it again republishes the same binaries under a
+# new number. That is how v61 and v62 ended up on the same commit.
+if head_tags=$(git tag --points-at HEAD) && [ -n "$head_tags" ]; then
+  echo "error: HEAD is already released as ${head_tags//$'\n'/, }. Commit something first." >&2
+  exit 1
+fi
 
-# Extract the version number, increment by 1
-current=$(echo "$latest_tag" | sed 's/^v//')
-next=$((current + 1))
-new_tag="v${next}"
+# Tags may have been pushed from elsewhere; the numbering has to account for
+# them or the push at the end fails after the tag is already made locally.
+git fetch --tags --quiet || echo "warning: could not fetch tags, numbering from local ones only" >&2
+
+# Next version = the highest vN that exists, plus one. NOT `git describe`,
+# which reports the tag it picks when several point at one commit: with v61 and
+# v62 both on HEAD~1 it answered v61, and the script then tried to create a v62
+# that was already there.
+latest_tag=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)
+new_tag="v$(( ${latest_tag#v} + 1 ))"
+if git rev-parse -q --verify "refs/tags/$new_tag" >/dev/null; then
+  echo "error: $new_tag already exists even though $latest_tag is the highest. Delete it or tag by hand." >&2
+  exit 1
+fi
 
 # Create the tag
 git tag "$new_tag"

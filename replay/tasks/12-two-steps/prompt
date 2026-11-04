@@ -1,0 +1,1 @@
+Make Parse return an error for a negative qty (message contains 'negative'), with a test, and then add `inv cheapest FILE` printing the cheapest item's name.

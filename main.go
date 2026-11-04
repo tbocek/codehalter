@@ -2,46 +2,41 @@ package main
 
 import (
 	"context"
-	_ "embed"
-	"encoding/base64"
+	"embed"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-//go:embed res/PLAN.md
-var defaultPlanMD string
+// resMD is every shipped prompt, skill and template macro; read it through builtin.
+//
+//go:embed res/*.md
+var resMD embed.FS
 
-//go:embed res/EXECUTE.md
-var defaultExecuteMD string
+//go:embed res/Dockerfile.devcontainer.*
+var devcontainerDockerfiles embed.FS
 
-//go:embed res/DOCUMENT.md
-var defaultDocumentMD string
+// builtin returns .codehalter/<name> when it exists (even empty), else the shipped res/<name>.
+func builtin(cwd, name string) (string, bool) {
+	if cwd != "" {
+		if data, err := os.ReadFile(filepath.Join(cwd, sessionDir, name)); err == nil {
+			return string(data), true
+		}
+	}
+	data, err := resMD.ReadFile("res/" + name)
+	return string(data), err == nil
+}
 
-//go:embed res/SUMMARISE.md
-var defaultSummariseMD string
-
-//go:embed res/RESUMMARISE.md
-var defaultResummariseMD string
-
-//go:embed res/Dockerfile.devcontainer.alpine
-var defaultDevcontainerDockerfileAlpine string
-
-//go:embed res/Dockerfile.devcontainer.arch
-var defaultDevcontainerDockerfileArch string
-
-//go:embed res/Dockerfile.devcontainer.debian
-var defaultDevcontainerDockerfileDebian string
-
-//go:embed res/Dockerfile.devcontainer.fedora
-var defaultDevcontainerDockerfileFedora string
-
-//go:embed res/Dockerfile.devcontainer.ubuntu
-var defaultDevcontainerDockerfileUbuntu string
+func shipped(name string) bool {
+	_, err := fs.Stat(resMD, "res/"+name)
+	return err == nil
+}
 
 //go:embed res/devcontainer.json
 var defaultDevcontainerJSON string
@@ -52,274 +47,150 @@ var defaultSettingsTOML string
 //go:embed res/mcp.toml
 var defaultMCPToml string
 
-// agent implements acp.Agent.
 type agent struct {
-	// mu guards the mutable top-level fields touched from concurrent ACP
-	// handlers and the bootstrap goroutine: cancel, sessions, mode,
-	// abortReason, and the probe-derived LLM fields (mainSlotTokens,
-	// imagesSupported). MCP state has its own mutex (see
-	// mcp mcpState); the per-conn semaphores in connSems lock themselves, but the
-	// connSems slice and settings are reassigned wholesale on reload under cfgMu (below).
+	// mu guards cancel, sessions, mode, abortReason, clientCaps, emptyProject, indexDone
+	// and mcp.clients.
 	mu sync.Mutex
-	// cfgMu guards the settings + connSems pair, which a foreground turn's prepare
-	// phase reassigns (loadSettings / probeAllLLMs / buildConnSems) while a PRIOR
-	// turn's background goroutine (summariser, git-commit drafter) may still be
-	// reading them through connForBackgroundLLM / connForSession / llmStream's slot
-	// gate. Writers take Lock; those background-reachable readers take RLock, copy
-	// what they need (ConnAt returns a value copy), and release before any blocking
-	// call. A strict leaf: never held while acquiring a.mu or sess.mu.
+	// cfgMu guards settings, connSems and connProbe, which prepare reassigns while a prior turn's
+	// goroutine reads them. A leaf: never held across a blocking call or while taking a.mu or sess.mu.
 	cfgMu        sync.RWMutex
 	conn         *AgentSideConnection
 	cancel       context.CancelFunc
 	sessions     map[string]*Session
 	settings     Settings
-	runners      []taskRunner
-	capabilities capabilities
-	emptyProject bool // true on first session if cwd had no source/manifest files
-	indexDone    chan struct{}
-	mode         string // "Interactive" | "Autopilot"
+	emptyProject bool
+	// indexDone is the latest session's startup; read it through startupDone.
+	indexDone chan struct{}
+	// asking counts questions waiting on the user (a card or a form): an editor's prompt
+	// during startup is refused only while startup asks, and waits otherwise.
+	asking atomic.Int32
+	// awaitingStartup counts prompts parked at the startup gate: startup hands them its
+	// fix cards rather than offering them ahead of the request.
+	awaitingStartup atomic.Int32
 
-	// connProbe holds the full prepare-phase probe result per configured
-	// LLMConnection, keyed by Server+"\x00"+Model.
-	// renderLLMStatus reads ModelKnown/ModelLoaded/AvailableModels from it to
-	// warn when a server is reachable but the configured model id isn't in its
-	// /v1/models list (the silent cause of empty completions). Populated by
-	// probeAllLLMs; nil before the first prepare — a nil-map read is the zero
-	// probeResult, so renderLLMStatus stays safe.
+	// Keyed by Server+"\x00"+Model; nil before the first prepare reads as the zero result.
 	connProbe map[string]probeResult
 
-	// ctkIgnored remembers which Server+Model has already been reported for
-	// accepting chat_template_kwargs and ignoring it, so the warning fires once
-	// per deployment instead of once per call. Its own map, not under a.mu:
-	// llmStream reaches it from every background goroutine and must not queue
-	// behind a foreground handler for a bool.
+	// Consecutive summariser-connection failures and the latest one's unix nanos.
+	// Atomic, not under a.mu: written by the summarise goroutine, read on the turn path.
+	summaryStrikes  atomic.Int32
+	summaryStruckAt atomic.Int64
+
+	// ctkIgnored: Server+Model already warned for ignoring chat_template_kwargs. A
+	// sync.Map so background llmStream calls don't queue behind a.mu.
 	ctkIgnored sync.Map
 
-	// mainSlotTokens is the per-slot context window for LLM[0] in tokens.
-	// Discovered by the startup probe: llama.cpp /props reports it per-slot
-	// directly (default_generation_settings.n_ctx); otherwise a known total
-	// (config context_size or /v1/models --ctx-size) is divided by the slot
-	// count. 0 means unknown (probe failed or server didn't report it);
-	// ensureLLM treats both that and "below minSlotTokens" as a hard failure and
-	// loops on a Retry card until the gate passes, so any turn that runs can
-	// assume this is ≥ minSlotTokens. Read by the input-size guard (prompt.go) and
-	// the startup banner (prepare.go).
-	mainSlotTokens int
+	// 0 means unknown, which ensureLLM treats like "below minSlotTokens". Atomic: a
+	// background llmStream reads it while the next turn's probe rewrites it.
+	mainSlotTokens atomic.Int64
 
-	// imagesSupported is whether LLM[0] accepts inline images — the agent-wide
-	// image capability advertised over ACP. Derived from LLM[0]'s config
-	// image_support (else the probe) by probeAllLLMs; gates view_image and the
-	// history image encoding.
-	imagesSupported bool
+	imagesSupported atomic.Bool
 
-	// clientCaps is what the editor told us it supports in the initialize
-	// request. Set once by Initialize (before any session exists) and read by
-	// fsRead/fsWrite to decide between the ACP filesystem and plain disk I/O.
-	// Zero value = "the client advertised nothing", which is the safe reading:
-	// every capability gate falls back to doing the work ourselves.
 	clientCaps ClientCapabilities
 
-	// connSems caps concurrent LLM calls per configured [[llm]] entry —
-	// settings.LLM[i] has a buffered channel at connSems[i] of capacity
-	// LLM[i].parallelCap(). llmStream acquires on entry and releases on exit,
-	// so a busy conn naturally queues excess calls instead of over-dispatching
-	// to its server. Sized by buildConnSems on startup and after any settings
-	// reload. nil entry → no semaphore (test mocks).
+	// connSems caps concurrent calls per [[llm]] entry; a nil entry means no limit (test mocks).
 	connSems []chan struct{}
 
-	// streamRules is the compiled stream-rule set (see rules.go): patterns that
-	// abort a generation mid-token when the reply goes off the rails. Loaded per
-	// project from .codehalter/rules.toml (else the built-in defaults) by
-	// initSession, and reassigned wholesale like the rest of the config — so it
-	// lives under cfgMu with settings and connSems, not under mu.
-	streamRules []streamRule
+	mcp   mcpState
+	tools toolRegistry
 
-	// mcp owns the MCP server children and the bookkeeping reconcileMCP
-	// needs; its mutex guards the whole group (see mcpState).
-	mcp mcpState
-
-	// abortReason is set by the bootstrap goroutine when codehalter must not
-	// run in this environment (today: started outside a devcontainer). Empty
-	// means proceed; non-empty causes Prompt to refuse with this message.
-	// Read under mu.
+	// abortReason, when set, makes Prompt refuse every turn (e.g. not in a devcontainer).
 	abortReason string
 
-	// standalone is true when our own terminal client is driving us (--cli,
-	// see cli.go) rather than an editor. It only picks the wording of the
-	// "you are not in a container" hints, which otherwise tell a terminal user
-	// to press a Zed keyboard shortcut. Written once by runCLI before the
+	// standalone (--cli) only changes hint wording. Written once by runCLI before the
 	// connection exists, so it needs no lock.
 	standalone bool
 
-	// subagentMeter folds the live status meter of each running subagent into
-	// its parent's in-progress phase row. Subagent sessions have no UI of their
-	// own (Zed only knows the parent sid), so their "↑sent ↓tokens… Ns" meter
-	// would otherwise be dropped. Keyed parentSid -> subSid -> latest meter
-	// fragment; setSubagentStatus re-renders the parent row as a compact join of
-	// every active subagent. Guarded by subagentMeterMu (concurrent subagents).
-	subagentMeterMu sync.Mutex
-	subagentMeter   map[string]map[string]string
-
-	// bgJobs tracks run_background jobs (long-lived processes the model starts:
-	// dev servers, watchers) so shutdownBackground can release their terminals on
-	// exit — which kills them — instead of orphaning them with a held port. Keyed
-	// by the sequential id shown to the model; bgSeq hands out ids. Guarded by bgMu.
+	// bgMu guards bgJobs and bgSeq.
 	bgMu   sync.Mutex
 	bgJobs map[int]*backgroundJob
-	bgSeq  int
+	// logPrev is the last logged request body per session and connection (requestLogDelta).
+	logPrevMu sync.Mutex
+	logPrev   map[string][]byte
+	bgSeq     int
 }
 
-// mcpState owns the spawned MCP server children plus the bookkeeping
-// reconcileMCP uses to diff the desired set against what's running. mu guards
-// the whole group, so a reconcile's diff/start/stop sequence is atomic against
-// a concurrent pass (startIndexing's banner pass vs Prompt's per-turn pass).
 type mcpState struct {
-	// mu serialises reconcileMCP across concurrent callers; its scope covers
-	// the full diff/start/stop sequence so two reconciles can't race on
-	// clients or the global tool registry.
-	mu sync.Mutex
-	// clients holds the spawned MCP server children, keyed by their configured
-	// `name`. Tools they advertise are registered into the global tool registry
-	// as `<name>__<tool>` so multiple servers can ship a tool called e.g.
-	// "search" without colliding. Populated and mutated by reconcileMCP; nil on
-	// projects without an mcp.toml.
+	// mu serializes reconcileMCP and shutdownMCP. clients is under agent.mu instead,
+	// so notifyCapabilities need not wait out a slow server start.
+	mu      sync.Mutex
 	clients map[string]*MCPClient
-	// applied is the set of [[server]] entries the last successful reconcile
-	// actually brought up. The next pass diffs the new file against this to
-	// decide what to start, stop, or restart. Entries that failed to start are
-	// NOT included, so the next reconcile retries them with a fresh
-	// StartMCPClient call once the file changes again.
-	applied []MCPServerConfig
-	// appliedMtime is the mtime of .codehalter/mcp.toml at the time of the last
-	// reconcile. Unchanged mtime → skip the diff entirely, which also keeps a
-	// persistently-broken server from re-emitting the same failed card on every
-	// prompt. Zero value means "never reconciled yet".
+	// applied holds only the servers that run, so the next diff retries a failed
+	// start. The diff runs only when the mtime changed, so a broken server does not
+	// re-emit its failed card on every prompt.
+	applied      []MCPServerConfig
 	appliedMtime time.Time
-	// Deferred-reconcile scheduler (see mcpState.schedule). The model writing
-	// mcp.toml mid-turn must NOT be applied mid-turn: registering tools rewrites
-	// the `tools` array, which the chat template renders ahead of the whole
-	// conversation, so the prompt would move under a turn already in flight. The
-	// reconcile is therefore scheduled at the turn boundary and coalesced.
-	// flushMu guards this group only. It is a leaf and is never held across a
-	// reconcile (which takes mu), so the two never deadlock.
-	flushMu      sync.Mutex
-	flushing     bool
-	flushPending bool
-	// flushDone is closed when the running flush finishes; nil while idle, so a
-	// starting turn can wait one out (mcpState.wait).
-	flushDone chan struct{}
-	// flushNotes / flushFixes hold what a background flush produced: one-line
-	// notices ("gopls started") and cards (a parse error, a server that would
-	// not start). A flush runs BETWEEN turns, and anything said there lands
-	// outside any prompt — a card has no turn to dispatch from, and a notice is
-	// at the mercy of whether the client renders out-of-turn updates. So both
-	// are parked here and the next checkMCP replays them from inside a turn.
-	flushNotes []string
-	flushFixes []fixProblem
 }
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
 
 func main() {
-	// --version: the release tag this binary was built from. selfUpdate runs the
-	// binary it has just downloaded with this flag and compares the whole line
-	// before replacing anything, so the format is load-bearing rather than
-	// cosmetic (see versionLine).
-	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println(versionLine(version))
-		os.Exit(0)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version":
+			// Exactly one line: installed updaters compare the whole output of the
+			// downloaded binary, and a second line leaves them unable to update.
+			fmt.Println(versionLine(version))
+			os.Exit(0)
+		case "--build":
+			fmt.Println(versionBanner())
+			os.Exit(0)
+		case "--update":
+			os.Exit(runUpdate())
+		case "--setup":
+			runSetup()
+			os.Exit(0)
+		case "--cli":
+			os.Exit(runCLI(os.Args[2:]))
+		}
 	}
 
-	// --update: install the newest release over this binary and exit. The
-	// terminal path asks first (offerUpdate); this is the form for a run with
-	// nobody watching, and the one the capabilities banner points an editor
-	// user at, since replacing the binary an editor is currently talking to is
-	// something to do between sessions rather than during one.
-	if len(os.Args) > 1 && os.Args[1] == "--update" {
-		os.Exit(runUpdate())
-	}
-
-	// --setup flag: interactive LLM configuration, skips the ACP server.
-	if len(os.Args) > 1 && os.Args[1] == "--setup" {
-		runSetup()
-		os.Exit(0)
-	}
-
-	// --cli flag: be our own ACP client and drive the agent from a terminal,
-	// instead of speaking the protocol over stdio to an editor. Same agent,
-	// same protocol; see cli.go. It sets up its own logging, because stderr is
-	// the user's screen here rather than an editor's log pane.
-	if len(os.Args) > 1 && os.Args[1] == "--cli" {
-		os.Exit(runCLI(os.Args[2:]))
-	}
-
-	// Global slog → stderr at debug (Zed captures it live); per-session detail
-	// (LLM req/reply, errors) goes to .codehalter/session_<id>.log via logSession.
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
 
-	a := &agent{sessions: make(map[string]*Session), mode: "Interactive"}
+	a := &agent{sessions: make(map[string]*Session)}
+	go killOrphanedJobs()
 	conn := NewAgentSideConnection(a, os.Stdout, os.Stdin)
 	a.conn = conn
 
 	slog.Info("waiting for connection")
 	<-conn.Done()
 	slog.Info("connection closed")
-	a.shutdownMCP()        // reap MCP children (spawned with no context) so they don't orphan
-	a.shutdownBackground() // reap detached run_background daemons (dev servers etc.)
+	a.shutdownMCP()
+	a.shutdownBackground()
 }
 
-// ---------------------------------------------------------------------------
-// ACP protocol handlers
-// ---------------------------------------------------------------------------
-
 func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (InitializeResponse, error) {
-	// Version negotiation is NOT a handshake we may fail: the spec says an agent
-	// that doesn't speak the requested version MUST answer with the latest version
-	// it does support and let the client decide whether to continue. Erroring here
-	// broke every client ahead of us — and with an ACP v2 in alpha, that will be
-	// most of them. res.ProtocolVersion below is always ours, so the reply already
-	// says what we speak; this only logs the mismatch.
+	// Never fail negotiation: the spec says answer with our version and let the client decide.
 	if req.ProtocolVersion != protocolVersion {
 		slog.Info("initialize: client speaks a different protocol version, answering with ours",
 			"client", req.ProtocolVersion, "agent", protocolVersion)
 	}
-	// Remember what the client can do before anything tries to use it. Written
-	// once, here, before any session exists — but handlers run concurrently, so
-	// it takes the same lock as the other agent-wide capability fields.
 	a.mu.Lock()
 	a.clientCaps = req.ClientCapabilities
 	a.mu.Unlock()
-	// Probe the execute/thinking LLM cheaply (metadata endpoints, no
-	// inference) to advertise image support in capabilities. We load the
-	// global settings only here — project-local settings live under a cwd
-	// we do not yet have. If project-local settings override the LLM later,
-	// the first Prompt's prepare phase re-probes and updates the flag plus
-	// the LLM banner.
+	// No cwd yet, so global settings only; the first prepare re-probes with project settings.
 	if gs, err := loadGlobalSettings(); err == nil {
 		a.cfgMu.Lock()
-		a.settings = gs
-		a.buildConnSems()
+		a.setSettings(gs)
 		a.cfgMu.Unlock()
-		if conn := a.settings.MainLLM("execute"); conn != nil {
-			a.imagesSupported = a.probeLLM(ctx, conn).ImageSupport
+		if conn := a.connFor("execute"); conn != nil {
+			// The setting wins: a server without /props (Halogen) cannot report
+			// vision, and the client learns image support only here.
+			if conn.ImageSupport != nil {
+				a.imagesSupported.Store(*conn.ImageSupport)
+			} else {
+				a.imagesSupported.Store(probeLLM(ctx, conn).ImageSupport)
+			}
 		}
 	}
 	var res InitializeResponse
 	res.ProtocolVersion = protocolVersion
 	res.AgentCapabilities.LoadSession = true
-	res.AgentCapabilities.PromptCapabilities.Image = a.imagesSupported
+	res.AgentCapabilities.PromptCapabilities.Image = a.imagesSupported.Load()
 	res.AgentCapabilities.PromptCapabilities.EmbeddedContext = true
 	res.AgentCapabilities.MCPCapabilities.HTTP = true
 	res.AgentCapabilities.SessionCapabilities = &struct {
 		List  *struct{} `json:"list,omitempty"`
 		Close *struct{} `json:"close,omitempty"`
 	}{List: &struct{}{}, Close: &struct{}{}}
-	// Static implementation block advertised in the initialize response —
-	// name and version don't change at runtime. The version is the release tag
-	// this binary was built from ("dev" for a local build), so an editor
-	// reporting a protocol problem names the build that produced it.
 	res.AgentInfo = struct {
 		Name    string `json:"name,omitempty"`
 		Version string `json:"version,omitempty"`
@@ -334,14 +205,7 @@ func (a *agent) Initialize(ctx context.Context, req InitializeRequest) (Initiali
 	return res, nil
 }
 
-// clientCan reports whether the editor advertised a capability in its
-// initialize request: "read", "write", "elicitation" or "terminal". A client
-// that didn't claim a method must never be sent it, so a false here means we
-// fall back — fsRead/fsWrite do the I/O themselves (the same path subagent
-// sessions already take) and asks go out as session/request_permission. The
-// exception is "terminal", which has no fallback: ensureTerminals refuses the
-// session outright. Zed advertises all four, which is why the missing fs gate
-// went unnoticed.
+// A method the client did not claim must never be sent. An unknown which reads as "read".
 func (a *agent) clientCan(which string) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -367,25 +231,18 @@ func (a *agent) NewSession(_ context.Context, req NewSessionRequest) (NewSession
 		slog.Debug("NewSession: newSession err", "err", err)
 		return NewSessionResponse{}, err
 	}
-	// newSession steps over the ids already on disk. A session that has not
-	// saved yet (no turn taken) exists only in a.sessions, and putSession would
-	// evict it without a word: ids are second-granular, so a client that opens a
-	// second session right away (the CLI's /new) lands there routinely.
+	// Ids are second-granular, and an unsaved session exists only in a.sessions,
+	// where putSession would silently evict it.
 	for n, base := 2, s.ID; a.getSession(s.ID) != nil; n++ {
 		s = newSessionWithID(cwd, fmt.Sprintf("%s_%d", base, n))
 	}
-	// Hold the editor's MCP list for offerMCPImport, which runs in the bootstrap
-	// goroutine below: importing needs an elicitation, and session/new must
-	// return the id before the client will accept one.
-	s.mcpOffer = req.McpServers
-	if err := a.initSession(cwd, s); err != nil {
+	if err := a.initSession(cwd, s, req.McpServers); err != nil {
 		slog.Debug("NewSession: initSession err", "err", err, "sid", s.ID)
-		a.deleteSession(s.ID)
 		return NewSessionResponse{}, err
 	}
 	a.startIndexing(s.ID, cwd)
 	slog.Debug("NewSession: returning", "sid", s.ID)
-	return NewSessionResponse{SessionId: s.ID, Modes: a.sessionModes()}, nil
+	return NewSessionResponse{SessionId: s.ID}, nil
 }
 
 func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSessionResponse, error) {
@@ -394,80 +251,15 @@ func (a *agent) LoadSession(ctx context.Context, req LoadSessionRequest) (LoadSe
 		return LoadSessionResponse{}, err
 	}
 	slog.Debug("LoadSession: enter", "cwd", cwd, "sid", req.SessionId)
-	// The requested workspace isn't mounted here (Zed restored a thread from a
-	// project that no longer exists in this environment), so there was nothing
-	// to restore — tell the user this is a fresh session rather than silently
-	// dropping their old thread's history.
 	if substituted {
 		a.say(ctx, req.SessionId, fmt.Sprintf("Started a new session: the workspace this thread was created in (%s) isn't available here, so there was nothing to restore.\n\n", req.Cwd))
 	}
-	s, err := loadSession(cwd, req.SessionId)
+	s, err := a.restoreSession(ctx, cwd, req.SessionId, req.McpServers)
 	if err != nil {
-		if os.IsNotExist(err) {
-			slog.Debug("LoadSession: not found, treating as new", "sid", req.SessionId)
-			// Zed cached an ID from an earlier session/new that never
-			// wrote a file (no prompt). It then sends session/load with
-			// that ID, and subsequently session/prompt under the same
-			// ID — LoadSessionResponse.sessionId is NOT honored by Zed,
-			// so we must accept the cached id as-is or prompts won't
-			// route. The filename inherits the cached id's stale
-			// timestamp, which is a known cosmetic wart.
-			s = newSessionWithID(cwd, req.SessionId)
-			s.mcpOffer = req.McpServers
-			if err := a.initSession(cwd, s); err != nil {
-				a.deleteSession(s.ID)
-				return LoadSessionResponse{}, err
-			}
-			a.startIndexing(s.ID, cwd)
-			return LoadSessionResponse{Modes: a.sessionModes()}, nil
-		}
-		return LoadSessionResponse{}, fmt.Errorf("loading session: %w", err)
-	}
-	s.mcpOffer = req.McpServers
-	if err := a.initSession(cwd, s); err != nil {
-		a.deleteSession(s.ID)
 		return LoadSessionResponse{}, err
 	}
-	// Re-announce the thread's name: the client asked us to restore this
-	// session, so it's ours to label, and a reload otherwise drops back to the
-	// session id.
-	if s.Title != "" {
-		a.sendUpdate(ctx, req.SessionId, sessionInfoUpdate{Kind: "session_info_update", Title: s.Title})
-	}
-	// Replay the restored thread's messages to the client so the UI shows the
-	// prior conversation. An empty chunk of the opposite role is emitted before
-	// two consecutive same-role messages so Zed renders them as distinct turns;
-	// images are re-read from disk and re-sent inline (missing files degrade to
-	// a placeholder line).
-	lastRole := ""
-	for _, m := range s.Messages {
-		if m.Role == lastRole {
-			if m.Role == "user" {
-				a.say(ctx, req.SessionId, "")
-			} else {
-				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: ""}})
-			}
-		}
-		if m.Role == "user" {
-			a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: m.Content}})
-			for _, img := range m.Images {
-				data, mime, err := readImageFile(s.Cwd, img.ID)
-				if err != nil {
-					a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[image %s missing on disk]", img.ID)}})
-					continue
-				}
-				if mime == "" {
-					mime = img.MimeType
-				}
-				a.sendUpdate(ctx, req.SessionId, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}})
-			}
-		} else {
-			a.say(ctx, req.SessionId, m.Content)
-		}
-		lastRole = m.Role
-	}
 	a.startIndexing(s.ID, cwd)
-	return LoadSessionResponse{Modes: a.sessionModes()}, nil
+	return LoadSessionResponse{}, nil
 }
 
 func (a *agent) ListSessions(_ context.Context, req ListSessionsRequest) (ListSessionsResponse, error) {
@@ -481,44 +273,16 @@ func (a *agent) ListSessions(_ context.Context, req ListSessionsRequest) (ListSe
 	return ListSessionsResponse{Sessions: sessions}, nil
 }
 
-func (a *agent) SetSessionMode(ctx context.Context, req SetSessionModeRequest) error {
-	if req.ModeId != "Interactive" && req.ModeId != "Autopilot" {
-		return nil
-	}
-	a.mu.Lock()
-	a.mode = req.ModeId
-	a.mu.Unlock()
-	// The current_mode_update notification carries "currentModeId" (matching
-	// SessionModeState.CurrentModeId), not the "modeId" of the inbound
-	// SetSessionModeRequest. Sending "modeId" makes the client reject the update
-	// with -32602 "missing field currentModeId".
-	a.sendUpdate(ctx, req.SessionId, struct {
-		Kind          string `json:"sessionUpdate"`
-		CurrentModeId string `json:"currentModeId"`
-	}{Kind: "current_mode_update", CurrentModeId: req.ModeId})
-	a.say(ctx, req.SessionId, "Mode: "+req.ModeId+"\n\n")
-	return nil
-}
-
-// CloseSession cancels any in-flight turn for sid and drops the session from
-// the live map. The on-disk TOML is preserved so /session resume still works
-// — close is a "this client is done watching" signal, not a delete.
-func (a *agent) CloseSession(_ context.Context, req CloseSessionRequest) error {
-	if sess := a.getSession(req.SessionId); sess != nil {
-		sess.cancelTurn()
-	}
-	a.mu.Lock() // global slot: the pre-turn bootstrap (ensureDevcontainer)
-	if a.cancel != nil {
-		a.cancel()
-	}
-	a.mu.Unlock()
+// CloseSession keeps the on-disk TOML: close means the client stopped watching, not delete.
+func (a *agent) CloseSession(ctx context.Context, req CloseSessionRequest) error {
+	a.Cancel(ctx, CancelNotification(req))
 	a.deleteSession(req.SessionId)
 	return nil
 }
 
 func (a *agent) Cancel(_ context.Context, n CancelNotification) {
 	if sess := a.getSession(n.SessionId); sess != nil {
-		sess.cancelTurn() // the in-flight turn for THIS session
+		sess.cancelTurn()
 	}
 	a.mu.Lock() // global slot: the pre-turn bootstrap
 	if a.cancel != nil {
@@ -526,10 +290,6 @@ func (a *agent) Cancel(_ context.Context, n CancelNotification) {
 	}
 	a.mu.Unlock()
 }
-
-// ---------------------------------------------------------------------------
-// Session registry
-// ---------------------------------------------------------------------------
 
 func (a *agent) getSession(id string) *Session {
 	a.mu.Lock()
@@ -546,67 +306,48 @@ func (a *agent) putSession(s *Session) {
 
 func (a *agent) deleteSession(id string) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	sess := a.sessions[id]
 	delete(a.sessions, id)
+	a.mu.Unlock()
+	if sess != nil {
+		sess.ctl.mu.Lock()
+		stop := sess.ctl.warmStop
+		sess.ctl.warmStop = nil
+		sess.ctl.mu.Unlock()
+		if stop != nil {
+			stop()
+		}
+	}
 }
 
-// ---------------------------------------------------------------------------
-// Session bootstrap
-// ---------------------------------------------------------------------------
-
-func (a *agent) initSession(cwd string, s *Session) error {
+// mcpOffer is only held here: importing needs an elicitation, which the client
+// accepts only after session/new has returned the id (see offerMCPImport).
+func (a *agent) initSession(cwd string, s *Session, mcpOffer []acpMCPServer) (err error) {
+	s.mcpOffer = mcpOffer
 	a.putSession(s)
+	defer func() {
+		if err != nil {
+			a.deleteSession(s.ID)
+		}
+	}()
 
-	// Seed .codehalter/ defaults when absent. Phase prompts
-	// (PLAN/EXECUTE/DOCUMENT/SUMMARISE/RESUMMARISE) are user-owned templates seeded once;
-	// every SKILL-*.md (including the always-on base skill) is owned by
-	// ensureSkills (skills.go), which seeds it once and otherwise leaves it.
+	// Prompts, skills and macros are never copied out, or a project would pin the
+	// release that created it; a same-named .codehalter file only overrides. mcp.toml
+	// is written once: its header comments are the only schema documentation.
 	dir := filepath.Join(cwd, ".codehalter")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("creating %s: %w", dir, err)
 	}
-	for _, f := range []struct{ name, content string }{
-		{"PLAN.md", defaultPlanMD},
-		{"EXECUTE.md", defaultExecuteMD},
-		{"DOCUMENT.md", defaultDocumentMD},
-		{"SUMMARISE.md", defaultSummariseMD},
-		{"RESUMMARISE.md", defaultResummariseMD},
-	} {
-		path := filepath.Join(dir, f.name)
-		if _, err := os.Stat(path); os.IsNotExist(err) {
-			if err := os.WriteFile(path, []byte(f.content), 0o644); err != nil {
-				return fmt.Errorf("seeding %s: %w", path, err)
-			}
+	if _, err := os.Stat(filepath.Join(dir, "mcp.toml")); os.IsNotExist(err) {
+		if err := os.WriteFile(filepath.Join(dir, "mcp.toml"), []byte(defaultMCPToml), 0o644); err != nil {
+			return fmt.Errorf("writing the mcp.toml placeholder: %w", err)
 		}
 	}
-	if err := ensureSkills(cwd, detectStacks(cwd), readOSInfo()); err != nil {
-		return err
-	}
-	// Template macros (TEMPLATE-*.md): seed editable copies once, same as the
-	// phase prompts. After this the on-disk copy wins, so users can edit them.
-	if err := seedTemplates(cwd); err != nil {
-		return err
-	}
-	// mcp.toml — only seeded on first run with the minimal placeholder (a header
-	// and ONE generic commented example, no per-stack servers). Per-stack MCP
-	// wiring (e.g. gopls for Go) is the prepare phase's job: checkEnv offers a
-	// setup card, and accepting it appends the matching [[server]] entry. The
-	// placeholder deliberately names no server so that "is gopls mentioned?"
-	// (mcpMentionsServer) reads as not-yet-offered on a fresh project. Once this
-	// file exists we never touch it again — the user owns it.
-	mcpPath := filepath.Join(dir, "mcp.toml")
-	if _, err := os.Stat(mcpPath); os.IsNotExist(err) {
-		if err := os.WriteFile(mcpPath, []byte(defaultMCPToml), 0o644); err != nil {
-			return fmt.Errorf("seeding %s: %w", mcpPath, err)
-		}
-	}
+	// systemPrompt below picks skills from knownStacks before checkEnv has run.
+	s.knownStacks = detectStacks(cwd)
 
-	// Always rebuild SystemPrompt from the freshly-seeded .codehalter/
-	// directory. NewSession starts with SystemPrompt == "" so this is the
-	// first-and-only build; LoadSession has a possibly-stale SystemPrompt
-	// from a prior run on a different host (different OS skill set), and
-	// we must overwrite it BEFORE prepare's proposeFix can dispatch an
-	// LLM call carrying the stale prefix.
+	// Always rebuild: a loaded session may carry one from another host, and a fix
+	// card must not send an LLM call with it.
 	if sp, err := a.systemPrompt(s.ID); err != nil {
 		slog.Warn("initSession: systemPrompt build failed", "sid", s.ID, "err", err)
 	} else {
@@ -616,53 +357,35 @@ func (a *agent) initSession(cwd string, s *Session) error {
 	if err != nil {
 		return err
 	}
-	// Empty settings are tolerated (path == "") — the first Prompt's prepare
-	// phase scaffolds the skeleton and blocks on a Retry card until the user
-	// fills it in. Running with no LLM until then is graceful (renderLLMStatus
-	// prints a warning instead of crashing).
+	// Empty settings are fine: the first prepare scaffolds them and blocks on a Retry card.
 	a.cfgMu.Lock()
-	a.settings = settings
-	a.buildConnSems()
-	// Stream rules are project config like the rest: reloaded here so editing
-	// .codehalter/rules.toml takes effect on the next session without a rebuild.
-	a.streamRules = loadStreamRules(cwd)
+	a.setSettings(settings)
 	a.cfgMu.Unlock()
-	a.discoverRunners(cwd)
+	a.mu.Lock()
+	a.emptyProject = isEmptyProject(cwd)
+	a.mu.Unlock()
 	a.discoverSandbox()
-	a.registerSubagentTool()
 	return nil
 }
 
-// startIndexing runs the once-per-session bootstrap in a goroutine: the
-// interactive devcontainer/gitignore prompts plus the first prepare(), so the
-// capabilities banner shows at session open rather than only after the first
-// turn (prepare also re-runs every turn from Prompt). Devcontainer goes first
-// because the gitignore prompt assumes a sandbox; if ensureDevcontainer fails
-// it sets abortReason and the rest is skipped, so Prompt then refuses every turn.
+// Devcontainer first: the gitignore prompt assumes a sandbox.
 func (a *agent) startIndexing(sid string, cwd string) {
-	a.indexDone = make(chan struct{})
+	// The goroutine closes its own channel: a second session may replace a.indexDone meanwhile.
+	done := make(chan struct{})
+	// Lets Cancel reach a fix card prepare dispatches. One slot, last writer wins.
+	ctx, cancel := context.WithCancel(context.Background())
+	a.mu.Lock()
+	a.indexDone = done
+	a.cancel = cancel
+	a.mu.Unlock()
 	slog.Debug("startIndexing: spawning bootstrap goroutine", "sid", sid, "cwd", cwd)
 	go func() {
-		defer close(a.indexDone)
+		defer close(done)
 		defer slog.Debug("startIndexing: bootstrap goroutine done", "sid", sid)
-		// Install a.cancel so Zed's Cancel button can interrupt a fix-install
-		// orchestrate that prepare may dispatch via proposeFix. Same pattern
-		// as Prompt(): one cancel slot, last-writer-wins.
-		ctx, cancel := context.WithCancel(context.Background())
-		a.mu.Lock()
-		a.cancel = cancel
-		a.mu.Unlock()
 		defer cancel()
 
-		// Brief pause before the first user-visible session/update. Zed
-		// registers the session (builds its AcpThread, inserts it into the
-		// session map) asynchronously AFTER it reads our session/new response;
-		// an update that lands inside that window is dropped as "Received
-		// session notification for unknown session" — which is exactly why the
-		// devcontainer notice never shows until the first prompt. We already
-		// write the response before the update, so this is purely Zed-side
-		// registration latency. 100ms lets registration win the race.
-		// Experimental: testing whether session-open notices then render.
+		// Zed registers the session only after reading our session/new response
+		// and drops an earlier update as "unknown session".
 		select {
 		case <-ctx.Done():
 			return
@@ -679,124 +402,81 @@ func (a *agent) startIndexing(sid string, cwd string) {
 		}
 		slog.Debug("startIndexing: devcontainer ok, about to ensureGitignore", "sid", sid)
 		a.ensureGitignore(ctx, cwd, sid)
-		// After the gitignore question and before any LLM work: this is the
-		// last interactive gate, and an imported server has to be in the file
-		// before the first turn's reconcileMCP reads it.
+		// An imported server must be in the file before the first reconcileMCP reads it.
 		a.offerMCPImport(ctx, cwd, sid)
 
 		sess := a.getSession(sid)
 		if sess != nil {
 			slog.Debug("startIndexing: gitignore done, about to prepare", "sid", sid)
-			// prepareChecks is the longest silent stretch of a session open: it
-			// probes every LLM (a local server that still has to load a 27B
-			// model answers in tens of seconds), seeds skills, and reconciles
-			// MCP servers. Without this line the thread sits empty after the
-			// gitignore card and a slow probe is indistinguishable from a hang.
-			a.say(ctx, sid, "Setting up: probing the LLM, seeding skills, checking project tooling. The first probe can take a while if your server still has to load the model.\n\n")
+			// Otherwise a slow probe is indistinguishable from a hang.
+			a.say(ctx, sid, "Setting up: probing the LLM, reading the project, checking its tooling. The first probe can take a while if your server still has to load the model.\n\n")
 			fixes := a.prepareChecks(ctx, sess, sid)
-			// Prefix-cache prewarm AFTER the checks (the probe has run, skills
-			// are seeded, SystemPrompt is final — the warmed bytes match turn
-			// one) but BEFORE the fix cards: an accepted card dispatches a full
-			// synthetic turn, and the warm must win the race to that turn's
-			// first call (the conn semaphore serialises them, so at worst the
-			// fix turn queues behind prompt processing it needed anyway).
-			// Backgrounded so bootstrap (and session/new) never waits.
+			// After the checks, so the warmed bytes match turn one; before the fix
+			// cards, whose accepted turn the warm must beat to its first call.
 			go a.prewarm(sess)
-			a.drainFixes(ctx, sid, fixes)
+			a.offerStartupFixes(ctx, sess, fixes)
 		}
 		slog.Debug("startIndexing: bootstrap done", "sid", sid)
 	}()
 }
 
-// ---------------------------------------------------------------------------
-// Session mode
-// ---------------------------------------------------------------------------
-
-// sessionModes is the mode state advertised to the client on session
-// create/load. The client uses this to render the mode selector. The mode id
-// IS the display name — there's no separate identifier to keep in sync.
-func (a *agent) sessionModes() *SessionModeState {
-	a.mu.Lock()
-	current := a.mode
-	a.mu.Unlock()
-	if current == "" {
-		current = "Interactive"
+// offerStartupFixes offers startup's fix cards, or hands them to a prompt that arrived first
+// (`--cli -p` prompts at once): offered now, an accepted card would run its whole fix turn
+// ahead of the request. Checked before each card, so at most the one on screen goes first.
+func (a *agent) offerStartupFixes(ctx context.Context, sess *Session, fixes []fixProblem) {
+	if len(fixes) == 0 {
+		return
 	}
-	return &SessionModeState{
-		CurrentModeId: current,
-		AvailableModes: []struct {
-			Id          string `json:"id"`
-			Name        string `json:"name"`
-			Description string `json:"description,omitempty"`
-		}{
-			{Id: "Interactive", Name: "Interactive", Description: "Ask before setup and anything outside the container"},
-			{Id: "Autopilot", Name: "Autopilot", Description: "Auto-answer prompts — no user interruption"},
-		},
+	if a.awaitingStartup.Load() > 0 {
+		sess.handFixes(fixes)
+		return
+	}
+	// An accepted card runs a whole turn, so it holds the turn like a prompt. A prompt waits
+	// for startup before it takes the turn, so this cannot wait on one.
+	turnCtx, release, _ := a.holdTurn(ctx, sess, true)
+	defer release()
+	for i, p := range fixes {
+		if turnCtx.Err() != nil {
+			return
+		}
+		if i > 0 && a.awaitingStartup.Load() > 0 {
+			sess.handFixes(fixes[i:])
+			return
+		}
+		a.proposeFix(turnCtx, sess.ID, p)
 	}
 }
 
-// isAutopilot reports whether questions should be auto-answered.
-func (a *agent) isAutopilot() bool {
+// startupDone is closed once the latest session's startup has finished; nil before any.
+func (a *agent) startupDone() chan struct{} {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.mode == "Autopilot"
+	return a.indexDone
 }
-
-// get/setMainSlotTokens guard a.mainSlotTokens for its ONE cross-goroutine access:
-// a background llmStream (summariser / git-commit drafter) reads it on its
-// finish=length path (llm.go) while the next turn's probeAllLLMs rewrites it. The
-// foreground prepare/prompt reads run on the same goroutine as the writes, so they
-// read the field directly; only the writer and the background reader need the lock.
-func (a *agent) getMainSlotTokens() int  { a.mu.Lock(); defer a.mu.Unlock(); return a.mainSlotTokens }
-func (a *agent) setMainSlotTokens(n int) { a.mu.Lock(); a.mainSlotTokens = n; a.mu.Unlock() }
-
-// ---------------------------------------------------------------------------
-// Agent → client output
-// ---------------------------------------------------------------------------
 
 func (a *agent) sendUpdate(ctx context.Context, sid string, u any) {
 	if a.conn == nil {
 		return
 	}
-	// Zed only knows the parent session id; SessionUpdate for a "sub_*"
-	// sid produces a "Received session notification for unknown session"
-	// warning on every emit. Subagent activity is intentionally not
-	// surfaced to the parent UI (only the final tool result is), so drop
-	// the notification entirely here. The per-session TOML log still
-	// captures the subagent's full message history.
-	if strings.HasPrefix(sid, "sub_") {
-		return
-	}
 	if err := a.conn.SessionUpdate(ctx, sid, u); err != nil {
-		// Best-effort UI sync: a write failure here means the client
-		// transport is broken, which surfaces on the next request read. Log
-		// at debug so it's visible during diagnosis without flooding the
-		// steady-state token stream.
+		// A broken transport surfaces on the next read; debug keeps the stream quiet.
 		slog.Debug("sendUpdate: SessionUpdate write failed", "sid", sid, "err", err)
 	}
 }
 
-// say emits `text` to the session's chat transcript. This is the overwhelmingly
-// common sendUpdate shape, so it gets a name: everything routed through here is
-// prose the user reads, as opposed to a tool card, a plan entry, or a status
-// line. Callers own their own trailing newlines, because some of these chunks
-// are streamed fragments that must concatenate seamlessly.
+// say also logs the text, so a run reads back from the session log alone. Callers
+// own trailing newlines: chunks may be streamed fragments.
 func (a *agent) say(ctx context.Context, sid, text string) {
 	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: text}})
+	if t := strings.TrimSpace(text); t != "" {
+		a.logSession(sid, "SAY", "%s", t)
+	}
 }
 
-// heartbeatEvery paces the "I am still here" dots. A var, not a const, so a
-// test can shorten it instead of sleeping for real seconds.
+// A var so a test can shorten it.
 var heartbeatEvery = 2 * time.Second
 
-// heartbeat streams one dot into the chat every heartbeatEvery until the
-// returned stop func is called, which also closes the line if any dot was
-// emitted. Session bootstrap blocks for tens of seconds on work the user
-// cannot see (probing every configured LLM server, starting MCP children),
-// and a thread that prints nothing is indistinguishable from a hang.
-//
-// Wrap ONLY work that cannot ask the user anything: a heartbeat around a card
-// would keep ticking for as long as the card sits there waiting for a click.
+// Wrap only work that asks nothing: around a card it would tick while the card waits.
 func (a *agent) heartbeat(ctx context.Context, sid string) func() {
 	tickCtx, cancel := context.WithCancel(ctx)
 	done := make(chan struct{})
@@ -815,8 +495,7 @@ func (a *agent) heartbeat(ctx context.Context, sid string) func() {
 			}
 		}
 	}()
-	// ticks is written only by the goroutine above and read only after <-done,
-	// so the channel close orders the two — no lock needed.
+	// ticks is read only after <-done, so the close orders it; no lock needed.
 	return func() {
 		cancel()
 		<-done
@@ -826,15 +505,6 @@ func (a *agent) heartbeat(ctx context.Context, sid string) func() {
 	}
 }
 
-// sayThought is say for the model's reasoning channel, which clients render
-// collapsed/dimmed rather than as an answer.
-func (a *agent) sayThought(ctx context.Context, sid, text string) {
-	a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: text}})
-}
-
-// sendUpdateAndAbort marks the session as do-not-run and emits the reason to
-// chat. Prompt reads a.abortReason under mu and fails every turn until the
-// process is restarted (inside a container).
 func (a *agent) sendUpdateAndAbort(ctx context.Context, sid, reason string) {
 	a.mu.Lock()
 	a.abortReason = reason
@@ -842,25 +512,12 @@ func (a *agent) sendUpdateAndAbort(ctx context.Context, sid, reason string) {
 	a.say(ctx, sid, reason+"\n")
 }
 
-// ---------------------------------------------------------------------------
-// Diagnostics
-// ---------------------------------------------------------------------------
-
-// logSession appends a tagged, timestamped block to the per-session debug log
-// at .codehalter/session_<sid>.log, opening and closing the file per call (the
-// log is strictly diagnostic and not time-critical, so a long-lived handle
-// isn't worth it). No-op when sid is empty/unknown or the file can't be opened.
-// The body is written verbatim — caller decides whether to truncate. Use a
-// short tag like "WEB" or "TOOL" so the log stays grep-friendly.
 func (a *agent) logSession(sid string, tag, format string, args ...any) {
-	if sid == "" {
-		return
-	}
 	sess := a.getSession(sid)
 	if sess == nil {
 		return
 	}
-	path := sess.sessionFilePath(fmt.Sprintf("session_%s.log", sid))
+	path := sessionPath(sess.Cwd, sid, "log")
 	logF, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return

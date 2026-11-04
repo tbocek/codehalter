@@ -4,14 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-// elicitationRequest is the wire shape of an elicitation/create as a test reads
-// it back: enough of the requested schema to assert on the fields, their types,
-// their enum options and which ones are required.
 type elicitationRequest struct {
 	ID     *json.RawMessage `json:"id"`
 	Method string           `json:"method"`
@@ -34,10 +32,8 @@ type elicitationRequest struct {
 	} `json:"params"`
 }
 
-// readElicitation reads from the fake client until an elicitation/create
-// arrives, returning it decoded so the caller can reply with the matching id.
-// A call routed through executeTool opens its tool card first, so the form is
-// never the first line on the wire.
+// readElicitation loops because a call through runToolCall sends its tool card
+// first.
 func readElicitation(t *testing.T, br *bufio.Reader) elicitationRequest {
 	t.Helper()
 	for {
@@ -58,11 +54,7 @@ func readElicitation(t *testing.T, br *bufio.Reader) elicitationRequest {
 	}
 }
 
-// TestAskUsesElicitationWhenAdvertised pins that a client advertising
-// elicitation.form gets an elicitation/create form instead of a
-// session/request_permission — permission means "may I do this dangerous
-// thing", and none of codehalter's Ask* call sites are that. The option ids
-// must survive the round trip so every caller's return value is unchanged.
+// Option ids survive the round trip, so every caller's return value is unchanged.
 func TestAskUsesElicitationWhenAdvertised(t *testing.T) {
 	a, s, br, peerW := elicitingAgent(t)
 
@@ -72,7 +64,7 @@ func TestAskUsesElicitationWhenAdvertised(t *testing.T) {
 	}
 	res := make(chan result, 1)
 	go func() {
-		choice, err := a.conn.AskChoice(context.Background(), s.ID, "tc1", "Mount your .git?", []string{"Yes, mount", "No"})
+		choice, err := a.askChoice(context.Background(), s.ID, "tc1", "Mount your .git?", []string{"Yes, mount", "No"})
 		res <- result{choice, err}
 	}()
 
@@ -123,11 +115,7 @@ func TestAskUsesElicitationWhenAdvertised(t *testing.T) {
 	}
 }
 
-// TestAskUserOptionsPlusFreeText pins the ask_user form the model can build:
-// `options` become a single-select and `allow_text` adds a text box beside
-// them, neither one required (the user answers with either). A typed answer
-// wins over a selected option, since the only way to reach the box is to ignore
-// the buttons.
+// Neither field is required, and a typed answer wins over a selected option.
 func TestAskUserOptionsPlusFreeText(t *testing.T) {
 	a, s, br, peerW := elicitingAgent(t)
 
@@ -136,7 +124,8 @@ func TestAskUserOptionsPlusFreeText(t *testing.T) {
 		var tc toolCall
 		tc.Function.Name = "ask_user"
 		tc.Function.Arguments = `{"question":"Which port?","options":["8080","3000"],"allow_text":true}`
-		out, _ := a.executeTool(context.Background(), s.ID, tc)
+		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+		out := tu.Output
 		res <- out
 	}()
 
@@ -156,7 +145,6 @@ func TestAskUserOptionsPlusFreeText(t *testing.T) {
 		t.Errorf("required = %v, want neither field required when both are offered", req.Params.RequestedSchema.Required)
 	}
 
-	// Answer BOTH: the typed text must win.
 	reply := jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
 		"action":  "accept",
 		"content": map[string]any{elicitChoiceKey: "8080", elicitTextKey: " 9999 "},
@@ -176,9 +164,7 @@ func TestAskUserOptionsPlusFreeText(t *testing.T) {
 	}
 }
 
-// TestAskUserTextOnlyIsRequired pins that a question with no options is a plain
-// text box: allow_text is implied (there would be nothing to answer with
-// otherwise) and the field is required, since an empty form carries no answer.
+// allow_text is implied and the field is required: an empty form carries no answer.
 func TestAskUserTextOnlyIsRequired(t *testing.T) {
 	a, s, br, peerW := elicitingAgent(t)
 
@@ -187,7 +173,8 @@ func TestAskUserTextOnlyIsRequired(t *testing.T) {
 		var tc toolCall
 		tc.Function.Name = "ask_user"
 		tc.Function.Arguments = `{"question":"What should I name it?"}`
-		out, _ := a.executeTool(context.Background(), s.ID, tc)
+		tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+		out := tu.Output
 		res <- out
 	}()
 
@@ -199,8 +186,7 @@ func TestAskUserTextOnlyIsRequired(t *testing.T) {
 		t.Errorf("required = %v, want the text field", got)
 	}
 
-	// Dismissing a text box is routine, so it must read as "no answer" rather
-	// than failing the tool call.
+	// Dismissing a text box is routine: "no answer", not a failed tool call.
 	b, _ := json.Marshal(jsonrpcResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{"action": "cancel"}})
 	if _, err := peerW.Write(append(b, '\n')); err != nil {
 		t.Fatal(err)
@@ -216,10 +202,8 @@ func TestAskUserTextOnlyIsRequired(t *testing.T) {
 	}
 }
 
-// TestAskUserFreeTextNeedsElicitation pins the one thing free text cannot do:
-// session/request_permission carries buttons only, so a client with no
-// elicitation form and a question with no options has nowhere to put the
-// answer. The model is told to re-ask with options instead of the turn dying.
+// request_permission carries buttons only, so the model is told to re-ask with
+// options.
 func TestAskUserFreeTextNeedsElicitation(t *testing.T) {
 	a, s, _, _ := elicitingAgent(t)
 	a.clientCaps.Elicitation = nil // client without form support
@@ -227,32 +211,15 @@ func TestAskUserFreeTextNeedsElicitation(t *testing.T) {
 	var tc toolCall
 	tc.Function.Name = "ask_user"
 	tc.Function.Arguments = `{"question":"What should I name it?"}`
-	out, _ := a.executeTool(context.Background(), s.ID, tc)
+	tu, _ := a.runToolCall(context.Background(), s.ID, tc)
+	out := tu.Output
 	if !strings.Contains(out, "options") {
 		t.Errorf("tool result = %q, want a steer back to options", out)
 	}
 }
 
-// TestAskUserLegacyYesNoLabels pins that the pre-form argument shape still
-// works: a model that emits yes_label/no_label (not in the schema any more, but
-// a strong trained prior) gets a two-option question rather than a dropped one.
-func TestAskUserLegacyYesNoLabels(t *testing.T) {
-	a, s := newTestAgent(t)
-	a.mode = "Autopilot" // auto-answer picks options[0], no editor conn needed
-
-	var tc toolCall
-	tc.Function.Name = "ask_user"
-	tc.Function.Arguments = `{"question":"Deploy?","yes_label":"Ship it","no_label":"Hold"}`
-	out, _ := a.executeTool(context.Background(), s.ID, tc)
-	if out != "user answered: Ship it" {
-		t.Errorf("tool result = %q, want the yes label as the first option", out)
-	}
-}
-
-// TestElicitationActionsMapToOutcomes pins the three response actions:
-// "decline" is an explicit no (the last option, which every Ask* builder makes
-// the reject one), while "cancel" and an unrecognised action are dismissals and
-// must surface as errPermissionCancelled rather than a silent default choice.
+// "decline" is the last (reject) option; "cancel" and unknown actions are
+// errPermissionCancelled, not a silent default choice.
 func TestElicitationActionsMapToOutcomes(t *testing.T) {
 	for _, tc := range []struct {
 		action  string
@@ -272,7 +239,7 @@ func TestElicitationActionsMapToOutcomes(t *testing.T) {
 			}
 			res := make(chan result, 1)
 			go func() {
-				choice, err := a.conn.doElicitation(context.Background(), permissionRequest{
+				choice, err := a.doPermissionRequest(context.Background(), permissionRequest{
 					SessionId: s.ID,
 					Message:   "pick",
 					Options: []permissionOption{
@@ -313,22 +280,20 @@ func TestElicitationActionsMapToOutcomes(t *testing.T) {
 					t.Errorf("choice = %q, want %q", got.choice, tc.want)
 				}
 			case <-time.After(2 * time.Second):
-				t.Fatal("doElicitation did not return")
+				t.Fatal("the permission request did not return")
 			}
 		})
 	}
 }
 
-// TestAskYesNoWithCardAutoNo pins that opt-in prompts (the SSH-agent forward)
-// resolve to No under autopilot, while the plain helper still auto-answers yes.
-func TestAskYesNoWithCardAutoNo(t *testing.T) {
+// A running /spec loop has nobody to answer: ask_user is turned to the planner's question path.
+func TestAskUserDuringSpecIsParked(t *testing.T) {
 	a, s := newTestAgent(t)
-	a.mode = "Autopilot"
-	ctx := context.Background()
-	if yes, _, err := a.askYesNoWithCardAuto(ctx, s.ID, "Forward SSH?", "think", "Yes", "No", false); err != nil || yes {
-		t.Errorf("autoYes=false under autopilot = (%v, %v), want (false, nil)", yes, err)
-	}
-	if yes, _, err := a.askYesNoWithCard(ctx, s.ID, "Mount .git?", "think", "Yes", "No"); err != nil || !yes {
-		t.Errorf("askYesNoWithCard under autopilot = (%v, %v), want (true, nil)", yes, err)
+	s.setSpecFence(filepath.Join(s.Cwd, "spec"))
+	var tc toolCall
+	tc.Function.Name = "ask_user"
+	tc.Function.Arguments = `{"question":"Which store?","options":["SQLite","JSON"]}`
+	if tu, _ := a.runToolCall(context.Background(), s.ID, tc); !strings.Contains(tu.Output, "refused: during /spec") || !strings.Contains(tu.Output, "QUESTIONS.md") {
+		t.Errorf("ask_user during /spec: %q", tu.Output)
 	}
 }

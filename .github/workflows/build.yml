@@ -40,8 +40,14 @@ jobs:
         # -X main.version stamps the release tag into the binary. It is what
         # --version prints and what the update check compares against; an
         # unstamped build reports "dev" and never offers to update itself.
+        #
+        # CGO_ENABLED=0 makes the binary static. Nothing here needs cgo, and a
+        # dynamically linked one asks for /lib64/ld-linux-x86-64.so.2, which on
+        # Alpine is gcompat re-executing the program through the musl loader:
+        # /proc/self/exe then names the loader, not codehalter, which is how a
+        # self-update once overwrote /lib/ld-musl-x86_64.so.1 (see installTarget).
         run: |
-          GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build \
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} go build \
             -ldflags "-X main.version=${{ github.ref_name }}" \
             -o codehalter-${{ matrix.goos }}-${{ matrix.goarch }} .
 

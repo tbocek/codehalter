@@ -1,0 +1,912 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+)
+
+// writeSpecFixture has nav bars, heading flows, id-less prose sections, a parameter table, an
+// index, an inventory repeating a flow id, and a heading naming an id only in parentheses.
+func writeSpecFixture(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	files := map[string]string{
+		"README.md":        "# The spec\n\nRead this first.\n\n## How to read\n\nOrientation only.\n",
+		"00-principles.md": "# 00 Principles\n\n## 1. Rules\n\nStanding rules.\n",
+		"01-files.md":      "# 01 Files\n\n## 1. Layout\n\nThe project folder.\n\n## 2. cut.json\n\nThe cut file format.\n",
+		"03-shell.md": "# 03 Shell\n\n<!-- nav -->\n[← 01](01-files.md) · [↑](README.md)\n<!-- /nav -->\n\n" +
+			"## 1. Screen\n\nThe window. See ![window](img/window.png) and [F0.1](#f01-switch-tab).\n\n" +
+			"## 2. Flows\n\n" +
+			"### F0.1 Switch tab\n\n<sub>[← start](#1-screen) · [F0.2 →](#f02-press-)</sub>\n\n" +
+			"S1 Switch. Uses P.policy.padSeconds and writes [the cut file](01-files.md#2-cutjson). Next is [F0.2](#f02-press-).\n\n" +
+			"### F0.2 Press ▶\n\nS1 Press. REVIEW: keep or drop.\n\n" +
+			"### 3.1 Derivation (F0.1, P.policy.padSeconds)\n\nHow the policy is derived, which PREVIEWING does not change.\n",
+		"09-llm.md":        "# 09 LLM\n\n## 2. Tool protocol (F6.1)\n\nThe protocol.\n",
+		"10-parameters.md": "# 10 Parameters\n\n## 1. Policy\n\n| parameter | default |\n|---|---|\n| P.policy.padSeconds | 10 |\n| P.policy.minTake | 2 |\n",
+		"11-index.md":      "# 11 Index\n\n## 1. All flows\n\n| id | flow |\n|---|---|\n| [F0.1](03-shell.md#f01-switch-tab) | Switch |\n| [F0.2](03-shell.md#f02-press-) | Press |\n| F6.1 | Tool protocol |\n",
+		"inventory/cut.md": "# Raw inventory\n\n## F0.1 raw notes\n\nFrom the prototype.\n",
+	}
+	writeTree(t, root, files)
+	return root
+}
+
+// What becomes an item, where each is defined, and the order the loop takes them in.
+func TestScanSpecLedger(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	where := func(id string) (string, int) {
+		t.Helper()
+		it := idx.items[id]
+		if it == nil {
+			t.Fatalf("%s is not an item; items: %v", id, idx.order)
+		}
+		return idx.docs[it.Doc].rel, it.Kind
+	}
+
+	// A chapter heading defines a flow, not the raw inventory repeating it.
+	if rel, kind := where("F0.1"); rel != "03-shell.md" || kind != specDefHeading {
+		t.Errorf("F0.1 defined at %s kind %d, want the chapter heading", rel, kind)
+	}
+	// A heading naming an id in parentheses beats the index row when no heading opens with it.
+	if rel, kind := where("F6.1"); rel != "09-llm.md" || kind != specDefHeading {
+		t.Errorf("F6.1 defined at %s kind %d, want 09's heading over the index row", rel, kind)
+	}
+	// A heading naming several ids moves neither; the parameter stays defined by its table row.
+	if rel, kind := where("P.policy.padSeconds"); rel != "10-parameters.md" || kind != specDefTableRow {
+		t.Errorf("P.policy.padSeconds defined at %s kind %d, want the parameter table row", rel, kind)
+	}
+
+	// Prose sections with no id become items; context files and page titles don't.
+	for _, id := range []string{"§01-files#1-layout", "§01-files#2-cutjson", "§03-shell#1-screen"} {
+		if _, kind := where(id); kind != specDefSection {
+			t.Errorf("%s kind %d, want a section item", id, kind)
+		}
+	}
+	for id := range idx.items {
+		if strings.HasPrefix(id, "§README") || strings.HasPrefix(id, "§00-principles") {
+			t.Errorf("context file became an item: %s", id)
+		}
+		if strings.HasPrefix(id, "§11-index") || strings.HasPrefix(id, "§10-parameters") {
+			t.Errorf("an index or a parameter table became an item: %s", id)
+		}
+		if strings.HasPrefix(id, "§inventory") {
+			t.Errorf("a subdirectory section became an item: %s", id)
+		}
+	}
+
+	// Document order, formats before the flows that use them; table ids last.
+	want := []string{"§01-files#1-layout", "§01-files#2-cutjson", "§03-shell#1-screen", "F0.1", "F0.2"}
+	if got := idx.order[:len(want)]; !reflect.DeepEqual(got, want) {
+		t.Errorf("ledger starts %v, want %v", got, want)
+	}
+	last := idx.order[len(idx.order)-1]
+	if idx.items[last].Kind == specDefHeading || idx.items[last].Kind == specDefSection {
+		t.Errorf("ledger ends with %s, want parameter rows after every flow and section", last)
+	}
+}
+
+// The text above a section's first flow is an item of its own, ending at the flow: naivepost's
+// header bar and tab row stood above F0.1 and went to no round. Its slice and its hash are that
+// text alone, so editing the flow redoes only the flow. A line that only introduces the flows
+// is no item.
+func TestSpecIntroAboveFlowsIsAnItem(t *testing.T) {
+	intro := "## 1. The window\n\nOne window. Header bar: New, Open, Save, the project name, the tab row as title widget, then Rescan and Settings from the right edge.\n\n"
+	flow := "### F0.1 Switch tab\n\nS1 A click shows the page.\n\n"
+	scan := func(intro, flow string) *specIndex {
+		t.Helper()
+		root := t.TempDir()
+		writeTree(t, root, map[string]string{"03-shell.md": "# 03 Shell\n\n" + intro + flow + "## 2. Flows\n\nThe flows of the run bar.\n\n### F0.2 Press\n\nS1 Press.\n"})
+		idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return idx
+	}
+	idx := scan(intro, flow)
+	it := idx.items["§03-shell#1-the-window"]
+	if it == nil || it.Kind != specDefSection || it.End != idx.items["F0.1"].Line {
+		t.Fatalf("window item = %+v, want a section item ending at F0.1 (line %d); items %v", it, idx.items["F0.1"].Line, idx.order)
+	}
+	if _, ok := idx.items["§03-shell#2-flows"]; ok {
+		t.Error("a one-line introduction to the flows became an item")
+	}
+	sl := idx.slice("§03-shell#1-the-window", "spec")
+	if !strings.Contains(sl.Text, "tab row as title widget") || strings.Contains(sl.Text, "A click shows the page") {
+		t.Errorf("slice is not the window text alone:\n%s", sl.Text)
+	}
+	if !slices.Contains(sl.Related, "spec/03-shell.md#f01-switch-tab") {
+		t.Errorf("related = %v, want the flow below named as its own item", sl.Related)
+	}
+	hash := specItemHash(idx, "§03-shell#1-the-window")
+	if got := specItemHash(scan(intro, strings.Replace(flow, "shows", "opens", 1)), "§03-shell#1-the-window"); got != hash {
+		t.Error("editing F0.1 changed the window item's hash")
+	}
+	if got := specItemHash(scan(strings.Replace(intro, "Rescan", "Refresh", 1), flow), "§03-shell#1-the-window"); got == hash {
+		t.Error("editing the window text left its hash as it was")
+	}
+}
+
+// Own section without nav, cited parameter rows, the linked section, only a pointer to another flow.
+func TestSpecSlice(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := idx.slice("F0.1", "spec")
+	for _, want := range []string{
+		"### F0.1 Switch tab",
+		"| P.policy.padSeconds | 10 |", // the cited parameter's row
+		"| parameter | default |",      // with its column names
+		"The cut file format.",         // the linked section
+	} {
+		if !strings.Contains(s.Text, want) {
+			t.Errorf("slice lacks %q:\n%s", want, s.Text)
+		}
+	}
+	if strings.Contains(s.Text, "<sub>") {
+		t.Error("slice carries the navigation bar")
+	}
+	if strings.Contains(s.Text, "S1 Press.") {
+		t.Error("slice pasted F0.2's section, which is another round's item")
+	}
+	if !reflect.DeepEqual(s.Related, []string{"spec/03-shell.md#f02-press-"}) {
+		t.Errorf("related = %v, want a pointer to F0.2", s.Related)
+	}
+
+	screen := idx.slice("§03-shell#1-screen", "spec")
+	if !reflect.DeepEqual(screen.Images, []string{"spec/img/window.png"}) {
+		t.Errorf("images = %v, want the screen's picture", screen.Images)
+	}
+}
+
+func TestSpecCoverage(t *testing.T) {
+	out := t.TempDir()
+	write := func(rel, body string) {
+		t.Helper()
+		writeTree(t, out, map[string]string{rel: body})
+	}
+	write("tests/shell.rs", "#[test]\nfn f0_1_s1_switches() {}\n#[test]\nfn f0_10_other() {}\n")
+	// An id in a production doc comment is not a test; the inline test module is.
+	write("src/lib.rs", "//! F0.2 lives here\npub fn press() {}\n#[cfg(test)]\nmod tests {\n    #[test] fn p_policy_padseconds_holds() {}\n}\n")
+	// A comment or a string inside a test does not name it: 130 items passed that way.
+	write("tests/said.rs", "// F1.1 is covered here\n#[test]\nfn checks() { assert_eq!(ITEM, \"F1.2\"); let s = r#\"F1.3\"#; }\n")
+	write("web/a.test.js", "it(\"F1.4 opens the file\", () => {});\nconst note = \"F1.5\";\n")
+	write("src/cut.rs", "// §01-files#2-cutjson\npub fn load() {}\n")
+	write("tests/files.rs", "#[test] fn sec_01_files_2_cutjson_round_trips() {}\n")
+	write("target/debug/stale.rs", "#[test] fn f0_2_would_count() {}\n") // build output: never scanned
+
+	ids := []string{"F0.1", "F0.2", "F0.10", "P.policy.padSeconds", "§01-files#2-cutjson", "F1.0", "F1.1", "F1.2", "F1.3", "F1.4", "F1.5"}
+	covered, files, err := specCoverage(out, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"F0.1", "F0.10", "P.policy.padSeconds", "§01-files#2-cutjson", "F1.4"} {
+		if _, ok := covered[id]; !ok {
+			t.Errorf("%s not covered, want it covered", id)
+		}
+	}
+	for _, id := range []string{"F0.2", "F1.0", "F1.1", "F1.2", "F1.3", "F1.5"} {
+		if f, ok := covered[id]; ok {
+			t.Errorf("%s covered by %s, want uncovered", id, f)
+		}
+	}
+	if files != 5 {
+		t.Errorf("test sources = %d, want 5 (tests/shell.rs, tests/files.rs, tests/said.rs, web/a.test.js, src/lib.rs)", files)
+	}
+}
+
+func TestSpecTestToken(t *testing.T) {
+	for id, want := range map[string]string{
+		"F2.3":                    "f2_3",
+		"P.policy.minTakeSeconds": "p_policy_mintakeseconds",
+		"tool:set_policy":         "tool_set_policy",
+		"§05-cut#7-rules":         "sec_05_cut_7_rules",
+	} {
+		if got := specTestToken(id); got != want {
+			t.Errorf("specTestToken(%q) = %q, want %q", id, got, want)
+		}
+	}
+}
+
+func TestGithubSlug(t *testing.T) {
+	for title, want := range map[string]string{
+		"F0.2 Press ▶":                        "f02-press-",
+		"3. cut/cut.json":                     "3-cutcutjson",
+		"2. Model roles (which job asks)":     "2-model-roles-which-job-asks",
+		"05 — Cut":                            "05--cut",
+		"8. Details confirmed (verification)": "8-details-confirmed-verification",
+	} {
+		if got := githubSlug(title); got != want {
+			t.Errorf("githubSlug(%q) = %q, want %q", title, got, want)
+		}
+	}
+}
+
+func TestParseSpecArgs(t *testing.T) {
+	for args, want := range map[string]string{"": "resume", "  ": "resume", "status": "status", " stop ": "stop", "abort": "stop", "redo": "redo"} {
+		if cmd, err := parseSpecArgs(args); err != nil || cmd != want {
+			t.Errorf("parseSpecArgs(%q) = %q, %v; want %q", args, cmd, err, want)
+		}
+	}
+	// Item ids and the positional spec-dir/out-dir form are refused.
+	for _, args := range []string{"redo F2.3", "redo 03-shell.md", "spec/ rust/ use gtk4-rs"} {
+		if _, err := parseSpecArgs(args); err == nil {
+			t.Errorf("%q parsed", args)
+		}
+	}
+}
+
+// Reopened items stay open though their tests name them, by id or file; an unknown target reopens nothing.
+func TestSpecRedoReopens(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &specConfig{SpecDir: "spec", Items: map[string]specLedger{}}
+	covered := map[string]string{}
+	for _, id := range idx.order {
+		cfg.Items[id] = specLedger{Hash: specItemHash(idx, id)}
+		covered[id] = "tests/all.rs"
+	}
+	byFile := idx.docs[idx.items[idx.order[0]].Doc].rel
+	ids, unknown := specRedoTargets(cfg, idx, []string{"spec/" + byFile, idx.order[len(idx.order)-1]})
+	if len(unknown) != 0 || len(ids) < 2 {
+		t.Fatalf("targets = %v unknown = %v", ids, unknown)
+	}
+	if _, unknown := specRedoTargets(cfg, idx, []string{"F9.9", byFile}); len(unknown) != 1 || unknown[0] != "F9.9" {
+		t.Errorf("unknown = %v, want the typo alone", unknown)
+	}
+	// A paraphrased slug resolves by its number; a number the file lacks does not.
+	var section string
+	for _, id := range idx.order {
+		if strings.HasPrefix(id, "§") && strings.Contains(id, "#") {
+			section = id
+			break
+		}
+	}
+	if section == "" {
+		t.Fatal("the fixture has no numbered section")
+	}
+	stem := section[:strings.Index(section, "#")+1]
+	num := strings.SplitN(section[len(stem):], "-", 2)[0]
+	got, unknown := specRedoTargets(cfg, idx, []string{stem + num + "-something-else"})
+	if len(unknown) != 0 || len(got) != 1 || got[0] != section {
+		t.Errorf("paraphrased section = %v %v, want %q", got, unknown, section)
+	}
+	if _, unknown := specRedoTargets(cfg, idx, []string{stem + "99-nothing"}); len(unknown) != 1 {
+		t.Errorf("a section number the file lacks resolved: %v", unknown)
+	}
+
+	cfg.reopen(ids)
+	for _, id := range ids {
+		if _, known := cfg.Items[id]; known {
+			t.Errorf("%s still in the ledger", id)
+		}
+	}
+	if d := specReconcile(cfg, idx, covered); d.Adopted != 0 {
+		t.Errorf("adopted %d reopened items back", d.Adopted)
+	}
+	if next := nextSpecItem(idx, cfg, nil); next != ids[0] {
+		t.Errorf("next = %q, want the first reopened item %q", next, ids[0])
+	}
+	if cfg.Redo[ids[0]] == "" {
+		t.Error("the redo mark did not stick")
+	}
+}
+
+// A justfile test recipe wins over the bare toolchain command.
+func TestDetectSpecTestCmd(t *testing.T) {
+	dir := t.TempDir()
+	if got := detectSpecTestCmd(dir); got != "" {
+		t.Errorf("empty dir = %q, want none", got)
+	}
+	writeTree(t, dir, map[string]string{"Cargo.toml": "[package]\n"})
+	if got := detectSpecTestCmd(dir); got != "cargo test" {
+		t.Errorf("cargo project = %q", got)
+	}
+	writeTree(t, dir, map[string]string{"justfile": "build:\n\tcargo build\n\ntest:\n\txvfb-run -a cargo test\n"})
+	if got := detectSpecTestCmd(dir); got != "just test" {
+		t.Errorf("with a justfile test recipe = %q, want just test", got)
+	}
+}
+
+// Done is the ledger's word; an item waits while its question has no answer.
+func TestNextSpecItem(t *testing.T) {
+	idx := &specIndex{order: []string{"a", "b", "c", "d"}, questions: map[string][]specQuestion{
+		"b": {{ID: "b", Question: "which store?"}},
+		"c": {{ID: "c", Question: "which db?", Answer: "use SQLite"}},
+	}}
+	cfg := &specConfig{Items: map[string]specLedger{"a": {}}}
+	if id := nextSpecItem(idx, cfg, nil); id != "c" {
+		t.Errorf("next = %q, want c: b waits on its question, c is answered", id)
+	}
+	if id := nextSpecItem(idx, cfg, func(id string) bool { return id == "c" }); id != "d" {
+		t.Errorf("next = %q, want d past c blocked in this run", id)
+	}
+	cfg.Items["c"], cfg.Items["d"] = specLedger{}, specLedger{}
+	if id := nextSpecItem(idx, cfg, nil); id != "" {
+		t.Errorf("next = %q, want nothing left", id)
+	}
+}
+
+func TestSpecOpenMarkers(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := idx.openMarkers(defaultSpecOpenMarkers, "spec")
+	// "REVIEW:" counts, "PREVIEWING" does not.
+	if len(got) != 1 || !strings.HasPrefix(got[0], "spec/03-shell.md:") {
+		t.Errorf("markers = %v, want exactly the one REVIEW line in 03-shell.md", got)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.md"), []byte("# A\n\nTODO: decide\nsee [open] here\nxTODO: not a marker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if idx, err = scanSpec(dir, defaultSpecIDPatterns, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Markers may start or end with punctuation.
+	if got := idx.openMarkers([]string{"TODO:", "[open]"}, "spec"); !slices.Equal(got, []string{"spec/a.md:3", "spec/a.md:4"}) {
+		t.Errorf("punctuated markers = %v, want lines 3 and 4", got)
+	}
+}
+
+func TestSpecConfigRoundTrip(t *testing.T) {
+	cwd := t.TempDir()
+	if cfg, err := loadSpecConfig(cwd); cfg != nil || err != nil {
+		t.Fatalf("no file = (%v, %v), want (nil, nil)", cfg, err)
+	}
+	in := &specConfig{SpecDir: "spec", OutDir: "rust", Target: "use gtk4-rs", Attempts: map[string]int{"F0.1": 1},
+		LintCmd: "off", MaxFileLines: 2000, Refactor: []string{"src/ui/window.rs"}, Refactored: []string{"src/a.rs"}}
+	if err := saveSpecConfig(cwd, in); err != nil {
+		t.Fatal(err)
+	}
+	out, err := loadSpecConfig(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(in, out) {
+		t.Errorf("round trip:\n got %+v\nwant %+v", out, in)
+	}
+	// A ledger from when refactor rounds were counted still loads.
+	writeTree(t, cwd, map[string]string{".codehalter/spec.toml": "spec_dir = \"spec\"\nrefactor_every = 0\nrefactor_at = 289\n"})
+	if old, err := loadSpecConfig(cwd); err != nil || old.SpecDir != "spec" {
+		t.Errorf("old ledger = %+v, %v", old, err)
+	}
+}
+
+// Rewording must still re-open an item.
+func TestSpecItemHashIgnoresFormatting(t *testing.T) {
+	root := writeSpecFixture(t)
+	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const id = "§01-files#1-layout"
+	before := specItemHash(idx, id)
+	if before == "" {
+		t.Fatalf("no hash for %s; items: %v", id, idx.order)
+	}
+
+	path := filepath.Join(root, "01-files.md")
+	body, _ := os.ReadFile(path)
+	reflowed := strings.Replace(string(body), "The project folder.", "  The project\n  folder.  ", 1)
+	if err := os.WriteFile(path, []byte(reflowed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx2, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := specItemHash(idx2, id); got != before {
+		t.Errorf("reformatting changed the hash: %s -> %s", before, got)
+	}
+
+	reworded := strings.Replace(string(body), "The project folder.", "The project folder, now with a lock file.", 1)
+	if err := os.WriteFile(path, []byte(reworded), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	idx3, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := specItemHash(idx3, id); got == before {
+		t.Error("rewording the section left the hash unchanged")
+	}
+}
+
+// A rename carries its record to the new id; covered work predating the ledger is adopted, not changed.
+func TestSpecReconcile(t *testing.T) {
+	root := writeSpecFixture(t)
+	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		unchanged = "§01-files#1-layout"
+		edited    = "§01-files#2-cutjson"
+	)
+	cfg := &specConfig{Items: map[string]specLedger{
+		unchanged: {Hash: specItemHash(idx, unchanged), Title: idx.items[unchanged].Title},
+		edited:    {Hash: "stale", Title: idx.items[edited].Title},
+		// Gone from the spec entirely.
+		"§99-old#1-dropped": {Hash: "whatever", Title: "1. Dropped"},
+		// Same heading, different file: a section that moved.
+		"§98-moved#1-screen": {Hash: "moved", Title: idx.items["§03-shell#1-screen"].Title},
+	}}
+	// A parameter row a test is named after, absent from the ledger: adopted, not
+	// reported as changed forever. A section likewise named: done only by a round.
+	adoptable, roundOnly := "", ""
+	for _, id := range idx.order {
+		if _, known := cfg.Items[id]; known || id == "§03-shell#1-screen" {
+			continue
+		}
+		switch {
+		case idx.items[id].Kind == specDefTableRow && adoptable == "":
+			adoptable = id
+		case idx.items[id].Kind != specDefTableRow && roundOnly == "":
+			roundOnly = id
+		}
+	}
+	if adoptable == "" || roundOnly == "" {
+		t.Fatalf("fixture has no spare row or section; order: %v", idx.order)
+	}
+	covered := map[string]string{adoptable: "tests/flows.rs", roundOnly: "tests/flows.rs",
+		unchanged: "tests/a.rs", edited: "tests/a.rs", "§03-shell#1-screen": "tests/a.rs"}
+
+	d := specReconcile(cfg, idx, covered)
+	if want := []string{edited}; !reflect.DeepEqual(d.Changed, want) {
+		t.Errorf("Changed = %v, want %v", d.Changed, want)
+	}
+	if want := []string{"§99-old#1-dropped"}; !reflect.DeepEqual(d.Removed, want) {
+		t.Errorf("Removed = %v, want %v", d.Removed, want)
+	}
+	if len(d.Renamed) != 1 || !strings.Contains(d.Renamed[0], "§03-shell#1-screen") {
+		t.Errorf("Renamed = %v, want the moved section", d.Renamed)
+	}
+	if _, ok := cfg.Items["§98-moved#1-screen"]; ok {
+		t.Error("the old id must not stay in the ledger after a rename")
+	}
+	if led, ok := cfg.Items["§03-shell#1-screen"]; !ok || led.Hash != specItemHash(idx, "§03-shell#1-screen") {
+		t.Errorf("the renamed item must be recorded at its new text, got %+v", led)
+	}
+	if d.Adopted != 1 || cfg.Items[adoptable].CoveredBy != "tests/flows.rs" {
+		t.Errorf("a named parameter row predating the ledger should be adopted, got %d and %+v", d.Adopted, cfg.Items[adoptable])
+	}
+	if _, ok := cfg.Items[roundOnly]; ok {
+		t.Errorf("%s was adopted without a round; only parameter and tool rows are", roundOnly)
+	}
+	if e := cfg.Items[adoptable]; e.At.IsZero() || e.Version == "" || e.Commit != "" {
+		t.Errorf("an adopted entry must say when and by which codehalter it was recorded, and carry no commit: %+v", e)
+	}
+	// A second pass adopts and renames nothing; the redo and the delete stay reported until acted on.
+	d2 := specReconcile(cfg, idx, covered)
+	if d2.Adopted != 0 || len(d2.Renamed) != 0 {
+		t.Errorf("a second pass must be quiet about renames and adoptions, got %+v", d2)
+	}
+	if !reflect.DeepEqual(d2.Changed, d.Changed) || !reflect.DeepEqual(d2.Removed, d.Removed) {
+		t.Errorf("unacted work must still be reported: %+v then %+v", d, d2)
+	}
+}
+
+// A done item no test is named after any more is open again, unless most of the
+// ledger would reopen at once, which reads as a scan problem. An entry from before
+// the test-name rule stays done and is reported.
+func TestSpecReconcileReopensUnnamedItems(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := func() *specConfig {
+		cfg := &specConfig{Items: map[string]specLedger{}}
+		for _, id := range idx.order[:4] {
+			cfg.Items[id] = specLedger{Hash: specItemHash(idx, id), Title: idx.items[id].Title, Named: true}
+		}
+		return cfg
+	}
+	named := map[string]string{}
+	for _, id := range idx.order[:3] {
+		named[id] = "tests/a.rs"
+	}
+	cfg := ledger()
+	d := specReconcile(cfg, idx, named)
+	if gone := idx.order[3]; !reflect.DeepEqual(d.Reopened, []string{gone}) || cfg.done(gone) {
+		t.Errorf("Reopened = %v, want %s open again", d.Reopened, gone)
+	}
+	if !strings.Contains(renderSpecDelta(d), "open again") {
+		t.Errorf("the reopen is not reported:\n%s", renderSpecDelta(d))
+	}
+
+	cfg = ledger()
+	d = specReconcile(cfg, idx, map[string]string{idx.order[0]: "tests/a.rs"})
+	if d.Unnamed != 3 || len(d.Reopened) != 0 || len(cfg.Items) != 4 {
+		t.Errorf("three of four unnamed: Unnamed=%d Reopened=%v items=%d, want none reopened", d.Unnamed, d.Reopened, len(cfg.Items))
+	}
+
+	cfg = ledger()
+	legacy := idx.order[3]
+	cfg.Items[legacy] = specLedger{Hash: specItemHash(idx, legacy), Title: idx.items[legacy].Title}
+	d = specReconcile(cfg, idx, named)
+	if !cfg.done(legacy) || !reflect.DeepEqual(d.Legacy, []string{legacy}) || len(d.Reopened) != 0 {
+		t.Errorf("an entry from before the rule: done=%v Legacy=%v Reopened=%v, want it kept and reported", cfg.done(legacy), d.Legacy, d.Reopened)
+	}
+	if !strings.Contains(renderSpecDelta(d), "/spec redo") {
+		t.Errorf("the kept entries are not reported:\n%s", renderSpecDelta(d))
+	}
+}
+
+// Which directory holds the spec, which page is read first, and what stack it asks for.
+func TestSpecSetupDetection(t *testing.T) {
+	root := t.TempDir()
+	for path, body := range map[string]string{
+		"notes/a.md":     "# a",
+		"notes/b.md":     "# b",
+		"spec/README.md": "# The spec\n\nA desktop editor. The rewrite targets Rust with gtk4-rs and libadwaita.\n",
+		"spec/01.md":     "# 01",
+		"spec/02.md":     "# 02",
+		"target/x.md":    "# ignored build output",
+		"target/y.md":    "# ignored build output",
+	} {
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cands := specDirCandidates(root)
+	if len(cands) == 0 || cands[0] != "spec" {
+		t.Errorf("candidates = %v, want spec first (it is named like a spec)", cands)
+	}
+	for _, c := range cands {
+		if c == "target" {
+			t.Error("build output must not be offered as a spec directory")
+		}
+		if strings.HasPrefix(c, "spec/") {
+			t.Errorf("%q is part of the spec already offered, not a rival to it", c)
+		}
+	}
+	rel, entry := specEntryPage(filepath.Join(root, "spec"))
+	if rel != "README.md" || !strings.Contains(entry, "desktop editor") {
+		t.Errorf("entry page = %q (%d bytes), want README.md", rel, len(entry))
+	}
+	out, target := specGuessTarget(entry)
+	if out != "rust" || !strings.Contains(target, "gtk4-rs") {
+		t.Errorf("guess = %q / %q, want rust and gtk4-rs", out, target)
+	}
+	if out, target := specGuessTarget("# a spec with no stack in it\n"); out != "" || target != "" {
+		t.Errorf("a page naming no stack must guess nothing, got %q / %q", out, target)
+	}
+}
+
+// The section stops at the next heading of its level or above.
+func TestSpecSectionFromText(t *testing.T) {
+	doc := "# 01 Files\n\n## 1. Layout\n\nThe folder.\n\n### 1.1 Detail\n\nMore.\n\n## 2. cut.json\n\nThe format.\n"
+	got := specSectionFromText(doc, "§01-files#1-layout")
+	if !strings.Contains(got, "The folder.") || !strings.Contains(got, "1.1 Detail") {
+		t.Errorf("section should carry its subsections, got %q", got)
+	}
+	if strings.Contains(got, "cut.json") {
+		t.Errorf("section must stop at the next heading of its level, got %q", got)
+	}
+	if got := specSectionFromText(doc, "§01-files#nope"); got != "" {
+		t.Errorf("an unknown slug should find nothing, got %q", got)
+	}
+}
+
+// Out-dir: the page's suggestion, then manifest dirs (never the spec dir or build output).
+// Target: the page's answer, then what the chosen directory's manifest says.
+func TestSpecSetupOptions(t *testing.T) {
+	root := t.TempDir()
+	for path, body := range map[string]string{
+		"spec/README.md":  "# The spec\n\nThe rewrite targets Rust with gtk4-rs and libadwaita.\n",
+		"spec/01.md":      "# 01",
+		"rust/Cargo.toml": "[package]\nname = \"x\"\n\n[dependencies]\ngtk4 = \"0.11\"\nlibadwaita = \"0.9\"\nserde_json = \"1\"\ncairo-rs = \"0.20\"\n\n[dev-dependencies]\ntempfile = \"3\"\n",
+		"gui/go.mod":      "module example.com/gui\n\ngo 1.26\n\nrequire (\n\tgithub.com/diamondburned/gotk4 v0.4.1\n\tgithub.com/coder/websocket v1.8.0 // indirect\n)\n",
+		"target/x.rs":     "",
+		"notes.txt":       "",
+	} {
+		full := filepath.Join(root, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if lang, deps := manifestStack(filepath.Join(root, "rust")); lang != "rust" || strings.Join(deps, ",") != "gtk4,libadwaita,serde_json" {
+		t.Errorf("rust manifest = %q %v, want rust and the first three [dependencies]", lang, deps)
+	}
+	if lang, deps := manifestStack(filepath.Join(root, "gui")); lang != "go" || strings.Join(deps, ",") != "gotk4" {
+		t.Errorf("go manifest = %q %v, want go and gotk4 (indirect skipped)", lang, deps)
+	}
+	if lang, _ := manifestStack(filepath.Join(root, "spec")); lang != "" {
+		t.Errorf("a directory with no manifest reports %q", lang)
+	}
+
+	outs := specOutDirOptions(root, "spec", "rust")
+	if strings.Join(outs, ",") != "rust,gui" {
+		t.Errorf("out-dir options = %v, want the suggestion first, then the other project, never spec or target", outs)
+	}
+	if outs := specOutDirOptions(root, "spec", "app"); outs[0] != "app" || len(outs) != 3 {
+		t.Errorf("a suggested new directory must lead: %v", outs)
+	}
+
+	entry := "The rewrite targets Rust with gtk4-rs and libadwaita."
+	got := specTargetOptions(root, "rust", "rust with gtk4-rs (v4_14) and libadwaita", entry)
+	want := []string{"rust with gtk4-rs (v4_14) and libadwaita", "rust with gtk4, libadwaita, serde_json", "rust with gtk4-rs and libadwaita"}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("target options = %v, want %v", got, want)
+	}
+	if got := specTargetOptions(root, "gui", "", entry); got[0] != "go with gotk4" {
+		t.Errorf("with no page suggestion the directory's own stack leads: %v", got)
+	}
+}
+
+// After a failed round the test exists but the suite did not pass, so it must not be adopted.
+func TestSpecFailedRoundStaysOpen(t *testing.T) {
+	root := writeSpecFixture(t)
+	idx, err := scanSpec(root, defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A parameter row: the one kind a named test adopts without a round.
+	item := ""
+	for _, id := range idx.order {
+		if idx.items[id].Kind == specDefTableRow {
+			item = id
+			break
+		}
+	}
+	covered := map[string]string{item: "tests/x.rs"}
+	cfg := &specConfig{Attempts: map[string]int{item: 1}}
+
+	if d := specReconcile(cfg, idx, covered); d.Adopted != 0 {
+		t.Errorf("adopted %d, want 0: the item's last round failed", d.Adopted)
+	}
+	if _, known := cfg.Items[item]; known {
+		t.Error("a failed item landed in the ledger")
+	}
+	if cfg.done(item) {
+		t.Errorf("%s counts as done after a failed round", item)
+	}
+
+	// A ledgered item is done whatever a stale attempt count says, and reconciling drops it.
+	cfg.Items[item] = specLedger{Hash: specItemHash(idx, item)}
+	if !cfg.done(item) {
+		t.Error("a ledgered item is not done because of a stale attempt count")
+	}
+	if !strings.Contains(renderSpecStatus(cfg, idx, 1, "just test"), "| "+idx.docs[idx.items[item].Doc].rel+" | 1 |") {
+		t.Error("status does not count a ledgered item with a stale attempt count as covered")
+	}
+	specReconcile(cfg, idx, covered)
+	if cfg.Attempts[item] != 0 {
+		t.Errorf("attempts = %d after reconcile, want the stale count dropped", cfg.Attempts[item])
+	}
+	// A changed item keeps its count: its change rounds are counted there.
+	cfg.Items[item] = specLedger{Hash: "stale"}
+	cfg.Attempts[item] = 1
+	specReconcile(cfg, idx, covered)
+	if cfg.Attempts[item] != 1 {
+		t.Error("reconcile dropped the attempt count of a changed item")
+	}
+	delete(cfg.Items, item)
+
+	delete(cfg.Attempts, item) // the item passed
+	if d := specReconcile(cfg, idx, covered); d.Adopted != 1 {
+		t.Errorf("adopted %d, want 1 once no failed round stands", d.Adopted)
+	}
+	if id := nextSpecItem(idx, cfg, nil); id == item {
+		t.Error("a covered item with no failed round was picked again")
+	}
+}
+
+// More than half of the ledger gone at once, or all of a ledger under 4, reads as a missing spec.
+func TestSpecReconcileVanished(t *testing.T) {
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		live, gone int
+		want       bool
+	}{
+		{3, 2, false}, {2, 2, false}, {2, 3, true}, // half is not more than half
+		{1, 2, false}, {0, 3, true}, {0, 1, true}, // under 4, only all of it
+	} {
+		cfg := &specConfig{Items: map[string]specLedger{}}
+		for _, id := range idx.order[:tc.live] {
+			cfg.Items[id] = specLedger{Hash: specItemHash(idx, id)}
+		}
+		for i := range tc.gone {
+			cfg.Items[fmt.Sprintf("§99-old#%d-dropped", i)] = specLedger{Hash: "gone"}
+		}
+		if d := specReconcile(cfg, idx, nil); d.Vanished != tc.want || len(d.Removed) != tc.gone {
+			t.Errorf("%d live, %d gone: vanished=%v removed=%v, want vanished=%v", tc.live, tc.gone, d.Vanished, d.Removed, tc.want)
+		}
+	}
+}
+
+func TestParseSpecArgsVerify(t *testing.T) {
+	if got, err := parseSpecArgs(" verify "); err != nil || got != "verify" {
+		t.Errorf("parseSpecArgs = %q, %v", got, err)
+	}
+	if _, err := parseSpecArgs("verify main~3"); err == nil {
+		t.Error("/spec verify takes no ref")
+	}
+}
+
+func verifySession(t *testing.T, cwd, id string, msgs ...Message) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := newSessionWithID(cwd, id)
+	s.Messages = msgs
+	s.saveOrLog()
+}
+
+// Chat edits since the check count, in every session; a /spec round, a question, the spec
+// itself, a failed edit and anything before the check do not.
+func TestSpecVerifyGoesOverSessionsSinceTheCheck(t *testing.T) {
+	cwd := t.TempDir()
+	check := time.Now().Add(-time.Hour)
+	before, after := check.Add(-time.Minute), check.Add(time.Minute)
+	edit := func(at time.Time, path string, failed bool) Message {
+		return Message{Role: "assistant", StartedAt: at, ToolUses: []ToolUse{{Name: "edit_file", Input: `{"path":"` + path + `","old_text":"8.0","new_text":"3.0"}`, Failed: failed}}}
+	}
+	user := func(at time.Time, text string) Message {
+		return Message{Role: "user", Content: text, StartedAt: at, Origin: originChat}
+	}
+	machine := func(at time.Time, text, origin string) Message {
+		return Message{Role: "user", Content: text, StartedAt: at, Origin: origin}
+	}
+	verifySession(t, cwd, "20260101_000000",
+		user(before, "old request"), edit(before, "src/old.rs", false),
+		user(after, "lower the dead air"), machine(after, "Begin the PLANNING phase: produce the plan now", ""), machine(after, "EXECUTION phase: Task 1/1", ""), edit(after, "src/a.rs", false),
+		edit(after, "src/failed.rs", true), edit(after, "spec/05-cut.md", false),
+		user(after, "what does this do?"),
+		machine(after, "# Spec round: F1.1 thing", originAuto), machine(after, "Your submit_plan was wrong", ""), edit(after, "src/round.rs", false),
+	)
+	verifySession(t, cwd, "20250101_000000", // from before origins
+		Message{Role: "user", Content: "unmarked", StartedAt: after}, edit(after, "src/unmarked.rs", false),
+	)
+	verifySession(t, cwd, "20260102_000000", user(after, "another tab"), edit(after, cwd+"/src/b.rs", false))
+
+	parts, err := specVerifyParts(cwd, "spec", check, specVerifyPartMax)
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("parts %d, err %v", len(parts), err)
+	}
+	got := parts[0]
+	for _, want := range []string{"Request: lower the dead air", "src/a.rs", "Session 20260102_000000", "Request: another tab", "src/b.rs"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in:\n%s", want, got)
+		}
+	}
+	for _, not := range []string{"old request", "src/old.rs", "src/failed.rs", "05-cut.md", "what does this do", "src/round.rs", "unmarked", "PLANNING", "EXECUTION"} {
+		if strings.Contains(got, not) {
+			t.Errorf("%q should not count:\n%s", not, got)
+		}
+	}
+	if parts, _ := specVerifyParts(cwd, "spec", time.Now().Add(time.Hour), specVerifyPartMax); len(parts) != 0 {
+		t.Errorf("nothing after the last check, got %q", parts)
+	}
+}
+
+// What a compaction took is gone from the messages: its summary stands in, unless the
+// fold is older than the check.
+func TestSpecVerifyNamesAFoldedPart(t *testing.T) {
+	check := time.Now().Add(-time.Hour)
+	s := newSessionWithID(t.TempDir(), "x")
+	s.Summary = "changed the export"
+	s.Messages = []Message{{Role: "user", Content: "hi", StartedAt: check.Add(time.Minute)}}
+	if got := strings.Join(specVerifyGroups(s, "spec", check, specVerifyPartMax), ""); !strings.Contains(got, "changed the export") {
+		t.Errorf("newer fold: %q", got)
+	}
+	s.Messages[0].StartedAt = check.Add(-time.Minute)
+	if got := specVerifyGroups(s, "spec", check, specVerifyPartMax); len(got) != 0 {
+		t.Errorf("older fold: %q", got)
+	}
+}
+
+func TestSpecVerifiedAtRoundTrips(t *testing.T) {
+	cwd := t.TempDir()
+	at := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	if err := saveSpecConfig(cwd, &specConfig{SpecDir: "spec", OutDir: "out", VerifiedAt: &at}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadSpecConfig(cwd)
+	if err != nil || cfg.VerifiedAt == nil || !cfg.VerifiedAt.Equal(at) {
+		t.Fatalf("cfg = %+v, %v", cfg, err)
+	}
+}
+
+// Too much for one round splits, oldest first: every edit lands in a part, under its
+// request, and none is dropped.
+func TestSpecVerifySplitsIntoParts(t *testing.T) {
+	cwd := t.TempDir()
+	check := time.Now().Add(-time.Hour)
+	at := check.Add(time.Minute)
+	session := func(id, request string, n int) {
+		msgs := []Message{{Role: "user", Content: request, StartedAt: at, Origin: originChat}}
+		for i := range n {
+			msgs = append(msgs, Message{Role: "assistant", StartedAt: at, ToolUses: []ToolUse{{Name: "edit_file", Input: fmt.Sprintf(`{"path":"src/%s_%d.rs"}`, id, i)}}})
+		}
+		verifySession(t, cwd, id, msgs...)
+	}
+	session("20260102_000000", "newer request", 2)
+	session("20260101_000000", "older request", 8)
+	const partMax = 300
+	parts, err := specVerifyParts(cwd, "spec", check, partMax)
+	if err != nil || len(parts) < 3 {
+		t.Fatalf("parts %d, err %v: want a split", len(parts), err)
+	}
+	if !strings.Contains(parts[0], "older request") || !strings.Contains(parts[len(parts)-1], "newer request") {
+		t.Errorf("not oldest first: %q", parts)
+	}
+	all := strings.Join(parts, "")
+	for i := range 8 {
+		if want := fmt.Sprintf("- edit_file src/20260101_000000_%d.rs", i); strings.Count(all, want) != 1 {
+			t.Errorf("%s appears %d times", want, strings.Count(all, want))
+		}
+	}
+	for _, p := range parts {
+		if len(p) > partMax+1 {
+			t.Errorf("part of %d bytes", len(p))
+		}
+		if !strings.Contains(p, "Request: ") {
+			t.Errorf("a part without its request: %q", p)
+		}
+	}
+}
+
+// Every part gets a round, and the check only moves once all of them finished.
+func TestSpecVerifyLoopsOverTheParts(t *testing.T) {
+	report := sseToolCall("p", submitPlanToolName, `{"clear":true,"report_only":true,"subtasks":[],"answer":"no contradiction"}`)
+	a, s, mock := planPhaseAgent(t, report, report, report, report, report, report)
+	idx, err := scanSpec(writeSpecFixture(t), defaultSpecIDPatterns, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	huge := strings.Repeat("x", specVerifyTextMax)
+	var msgs []Message
+	at := time.Now().Add(-time.Minute)
+	msgs = append(msgs, Message{Role: "user", Content: "big change", StartedAt: at, Origin: originChat})
+	for i := range specVerifyPartMax/specVerifyTextMax + 5 {
+		msgs = append(msgs, Message{Role: "assistant", StartedAt: at, ToolUses: []ToolUse{{Name: "edit_file", Input: fmt.Sprintf(`{"path":"src/%d.rs","new_text":"%s"}`, i, huge)}}})
+	}
+	verifySession(t, s.Cwd, "20260101_000000", msgs...)
+	cfg := &specConfig{SpecDir: "spec", OutDir: "out"}
+	r := &specRun{a: a, sid: s.ID, sess: s, cfg: cfg, idx: idx, reasons: map[string]string{}, blocked: map[string]string{}}
+	if _, err := a.specVerify(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.VerifiedAt == nil {
+		t.Error("the check did not move after the last part")
+	}
+	asked := 0
+	for _, m := range s.Messages {
+		if m.Origin == originAuto && strings.HasPrefix(m.Content, "# Spec verify") {
+			asked++
+		}
+	}
+	if asked < 2 || mock.callCount() < 2 {
+		t.Errorf("rounds %d, calls %d: want one per part", asked, mock.callCount())
+	}
+	s.waitSummarise()
+	if s.rt.specVerify {
+		t.Error("left in verify mode")
+	}
+}

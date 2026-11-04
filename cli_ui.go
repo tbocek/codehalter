@@ -3,35 +3,18 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// ---------------------------------------------------------------------------
-// Inline TUI renderer for the standalone CLI client.
-//
-// The screen is split in two, and the split is the whole design. Everything
-// above the cursor is the TRANSCRIPT: rows that have been printed and are never
-// touched again, exactly like ordinary program output. The bottom liveRows rows
-// are the LIVE REGION: the partial tail of the streaming reply, the current
-// plan, in-flight tool cards and the status line, all reprinted from scratch on
-// every render.
-//
-// "Inline" means no alternate screen and no full-screen repaint. Scrollback
-// still holds the whole conversation, Ctrl+Shift+C copies what you'd expect,
-// and the shell prompt comes back below the last line instead of the screen
-// being wiped. It also means the only escape sequences we need are "up N rows"
-// and "clear to end of screen"; with tty false we emit neither, so piping
-// stdout to a file yields a plain readable log rather than a pile of escapes.
-//
-// Every write goes through emitLine (transcript) or drawLive (live region), and
-// both erase the live region first. liveRows is therefore the single piece of
-// cursor state: get it wrong and the display eats real transcript rows.
-// ---------------------------------------------------------------------------
+// Inline TUI: rows above the live region are printed once; the bottom liveRows rows are
+// reprinted on every render. All writes go through emitLine/drawLive, so liveRows is the only cursor state.
 
 const (
 	ansiReset = "\x1b[0m"
@@ -40,40 +23,27 @@ const (
 	ansiRed   = "\x1b[31m"
 	ansiGreen = "\x1b[32m"
 	ansiYell  = "\x1b[33m"
-	ansiBlue  = "\x1b[34m"
 	ansiCyan  = "\x1b[36m"
 )
 
-// spinnerFrames is the braille spinner. Every frame is one column wide, which
-// the width arithmetic below assumes of every glyph it prints.
+// Every frame must be one column wide; the width arithmetic assumes it.
 var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
 const (
-	// cliMinCols is the floor for a terminal that won't tell us its width.
-	cliMinCols = 40
-	// cliTermTail is how many lines of a running command's output stay visible
-	// under its card. Enough to see a build moving, short enough that three
-	// concurrent commands still fit.
-	cliTermTail = 3
-	// cliMaxCards caps the in-flight card list so a fan-out of subagent tools
-	// can't push the status line off the screen.
-	cliMaxCards = 6
-	// cliDiffLines caps each side of a rendered diff hunk.
-	cliDiffLines = 8
-	// cliContentLines caps a tool result preview in the transcript.
+	cliMinCols      = 40
+	cliTermTail     = 3
+	cliMaxCards     = 6
+	cliDiffLines    = 8
 	cliContentLines = 8
 )
 
-// cliCall is one tool card. Cards live here while the tool runs and are
-// committed to the transcript when it finishes, so the live region only ever
-// holds work that is actually in flight.
 type cliCall struct {
 	id      string
 	title   string
-	kind    string
 	status  string
 	started time.Time
 	termID  string
+	text    []string // the live text of a running card (codehalter's own test check), its last lines
 }
 
 type cliUI struct {
@@ -84,17 +54,11 @@ type cliUI struct {
 	cols, rows int
 	liveRows   int
 
-	// echoInput is set when stdin is not a terminal, i.e. nothing is echoing
-	// the user's input for us. Then the CLI prints each submitted line itself,
-	// so a piped run reads back as a transcript instead of a wall of prompts
-	// with no questions attached.
+	// echoInput: stdin is not a terminal, so nothing echoes input and Submitted prints it.
 	echoInput bool
 
-	// pend is the not-yet-complete tail of the current wrapped row of streamed
-	// text, held back from the transcript because more of that row may still
-	// arrive. It is rendered at the TOP of the live region: it is a continuation
-	// of the committed rows directly above, so anywhere else would make the
-	// sentence jump around as it grows.
+	// pend is the incomplete tail of the current wrapped row, drawn at the top of the live
+	// region so it reads as a continuation of the committed rows above.
 	pend    []rune
 	pendSty string
 	pendPre string
@@ -103,22 +67,39 @@ type cliUI struct {
 	order []string
 	terms map[string][]string
 
-	plan []PlanEntry
+	used int
+	size int
+	// pp and tg: the last call's prompt and generation tokens per second, 0 until known.
+	pp, tg float64
+	// phase and meter: codehalter's phase in progress and what runs in it, from its plan
+	// entry's _meta; shown in the status row instead of plan rows.
+	phase, meter string
+	busy         bool
+	start        time.Time
+	frame        int
 
-	mode  string
-	used  int
-	size  int
-	busy  bool
-	start time.Time
-	frame int
-
-	// promptStr is set while the cursor sits at the end of an input prompt,
-	// which is the one moment the cursor is NOT at the start of a fresh row.
-	// An update arriving then (a background task from a finished turn) would
-	// otherwise append itself to whatever the user is typing, so emitLine
-	// breaks the row first and drawLive reprints the prompt underneath.
+	// promptStr is set while the cursor sits mid-row after an input prompt; emitLine then
+	// breaks the row first and drawLive reprints the prompt below.
 	promptStr    string
 	promptBroken bool
+	// asking: a question's prompt is open (Ask). Lines arriving meanwhile are held and printed
+	// after the answer: in cooked mode a reprinted prompt row lost what had been typed so far.
+	asking bool
+	held   []string
+
+	// inputOn: the terminal is in character mode (startInput) and the input row, inPrompt
+	// then what has been typed, is the live region's last row, the cursor at inCur in inBuf;
+	// inCol is that cursor's column on the row as last drawn.
+	inputOn     bool
+	inPrompt    string
+	inBuf       []rune
+	inCur       int
+	inCol       int
+	cursorInRow bool
+}
+
+func stdoutStyled() bool {
+	return isTerminal(os.Stdout) && os.Getenv("TERM") != "dumb" && os.Getenv("NO_COLOR") == ""
 }
 
 func newCLIUI() *cliUI {
@@ -129,28 +110,78 @@ func newCLIUI() *cliUI {
 		cols:  80,
 		rows:  24,
 	}
-	fi, err := os.Stdout.Stat()
-	u.tty = err == nil && fi.Mode()&os.ModeCharDevice != 0 &&
-		os.Getenv("TERM") != "dumb" && os.Getenv("NO_COLOR") == ""
-	in, err := os.Stdin.Stat()
-	u.echoInput = err != nil || in.Mode()&os.ModeCharDevice == 0
+	u.tty = stdoutStyled()
+	u.echoInput = !stdinIsTTY()
 	u.refreshSize()
 	return u
 }
 
-// refreshSize re-reads the terminal geometry. It shells out to stty because the
-// alternative is a TIOCGWINSZ ioctl, and codehalter imports neither syscall nor
-// x/sys anywhere else: one subprocess per turn is a cheaper price than making
-// the whole program platform-specific for a cosmetic number. Called at startup
-// and at the top of each turn, NOT on SIGWINCH (which would need syscall too),
-// so a mid-turn resize renders at the old width until the next prompt.
+// stty runs stty on the terminal itself.
+func stty(args ...string) (string, error) {
+	cmd := exec.Command("stty", args...)
+	cmd.Stdin = os.Stdin
+	out, err := cmd.Output()
+	return string(out), err
+}
+
+// startInput puts the terminal in character mode without echo, so the input row is drawn
+// here and can be typed in while a turn runs; Ctrl+C still raises SIGINT. Pasted text is
+// bracketed so its newlines stay text. It returns what undoes it, safe to call twice.
+func (u *cliUI) startInput() func() {
+	if !u.tty || !stdinIsTTY() {
+		return func() {}
+	}
+	saved, err := stty("-g")
+	if err != nil {
+		return func() {}
+	}
+	// -iexten: macOS's terminal driver still takes Ctrl+V as "literal next" in this mode and eats it, so the
+	// editor's Ctrl+V (attach the clipboard's picture) never arrived; Linux passes it through either way.
+	if _, err := stty("-icanon", "-echo", "-iexten", "min", "1", "time", "0"); err != nil {
+		return func() {}
+	}
+	u.mu.Lock()
+	u.inputOn, u.inPrompt = true, "❯ "
+	u.out.WriteString("\x1b[?2004h")
+	u.drawLive()
+	u.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			u.mu.Lock()
+			u.eraseLive()
+			u.inputOn = false
+			u.out.WriteString("\x1b[?2004l")
+			u.out.Flush()
+			u.mu.Unlock()
+			if _, err := stty(strings.TrimSpace(saved)); err != nil {
+				slog.Debug("cli: restoring the terminal", "err", err)
+			}
+		})
+	}
+}
+
+func (u *cliUI) inputActive() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.inputOn
+}
+
+// SetInput shows what is typed so far, the cursor at index cur of buf.
+func (u *cliUI) SetInput(buf []rune, cur int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.inBuf, u.inCur = buf, cur
+	u.drawLive()
+}
+
+// stty instead of a TIOCGWINSZ ioctl keeps this platform-neutral. Called per turn and, where
+// there is one, on SIGWINCH (watchResize).
 func (u *cliUI) refreshSize() {
 	if !u.tty {
 		return
 	}
-	cmd := exec.Command("stty", "size")
-	cmd.Stdin = os.Stdin
-	out, err := cmd.Output()
+	out, err := stty("size")
 	if err != nil {
 		return
 	}
@@ -168,24 +199,29 @@ func (u *cliUI) refreshSize() {
 	u.mu.Unlock()
 }
 
-// ---------------------------------------------------------------------------
-// Cursor primitives. Only these three touch liveRows.
-// ---------------------------------------------------------------------------
-
-// eraseLive removes the live region and leaves the cursor where its first row
-// began. drawLive always ends with the cursor at the start of the row after the
-// last live row, so moving up liveRows and clearing to the end of the screen is
-// exact regardless of how the rows wrapped.
+// Exact because drawLive leaves the cursor at the start of the row after the live region,
+// or, with the input row, at the end of that row, the region's last.
 func (u *cliUI) eraseLive() {
 	if u.liveRows == 0 {
 		return
 	}
-	fmt.Fprintf(u.out, "\x1b[%dA\x1b[0J", u.liveRows)
-	u.liveRows = 0
+	if u.cursorInRow {
+		u.out.WriteString("\r")
+		if u.liveRows > 1 {
+			fmt.Fprintf(u.out, "\x1b[%dA", u.liveRows-1)
+		}
+		u.out.WriteString("\x1b[0J")
+	} else {
+		fmt.Fprintf(u.out, "\x1b[%dA\x1b[0J", u.liveRows)
+	}
+	u.liveRows, u.cursorInRow = 0, false
 }
 
-// emitLine appends one row to the transcript, permanently.
 func (u *cliUI) emitLine(s string) {
+	if u.asking {
+		u.held = append(u.held, s)
+		return
+	}
 	if u.promptStr != "" && !u.promptBroken {
 		u.out.WriteString("\n")
 		u.promptBroken = true
@@ -195,14 +231,10 @@ func (u *cliUI) emitLine(s string) {
 	u.out.WriteString("\n")
 }
 
-// drawLive reprints the live region from current state. Every public method
-// ends with this, so a chunk that commits five transcript rows still costs one
-// redraw.
 func (u *cliUI) drawLive() {
 	u.eraseLive()
 	if u.promptStr != "" {
-		// A prompt owns the bottom row: reprint it if we broke it, and draw no
-		// live region at all, since the cursor has to stay where the user types.
+		// The cursor must stay where the user types, so no live region under a prompt.
 		if u.promptBroken {
 			u.out.WriteString(u.style(u.promptStr, ansiBold))
 			u.promptBroken = false
@@ -214,27 +246,35 @@ func (u *cliUI) drawLive() {
 		u.out.Flush()
 		return
 	}
-	for _, l := range u.liveLines() {
+	// Autowrap off while drawing: a row wider than the terminal (an emoji or CJK glyph takes
+	// two cells but counts as one) is cut at the edge instead of wrapping onto a row liveRows
+	// does not count, which left the region's top row behind on every redraw.
+	u.out.WriteString("\x1b[?7l")
+	lines := u.liveLines()
+	for _, l := range lines {
 		u.out.WriteString(l)
 		u.out.WriteString("\n")
 		u.liveRows++
 	}
+	u.out.WriteString("\x1b[?7h")
+	if u.inputOn && len(lines) > 0 {
+		// Back to the input row, at the cursor in what is typed.
+		u.out.WriteString("\x1b[1A\r")
+		if u.inCol > 0 {
+			fmt.Fprintf(u.out, "\x1b[%dC", u.inCol)
+		}
+		u.cursorInRow = true
+	}
 	u.out.Flush()
 }
 
-// liveLines builds the live region top to bottom. Each entry must occupy
-// exactly one terminal row, which is why every builder clips to cols-1: a row
-// that reaches the last column makes some terminals wrap, and one wrapped row
-// throws liveRows off by one for the rest of the session.
+// Each entry must be exactly one terminal row (see clip, and drawLive's autowrap), or liveRows desyncs.
 func (u *cliUI) liveLines() []string {
 	var out []string
 	if len(u.pend) > 0 {
 		out = append(out, u.clip(u.pendPre+u.style(string(u.pend), u.pendSty)))
 	}
-	out = append(out, u.planLines()...)
 
-	// Everything left in u.order is still in flight: dropCall removes a card
-	// from both maps the moment it completes.
 	running := make([]*cliCall, 0, len(u.order))
 	for _, id := range u.order {
 		running = append(running, u.calls[id])
@@ -246,60 +286,60 @@ func (u *cliUI) liveLines() []string {
 	for _, c := range running {
 		out = append(out, u.clip(u.style(u.spin()+" "+c.title, ansiCyan)+
 			u.style(" "+elapsed(time.Since(c.started)), ansiDim)))
-		for _, l := range u.terms[c.termID] {
+		for _, l := range slices.Concat(u.terms[c.termID], c.text) {
 			out = append(out, u.clip(u.style("    "+l, ansiDim)))
 		}
 	}
 	if u.busy {
 		out = append(out, u.clip(u.statusLine()))
 	}
+	if u.inputOn {
+		// A window of what is typed that keeps the cursor in view: as much before it as fits,
+		// then as much after it.
+		typed := []rune(strings.ReplaceAll(string(u.inBuf), "\n", "⏎"))
+		cur := min(max(u.inCur, 0), len(typed))
+		room := max(u.cols-1-visibleLen(u.inPrompt), 8)
+		start, end := 0, cur
+		for start < cur && visibleLen(string(typed[start:cur])) > room {
+			start++
+		}
+		for end < len(typed) && visibleLen(string(typed[start:end+1])) <= room {
+			end++
+		}
+		u.inCol = visibleLen(u.inPrompt) + visibleLen(string(typed[start:cur]))
+		out = append(out, u.style(u.inPrompt, ansiBold)+string(typed[start:end]))
+	}
 
-	// Never let the live region fill the screen: the transcript has to stay
-	// readable while it renders, and a live region taller than the terminal
-	// would scroll its own top row away and desync liveRows. The first row is
-	// kept (it is the streaming sentence, or the plan header) and the newest
-	// rows below it win, because those are the ones still changing.
+	// A live region taller than the terminal would scroll its top row away and desync
+	// liveRows. Keep the first row (streaming sentence or plan header) and the newest rows.
 	if limit := u.rows - 2; limit > 1 && len(out) > limit {
 		out = append(out[:1], out[len(out)-(limit-1):]...)
 	}
 	return out
 }
 
-func (u *cliUI) planLines() []string {
-	if len(u.plan) == 0 {
-		return nil
-	}
-	var out []string
-	done := 0
-	for _, e := range u.plan {
-		if e.Status == "completed" {
-			done++
-		}
-	}
-	out = append(out, u.clip(u.style(fmt.Sprintf("  plan %d/%d", done, len(u.plan)), ansiDim)))
-	for _, e := range u.plan {
-		// Finished and not-yet-started entries are counted in the header above;
-		// spelling them all out would push a 20-step plan over the whole screen.
-		if e.Status != "in_progress" {
-			continue
-		}
-		out = append(out, u.clip(u.style("  → "+e.Content, ansiYell)))
-	}
-	return out
-}
-
+// statusLine: "⠸ 67m12s · llm[0] ↑426kb ↓37 tok · 124k/262k ctx · 812 pp/s · 51 tg/s · executing",
+// the phase last as the least telling. A running tool is no part of it: its card shows it.
 func (u *cliUI) statusLine() string {
 	parts := []string{elapsed(time.Since(u.start))}
-	if u.mode != "" {
-		parts = append(parts, strings.ToLower(u.mode))
+	if u.meter != "" {
+		parts = append(parts, u.meter)
 	}
 	if u.size > 0 {
 		parts = append(parts, fmt.Sprintf("%s/%s ctx", short(u.used), short(u.size)))
 	} else if u.used > 0 {
 		parts = append(parts, short(u.used)+" ctx")
 	}
-	if n := len(u.order); n > 0 {
-		parts = append(parts, fmt.Sprintf("%d running", n))
+	for _, s := range []struct {
+		rate float64
+		unit string
+	}{{u.pp, "pp/s"}, {u.tg, "tg/s"}} {
+		if s.rate > 0 {
+			parts = append(parts, strconv.Itoa(int(s.rate+0.5))+" "+s.unit)
+		}
+	}
+	if u.phase != "" {
+		parts = append(parts, strings.ToLower(u.phase))
 	}
 	return u.style(u.spin()+" "+strings.Join(parts, " · "), ansiDim)
 }
@@ -311,10 +351,6 @@ func (u *cliUI) spin() string {
 	return spinnerFrames[u.frame%len(spinnerFrames)]
 }
 
-// ---------------------------------------------------------------------------
-// Styling and width
-// ---------------------------------------------------------------------------
-
 func (u *cliUI) style(s, sty string) string {
 	if !u.tty || sty == "" {
 		return s
@@ -322,19 +358,10 @@ func (u *cliUI) style(s, sty string) string {
 	return sty + s + ansiReset
 }
 
-// clip truncates to one row, ellipsis included: the result is at most cols-1
-// columns wide, because a row that reaches the last column makes some terminals
-// wrap it, and one wrapped row throws liveRows off by one for the rest of the
-// session.
-//
-// It measures only printable runes, so a string that already carries escapes
-// keeps them: the styles applied above wrap a whole line, and cutting inside
-// one would leak the colour into the rest of the screen.
+// clip keeps rows under cols-1 columns: a row reaching the last column wraps on some
+// terminals and desyncs liveRows. Escapes are kept whole so a cut never leaks colour.
 func (u *cliUI) clip(s string) string {
-	limit := u.cols - 1
-	if limit < 2 {
-		limit = 2
-	}
+	limit := max(u.cols-1, 2)
 	if visibleLen(s) <= limit {
 		return s
 	}
@@ -353,11 +380,11 @@ func (u *cliUI) clip(s string) string {
 			b.WriteRune(r)
 			continue
 		}
-		if width == limit-1 {
+		if width+runeCells(r) > limit-1 {
 			break
 		}
 		b.WriteRune(r)
-		width++
+		width += runeCells(r)
 	}
 	b.WriteString("…")
 	// Close whatever styling the truncated tail would have closed.
@@ -367,10 +394,7 @@ func (u *cliUI) clip(s string) string {
 	return b.String()
 }
 
-// visibleLen counts printable runes, treating CSI sequences as zero-width.
-// Runes, not display cells: a CJK glyph is two columns wide and is undercounted
-// here, so the live region keeps to ASCII plus the single-column glyphs above
-// and only model-supplied text (which clips conservatively) can be wide.
+// visibleLen counts terminal cells, escapes excluded.
 func visibleLen(s string) int {
 	n, esc := 0, false
 	for _, r := range s {
@@ -381,21 +405,61 @@ func visibleLen(s string) int {
 		case r == '\x1b':
 			esc = true
 		default:
-			n++
+			n += runeCells(r)
 		}
 	}
 	return n
 }
 
-// sanitize strips the control characters that would move the cursor, and
-// expands tabs. Text from the model and from tool output is printed verbatim,
-// so an ESC in a file being previewed (or in a build log echoed back) would
-// otherwise repaint the screen under us and leave liveRows counting rows that
-// are no longer there. Tabs go because the width arithmetic counts them as one
-// column and the terminal draws up to eight, which wraps a live row and desyncs
-// the same counter; four spaces keeps a Go diff's indentation readable and
-// makes the count exact. Newlines survive: callers split on them and commit one
-// row each.
+// wideRanges are drawn two cells wide: CJK, Hangul, fullwidth forms, and the emoji with
+// emoji presentation (Unicode East Asian Width W). Ambiguous characters count as one,
+// as most terminals draw them.
+var wideRanges = [][2]rune{
+	{0x1100, 0x115F}, {0x231A, 0x231B}, {0x2329, 0x232A}, {0x23E9, 0x23EC}, {0x23F0, 0x23F0},
+	{0x23F3, 0x23F3}, {0x25FD, 0x25FE}, {0x2614, 0x2615}, {0x2648, 0x2653}, {0x267F, 0x267F},
+	{0x2693, 0x2693}, {0x26A1, 0x26A1}, {0x26AA, 0x26AB}, {0x26BD, 0x26BE}, {0x26C4, 0x26C5},
+	{0x26CE, 0x26CE}, {0x26D4, 0x26D4}, {0x26EA, 0x26EA}, {0x26F2, 0x26F3}, {0x26F5, 0x26F5},
+	{0x26FA, 0x26FA}, {0x26FD, 0x26FD}, {0x2705, 0x2705}, {0x270A, 0x270B}, {0x2728, 0x2728},
+	{0x274C, 0x274C}, {0x274E, 0x274E}, {0x2753, 0x2755}, {0x2757, 0x2757}, {0x2795, 0x2797},
+	{0x27B0, 0x27B0}, {0x27BF, 0x27BF}, {0x2B1B, 0x2B1C}, {0x2B50, 0x2B50}, {0x2B55, 0x2B55},
+	{0x2E80, 0x303E}, {0x3041, 0x33FF}, {0x3400, 0x4DBF}, {0x4E00, 0x9FFF}, {0xA000, 0xA4CF},
+	{0xA960, 0xA97F}, {0xAC00, 0xD7A3}, {0xF900, 0xFAFF}, {0xFE10, 0xFE19}, {0xFE30, 0xFE6F},
+	{0xFF00, 0xFF60}, {0xFFE0, 0xFFE6}, {0x1F004, 0x1F004}, {0x1F0CF, 0x1F0CF}, {0x1F18E, 0x1F18E},
+	{0x1F191, 0x1F19A}, {0x1F200, 0x1F251}, {0x1F300, 0x1F320}, {0x1F32D, 0x1F335}, {0x1F337, 0x1F37C},
+	{0x1F37E, 0x1F393}, {0x1F3A0, 0x1F3CA}, {0x1F3CF, 0x1F3D3}, {0x1F3E0, 0x1F3F0}, {0x1F3F4, 0x1F3F4},
+	{0x1F3F8, 0x1F43E}, {0x1F440, 0x1F440}, {0x1F442, 0x1F4FC}, {0x1F4FF, 0x1F53D}, {0x1F54B, 0x1F54E},
+	{0x1F550, 0x1F567}, {0x1F57A, 0x1F57A}, {0x1F595, 0x1F596}, {0x1F5A4, 0x1F5A4}, {0x1F5FB, 0x1F64F},
+	{0x1F680, 0x1F6C5}, {0x1F6CC, 0x1F6CC}, {0x1F6D0, 0x1F6D2}, {0x1F6D5, 0x1F6D7}, {0x1F6DC, 0x1F6DF},
+	{0x1F6EB, 0x1F6EC}, {0x1F6F4, 0x1F6FC}, {0x1F7E0, 0x1F7EB}, {0x1F7F0, 0x1F7F0}, {0x1F90C, 0x1F93A},
+	{0x1F93C, 0x1F945}, {0x1F947, 0x1F9FF}, {0x1FA70, 0x1FAFF}, {0x20000, 0x3FFFD},
+}
+
+// runeCells is how many terminal cells r takes: 0 for combining marks, zero-width
+// characters and variation selectors, 2 for wide ones, else 1.
+func runeCells(r rune) int {
+	switch {
+	case r >= 0x300 && r <= 0x36F, r >= 0x200B && r <= 0x200F, r >= 0x2060 && r <= 0x2064,
+		r >= 0xFE00 && r <= 0xFE0F, r >= 0xFE20 && r <= 0xFE2F, r >= 0xE0100 && r <= 0xE01EF:
+		return 0
+	case r < 0x1100:
+		return 1
+	}
+	if _, wide := slices.BinarySearchFunc(wideRanges, r, func(rg [2]rune, r rune) int {
+		switch {
+		case rg[1] < r:
+			return -1
+		case rg[0] > r:
+			return 1
+		}
+		return 0
+	}); wide {
+		return 2
+	}
+	return 1
+}
+
+// sanitize drops cursor-moving control chars from model/tool text and expands tabs (drawn up
+// to 8 columns, counted as 1); either would desync liveRows. Newlines are kept.
 func sanitize(s string) string {
 	if strings.IndexFunc(s, func(r rune) bool { return r < 0x20 && r != '\n' || r == 0x7f }) < 0 {
 		return s
@@ -428,19 +492,12 @@ func short(n int) string {
 	case n >= 1000000:
 		return fmt.Sprintf("%.1fM", float64(n)/1e6)
 	case n >= 1000:
-		return fmt.Sprintf("%.1fk", float64(n)/1e3)
+		return strconv.Itoa((n+500)/1000) + "k"
 	default:
 		return strconv.Itoa(n)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Streaming text
-// ---------------------------------------------------------------------------
-
-// Stream appends streamed assistant output, wrapping it to the terminal and
-// committing every row that is complete. sty/pre select the look: plain for a
-// message, dim behind a bar for a thought.
 func (u *cliUI) Stream(sty, pre, s string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -449,17 +506,14 @@ func (u *cliUI) Stream(sty, pre, s string) {
 		u.flushRow()
 		u.pendSty, u.pendPre = sty, pre
 	}
-	width := u.cols - 1 - len([]rune(u.pendPre))
-	if width < 16 {
-		width = 16
-	}
+	width := max(u.cols-1-visibleLen(u.pendPre), 16)
 	for _, r := range s {
 		if r == '\n' {
 			u.endRow()
 			continue
 		}
 		u.pend = append(u.pend, r)
-		for len(u.pend) > width {
+		for visibleLen(string(u.pend)) > width {
 			head, tail := breakRow(u.pend, width)
 			u.emitLine(u.pendPre + u.style(string(head), u.pendSty))
 			u.pend = tail
@@ -468,48 +522,34 @@ func (u *cliUI) Stream(sty, pre, s string) {
 	u.drawLive()
 }
 
-// breakRow splits an over-long row at the last space that fits, so wrapping
-// falls between words. A single word longer than the row (a path, a URL) has no
-// space to break at and is cut hard rather than pushed past the edge.
+// breakRow splits row after at most width cells, at its last space when there is one.
 func breakRow(row []rune, width int) (head, tail []rune) {
-	for i := width; i > 0; i-- {
+	fit, cells := 0, 0
+	for fit < len(row) && cells+runeCells(row[fit]) <= width {
+		cells += runeCells(row[fit])
+		fit++
+	}
+	fit = max(fit, 1) // a row always moves on, even past a glyph wider than the whole width
+	for i := fit; i > 0; i-- {
 		if row[i-1] == ' ' {
 			return row[:i-1], row[i:]
 		}
 	}
-	return row[:width], row[width:]
+	return row[:fit], row[fit:]
 }
 
-// endRow commits the current row even when empty, which is how a blank line in
-// the model's markdown survives into the transcript.
+// endRow commits even an empty row, so blank markdown lines survive.
 func (u *cliUI) endRow() {
 	u.emitLine(u.pendPre + u.style(string(u.pend), u.pendSty))
 	u.pend = u.pend[:0]
 }
 
-// flushRow commits a partial row, if any. Called when the style changes and at
-// the end of a turn, never on a plain newline.
 func (u *cliUI) flushRow() {
 	if len(u.pend) > 0 {
 		u.endRow()
 	}
 }
 
-// Flush ends the current paragraph. Used before printing anything that is not
-// streamed text, so a card or a prompt never lands in the middle of a sentence.
-func (u *cliUI) Flush() {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	u.flushRow()
-	u.drawLive()
-}
-
-// ---------------------------------------------------------------------------
-// Transcript entries
-// ---------------------------------------------------------------------------
-
-// Note prints one styled line straight into the transcript. Multi-line text is
-// split so each row is committed separately and the live region stays aligned.
 func (u *cliUI) Note(sty, s string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -520,9 +560,6 @@ func (u *cliUI) Note(sty, s string) {
 	u.drawLive()
 }
 
-// Card records a tool call. A card announced or updated as still running goes
-// into the live region; one that reports completed or failed is committed to
-// the transcript with its result and removed from the live set.
 func (u *cliUI) Card(up toolCallUpdate) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -534,10 +571,12 @@ func (u *cliUI) Card(up toolCallUpdate) {
 		u.order = append(u.order, up.ToolCallId)
 	}
 	if up.Title != "" {
-		c.title = sanitize(up.Title)
-	}
-	if up.ToolKind != "" {
-		c.kind = up.ToolKind
+		// One row per card (liveLines): a multi-line command shows its first line and "…".
+		title, _, more := strings.Cut(strings.TrimSpace(sanitize(up.Title)), "\n")
+		if more {
+			title += " …"
+		}
+		c.title = title
 	}
 	if up.Status != "" {
 		c.status = up.Status
@@ -549,6 +588,11 @@ func (u *cliUI) Card(up toolCallUpdate) {
 	}
 
 	if c.status != "completed" && c.status != "failed" {
+		for _, ct := range up.Content {
+			if ct.Type == "content" && ct.Content != nil && ct.Content.Type == "text" {
+				c.text = strings.Split(strings.TrimRight(sanitize(ct.Content.Text), "\n"), "\n")
+			}
+		}
 		u.drawLive()
 		return
 	}
@@ -568,28 +612,20 @@ func (u *cliUI) Card(up toolCallUpdate) {
 }
 
 func (u *cliUI) dropCall(c *cliCall) {
-	id := c.id
-	delete(u.calls, id)
+	delete(u.calls, c.id)
 	if c.termID != "" {
 		delete(u.terms, c.termID)
 	}
-	for i, o := range u.order {
-		if o == id {
-			u.order = append(u.order[:i], u.order[i+1:]...)
-			break
-		}
-	}
+	u.order = slices.DeleteFunc(u.order, func(o string) bool { return o == c.id })
 }
 
-// contentLines renders a finished card's result blocks. Text is previewed, a
-// diff is rendered as a hunk, and a terminal block is dropped: its output was
-// already on screen live and the agent sends the same bytes as text.
+// Terminal blocks are skipped: their output was shown live and also arrives as text.
 func (u *cliUI) contentLines(cs []ToolCallContent) []string {
 	var out []string
 	for _, c := range cs {
 		switch c.Type {
 		case "diff":
-			out = append(out, diffLines(c.Path, c.OldText, c.NewText, u.tty)...)
+			out = append(out, u.diffLines(c.Path, c.OldText, c.NewText)...)
 		case "content":
 			if c.Content == nil || c.Content.Type != "text" {
 				continue
@@ -607,21 +643,21 @@ func (u *cliUI) contentLines(cs []ToolCallContent) []string {
 	return out
 }
 
-// Plan replaces the current plan. It stays in the live region rather than being
-// committed on every change: a plan is current state, and each entry's status
-// is rewritten several times per turn.
 func (u *cliUI) Plan(entries []PlanEntry) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.plan = make([]PlanEntry, len(entries))
-	for i, e := range entries {
-		e.Content = sanitize(e.Content)
-		u.plan[i] = e
+	// Every entry codehalter sends is a phase: it goes into the status row.
+	if len(entries) > 0 {
+		u.phase, u.meter = "", ""
+		for _, e := range entries {
+			if e.Meta != nil && e.Status == "in_progress" {
+				u.phase, u.meter = e.Meta.Phase, e.Meta.Meter
+			}
+		}
 	}
 	u.drawLive()
 }
 
-// Usage updates the context meter shown in the status line.
 func (u *cliUI) Usage(used, size int) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -629,22 +665,23 @@ func (u *cliUI) Usage(used, size int) {
 	u.drawLive()
 }
 
-func (u *cliUI) Mode(mode string) {
+// Speeds keeps the last call's rates; a call with nothing to measure (its whole prompt
+// came from the cache) leaves the previous one shown.
+func (u *cliUI) Speeds(pp, tg float64) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	u.mode = mode
+	if pp > 0 {
+		u.pp = pp
+	}
+	if tg > 0 {
+		u.tg = tg
+	}
 	u.drawLive()
 }
 
-// TerminalTail publishes the last few lines of a running command so they show
-// under its card. Keyed by terminal id, which is what the card's content block
-// names.
 func (u *cliUI) TerminalTail(tid string, lines []string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if len(lines) > cliTermTail {
-		lines = lines[len(lines)-cliTermTail:]
-	}
 	for i, l := range lines {
 		lines[i] = sanitize(l)
 	}
@@ -652,11 +689,6 @@ func (u *cliUI) TerminalTail(tid string, lines []string) {
 	u.drawLive()
 }
 
-// ---------------------------------------------------------------------------
-// Turn lifecycle
-// ---------------------------------------------------------------------------
-
-// Begin starts a turn: the status line appears and the spinner runs.
 func (u *cliUI) Begin() {
 	u.refreshSize()
 	u.mu.Lock()
@@ -666,30 +698,21 @@ func (u *cliUI) Begin() {
 	u.drawLive()
 }
 
-// End finishes a turn, committing anything still partial and clearing the live
-// region. Cards still marked running are committed as interrupted: they were
-// announced, so leaving them only in an erased live region would lose them.
 func (u *cliUI) End() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.flushRow()
-	for _, id := range append([]string(nil), u.order...) {
+	for _, id := range slices.Clone(u.order) {
 		c := u.calls[id]
-		if c == nil {
-			continue
-		}
 		u.dropCall(c)
 		u.emitLine(u.clip(u.style("· "+c.title+" (interrupted)", ansiDim)))
 	}
 	u.busy = false
-	u.plan = nil
 	u.terms = map[string][]string{}
 	u.eraseLive()
 	u.out.Flush()
 }
 
-// Tick advances the spinner and refreshes elapsed times. Driven by the CLI's
-// render ticker while a turn runs.
 func (u *cliUI) Tick() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -700,9 +723,7 @@ func (u *cliUI) Tick() {
 	u.drawLive()
 }
 
-// Suspend clears the live region and stops it being redrawn, so a question can
-// be asked inline and the user's typing is not overwritten. The turn keeps
-// running underneath; Resume brings the region back.
+// Suspend hides the live region for an inline question; the turn keeps running.
 func (u *cliUI) Suspend() {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -719,44 +740,56 @@ func (u *cliUI) Resume() {
 	u.drawLive()
 }
 
-// Prompt writes the input prompt with no trailing newline, so the terminal's
-// own echo of what the user types continues on the same row. This is the one
-// place that deliberately leaves the cursor mid-row, which is why the live
-// region must already be empty when it runs.
 func (u *cliUI) Prompt(s string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.inputOn {
+		u.inPrompt = strings.TrimLeft(s, "\n")
+		u.drawLive()
+		return
+	}
 	u.eraseLive()
 	u.promptStr, u.promptBroken = s, false
 	u.out.WriteString(u.style(s, ansiBold))
 	u.out.Flush()
 }
 
-// Submitted is called with the line the user just entered. On a terminal the
-// echo already happened and the cursor is back at the start of a row, so this
-// only clears the prompt state. Piped in, nothing echoed, and the prompt row is
-// still open: writing the line here is what closes it.
+// Ask is Prompt for a question's answer: output arriving before Submitted waits for it,
+// unless the input row is drawn apart from the output anyway.
+func (u *cliUI) Ask(s string) {
+	u.Prompt(s)
+	u.mu.Lock()
+	u.asking = !u.inputOn
+	u.mu.Unlock()
+}
+
 func (u *cliUI) Submitted(text string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.inputOn {
+		// What was entered stays in the transcript; the row is ready for the next line.
+		if text != "" {
+			u.emitLine(u.style(u.inPrompt, ansiBold) + strings.ReplaceAll(text, "\n", "\n  "))
+		}
+		u.inBuf, u.inCur, u.inPrompt = nil, 0, "❯ "
+		u.drawLive()
+		return
+	}
 	if u.promptStr != "" && u.echoInput {
 		u.out.WriteString(text)
 		u.out.WriteString("\n")
-		u.out.Flush()
 	}
-	u.promptStr, u.promptBroken = "", false
+	u.promptStr, u.promptBroken, u.asking = "", false, false
+	for _, l := range u.held {
+		u.out.WriteString(l)
+		u.out.WriteString("\n")
+	}
+	u.held = nil
+	u.out.Flush()
 }
 
-// ---------------------------------------------------------------------------
-// Diff rendering
-// ---------------------------------------------------------------------------
-
-// diffLines renders an edit as a unified-ish hunk: common leading and trailing
-// lines are trimmed and what's left is shown as removed then added. That is not
-// a minimal diff (no LCS, so two separate edits in one file come back as one
-// wide hunk) but it IS a correct one, it is exact for the single-region edits
-// edit_file actually makes, and it costs no dependency.
-func diffLines(path string, oldText *string, newText string, color bool) []string {
+// Trims common head and tail only (no LCS): exact for edit_file's single-region edits, no dependency.
+func (u *cliUI) diffLines(path string, oldText *string, newText string) []string {
 	var old []string
 	if oldText != nil && *oldText != "" {
 		old = strings.Split(sanitize(*oldText), "\n")
@@ -776,21 +809,15 @@ func diffLines(path string, oldText *string, newText string, color bool) []strin
 	}
 	rm, add := old[pre:len(old)-suf], nw[pre:len(nw)-suf]
 
-	paint := func(s, sty string) string {
-		if !color {
-			return s
-		}
-		return sty + s + ansiReset
-	}
 	head := fmt.Sprintf("  %s +%d -%d", sanitize(path), len(add), len(rm))
-	out := []string{paint(head, ansiDim)}
+	out := []string{u.style(head, ansiDim)}
 	emit := func(lines []string, sign, sty string) {
 		for i, l := range lines {
 			if i == cliDiffLines {
-				out = append(out, paint(fmt.Sprintf("    … %d more %s lines", len(lines)-i, sign), ansiDim))
+				out = append(out, u.style(fmt.Sprintf("    … %d more %s lines", len(lines)-i, sign), ansiDim))
 				return
 			}
-			out = append(out, paint("  "+sign+" "+strings.TrimRight(l, " \t"), sty))
+			out = append(out, u.style("  "+sign+" "+strings.TrimRight(l, " \t"), sty))
 		}
 	}
 	emit(rm, "-", ansiRed)

@@ -1,536 +1,259 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 )
 
-// beginTurn registers the in-flight turn's cancel.
-func (s *Session) beginTurn(c context.CancelFunc) {
-	s.turnCancelMu.Lock()
-	s.turnCancel = c
-	s.turnCancelMu.Unlock()
-}
-
-// cancelTurn cancels the in-flight turn's ctx (Cancel button, or a new prompt
-// superseding it). The caller does NOT wait for the turn to finish.
-func (s *Session) cancelTurn() {
-	s.turnCancelMu.Lock()
-	c := s.turnCancel
-	s.turnCancelMu.Unlock()
-	if c != nil {
-		c()
-	}
-}
-
-// markSuperseding flags that a freshly-arrived prompt is about to cancel and
-// replace the in-flight turn, so that turn's cancel handler stays silent (the
-// new turn speaks for itself) instead of reporting an editor abort. Pairs with
-// adoptTurn, which clears the flag once the new turn has taken over.
-func (s *Session) markSuperseding() {
-	s.turnCancelMu.Lock()
-	s.superseding = true
-	s.turnCancelMu.Unlock()
-}
-
-// adoptTurn clears the supersede flag once the new prompt has acquired turnMu
-// and become the active turn (the superseded turn has fully unwound by then).
-func (s *Session) adoptTurn() {
-	s.turnCancelMu.Lock()
-	s.superseding = false
-	s.turnCancelMu.Unlock()
-}
-
-// superseded reports whether a newly-arrived prompt flagged the in-flight turn
-// for replacement (markSuperseding). A superseded turn's cancel handler stays
-// silent; a plain editor abort / client-side timeout surfaces its reason.
-func (s *Session) superseded() bool {
-	s.turnCancelMu.Lock()
-	defer s.turnCancelMu.Unlock()
-	return s.superseding
-}
-
 const sessionDir = ".codehalter"
 
 type Message struct {
-	Role     string      `toml:"role"`
-	Content  string      `toml:"content"`
-	Images   []ImageData `toml:"images,omitempty"`
-	ToolUses []ToolUse   `toml:"tool_uses,omitempty"`
-	// StartedAt is the wall-clock time the message was created. For user
-	// turns this is when the prompt arrived; for assistant turns this is
-	// when the first llmStream call of that turn started. Always populated
-	// for newly-created messages; older session files decode with the zero
-	// value (omitempty keeps them clean).
-	StartedAt time.Time `toml:"started_at,omitempty"`
-	// DurationMs is meaningful only for assistant turns: cumulative wall-clock
-	// time spent in llmStream calls for that turn (the agentic loop may run
-	// multiple llmStream → tools → llmStream cycles, all attributed here).
-	// Excludes tool execution time — those are timed individually on each
-	// ToolUse. Zero on user turns.
-	DurationMs int64 `toml:"duration_ms,omitempty"`
-	// Phase tags which pipeline stage produced this message: "plan",
-	// "execute", "verify", "document", or "subagent". Empty on user turns
-	// and on legacy entries from before this field existed.
-	Phase string `toml:"phase,omitempty"`
-	// PromptTokens is the server-reported prompt_tokens of the call that produced
-	// this assistant message — the cumulative context size at that point. The
-	// 400-recovery keep-window (keepWindowStart) sizes by these real tokens. 0 on
-	// user turns, on backends that don't report usage, and on legacy entries.
+	Role      string      `toml:"role"`
+	Content   string      `toml:"content"`
+	Images    []ImageData `toml:"images,omitempty"`
+	ToolUses  []ToolUse   `toml:"tool_uses,omitempty"`
+	StartedAt time.Time   `toml:"started_at,omitempty"`
+	// PromptTokens is the context size at the call that produced this assistant
+	// message (keepWindowStart sizes by it); 0 when unknown.
 	PromptTokens int `toml:"prompt_tokens,omitempty"`
+	// Origin marks a user message that starts work: what /spec verify tells chat from the
+	// loop and from fix cards by. Empty for messages inside a turn. Never sent to the model.
+	Origin string `toml:"origin,omitempty"`
 }
 
+const (
+	originChat = "chat"
+	originAuto = "auto"
+)
+
 type ImageData struct {
-	// ID is the content-addressed handle ("img_<sha256[:8] hex>") assigned at
-	// extraction. The bytes themselves live in <cwd>/.codehalter/images/<id>.<ext>;
-	// buildLLMContext re-reads them every turn (so the wire shape stays
-	// byte-identical for the prefix cache) and view_image fetches them after
-	// compaction has dropped the owning message.
+	// The bytes live in .codehalter/images and are re-read every turn, so the wire
+	// stays byte-identical for the prefix cache.
 	ID       string `toml:"id,omitempty"`
 	MimeType string `toml:"mime_type"`
 }
 
 type ToolUse struct {
-	// ID is a per-session stable handle ("tu_<n>") generated when the tool
-	// loop records the call. Surfaced in head/tail truncation hints so the
-	// model can call `view_output id=tu_N` to retrieve any portion of the
-	// full result without re-running the original tool. Empty for ToolUses
-	// loaded from older session files; view_output treats those as not found.
 	ID string `toml:"id,omitempty"`
-	// CallID is the tool_call id the MODEL emitted (OpenAI linkage between the
-	// assistant's tool call and its result). It's what the live wire used, so we
-	// replay it verbatim from history — using the internal useID (ID) instead
-	// would change the bytes and bust the prefix cache at every phase boundary.
-	// Empty for older sessions / models that don't send ids → falls back to ID.
+	// CallID is the model's own tool_call id, replayed verbatim: substituting ID
+	// would change the bytes and bust the prefix cache. Empty falls back to ID.
 	CallID string `toml:"call_id,omitempty"`
 	Name   string `toml:"name"`
 	Input  string `toml:"input"`
 	Output string `toml:"output"`
-	// Failed is set by the tool handler when it observed a hard failure
-	// (e.g. run_task saw a non-zero exit). Authoritative — verify uses it
-	// to override an LLM "success=true" verdict when codehalter itself
-	// knows the call failed. omitempty keeps older session files clean.
+	// Failed is authoritative: it overrides an LLM "success=true" verdict.
 	Failed bool `toml:"failed,omitempty"`
-	// StartedAt and DurationMs are populated by runToolLoop when the call is
-	// dispatched. omitempty keeps older session files decoding cleanly. For
-	// deduped cache hits DurationMs is near zero and StartedAt is when the
-	// hit happened, not when the original call ran.
+	// For a dedup hit these describe the hit, not the original call.
 	StartedAt  time.Time `toml:"started_at,omitempty"`
 	DurationMs int64     `toml:"duration_ms,omitempty"`
-	// ImageID is the content-addressed id of an image this call PRODUCED
-	// (screenshot). Replay rebuilds the multimodal parts from those STORED
-	// bytes instead of re-running the tool: unlike view_image, re-rendering is
-	// not pure — the page may have changed since — and different bytes in the
-	// middle of the prompt reprocess every message behind them. Empty for
-	// every other tool and for older sessions.
+	// ImageID is an image this call produced. Replay uses the stored bytes, never
+	// a re-run: re-rendering is not pure, and new bytes would bust the cache.
 	ImageID string `toml:"image_id,omitempty"`
-}
-
-// summariseTask is one queued background-summariser job: the messages of one
-// completed turn to feed the structured-turn prompt. The connection is picked
-// at enqueue time so the runner doesn't have to reach back into the agent.
-type summariseTask struct {
-	Turn []Message
-	Conn *LLMConnection
-	// Prompt is the SUMMARISE.md body for the paste-mode render (unused in
-	// prefix-extension mode, where it is already baked into Msgs).
-	Prompt string
-	// Msgs, when non-nil, switches the note generation to prefix-extension
-	// mode: the full wire context frozen at turn end plus the summarise
-	// instruction (see appendSummariseMsgs). Frozen at ENQUEUE time so a
-	// queued task still summarises exactly its own turn even when the next
-	// turn has already started by the time the worker runs it.
-	Msgs []llmMessage
+	// SameImageAs: the call produced a picture already in view, sent as a note
+	// instead (see imageInView); it still counts as a look.
+	SameImageAs string `toml:"same_image_as,omitempty"`
+	// Changed: the call changed the project (observed, see changedBy). Not stored.
+	Changed bool `toml:"-"`
 }
 
 type Session struct {
 	ID        string    `toml:"id"`
 	Cwd       string    `toml:"cwd"`
 	CreatedAt time.Time `toml:"created_at"`
-	Depth     int       `toml:"depth,omitempty"`
-	ParentID  string    `toml:"parent_id,omitempty"`
 	Summary   string    `toml:"summary,omitempty"`
-	// FoldedSummary is a shorter rewrite of Summary, produced in the background
-	// after a compaction (scheduleSummaryFold) and consumed as the BASE of the
-	// next one. Empty means "no rewrite ready", which is not an error: the next
-	// compaction then concatenates onto Summary exactly as it always did.
-	//
-	// It is a separate field rather than an in-place shrink of Summary because
-	// Summary leads every request. Rewriting it between compactions would
-	// re-render the entire prompt behind it for a saving nothing reads until the
-	// next compaction, which is the one moment the prefix is already gone.
-	FoldedSummary string `toml:"folded_summary,omitempty"`
-	// Title is the thread name shown in the client, derived from the first user
-	// message (see setSessionTitle). Persisted so a reloaded thread keeps the
-	// name it was given instead of reverting to its id.
-	Title string `toml:"title,omitempty"`
-	// SystemPrompt holds the rendered skills + project context that leads
-	// every LLM call. Set on the first user turn (see Prompt) and refreshed
-	// after each foldHistory rotation — so it survives the summariser
-	// (which otherwise compresses skills away) and reflects current
-	// .codehalter/SKILL-*.md content. Emitted by buildLLMContext as the
-	// leading user message before any Summary.
-	SystemPrompt string    `toml:"system_prompt,omitempty"`
-	Messages     []Message `toml:"messages"`
-	// Shadow holds one structured per-turn note (Goal / Constraints / Progress /
-	// Decisions / Next Steps / Critical Context, per SUMMARISE.md) for every
-	// COMPLETED turn since the last compaction — produced by the background
-	// summariser at each turn boundary. foldHistory folds the whole buffer
-	// into Summary when it rotates, so a note exists for every turn it archives.
-	// Persisted (toml) so the notes survive a restart; the live context never
-	// shows them — they exist only to feed the next compaction.
+	// FoldedSummary is the base for the next compaction. Separate from Summary,
+	// which leads every request: shrinking that in place would re-render the prompt.
+	FoldedSummary string    `toml:"folded_summary,omitempty"`
+	Title         string    `toml:"title,omitempty"`
+	SystemPrompt  string    `toml:"system_prompt,omitempty"`
+	Messages      []Message `toml:"messages"`
+	// Shadow holds one note per completed turn since the last compaction; never in the live context.
 	Shadow   []string `toml:"shadow,omitempty"`
-	filePath string
-	// mcpOffer holds the editor's own MCP server list, as it arrived on
-	// session/new. Not persisted: it's the client's configuration, re-sent on
-	// every connect, and offerMCPImport consumes it once at bootstrap.
 	mcpOffer []acpMCPServer
-	// phaseActive/phaseCurrent track the plan UI state. Not persisted.
-	// phaseActive=true means a phase entry is showing as in_progress and
-	// must be marked completed before Prompt returns; phaseCurrent is the
-	// 0-based index into phaseNames it refers to. Guarded by phaseMu, NOT
-	// the main session mu — llmStream calls setStatus mid-stream during long
-	// calls while session writers hold sess.mu, so reusing sess.mu for phase
-	// reads would deadlock.
+	// phaseMu, not mu: llmStream updates the status while writers hold mu.
 	phaseMu      sync.Mutex
 	phaseActive  bool
 	phaseCurrent int
-	// planTableShown records that the planner's subtasks already streamed into
-	// the transcript as a live table (see planTableSink), so renderPlan prints
-	// its heading alone instead of repeating the list. Consumed on read: a later
-	// mid-run revision never went through submit_plan, has nothing on screen, and
-	// must still render in full. Under phaseMu for the same reason as the fields
-	// above, it is written from the SSE read loop.
+	// Under phaseMu: what the status shows besides the phase. meter is what runs now (a model
+	// call's progress, "queued"), meterFn its live source; pp and tg the last call's speeds;
+	// phaseTicking, that the one-second ticker runs.
+	meter          string
+	meterFn        func() string
+	pp, tg         float64
+	phaseTicking   bool
 	planTableShown bool
-	// launchedSubagents caches results of completed launch_subagent tasks,
-	// keyed by a hash of (instructions, context). When the model re-asks for
-	// an identical subagent (within or across launch_subagent tool calls in
-	// the same session), we return the prior result instead of running it
-	// again — small models forget what they already launched. Not persisted
-	// across process restarts: re-running after a restart re-launches, which
-	// is the safer default than feeding back a possibly-stale cached result.
-	launchedSubagentsMu sync.Mutex
-	launchedSubagents   map[string]string
-	// webBodies caches the full raw page text from web_read / web_read_raw,
-	// keyed by URL. When the LLM-visible result is truncated, the model can
-	// re-call with offset/limit to view a specific range — we slice from the
-	// cache instead of issuing another HTTP fetch, so paging through a long
-	// document is free after the first read. In-memory only; lost on restart.
-	webBodiesMu sync.Mutex
-	webBodies   map[string]string
-	// webResults caches the final rendered output (summary or raw-truncated)
-	// keyed by URL+mode. A literal-repeat web_read on the same URL skips both
-	// the HTTP fetch AND the re-summarize, and the model receives the exact
-	// same string — friendly to the LLM prefix cache. Range requests bypass
-	// this and go through webBodies/sliceWebBody.
-	webResultsMu sync.Mutex
-	webResults   map[string]string
-	// mu serialises the Save() encoder write against concurrent mutators —
-	// AddUser/AddAssistant/etc. acquire it before touching persisted fields
-	// so a Save() landing in parallel doesn't observe a torn slice. Prompt
-	// runs synchronously per session so contention is rare; the lock mainly
-	// exists for the background summariser path (which reads Messages while
-	// the foreground turn may be appending) and for the encoder invariant
-	// inside saveLocked. The phaseMu and launchedSubagentsMu fields above
-	// intentionally have their own locks — they don't touch persisted state
-	// and must not block on mu.
+	// mu guards the persisted fields so a parallel Save never encodes a torn slice.
 	mu sync.Mutex
-	// turnStartIdx is the index into Messages where the current top-level turn
-	// begins (set by markTurnStart at runTurn entry, after the human/card prompt
-	// is appended). Mid-turn compaction keeps Messages[turnStartIdx:] verbatim
-	// and folds only the completed turns before it; synthetic user messages a
-	// turn injects (subtask/doc prompts, mid-session skills) all land after
-	// turnStartIdx and stay in the in-flight turn. In-memory only: a turn never
-	// spans a restart, and the next prompt re-marks it. Guarded by mu.
+	// turnStartIdx is guarded by mu.
 	turnStartIdx int
-	// summariseQueue is a FIFO of completed-turn snapshots waiting for the
-	// background summariser. backgroundSummarise enqueues exactly one per turn
-	// boundary; a single worker goroutine drains the queue sequentially (the LLM
-	// connection's slot semaphore would serialise concurrent runners anyway).
-	// summariseUndone counts enqueued-minus-finished; waitSummarise blocks while
-	// it exceeds 0 — compaction folds the whole Shadow buffer with no anchor held
-	// back, so every note must have landed first. summariseCond is
-	// lazy-initialised under summariseMu on first use so tests that construct
-	// Session{} directly don't need to know about it.
+	// summariseUndone is enqueued minus finished; waitSummarise blocks on it because
+	// compaction folds the whole Shadow. summariseCond is created on first use.
 	summariseMu      sync.Mutex
-	summariseQueue   []summariseTask
+	summariseQueue   []func()
 	summariseRunning bool
 	summariseUndone  int
 	summariseCond    *sync.Cond
-	// readDedup remembers read_file outcomes for the current Prompt() turn
-	// so a literal-repeat read (same path+line+limit, file unchanged) is
-	// rejected instead of re-running. Reset at the top of Prompt(); busted
-	// for a specific path whenever edit_file / write_file writes through
-	// fsWrite. In-memory only.
-	readDedupMu sync.Mutex
-	readDedup   map[string]readDedupEntry
-	// searchDedup remembers search_text outcomes for the current Prompt() turn
-	// so a literal-repeat search (same query+path+flags, same results) is flagged
-	// with a note instead of silently re-running. Keyed by the full args, value
-	// is the fnv hash of the result. Same lifecycle as readDedup: reset at the
-	// top of Prompt(). In-memory only.
-	searchDedupMu sync.Mutex
-	searchDedup   map[string]uint64
-	// readCursor remembers, per file path, the next 1-based line continue_read
-	// should serve — set when read_file (or continue_read) returns a partial
-	// chunk, cleared when a chunk reaches EOF. Lets continue_read page forward
-	// with no line math. Same lifecycle as readDedup: reset each Prompt() turn,
-	// busted for a path on write. In-memory only.
-	readCursorMu sync.Mutex
-	readCursor   map[string]int
-	// editFailedPaths is the set of paths where edit_file returned "not found"
-	// this turn. A failed edit signals that the model's remembered content is
-	// stale or inexact, so the next read_file on that path must bypass the
-	// readContentInContext guard — the model genuinely needs a fresh look to
-	// get the exact old_text for a retry. Cleared when the path is re-read.
-	// Same lifecycle as readDedup: reset at the top of Prompt(). In-memory only.
-	editFailedPathsMu sync.Mutex
-	editFailedPaths   map[string]bool
-	// One turn per session. turnMu is held across the whole turn; a new prompt
-	// cancelTurn()s the in-flight one then Lock()s here, so turns never overlap
-	// (overlap raced compaction → two divergent context snapshots). turnCancel is
-	// the in-flight turn's ctx cancel, fired by the Cancel button or a superseding
-	// prompt; guarded by turnCancelMu. superseding (same mutex) is set by a
-	// newly-arrived prompt right before it cancels the in-flight turn, so that
-	// turn's cancel handler can tell a supersede (stay silent) from a plain
-	// editor abort / client-side timeout (surface the reason).
-	turnMu       sync.Mutex
-	turnCancelMu sync.Mutex
-	turnCancel   context.CancelFunc
-	superseding  bool
-	// promptSkills is the set of SKILL-*.md filenames folded into the current
-	// SystemPrompt. A skill seeded on disk AFTER the prompt was built is injected
-	// as a user message (NOT folded into the prompt — that would bust the KV
-	// prefix cache) until the next compaction re-renders the prompt. Runtime-only.
+	ctl              turnControl
+	// turnMu is a leaf lock: nothing is called while holding it.
+	turnMu  sync.Mutex
+	turn    turnState
+	lineage cacheLineage
+	rt      sessionRuntime
+	// promptSkills are the skills in SystemPrompt (see checkEnv).
 	promptSkills []string
-	// DisclosedSkills is the set of deferred SKILL-*.md filenames already
-	// injected into this session under skills="auto" (see discloseSkills). The
-	// system-prompt renderer keeps a deferred skill out of the prefix until it
-	// appears here. Persisted so a resumed session's rebuilt prompt still
-	// carries the skills its history already relies on.
-	DisclosedSkills []string `toml:"disclosed_skills,omitempty"`
-	// PinnedLLMIdx pins a subagent session to one [[llm]] entry. All LLM
-	// calls from this session route to settings.LLM[PinnedLLMIdx] regardless
-	// of role — cache-coherence trumps per-role sampler matching, the conn
-	// stays warm across the subagent's whole run instead of bouncing on every
-	// plan/execute switch. -1 means no pin (main session, tests).
-	// Breadth-first assigned at creation by launch_subagent: the first
-	// subagent in a batch pins to LLM[0], the rest fan out across LLM[1+]
-	// up to each conn's parallel cap.
-	PinnedLLMIdx int `toml:"pinned_llm_idx,omitempty"`
-	// DisplayLabel is the short human-readable name the runner uses when it
-	// surfaces this session's activity to its parent ("subagent 1",
-	// "subagent 2", …). Not persisted — purely a UI breadcrumb so the
-	// parent's chat can show what each subagent is doing tool-call by
-	// tool-call. Set by launch_subagent at creation; empty on main sessions
-	// (we don't forward main-session updates anywhere).
-	DisplayLabel string `toml:"-"`
-	// llmHash is hex sha256 of the concatenated global + project
-	// settings.toml contents at the time of the last successful LLM probe.
-	// ensureLLM short-circuits the probe when the current hash matches AND
-	// we still have a reachable connection — the file the user could have
-	// edited hasn't actually changed, no need to re-handshake every prompt.
-	// Reset to "" by failed probes so the next prompt re-probes from scratch.
-	// In-memory only; a restart pays one extra probe on the first turn.
-	llmHash string `toml:"-"`
-	// knownStacks is the set of language stacks detectStacks reports for
-	// this session's cwd, with the meta-tooling entries (bash, devcontainer)
-	// filtered out — those aren't stacks, they're scaffolding every project
-	// uses. Populated by checkEnv on every Prompt turn so a stack appearing
-	// or disappearing mid-session takes effect on the next turn.
-	knownStacks []string `toml:"-"`
-	// knownRunners is the set of runner-config kinds detectRunnerConfigs
-	// reports for cwd (just/make/npm/cargo/go) — driven purely by config-
-	// file presence so we can flag "user has a justfile but `just` not on
-	// PATH" as a fixable problem, distinct from "no runner at all".
-	knownRunners []string `toml:"-"`
-	// capabilitiesShown gates the full capabilities banner to once per session.
-	// The first prepare (bootstrap) always emits it, so a session opens with a
-	// visible statement of what codehalter found; afterwards routine changes
-	// (a tool installed, an MCP server starting, a re-probe) surface as
-	// one-line notices / fix cards instead of re-dumping the whole setup
-	// screen mid-conversation. Not persisted — a restart re-shows it once.
-	capabilitiesShown bool `toml:"-"`
-
-	// Per-turn stats for the "✅ Done" line: reset at Prompt start, summed
-	// during the turn, read at the end. turnStart is wall-clock; turnHumanWaitMs
-	// is time blocked on user-input cards (doPermissionRequest) so it can be
-	// subtracted out; turn*Tokens sum every llmStream call's reported usage.
-	// Guarded by turnStatsMu — background goroutines (summariser, git-commit)
-	// add tokens concurrently with the foreground turn.
-	turnStatsMu          sync.Mutex
-	turnStart            time.Time
-	turnHumanWaitMs      int64
-	turnCompletionTokens int
-	// turnWastedCompletion is decode the harness threw away: a <think> stall, a
-	// stream-rule abort, a cap retry. It is already inside turnCompletionTokens,
-	// so without a name of its own it reads as productive output. It is usually
-	// the largest single cost in a bad turn: one measured stall burned 8192
-	// tokens, which at that server's 37.7 tok/s is 3.6 min, against 57 s for the
-	// prefix loss the same event caused.
-	turnWastedCompletion int
-	// turnEvaluatedPrompt is the sent-but-not-cached prompt total (Σ of each call's
-	// prompt_tokens − cached_tokens) — the real prompt work, shown on the Done line.
-	// We deliberately do NOT sum the gross prompt_tokens (which re-counts the cached
-	// prefix every call). When no backend reports a cache split, haveServerCache is
-	// false and the line falls back to turnLastPrompt (final context size).
-	turnEvaluatedPrompt int
-	turnLastPrompt      int // most recent call's prompt size
-	haveServerCache     bool
-	turnPromptMs        int64 // eval time (server prompt_ms, else TTFT)
-	turnGenMs           int64 // generation time
-	// Prefix-cache rewind detector, fed by the tool loop's calls only (see
-	// noteCacheLineage). cacheRewinds counts the calls that had to re-read
-	// prompt the previous call already sent; cacheRewound sums those tokens.
-	//
-	// cachePrevPrompt deliberately does NOT reset per turn (resetTurnStats
-	// leaves it alone): the comparison point is a property of the conversation,
-	// not of the turn. Zeroing it at every turn start exempted the FIRST call of
-	// every turn from the check, which is the one place message-list mutations
-	// actually land (compaction, a summariser fold, a tool result that replays
-	// differently than it was sent). An 11.6h session logged zero CACHE lines
-	// with a 30466-token rewind sitting in it, at exactly such a boundary.
-	cachePrevPrompt int
-	// cachePrevRender is the previous call's renderKey: the template-affecting
-	// params it was sent with. Kept next to cachePrevPrompt, and dropped by the
-	// same two callers, because it answers the question the token counts raise
-	// but cannot settle: a rewind means the prompt was re-rendered, and this
-	// says whether WE asked for that (a role switch across differing
-	// chat_template_kwargs) or the server did it on its own.
-	//
-	// Not persisted, like the rest of the lineage: a restart re-prefills anyway,
-	// so there is no cache to reason about across process boundaries.
-	cachePrevRender string
-	// cachePrevAt is when the previous call landed. A rewind cannot say why on
-	// token counts alone, and the gap separates the two causes better than
-	// anything else in the record: on the 11.6h session that motivated this
-	// detector, every stable-rendering rewind sat behind an idle gap (2h06 and
-	// 13min), while the calls seconds apart never lost a prefix. Servers reclaim
-	// idle slots, and no line of settings.toml prevents that.
-	cachePrevAt  time.Time
-	cacheRewinds int
-	cacheRewound int
-	// cacheRewindsRender is the subset of cacheRewinds where the two calls
-	// carried different template params. Split out because the fix differs: for
-	// those the user has one line of settings.toml to change, for the rest the
-	// cause is elsewhere entirely.
-	cacheRewindsRender int
+	// llmHash is the settings files' hash at the last successful probe.
+	llmHash           string   `toml:"-"`
+	knownStacks       []string `toml:"-"`
+	capabilitiesShown bool     `toml:"-"`
+	// toolLog holds every tool call since the /spec loop last trimmed it (guarded by
+	// mu): a compaction mid-round folds the history's copy away. toolLogBase is the
+	// position of toolLog[0]; positions never move.
+	toolLog     []ToolUse `toml:"-"`
+	toolLogOn   bool      `toml:"-"`
+	toolLogBase int       `toml:"-"`
 }
 
-// resetTurnStats starts a fresh per-turn measurement window at start.
-func (s *Session) resetTurnStats(start time.Time) {
-	s.turnStatsMu.Lock()
-	s.turnStart = start
-	s.turnHumanWaitMs = 0
-	s.turnCompletionTokens = 0
-	s.turnWastedCompletion = 0
-	s.turnEvaluatedPrompt = 0
-	s.turnLastPrompt = 0
-	s.haveServerCache = false
-	s.turnPromptMs = 0
-	s.turnGenMs = 0
-	// cachePrevPrompt survives on purpose — see its declaration. The counters
-	// below are per-turn reporting and do reset.
-	s.cacheRewinds = 0
-	s.cacheRewound = 0
-	s.cacheRewindsRender = 0
-	s.turnStatsMu.Unlock()
+// turnState is replaced per turn, so it needs no reset code. Background calls
+// add their tokens to whichever turn is current.
+type turnState struct {
+	start       time.Time
+	humanWaitMs int64
+	stats       turnReport
 }
 
-// addTurnTokens folds one call's usage into the turn: it sums completion and the
-// evaluated (sent-but-not-cached) prompt tokens, and tracks the most recent
-// call's full prompt size for the no-cache fallback line. evaluated is -1 when
-// the backend reported no cache split (then haveServerCache stays false). prompt
-// is the full prompt size, used only for the context-size fallback — never summed.
+// cacheLineage does not reset per turn: a turn's first call is exactly where
+// message-list mutations land.
+type cacheLineage struct {
+	prompt int // its prompt_tokens
+	// render tells a rewind we caused (a different renderKey) from one the server did.
+	render string
+	// at: servers reclaim idle slots, so the gap since it hints at an eviction.
+	at time.Time
+}
+
+// sessionRuntime is never persisted. mu is a leaf.
+type sessionRuntime struct {
+	mu        sync.Mutex
+	webBodies map[string]string
+	// drifted marks paths rewritten from outside after our write (format-on-save).
+	// Not per turn: that drift routinely spans turns.
+	wroteHash map[string]string
+	drifted   map[string]bool
+	pending   []pendingInput
+	specStop  bool
+	// specAbort cancels the running /spec loop at once (`/spec abort`).
+	specAbort context.CancelFunc
+	// specFenceDir is read-only for the file tools while a /spec loop runs.
+	specFenceDir string
+	// specHandoff is the /spec redo audit's list of items, read when its turn ends.
+	specHandoff string
+	// specAudit: a bare /spec redo is auditing, so the planner's list is not asked about.
+	specAudit bool
+	// specVerify: /spec verify is reporting, so a plan's subtasks do not run.
+	specVerify bool
+	// stuckCalls: the calls a step repeated until the loop ended it, keyed like the
+	// repetition tracker, with their output. The turn's later steps get the output
+	// back instead of a run, until they write something (see runToolLoop).
+	stuckCalls map[string]string
+	// stuckOutputs: those calls' outputs as repeats are judged (repeatText): a changed
+	// command with the same answer is the same loop.
+	stuckOutputs map[uint64]bool
+	prevCall     toolCallBrief
+	// Later calls of the same reply were batched already and get no batching note.
+	replyStart bool
+	// jobRuns are the background jobs that exited: a /spec gate that ran as one counts.
+	jobRuns []jobRun
+	// startupFixes are the fix cards startup handed to a prompt that was waiting on it.
+	startupFixes []fixProblem
+}
+
+type jobRun struct {
+	cmd            string
+	code           int
+	started, ended time.Time
+	log            string // its output, kept after the exit
+}
+
+func (s *Session) recordJobRun(j jobRun) {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	s.rt.jobRuns = append(s.rt.jobRuns, j)
+	if len(s.rt.jobRuns) > 20 {
+		s.rt.jobRuns = s.rt.jobRuns[1:]
+	}
+}
+
+func (s *Session) markReplyStart() {
+	s.rt.mu.Lock()
+	s.rt.replyStart = true
+	s.rt.mu.Unlock()
+}
+
+type toolCallBrief struct {
+	name, args string
+	failed     bool
+}
+
+// startTurn keeps the cache lineage on purpose, see cacheLineage.
+func (s *Session) startTurn(start time.Time) {
+	s.turnMu.Lock()
+	s.turn = turnState{start: start}
+	s.turnMu.Unlock()
+}
+
+// evaluated < 0 means no cache split was reported. prompt is never summed.
 func (s *Session) addTurnTokens(prompt, completion, evaluated int) {
-	s.turnStatsMu.Lock()
-	s.turnCompletionTokens += completion
+	s.turnMu.Lock()
+	st := &s.turn.stats
+	st.calls++
+	st.completion += completion
 	if prompt > 0 {
-		s.turnLastPrompt = prompt
+		st.lastPrompt = prompt
 	}
 	if evaluated >= 0 {
-		s.turnEvaluatedPrompt += evaluated
-		s.haveServerCache = true
+		st.evaluatedPrompt += evaluated
+		st.haveServerCache = true
 	}
-	s.turnStatsMu.Unlock()
+	s.turnMu.Unlock()
 }
 
-// cacheRewindSlack is how far below the previous call's prompt this call's
-// cached count may sit before it counts as a rewind. Two things eat into it
-// legitimately: llama.cpp always drops the last cache chunk (measured at 4
-// tokens), and the end-of-turn summariser, when it lands on the foreground
-// connection, extends the prefix with an instruction tail that the next call
-// then trims back off. Both are in the low hundreds. Every rewind we have
-// actually diagnosed was thousands (3129, 4366, 6871, 9998 on one turn), so a
-// threshold here is generous without hiding anything worth reporting.
+// Covers llama.cpp dropping the last cache chunk and a trimmed summariser tail.
 const cacheRewindSlack = 1024
 
-// idleEvictionSuspect is the gap after which a rewind under an unchanged
-// rendering is more likely the server reclaiming an idle slot than anything
-// codehalter did. There is no protocol signal for an eviction, so this is a
-// judgement call from the record: on the 11.6h session that motivated the
-// detector, every same-rendering rewind sat behind a gap of minutes or hours
-// (2h06 and 13min), while the hundreds of calls seconds apart never lost a
-// prefix. One minute is comfortably above the largest gap a tool loop puts
-// between two calls on its own and well below any of the observed evictions.
+// No protocol signal marks an idle-slot eviction; a minute is above any tool-loop gap.
 const idleEvictionSuspect = time.Minute
 
-// wastedCompletionFloor is how much discarded decode a turn has to accumulate
-// before the Done line names it. A stream-rule abort throws away a few dozen
-// tokens as a matter of course and saying so every turn would be noise; the
-// events worth seeing are cap-length stalls and retries, which are thousands.
-// 256 tokens is ~7s of decode on the hardware this was measured on.
+// Below this, discarded decode is routine noise; stalls and retries are thousands.
 const wastedCompletionFloor = 256
 
-// cacheRewind is one detected rewind. tokens == 0 means there is nothing to
-// report; the other fields exist to answer "and whose fault is it", which the
-// token counts on their own cannot: the same prompt/cached pair is produced by
-// a rendering change, a rewritten message, and a server-side eviction alike.
+// tokens == 0 means no rewind.
 type cacheRewind struct {
-	tokens        int           // prompt the previous call had already sent, re-read now
-	prevRender    string        // the previous call's renderKey
-	renderChanged bool          // ... and this call asked for a different one
+	tokens        int // prompt the previous call had already sent, re-read now
+	prevRender    string
+	renderChanged bool
 	idle          time.Duration // wall gap since the previous call (0 if unknown)
 }
 
-// noteCacheLineage folds one tool-loop call's cache split into the turn's
-// rewind detector and describes what it found. render is this call's renderKey
-// and now is its wall time; both are recorded for the next call to compare
-// against, whether or not this one rewound.
-//
-// When the rendering changed, the rewind is explained: the two calls asked the
-// server for two different renderings of the same conversation, and a rendering
-// the server has never held has no shared prefix to hit. When it did NOT
-// change, that is just as informative: it rules the settings out and leaves the
-// idle gap to separate the remaining two causes, a server-side eviction from
-// something rewriting the middle of the prompt (a tool result that replayed
-// differently than it was sent, or a template that repositions content).
-//
-// Only the tool loop feeds this (LLMConnection.cacheLineage), because only the
-// tool loop guarantees the premise: each call's message list is the previous
-// call's plus an append, so the server should serve the whole previous prompt
-// from cache and evaluate just the new tail. The premise holds ACROSS turn
-// boundaries too (the next turn's first call is the same list plus one user
-// message), which is why the comparison point outlives resetTurnStats: the one
-// place where it genuinely does not hold drops it by hand (resetCacheLineage,
-// called by compaction).
-//
-// cached < 0 means the backend reported no cache split; then there is nothing
-// to compare and the lineage restarts at this call.
+// Only the tool loop feeds this: only there is each call the previous one plus
+// an append. cached < 0 (no split reported) restarts the lineage.
 func (s *Session) noteCacheLineage(prompt, cached int, render string, now time.Time) cacheRewind {
-	s.turnStatsMu.Lock()
-	defer s.turnStatsMu.Unlock()
-	prev, prevRender, prevAt := s.cachePrevPrompt, s.cachePrevRender, s.cachePrevAt
-	s.cachePrevPrompt, s.cachePrevRender, s.cachePrevAt = prompt, render, now
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	prev, prevRender, prevAt := s.lineage.prompt, s.lineage.render, s.lineage.at
+	s.lineage = cacheLineage{prompt: prompt, render: render, at: now}
 	out := cacheRewind{prevRender: prevRender}
 	if !prevAt.IsZero() && now.After(prevAt) {
 		out.idle = now.Sub(prevAt)
@@ -538,12 +261,7 @@ func (s *Session) noteCacheLineage(prompt, cached int, render string, now time.T
 	if prev <= 0 || cached < 0 {
 		return out
 	}
-	// A shrinking prompt is not a rewind: an extension can only grow, so if this
-	// call is SMALLER than the previous one the message list was rewritten and
-	// there was never a prefix to reuse. Reporting prev-cached there invents
-	// enormous faults out of ordinary context resets. Measured against one 11.6h
-	// session, this guard is the difference between 16 reported rewinds (10 of
-	// them a compaction dropping 115135 tokens to 5970) and the 6 that were real.
+	// A shrinking prompt is not a rewind: the message list was rewritten.
 	if prompt+cacheRewindSlack < prev {
 		return out
 	}
@@ -551,207 +269,138 @@ func (s *Session) noteCacheLineage(prompt, cached int, render string, now time.T
 	if rewound <= cacheRewindSlack {
 		return out
 	}
-	s.cacheRewinds++
-	s.cacheRewound += rewound
+	s.turn.stats.cacheRewinds++
+	s.turn.stats.cacheRewound += rewound
 	out.tokens = rewound
 	if prevRender != render {
-		s.cacheRewindsRender++
+		s.turn.stats.cacheRewindsRender++
 		out.renderChanged = true
 	}
 	return out
 }
 
-// addWastedCompletion records completion tokens that were generated and then
-// discarded. See turnWastedCompletion.
 func (s *Session) addWastedCompletion(n int) {
-	s.turnStatsMu.Lock()
-	s.turnWastedCompletion += n
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	s.turn.stats.wastedCompletion += n
+	s.turnMu.Unlock()
 }
 
-// resetCacheLineage drops the comparison point so the next call can't be read
-// as a rewind. Compaction calls it: rewriting the front of the context throws
-// the prefix away by design, and reporting that as a fault would be crying
-// wolf at the one moment the user was already told what happened.
+// Compaction drops the prefix by design, so that must not read as a rewind.
 func (s *Session) resetCacheLineage() {
-	s.turnStatsMu.Lock()
-	s.cachePrevPrompt = 0
-	s.cachePrevRender = ""
-	s.cachePrevAt = time.Time{}
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	s.lineage = cacheLineage{}
+	s.turnMu.Unlock()
 }
 
-// addTurnTiming sums one call's eval/gen times.
 func (s *Session) addTurnTiming(promptMs, genMs int64) {
-	s.turnStatsMu.Lock()
-	s.turnPromptMs += promptMs
-	s.turnGenMs += genMs
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	s.turn.stats.promptMs += promptMs
+	s.turn.stats.genMs += genMs
+	s.turnMu.Unlock()
 }
 
-// addHumanWait records time spent blocked on a user-input card so it can be
-// excluded from the turn's active time.
+// addToolTime counts a tool call's time, and a step's wait for the background jobs it started.
+func (s *Session) addToolTime(ms int64) {
+	s.turnMu.Lock()
+	s.turn.stats.toolMs += ms
+	s.turnMu.Unlock()
+}
+
+// addInput counts something the user typed or answered in this turn: a prompt, a message sent
+// during it, a question card.
+func (s *Session) addInput() {
+	s.turnMu.Lock()
+	s.turn.stats.inputs++
+	s.turnMu.Unlock()
+}
+
 func (s *Session) addHumanWait(d time.Duration) {
-	s.turnStatsMu.Lock()
-	s.turnHumanWaitMs += d.Milliseconds()
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	s.turn.humanWaitMs += d.Milliseconds()
+	s.turnMu.Unlock()
 }
 
-// turnStats returns the active wall-clock for the current turn (elapsed minus
-// time spent waiting on the user) and the summed token usage. activeMs is 0
-// before the first resetTurnStats.
-// turnReport is the end-of-turn accounting for the "✅ Done" line.
 type turnReport struct {
-	activeMs        int64
-	completion      int  // Σ completion_tokens
-	evaluatedPrompt int  // Σ sent-but-not-cached prompt tokens (the real prompt work)
-	lastPrompt      int  // final context size (last call's prompt_tokens)
-	haveServerCache bool // a backend reported the cache split
-	promptMs        int64
+	activeMs   int64 // wall clock minus user wait; set by turnStats
+	completion int
+	// Σ (prompt_tokens - cached_tokens)
+	evaluatedPrompt int
+	lastPrompt      int
+	haveServerCache bool
+	promptMs        int64 // server prompt_ms, else TTFT
 	genMs           int64
-	cacheRewinds    int // calls that re-read prompt the previous call had sent
-	cacheRewound    int // Σ of those re-read tokens
-	// cacheRewindsRender is how many of cacheRewinds we caused ourselves by
-	// changing the template params between the two calls.
+	// cacheRewindsRender counts the rewinds we caused by changing template params.
+	cacheRewinds       int
+	cacheRewound       int
 	cacheRewindsRender int
-	// wastedCompletion is the part of completion that was generated and then
-	// discarded.
+	// wastedCompletion is decode thrown away (cap hit, truncation); it is inside completion.
 	wastedCompletion int
+	calls            int   // model replies
+	toolMs           int64 // in tool calls and in waits for their background jobs
+	inputs           int   // what the user typed or answered during the turn
 }
 
 func (s *Session) turnStats() turnReport {
-	s.turnStatsMu.Lock()
-	defer s.turnStatsMu.Unlock()
-	if s.turnStart.IsZero() {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	if s.turn.start.IsZero() {
 		return turnReport{}
 	}
-	activeMs := time.Since(s.turnStart).Milliseconds() - s.turnHumanWaitMs
-	if activeMs < 0 {
-		activeMs = 0
-	}
-	return turnReport{
-		activeMs:           activeMs,
-		completion:         s.turnCompletionTokens,
-		evaluatedPrompt:    s.turnEvaluatedPrompt,
-		lastPrompt:         s.turnLastPrompt,
-		haveServerCache:    s.haveServerCache,
-		promptMs:           s.turnPromptMs,
-		genMs:              s.turnGenMs,
-		cacheRewinds:       s.cacheRewinds,
-		cacheRewound:       s.cacheRewound,
-		cacheRewindsRender: s.cacheRewindsRender,
-		wastedCompletion:   s.turnWastedCompletion,
-	}
+	r := s.turn.stats
+	r.activeMs = max(time.Since(s.turn.start).Milliseconds()-s.turn.humanWaitMs, 0)
+	return r
 }
 
-// recallSubagent returns a prior result for the given task hash if one exists.
-func (s *Session) recallSubagent(hash string) (string, bool) {
-	s.launchedSubagentsMu.Lock()
-	defer s.launchedSubagentsMu.Unlock()
-	if s.launchedSubagents == nil {
-		return "", false
-	}
-	r, ok := s.launchedSubagents[hash]
-	return r, ok
-}
-
-// rememberSubagent caches the result of a successful subagent run.
-func (s *Session) rememberSubagent(hash, result string) {
-	s.launchedSubagentsMu.Lock()
-	defer s.launchedSubagentsMu.Unlock()
-	if s.launchedSubagents == nil {
-		s.launchedSubagents = make(map[string]string)
-	}
-	s.launchedSubagents[hash] = result
-}
-
-// recallWebBody returns a cached page body if the URL was fetched earlier in
-// this session. Lets range-style web_read calls slice from cache without
-// re-issuing the HTTP request.
 func (s *Session) recallWebBody(url string) (string, bool) {
-	s.webBodiesMu.Lock()
-	defer s.webBodiesMu.Unlock()
-	if s.webBodies == nil {
-		return "", false
-	}
-	b, ok := s.webBodies[url]
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	b, ok := s.rt.webBodies[url]
 	return b, ok
 }
 
-// rememberWebBody stores the full raw page text from a web_read / web_read_raw
-// fetch. Overwrites on re-fetch so a refresh updates the cache; this is what
-// the model wants — if it asked for a fresh fetch it should see fresh content
-// on subsequent range views.
 func (s *Session) rememberWebBody(url, body string) {
-	s.webBodiesMu.Lock()
-	defer s.webBodiesMu.Unlock()
-	if s.webBodies == nil {
-		s.webBodies = make(map[string]string)
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	if s.rt.webBodies == nil {
+		s.rt.webBodies = make(map[string]string)
 	}
-	s.webBodies[url] = body
+	s.rt.webBodies[url] = body
 }
 
-// webResultKey distinguishes summarized vs. raw output for the same URL so
-// web_read and web_read_raw don't collide in the result cache.
-func webResultKey(url string, summarize bool) string {
-	if summarize {
-		return url + "\x00summary"
-	}
-	return url + "\x00raw"
-}
-
-// recallWebResult returns a previously-rendered web_read / web_read_raw output
-// for the same URL+mode. Lets the second call on a duplicate URL skip fetch
-// and re-summarize entirely.
-func (s *Session) recallWebResult(url string, summarize bool) (string, bool) {
-	s.webResultsMu.Lock()
-	defer s.webResultsMu.Unlock()
-	if s.webResults == nil {
-		return "", false
-	}
-	r, ok := s.webResults[webResultKey(url, summarize)]
-	return r, ok
-}
-
-// rememberWebResult stores the final rendered output for a URL+mode so a
-// duplicate call returns the byte-identical string without redoing any work.
-func (s *Session) rememberWebResult(url string, summarize bool, out string) {
-	s.webResultsMu.Lock()
-	defer s.webResultsMu.Unlock()
-	if s.webResults == nil {
-		s.webResults = make(map[string]string)
-	}
-	s.webResults[webResultKey(url, summarize)] = out
+func sessionPath(cwd, id, ext string) string {
+	return filepath.Join(cwd, sessionDir, "session_"+id+"."+ext)
 }
 
 func loadSession(cwd string, id string) (*Session, error) {
-	filename := fmt.Sprintf("session_%s.toml", id)
-	path := filepath.Join(cwd, sessionDir, filename)
-
+	path := sessionPath(cwd, id, "toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	// TOML refuses invalid UTF-8. One U+FFFD per bad byte (not per run, as
+	// ToValidUTF8 does) is what Go's JSON encoder already sent for those bytes, as
+	// an escape where this is the raw rune: the server decodes the same text, so the
+	// cache stays the same.
+	text := string(data)
+	if !utf8.ValidString(text) {
+		slog.Warn("session file has invalid UTF-8, replacing it with U+FFFD", "path", path)
+		text = string([]rune(text))
+	}
 	var s Session
-	if _, err := toml.DecodeFile(path, &s); err != nil {
+	if _, err := toml.Decode(text, &s); err != nil {
 		return nil, err
 	}
 	s.ID = id
 	s.Cwd = cwd
-	s.filePath = path
 	return &s, nil
 }
 
-// newSessionWithID resurrects a session under a Zed-supplied id (used by
-// LoadSession when the .toml is missing). The file appears on first Save() —
-// typically from prompt.go after the first user message. Zed opens an agent
-// connection per editor tab; if a tab is opened and never prompted, this
-// avoids leaving an empty stub session on disk that would clutter
-// listSessions.
+// Nothing is written until the first Save, so an unprompted tab leaves no stub on disk.
 func newSessionWithID(cwd string, id string) *Session {
-	filename := fmt.Sprintf("session_%s.toml", id)
-	path := filepath.Join(cwd, sessionDir, filename)
 	return &Session{
 		ID:        id,
 		Cwd:       cwd,
 		CreatedAt: time.Now(),
-		filePath:  path,
 	}
 }
 
@@ -759,61 +408,28 @@ func newSession(cwd string) (*Session, error) {
 	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0755); err != nil {
 		return nil, fmt.Errorf("creating session dir: %w", err)
 	}
-	now := time.Now()
-	// Second granularity collides when one session is opened in the same second
-	// as the last, which is exactly what the CLI's /new does. Reusing that id
-	// would overwrite the previous session's file, so take the next free name.
-	base := now.Format("20060102_150405")
+	// Ids are second-granular; reusing one would overwrite that session's file.
+	base := time.Now().Format("20060102_150405")
 	id := base
-	var path string
 	for n := 2; ; n++ {
-		path = filepath.Join(cwd, sessionDir, fmt.Sprintf("session_%s.toml", id))
-		if _, err := os.Stat(path); err != nil {
+		if _, err := os.Stat(sessionPath(cwd, id, "toml")); err != nil {
 			break // free, or unreadable: the first save reports the real problem
 		}
 		id = fmt.Sprintf("%s_%d", base, n)
 	}
-	return &Session{
-		ID:        id,
-		Cwd:       cwd,
-		CreatedAt: now,
-		filePath:  path,
-	}, nil
+	return newSessionWithID(cwd, id), nil
 }
 
-func newSubagentSession(cwd string, parentID string, index, depth, pinnedLLMIdx int) *Session {
-	// Belt-and-suspenders: the parent session already created this dir. If it
-	// fails here the first saveLocked will surface it, but don't let the mkdir
-	// itself vanish.
-	if err := os.MkdirAll(filepath.Join(cwd, sessionDir), 0755); err != nil {
-		slog.Warn("newSubagentSession: mkdir failed", "cwd", cwd, "err", err)
-	}
-	// Nanosecond suffix so sequential launch_subagent calls from the same
-	// parent don't collide on id (each call re-starts index at 0).
-	now := time.Now()
-	id := fmt.Sprintf("sub_%s_%d_%d", parentID, now.UnixNano(), index)
-	filename := fmt.Sprintf("session_%s.toml", id)
-	path := filepath.Join(cwd, sessionDir, filename)
-	s := &Session{
-		ID:           id,
-		Cwd:          cwd,
-		Depth:        depth,
-		ParentID:     parentID,
-		CreatedAt:    now,
-		filePath:     path,
-		PinnedLLMIdx: pinnedLLMIdx,
-	}
-	s.saveOrLog()
-	return s
-}
-
-func (s *Session) AddUser(text string) {
+// addOrigin marks the message just added.
+func (s *Session) addOrigin(origin string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.Messages = append(s.Messages, Message{Role: "user", Content: text, StartedAt: time.Now()})
+	if n := len(s.Messages); n > 0 {
+		s.Messages[n-1].Origin = origin
+	}
 }
 
-func (s *Session) AddUserWithImages(text string, images []ImageData) {
+func (s *Session) AddUser(text string, images ...ImageData) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Messages = append(s.Messages, Message{Role: "user", Content: text, Images: images, StartedAt: time.Now()})
@@ -825,13 +441,6 @@ func (s *Session) AddAssistant(text string) {
 	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text, StartedAt: time.Now()})
 }
 
-func (s *Session) AddAssistantWithTools(text string, tools []ToolUse) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.Messages = append(s.Messages, Message{Role: "assistant", Content: text, ToolUses: tools, StartedAt: time.Now()})
-}
-
-// AppendToolUse adds a tool use to the last assistant message, creating one if needed.
 func (s *Session) AppendToolUse(tu ToolUse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -840,86 +449,154 @@ func (s *Session) AppendToolUse(tu ToolUse) {
 	}
 	last := &s.Messages[len(s.Messages)-1]
 	last.ToolUses = append(last.ToolUses, tu)
+	if s.toolLogOn {
+		s.toolLog = append(s.toolLog, tu)
+	}
 }
 
-// markEditFailed records that edit_file failed with "not found" for path,
-// allowing the next read_file on that path to bypass readContentInContext.
-func (s *Session) markEditFailed(path string) {
-	s.editFailedPathsMu.Lock()
-	if s.editFailedPaths == nil {
-		s.editFailedPaths = map[string]bool{}
+func (s *Session) startToolLog() (stop func()) {
+	s.mu.Lock()
+	s.toolLogOn, s.toolLog = true, nil
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		s.toolLogOn, s.toolLog = false, nil
+		s.mu.Unlock()
 	}
-	s.editFailedPaths[path] = true
-	s.editFailedPathsMu.Unlock()
 }
 
-// clearEditFailed clears the edit-failed flag for path and returns whether
-// it was set. Called by serveRead so the bypass fires exactly once per failure.
-func (s *Session) clearEditFailed(path string) bool {
-	s.editFailedPathsMu.Lock()
-	defer s.editFailedPathsMu.Unlock()
-	if s.editFailedPaths[path] {
-		delete(s.editFailedPaths, path)
-		return true
-	}
-	return false
-}
-
-// readContentInContext reports whether the exact bytes `content` are still
-// present in the live message window as a prior read_file/continue_read result
-// the model can scroll back to. Compaction trims s.Messages, so an archived read
-// returns false — the model genuinely needs those bytes re-served. Callers
-// restrict this to content that fits whole in context (≤ liveExemptCap); a
-// clipped >32 KB read isn't fully present and must not be treated as available.
-// Only read tools count: a run_command that happened to echo the same bytes
-// isn't the file "in context" for navigation purposes.
-func (s *Session) readContentInContext(content string) bool {
-	if content == "" {
-		return false
-	}
+// toolMark is the position of the next tool call; a compaction does not move it.
+// It also forgets the calls before it: the loop only asks about the round in flight.
+func (s *Session) toolMark() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for i := range s.Messages {
-		for _, tu := range s.Messages[i].ToolUses {
-			if tu.Name == "read_file" || tu.Name == "continue_read" {
-				if strings.Contains(tu.Output, content) {
-					return true
-				}
-			}
-		}
-	}
-	return false
+	s.toolLogBase += len(s.toolLog)
+	s.toolLog = nil
+	return s.toolLogBase
 }
 
-// FindToolUseOutput scans every message's tool uses for one matching id and
-// returns its Output. Used by view_output to re-serve the full output of any
-// prior tool call without re-running it. Returns "" when no match (older
-// session files that predate ToolUse.ID, or a hallucinated id).
-func (s *Session) FindToolUseOutput(id string) string {
-	if id == "" {
+func (s *Session) toolUsesSince(mark int) []ToolUse {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i := max(mark-s.toolLogBase, 0)
+	if i >= len(s.toolLog) {
+		return nil
+	}
+	return slices.Clone(s.toolLog[i:])
+}
+
+// recordWrite drops any pending drift note: we just overwrote the other writer's change.
+func (s *Session) recordWrite(path, content string) {
+	sum := sha256.Sum256([]byte(content))
+	s.rt.mu.Lock()
+	if s.rt.wroteHash == nil {
+		s.rt.wroteHash = map[string]string{}
+	}
+	s.rt.wroteHash[path] = string(sum[:])
+	delete(s.rt.drifted, path)
+	s.rt.mu.Unlock()
+}
+
+// The hash advances to the content read, so each drift is reported once. Paths we
+// never wrote are not tracked.
+func (s *Session) checkExternalChange(path, content string) {
+	sum := sha256.Sum256([]byte(content))
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	prev, ok := s.rt.wroteHash[path]
+	if !ok || prev == string(sum[:]) {
+		return
+	}
+	s.rt.wroteHash[path] = string(sum[:])
+	if s.rt.drifted == nil {
+		s.rt.drifted = map[string]bool{}
+	}
+	s.rt.drifted[path] = true
+}
+
+func (s *Session) takeDriftNote(path string) string {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	if !s.rt.drifted[path] {
 		return ""
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i := range s.Messages {
-		for _, tu := range s.Messages[i].ToolUses {
-			if tu.ID == id {
-				return tu.Output
-			}
-		}
-	}
-	return ""
+	delete(s.rt.drifted, path)
+	// Names the likely cause because the model cannot see the editor.
+	return "\n\n[NOTE: this file changed on disk after codehalter wrote it: something outside this session rewrote it, and an editor's format-on-save is the usual cause. Any old_text you remember from before that write may no longer match; copy it from THIS read.]"
 }
 
-// enqueueSummarise appends a task to the summariser queue and starts the
-// single worker goroutine if one isn't already draining it. runner is called
-// sequentially for each task in FIFO order; the worker exits when the queue
-// empties. summariseUndone tracks queued + in-flight tasks for the joiner
-// (waitSummarise). Caller holds no session locks; this method manages its
-// own.
-func (s *Session) enqueueSummarise(t summariseTask, runner func(summariseTask)) {
+// line is for the user; full (exit code, log path, tail) is for the model.
+type bgNote struct {
+	line, full string
+	job        int // the job it reports on, so a stopped job's notes can be dropped
+}
+
+// pendingInput is the user's text typed during a turn, or a job note when note is set.
+type pendingInput struct {
+	text string
+	note *bgNote
+}
+
+// handFixes leaves fix cards for the session's next prompt to offer after its turn.
+func (s *Session) handFixes(fixes []fixProblem) {
+	s.rt.mu.Lock()
+	s.rt.startupFixes = append(s.rt.startupFixes, fixes...)
+	s.rt.mu.Unlock()
+}
+
+// takeFixes adds the handed-over cards to fixes, each once: a check the prompt ran again
+// may have found the same problem.
+func (s *Session) takeFixes(fixes []fixProblem) []fixProblem {
+	s.rt.mu.Lock()
+	handed := s.rt.startupFixes
+	s.rt.startupFixes = nil
+	s.rt.mu.Unlock()
+	for _, f := range handed {
+		if !slices.ContainsFunc(fixes, func(g fixProblem) bool { return g.desc == f.desc }) {
+			fixes = append(fixes, f)
+		}
+	}
+	return fixes
+}
+
+func (s *Session) addSteer(text string) {
+	s.rt.mu.Lock()
+	s.rt.pending = append(s.rt.pending, pendingInput{text: text})
+	s.rt.mu.Unlock()
+	s.addInput()
+}
+
+func (s *Session) addBgNote(n bgNote) {
+	s.rt.mu.Lock()
+	s.rt.pending = append(s.rt.pending, pendingInput{note: &n})
+	s.rt.mu.Unlock()
+}
+
+// dropJobNotes takes the notes of the given jobs out of the queue, the user's text staying.
+func (s *Session) dropJobNotes(jobs map[int]bool) {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	s.rt.pending = slices.DeleteFunc(s.rt.pending, func(p pendingInput) bool { return p.note != nil && jobs[p.note.job] })
+}
+
+func (s *Session) hasPending() bool {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	return len(s.rt.pending) > 0
+}
+
+func (s *Session) takePending() []pendingInput {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	items := s.rt.pending
+	s.rt.pending = nil
+	return items
+}
+
+// One worker runs jobs FIFO and exits when the queue empties. Caller holds no session locks.
+func (s *Session) enqueueSummarise(job func()) {
 	s.summariseMu.Lock()
-	s.summariseQueue = append(s.summariseQueue, t)
+	s.summariseQueue = append(s.summariseQueue, job)
 	s.summariseUndone++
 	if s.summariseRunning {
 		s.summariseMu.Unlock()
@@ -940,7 +617,7 @@ func (s *Session) enqueueSummarise(t summariseTask, runner func(summariseTask)) 
 			s.summariseQueue = s.summariseQueue[1:]
 			s.summariseMu.Unlock()
 
-			runner(next)
+			next()
 
 			s.summariseMu.Lock()
 			s.summariseUndone--
@@ -952,11 +629,6 @@ func (s *Session) enqueueSummarise(t summariseTask, runner func(summariseTask)) 
 	}()
 }
 
-// waitSummarise blocks until no summariser task remains outstanding (queued or
-// in-flight). foldHistory uses it before folding: every completed turn's
-// note must be in the Shadow buffer, since compaction folds the whole buffer
-// with no anchor held back. Only ever called past the trigger check, so a
-// below-budget turn never stalls on it.
 func (s *Session) waitSummarise() {
 	s.summariseMu.Lock()
 	defer s.summariseMu.Unlock()
@@ -968,9 +640,6 @@ func (s *Session) waitSummarise() {
 	}
 }
 
-// appendShadow adds one completed-turn note to the Shadow buffer. Guarded by mu
-// (same lock as Messages/Save) so a note landing from the background worker
-// can't tear a concurrent encode.
 func (s *Session) appendShadow(chunk string) {
 	chunk = strings.TrimSpace(chunk)
 	if chunk == "" {
@@ -981,10 +650,7 @@ func (s *Session) appendShadow(chunk string) {
 	s.Shadow = append(s.Shadow, chunk)
 }
 
-// drainShadow returns every accumulated turn note joined with blank-line
-// separators and clears the buffer. No anchor is held back: compaction rotates
-// out exactly the turns these notes cover, so all of them belong in Summary.
-// Returns "" when the buffer is empty (no completed turn has a note yet).
+// No anchor held back: compaction rotates out exactly the turns these notes cover.
 func (s *Session) drainShadow() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -996,47 +662,29 @@ func (s *Session) drainShadow() string {
 	return out
 }
 
-// markTurnStart records where the current top-level turn begins: the index of
-// the just-appended human/card prompt. Called at runTurn entry. Mid-turn
-// compaction reads turnStartIdx to decide what to keep verbatim.
 func (s *Session) markTurnStart() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.turnStartIdx = len(s.Messages) - 1
-	if s.turnStartIdx < 0 {
-		s.turnStartIdx = 0
-	}
+	s.turnStartIdx = max(len(s.Messages)-1, 0)
 }
 
-// lastAssistantIndex returns the index of the most recent assistant message in
-// the in-flight large turn (at or after turnStartIdx), i.e. the start of the
-// unfinished small turn. The 400 recovery folds everything before it and keeps
-// it verbatim. Falls back to turnStartIdx when the turn has no assistant
-// message yet (its first call 400'd), so foldHistory then keeps the whole
-// in-flight turn rather than slicing into a prompt-only window.
+// Without an assistant message yet it returns turnStartIdx, so foldHistory keeps
+// the whole in-flight turn.
 func (s *Session) lastAssistantIndex() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	start := s.turnStartIdx
-	if start < 0 || start > len(s.Messages) {
-		start = 0
-	}
-	for i := len(s.Messages) - 1; i >= start; i-- {
+	for i := len(s.Messages) - 1; i >= s.turnStartIdx; i-- {
 		if s.Messages[i].Role == "assistant" {
 			return i
 		}
 	}
-	return start
+	return s.turnStartIdx
 }
 
-// recordLastPromptTokens stamps the server-reported prompt_tokens of the call
-// that just produced the trailing assistant message onto it (the cumulative
-// context size at that call), so keepWindowStart can size the 400-recovery keep
-// window by REAL tokens. No-op when the backend reports no usage.
 func (s *Session) recordLastPromptTokens() {
-	s.turnStatsMu.Lock()
-	pt := s.turnLastPrompt
-	s.turnStatsMu.Unlock()
+	s.turnMu.Lock()
+	pt := s.turn.stats.lastPrompt
+	s.turnMu.Unlock()
 	if pt <= 0 {
 		return
 	}
@@ -1047,46 +695,23 @@ func (s *Session) recordLastPromptTokens() {
 	}
 }
 
-// keepWindowStart returns the index the 400 recovery should keep verbatim FROM:
-// the unfinished small turn (the last assistant message, always kept) plus the
-// most recent completed small turns whose combined cost stays under
-// maxCompletedTokens. Sizing uses the server's real per-call prompt_tokens
-// (Message.PromptTokens = cumulative context at each call), so the cost of
-// keeping from K is PromptTokens[unfinished] - PromptTokens[K]. Everything older
-// — earlier small turns and all prior large turns — folds into Summary, so an
-// oversized in-flight turn is NOT kept whole (that was the 194 KB bug). When the
-// server reports no token usage (PromptTokens == 0), it conservatively keeps only
-// the unfinished small turn rather than guess.
+// keepWindowStart keeps the unfinished small turn plus the recent completed ones
+// under maxCompletedTokens, sized by real prompt_tokens.
 func (s *Session) keepWindowStart(maxCompletedTokens int) int {
+	last := s.lastAssistantIndex()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	n := len(s.Messages)
-	if n == 0 {
-		return 0 // nothing to keep or fold
-	}
-	start := s.turnStartIdx
-	if start < 0 || start >= n {
-		start = 0 // turnStartIdx past the end (or unset) → scan from the top
-	}
-	// unfinished small turn = last assistant message (always kept)
-	last := start
-	for i := n - 1; i >= start; i-- {
-		if s.Messages[i].Role == "assistant" {
-			last = i
-			break
-		}
+	if last >= len(s.Messages) {
+		return last
 	}
 	ref := s.Messages[last].PromptTokens
 	if ref <= 0 {
-		return last // no server token data → keep only the unfinished small turn
+		return last
 	}
-	// Walk back through completed small turns, keeping the most recent ones while
-	// (ref - PromptTokens[K]) stays under budget. A PromptTokens that RISES going
-	// back marks a prior fold boundary (the context was reset there) — stop, don't
-	// keep pre-fold messages verbatim.
+	// PromptTokens rising going back marks a prior fold boundary: stop there.
 	prev := ref
 	keep := last
-	for i := last - 1; i >= start; i-- {
+	for i := last - 1; i >= s.turnStartIdx; i-- {
 		if s.Messages[i].Role != "assistant" {
 			continue
 		}
@@ -1100,107 +725,30 @@ func (s *Session) keepWindowStart(maxCompletedTokens int) int {
 	return keep
 }
 
-// resetTurnStart is called right after rotate() trims the message prefix: the
-// kept window now begins at index 0, so the in-flight turn does too. rotate
-// runs with no concurrent writer (see its doc), so this needs no extra lock.
-func (s *Session) resetTurnStart() {
-	s.turnStartIdx = 0
-}
-
-// UpsertLastAssistant sets the content of the trailing assistant message,
-// or appends a new one if the last message is not already an assistant turn.
-func (s *Session) UpsertLastAssistant(content string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.Messages) > 0 && s.Messages[len(s.Messages)-1].Role == "assistant" {
-		s.Messages[len(s.Messages)-1].Content = content
-		return
-	}
-	s.Messages = append(s.Messages, Message{Role: "assistant", Content: content, StartedAt: time.Now()})
-}
-
-// appendAssistantNote concatenates a short note (e.g. "Understood: A",
-// "User declined execution") onto the trailing assistant message instead of
-// creating a fresh assistant turn. Two consecutive assistant messages would
-// break strict role alternation; UpsertLastAssistant overwrites in place,
-// preserving the planner's JSON content plus any prior tool uses.
-func appendAssistantNote(sess *Session, note string) {
-	if sess == nil || note == "" {
-		return
-	}
-	sess.mu.Lock()
-	var existing string
-	if len(sess.Messages) > 0 && sess.Messages[len(sess.Messages)-1].Role == "assistant" {
-		existing = sess.Messages[len(sess.Messages)-1].Content
-	}
-	sess.mu.Unlock()
-	if existing != "" {
-		sess.UpsertLastAssistant(existing + "\n\n" + note)
-	} else {
-		sess.UpsertLastAssistant(note)
-	}
-}
-
-// MarkLastAssistantTiming stamps timing and phase onto the trailing assistant
-// message, creating one if no assistant turn is currently the latest entry.
-// Used by runToolLoop at the end of an assistant turn so the .toml records
-// when generation started, how much wall-clock the LLM calls took, and which
-// phase produced the turn. started.IsZero() preserves any existing stamp
-// (idempotent — repeated calls with a zero start time don't clobber).
-func (s *Session) MarkLastAssistantTiming(started time.Time, durationMs int64, phase string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.Messages) == 0 || s.Messages[len(s.Messages)-1].Role != "assistant" {
-		s.Messages = append(s.Messages, Message{Role: "assistant"})
-	}
-	m := &s.Messages[len(s.Messages)-1]
-	if !started.IsZero() {
-		m.StartedAt = started
-	}
-	m.DurationMs = durationMs
-	m.Phase = phase
-}
-
 func (s *Session) Save() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.saveLocked()
 }
 
-// saveOrLog persists the session, logging on failure instead of returning the
-// error. Most save sites are best-effort (after each AddUser/AddAssistant in
-// the tool loops) where a failure isn't worth unwinding the turn — but it must
-// NOT vanish: a full disk or read-only .codehalter should be loud. Replaces the
-// former `_ = sess.Save()` discards so the failure is never silent.
 func (s *Session) saveOrLog() {
 	if err := s.Save(); err != nil {
-		slog.Error("session save failed", "id", s.ID, "path", s.filePath, "err", err)
+		slog.Error("session save failed", "id", s.ID, "path", sessionPath(s.Cwd, s.ID, "toml"), "err", err)
 	}
 }
 
-// rotate archives the session as it currently is to a new "session_archive_*"
-// file, then resets s in place to carry only `keep` raw messages and `summary`
-// as the rolled-up prior context. The live session keeps its own ID and
-// filePath; only its on-disk contents change. Returns the archive's id.
-// rotate itself takes no lock; its sole caller, foldHistory, runs mid-turn on a
-// context-overflow 400 where no concurrent writer exists. The follow-up
-// live-session Save() (by the caller) does lock.
+// rotate takes no lock: its sole caller, foldHistory, runs where no concurrent
+// writer exists. The caller saves the live session.
 func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	archiveID := fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano())
-	archivePath := filepath.Join(s.Cwd, sessionDir, fmt.Sprintf("session_%s.toml", archiveID))
 	archive := &Session{
 		ID:           archiveID,
 		Cwd:          s.Cwd,
 		CreatedAt:    s.CreatedAt,
-		Depth:        s.Depth,
-		ParentID:     s.ParentID,
 		Summary:      s.Summary,
 		SystemPrompt: s.SystemPrompt,
 		Messages:     s.Messages,
-		filePath:     archivePath,
 	}
-	// Fresh struct, no concurrent access — the encoder invariant on
-	// saveLocked is vacuously satisfied.
 	if err := archive.saveLocked(); err != nil {
 		return "", err
 	}
@@ -1209,26 +757,32 @@ func (s *Session) rotate(keep []Message, summary string) (string, error) {
 	return archiveID, nil
 }
 
-// sessionFilePath returns where this session's toml/log of basename `name`
-// should be written: the project's .codehalter/ directory.
-func (s *Session) sessionFilePath(name string) string {
-	return filepath.Join(s.Cwd, sessionDir, name)
+// imageInView: a tool call still in the history carries this picture (ids are
+// content hashes). Repeats once pushed a request past Halogen's 64-picture limit.
+// Caller must hold s.mu or own the session exclusively.
+func (s *Session) imageInView(id string) bool {
+	for _, m := range s.Messages {
+		for _, u := range m.ToolUses {
+			if u.ImageID == id {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// saveLocked writes the session to disk. Caller must hold s.mu (or own the
-// session exclusively, e.g. a freshly-constructed archive in rotate()).
 func (s *Session) saveLocked() error {
-	f, err := os.Create(s.sessionFilePath(filepath.Base(s.filePath)))
-	if err != nil {
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(s); err != nil {
 		return err
 	}
-	if err := toml.NewEncoder(f).Encode(s); err != nil {
-		f.Close() // best-effort; the encode error is the real failure
-		return err
-	}
-	// Return the close error: a failed flush on close means a truncated /
-	// corrupt session TOML, which the encode step alone won't surface.
-	return f.Close()
+	return writeFileAtomic(sessionPath(s.Cwd, s.ID, "toml"), buf.Bytes(), 0o644)
+}
+
+type SessionInfo struct {
+	SessionId string `json:"sessionId"`
+	Cwd       string `json:"cwd"`
+	UpdatedAt string `json:"updatedAt,omitempty"`
 }
 
 func listSessions(cwd string) ([]SessionInfo, error) {
@@ -1243,39 +797,75 @@ func listSessions(cwd string) ([]SessionInfo, error) {
 
 	var sessions []SessionInfo
 	for _, e := range entries {
-		if !strings.HasPrefix(e.Name(), "session_") || !strings.HasSuffix(e.Name(), ".toml") {
+		id, ok := strings.CutPrefix(e.Name(), "session_")
+		if !ok {
 			continue
 		}
-		// Skip subagent and post-rotation archive sessions — both live on
-		// disk for inspection but should not clutter the picker.
-		if strings.HasPrefix(e.Name(), "session_sub_") ||
-			strings.HasPrefix(e.Name(), "session_archive_") {
+		id, ok = strings.CutSuffix(id, ".toml")
+		// Archives and old subagent sessions are for inspection, not the picker.
+		if !ok || strings.HasPrefix(id, "sub_") || strings.HasPrefix(id, "archive_") {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		id := strings.TrimPrefix(e.Name(), "session_")
-		id = strings.TrimSuffix(id, ".toml")
-
-		sessions = append(sessions, SessionInfo{
-			SessionId: id,
-			Cwd:       cwd,
-			UpdatedAt: info.ModTime().Format(time.RFC3339),
-		})
+		sessions = append(sessions, SessionInfo{SessionId: id, Cwd: cwd, UpdatedAt: info.ModTime().Format(time.RFC3339)})
 	}
-
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].UpdatedAt > sessions[j].UpdatedAt
-	})
-
+	slices.SortFunc(sessions, func(x, y SessionInfo) int { return strings.Compare(y.UpdatedAt, x.UpdatedAt) })
 	return sessions, nil
 }
 
-// SessionInfo is returned by session/list.
-type SessionInfo struct {
-	SessionId string `json:"sessionId"`
-	Cwd       string `json:"cwd"`
-	UpdatedAt string `json:"updatedAt,omitempty"`
+func (a *agent) restoreSession(ctx context.Context, cwd, sid string, mcpOffer []acpMCPServer) (*Session, error) {
+	s, err := loadSession(cwd, sid)
+	switch {
+	case os.IsNotExist(err):
+		slog.Debug("LoadSession: not found, treating as new", "sid", sid)
+		// Zed loads ids from a session/new that never saved and ignores a
+		// sessionId we send back, so accept the id or prompts won't route.
+		s = newSessionWithID(cwd, sid)
+	case err != nil:
+		return nil, fmt.Errorf("loading session: %w", err)
+	}
+	if err := a.initSession(cwd, s, mcpOffer); err != nil {
+		return nil, err
+	}
+	// Otherwise a reload labels the thread with its id.
+	if s.Title != "" {
+		a.sendUpdate(ctx, sid, sessionInfoUpdate{Kind: "session_info_update", Title: s.Title})
+	}
+	// An empty chunk of the opposite role separates two same-role messages, or
+	// Zed merges them into one turn.
+	lastRole := ""
+	for _, m := range s.Messages {
+		if m.Role == lastRole {
+			if m.Role == "user" {
+				a.say(ctx, sid, "")
+			} else {
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: ""}})
+			}
+		}
+		if m.Role == "user" {
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: m.Content}})
+			for _, img := range m.Images {
+				data, mime, err := readImageFile(s.Cwd, img.ID)
+				if err != nil {
+					a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "text", Text: fmt.Sprintf("[image %s missing on disk]", img.ID)}})
+					continue
+				}
+				a.sendUpdate(ctx, sid, messageChunk{Kind: KindUserMessage, Content: ContentBlock{Type: "image", MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}})
+			}
+		} else {
+			a.say(ctx, sid, m.Content)
+		}
+		lastRole = m.Role
+	}
+	return s, nil
+}
+
+// turnCompletion is the tokens the model generated so far this turn, reasoning included.
+func (s *Session) turnCompletion() int {
+	s.turnMu.Lock()
+	defer s.turnMu.Unlock()
+	return s.turn.stats.completion
 }

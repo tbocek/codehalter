@@ -6,52 +6,25 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 )
 
-// ACP terminals are how codehalter runs commands: the client starts the process
-// and owns it, and we drive it by id. There is no in-process exec path — a
-// client that doesn't advertise clientCapabilities.terminal is refused at
-// bootstrap (see ensureTerminals), rather than silently falling back to running
-// processes ourselves.
-//
-// Handing the process to the client is not a sandbox escape. bootstrap.go
-// directs the user to Zed's "Connect Dev Container", where Zed's remote server
-// runs INSIDE the container and spawns codehalter there, so a terminal it
-// creates is in the same container as everything else we do. run_background
-// relies on the stronger form of that: the client's terminal and codehalter see
-// the same filesystem, so a log file written by a terminal is readable here.
-//
-// Two things differ from running the process ourselves:
-//
-//   - We never see a pid, so there is no process group to own and no way to ask
-//     whether a command left a child behind (`npm run dev &`). That case is out
-//     of run_command's contract: it runs commands that exit on their own, and a
-//     never-exits process belongs in run_background. run_command finishes
-//     regardless, and the deferred terminal/release kills whatever the terminal
-//     still holds. The steer to run_background lives in the tool description.
-//   - The idle watchdog is a poll, not a stream. terminal/wait_for_exit blocks
-//     and there is no output stream to watch, so silence is detected by
-//     re-reading terminal/output on a timer and timestamping the last change.
-//     Kill latency is bounded by the poll interval, not by the timeout. See
-//     runTerminalCmd.
+// Zed's remote server spawns codehalter inside the container, so the client's
+// ACP terminals share our filesystem; they expose no pid and no output stream.
 
-// terminalOutputLimit is the byte cap we ask the client to enforce. The client
-// truncates from the FRONT (it keeps the tail), which loses the head of a long
-// build — so we set it well above cmdOutputCap and let boundedOutput do the
-// head+tail elision on the result instead. Only a command that outputs this
-// much loses its opening lines.
+// terminalOutputLimit: the client truncates from the FRONT, so this sits far
+// above cmdOutputCap and boundedCapture does the head+tail elision instead.
 const terminalOutputLimit = 4 * 1024 * 1024
 
-// terminalExit is the exit status of a finished terminal. ExitCode is nil when
-// the command was killed by a signal, which is why this isn't a bare int.
 type terminalExit struct {
 	ExitCode *int   `json:"exitCode"`
 	Signal   string `json:"signal"`
 }
 
-// code flattens an exit status the way run_command reports it: the real code,
-// or -1 for a signal death (which is also what a failure to exec reported).
 func (e terminalExit) code() int {
 	if e.ExitCode != nil {
 		return *e.ExitCode
@@ -59,32 +32,11 @@ func (e terminalExit) code() int {
 	return -1
 }
 
-// clientSessionID maps a session id to one the client actually knows. Subagent
-// sessions are minted locally as "sub_<parent>_…" and never announced, so a
-// terminal request naming one is rejected exactly as fs/read_text_file is;
-// their commands run on the parent's session instead. The loop (rather than a
-// single hop) is for depth-2 subagents, whose parent is itself a sub_ session.
-func (a *agent) clientSessionID(sid string) string {
-	for i := 0; i < maxSubagentDepth+1; i++ {
-		sess := a.getSession(sid)
-		if sess == nil || sess.ParentID == "" {
-			return sid
-		}
-		sid = sess.ParentID
-	}
-	return sid
-}
-
-// terminalCreate starts command+args in a client terminal and returns its id.
-// terminal/create takes an argv, not a shell line, so a caller with a shell
-// line passes ("bash", []string{"-c", line}) — that's what keeps pipes,
-// redirects and `&&` working.
+// terminal/create takes an argv, not a shell line; pass ("bash", {"-c", line})
+// for pipes, redirects and `&&`.
 func (a *agent) terminalCreate(ctx context.Context, sid, command string, args []string, cwd string) (string, error) {
-	if args == nil {
-		args = []string{}
-	}
 	raw, err := a.conn.sendRequest(ctx, "terminal/create", map[string]any{
-		"sessionId":       a.clientSessionID(sid),
+		"sessionId":       sid,
 		"command":         command,
 		"args":            args,
 		"cwd":             cwd,
@@ -105,197 +57,65 @@ func (a *agent) terminalCreate(ctx context.Context, sid, command string, args []
 	return resp.TerminalId, nil
 }
 
-// terminalOutput fetches everything the terminal has produced so far. exit is
-// nil while the command is still running.
-func (a *agent) terminalOutput(ctx context.Context, sid, tid string) (out string, truncated bool, exit *terminalExit, err error) {
-	raw, err := a.conn.sendRequest(ctx, "terminal/output", map[string]any{"sessionId": a.clientSessionID(sid), "terminalId": tid})
+func (a *agent) terminalOutput(ctx context.Context, sid, tid string) (string, error) {
+	raw, err := a.conn.sendRequest(ctx, "terminal/output", map[string]any{"sessionId": sid, "terminalId": tid})
 	if err != nil {
-		return "", false, nil, err
+		return "", err
 	}
 	var resp struct {
-		Output     string        `json:"output"`
-		Truncated  bool          `json:"truncated"`
-		ExitStatus *terminalExit `json:"exitStatus"`
+		Output string `json:"output"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", false, nil, err
+		return "", err
 	}
-	return resp.Output, resp.Truncated, resp.ExitStatus, nil
+	return resp.Output, nil
 }
 
-// terminalWaitForExit blocks until the command finishes.
-func (a *agent) terminalWaitForExit(ctx context.Context, sid, tid string) (terminalExit, error) {
-	raw, err := a.conn.sendRequest(ctx, "terminal/wait_for_exit", map[string]any{"sessionId": a.clientSessionID(sid), "terminalId": tid})
-	if err != nil {
-		return terminalExit{}, err
-	}
-	var exit terminalExit
-	if err := json.Unmarshal(raw, &exit); err != nil {
-		return terminalExit{}, err
-	}
-	return exit, nil
-}
-
-// terminalKill kills the command but keeps the terminal id valid, so output
-// produced before the kill can still be read.
+// terminalKill keeps the terminal id valid, so output from before the kill can
+// still be read.
 func (a *agent) terminalKill(ctx context.Context, sid, tid string) error {
-	_, err := a.conn.sendRequest(ctx, "terminal/kill", map[string]any{"sessionId": a.clientSessionID(sid), "terminalId": tid})
+	_, err := a.conn.sendRequest(ctx, "terminal/kill", map[string]any{"sessionId": sid, "terminalId": tid})
 	return err
 }
 
-// terminalRelease kills the command if it is still running and invalidates the
-// id — which is why a background job's terminal is held until shutdown and
-// released only there. Best-effort by design: it runs on the way out of a tool
-// call, including paths where the turn is already being torn down, and there is
-// nothing useful to do with a failure beyond logging it.
+// terminalRelease kills a still-running command and invalidates the id.
 func (a *agent) terminalRelease(sid, tid string) {
-	// Deliberately not the caller's ctx: release is the cleanup for a cancelled
-	// context, so reusing it would skip the kill exactly when it matters most.
+	// Not the caller's ctx: release is the cleanup for a cancelled context.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := a.conn.sendRequest(ctx, "terminal/release", map[string]any{"sessionId": a.clientSessionID(sid), "terminalId": tid}); err != nil {
+	if _, err := a.conn.sendRequest(ctx, "terminal/release", map[string]any{"sessionId": sid, "terminalId": tid}); err != nil {
 		slog.Debug("terminal/release failed", "terminal", tid, "err", err)
 	}
 }
 
-// runTerminalCmd runs command+args to completion in a client terminal: create,
-// show it live in the tool call's card, wait for exit, then read the full
-// output back. idle > 0 kills a command that produces nothing new for that
-// long; idle == 0 waits indefinitely (a build may legitimately go quiet while
-// linking or fetching deps).
-//
-// The returned text is the captured output, already head+tail bounded.
-// started=false means the terminal never came up, and err is the reason.
-func (a *agent) runTerminalCmd(ctx context.Context, sid, tcId, command string, args []string, cwd string, idle time.Duration) (text string, exit terminalExit, started bool, err error) {
-	tid, err := a.terminalCreate(ctx, sid, command, args, cwd)
-	if err != nil {
-		return "", terminalExit{}, false, err
-	}
-	defer a.terminalRelease(sid, tid)
+// redirectRe: `> f`, `>> f`, `&> f`, `2> f`; `2>&1` names no file.
+var redirectRe = regexp.MustCompile(`(?:^|[^&])(?:\d?>>?|&>)\s*([^\s;&|()<>]+)`)
 
-	// Put the live terminal in the card before anything can release it — after
-	// release the client keeps displaying it, but it won't accept the embed.
-	a.sendUpdate(ctx, sid, toolCallUpdate{
-		Kind:       "tool_call_update",
-		ToolCallId: tcId,
-		Status:     "in_progress",
-		Content:    []ToolCallContent{TerminalContent(tid)},
-	})
-
-	type waitResult struct {
-		exit terminalExit
-		err  error
-	}
-	exited := make(chan waitResult, 1)
-	go func() {
-		e, werr := a.terminalWaitForExit(ctx, sid, tid)
-		exited <- waitResult{e, werr}
-	}()
-
-	idleKilled := false
-	if idle > 0 {
-		// Polled at HALF the timeout, and silence measured from a timestamp rather
-		// than from "the last two polls matched". A poll that fires only once per
-		// interval cannot tell 1s of silence from 59s, so the old scheme killed
-		// somewhere between one and two intervals: with a 2m timeout that is a
-		// command dying anywhere from 2 to 4 minutes in, and the notice it hands
-		// the model ("no output for 2m0s") would be a lie half the time. Two polls
-		// per interval bound the error at idle/2 and cost exactly what one poll
-		// per interval cost at the old, shorter timeout: each poll drags the whole
-		// accumulated output across the wire, which is why this is not polled
-		// faster.
-		ticker := time.NewTicker(idle / 2)
-		defer ticker.Stop()
-		// Seeded with the hash of EMPTY output, not the zero value: a command that
-		// never prints anything would otherwise register its first poll as a
-		// "change" and get measured from there, buying a hung command an extra
-		// poll interval of life for having produced nothing.
-		lastHash := hashOutput("")
-		lastChange := time.Now()
-	wait:
-		for {
-			select {
-			case res := <-exited:
-				if res.err != nil {
-					return "", terminalExit{}, true, res.err
-				}
-				exit = res.exit
-				break wait
-			case <-ctx.Done():
-				// The user hit Stop, or the turn was cancelled. The deferred release
-				// kills the command; report what it managed to print.
-				out, _, _, _ := a.terminalOutput(context.Background(), sid, tid)
-				return boundedCapture(out), terminalExit{}, true, ctx.Err()
-			case <-ticker.C:
-				out, _, status, oerr := a.terminalOutput(ctx, sid, tid)
-				if oerr != nil {
-					// Polling is only the watchdog; a failed poll must not fail the
-					// command. Skip this round and let wait_for_exit decide.
-					slog.Debug("terminal/output poll failed", "terminal", tid, "err", oerr)
-					continue
-				}
-				if status != nil {
-					continue // finished between ticks; wait_for_exit is about to return
-				}
-				if h := hashOutput(out); h != lastHash {
-					lastHash, lastChange = h, time.Now()
-					continue
-				}
-				if idleKilled {
-					continue // already killed; still waiting for wait_for_exit to land
-				}
-				if time.Since(lastChange) < idle {
-					continue // quiet, but not yet quiet for long enough
-				}
-				// Nothing new for a whole timeout: silent or hung. Kill it, but do
-				// NOT release yet — we still want to read what it printed.
-				idleKilled = true
-				if kerr := a.terminalKill(ctx, sid, tid); kerr != nil {
-					slog.Debug("terminal/kill failed", "terminal", tid, "err", kerr)
-				}
-			}
+// redirectTargets skips anything that is not a plain path (a `$var`, a quote):
+// a missed file is only not watched.
+func redirectTargets(line, cwd string) []string {
+	var files []string
+	for _, m := range redirectRe.FindAllStringSubmatch(line, -1) {
+		f := m[1]
+		if strings.ContainsAny(f, "$\"'`*") || f == "/dev/null" {
+			continue
 		}
-	} else {
-		select {
-		case res := <-exited:
-			if res.err != nil {
-				return "", terminalExit{}, true, res.err
-			}
-			exit = res.exit
-		case <-ctx.Done():
-			out, _, _, _ := a.terminalOutput(context.Background(), sid, tid)
-			return boundedCapture(out), terminalExit{}, true, ctx.Err()
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(cwd, f)
 		}
+		files = append(files, f)
 	}
-
-	out, truncated, _, oerr := a.terminalOutput(ctx, sid, tid)
-	if oerr != nil {
-		return "", exit, true, oerr
-	}
-	text = boundedCapture(out)
-	if truncated {
-		text = "[... earlier output truncated by the client ...]\n" + text
-	}
-	if idleKilled {
-		text += fmt.Sprintf("\n[killed: no output for %s, command timed out]\n", idle)
-	}
-	return text, exit, true, nil
+	return files
 }
 
-// boundedCapture puts a finished terminal's output through the head+tail window
-// that bounds what any command can hand a small-context model.
-func boundedCapture(out string) string {
-	b := newBoundedOutput(cmdOutputCap)
-	b.Write([]byte(out))
-	return b.String()
-}
-
-// hashOutput fingerprints accumulated output for the idle check. A hash rather
-// than a length because once the client's byte cap is reached the output stops
-// growing while the command is still very much alive, and a length comparison
-// would read that as silence.
-func hashOutput(s string) uint64 {
+func progressSignature(files []string) uint64 {
 	h := fnv.New64a()
-	_, _ = h.Write([]byte(s))
+	for _, f := range files {
+		size := int64(-1)
+		if st, err := os.Stat(f); err == nil {
+			size = st.Size()
+		}
+		fmt.Fprintf(h, "\x00%s=%d", f, size)
+	}
 	return h.Sum64()
 }

@@ -4,259 +4,272 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"log/slog"
+	"maps"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// This file owns the plan + per-subtask machinery. The orchestrator
-// (prompt.go) drives the larger plan → subtasks → replan cycle and the
-// once-at-end document phase.
-//
-// The plan phase produces a list of subtasks; each subtask carries its
-// own verify recipe. Every subtask runs as ONE tool-calling loop where
-// the executor can read, edit, install, and self-verify before declaring
-// done via `respond`. No separate verify-phase LLM call — the executor
-// runs the recipe itself. The loop's only ceiling is the hard
-// maxToolLoopIterations backstop in this file.
-
-// ---------------------------------------------------------------------------
-// Plan phase
-// ---------------------------------------------------------------------------
-
-// subtask is one piece of decomposed work. Description is the self-
-// contained instruction the executor acts on; Verify is the ordered list
-// of concrete checks the executor MUST run (via tools) before calling
-// respond. An empty Verify is legal only for pure-lookup subtasks where
-// no files are edited.
+// An empty Verify is legal only for pure-lookup subtasks that edit no files.
 type subtask struct {
 	Description string   `json:"description"`
 	Verify      []string `json:"verify,omitempty"`
 }
 
+// Also accepts `subtasks` serialised into a string, which planners send; a
+// rejection would cost a whole planning call.
+func (p *planResult) UnmarshalJSON(b []byte) error {
+	type plain planResult
+	var raw struct {
+		plain
+		Subtasks json.RawMessage `json:"subtasks"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*p = planResult(raw.plain)
+	if len(raw.Subtasks) == 0 || string(raw.Subtasks) == "null" {
+		return nil
+	}
+	if raw.Subtasks[0] == '"' {
+		var inner string
+		if err := json.Unmarshal(raw.Subtasks, &inner); err != nil {
+			return err
+		}
+		// The list in the string often lacks its closing bracket (both tries of five
+		// /spec rounds in a row, which stopped two items).
+		raw.Subtasks = json.RawMessage(repairJSON(trimJSONArray(inner)))
+	}
+	return json.Unmarshal(raw.Subtasks, &p.Subtasks)
+}
+
 type planResult struct {
-	Clear    bool      `json:"clear"`
+	Clear    bool      `json:"-"`
 	Choices  []string  `json:"choices"`
 	Question string    `json:"question"`
 	Subtasks []subtask `json:"subtasks"`
-	// ReportOnly is true when the planner already has the answer in hand
-	// (pure-lookup tasks: "where is X?", "what version of Y?") and every
-	// subtask only relays findings — no file edits, no commands. When
-	// true the orchestrator skips the "Execute this plan?" confirmation.
-	ReportOnly bool `json:"report_only"`
-	// answer is the planner's user-facing prose when it answered a lookup
-	// directly (report_only with no subtasks). It rides on the struct rather
-	// than the JSON — runPlanPhase sets it from the loop's separate content
-	// channel — so orchestrate can surface it instead of silently dropping a
-	// finished answer. No json tag: it never comes from the model's arguments.
+	// A /spec round's question: the spec text that comes closest, and options with examples.
+	SpecQuote string       `json:"spec_quote"`
+	Options   []specOption `json:"options"`
+	// The /spec redo audit's answer: the items that fall short. Refused anywhere else.
+	Redo []string `json:"redo"`
+	// An argument because a server that forces the tool call (Halogen) returns no
+	// message text beside it.
+	Answer string `json:"answer"`
+	// Answer when given, else the message text beside the call (set by planFrom).
 	answer string
 }
 
-// runPlanPhase appends PLAN.md (plus an optional replanContext on retries) as a
-// fresh user message, runs the planning LLM, persists the JSON response as the
-// trailing assistant turn, parses the plan, and resolves any clarification
-// round-trip. It does NOT ask "Execute this plan?" — the orchestrator owns the
-// single confirmation per plan / per replan so the user sees the full subtask
-// list before deciding.
-//
-// Returns (nil, nil, err) when no LLM is configured. Returns (nil, ...) when
-// there's no PLAN.md, the tool loop fails, or the response can't be parsed even
-// after one corrective retry — callers treat any of those as "no plan, proceed
-// without one". errUserCancelled fires when the user aborts on a clarification
-// prompt.
-//
-// replanContext is "" on the first planning pass; on a replan the orchestrator
-// supplies a short note (e.g. "REPLAN: prior attempt failed — see history.
-// Same failure surfaced N times — try a structurally different approach.")
-// The actual failure detail is already in history on the preceding executor
-// response, so we don't repeat it here.
-func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext string) (*planResult, []ToolUse, error) {
-	thinking := a.connForSession(ctx, sid, "thinking")
+// planProblem names how a planner submission missed its contract, with the
+// corrective for the one retry: invalid JSON, prose (after the loop's own
+// nudge), a plan with neither an answer, a question nor any work, or a `redo` outside
+// the audit that asks for it (only the user starts /spec).
+func planProblem(res toolLoopResult, p *planResult, parseErr error, audit, verify bool) (wrong, corrective string) {
+	switch {
+	case parseErr != nil && res.Terminal == "":
+		return "the planner replied in prose instead of calling submit_plan",
+			"Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."
+	case parseErr != nil:
+		return fmt.Sprintf("submit_plan's arguments were not valid JSON (%v)", parseErr),
+			fmt.Sprintf("Your `submit_plan` arguments were not valid JSON (%v). Call it again, emitting the arguments as one well-formed JSON object.", parseErr)
+	case verify && len(p.Subtasks) > 0:
+		return "the planner planned changes during /spec verify, which only reports",
+			"/spec verify changes nothing. Call `submit_plan` again with no subtasks and the whole report in `answer`."
+	case !audit && len(p.Redo) > 0:
+		return "the planner asked to reopen spec items, which only the user's /spec redo does",
+			"`redo` applies only inside the /spec redo audit, and this is not one. Call `submit_plan` again without it: `subtasks` for the work, or the complete `answer`. Work too big for one plan: say so in `answer` and name `/spec`, which the user runs."
+	// Whether or not it set clear: an empty plan once ended six /spec rounds in a row.
+	case len(p.Subtasks) == 0 && p.answer == "" && len(p.Redo) == 0 && strings.TrimSpace(p.Question) == "":
+		return "the planner submitted neither an answer nor any subtasks",
+			"Your `submit_plan` had neither an answer nor subtasks, so nothing reaches the user. Call it again with EITHER the complete answer in `answer` (no subtasks) OR the subtasks that do the work. Put the fields at the top level of the arguments, `{\"subtasks\": [...]}`, not inside another key."
+	}
+	return "", ""
+}
+
+// unwrapPlan: a plan put inside one wrapper key, as an object or as JSON text
+// (`{"plan": {...}}`, `{"plan": "[{...}]"}`), is the plan itself. Qwen3.8 did
+// this six rounds in a row, copying its own call from the history, and each
+// round read as an empty plan.
+func unwrapPlan(raw string) string {
+	var outer map[string]json.RawMessage
+	if json.Unmarshal([]byte(raw), &outer) != nil || len(outer) != 1 {
+		return raw
+	}
+	for _, inner := range outer {
+		var text string
+		if json.Unmarshal(inner, &text) == nil {
+			// Text that is cut off counts too: a stringified plan lost its closing brackets
+			// and its work, with the prose beside it passing for an answer.
+			inner = json.RawMessage(repairJSON(strings.TrimSpace(text)))
+		}
+		var list []json.RawMessage
+		if json.Unmarshal(inner, &list) == nil && len(list) == 1 {
+			inner = list[0]
+		}
+		var plan map[string]json.RawMessage
+		if json.Unmarshal(inner, &plan) == nil && (plan["subtasks"] != nil || plan["clear"] != nil || plan["answer"] != nil || plan["question"] != nil) {
+			return string(inner)
+		}
+	}
+	return raw
+}
+
+// respond as the plan terminal is a direct answer: a plan with no subtasks.
+func planFrom(res toolLoopResult) (*planResult, error) {
+	if res.Terminal == respondToolName {
+		return &planResult{Clear: true, answer: strings.TrimSpace(res.Text)}, nil
+	}
+	var p planResult
+	if err := json.Unmarshal([]byte(unwrapPlan(trimJSON(res.Text))), &p); err != nil {
+		return nil, err
+	}
+	// A question without work is what makes a plan unclear; the old `clear` argument a model
+	// may still copy from its history is not read. Subtasks win over a question beside them: a
+	// replay lost a whole plan to a filled-in `question`.
+	p.Clear = len(p.Subtasks) > 0 || strings.TrimSpace(p.Question) == "" && len(p.Choices) == 0 && len(p.Options) == 0
+	switch {
+	case strings.TrimSpace(p.Answer) != "":
+		// A server's tool parser can leave the next argument inside this one.
+		answer, _, _ := strings.Cut(p.Answer, "<parameter=")
+		p.answer = strings.TrimSpace(answer)
+	case res.Terminal != "":
+		p.answer = strings.TrimSpace(res.Content)
+	default:
+		p.answer = strings.TrimSpace(strings.Replace(res.Text, trimJSON(res.Text), "", 1))
+	}
+	return &p, nil
+}
+
+// Past this many clarifying questions in one planning phase, the planner's last
+// plan goes on as it is.
+const maxClarifications = 3
+
+// Does not ask "Execute this plan?": the orchestrator does, after the whole list
+// is shown. errUserCancelled means the user aborted a clarification.
+func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext string) (*planResult, error) {
+	thinking := a.connFor("thinking")
 	if thinking == nil {
-		return nil, nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
+		return nil, fmt.Errorf("no [[llm]] in .codehalter/settings.toml")
 	}
-	// PLAN.md is in the system prompt now (the stable, cached prefix); here we
-	// inject only the phase trigger + any replan context. An empty PLAN.md still
-	// disables planning. Keeping the primer out of the history is what stops
-	// re-plans from stacking 7 KB copies and re-bloating the context.
-	if a.loadPromptFile(sid, "PLAN.md") == "" {
-		return nil, nil, nil
+	sess := a.getSession(sid)
+	if sess == nil {
+		return nil, fmt.Errorf("no session found")
 	}
-	marker := "Begin the PLANNING phase — produce the plan now (planning guidance is in the system prompt)."
+	// PLAN.md lives in the cached system prompt; repeating it here would stack a copy per replan.
+	marker := "Begin the PLANNING phase: produce the plan now (planning guidance is in the system prompt)."
 	if replanContext != "" {
 		marker = "Begin the PLANNING phase again.\n\n" + replanContext
 	}
+	// Planner edits would leak into history (`sed -i` cannot be blocked here).
+	policy := phasePolicy{
+		deny:      map[string]bool{"write_file": true, "edit_file": true},
+		terminals: map[string]bool{submitPlanToolName: true, respondToolName: true},
+	}
+	// Planning does not stream, so the warning is all that shows during the extra round trip.
+	retry := func(warning, corrective string) (*planResult, error) {
+		a.say(ctx, sid, warning)
+		res, err := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, corrective)
+		if err != nil {
+			return nil, err
+		}
+		plan, err := planFrom(res)
+		if err != nil {
+			a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning failed! The planner's corrected answer was not a valid plan either (%v). Nothing will run.\n", err))
+			return nil, fmt.Errorf("plan not valid JSON: %w", err)
+		}
+		return plan, nil
+	}
 
-	sess := a.getSession(sid)
-	if sess != nil {
+	answerChecked := false
+	for asked := 0; ; asked++ {
 		sess.AddUser(marker)
 		sess.saveOrLog()
-		// Only renderPlan clears this, and a plan phase that streamed its first row
-		// and then errored or was cancelled never reaches it. Clearing here means
-		// the only thing that can suppress this phase's list is this phase's own
-		// table, never a leftover from the turn before.
+		// A plan phase that errored after streaming a row never reaches renderPlan.
 		sess.phaseMu.Lock()
 		sess.planTableShown = false
 		sess.phaseMu.Unlock()
-	}
 
-	// Exclude respond: planning has its OWN terminal tool, submit_plan, whose
-	// arguments are the structured plan. Keeping respond out forces the planner
-	// onto submit_plan instead of escaping into execute's exit and emitting a
-	// free-text answer with no plan attached.
-	// Read-only planning, enforced at dispatch: edit_file/write_file/launch_subagent
-	// are denied (planner edits leak into history; launch_subagent fans them to a
-	// leaf worker). `sed -i` is unblockable here — PLAN.md forbids it in prose.
-	// Terminals: submit_plan (the plan) or respond (a direct answer, no work).
-	policy := phasePolicy{
-		deny:      map[string]bool{"write_file": true, "edit_file": true, "launch_subagent": true},
-		terminals: map[string]bool{submitPlanToolName: true, respondToolName: true},
-	}
-
-	// Run the tool loop (stream=false: planning output is machinery, not shown
-	// live — orchestrate renders the subtask list or surfaces a direct answer).
-	// The planner ends by calling submit_plan, whose arguments ARE the plan, so
-	// planRes.Text is clean JSON and planRes.Content is any user-facing answer
-	// prose — already separated. A model that skips the tool and emits the plan
-	// as free text falls through to the legacy parse + one corrective retry.
-	// Merged ToolUses keep full visibility either way.
-	var plan planResult
-	planRes, err := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0)
-	if err != nil {
-		return nil, planRes.ToolUses, err
-	}
-	// respond as the plan terminal = a direct answer: the request needs no work
-	// (a question, or already done), so there's no plan to execute. Surface it as
-	// a report_only answer with no subtasks; orchestrate prints it and stops.
-	if planRes.Terminal == respondToolName {
-		// The respond turn's text is already in the session (the loop stored it +
-		// respond's tool result); just surface the answer to orchestrate.
-		return &planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(planRes.Text)}, planRes.ToolUses, nil
-	}
-	parseErr := json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
-	if parseErr != nil {
-		// Two different failures land here and they need different correctives:
-		// the planner answered in prose without ever calling submit_plan, or it
-		// called it with arguments that aren't valid JSON. The second used to skip
-		// this retry outright (the condition also demanded !RespondCalled), so one
-		// malformed argument list failed the whole turn with nothing said.
-		corrective := "Call the `submit_plan` tool with your plan as its arguments. Do not reply in prose."
-		wrong := "the planner replied in prose instead of calling submit_plan"
-		if planRes.RespondCalled {
-			corrective = fmt.Sprintf("Your `submit_plan` arguments were not valid JSON (%v). Call it again, emitting the arguments as one well-formed JSON object.", parseErr)
-			wrong = fmt.Sprintf("submit_plan's arguments were not valid JSON (%v)", parseErr)
+		// stream=false: planning output is machinery; orchestrate renders the result.
+		planRes, err := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0)
+		if err != nil {
+			return nil, err
 		}
-		// Rows only stream once their object closes, so some may already be on
-		// screen. Name the count: the user just watched a plan appear and has to
-		// know it is not the one that will run.
-		salvaged := ""
-		var partial struct {
-			Subtasks []subtask `json:"subtasks"`
-		}
-		if json.Unmarshal([]byte(repairJSON(planRes.Text)), &partial) == nil && len(partial.Subtasks) > 0 {
-			salvaged = fmt.Sprintf(" %d subtask(s) already reached the table and are not final.", len(partial.Subtasks))
-		}
-		// Say it out loud. Planning runs with stream=false, so without this the
-		// user watches the Planning row sit through an entire extra round trip
-		// with no hint that anything went wrong.
-		a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning went wrong! %s.%s Asking the planner to try again.\n", wrong, salvaged))
-		slog.Info("planner produced no parsable plan; retrying with corrective",
-			"sid", sid, "calledSubmitPlan", planRes.RespondCalled, "err", parseErr, "snippet", truncate(planRes.Text, 200))
-		// runToolLoop builds fresh from the session, so the files the planner read
-		// this turn stay in front of it; the corrective rides as a trailing turn.
-		retry, retryErr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, corrective)
-		planRes.Text = retry.Text
-		planRes.Content = retry.Content
-		planRes.RespondCalled = retry.RespondCalled
-		planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
-		planRes.DurationMs += retry.DurationMs
-		if retryErr != nil {
-			return nil, planRes.ToolUses, retryErr
-		}
-		parseErr = json.Unmarshal([]byte(trimJSON(planRes.Text)), &plan)
-	}
-	if parseErr != nil {
-		a.say(ctx, sid, fmt.Sprintf("\n⚠ Planning failed! The planner could not produce a valid plan even after a corrective retry (%v). Nothing will run.\n", parseErr))
-		return nil, planRes.ToolUses, fmt.Errorf("plan not valid JSON: %w", parseErr)
-	}
-
-	// Direct-answer prose: when the planner called submit_plan it's in the clean
-	// content channel; a free-text plan has it mashed with the JSON, so drop the
-	// JSON object out. orchestrate shows this when the plan has no subtasks.
-	if planRes.RespondCalled {
-		plan.answer = strings.TrimSpace(planRes.Content)
-	} else {
-		plan.answer = strings.TrimSpace(strings.Replace(planRes.Text, trimJSON(planRes.Text), "", 1))
-	}
-
-	// Clean-signal enforcement: the planner must submit EITHER a final answer (a
-	// message, no subtasks) OR a plan (subtasks) — never both, never neither.
-	// PLAN.md spells this out; here we catch the structural violations and nudge
-	// ONCE to pick a lane, then re-parse — orchestrate then surfaces the answer or
-	// runs the subtasks. (A "message" that's really a promise — "I'll summarize" —
-	// reads structurally as an answer; keeping the model off that is PLAN.md's job,
-	// not a brittle string match here.)
-	hasPlan := len(plan.Subtasks) > 0
-	// Prose alongside subtasks is a PREAMBLE, not an answer, and must not count as
-	// one: orchestrate surfaces answer only when there are no subtasks
-	// (prompt.go), and report_only=false says the planner means this plan to run,
-	// so there is nothing to choose between and nothing to ask. Measured over two
-	// sessions: 10 of 35 plan submissions carried a preamble ("The request is
-	// clear: delete the out/test build output and recompile the site."), every one
-	// of them report_only=false, and every one cost a corrective round trip (4-50s)
-	// plus a second plan table streamed over the first, to arrive at the plan
-	// already submitted. The nudge also lingers as a stored turn: a later planner
-	// round spent 1825 bytes of reasoning re-litigating one.
-	//
-	// report_only=true is the real fork and still nudges: those subtasks relay
-	// findings the message may already have delivered, so running them can
-	// re-derive an answer the user was just given.
-	hasAnswer := plan.answer != "" && (!hasPlan || plan.ReportOnly)
-	if plan.Clear && hasPlan == hasAnswer {
-		nudge := "You submitted neither a usable answer nor a plan — your message is empty or only promises to act (\"I'll…\"). Either write the COMPLETE answer now (report_only=true, no subtasks), OR submit subtasks that produce it. Never write \"I'll…\" / \"let me…\"."
-		if hasPlan {
-			nudge = "You submitted BOTH a final answer and a plan. Pick one: answer the user completely now (report_only=true, no subtasks), OR drop the message and submit only the subtasks to execute."
-		}
-		wrong := "submitted neither an answer nor any subtasks"
-		if hasPlan {
-			wrong = "submitted a final answer AND a plan at once"
-		}
-		a.say(ctx, sid, "\n⚠ The planner "+wrong+"! Asking it to pick one.\n")
-		slog.Info("planner: ambiguous submission, nudging to pick one", "sid", sid, "hasPlan", hasPlan, "hasAnswer", hasAnswer)
-		// runToolLoop builds fresh from the session (reads from this turn stay in
-		// context) and stores the nudge as the trailing turn.
-		retry, rerr := a.runToolLoop(ctx, sid, thinking, policy, "plan", false, 0, nudge)
-		switch {
-		case rerr != nil:
-			// Recoverable: the ambiguous submission still stands and orchestrate can
-			// work with it. Not silent, though, because what runs next is then the
-			// thing that was just called ambiguous.
-			a.say(ctx, sid, fmt.Sprintf("⚠ The corrective round failed (%v)! Going ahead with the planner's first submission.\n", rerr))
-		default:
-			planRes.ToolUses = append(planRes.ToolUses, retry.ToolUses...)
-			var rp planResult
-			switch {
-			case retry.Terminal == respondToolName:
-				plan = planResult{Clear: true, ReportOnly: true, answer: strings.TrimSpace(retry.Text)}
-			case json.Unmarshal([]byte(trimJSON(retry.Text)), &rp) == nil:
-				plan = rp
-				if retry.RespondCalled {
-					plan.answer = strings.TrimSpace(retry.Content)
-				} else {
-					plan.answer = strings.TrimSpace(strings.Replace(retry.Text, trimJSON(retry.Text), "", 1))
-				}
-			default:
-				a.say(ctx, sid, "⚠ The corrected reply was not valid JSON either! Going ahead with the planner's first submission.\n")
+		plan, parseErr := planFrom(planRes)
+		sess.rt.mu.Lock()
+		audit, verify := sess.rt.specAudit, sess.rt.specVerify
+		sess.rt.mu.Unlock()
+		// Prose was already nudged in the loop; this retry covers what the loop cannot see.
+		if wrong, corrective := planProblem(planRes, plan, parseErr, audit, verify); wrong != "" {
+			// Rows already on screen must be named as not final.
+			salvaged := ""
+			var partial struct {
+				Subtasks []subtask `json:"subtasks"`
+			}
+			if json.Unmarshal([]byte(repairJSON(planRes.Text)), &partial) == nil && len(partial.Subtasks) > 0 {
+				salvaged = fmt.Sprintf(" %d subtask(s) already reached the table and are not final.", len(partial.Subtasks))
+			}
+			slog.Info("planner submission missed its contract; retrying with corrective",
+				"sid", sid, "calledSubmitPlan", planRes.Terminal != "", "err", parseErr, "snippet", truncate(planRes.Text, 200))
+			if plan, err = retry(fmt.Sprintf("\n⚠ Planning went wrong! %s.%s Asking the planner to try again.\n", wrong, salvaged), corrective); err != nil {
+				return nil, err
 			}
 		}
-	}
 
-	// The planner's turn (its prose + the submit_plan call/result) is already in
-	// the session, stored verbatim by the loop — no post-hoc patch.
+		// An answer alone ends the turn with nothing done, and the planner has called that a plan.
+		if !answerChecked && len(plan.Subtasks) == 0 && plan.answer != "" && strings.TrimSpace(plan.Question) == "" && !audit && !verify && sess.specFence() == "" {
+			answerChecked = true
+			kept := plan.answer
+			if plan, err = retry("", answerCheckText); err != nil {
+				return nil, err
+			}
+			if len(plan.Subtasks) == 0 && strings.TrimSpace(plan.Question) == "" && (plan.answer == "" || strings.EqualFold(strings.Trim(strings.TrimSpace(plan.answer), "\"."), "same")) {
+				plan.answer = kept
+			}
+		}
 
-	toolUses := planRes.ToolUses
-	if !plan.Clear && len(plan.Choices) > 0 {
+		// A /spec question is parked in QUESTIONS.md, and only once the spec alone can
+		// answer it: a chat answer is lost to later rounds.
+		if fence := sess.specFence(); fence != "" && !plan.Clear {
+			q, wrong := specQuestionFrom(plan, fence)
+			if wrong != "" {
+				corrective := "Your question was not recorded: " + wrong + ". Read the spec again first: a layout, a label, an order or a value it states anywhere (the chapter's screen description, its picture, a table, another item) decides it, so follow that and call `submit_plan` with the subtasks. " +
+					"Only if the spec truly does not decide it, call `submit_plan` again with no subtasks and: `question`, one sentence naming what the user must decide; `spec_quote`, the spec text that comes closest to deciding it, copied exactly from a spec file; `options`, 2 or 3 ways to decide it with your pick first, each a short `choice` and an `example` of what the user would see or the program would do with it (a label, a layout, a value, a line of a file)."
+				if plan, err = retry(fmt.Sprintf("\n⚠ The planner asked a question that is not answerable from the spec as asked: %s. Asking it to look again.\n", wrong), corrective); err != nil {
+					return nil, err
+				}
+				if plan.Clear {
+					return plan, nil // it found the answer in the spec
+				}
+				q, wrong = specQuestionFrom(plan, fence)
+			}
+			a.say(ctx, sid, q.Question+"\n")
+			sess.AddUser("Question parked for the user by the spec loop: " + q.Question)
+			sess.saveOrLog()
+			return nil, &specQuestionError{Q: q, Problem: wrong}
+		}
+
+		if plan.Clear || len(plan.Choices) == 0 {
+			// A question with no buttons is still a question: the user answers it in chat,
+			// and whatever was planned beside it waits for that answer.
+			if q := strings.TrimSpace(plan.Question); !plan.Clear && q != "" {
+				plan.Subtasks, plan.answer = nil, q
+			}
+			return plan, nil
+		}
+		if asked == maxClarifications {
+			a.say(ctx, sid, fmt.Sprintf("\n⚠ Still unclear after %d clarifications; going on with the planner's last plan.\n", maxClarifications))
+			return plan, nil
+		}
 		question := plan.Question
 		if question == "" {
 			question = "I'm not sure what you mean. Which of these?"
@@ -264,76 +277,53 @@ func (a *agent) runPlanPhase(ctx context.Context, sid string, replanContext stri
 		a.say(ctx, sid, question)
 
 		tcId := a.StartToolCall(ctx, sid, "Clarification needed", "think", nil)
-		choice, err := a.askChoiceAuto(ctx, sid, tcId, question, plan.Choices)
+		choice, askErr := a.askChoice(ctx, sid, tcId, question, plan.Choices)
 		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("User chose: " + choice)})
 
-		// err = the card's ctx was cancelled (the editor aborted this turn to send
-		// a new prompt) — NOT a stop the user made; surface the real cause so the
-		// notice doesn't say "you stopped it". choice=="abort" IS an explicit stop.
-		if err != nil {
-			appendAssistantNote(sess, "Clarification cancelled (superseded).")
-			if sess != nil {
-				sess.saveOrLog()
-			}
-			return nil, toolUses, err
+		// A new user message, never an edit: the planner's stored reply is in the server's cache.
+		note := "User chose: " + choice
+		switch {
+		case askErr != nil:
+			note = "Clarification cancelled."
+		case choice == "abort":
+			note = "User aborted on clarification."
+		}
+		sess.AddUser(note)
+		sess.saveOrLog()
+		if askErr != nil {
+			return nil, askErr
 		}
 		if choice == "abort" {
-			appendAssistantNote(sess, "User aborted on clarification.")
-			if sess != nil {
-				sess.saveOrLog()
-			}
-			return nil, toolUses, errUserCancelled
-		}
-
-		appendAssistantNote(sess, "User chose: "+choice)
-		if sess != nil {
-			sess.saveOrLog()
+			return nil, errUserCancelled
 		}
 		a.say(ctx, sid, "Understood: "+choice+"\n")
-
-		// Re-run the planner now that the user has clarified. The session already
-		// carries "User chose: X" so the model sees the full context and should
-		// produce subtasks. Without this, orchestrate receives the original empty
-		// plan (subtasks=[]) and hits the "couldn't produce a plan" fallback.
-		p, u, err := a.runPlanPhase(ctx, sid, replanContext)
-		return p, append(toolUses, u...), err
 	}
-
-	return &plan, toolUses, nil
 }
 
-// ---------------------------------------------------------------------------
-// Subtask loop: one bounded tool-calling pass that self-verifies
-// ---------------------------------------------------------------------------
-
-// subtaskOutcome captures what runExecutePhase produced. Success is true only
-// when the model called respond AND no tool in the loop returned Failed=true.
-// Reason summarises why a failed subtask failed — it feeds the orchestrator's
-// replan context and the Jaccard duplicate-failure check.
+// Reason feeds the replan context and the Jaccard duplicate-failure check.
 type subtaskOutcome struct {
 	Result  toolLoopResult
 	Success bool
 	Reason  string
-	// Upsert is non-nil when the executor called submit_plan to revise the
-	// remaining plan; the orchestrator adopts it and continues (completed work
-	// stays, nothing cancelled). Success=false, Reason empty in this case.
+	// The executor's revision of the remaining plan; Success is false and Reason empty.
 	Upsert *planResult
 }
 
-// runExecutePhase runs one subtask as a single tool-calling loop. EXECUTE.md
-// plus the subtask description and verify recipe open the loop; the
-// executor runs with all execute tools (web tools excluded — those live in
-// planning). The executor self-verifies via the recipe before calling
-// respond. Bounded only by the hard maxToolLoopIterations backstop in this file.
 func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx, total int) subtaskOutcome {
 	sess := a.getSession(sid)
+	// The red-first check compares against the files as they are now. /spec rounds have
+	// their own gates, and the check would run a round's tests twice.
+	var root string
+	var before map[string]*fileState
+	if sess != nil && sess.specFence() == "" {
+		root, before = dirtyFiles(sess.Cwd)
+	}
 
-	// EXECUTE.md is in the system prompt now; inject only the specific subtask +
-	// verify recipe, not the full primer (which stacked in the history per subtask).
+	// EXECUTE.md lives in the system prompt; repeating it would stack a copy per subtask.
 	var prompt strings.Builder
-	fmt.Fprintf(&prompt, "EXECUTION phase — Task %d/%d\n\n%s\n", idx+1, total, st.Description)
+	fmt.Fprintf(&prompt, "EXECUTION phase: Task %d/%d\n\n%s\n", idx+1, total, st.Description)
 	if len(st.Verify) > 0 {
-		prompt.WriteString("\n## Verify recipe — run every entry via tools before calling respond\n\n")
+		prompt.WriteString("\n## Verify recipe: run every entry via tools before calling respond\n\n")
 		for i, v := range st.Verify {
 			fmt.Fprintf(&prompt, "%d. %s\n", i+1, v)
 		}
@@ -344,185 +334,127 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 		sess.saveOrLog()
 	}
 
-	// Execute allows EVERY tool (web_search/web_read usable mid-edit). Terminals:
-	// respond ends the subtask; submit_plan revises the remaining plan in place
-	// (the orchestrator adopts it — see subtaskOutcome).
+	// submit_plan revises the remaining plan in place (see subtaskOutcome.Upsert).
 	policy := phasePolicy{terminals: map[string]bool{respondToolName: true, submitPlanToolName: true}}
-	// Reasoning off for the whole subtask: withThinkingDisabled appends a closed
-	// <think></think> for the model to continue, which suppresses it without
-	// changing a single earlier token (see llm.go).
-	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
+	// tool_choice=auto, not required: this phase ends only on a terminal tool, so prose is a slip the
+	// phase contract corrects, but a forced call is decided before the model has weighed what it was
+	// just told. Halogen starts the call for the model under "required", and the name that comes out is
+	// the last one called: replayed 8 times each, the request after a refused edit ("read it with
+	// read_file first") resent the same edit 8/8 under required, with the refusal rewritten or a user
+	// message added too, and called read_file 8/8 under auto, reasoning off in both. The executor had
+	// made 0 read_file calls in 12 runs, and edit loops of 90 to 299 calls, under required.
+	conn := a.connFor("execute").withThinkingDisabled().withBody("tool_choice", "auto")
 	res, err := a.runToolLoop(ctx, sid, conn, policy, "execute", true, executeFailCap)
-	// The executor's turns (prose + respond's call/result) are already in the
-	// session, stored verbatim by the loop — no post-hoc patch.
 
 	out := subtaskOutcome{Result: res}
 	if err != nil {
 		out.Reason = "executor error: " + err.Error()
 		return out
 	}
-	// Plan-upsert: submit_plan's args ARE the revised plan (in res.Text). Hand it
-	// up for the orchestrator to adopt; a malformed one falls through to failure.
 	if res.Terminal == submitPlanToolName {
 		var up planResult
-		if err := json.Unmarshal([]byte(trimJSON(res.Text)), &up); err == nil && len(up.Subtasks) > 0 {
+		if err := json.Unmarshal([]byte(unwrapPlan(trimJSON(res.Text))), &up); err == nil && len(up.Subtasks) > 0 {
 			out.Upsert = &up
 			return out
 		}
 		out.Reason = "executor called submit_plan with no usable subtasks"
 		return out
 	}
-	if !res.RespondCalled {
+	if res.Terminal != respondToolName {
 		out.Reason = "executor exited without calling respond"
 		return out
 	}
-	// Exit-code authority, last state only: typed Failed flags override
-	// whatever the model claimed in its respond message — small models
-	// routinely declare success while a command exited non-zero, so we trust
-	// the tool stream. But we honour only the LAST invocation of each distinct
-	// call (same tool name + same arguments): a verify command that failed, got
-	// fixed, and then re-ran green leaves an early Failed=true in the history
-	// that must NOT condemn the subtask. Keying on name+input means re-running
-	// the exact same command updates its verdict, while a different command
-	// keeps its own.
-	type callKey struct{ name, input string }
-	lastFailed := map[callKey]bool{}
-	var order []callKey
-	for _, u := range res.ToolUses {
-		k := callKey{u.Name, u.Input}
-		if _, seen := lastFailed[k]; !seen {
-			order = append(order, k)
-		}
-		lastFailed[k] = u.Failed
-	}
-	var failedNames []string
-	for _, k := range order {
-		// Only run_task/run_command exit codes are authoritative build verdicts.
-		// Several other tools set Failed to feed the loop's fail cap but are NOT
-		// verdicts: edit_file/write_file on a usage error (a recovered edit is a
-		// later edit with a different key, and an unrecovered one is caught by the
-		// verify recipe when the file won't build), view_image on a benign missing
-		// image. Condemning the subtask on those triggers spurious replans, so use
-		// a positive allowlist.
-		if lastFailed[k] && (k.name == "run_task" || k.name == "run_command") {
-			failedNames = append(failedNames, k.name)
+	// A non-zero exit is no verdict (a grep that finds nothing exits 1); the executor's own word is.
+	for i := len(res.ToolUses) - 1; i >= 0; i-- {
+		if u := res.ToolUses[i]; u.Name == respondToolName {
+			if parseArgs(u.Input).flag("failed") {
+				out.Reason = "the executor reports: " + truncate(res.Text, 400)
+				return out
+			}
+			break
 		}
 	}
-	if len(failedNames) > 0 {
-		out.Reason = "failed tools: " + strings.Join(failedNames, ", ")
+	if reason := a.testShowsFault(ctx, sid, root, before, res.ToolUses); reason != "" {
+		out.Reason = reason
 		return out
 	}
 	out.Success = true
 	return out
 }
 
-// ---------------------------------------------------------------------------
-// Document phase (runs once at end of a successful prompt)
-// ---------------------------------------------------------------------------
-
-// runDocumentPhase runs after every subtask in the prompt has succeeded. It is
-// part of the FOREGROUND turn (plan → execute → document): it runs on the same
-// connection as execute and feeds the documenter the full conversation via
-// buildLLMContext, so it reuses execute's warm KV prefix (a cache hit, not a
-// cold prefill) and sees the actual edits — not a digest. Only the summariser
-// and git-commit drafter run on the background LLM.
-// DOCUMENT.md self-skips when no documentation update is warranted.
-func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopResult) (toolLoopResult, error) {
+// A failed documentation pass is logged, never the turn's failure.
+func (a *agent) runDocumentPhase(ctx context.Context, sid string, exec toolLoopResult) toolLoopResult {
 	docPrompt := a.loadPromptFile(sid, "DOCUMENT.md")
 	if docPrompt == "" {
-		return exec, nil
+		return exec
 	}
-
 	sess := a.getSession(sid)
 	if sess == nil {
-		return exec, nil
+		return exec
 	}
-
-	// Documentation is part of the FOREGROUND turn (plan → execute → document),
-	// not background work — only the summariser and git-commit drafter belong on
-	// the background LLM. Run it on the SAME connection as execute so it reuses
-	// execute's warm KV prefix instead of cold-prefilling a separate slot.
-	// Reasoning off, like the executor it follows (see withThinkingDisabled).
-	conn := a.connForSession(ctx, sid, "execute").withThinkingDisabled()
-	if conn == nil {
-		return exec, nil
-	}
-
-	// The doc instruction lands in the session as the trailing user turn, so
-	// buildLLMContext hands the documenter the FULL turn — the edits the executor
-	// actually made, not a lossy digest — continuing the cached lineage.
 	sess.AddUser(docPrompt)
 	sess.saveOrLog()
 
-	// Blank line before the documenter streams, so its output (often just "No
-	// documentation change needed.") starts a fresh markdown paragraph instead
-	// of running into the executor's final sentence.
 	a.say(ctx, sid, "\n\n")
-	// Documentation wraps up a finished turn: deny submit_plan (no looping back
-	// to planning). respond is a terminal here too: the model writes docs and
-	// then calls respond to signal "documentation complete" — the same intent as
-	// in execute phase. Without this, the loop sees respond as a normal tool
-	// call, continues, and the model calls respond again → stuck-repetition.
+	// respond must be a terminal, or the model calls it again and trips the repetition ladder.
 	docPolicy := phasePolicy{
 		deny:      map[string]bool{submitPlanToolName: true},
 		terminals: map[string]bool{respondToolName: true},
+		proseEnds: true, // DOCUMENT.md asks for a prose reply when nothing changes
 	}
-	docRes, err := a.runToolLoop(ctx, sid, conn, docPolicy, "document", true, 0)
+	// The execute connection, so it reuses execute's warm KV prefix.
+	docRes, err := a.runToolLoop(ctx, sid, a.connFor("execute").withThinkingDisabled(), docPolicy, "document", true, 0)
 	if err != nil {
 		slog.Warn("document phase failed", "err", err)
-		return exec, nil
+		return exec
 	}
-	// The document turn is already in the session, stored verbatim by the loop.
 	exec.ToolUses = append(exec.ToolUses, docRes.ToolUses...)
-	return exec, nil
+	return exec
 }
 
-// maxToolLoopIterations is runToolLoop's hard runaway backstop: a model
-// emitting "different enough" tool calls forever can't spin past it. One
-// iteration is one LLM round-trip; a complex execute pass is usually 10-20, so
-// 100 leaves headroom while still bailing genuine runaways. The repetition
-// ladder catches the common stuck patterns earlier.
+// Above the median plan, below the runaways; the executor reads what is left cheaply.
+const planRoundNudge = 20
+
+// A planner past this many generated tokens without a plan is thinking in circles: on an
+// impossible request it hunted workarounds for 13k tokens, and a JDK upgrade plan took 13 minutes.
+// Normal plans stay under it (1-3k).
+const planTokenNudge = 6000
+
+// Backstop for "different enough" calls forever; the repetition ladder catches the rest earlier.
 const maxToolLoopIterations = 100
 
-// keepSmallTurnTokens caps the verbatim keep-window of completed small turns the
-// 400 recovery preserves, sized by the server's real prompt_tokens (not an
-// estimate). The unfinished small turn is always kept on top; everything older
-// folds into Summary. See Session.keepWindowStart.
-const keepSmallTurnTokens = 10_000
-
-// reasoningNudgeBytes is the "the model clearly worked" bar: more reasoning than
-// this with an EMPTY visible message means the answer is stuck in the (never-
-// shown) reasoning channel, so the loop nudges it to write the answer as text.
-const reasoningNudgeBytes = 512
-
-// A mid-response connection drop (server/router closed the stream) is usually
-// momentary, so the recovery loop re-sends the same request a few times with a
-// short backoff before surfacing a clear message instead of a raw EOF.
+// An execute step at the cap with at least two edits and a build or test run in
+// its last productiveWindow calls gets productiveExtension more, once.
 const (
-	maxTransientStreamRetries = 5
-	transientStreamBackoff    = 3 * time.Second
+	productiveWindow    = 40
+	productiveExtension = 50
 )
 
-// maxStreamRuleRetries caps how many times one round re-asks after a stream
-// rule aborted the generation (see rules.go). Two: the first retry carries the
-// reminder, the second is the benefit of the doubt. A model still emitting the
-// same off-format output after both is not going to be corrected by a third
-// reminder, and the failure is more useful surfaced to the replan machinery
-// than spun on here.
-const maxStreamRuleRetries = 2
+// An execute subtask that only reads for this long is lost: in the logs, no
+// successful one read more than about 32 calls in a row, and most capped ones did.
+const (
+	readStreakEscalate = 20
+	readStreakBail     = 40
+)
 
-// streamFlushInterval batches streamed model tokens to the editor at most this
-// often. Per-token sendUpdate is fine at ~45 tg/s, but at higher rates (e.g. 450
-// tg/s) it floods: each call takes the one conn write lock, and a slow editor
-// would backpressure the SSE read and stall the LLM call (the same failure run_command
-// had). Batching keeps editor updates at ~1/interval regardless of generation speed.
+// The completed small turns 400 recovery keeps verbatim (see Session.keepWindowStart).
+const keepSmallTurnTokens = 10_000
+
+// A mid-response drop (router model swap, a blip) is usually momentary. A server
+// that refuses connections is restarting, which took two minutes in the logs, so
+// it gets doubling waits for up to serverDownPatience. Vars so tests can shorten them.
+const maxTransientStreamRetries = 5
+
+var (
+	transientStreamBackoff = 3 * time.Second
+	serverDownPatience     = 5 * time.Minute
+)
+
+// Per-token updates at high rates contend for the one conn write lock, and a slow
+// editor would backpressure the SSE read and stall the LLM call.
 const streamFlushInterval = 200 * time.Millisecond
 
-// throttledStream returns a per-token sink that accumulates tokens and emits an
-// EMITTED chunk at most once per streamFlushInterval (driven by token arrivals;
-// the first token emits immediately), plus a flush that emits whatever is left
-// (call it when the stream ends). Single-goroutine by construction: the SSE loop
-// drives the sink, the caller drives flush after llmStream returns, so no lock.
+// No lock: the SSE loop drives sink, and the caller calls flush after llmStream returns.
 func throttledStream(emit func(string)) (sink func(string), flush func()) {
 	var buf strings.Builder
 	var lastSent time.Time
@@ -543,126 +475,43 @@ func throttledStream(emit func(string)) (sink func(string), flush func()) {
 	return sink, send
 }
 
-// executeFailCap is the per-subtask budget of FAILED rounds (iterations whose
-// tool batch produced a failure). Successful work is uncounted, so a long but
-// productive subtask runs unhindered; only one that keeps hitting failures it
-// can't clear burns the budget. A healthy verify-fix cycle costs 1-2 failures
-// (red build → fix → green), so this leaves room for a few bumps before
-// concluding the loop is stuck and bouncing it to a replan — where
-// web_search/web_read and a fresh decomposition are available, unlike this
-// web-blind execute loop. maxToolLoopIterations stays above it as the absolute
-// runaway backstop (and still solely governs the plan/subagent loops, which
-// pass no cap). Small fail budget + larger maxReplans deliberately shifts work
-// from one web-blind loop toward more web-capable replan rounds.
+// Counts FAILED rounds only; past it the subtask bounces to a replan.
 const executeFailCap = 8
 
-// stuckEscalateRounds / stuckBailRounds drive runToolLoop's repetition ladder.
-// A "stuck round" is an iteration whose every tool call reproduced output it
-// already produced this loop (an unchanged re-read, a re-run command with
-// identical output, a repeated failing call). Consecutive stuck rounds first
-// warm the sampler (switch execute→thinking — same server/model, so the prefix
-// cache stays warm), then bail. Escalate strictly below bail so the warmer
-// sampler always gets a turn before we give up.
+// Escalate strictly below bail, so the warmer sampler always gets a turn.
 const (
 	stuckEscalateRounds = 3
 	stuckBailRounds     = 5
 )
 
-// toolLoopResult is what an agentic tool loop (runToolLoop) returns.
 type toolLoopResult struct {
 	Text string
-	// Content is the model's accumulated free-text (assistant content) across
-	// the loop, separate from Text. For a terminal exit these diverge: Text is
-	// the terminal tool's output (respond's message, or submit_plan's plan
-	// JSON), while Content is whatever prose the model wrote alongside the tool
-	// call. runPlanPhase relies on this split — submit_plan's args land in Text,
-	// the planner's user-facing answer lands here — so the two never mix.
+	// The prose beside the calls. On a terminal exit Text is the terminal's output
+	// instead; runPlanPhase relies on the split.
 	Content  string
 	ToolUses []ToolUse
-	// RespondCalled is true when the loop exited because the model invoked
-	// the registered terminal tool (typically `respond`). False when the
-	// loop exited via the legacy empty-tool-calls path, hit the failed-round
-	// soft cap, or returned an error. Subtask runners use this as the primary
-	// success signal — a loop that ran out of turns without calling
-	// `respond` is a failed subtask regardless of what's in res.Text.
-	RespondCalled bool
-	// Terminal is which terminal tool ended the loop ("" if none — legacy exit,
-	// fail cap, or error). A phase can expose several terminals (execute exits on
-	// respond OR submit_plan), so callers branch on this to tell a finished
-	// subtask (respond) from a plan-upsert (submit_plan). RespondCalled stays
-	// true for ANY terminal — it's the generic "loop reached a terminal" signal.
+	// "" when no terminal ended the loop: a failed subtask whatever Text says.
 	Terminal string
-	// StartedAt is when the first llmStream call of this loop began.
-	// StartedAt/DurationMs are the loop's own LLM-call timing (DurationMs is
-	// cumulative across iterations and excludes tool execution). runToolLoop
-	// stamps them onto the trailing assistant message via MarkLastAssistantTiming
-	// before returning — callers don't read them.
-	StartedAt  time.Time
-	DurationMs int64
 }
 
-// runToolLoop is the core agentic tool loop: send to LLM, execute tool calls,
-// repeat. When stream is true the model's text/reasoning tokens are forwarded to
-// the UI live (execute / document phases); the planner's internal JSON pass
-// passes false so its tokens stay silent. The phase tag ("plan"/"execute"/
-// "document"/"subagent") and cumulative llmStream wall-clock are stamped onto
-// the trailing assistant message via MarkLastAssistantTiming, so session.toml
-// records who ran the turn and how much time was generation vs tool execution.
-//
-// failSoftCap is an optional soft ceiling on FAILED rounds — iterations whose
-// tool batch produced at least one failed tool. When > 0 and that count is
-// reached without the terminal tool firing, returns (res, nil) with
-// RespondCalled=false instead of erroring, so a subtask runner bounces to a
-// replan. Counting failures (not total iterations) lets a long-but-productive
-// subtask run freely while a stuck one — one that keeps hitting red builds/tests
-// this web-blind loop can't resolve — exits early. 0 means only the
-// maxToolLoopIterations backstop applies.
-// runToolLoop builds the LLM context FRESH from the session each call — never
-// from a caller-held snapshot, which goes stale the instant the loop does work
-// that lands in the session but not the snapshot (the b/c re-read bug).
-// corrective carries a caller's retry turn (a nudge, a "call submit_plan"
-// retry). It is STORED before the rebuild instead of appended after it, for the
-// reason addCorrective gives. Every phase uses this; only the subagent — which
-// seeds from its PARENT's session for cache warmth — calls runToolLoopSeeded
-// directly.
+// failSoftCap > 0 ends the loop after that many FAILED rounds, 0 leaves only
+// maxToolLoopIterations. The context is rebuilt from the session; corrective is stored first.
 func (a *agent) runToolLoop(ctx context.Context, sid string, conn *LLMConnection, policy phasePolicy, phase string, stream bool, failSoftCap int, corrective ...string) (toolLoopResult, error) {
-	var messages []llmMessage
-	if sess := a.getSession(sid); sess != nil {
-		for _, c := range corrective {
-			sess.AddUser(c)
-		}
-		if len(corrective) > 0 {
-			sess.saveOrLog()
-		}
-		messages = a.buildLLMContext(sess)
-	} else {
-		// No session to store into (probe paths): nothing will ever rebuild this
-		// context, so the wire is the only place the corrective can live.
-		for _, c := range corrective {
-			messages = append(messages, llmMessage{Role: "user", Content: c})
-		}
+	sess := a.getSession(sid)
+	if sess == nil {
+		return toolLoopResult{}, fmt.Errorf("no session found")
 	}
-	return a.runToolLoopSeeded(ctx, sid, conn, messages, policy, phase, stream, failSoftCap)
+	for _, c := range corrective {
+		sess.AddUser(c)
+	}
+	if len(corrective) > 0 {
+		sess.saveOrLog()
+	}
+	return a.runToolLoopSeeded(ctx, sid, conn, a.buildLLMContext(sess), policy, phase, stream, failSoftCap)
 }
 
-// addCorrective puts a corrective turn on the wire AND stores it in the session.
-// Both, always.
-//
-// A wire-only turn reads as free: it is appended after everything else, so it
-// looks like a pure suffix on a warm prefix. That holds only while it is the
-// last message. runToolLoop rebuilds the context from the session on every
-// entry, and a turn the session never saw is gone from that rebuild — from the
-// MIDDLE of history, shifting every message after it. The server then re-renders
-// from that point. Measured on one plan-phase retry: the no-tool-call nudge
-// vanished at index 8 of 23 and the server re-evaluated 9998 of 15346 tokens,
-// 19s, the single most expensive event in that turn.
-//
-// One rule, no exceptions: what goes on the wire is what is stored.
-//
-// Storing has two visible consequences, both accepted. The turn stays in context
-// for the rest of the session (a few hundred bytes), and session/load replays it
-// to the client as a user message — which the phase prompts (AddUser at
-// runExecutePhase / runDocumentPhase) and the skill disclosures already do.
+// What goes on the wire is stored: runToolLoop rebuilds from the session, and an
+// unstored turn would vanish from the MIDDLE of history and bust the cache.
 func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []llmMessage {
 	if sess := a.getSession(sid); sess != nil {
 		sess.AddUser(text)
@@ -671,307 +520,249 @@ func (a *agent) addCorrective(sid string, messages []llmMessage, text string) []
 	return append(messages, llmMessage{Role: "user", Content: text})
 }
 
-// startToolMeter shows "(running run_command go build ./...… 12s)" for as long
-// as a tool runs, so a slow tool or a subagent's tool call reads as busy rather
-// than frozen. For a subagent session setStatus folds it into the parent's row.
-//
-// The tool name alone doesn't answer the question the row raises: "run_command"
-// sitting at 77s says something is slow but not WHAT, and the arguments are only
-// in the transcript above, scrolled away behind whatever streamed since. So the
-// one argument that identifies the call rides along.
-func (a *agent) startToolMeter(ctx context.Context, sid string, tc toolCall) (stop func()) {
-	label := tc.Function.Name
-	// Tried in priority order: a tool can carry several of these (search_text has
-	// both a query and a path) and only one fits the row. Whitespace runs collapse
-	// to single spaces because a heredoc or a multi-line command would otherwise
-	// break the row apart, and the cut is on runes so it can't split one in half.
-	var args map[string]any
-	if json.Unmarshal([]byte(tc.Function.Arguments), &args) == nil {
-		for _, key := range []string{"command", "task", "query", "path", "id"} {
-			v, _ := args[key].(string)
-			if v = strings.Join(strings.Fields(v), " "); v == "" {
-				continue
-			}
-			if r := []rune(v); len(r) > toolMeterArgRunes {
-				v = string(r[:toolMeterArgRunes])
-			}
-			label += " " + v
-			break
-		}
-	}
-	start := time.Now()
-	a.setStatus(ctx, sid, " (running "+label+"…)") // immediate, before the first tick
-	return a.startStatusMeter(ctx, sid, func() string {
-		return fmt.Sprintf(" (running %s… %ds)", label, int(time.Since(start).Seconds()))
-	})
-}
-
-// toolMeterArgRunes caps the argument shown in the status row. The row is one
-// line in a plan entry: past this the phase name and the seconds counter get
-// pushed out of view, which costs more than the tail of a long command is worth.
-// The trailing "…" the meter already prints doubles as the cut marker.
-const toolMeterArgRunes = 48
-
-// toolLoopCaller holds everything a tool loop needs to make ONE round's LLM
-// call, so the per-round entry point takes only what changes between rounds.
-// Built once per runToolLoopSeeded; conn is swapped in place by the repetition
-// ladder's sampler escalation, and stalled latches in place by the <think>
-// recovery below.
-type toolLoopCaller struct {
-	a     *agent
-	sid   string
-	phase string
-	conn  *LLMConnection
-	tools []map[string]any
-	// on/think are the UI sinks (nil for a silent internal pass); flush emits
-	// whatever the throttled sinks still hold.
-	on, think func(string)
-	flush     func()
-	// stalled latches once the model burns a whole budget looping in <think>:
-	// every later round then starts with thinking off, so a chronically-stalling
-	// model can't re-waste ~max_tokens of reasoning each round. Scoped to one
-	// tool loop — the next phase/subtask re-enables thinking.
-	stalled bool
-}
-
-// round makes one LLM call and runs the whole recovery ladder around it: the
-// stuck-<think> swap, the stream-rule re-ask, the two max_tokens cap rungs, the
-// transient-drop retries, and the context-full history fold. It returns the
-// model's text, tool calls and reasoning, plus the message slice — which the
-// ladder rewrites as it goes, since a corrective turn or a fold changes the
-// context the next attempt is made against.
-//
-// It is its own function because the ladder is a self-contained state machine
-// over a single call, with five independent retry latches; inline, it buried
-// the loop's actual shape (call → run tools → repeat) 150 lines deep.
-func (c *toolLoopCaller) round(ctx context.Context, messages []llmMessage) (string, []toolCall, string, []llmMessage, error) {
-	a, sid := c.a, c.sid
-	var text, reasoning string
-	var calls []toolCall
-	var err error
-	// On a context-overflow 400 (ground truth from the server), escalate the fold
-	// and retry: step 1 keeps the unfinished small turn plus the most recent
-	// ~keepSmallTurnTokens of completed small turns (folding everything older,
-	// including the rest of the in-flight large turn); if that still 400s, step 2
-	// keeps ONLY the unfinished small turn. Each step strictly shrinks the
-	// context, so it terminates: out of steps, the 400 surfaces.
-	recoverStep := 0
-	recoverKeepFrom := []func(*Session) int{
-		func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
-		(*Session).lastAssistantIndex,
-	}
-	// Arm the stream-rule check for this round. The tool loop is the only
-	// caller that does: it owns the retry ladder below, which is what makes a
-	// mid-generation abort recoverable rather than just a failed call.
-	callConn := c.conn.forToolLoop() // a <think> stall retries (and latches) on a thinking-off copy
-	if c.stalled {
-		callConn = callConn.withThinkingDisabled()
-	}
-	thinkingRetried := false // at most one such retry per round
-	capNudged := false       // cap ladder rung 1: one be-concise nudge retry per round
-	capDoubled := false      // cap ladder rung 2: one doubled-max_tokens retry per round
-	transientRetries := 0    // mid-response drops retried up to maxTransientStreamRetries
-	ruleRetries := 0         // stream-rule aborts re-asked up to maxStreamRuleRetries
-	for {
-		// The plan-table sink is built fresh per attempt: a retry re-sends the
-		// request from scratch, so the aborted attempt's partial arguments must
-		// not carry into the next one. Rows already on screen stay there (the
-		// same convention as an aborted stream-rule response) and the retry
-		// simply renders a second table.
-		text, calls, reasoning, err = a.llmStream(ctx, sid, callConn, messages, c.tools, c.on, c.think, a.planTableSink(ctx, sid))
-		c.flush() // emit any batched tail of this call's tokens to the UI
-		if err == nil {
-			return text, calls, reasoning, messages, nil
-		}
-		// Stuck in <think>: the model burned the whole budget on reasoning with
-		// no content and no tool calls. Retry once on a thinking-off copy so it
-		// must answer directly, and latch it for the rest of the run so it can't
-		// re-burn the budget next round. Any phase/depth — swaps the conn, no
-		// history fold needed.
-		if isStuckThinking(err) && !thinkingRetried {
-			thinkingRetried = true
-			c.stalled = true
-			// withThinkingDisabled appends a closed <think></think> for the
-			// model to continue instead of re-rendering the prompt, so the
-			// prefix cache survives both the retry and the return to normal at
-			// the end of this loop. No cache-lineage reset is needed: the next
-			// call extends the previous tokens like any other.
-			//
-			// This used to change chat_template_kwargs, and one real session
-			// paid for it: 71997 tokens re-evaluated at cached=0 entering the
-			// thinking-off window, then 27585 more leaving it, for a 99614-token
-			// context. Probed against the same server afterwards, the append
-			// keeps 13968 of 13978 tokens where the kwargs change kept none.
-			callConn = callConn.withThinkingDisabled()
-			a.logSession(sid, "RECOVER", "model stuck in <think>: continuing a closed <think></think> for the rest of this tool loop")
-			continue
-		}
-		// A stream rule fired: llmStream abandoned the generation the moment the
-		// content matched, so there is no partial to salvage. Re-ask with the
-		// rule's reminder added as a user turn — the same shape as the cap nudge
-		// below, and stored for the same reason (addCorrective): a suffix is only
-		// cache-cheap while it stays the last message.
-		//
-		// Capped, because a model that ignores the reminder twice is not going to
-		// be talked out of it on the third try; better to let the bad reply
-		// through and end up in the replan machinery than to spin here.
-		if sr := asStreamRule(err); sr != nil {
-			if ruleRetries >= maxStreamRuleRetries {
-				a.logSession(sid, "RECOVER", "stream rule %q fired %d times — giving up on the nudge, letting the turn fail", sr.Rule, ruleRetries+1)
-				break
-			}
-			ruleRetries++
-			a.logSession(sid, "RECOVER", "stream rule %q fired — aborted mid-generation, re-asking with the reminder (%d/%d). Matched: %s",
-				sr.Rule, ruleRetries, maxStreamRuleRetries, truncate(sr.Matched, 200))
-			if sid != "" {
-				// The partial is already on screen (llmStream streams before it
-				// checks), so say what happened to it — otherwise the retry reads as
-				// the model repeating itself.
-				a.say(ctx, sid, "\n⟲ Response went off-format and was discarded; re-asking.\n")
-			}
-			messages = a.addCorrective(sid, messages, ruleRetryMessage(sr))
-			continue
-		}
-		// Cap ladder: the generation died AT the requested max_tokens cap with
-		// content or tool calls in flight. The partial is discarded (truncated
-		// tool-call JSON can't be resumed through the chat API). Rung 1: retry
-		// with a be-concise nudge — cheapest, and it keeps the output small,
-		// which is what packs concurrent calls into the KV pool. Rung 2: the
-		// output is genuinely too big for the cap, retry once on a doubled cap
-		// (sampler-side param, so the prefix cache survives). A third hit
-		// surfaces as a normal failure into the replan machinery.
-		if ce := asCapHit(err); ce != nil {
-			if !capNudged {
-				capNudged = true
-				a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d) — retrying with a be-concise nudge", ce.Cap)
-				if sid != "" {
-					a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
-				}
-				messages = a.addCorrective(sid, messages, fmt.Sprintf(
-					"Your previous response was cut off at the %d-token output limit and was DISCARDED — nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
-				continue
-			}
-			if !capDoubled {
-				capDoubled = true
-				base := ce.Cap
-				if base <= 0 {
-					base = defaultMaxTokens
-				}
-				callConn = callConn.withMaxTokens(base * 2)
-				a.logSession(sid, "RECOVER", "still at the cap after the nudge — one retry with max_tokens=%d", base*2)
-				if sid != "" {
-					a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", base*2))
-				}
-				continue
-			}
-			break // both rungs spent — surface as a normal failure (replan)
-		}
-		// Mid-response connection drop (EOF/reset — server or router closed the
-		// stream), distinct from a deliberate cancel. Usually momentary: re-send
-		// a few times, then surface a clear, actionable message instead of the
-		// raw EOF so the user knows it's transient.
-		if isTransientStreamError(err) {
-			if transientRetries >= maxTransientStreamRetries {
-				err = fmt.Errorf("lost the connection to the LLM mid-response %d times (the server or router dropped the stream); this is usually transient — try again in a moment", transientRetries+1)
-				break
-			}
-			transientRetries++
-			a.logSession(sid, "RECOVER", "stream dropped mid-response (%v) — retry %d/%d", err, transientRetries, maxTransientStreamRetries)
-			if sid != "" {
-				// The dropped attempt's partial tokens are already on screen and the
-				// retry re-streams from the top; flag it so the repeated prefix reads
-				// as a reconnect, not a glitch (append-only streaming can't rewind).
-				a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
-			}
-			select {
-			case <-time.After(transientStreamBackoff):
-				continue
-			case <-ctx.Done():
-				err = ctx.Err() // cancelled during backoff → falls through to the cancel path
-			}
-		}
-		if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
-			(c.phase != "plan" && c.phase != "execute") || sid == "" {
-			break
-		}
-		s := a.getSession(sid)
-		if s == nil || s.Depth != 0 {
-			break
-		}
-		// Advance through fold steps until one frees something.
-		folded := false
-		for recoverStep < len(recoverKeepFrom) {
-			keepFrom := recoverKeepFrom[recoverStep](s)
-			recoverStep++
-			if a.foldHistory(ctx, s, keepFrom) {
-				folded = true
-				break
-			}
-		}
-		if !folded {
-			break
-		}
-		messages = a.buildLLMContext(s)
-	}
-	return text, calls, reasoning, messages, err
-}
-
-// repetitionTracker answers one question per tool call: did this exact
-// (name,args) call reproduce output it already produced in this loop? An
-// interleaved revisit counts, not just a consecutive one, which is why it is a
-// map and not a last-call comparison.
+// Repeats are keyed by the answer, not the call: a varied call (a new echo label, a
+// counter in a log name) still gets the same answer. Maps, so an interleaved revisit counts.
 type repetitionTracker struct {
-	// hash is the last output hash of each call, bag the same output as a word
-	// bag: a re-issued call whose output is ≥ stuckOutputSimilarity
-	// Jaccard-similar to its previous output also counts as reproduced. That
-	// catches the loops the hash misses — a re-run failing build with a
-	// timestamp in its output.
-	hash map[string]uint64
+	// A change to the project makes a command's answer new again (a re-check), but
+	// not a read's: re-reading a file the edit did not touch still says nothing new.
+	reads, runs repeatMemory
+	// stuck: outputs that ended an earlier step of this turn by repeating.
+	stuck map[uint64]bool
+	// cwd and sig: the project and its fingerprint after the last observed call;
+	// exact: git gave it, so it sees every change by content.
+	cwd, sig string
+	exact    bool
+	changes  int  // calls that changed the project in this step
+	hitStuck bool // the last sawAgain returned an output that ended an earlier step
+}
+
+// repeatMemory: the outputs the model got, from any call, and per exact call its
+// last output, whose bag catches near-identical output the hash misses (a
+// timestamp in a failing build).
+type repeatMemory struct {
+	seen map[uint64]bool
+	last map[string]uint64
 	bag  map[string]map[string]bool
 }
 
-func newRepetitionTracker() *repetitionTracker {
-	return &repetitionTracker{hash: map[string]uint64{}, bag: map[string]map[string]bool{}}
+func newRepeatMemory() repeatMemory {
+	return repeatMemory{seen: map[uint64]bool{}, last: map[string]uint64{}, bag: map[string]map[string]bool{}}
 }
 
-// sawAgain records this call's output and reports whether it made no progress.
-func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse) bool {
-	key := tc.Function.Name + "\x00" + tc.Function.Arguments
-	h := fnvHash(tu.Output)
-	bag := issueBag([]string{tu.Output})
-	repeated := false
-	if prev, ok := rt.hash[key]; ok && prev == h {
-		repeated = true
-	} else if prevBag, ok := rt.bag[key]; ok && jaccard(prevBag, bag) >= stuckOutputSimilarity {
-		// Not byte-identical but near-identical in content — a re-run whose
-		// output only differs in noise (timestamp, duration, pid) made no more
-		// progress than an exact repeat.
+// readerTools cannot change the project.
+var readerTools = map[string]bool{"read_file": true, "search": true, "continue_read": true, "screenshot": true, "view_image": true,
+	"web_search": true, "web_read": true, "ask_user": true, respondToolName: true, submitPlanToolName: true}
+
+// wroteFile: a refused or unmatched edit says otherwise.
+func wroteFile(name, output string) bool {
+	return (name == "edit_file" || name == "write_file") && strings.HasPrefix(output, "file written")
+}
+
+// isReadCall: the call looks something up and changes nothing.
+func isReadCall(name, args string) bool {
+	switch name {
+	case "read_file", "search", "web_search", "web_read":
+		return true
+	case "run_command":
+		return onlyReads(parseArgs(args).str("command"))
+	}
+	return false
+}
+
+func newRepetitionTracker(cwd string, stuck map[uint64]bool) *repetitionTracker {
+	rt := &repetitionTracker{reads: newRepeatMemory(), runs: newRepeatMemory(), stuck: maps.Clone(stuck), cwd: cwd}
+	if cwd != "" {
+		rt.sig, rt.exact = projectSig(cwd)
+	}
+	return rt
+}
+
+// From the same call again, a timestamp, a pid or a counter in the output does not
+// make it new. Between different calls a number can be the news ("3 passed", "5
+// passed"), so there only a clock time or a date is folded.
+var (
+	digitRunRe = regexp.MustCompile(`\d+`)
+	clockRe    = regexp.MustCompile(`\d{4}-\d\d-\d\d|\d{1,2}:\d\d(?::\d\d(?:\.\d+)?)?`)
+)
+
+// repeatMinOutput: shorter answers ("exit 0", "no matches found") come from many
+// different probes alike, so across calls they say nothing about a loop; from the
+// same call again they do.
+const repeatMinOutput = 24
+
+func callKey(tc toolCall) string { return tc.Function.Name + "\x00" + tc.Function.Arguments }
+
+// answerRepeats: a write's answer ("file written successfully", its error) and a job's launch
+// note read alike for any call, so only the same call again repeats them, not the same answer.
+func answerRepeats(name string) bool {
+	return name != "edit_file" && name != "write_file" && name != "run_background" && name != "run_server"
+}
+
+// repeatText is an output as compared across calls: no batching note, no lines the
+// call spelled out itself (an echo label), clock times and dates folded.
+func repeatText(args, output string) string {
+	out, _, _ := strings.Cut(output, batchNoteLead)
+	var own strings.Builder
+	var walk func(v any)
+	walk = func(v any) {
+		switch v := v.(type) {
+		case string:
+			own.WriteString(v)
+			own.WriteByte('\n')
+		case []any:
+			for _, e := range v {
+				walk(e)
+			}
+		case map[string]any:
+			for _, e := range v {
+				walk(e)
+			}
+		}
+	}
+	var v any
+	if json.Unmarshal([]byte(args), &v) == nil {
+		walk(v)
+	}
+	spelled := own.String()
+	lines := strings.Split(out, "\n")
+	lines = slices.DeleteFunc(lines, func(l string) bool {
+		t := strings.TrimSpace(l)
+		return len(t) >= 3 && strings.Contains(spelled, t)
+	})
+	return strings.TrimSpace(clockRe.ReplaceAllString(strings.Join(lines, "\n"), "#"))
+}
+
+// changedBy observes the project rather than guessing from a command's text (a
+// redirect, `sed -i`, a heredoc). A write tool's own word counts only where the
+// look is partial (no git); with git, an edit that wrote the same bytes changed nothing.
+func (rt *repetitionTracker) changedBy(tc toolCall, tu ToolUse) bool {
+	if readerTools[tc.Function.Name] {
+		return false
+	}
+	written := wroteFile(tc.Function.Name, tu.Output)
+	if rt.cwd == "" {
+		return written
+	}
+	sig, exact := projectSig(rt.cwd)
+	changed := sig != rt.sig || written && !exact
+	rt.sig, rt.exact = sig, exact
+	if changed {
+		rt.changes++
+	}
+	return changed
+}
+
+// sawAgain: the call brought nothing new, since the model already got this output
+// with the project as it is.
+func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse, changed bool) bool {
+	rt.hitStuck = false
+	if changed {
+		// Every command may answer differently now: a re-run is a re-check.
+		rt.runs = newRepeatMemory()
+		clear(rt.stuck)
+		return false
+	}
+	mem := &rt.runs
+	if readerTools[tc.Function.Name] {
+		mem = &rt.reads
+	}
+	out := repeatText(tc.Function.Arguments, tu.Output)
+	h := fnvHash(out)
+	folded := digitRunRe.ReplaceAllString(out, "#")
+	bag := issueBag([]string{folded})
+	key := callKey(tc)
+	last, again := mem.last[key]
+	repeated := again && last == fnvHash(folded)
+	if prev, ok := mem.bag[key]; ok && jaccard(prev, bag) >= stuckOutputSimilarity {
 		repeated = true
 	}
-	rt.hash[key] = h
-	rt.bag[key] = bag
-	// A SUCCESSFUL run_task/run_command re-run with identical output is a
-	// legitimate re-verify after an edit (re-running just:build / just:test to
-	// confirm a change held), NOT spinning — don't count it as no-progress. A
-	// FAILED re-run still counts: the model IS stuck on a red build/test.
-	if repeated && !tu.Failed && (tc.Function.Name == "run_task" || tc.Function.Name == "run_command") {
-		repeated = false
+	// The length is the answer's, without run_command's own exit line.
+	answer := strings.TrimSpace(strings.TrimPrefix(folded, "exit #"))
+	if len(answer) >= repeatMinOutput && answerRepeats(tc.Function.Name) {
+		repeated = repeated || mem.seen[h]
+		if rt.stuck[h] {
+			repeated, rt.hitStuck = true, true
+		}
+		mem.seen[h] = true
 	}
-	// read_file/continue_read/search_text also honour the content-dedup marker —
-	// serveRead prepends a note on a repeat, which would otherwise defeat the
-	// hash on the first re-read.
-	if (tc.Function.Name == "read_file" || tc.Function.Name == "continue_read" || tc.Function.Name == "search_text") &&
-		strings.Contains(tu.Output, readUnchangedMarker) {
-		repeated = true
-	}
+	mem.last[key] = fnvHash(folded)
+	mem.bag[key] = bag
 	return repeated
 }
 
-// announceToolCall shows what the tool was actually asked to do. Only its NAME
-// reaches the status ticker ("running run_command… 94s"), so without this a long
-// tool ran with nothing on screen saying which command it was, and no ACP
-// tool-call update carries it either.
+// projectSig fingerprints the files git reports as changed or new by content (a
+// re-render of the same picture changes nothing); outside git, size and mtime of
+// the first files, so not exact.
+func projectSig(cwd string) (sig string, exact bool) {
+	h := fnv.New64a()
+	out, err := exec.Command("git", "-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all").Output()
+	if err != nil {
+		n := 0
+		walkErr := filepath.WalkDir(cwd, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return nil // a file gone mid-walk is a change the next look sees
+			}
+			if d.IsDir() {
+				if path != cwd && skipWalkDir(d.Name()) {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			if n++; n > projectSigMaxFiles {
+				return filepath.SkipAll
+			}
+			if info, err := d.Info(); err == nil {
+				fmt.Fprintf(h, "%s\x00%d\x00%d\x00", path, info.Size(), info.ModTime().UnixNano())
+			}
+			return nil
+		})
+		if walkErr != nil {
+			slog.Debug("projectSig: walk", "cwd", cwd, "err", walkErr)
+		}
+		return strconv.FormatUint(h.Sum64(), 16), false
+	}
+	h.Write(out)
+	hashed := 0
+	for _, entry := range strings.Split(string(out), "\x00") {
+		// "XY path"; a rename's second field is the old path alone, with no status.
+		if len(entry) < 4 || entry[2] != ' ' {
+			continue
+		}
+		path := filepath.Join(cwd, entry[3:])
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		if hashed++; hashed > projectSigMaxFiles || info.Size() > projectSigMaxBytes {
+			fmt.Fprintf(h, "%d\x00%d\x00", info.Size(), info.ModTime().UnixNano())
+			continue
+		}
+		// An unreadable file goes in as its error: seen the same way twice, it is no change.
+		f, err := os.Open(path)
+		if err != nil {
+			fmt.Fprintf(h, "\x00%v\x00", err)
+			continue
+		}
+		if _, err := io.Copy(h, f); err != nil {
+			fmt.Fprintf(h, "\x00%v\x00", err)
+		}
+		f.Close()
+	}
+	return strconv.FormatUint(h.Sum64(), 16), true
+}
+
+// Bounds on projectSig's cost per call: content is hashed for this many changed
+// files up to this size; past them size and mtime stand in.
+const (
+	projectSigMaxFiles = 500
+	projectSigMaxBytes = 8 << 20
+)
+
 func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
+	// Only MCP tools and the card-less few lack a card that already shows the arguments.
+	if name := tc.Function.Name; !strings.Contains(name, "__") && name != "view_image" {
+		return
+	}
 	shown := tc.Function.Arguments
 	var pretty bytes.Buffer
 	if json.Indent(&pretty, []byte(shown), "", "  ") == nil {
@@ -981,9 +772,7 @@ func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 		a.say(ctx, sid, "\n**"+tc.Function.Name+"**\n")
 		return
 	}
-	// A fence longer than any backtick run inside it: an argument carrying ```
-	// would otherwise close the block early and spill the rest of the JSON into
-	// the transcript as prose.
+	// Longer than any backtick run inside, so an argument cannot close the block early.
 	fence := "```"
 	for strings.Contains(shown, fence) {
 		fence += "`"
@@ -991,151 +780,291 @@ func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 	a.say(ctx, sid, fmt.Sprintf("\n**%s**\n%sjson\n%s\n%s\n", tc.Function.Name, fence, shown, fence))
 }
 
-// runToolLoopSeeded runs the agentic loop with an EXPLICIT initial context. Only
-// the subagent uses it (it seeds from the parent's context, not its own session);
-// single-use, so the stale-snapshot risk runToolLoop removes doesn't apply. The
-// failSoftCap / loop-exit semantics in the doc above apply here too.
-func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
-	// `stream` gates the TEXT channel only. Reasoning always streams when there
-	// is a session to stream to: it is the sole live signal during a long call,
-	// and it is never the machinery `stream=false` exists to hide — the planner's
-	// output arrives as submit_plan arguments and text, not on the reasoning
-	// channel. Silencing both left the planner showing a ↓ counter climbing past
-	// 8k tokens with nothing on screen. nil callbacks are no-ops in the loop below.
-	var on, think func(string)
-	flushStream := func() {} // no-op unless streaming; flushes the batched tail
-	if sid != "" {
-		var flushOn, flushThink func()
-		if stream {
-			on, flushOn = throttledStream(func(chunk string) {
-				a.say(ctx, sid, chunk)
-			})
-		}
-		think, flushThink = throttledStream(func(chunk string) {
-			a.sayThought(ctx, sid, chunk)
-		})
-		flushStream = func() {
-			if flushOn != nil { // nil when stream=false: no text channel to flush
-				flushOn()
-			}
-			flushThink()
-		}
-	}
-	tools := llmAllToolDefinitions()
+// loopStreams is a tool loop's live output. `stream` gates the text channel only:
+// reasoning is the sole live signal during a long call.
+type loopStreams struct {
+	text, think func(string) // text is nil unless streaming
+	flush       func()       // sends the batched tails
+}
 
-	// Terminals come from the phase policy, not the tool array (which is the full
-	// superset now). When the phase has any terminal, the empty-tool-calls branch
-	// below stops meaning "model finished" and starts meaning "model dropped out
-	// of tool-calling grammar" — see the nudge + fallback there.
-	hasTerminal := policy.hasTerminal()
-	termList := terminalList(policy)
+func (a *agent) newLoopStreams(ctx context.Context, sid string, stream bool) loopStreams {
+	s := loopStreams{flush: func() {}}
+	if sid == "" {
+		return s
+	}
+	flushText := func() {}
+	if stream {
+		s.text, flushText = throttledStream(func(chunk string) {
+			// Not through say: the text is logged whole in its RESPONSE block.
+			a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentMessage, Content: ContentBlock{Type: "text", Text: chunk}})
+		})
+	}
+	var flushThink func()
+	s.think, flushThink = throttledStream(func(chunk string) {
+		a.sendUpdate(ctx, sid, messageChunk{Kind: KindAgentThought, Content: ContentBlock{Type: "text", Text: chunk}})
+	})
+	s.flush = func() { flushText(); flushThink() }
+	return s
+}
+
+// callModelRecovering is one model call of a tool loop, riding out the output cap,
+// a dropped or refused connection and, in plan and execute, the server's
+// context-full refusal (by folding history). It returns the messages too: a
+// corrective turn or a fold rewrites them.
+func (a *agent) callModelRecovering(ctx context.Context, sid string, sess *Session, conn *LLMConnection, messages []llmMessage, tools []map[string]any, phase string, streams loopStreams) (string, []toolCall, []llmMessage, error) {
+	// Each fold step strictly shrinks the context, so recovery terminates.
+	recoverStep := 0
+	recoverKeepFrom := []func(*Session) int{
+		func(s *Session) int { return s.keepWindowStart(keepSmallTurnTokens) },
+		(*Session).lastAssistantIndex,
+	}
+	// Tool-loop calls append to each other, which the rewind check relies on.
+	callConn := *conn
+	callConn.cacheLineage = true
+	capNudged, capDoubled := false, false // per round: one be-concise nudge, then one doubled cap
+	transientRetries, refusals := 0, 0
+	var downFor time.Duration
+	for {
+		// Fresh sink per attempt: an aborted attempt's partial arguments must not carry over.
+		text, calls, _, err := a.llmStream(ctx, sid, &callConn, messages, tools, streams.text, streams.think, a.planTableSink(ctx, sid))
+		streams.flush()
+		if err == nil {
+			return text, calls, messages, nil
+		}
+		var ce *capHitError
+		if errors.As(err, &ce) {
+			switch {
+			case !capNudged:
+				capNudged = true
+				a.logSession(sid, "RECOVER", "generation hit the max_tokens cap (%d): retrying with a be-concise nudge", ce.Cap)
+				if sid != "" {
+					a.say(ctx, sid, "⚠ Reply hit the output-token cap; retrying with a be-concise instruction.\n")
+				}
+				messages = a.addCorrective(sid, messages, fmt.Sprintf(
+					"Your previous response was cut off at the %d-token output limit and was DISCARDED: nothing of it was applied. Respond again, keeping the output well under that limit: be concise. If you are writing a large file, write it in parts: write_file with the first part, then extend it with edit_file.", ce.Cap))
+				continue
+			case !capDoubled:
+				// A file that needs more than the cap cannot be made concise. The cap is
+				// a sampler setting, so the doubled retry keeps the prefix cache.
+				capDoubled = true
+				callConn = *callConn.withBody("max_tokens", 2*ce.Cap)
+				a.logSession(sid, "RECOVER", "still at the cap after the nudge: one retry with max_tokens=%d", 2*ce.Cap)
+				if sid != "" {
+					a.say(ctx, sid, fmt.Sprintf("⚠ Still at the cap; retrying once with max_tokens=%d.\n", 2*ce.Cap))
+				}
+				continue
+			}
+			return "", nil, messages, err
+		}
+		if isTransientStreamError(err) {
+			wait := transientStreamBackoff
+			switch refused := strings.Contains(err.Error(), "connection refused"); {
+			case refused && downFor >= serverDownPatience:
+				return "", nil, messages, fmt.Errorf("the LLM server refused connections for %s; start it, then send the message again: %w", humanDuration(downFor.Milliseconds()), err)
+			case refused:
+				wait = min(transientStreamBackoff<<refusals, time.Minute)
+				refusals++
+				downFor += wait
+				a.logSession(sid, "RECOVER", "server refused the connection (%v): retry in %s", err, wait)
+				if sid != "" && refusals == 1 {
+					a.say(ctx, sid, fmt.Sprintf("\n⟲ The LLM server refuses connections (restarting?); retrying for up to %s.\n", humanDuration(serverDownPatience.Milliseconds())))
+				}
+			case transientRetries >= maxTransientStreamRetries:
+				return "", nil, messages, fmt.Errorf("lost the connection to the LLM mid-response %d times (the server or router dropped the stream); this is usually transient, try again in a moment", transientRetries+1)
+			default:
+				transientRetries++
+				a.logSession(sid, "RECOVER", "stream dropped mid-response (%v): retry %d/%d", err, transientRetries, maxTransientStreamRetries)
+				if sid != "" {
+					// Streaming cannot rewind, so the retry's repeated prefix needs this flag.
+					a.say(ctx, sid, "\n⟲ Connection dropped mid-response; reconnecting.\n")
+				}
+			}
+			select {
+			case <-time.After(wait):
+				continue
+			case <-ctx.Done():
+				return "", nil, messages, ctx.Err()
+			}
+		}
+		if !isContextFull(err) || // 400 reject OR n_ctx-ceiling truncation
+			(phase != "plan" && phase != "execute") || sess == nil {
+			return "", nil, messages, err
+		}
+		folded := false
+		for recoverStep < len(recoverKeepFrom) {
+			keepFrom := recoverKeepFrom[recoverStep](sess)
+			recoverStep++
+			if a.foldHistory(ctx, sess, keepFrom) {
+				folded = true
+				break
+			}
+		}
+		if !folded {
+			return "", nil, messages, err
+		}
+		messages = a.buildLLMContext(sess)
+	}
+}
+
+// repeatedCall is a call of a stuck round, keyed like the repetition tracker.
+type repeatedCall struct {
+	key, output string
+	hash        uint64
+}
+
+// stuckSnapshot: the calls that ended an earlier step of this turn by repeating,
+// with their outputs, and those outputs as repeats are judged (repeatText hashes).
+func (s *Session) stuckSnapshot() (map[string]string, map[uint64]bool) {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	return maps.Clone(s.rt.stuckCalls), maps.Clone(s.rt.stuckOutputs)
+}
+
+// recordStuck hands the calls that ended this step on to the turn's later steps.
+func (s *Session) recordStuck(calls []repeatedCall) {
+	s.rt.mu.Lock()
+	defer s.rt.mu.Unlock()
+	if s.rt.stuckCalls == nil {
+		s.rt.stuckCalls, s.rt.stuckOutputs = map[string]string{}, map[uint64]bool{}
+	}
+	for _, c := range calls {
+		s.rt.stuckCalls[c.key] = c.output
+		s.rt.stuckOutputs[c.hash] = true
+	}
+}
+
+func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConnection, messages []llmMessage, policy phasePolicy, phase string, stream bool, failSoftCap int) (toolLoopResult, error) {
+	streams := a.newLoopStreams(ctx, sid, stream)
+	tools := a.tools.defs()
+
+	// Only jobs this loop's own run_command calls handed over can park it.
+	loopStart := time.Now()
+	planStartTokens, tokenNudged := 0, false
+	if s := a.getSession(sid); s != nil {
+		planStartTokens = s.turnCompletion()
+	}
 
 	var res toolLoopResult
 	var allText strings.Builder
-	var genElapsed time.Duration
-	// stampTiming applies the accumulated start/duration/phase to the
-	// trailing assistant message in session. Called on every exit path so
-	// even error returns leave a recorded turn for postmortem analysis.
-	stampTiming := func() {
-		// Capture the accumulated free-text on every exit path so callers that
-		// need the prose separate from a terminal tool's output (runPlanPhase)
-		// always see it. Independent of the timing stamp below.
-		res.Content = allText.String()
-		if res.StartedAt.IsZero() {
-			return
-		}
-		res.DurationMs = genElapsed.Milliseconds()
-		if sess := a.getSession(sid); sess != nil {
-			sess.MarkLastAssistantTiming(res.StartedAt, res.DurationMs, phase)
-		}
+	nudged := false // the last reply was prose and got its contract nudge
+	finish := func(err error) (toolLoopResult, error) {
+		res.Text = allText.String()
+		res.Content = res.Text
+		return res, err
 	}
 
-	// Repetition ladder state; repetitionTracker owns what counts as a repeat. A
-	// round whose every call reproduced known output is "stuck"; consecutive
-	// stuck rounds climb one ladder — corrective nudge each round, warm the
-	// sampler at stuckEscalateRounds, bail at stuckBailRounds — and any
-	// productive round resets the streak, so read-after-write and genuine fan-out
-	// are never punished.
-	repeats := newRepetitionTracker()
+	// Stuck rounds climb one ladder (nudge, warm the sampler, bail); a productive
+	// round resets it. Calls that ended an earlier step of this turn are not run
+	// again: successors copied them from the history, five steps in a row.
+	var stuckBefore map[string]string
+	var stuckOutputs map[uint64]bool
+	cwd := ""
+	loopSess := a.getSession(sid) // nil for a sessionless internal pass
+	if loopSess != nil {
+		cwd = loopSess.Cwd
+		stuckBefore, stuckOutputs = loopSess.stuckSnapshot()
+	}
+	repeats := newRepetitionTracker(cwd, stuckOutputs)
 	var stuckRounds int
 	var nudgedUI bool // the "repeating" UI warning fires only once
 	var escalated bool
-	// respondNudged: with a terminal tool (hasTerminal), an empty tool-call list
-	// gets one nudge to call it; a second empty list falls through to the legacy
-	// text exit so a model that refuses the terminal can't spin forever.
-	var respondNudged bool
-	// failedRounds counts iterations whose tool batch produced a failure; the
-	// failSoftCap check below bounces the loop once it accumulates too many.
 	var failedRounds int
-	// Everything one round's LLM call needs, built once. Its conn is swapped in
-	// place by the sampler escalation at the bottom of this loop.
-	caller := &toolLoopCaller{a: a, sid: sid, phase: phase, conn: conn, tools: tools, on: on, think: think, flush: flushStream}
+	var readStreak int // execute calls since the last edit, test or build
+	limit, extended := maxToolLoopIterations, false
+	readNudged := false
+	// Samplers do not enter the KV cache key, so the prefix survives unless a role
+	// carries chat_template_kwargs (see res/settings.toml).
+	escalate := func() bool {
+		if escalated || conn == nil || conn.Tag == "thinking" {
+			return false
+		}
+		thinkConn := a.connFor("thinking")
+		if thinkConn == nil {
+			return false
+		}
+		// Without it the thinking role may answer in prose, ending an execute loop. It
+		// is a grammar, not a rendering, on llama.cpp and Halogen alike.
+		if tc, ok := conn.ExtraBody["tool_choice"]; ok {
+			thinkConn = thinkConn.withBody("tool_choice", tc)
+		}
+		conn = thinkConn
+		escalated = true
+		return true
+	}
 	for iter := 0; ; iter++ {
-		if iter >= maxToolLoopIterations {
-			res.Text = allText.String()
-			stampTiming()
-			return res, fmt.Errorf("tool loop exceeded %d iterations", maxToolLoopIterations)
+		if iter >= limit {
+			// Still editing and building at the cap is big work, not a spiral (the read
+			// tripwire ends those), so it gets one extension rather than a replan.
+			edits, runs := 0, 0
+			for _, u := range res.ToolUses[max(0, len(res.ToolUses)-productiveWindow):] {
+				switch {
+				case wroteFile(u.Name, u.Output):
+					edits++
+				case u.Name == "run_command" && !isReadCall(u.Name, u.Input):
+					runs++
+				}
+			}
+			if extended || phase != "execute" || edits < 2 || runs < 1 {
+				return finish(fmt.Errorf("tool loop exceeded %d iterations", limit))
+			}
+			extended = true
+			limit += productiveExtension
+			messages = a.addCorrective(sid, messages, fmt.Sprintf(
+				"You have used %d calls on this step. You are still making progress, so you get %d more, and no more after that: finish the step, run its check, and call `respond`. What does not fit goes into `respond` as the next step.", iter, productiveExtension))
+			a.say(ctx, sid, fmt.Sprintf("\n⏱ Step at %d calls and still editing and building: %d more to finish it.\n", iter, productiveExtension))
 		}
-		streamStart := time.Now()
-		if res.StartedAt.IsZero() {
-			res.StartedAt = streamStart
+		sess := a.getSession(sid)
+		// Steering and finished jobs go in mid-turn, or the model polls for jobs, as one
+		// plain user message: an append, so the prefix cache holds.
+		if sess != nil {
+			if items := sess.takePending(); len(items) > 0 {
+				text, _ := a.sayPending(ctx, sid, items, true)
+				messages = a.addCorrective(sid, messages, text)
+			}
 		}
-		// Call the model, with the whole recovery ladder around it (see
-		// toolLoopCaller.round). messages comes back rewritten when the ladder
-		// added a corrective turn or folded history to make the context fit.
-		var text, reasoning string
-		var calls []toolCall
-		var err error
-		text, calls, reasoning, messages, err = caller.round(ctx, messages)
-		genElapsed += time.Since(streamStart)
+		// Naming the blocker turns a hunt for workarounds into a refusal or a different plan.
+		if phase == "plan" && sess != nil && !tokenNudged {
+			if spent := sess.turnCompletion() - planStartTokens; spent >= planTokenNudge {
+				tokenNudged = true
+				messages = a.addCorrective(sid, messages, planTokenNudgeText(spent))
+				a.say(ctx, sid, fmt.Sprintf("\n⏱ Planning at %d tokens without a plan: asked to name the blocker and change course.\n", spent))
+			}
+		}
+		// Planning rounds are the most expensive thing codehalter does.
+		if phase == "plan" && iter == planRoundNudge {
+			messages = a.addCorrective(sid, messages, fmt.Sprintf("You have gathered for %d rounds. Call `submit_plan` NOW with what you have: name the files and the approach, and say in each subtask what you did not verify; the executor reads and checks cheaply.", iter))
+			a.say(ctx, sid, "\n⏱ Planning past "+fmt.Sprint(planRoundNudge)+" rounds: asked to submit with what it has.\n")
+		}
+
+		text, calls, rewritten, err := a.callModelRecovering(ctx, sid, sess, conn, messages, tools, phase, streams)
+		messages = rewritten
 		if err != nil {
-			res.Text = allText.String()
-			stampTiming()
-			return res, err
+			if ctx.Err() == nil {
+				err = &llmCallError{err}
+			}
+			return finish(err)
 		}
 		allText.WriteString(text)
 
-		// Persist this turn's assistant text verbatim (a fresh message per
-		// iteration, not a merged turn) so a session replay reproduces the wire —
-		// cache consistency, not readability. AppendToolUse attaches the tool uses.
-		if s := a.getSession(sid); s != nil {
-			s.AddAssistant(text)
-			s.recordLastPromptTokens() // stamp the call's prompt_tokens for keepWindowStart
-			s.saveOrLog()
+		// One message per iteration, not a merged turn, so a replay reproduces the wire.
+		if sess != nil {
+			sess.AddAssistant(text)
+			sess.recordLastPromptTokens() // stamp the call's prompt_tokens for keepWindowStart
+			sess.saveOrLog()
 		}
 
+		// Prose ends the loop where the phase allows it; elsewhere one nudge per slip.
 		if len(calls) == 0 {
-			// No tool call. Nudge ONCE (respondNudged) before accepting the text
-			// exit, for either model slip:
-			//   (a) reasoned a lot but emitted EMPTY content — the answer is stuck
-			//       in the never-shown reasoning channel ("calculated a lot, then
-			//       nothing"); tell it to write the answer as plain text.
-			//   (b) terminal mode: it dropped out of tool-calling without finishing.
-			reasonedButSilent := text == "" && len(reasoning) > reasoningNudgeBytes
-			if !respondNudged && (reasonedButSilent || hasTerminal) {
-				respondNudged = true
-				var nudge string
-				if reasonedButSilent {
-					nudge = "You produced a lot of reasoning but no visible output — your reasoning/thinking is NEVER shown to the user. Write your result now as plain text; this message is what they read."
-					if hasTerminal {
-						nudge += fmt.Sprintf(" If you're done, put it in %s.", termList)
-					}
-				} else {
-					nudge = fmt.Sprintf("Your last response was plain text with no tool call. "+
-						"This turn ends only when you call a terminal tool (%s), or "+
-						"another tool if you still have work to do. Do not reply in "+
-						"prose — call a tool.", termList)
-				}
-				// The assistant turn above is already in the session (AddAssistant at
-				// the top of this iteration); only the nudge needs storing.
-				messages = append(messages, llmMessage{Role: "assistant", Content: text})
-				messages = a.addCorrective(sid, messages, nudge)
-				continue
+			if policy.proseEnds || len(policy.terminals) == 0 || nudged {
+				return finish(nil)
 			}
-			res.Text = allText.String()
-			stampTiming()
-			return res, nil
+			nudged = true
+			messages = append(messages, llmMessage{Role: "assistant", Content: text})
+			messages = a.addCorrective(sid, messages, contractNudge(policy, text))
+			a.say(ctx, sid, "\n⚠ The model replied without the tool call this step needs; asking it once more.\n")
+			continue
 		}
+		nudged = false
 
 		messages = append(messages, llmMessage{
 			Role:      "assistant",
@@ -1143,81 +1072,69 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			ToolCalls: calls,
 		})
 
-		// terminalCalled flips when this batch contains a Terminal tool call;
-		// we finish processing the batch (so its tool result lands in history
-		// for postmortem) and then exit with the message as res.Text.
-		var terminalCalled bool
-		var terminalName string
-		var terminalMessage string
-		// failedThisRound flips when any tool in this batch returns Failed=true,
-		// feeding the failSoftCap counter once the batch is done.
+		// The rest of the batch still runs, so its results land in history.
+		var terminalName, terminalMessage string
 		var failedThisRound bool
-		// roundStuck stays true only if EVERY call this round reproduced output it
-		// already produced this loop — i.e. the round made no progress (see the
-		// repetition ladder below). A single new/productive call clears it.
-		roundStuck := len(calls) > 0
+		var roundRepeats []repeatedCall // this round's calls that repeated
+		hitStuck := false               // one of them was an output that ended an earlier step
+		roundStuck := true              // only if EVERY call this round reproduced known output
 
+		// A build or test run is the gap in which a server reclaims the idle slot.
+		stopWarm := func() {}
+		if sess != nil {
+			sent := messages
+			stopWarm = a.keepWarm(sess, conn, func() []llmMessage { return sent })
+			sess.markReplyStart()
+		}
 		for _, tc := range calls {
-			// Subagent sessions don't surface their own UI (Zed doesn't know
-			// their sid), so forward a one-liner to the parent before each
-			// tool call. Gives the user a live feed of what each subagent is
-			// up to instead of just "Starting…" → 5 minutes → "Done".
-			if sess := a.getSession(sid); sess != nil && sess.ParentID != "" && sess.DisplayLabel != "" {
-				a.say(ctx, sess.ParentID, fmt.Sprintf("[%s] %s %s\n\n", sess.DisplayLabel, tc.Function.Name, truncate(tc.Function.Arguments, 80)))
-			}
-			// Terminal tools are skipped because their payload is already
-			// rendered: submit_plan as the streamed table, respond as the turn's
-			// own text.
-			if !policy.isTerminal(tc.Function.Name) {
+			// Terminal payloads are already rendered: submit_plan's table, respond's text.
+			if !policy.terminals[tc.Function.Name] {
 				a.announceToolCall(ctx, sid, tc)
 			}
 
-			// Live status while the tool runs (the tool-side counterpart of the LLM
-			// meter in llmStream): "(running web_search… 12s)" ticks so a long tool or a
-			// subagent's tool call shows liveness instead of a frozen row.
-			// launch_subagent is excluded: its subagents fold their OWN meters into
-			// this same parent row (setSubagentStatus), so a ticker here would fight
-			// them; a one-time marker holds until they take over.
-			var stopMeter func()
-			if tc.Function.Name == "launch_subagent" {
-				a.setStatus(ctx, sid, " (running "+tc.Function.Name+"…)")
-			} else {
-				stopMeter = a.startToolMeter(ctx, sid, tc)
-			}
-
-			// runToolCall (tools.go) executes the tool, caches its full output
-			// for view_output, and hands back the model-visible content (the
-			// output truncated past truncateThreshold, or inline image parts).
-			// A tool the phase policy forbids is rejected here WITHOUT executing —
-			// the rejection is recorded so the model sees why and corrects.
 			var tu ToolUse
 			var content any
-			denied := policy.isDenied(tc.Function.Name)
+			denied := policy.deny[tc.Function.Name]
+			key := callKey(tc)
+			before, wasStuck := stuckBefore[key]
 			switch {
 			case denied:
 				var msg string
 				tu, msg = a.denyToolCall(ctx, sid, phase, tc)
 				content = msg
+			// Once the step wrote something, the same call may answer differently: a re-check.
+			case wasStuck && repeats.changes == 0:
+				msg := "not run: an earlier attempt at this task ran exactly this call again and again until codehalter ended it, so it answers nothing new. Its output, which you already have:\n\n" +
+					before + "\n\nDo what the task asks with a different call; if the task asks you to look at a picture, call `screenshot` on it."
+				tcId := a.StartToolCall(withToolName(ctx, tc.Function.Name), sid, tc.Function.Name+" (repeated from an ended attempt)", "tool", nil)
+				a.FailToolCall(ctx, sid, tcId, "not run: this call ended an earlier attempt by repeating")
+				tu, content = a.recordToolUse(sid, tc, ToolUse{Output: msg, Failed: true, StartedAt: time.Now()}), msg
 			default:
 				tu, content = a.runToolCall(ctx, sid, tc)
 			}
-			if stopMeter != nil {
-				stopMeter() // stop the live ticker now the tool has returned
-			}
 			res.ToolUses = append(res.ToolUses, tu)
-			// A denied call is the model's mistake, not a tool failure — don't feed
-			// it to the fail cap (the repetition ladder still catches spamming it).
+			// A denied call is the model's mistake, not a tool failure.
 			if tu.Failed && !denied {
 				failedThisRound = true
 			}
-			// A call that returns NEW output is progress and clears roundStuck.
-			if !repeats.sawAgain(tc, tu) {
+			changed := repeats.changedBy(tc, tu)
+			res.ToolUses[len(res.ToolUses)-1].Changed = changed
+			if !repeats.sawAgain(tc, tu, changed) {
 				roundStuck = false
+			} else {
+				roundRepeats = append(roundRepeats, repeatedCall{key, tu.Output, fnvHash(repeatText(tc.Function.Arguments, tu.Output))})
+				hitStuck = hitStuck || repeats.hitStuck
 			}
-			if hasTerminal && policy.isTerminal(tc.Function.Name) && !terminalCalled {
-				terminalCalled = true
-				terminalName = tc.Function.Name
-				terminalMessage = tu.Output
+			if phase == "execute" && !denied {
+				switch name := tc.Function.Name; {
+				case isReadCall(name, tc.Function.Arguments):
+					readStreak++
+				case name == "edit_file", name == "write_file", name == "run_command", name == "run_background", name == "run_server":
+					readStreak, readNudged = 0, false
+				}
+			}
+			if policy.terminals[tc.Function.Name] && terminalName == "" {
+				terminalName, terminalMessage = tc.Function.Name, tu.Output
 			}
 			messages = append(messages, llmMessage{
 				Role:       "tool",
@@ -1225,102 +1142,307 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				ToolCallID: tc.ID,
 			})
 		}
+		stopWarm() // the model is about to be called again; the slot is busy from here
 
-		// skills="auto": if this batch touched a stack whose deferred SKILL
-		// isn't in context yet, put it on the wire now — appended after the
-		// batch's tool results, so the cached prefix is untouched — and let
-		// discloseSkills persist it for rebuilds and the next compaction's
-		// prompt re-render.
-		for _, body := range a.discloseSkills(sid, calls) {
-			messages = append(messages, llmMessage{Role: "user", Content: body})
-		}
-
-		// Terminal tool called: stream the message to the UI as one chunk
-		// (the model emitted it as tool arguments, which never went through
-		// the text-stream callback) and exit. The repetition ladder below is
-		// skipped — this turn is over.
-		if terminalCalled {
+		// The terminal message came as tool arguments, never through the text stream.
+		if terminalName != "" {
+			// A respond while this loop's background job still runs parks the turn until
+			// the job's note resumes it. Input that came in during the call (a job's exit,
+			// the user's text) goes in first: the respond was written without it.
+			if terminalName == respondToolName {
+				if a.parkableJobs(sid, loopStart) != "" || loopSess != nil && loopSess.hasPending() {
+					if streams.text != nil && terminalMessage != "" {
+						streams.text(terminalMessage)
+						streams.flush()
+					}
+					resume, perr := a.parkForJobs(ctx, sid, loopStart)
+					if perr != nil {
+						res.Text, res.Content = terminalMessage, allText.String()
+						return res, perr
+					}
+					messages = a.addCorrective(sid, messages, resume)
+					continue
+				}
+			}
 			switch {
-			case on == nil:
-				// Silent internal pass (e.g. the planner): no UI emit.
+			case streams.text == nil:
+				// Silent internal pass, such as the planner.
 			case terminalMessage != "":
-				on(terminalMessage)
-				flushStream() // the terminal message is the FINAL emit; never leave it batched in the throttled sink
+				streams.text(terminalMessage)
+				streams.flush() // the FINAL emit: never leave it batched
 			default:
-				// An empty respond/terminal would end the turn wordlessly; emit a
-				// minimal acknowledgement so a turn that ran is never silent.
 				a.say(ctx, sid, "(done)\n")
 			}
-			res.Text = terminalMessage
-			res.RespondCalled = true
-			res.Terminal = terminalName
-			stampTiming()
+			res.Text, res.Content, res.Terminal = terminalMessage, allText.String(), terminalName
 			return res, nil
 		}
 
-		// Failed-round soft cap: this non-terminal batch had a tool failure, so
-		// count it. Once a subtask racks up failSoftCap failed rounds it is stuck
-		// on something this web-blind execute loop can't clear; exit gracefully
-		// (RespondCalled=false) so runExecutePhase records a failure to replan
-		// against — replans are where web_search/web_read and a fresh
-		// decomposition become available.
+		// No Terminal, so runExecutePhase records a failure to replan against.
 		if failedThisRound && failSoftCap > 0 {
 			failedRounds++
 			if failedRounds >= failSoftCap {
-				res.Text = allText.String()
-				stampTiming()
-				return res, nil
+				return finish(nil)
 			}
 		}
 
-		// Repetition ladder. A round where every call reproduced known output is
-		// "stuck"; any productive round resets the streak. Consecutive stuck
-		// rounds climb one ladder so the recovery step (warming the sampler)
-		// always gets a turn before we give up.
+		// The nudge always comes first, even when one reply of parallel reads jumps past both marks.
+		if readStreak >= readStreakBail && readNudged {
+			return finish(fmt.Errorf("read %d calls in a row without an edit, a test or a build", readStreak))
+		}
+		if readStreak >= readStreakEscalate && !readNudged {
+			readNudged = true
+			messages = a.addCorrective(sid, messages, fmt.Sprintf(
+				"You have read for %d calls in a row without changing a file or running a test. Stop gathering: make the edit, run the test, or call `respond` with what blocks you. At %d reads in a row this subtask ends and is planned again.", readStreak, readStreakBail))
+			if escalate() {
+				a.say(ctx, sid, "⚠ Reading without acting: nudged, and switched to the thinking sampler.\n")
+			} else {
+				a.say(ctx, sid, "⚠ Reading without acting: nudged the model to act.\n")
+			}
+		}
+
 		if !roundStuck {
 			stuckRounds = 0
 			continue
 		}
 		stuckRounds++
 		if stuckRounds >= stuckBailRounds {
-			// Give up gracefully (RespondCalled=false): in execute this surfaces
-			// as a failed subtask → replan (where web tools + a fresh
-			// decomposition open up); in plan, runPlanPhase salvages what's
-			// there. A scary hard error for a re-read loop is worse than letting
-			// the normal failure paths run.
-			res.Text = allText.String()
-			stampTiming()
-			return res, nil
+			if loopSess != nil {
+				loopSess.recordStuck(roundRepeats)
+			}
+			// No error: the normal failure paths (replan, plan salvage) beat a hard error.
+			return finish(nil)
 		}
 		if !nudgedUI && sid != "" {
 			nudgedUI = true
-			a.say(ctx, sid, "⚠ Repeating with no new information — nudging the model to change course.\n")
+			a.say(ctx, sid, "⚠ Repeating with no new information: nudging the model to change course.\n")
 		}
-		// Corrective alongside the (unchanged) tool results, so the next round
-		// sees the break-out instruction next to the output it just got back.
+		if hitStuck {
+			// The call differs from the one that ended the earlier attempt; its answer does not.
+			messages = a.addCorrective(sid, messages,
+				"That output is the one an earlier attempt at this task got again and again until codehalter ended it. Changing the command does not change the answer. Do what the task asks with a different call; if it asks you to look at a picture, call `screenshot` on it.")
+			continue
+		}
 		messages = a.addCorrective(sid, messages,
-			"Your last tool call(s) returned output you already have — that makes no progress. Do NOT repeat them. Instead:\n"+
-				"1. If a read came back PARTIAL and you need more, call continue_read for the next chunk — never re-read the same window, never rewrite a whole file.\n"+
+			"Your last tool call(s) returned output you already have, which makes no progress. Do NOT repeat them. Instead:\n"+
+				"1. If a read came back PARTIAL and you need more, read the next part with sed -n; never re-read the same window, never rewrite a whole file.\n"+
 				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n"+
 				"3. If you are stuck or the task is infeasible, say so and stop.")
-		// Mid-ladder recovery: warm the sampler once before the bail. Same
-		// server/model, so it routes to the same slot gate.
-		//
-		// Same server/model, and samplers don't enter the KV cache key, so the
-		// prefix cache survives — but only while the two roles differ in SAMPLERS
-		// alone. A role whose params carry chat_template_kwargs renders the prompt
-		// differently, which would make this swap a re-prefill at the worst
-		// possible moment: deep into a long execute context. res/settings.toml
-		// costs that trade; this is one of the places that pays for it.
-		// Skip when already on "thinking" (plan phase) — a no-op swap.
-		if stuckRounds >= stuckEscalateRounds && !escalated && caller.conn != nil && caller.conn.Tag != "thinking" {
-			if thinkConn := a.connForSession(ctx, sid, "thinking"); thinkConn != nil {
-				caller.conn = thinkConn
-				escalated = true
-				if sid != "" {
-					a.say(ctx, sid, "⚠ Still repeating — switching to the thinking sampler to break out.\n")
-				}
-			}
+		if stuckRounds >= stuckEscalateRounds && escalate() && sid != "" {
+			a.say(ctx, sid, "⚠ Still repeating: switching to the thinking sampler to break out.\n")
 		}
 	}
 }
+
+// fileState is a file's content at one moment; exists is false for a file that is not there.
+type fileState struct {
+	data   []byte
+	exists bool
+}
+
+// Files above this are not kept for the red-first check; a step that changed one is not checked.
+const redFirstMaxBytes = 4 << 20
+
+// dirtyFiles reads every file git reports as changed or new, by absolute path. Empty
+// outside a git work tree; a file too large to keep is there with a nil state.
+func dirtyFiles(cwd string) (root string, files map[string]*fileState) {
+	top, err := exec.Command("git", "-C", cwd, "rev-parse", "--show-toplevel").Output()
+	if err != nil {
+		return "", nil
+	}
+	root = strings.TrimSpace(string(top))
+	out, err := exec.Command("git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all").Output()
+	if err != nil {
+		slog.Debug("red-first: git status", "err", err)
+		return "", nil
+	}
+	files = map[string]*fileState{}
+	entries := strings.Split(string(out), "\x00")
+	for i := 0; i < len(entries); i++ {
+		entry := entries[i]
+		if len(entry) < 4 || entry[2] != ' ' {
+			continue
+		}
+		if entry[0] == 'R' || entry[0] == 'C' {
+			i++ // the old path follows as a field of its own
+		}
+		path := filepath.Join(root, entry[3:])
+		files[path] = readState(path)
+	}
+	return root, files
+}
+
+// readState is nil for a file too large to keep or unreadable.
+func readState(path string) *fileState {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return &fileState{}
+	}
+	if err != nil || info.IsDir() || info.Size() > redFirstMaxBytes {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	return &fileState{data: data, exists: true}
+}
+
+// headState is a clean file's content: the committed one, or none for a file git does not track.
+func headState(root, path string) *fileState {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return nil
+	}
+	out, err := exec.Command("git", "-C", root, "show", "HEAD:"+filepath.ToSlash(rel)).Output()
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		return &fileState{}
+	}
+	if err != nil {
+		return nil
+	}
+	return &fileState{data: out, exists: true}
+}
+
+// testRunRe: a command line that runs tests, in the common runners.
+var testRunRe = regexp.MustCompile(`(?i)\b(?:test|tests|pytest|jest|vitest|rspec|ctest|phpunit|mocha|unittest)\b`)
+
+// trailingEchoRe: a test run followed by echo exit=$? always exits 0; without the echo it tells.
+var trailingEchoRe = regexp.MustCompile("\\s*;\\s*echo\\b[^;|&]*$")
+
+// docExts are not part of a fix: taking them out changes no test.
+var docExts = map[string]bool{".md": true, ".txt": true, ".rst": true, ".adoc": true}
+
+// testShowsFault is red before green. A step that changed tests and code and ended with a
+// green test run is run once more with its code changes taken out (its test changes stay).
+// A test that still passes then does not show what the step fixed or added: the cause can be
+// elsewhere, as when a model rebuilt the release packaging for tab icons that the code never
+// set, and wrote a test that passed before and after. It returns the failure reason, or "".
+// The files are put back whatever happens.
+func (a *agent) testShowsFault(ctx context.Context, sid, root string, before map[string]*fileState, uses []ToolUse) string {
+	sess := a.getSession(sid)
+	if sess == nil || root == "" {
+		return ""
+	}
+	cmd := ""
+	for i := len(uses) - 1; i >= 0 && cmd == ""; i-- {
+		if u := uses[i]; u.Name == "run_command" {
+			c := parseArgs(u.Input).str("command")
+			// A look at the log of an earlier run names "test" too, and is no run.
+			if !testRunRe.MatchString(c) || onlyReads(c) {
+				continue
+			}
+			// A pipeline or a sequence reports its last command's exit, so it cannot tell red
+			// from green: all 3 firings in a 36-run replay were a go test followed by ; echo
+			// and more, each costing a replan for nothing.
+			c = trailingEchoRe.ReplaceAllString(c, "")
+			if strings.ContainsAny(c, "|;") {
+				return ""
+			}
+			cmd = c
+		}
+	}
+	if cmd == "" {
+		return ""
+	}
+	_, after := dirtyFiles(sess.Cwd)
+	var code, tests []string
+	was := map[string]*fileState{}
+	for _, path := range slices.Sorted(maps.Keys(mergeKeys(before, after))) {
+		old, ok := before[path]
+		if !ok {
+			old = headState(root, path)
+		}
+		now := readState(path)
+		if old == nil || now == nil {
+			if old == nil && now == nil {
+				continue // too large to compare, and too large to take out
+			}
+			return "" // one side unknown: no clean way to take the step's change out
+		}
+		if old.exists == now.exists && bytes.Equal(old.data, now.data) {
+			continue
+		}
+		rel, _ := filepath.Rel(root, path)
+		switch {
+		case strings.HasPrefix(path, filepath.Join(sess.Cwd, ".codehalter")+string(filepath.Separator)):
+			// codehalter's own session files, written all through the step
+		case isTestPath(rel):
+			tests = append(tests, rel)
+		case !docExts[strings.ToLower(filepath.Ext(rel))]:
+			code = append(code, rel)
+			was[path] = old
+		}
+	}
+	if len(tests) == 0 || len(code) == 0 {
+		return ""
+	}
+	now := map[string]*fileState{}
+	for path := range was {
+		now[path] = readState(path)
+	}
+	defer func() {
+		for path, st := range now {
+			if err := putState(path, st); err != nil {
+				slog.Error("red-first: could not put a file back", "path", path, "err", err)
+				a.say(context.Background(), sid, fmt.Sprintf("⚠️ could not put back `%s` after the red-first check: %v\n", path, err))
+			}
+		}
+	}()
+	for path, st := range was {
+		if err := putState(path, st); err != nil {
+			slog.Warn("red-first: could not take a change out", "path", path, "err", err)
+			return ""
+		}
+	}
+	a.say(ctx, sid, fmt.Sprintf("🧪 Does the test show the fault? Running `%s` with this step's changes to %s taken out, its tests kept\n", cmd, strings.Join(code, ", ")))
+	passed, _, took := a.runCheckCommand(ctx, sid, sess.Cwd, "Checking without the fix: "+cmd, cmd)
+	slog.Info("red-first check", "cmd", cmd, "code", code, "tests", tests, "passed_without", passed, "took", took)
+	if ctx.Err() != nil || !passed {
+		if ctx.Err() == nil {
+			a.say(ctx, sid, fmt.Sprintf("🧪 it fails without the change (%s), as it should\n", took))
+		}
+		return ""
+	}
+	a.say(ctx, sid, fmt.Sprintf("🧪 it passes without the change too (%s): the test does not show the fault\n", took))
+	return fmt.Sprintf("red before green failed: `%s` passes with this step's changes to %s taken out (its test changes to %s kept), so those tests do not show what the step fixed. Either they do not check the reported fault, or the fault is elsewhere and the change does not touch it. Reproduce the fault first: a test or check that FAILS on the code as it was, then the fix that turns it green",
+		cmd, strings.Join(code, ", "), strings.Join(tests, ", "))
+}
+
+func mergeKeys(a, b map[string]*fileState) map[string]*fileState {
+	out := maps.Clone(a)
+	if out == nil {
+		out = map[string]*fileState{}
+	}
+	maps.Copy(out, b)
+	return out
+}
+
+// putState writes st back, or removes the file when st says it was not there.
+func putState(path string, st *fileState) error {
+	if !st.exists {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(path, st.data, 0o644)
+}
+
+func planTokenNudgeText(spent int) string {
+	return fmt.Sprintf("You have reasoned for %d tokens in this planning phase without a plan. Stop. Name in one line what is blocking you, then decide:\n"+
+		"- The request's own conditions rule it out: say so in `answer`, naming the condition.\n"+
+		"- You are working out what a command would settle: submit a plan whose first subtask runs it.\n"+
+		"- Otherwise: drop the approach you were on, and submit a plan that takes a different one.\n"+
+		"Call `submit_plan` in your next reply.", spent)
+}
+
+// answerCheckText goes back once when a plan has only an answer: the planner has written
+// "planned a subtask that runs it" into `answer` and sent no subtasks.
+const answerCheckText = "Your `submit_plan` has an `answer` and no `subtasks`, so nothing will run and the turn ends now. Read the user's request once more:\n" +
+	"- A question: call `submit_plan` with `answer` set to \"same\" to keep the answer you wrote.\n" +
+	"- A task its own conditions rule out: call `submit_plan` with `answer` set to \"same\".\n" +
+	"- Anything to do, run, start or change: call `submit_plan` with the `subtasks` that do it."

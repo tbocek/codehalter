@@ -1,101 +1,44 @@
 package main
 
 import (
+	"cmp"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 )
 
-// This file owns the prompt orchestrator. Prompt() is the ACP entry point.
-// The pipeline per turn is:
-//
-//   1. Plan once (read-only, decomposes into subtasks each with a verify
-//      recipe). User confirms (skipped in autopilot).
-//   2. For each subtask, run a single bounded tool-calling loop where the
-//      executor self-verifies before calling respond.
-//   3. If any subtask fails, re-plan with the failure context — up to
-//      maxReplans times. User confirms each replan (skipped in autopilot).
-//      Jaccard similarity over failure reasons escalates the replan note
-//      ("same problem N times — try a structurally different approach").
-//   4. Once every subtask in the current plan succeeds, fire the document
-//      phase exactly once.
-//
-// The phase UI helpers (sendPhase, setStatus, finalizePlan) and the
-// request-level error shaper (failPrompt, stopReasonFor) live here.
+// maxReplans caps the replans of one turn, maxSameFailure the times one failure may
+// come back: planning again after the third time has not changed the outcome.
+const (
+	maxReplans     = 5
+	maxSameFailure = 3
+)
 
-// maxReplans caps the number of planner retries per Prompt. The planner has
-// the conversation history (showing what's been tried and what failed) plus the
-// orchestrator's REPLAN note. The budget is deliberately generous: the execute
-// loop now caps failed rounds low (executeFailCap) and bounces stuck subtasks
-// here, and replans are the only place web_search/web_read run — so most hard problems
-// resolve across several cheap, web-capable replan rounds rather than one long
-// web-blind execute loop. Still bounds total cost when a request is infeasible.
-const maxReplans = 20
-
-// maxUpserts caps how many times the executor may revise the plan mid-run via
-// submit_plan before the orchestrator stops, so a model that re-plans instead of
-// executing can't spin. Separate from (and additive to) the replan budget.
+// maxUpserts caps mid-run submit_plan revisions, separately from maxReplans.
 const maxUpserts = 20
 
-// errUserCancelled flags a deliberate stop initiated by the user (e.g. they
-// chose Abort in a tool-choice prompt). It's NOT an error to surface as a
-// red box — the prompt returns a clean PromptResponse with stopReason
-// "cancelled" when this sentinel reaches the top level.
+// errUserCancelled ends the turn with stopReason "cancelled", not an error.
 var errUserCancelled = errors.New("user cancelled")
 
-// resourcePath returns the local filesystem path an ACP resource URI points
-// at: a file:// URI collapses to its percent-decoded path with any fragment
-// (e.g. an editor line range "#L801-836") stripped, so the model can pass it
-// straight to read_file. Non-file or unparseable URIs are returned verbatim.
-func resourcePath(uri string) string {
-	if uri == "" {
-		return ""
-	}
-	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
-		return u.Path
-	}
-	return strings.TrimPrefix(uri, "file://")
-}
-
-// resourceLabel is resourcePath plus the URI fragment in parentheses when
-// present — used as a human-readable header for an attached snippet so the
-// model sees which file (and line range) the context came from.
-func resourceLabel(uri string) string {
-	if uri == "" {
-		return "attachment"
-	}
-	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
-		if u.Fragment != "" {
-			return u.Path + " (" + u.Fragment + ")"
-		}
-		return u.Path
-	}
-	return strings.TrimPrefix(uri, "file://")
-}
-
-// readLinkedResource reads the file a resource_link / embedded-resource URI
-// points at and returns it as an inline snippet plus a display label, honouring
-// a #L<start>-<end> line-range fragment. ok is false (caller falls back to just
-// noting the path) when the file is outside cwd, missing, or the URI isn't a
-// readable local file — so the model never read-loops hunting for content the
-// editor already handed us. Only files inside cwd are inlined.
+// readLinkedResource honours a #L<start>-<end> fragment; ok is false for a file
+// outside cwd, missing, or not local.
 func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
 	if cwd == "" || uri == "" {
 		return "", "", false
 	}
-	path, start, end := parseResourceURI(uri)
+	path, frag := parseResourceURI(uri)
+	start, end := parseLineRange(frag)
 	if path == "" {
 		return "", "", false
 	}
@@ -103,8 +46,9 @@ func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
 	if !filepath.IsAbs(clean) {
 		clean = filepath.Join(cwd, clean)
 	}
-	root := filepath.Clean(cwd)
-	if clean != root && !strings.HasPrefix(clean, root+string(filepath.Separator)) {
+	// realInside, not a prefix test: a symlink in the project pointing out of it
+	// passes a prefix test.
+	if !realInside(clean, cwd) {
 		return "", "", false
 	}
 	data, err := os.ReadFile(clean)
@@ -124,54 +68,31 @@ func readLinkedResource(cwd, uri string) (snippet, label string, ok bool) {
 	}
 	s := string(data)
 	if len(s) > maxLLMInputBytes {
-		s = s[:maxLLMInputBytes] + "\n[... truncated ...]"
+		s = clipUTF8(s, maxLLMInputBytes) + "\n[... truncated ...]"
 	}
 	return s, base, true
 }
 
-// parseResourceURI splits a resource URI into its local path and an optional
-// line range from the fragment (file:///x/llm.go#L810-845 → "/x/llm.go", 810,
-// 845). Non-file or unparseable URIs return an empty path.
-func parseResourceURI(uri string) (path string, start, end int) {
-	if uri == "" {
-		return "", 0, 0
-	}
-	var frag string
+// A non-file URI comes back as its own path, so the caller can still name it.
+func parseResourceURI(uri string) (path, frag string) {
 	if u, err := url.Parse(uri); err == nil && (u.Scheme == "file" || u.Scheme == "") && u.Path != "" {
-		path = u.Path
-		frag = u.Fragment
-	} else {
-		path = strings.TrimPrefix(uri, "file://")
-		if i := strings.IndexByte(path, '#'); i >= 0 {
-			frag, path = path[i+1:], path[:i]
-		}
+		return u.Path, u.Fragment
 	}
-	start, end = parseLineRange(frag)
-	return path, start, end
+	path = strings.TrimPrefix(uri, "file://")
+	if i := strings.IndexByte(path, '#'); i >= 0 {
+		path, frag = path[:i], path[i+1:]
+	}
+	return path, frag
 }
 
-// parseLineRange pulls a 1- or 2-number line range out of a URI fragment,
-// tolerating the common encodings: "L810-845", "810:845", "810-845", "L810".
-// Returns 0,0 when the fragment carries no digits (whole-file reference).
+// parseLineRange accepts "L810-845", "810:845", "L810"; 0,0 means the whole file.
 func parseLineRange(frag string) (int, int) {
 	var nums []int
-	var cur strings.Builder
-	flush := func() {
-		if cur.Len() > 0 {
-			if n, err := strconv.Atoi(cur.String()); err == nil {
-				nums = append(nums, n)
-			}
-			cur.Reset()
+	for _, m := range digitRunRe.FindAllString(frag, -1) {
+		if n, err := strconv.Atoi(m); err == nil {
+			nums = append(nums, n)
 		}
 	}
-	for _, r := range frag {
-		if r >= '0' && r <= '9' {
-			cur.WriteRune(r)
-		} else {
-			flush()
-		}
-	}
-	flush()
 	switch len(nums) {
 	case 0:
 		return 0, 0
@@ -182,263 +103,194 @@ func parseLineRange(frag string) (int, int) {
 	}
 }
 
-// isCancelled returns true for both the deliberate-cancel sentinel and a
-// raw context.Canceled / DeadlineExceeded. The latter is what the LLM
-// stream / HTTP client surface when the user hits the red Cancel button
-// mid-request — surfacing it as a JSON-RPC error makes Zed render the
-// AUTH_REQUIRED red box (because ACP reserves -32000 for that). All three
-// must collapse to a clean "cancelled" stopReason at the top of Prompt.
+const attachedContext = "\n\n[Attached context from %s]\n```\n%s\n```\n"
+
+// Images are stored by content id, so the wire's base64 never lands in session.toml.
+func promptContent(cwd string, blocks []ContentBlock) (text string, images []ImageData) {
+	for _, block := range blocks {
+		slog.Debug("prompt: content block", "type", block.Type, "uri", block.URI, "hasResource", block.Resource != nil)
+		switch block.Type {
+		case "text":
+			text += block.Text
+		case "image":
+			bytes, err := base64.StdEncoding.DecodeString(block.Data)
+			if err != nil {
+				slog.Warn("prompt: skipping image with undecodable base64", "err", err)
+				continue
+			}
+			id, err := storeImage(cwd, block.MimeType, bytes)
+			if err != nil {
+				slog.Warn("prompt: writing image file failed", "id", id, "err", err)
+				continue
+			}
+			images = append(images, ImageData{ID: id, MimeType: block.MimeType})
+		case "resource":
+			if block.Resource == nil {
+				slog.Debug("prompt: resource block with no embedded resource")
+				continue
+			}
+			label, frag := parseResourceURI(block.Resource.URI)
+			switch {
+			case label == "":
+				label = "attachment"
+			case frag != "":
+				label += " (" + frag + ")"
+			}
+			switch {
+			case block.Resource.Text != "":
+				text += fmt.Sprintf(attachedContext, label, block.Resource.Text)
+			case block.Resource.Blob != "":
+				text += fmt.Sprintf("\n\n[Attached binary resource %s (%s), not inlined]\n", label, block.Resource.MimeType)
+			default:
+				if snippet, l, ok := readLinkedResource(cwd, block.Resource.URI); ok {
+					text += fmt.Sprintf(attachedContext, l, snippet)
+				} else {
+					slog.Debug("prompt: empty embedded resource", "uri", block.Resource.URI)
+				}
+			}
+		case "resource_link":
+			// Inlined so the model doesn't read-loop hunting for the snippet.
+			if snippet, label, ok := readLinkedResource(cwd, block.URI); ok {
+				text += fmt.Sprintf(attachedContext, label, snippet)
+			} else {
+				name := block.Name
+				path, _ := parseResourceURI(block.URI)
+				if name == "" {
+					name = path
+				}
+				text += fmt.Sprintf("\n\n[Referenced file: %s (%s)]\n", name, path)
+			}
+		default:
+			slog.Debug("prompt: ignoring unsupported content block", "type", block.Type)
+		}
+	}
+	return text, images
+}
+
+// All three must end as stopReason "cancelled", never as a JSON-RPC error.
 func isCancelled(err error) bool {
 	return errors.Is(err, errUserCancelled) ||
 		errors.Is(err, context.Canceled) ||
 		errors.Is(err, context.DeadlineExceeded)
 }
 
-// cancelReason renders a short human explanation for a cancelled turn so the
-// stop is never silent. errUserCancelled is the in-app Abort/clarification
-// path; a bare context.Canceled means the editor aborted the request (Cancel
-// button, session switch, or — the case that bit us — a client-side request
-// timeout while we were waiting on a busy LLM); DeadlineExceeded is a context
-// deadline (codehalter sets none on the foreground, so it's the client's).
-func cancelReason(err error) string {
-	switch {
-	case errors.Is(err, errUserCancelled):
-		return "you stopped it"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "a deadline was exceeded (client-side timeout)"
-	case errors.Is(err, context.Canceled):
-		return "the editor aborted the request (Cancel button, or a client-side timeout while the LLM was busy)"
-	default:
-		return "cancelled"
-	}
-}
+var phaseNames = []string{"Planning", "Executing", "Documenting"}
 
-// phaseNames are the pipeline stages; only the current one is shown to the
-// client at a time (the plan UI updates in place as phases progress).
-var phaseNames = []string{"Planning", "Working", "Documenting"}
-
-// phaseEntries builds the multi-row plan entries to render in the client: all
-// phases up to and including `phase`, with prior phases marked completed and
-// phase `phase` marked in_progress or completed depending on `done`. Optional
-// `suffix` is appended to whichever row is in_progress (used by setStatus to
-// surface transient lifecycle markers like " (thinking…)" or " (running
-// read_file…)"). Document (phase 2) only appears once it actually starts,
-// so a no-doc run ends with two rows.
-func phaseEntries(phase int, done bool, suffix string) []PlanEntry {
-	if phase < 0 || phase >= len(phaseNames) {
-		return nil
-	}
+// phaseEntries: the phases so far, the current one in progress unless done. Its content is
+// Zed's status line (phaseStatus); its _meta the CLI's parts.
+func phaseEntries(sess *Session, phase int, done bool) []PlanEntry {
 	entries := make([]PlanEntry, 0, phase+1)
 	for i := 0; i <= phase; i++ {
-		status := "completed"
-		content := phaseNames[i]
+		e := PlanEntry{Content: phaseNames[i], Priority: "medium", Status: "completed"}
 		if i == phase && !done {
-			status = "in_progress"
-			content += suffix
+			e.Status = "in_progress"
+			if sess != nil {
+				var meter string
+				e.Content, meter = sess.phaseStatus(phase)
+				e.Meta = &planMeta{Phase: phaseNames[i], Meter: meter}
+			}
 		}
-		entries = append(entries, PlanEntry{Content: content, Priority: "medium", Status: status})
+		entries = append(entries, e)
 	}
 	return entries
 }
 
-// sendPhase emits a plan update covering every phase started so far. The
-// current phase is in_progress (or completed when done=true); earlier phases
-// are completed. The session tracks in-progress state so finalizePlan can
-// mark whatever phase was running as completed if Prompt exits early.
+// phaseStatus: "Executing · 67m12s · llm[0] ↑426kb ↓37 tok · 812 pp/s · 51 tg/s", the same as
+// the CLI's status row without the context (Zed draws that as its ring), and the meter alone.
+func (s *Session) phaseStatus(phase int) (string, string) {
+	s.turnMu.Lock()
+	start := s.turn.start
+	s.turnMu.Unlock()
+	s.phaseMu.Lock()
+	meter, fn, pp, tg := s.meter, s.meterFn, s.pp, s.tg
+	s.phaseMu.Unlock()
+	if fn != nil {
+		meter = fn()
+	}
+	parts := []string{phaseNames[phase]}
+	if !start.IsZero() {
+		parts = append(parts, elapsed(time.Since(start)))
+	}
+	if meter != "" {
+		parts = append(parts, meter)
+	}
+	if pp > 0 {
+		parts = append(parts, strconv.Itoa(int(pp+0.5))+" pp/s")
+	}
+	if tg > 0 {
+		parts = append(parts, strconv.Itoa(int(tg+0.5))+" tg/s")
+	}
+	return strings.Join(parts, " · "), meter
+}
+
+// The tracked phase lets holdTurn's release complete it if the turn exits early. While a
+// phase is active one ticker per session sends its status every second, so the time moves
+// during a long tool run too; it ends itself once no phase is active.
 func (a *agent) sendPhase(ctx context.Context, sid string, phase int, done bool) {
-	entries := phaseEntries(phase, done, "")
-	if entries == nil {
+	sess := a.getSession(sid)
+	if sess == nil { // closed mid-turn
+		a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(nil, phase, done)})
 		return
 	}
-	if sess := a.getSession(sid); sess != nil {
+	sess.phaseMu.Lock()
+	sess.phaseCurrent = phase
+	sess.phaseActive = !done
+	tick := !done && !sess.phaseTicking
+	sess.phaseTicking = sess.phaseTicking || tick
+	sess.phaseMu.Unlock()
+	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(sess, phase, done)})
+	if tick {
+		go func() {
+			t := time.NewTicker(time.Second)
+			defer t.Stop()
+			for range t.C {
+				sess.phaseMu.Lock()
+				active, cur := sess.phaseActive, sess.phaseCurrent
+				sess.phaseTicking = active
+				sess.phaseMu.Unlock()
+				if !active {
+					return
+				}
+				a.sendUpdate(context.Background(), sid, planUpdate{Kind: "plan", Entries: phaseEntries(sess, cur, false)})
+			}
+		}()
+	}
+}
+
+// setStatus shows what runs now ("queued", a model call's progress), "" for nothing; a
+// no-op when no phase is active, so background calls don't clobber the UI.
+func (a *agent) setStatus(ctx context.Context, sid string, meter string) {
+	sess := a.getSession(sid)
+	if sess == nil {
+		return
+	}
+	sess.phaseMu.Lock()
+	sess.meter, sess.meterFn = meter, nil
+	active, phase := sess.phaseActive, sess.phaseCurrent
+	sess.phaseMu.Unlock()
+	if active {
+		a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: phaseEntries(sess, phase, false)})
+	}
+}
+
+// startStatusMeter makes render the meter the phase ticker shows; stop() takes it away.
+func (a *agent) startStatusMeter(ctx context.Context, sid string, render func() string) (stop func()) {
+	sess := a.getSession(sid)
+	if sess == nil {
+		return func() {}
+	}
+	sess.phaseMu.Lock()
+	sess.meterFn = render
+	sess.phaseMu.Unlock()
+	return func() {
 		sess.phaseMu.Lock()
-		sess.phaseCurrent = phase
-		sess.phaseActive = !done
+		sess.meterFn = nil
 		sess.phaseMu.Unlock()
 	}
-	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
 }
 
-// setStatus re-emits the full multi-row plan with `suffix` appended to
-// whichever row is currently in_progress. Used as a transient marker for
-// lifecycle states: " (sent to llm…)" between HTTP POST and first token,
-// " (thinking…)" while tokens stream, " (running read_file…)" while a tool
-// executes. Pass "" to revert to the bare phase name. No-op when no phase is
-// active so background calls (history compaction, per-turn summariser) don't
-// clobber the UI.
-func (a *agent) setStatus(ctx context.Context, sid string, suffix string) {
-	sess := a.getSession(sid)
-	if sess == nil {
-		return
-	}
-	// Subagents own no phase row (Zed only knows the parent sid), so fold their
-	// live meter into the PARENT's in-progress row instead of letting sendUpdate
-	// drop it. Intercept before the phaseActive gate below: an execute-mode
-	// subagent runs no phase of its own, yet its parent is mid-"Working".
-	if sess.ParentID != "" {
-		a.setSubagentStatus(ctx, sess.ParentID, sid, sess.DisplayLabel, suffix)
-		return
-	}
-	sess.phaseMu.Lock()
-	active := sess.phaseActive
-	phase := sess.phaseCurrent
-	sess.phaseMu.Unlock()
-	if !active {
-		return
-	}
-	entries := phaseEntries(phase, false, suffix)
-	if entries == nil {
-		return
-	}
-	a.sendUpdate(ctx, sid, planUpdate{Kind: "plan", Entries: entries})
-}
-
-// startStatusMeter refreshes the active phase row once a second with whatever
-// render() returns, so anything that takes a while (an LLM round trip, a slow
-// tool) shows a climbing counter instead of a frozen row. setStatus is a no-op
-// when no phase is active, so this is safe to run unconditionally.
-//
-// The returned stop() halts the ticker AND waits for the goroutine, so a late
-// tick can never re-set the row after the caller has cleared it. Callers that
-// also `defer a.setStatus(ctx, sid, "")` must register that defer FIRST, so LIFO
-// runs the join before the clear.
-func (a *agent) startStatusMeter(ctx context.Context, sid string, render func() string) (stop func()) {
-	done, stopped := make(chan struct{}), make(chan struct{})
-	go func() {
-		defer close(stopped)
-		ticker := time.NewTicker(time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				a.setStatus(ctx, sid, render())
-			}
-		}
-	}()
-	return func() { close(done); <-stopped }
-}
-
-// setSubagentStatus records (suffix non-empty) or clears (suffix empty) one
-// subagent's live meter under its parent, then re-renders the parent's
-// in-progress row as a compact " (labelA …metersA · labelB …metersB)" join of
-// every active subagent. This is what surfaces a subagent's ↑sent / ↓tokens /
-// elapsed in Zed's "Current: Working (…)" status — N parallel subagents each
-// keep their own fragment instead of clobbering a single row. Called from
-// concurrent subagent goroutines, so the map is mutex-guarded; the parent
-// sendUpdate it ends in already runs concurrently today (loop.go breadcrumbs).
-// Returns the rendered aggregate (the suffix handed to the parent's setStatus)
-// so the folding is observable in tests, mirroring phaseEntries' compute-and-
-// return shape; production callers ignore it.
-func (a *agent) setSubagentStatus(ctx context.Context, parentSid, subSid, label, suffix string) string {
-	if label == "" {
-		label = "sub"
-	}
-	a.subagentMeterMu.Lock()
-	if a.subagentMeter == nil {
-		a.subagentMeter = map[string]map[string]string{}
-	}
-	subs := a.subagentMeter[parentSid]
-	if subs == nil {
-		subs = map[string]string{}
-		a.subagentMeter[parentSid] = subs
-	}
-	// suffix is the meter fragment " (llm[0] ↑12kb ↓1.2k…)" / " (running read_file…)".
-	// Strip its outer " ( … )" framing (and the redundant "llm[slot] " prefix the
-	// meter adds — the label already names the slot) so the join reads cleanly.
-	if inner := strings.Trim(strings.TrimSpace(suffix), "()"); inner == "" {
-		delete(subs, subSid)
-	} else {
-		if rest, ok := strings.CutPrefix(inner, "llm["); ok {
-			if i := strings.IndexByte(rest, ']'); i >= 0 {
-				inner = strings.TrimPrefix(rest[i+1:], " ")
-			}
-		}
-		subs[subSid] = label + " " + inner
-	}
-	parts := make([]string, 0, len(subs))
-	for _, v := range subs {
-		parts = append(parts, v)
-	}
-	if len(subs) == 0 {
-		delete(a.subagentMeter, parentSid)
-	}
-	a.subagentMeterMu.Unlock()
-
-	sort.Strings(parts) // stable order so the row doesn't reshuffle each tick
-	agg := ""
-	if len(parts) > 0 {
-		agg = " (" + strings.Join(parts, " · ") + ")"
-	}
-	a.setStatus(ctx, parentSid, agg)
-	return agg
-}
-
-// finalizePlan marks every phase up to and including the currently-active one
-// as completed so the UI stops spinning. Idempotent and safe to call when no
-// phase is active. Used from a Prompt-level defer to cover every exit path:
-// errors mid-phase (LLM 500, tool failure), user cancel, or panic.
-func (a *agent) finalizePlan(sid string) {
-	sess := a.getSession(sid)
-	if sess == nil {
-		return
-	}
-	sess.phaseMu.Lock()
-	active := sess.phaseActive
-	phase := sess.phaseCurrent
-	sess.phaseActive = false
-	sess.phaseMu.Unlock()
-	if !active {
-		return
-	}
-	entries := phaseEntries(phase, true, "")
-	if entries == nil {
-		return
-	}
-	// Background ctx so the finalize fires even when the request ctx is cancelled.
-	a.sendUpdate(context.Background(), sid, planUpdate{Kind: "plan", Entries: entries})
-}
-
-// failPrompt records a fatal error in the session and returns it so the ACP
-// dispatcher emits a JSON-RPC error response — Zed renders that as a red
-// error box in the chat. Use only for failures that abort the prompt
-// (LLM auth / out-of-credits / runPlanPhase crash). Pass any tool uses
-// captured before the failure so they're preserved in history. Recoverable
-// warnings should keep using sendUpdate with a "⚠ ..." chunk.
-func (a *agent) failPrompt(sid string, err error, toolUses []ToolUse) (PromptResponse, error) {
-	if sess := a.getSession(sid); sess != nil {
-		if len(toolUses) > 0 {
-			sess.AddAssistantWithTools("❌ "+err.Error(), toolUses)
-		} else {
-			sess.AddAssistant("❌ " + err.Error())
-		}
-		sess.saveOrLog()
-	}
-	return PromptResponse{}, err
-}
-
-// stopReasonFor reports `cancelled` if the prompt's context was cancelled
-// (user hit Cancel in the client), else `end_turn`. ACP clients use the
-// stop reason to distinguish a clean turn from a user-initiated abort.
-func stopReasonFor(ctx context.Context) string {
-	if ctx.Err() != nil {
-		return "cancelled"
-	}
-	return "end_turn"
-}
-
-// sessionTitleMax is how many runes of the opening message become the thread
-// name. Long enough to keep a real sentence, short enough not to be elided by
-// the client's own thread list.
 const sessionTitleMax = 60
 
-// deriveTitle turns a user message into a one-line thread name: the first
-// non-blank line, whitespace collapsed, cut to sessionTitleMax on a word
-// boundary. Returns "" for a message with no text at all (an image-only
-// prompt), which leaves the thread unnamed rather than naming it "".
 func deriveTitle(raw string) string {
 	var line string
 	for _, l := range strings.Split(raw, "\n") {
@@ -452,18 +304,14 @@ func deriveTitle(raw string) string {
 		return line
 	}
 	cut := string([]rune(line)[:sessionTitleMax])
-	// Only back up to a word boundary if one is reasonably close to the limit;
-	// a single 60-rune token would otherwise collapse to almost nothing.
+	// Only a nearby word boundary: one long token would otherwise collapse to nothing.
 	if i := strings.LastIndex(cut, " "); i > sessionTitleMax/2 {
 		cut = cut[:i]
 	}
 	return strings.TrimRight(cut, " ,.;:-") + "…"
 }
 
-// setSessionTitle names the thread in the client. ACP has no request for this:
-// the agent volunteers a session_info_update, and a client that doesn't
-// implement it ignores the unknown update kind, so there is no capability to
-// gate on. Title is also persisted, so LoadSession can re-announce it.
+// No capability gate: a client without session_info_update ignores the unknown kind.
 func (a *agent) setSessionTitle(ctx context.Context, sess *Session, raw string) {
 	title := deriveTitle(raw)
 	if title == "" || title == sess.Title {
@@ -479,208 +327,68 @@ func (a *agent) setSessionTitle(ctx context.Context, sess *Session, raw string) 
 
 func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, error) {
 	slog.Debug("Prompt: enter", "sid", req.SessionId, "blocks", len(req.Content))
-
-	// One turn per session. A new prompt supersedes the in-flight turn: cancel it
-	// (stops its LLM call), then WAIT on turnMu for it to fully unwind before
-	// starting — so two turns never run with divergent context snapshots. That
-	// overlap was the bug: one turn compacted the session while the other kept
-	// re-sending its pre-compaction snapshot, re-bloating the context and
-	// double-compacting. The deadlock that made us drop this lock is fixed
-	// (connSems capture + the ctx bail-out in orchestrate below), so the wait is
-	// short: the old turn sees its cancelled ctx and returns within one step.
-	if sess := a.getSession(req.SessionId); sess != nil {
-		sess.markSuperseding() // tell the in-flight turn this is a replacement, not an abort
-		sess.cancelTurn()
-		sess.turnMu.Lock()
-		sess.adoptTurn() // we're now the active turn; the superseded one has unwound
-		defer sess.turnMu.Unlock()
-	}
-	ctx, cancel := context.WithCancel(ctx)
-	if sess := a.getSession(req.SessionId); sess != nil {
-		sess.beginTurn(cancel)
-	}
-	defer cancel()
-	defer a.finalizePlan(req.SessionId)
-
-	// Abort wins over pending-question. Once ensureDevcontainer has decided
-	// the session can't proceed (set abortReason), the pending UI prompt is
-	// moot — the user should see the real reason, not "answer the question".
-	// Each refused turn also appends the reason to chat: Zed locks an open
-	// red box until the user dismisses it, so the error response alone is
-	// invisible after the first turn — the chat append gives fresh feedback.
-	a.mu.Lock()
-	abort := a.abortReason
-	a.mu.Unlock()
-	slog.Debug("Prompt: abort gate", "sid", req.SessionId, "abortReason", abort)
-	if abort != "" {
-		a.say(ctx, req.SessionId, abort+"\n")
-		return a.failPrompt(req.SessionId, errors.New(abort), nil)
-	}
-
-	// Non-blocking: if the bootstrap goroutine is still running it's parked
-	// on an interactive prompt (devcontainer OS choice, gitignore choice).
-	// Block the typed prompt with a red box so the user is told to answer
-	// the pending question instead of their message hanging silently.
-	if a.indexDone != nil {
-		select {
-		case <-a.indexDone:
-			slog.Debug("Prompt: indexDone gate passed", "sid", req.SessionId)
-		default:
-			slog.Debug("Prompt: indexDone gate refused (bootstrap still running)", "sid", req.SessionId)
-			return a.failPrompt(req.SessionId, errors.New("Please answer the pending question above first."), nil)
-		}
-	} else {
-		slog.Debug("Prompt: indexDone nil, no gate", "sid", req.SessionId)
-	}
-
-	// Capture isFirstMessage and seed sess.SystemPrompt BEFORE the pre-turn
-	// checks run. prepareChecks rebuilds the system prompt (skills / cwd context)
-	// and an LLM call needs it seeded; isFirstMessage is read later for the
-	// empty-project hint.
 	sess := a.getSession(req.SessionId)
-	isFirstMessage := sess != nil && len(sess.Messages) == 0 && sess.Summary == ""
-	if sess != nil && sess.SystemPrompt == "" {
+	if sess == nil {
+		return PromptResponse{}, fmt.Errorf("no session found")
+	}
+
+	// These gates refuse before the message is stored, so history gets no reply.
+	if err := a.abortGate(ctx, req.SessionId); err != nil {
+		return PromptResponse{}, err
+	}
+	// Before the turn is taken and before steering: startup takes the turn for its fix
+	// cards, and a prompt steered into that fix turn would end at once, unanswered.
+	if waited, err := a.awaitStartup(ctx, sess); err != nil {
+		if isCancelled(err) {
+			return PromptResponse{StopReason: "cancelled"}, nil
+		}
+		return PromptResponse{}, err
+	} else if waited {
+		// Startup may have ended on a problem the abort gate above did not see yet.
+		if err := a.abortGate(ctx, req.SessionId); err != nil {
+			return PromptResponse{}, err
+		}
+	}
+
+	if sess.turnRunning() && a.steerRunningTurn(ctx, sess, req.Content) {
+		return PromptResponse{StopReason: "end_turn"}, nil
+	}
+
+	ctx, release, _ := a.holdTurn(ctx, sess, true)
+	detached := false // a /spec loop that outlives Zed's cancel releases the turn itself
+	defer func() {
+		if !detached {
+			release()
+		}
+	}()
+
+	// Seeded before prepareChecks, whose LLM calls need a system prompt.
+	isFirstMessage := len(sess.Messages) == 0 && sess.Summary == ""
+	if sess.SystemPrompt == "" {
 		sysPrompt, err := a.systemPrompt(req.SessionId)
 		if err != nil {
-			return a.failPrompt(req.SessionId, err, nil)
+			return PromptResponse{}, err
 		}
 		sess.SystemPrompt = sysPrompt
 	}
 
-	// Pre-turn freshness pass: verify a reachable LLM (looping on a Retry card
-	// if not), refresh the env snapshot, and reconcile mcp.toml so THIS turn
-	// runs against current config — a server or tool added last turn is live
-	// before its work starts. Cheap in steady state (every check short-circuits).
-	// Detected problems are held and offered as fix cards post-turn via
-	// drainFixes, so an accepted card can't jump ahead of the user's request.
-	var pendingFixes []fixProblem
-	if sess != nil {
-		pendingFixes = a.prepareChecks(ctx, sess, req.SessionId)
-	}
+	// Fix cards are held until after the turn, so an accepted one can't jump
+	// ahead of the user's request.
+	pendingFixes := sess.takeFixes(a.prepareChecks(ctx, sess, req.SessionId))
 
-	// Clear per-turn read-dedup. Dedup is scoped to a single Prompt() turn
-	// so that across-turn re-reads (after a user reply, edits made outside
-	// our process, etc.) still go through.
-	if sess != nil {
-		sess.readDedupMu.Lock()
-		sess.readDedup = nil
-		sess.readDedupMu.Unlock()
-		sess.searchDedupMu.Lock()
-		sess.searchDedup = nil
-		sess.searchDedupMu.Unlock()
-		sess.readCursorMu.Lock()
-		sess.readCursor = nil
-		sess.readCursorMu.Unlock()
-		sess.editFailedPathsMu.Lock()
-		sess.editFailedPaths = nil
-		sess.editFailedPathsMu.Unlock()
-	} else {
-		slog.Debug("Prompt: pre-turn getSession NIL", "sid", req.SessionId, "knownSessions", len(a.sessions))
-	}
+	userText, images := promptContent(sess.Cwd, req.Content)
 
-	// Extract user text and images from prompt blocks. Image bytes are
-	// content-addressed (sha256[:8]) and written under .codehalter/images so
-	// the ACP wire-side base64 doesn't get persisted in session.toml; what
-	// stays on Message.Images is just {id, mime}. Re-pasting the same
-	// screenshot collides on id and skips the write.
-	var userText string
-	var images []ImageData
-	for _, block := range req.Content {
-		slog.Debug("prompt: content block", "type", block.Type, "uri", block.URI, "hasResource", block.Resource != nil)
-		switch block.Type {
-		case "text":
-			userText += block.Text
-		case "image":
-			bytes, err := base64.StdEncoding.DecodeString(block.Data)
-			if err != nil {
-				slog.Warn("prompt: skipping image with undecodable base64", "err", err)
-				continue
-			}
-			// Content-addressed id ("img_<sha256[:8] hex>") — same bytes →
-			// same id → same file path, so a re-pasted screenshot doesn't
-			// re-write the store.
-			h := sha256.Sum256(bytes)
-			id := "img_" + hex.EncodeToString(h[:8])
-			if sess != nil {
-				if err := writeImageFile(sess.Cwd, id, block.MimeType, bytes); err != nil {
-					slog.Warn("prompt: writing image file failed", "id", id, "err", err)
-					continue
-				}
-			}
-			images = append(images, ImageData{ID: id, MimeType: block.MimeType})
-		case "resource":
-			// Embedded resource: an editor selection / file excerpt attached via
-			// Zed's "@ include context". The snippet text lives inline; without
-			// this case it was silently dropped and the model saw only the bare
-			// prompt, so a reference like "why do we need this?" had no referent.
-			if block.Resource == nil {
-				slog.Debug("prompt: resource block with no embedded resource")
-				continue
-			}
-			label := resourceLabel(block.Resource.URI)
-			switch {
-			case block.Resource.Text != "":
-				userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, block.Resource.Text)
-			case block.Resource.Blob != "":
-				// Binary embedded resource (rare from editors — images arrive as
-				// "image" blocks). Note it rather than inlining opaque bytes.
-				userText += fmt.Sprintf("\n\n[Attached binary resource %s (%s) — not inlined]\n", label, block.Resource.MimeType)
-			default:
-				// No inline text/blob but a URI — same fallback as resource_link:
-				// read the linked file so the reference still resolves.
-				cwd := ""
-				if sess != nil {
-					cwd = sess.Cwd
-				}
-				if snippet, l, ok := readLinkedResource(cwd, block.Resource.URI); ok {
-					userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", l, snippet)
-				} else {
-					slog.Debug("prompt: empty embedded resource", "uri", block.Resource.URI)
-				}
-			}
-		case "resource_link":
-			// A pointer to a file (no inline content). Pull the linked file in —
-			// honouring a #L<start>-<end> line range — so a bare reference like
-			// "why do we need this?" resolves immediately instead of forcing the
-			// model to read_file and risk a read-loop hunting for the snippet.
-			// Falls back to noting the path when the file is outside the
-			// workspace or unreadable.
-			cwd := ""
-			if sess != nil {
-				cwd = sess.Cwd
-			}
-			if snippet, label, ok := readLinkedResource(cwd, block.URI); ok {
-				userText += fmt.Sprintf("\n\n[Attached context from %s]\n```\n%s\n```\n", label, snippet)
-			} else {
-				name := block.Name
-				path := resourcePath(block.URI)
-				if name == "" {
-					name = path
-				}
-				userText += fmt.Sprintf("\n\n[Referenced file: %s (%s)]\n", name, path)
-			}
-		default:
-			slog.Debug("prompt: ignoring unsupported content block", "type", block.Type)
-		}
-	}
-
-	// Name the thread from its opening request. Done here, BEFORE macro
-	// expansion, so a slash command titles as the command rather than as the
-	// first line of the rendered template. The field is only set on the session; the
-	// saveOrLog that stores this same message persists it.
-	if isFirstMessage && sess != nil {
+	// Before macro expansion, so a slash command titles as the command.
+	if isFirstMessage {
 		a.setSessionTitle(ctx, sess, userText)
 	}
 
-	// `/<name> <args>` matching a TEMPLATE-<name>.md (user copy in .codehalter,
-	// else the embedded default) expands into a full prompt and runs as a normal
-	// turn. A macro that requires an arg ({{}}) but got none stops here with a
-	// user-facing note — no model call.
-	macroCwd := ""
-	if sess != nil {
-		macroCwd = sess.Cwd
+	if name, args := splitMacro(userText); name == "spec" {
+		resp, err, d := a.runSpecTurn(ctx, req.SessionId, sess, args, pendingFixes, release)
+		detached = d
+		return resp, err
 	}
-	if rendered, stopMsg, handled := a.expandMacro(ctx, req.SessionId, macroCwd, userText); handled {
+	if rendered, stopMsg, handled := a.expandMacro(ctx, req.SessionId, sess.Cwd, userText); handled {
 		if stopMsg != "" {
 			a.say(ctx, req.SessionId, stopMsg+"\n")
 			return PromptResponse{StopReason: "end_turn"}, nil
@@ -688,127 +396,167 @@ func (a *agent) Prompt(ctx context.Context, req PromptRequest) (PromptResponse, 
 		userText = rendered
 	}
 
-	// The empty-project hint stays folded into the first user message because
-	// it's a one-shot nudge — once the project has files, we want the
-	// summariser to drop it naturally rather than re-injecting it forever.
-	stored := userText
-	if isFirstMessage {
-		a.mu.Lock()
-		empty := a.emptyProject
-		a.mu.Unlock()
-		if empty {
-			stored = emptyProjectHint + "\n---\n" + userText
+	// Before the message is stored: a refused message must not stay in history.
+	if mst := int(a.mainSlotTokens.Load()); mst > 0 {
+		estTokens := len(userText) / 4
+		triggerTokens := mst * compactTriggerPct / 100
+		if estTokens > triggerTokens {
+			return PromptResponse{}, fmt.Errorf("message too large: ~%d tokens estimated, exceeds the %d-token compaction trigger (per-slot n_ctx %d × %d%%). Trim the prompt or restart your server with a larger -c N / --max-model-len N", estTokens, triggerTokens, mst, compactTriggerPct)
 		}
-	}
-	if sess != nil {
-		if len(images) > 0 {
-			sess.AddUserWithImages(stored, images)
-		} else {
-			sess.AddUser(stored)
-		}
-		sess.saveOrLog()
 	}
 
-	// Reject prompts whose text alone would breach the context-size guard.
-	// Even on a fresh session, system prompt + skills + the assistant
-	// reply won't fit alongside a user message that big, and letting
-	// llmStream error out mid-stream is worse UX than refusing up front.
-	// bytes/4 is a rough chars-per-token estimate; precision doesn't matter
-	// here since the trigger leaves ~20% headroom anyway.
-	if a.mainSlotTokens > 0 {
-		estTokens := len(userText) / 4
-		triggerTokens := a.mainSlotTokens * compactTriggerPct / 100
-		if estTokens > triggerTokens {
-			return a.failPrompt(req.SessionId, fmt.Errorf("message too large: ~%d tokens estimated, exceeds the %d-token compaction trigger (per-slot n_ctx %d × %d%%). Trim the prompt or restart your server with a larger -c N / --max-model-len N", estTokens, triggerTokens, a.mainSlotTokens, compactTriggerPct), nil)
-		}
+	// In the first message, not the system prompt, so the summariser drops it later.
+	stored := userText
+	if isFirstMessage && a.projectIsEmpty() {
+		stored = emptyProjectHint + "\n---\n" + userText
 	}
+	sess.AddUser(stored, images...)
+	sess.addOrigin(originChat)
+	sess.saveOrLog()
 
 	slog.Info("Prompt", "sid", req.SessionId, "sessions", len(a.sessions))
 
-	if err := a.runTurn(ctx, req.SessionId); err != nil {
+	if err := a.runTurn(ctx, req.SessionId, true); err != nil {
 		if isCancelled(err) {
-			// Never silent: log the cancellation and tell the user why. Covers
-			// the in-app Abort/Cancel button AND the editor aborting the turn
-			// (e.g. a client-side request-deadline timeout while the LLM was
-			// busy) — the latter used to vanish with no trace at all. Background
-			// ctx for the notice since the request ctx is already cancelled.
-			reason := cancelReason(err)
-			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "reason", reason, "err", err)
-			// Only the explicit in-app Abort is "you stopped it". An external cancel
-			// (the editor aborting to send your next message) is NOT a stop you made,
-			// so don't blame you — and when a plan is held, say that instead. A new
-			// prompt that superseded this turn will speak for itself.
-			sess := a.getSession(req.SessionId)
-			msg := ""
+			slog.Warn("Prompt: turn cancelled", "sid", req.SessionId, "err", err)
+			// codehalter sets no foreground deadline, so DeadlineExceeded is the client's.
+			msg := "⏹ Turn cancelled: the editor aborted the request (Cancel button, or a client-side timeout while the LLM was busy).\n"
 			switch {
 			case errors.Is(err, errUserCancelled):
 				msg = "⏹ Stopped.\n"
-			case sess == nil || !sess.superseded():
-				// Editor aborted the request (Cancel button, or a client-side
-				// request timeout while the LLM was busy) with nothing taking
-				// over — surface it so an aborted turn never dies without a
-				// trace in the UI. A supersede stays silent: the new turn speaks
-				// for itself.
-				msg = "⏹ Turn cancelled — " + cancelReason(err) + ".\n"
+			case errors.Is(err, context.DeadlineExceeded):
+				msg = "⏹ Turn cancelled: a deadline was exceeded (client-side timeout).\n"
 			}
-			if msg != "" {
-				a.say(context.Background(), req.SessionId, msg)
-			}
+			// Background ctx: the request's own is already cancelled.
+			a.say(context.Background(), req.SessionId, msg)
 			return PromptResponse{StopReason: "cancelled"}, nil
 		}
-		return a.failPrompt(req.SessionId, err, nil)
+		sess.AddAssistant("❌ " + err.Error())
+		sess.saveOrLog()
+		return PromptResponse{}, err
 	}
 
-	// Offer any fix cards the pre-turn checks detected, now that the user's
-	// actual request has run. The freshness checks themselves moved pre-turn
-	// (prepareChecks above); only the user-facing "fix it for me?" cards run
-	// here so an accepted one can't dispatch its orchestrate cycle ahead of the
-	// request it interrupted.
+	// Steering or a job note that came after the final round asked the model is nobody's yet.
+	a.drainSteer(ctx, sess)
+
 	slog.Debug("Prompt: draining pre-turn fix cards (post-turn)", "sid", req.SessionId, "fixes", len(pendingFixes))
 	a.drainFixes(ctx, req.SessionId, pendingFixes)
 
-	return PromptResponse{StopReason: stopReasonFor(ctx)}, nil
+	// The stop reason is how the client tells a clean turn from an abort.
+	if ctx.Err() != nil {
+		return PromptResponse{StopReason: "cancelled"}, nil
+	}
+	return PromptResponse{StopReason: "end_turn"}, nil
 }
 
-// runTurn drives one full turn through the single shared path: reset the
-// per-turn stats window, run the orchestrator, and on a clean result fire the
-// epilogue — the "✅ Done" stats line and history compaction. Both entry
-// points use it — a typed user Prompt and an
-// accepted proposeFix "install fix?" card — so a fix-dispatched turn behaves
-// identically to a typed one (they used to diverge: the fix path skipped stats
-// AND compaction). The caller owns error presentation (Prompt surfaces it over
-// ACP, proposeFix logs it).
-func (a *agent) runTurn(ctx context.Context, sid string) error {
-	// MCP config this turn writes is applied at the BOUNDARY, never inside the
-	// turn: registering tools rewrites the `tools` array, which the chat template
-	// renders ahead of the whole conversation, so an in-turn reconcile would move
-	// the prompt under a loop already running. wait() holds a turn that starts
-	// while the previous flush is still bringing a child up; the deferred
-	// schedule() applies whatever changed once this turn is fully done, coalesced
-	// so a run of turns can never stack reconciles.
-	a.mcp.wait()
-	defer a.mcp.schedule(func() { a.flushMCP(sid) })
+// awaitStartup parks a prompt until startup has finished; waited reports that it had to. It
+// holds no turn meanwhile: startup takes the turn for its fix cards, so holding it here
+// would leave each waiting on the other.
+func (a *agent) awaitStartup(ctx context.Context, sess *Session) (waited bool, err error) {
+	sid := sess.ID
+	startup := a.startupDone()
+	if startup == nil {
+		slog.Debug("Prompt: indexDone nil, no gate", "sid", sid)
+		return false, nil
+	}
+	select {
+	case <-startup:
+		slog.Debug("Prompt: indexDone gate passed", "sid", sid)
+		return false, nil
+	default:
+	}
+	// In an editor a message sent while startup asks is the user answering past its card.
+	// The CLI gives a line typed then to the open question, so a prompt here is a `-p` one,
+	// sent before anyone could answer: it waits like any other.
+	if a.asking.Load() > 0 && !a.standalone {
+		slog.Debug("Prompt: indexDone gate refused (startup is asking)", "sid", sid)
+		return false, errors.New("Please answer the pending question above first.")
+	}
+	a.awaitingStartup.Add(1)
+	defer a.awaitingStartup.Add(-1)
+	// No turn to cancel yet, so Stop is wired here: it also cancels startup, which would
+	// otherwise let this prompt through.
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	defer sess.onCancel(func() { cancel(errUserCancelled) })()
+	slog.Debug("Prompt: waiting for startup", "sid", sid)
+	a.say(ctx, sid, "⏳ Still setting up; your message runs as soon as that is done.\n")
+	select {
+	case <-startup:
+		// Stop cancels startup too, so both may be ready: the Stop wins.
+		if ctx.Err() != nil {
+			return true, context.Cause(ctx)
+		}
+		return true, nil
+	case <-ctx.Done():
+		return true, context.Cause(ctx)
+	}
+}
 
+// A prompt typed while a turn runs. Images cannot be queued, and the reply says
+// so. False when there was nothing to handle.
+func (a *agent) steerRunningTurn(ctx context.Context, sess *Session, content []ContentBlock) bool {
+	text, images := promptContent(sess.Cwd, content)
+	t := strings.TrimSpace(text)
+	const noLoop = "No /spec loop is running in this session.\n"
+	switch {
+	case t == "/spec stop":
+		if sess.specFence() == "" {
+			a.say(ctx, sess.ID, noLoop)
+		} else if !sess.requestSpecStop() {
+			a.say(ctx, sess.ID, "\n⏹ **/spec stops after the round in flight** (its tests and commit finish first). To stop right away, send `/spec abort`.\n")
+		}
+	case t == "/spec abort":
+		if sess.abortSpec() {
+			a.say(ctx, sess.ID, "⏹ Aborting /spec now: the round in flight is cut off. What it did so far stays in the project; the next `/spec` continues from it.\n")
+		} else {
+			a.say(ctx, sess.ID, noLoop)
+		}
+	case strings.HasPrefix(t, "/spec") && sess.specFence() != "":
+		a.say(ctx, sess.ID, "A /spec loop is running. `/spec stop` ends it after the round in flight; then `"+t+"`.\n")
+	case t == "":
+		return false
+	case len(images) > 0:
+		sess.addSteer(text)
+		a.say(ctx, sess.ID, fmt.Sprintf("↪ Queued your message for the turn in flight (%d image(s) left out, send them once it finishes). Stop the turn to interrupt it instead.\n", len(images)))
+	default:
+		sess.addSteer(text)
+		a.say(ctx, sess.ID, "↪ Queued for the turn in flight, it lands at its next step. Stop the turn to interrupt it instead.\n")
+	}
+	return true
+}
+
+// abortGate also says the abort in chat: Zed keeps the first red box open, so a
+// later error alone is invisible.
+func (a *agent) abortGate(ctx context.Context, sid string) error {
+	a.mu.Lock()
+	abort := a.abortReason
+	a.mu.Unlock()
+	slog.Debug("Prompt: abort gate", "sid", sid, "abortReason", abort)
+	if abort == "" {
+		return nil
+	}
+	a.say(ctx, sid, abort+"\n")
+	return errors.New(abort)
+}
+
+// runTurn is shared by typed prompts and accepted fix cards; the caller presents errors. typed: the
+// user wrote the prompt, which the turn's Done line counts as an input.
+func (a *agent) runTurn(ctx context.Context, sid string, typed bool) error {
 	sess := a.getSession(sid)
 	if sess != nil {
-		sess.resetTurnStats(time.Now())
-		// Anchor the in-flight turn at the prompt just appended by the caller
-		// (Prompt / proposeFix), so the 400-recovery's first fold (foldHistory at
-		// turnStartIndex) keeps this whole turn — human prompt plus the synthetic
-		// subtask/doc prompts orchestrate adds — verbatim while folding only the
-		// completed turns before it.
+		sess.startTurn(time.Now())
+		if typed {
+			sess.addInput()
+		}
+		// The 400-recovery's first fold keeps this turn verbatim and folds only
+		// the completed turns before it.
 		sess.markTurnStart()
 	}
 	result, err := a.orchestrate(ctx, sid)
 
-	// Summarise the just-finished turn on EVERY exit path — success, empty output
-	// (orchestrate produced no answer/plan), or a non-recoverable error that still
-	// added messages — so its messages always carry a note before a later
-	// compaction can rotate them out. fold-all has no way to summarise an un-noted
-	// turn after the fact, so a skipped note here is silent loss. This only
-	// ENQUEUES; whichever compaction runs next folds it via waitSummarise. The
-	// summariser's own LLM call uses context.Background(), so a cancelled turn
-	// still gets a note.
+	// On every exit path: fold-all can't note a turn after the fact, so a skipped
+	// note is silent loss. Only enqueues.
 	if sess != nil {
 		a.backgroundSummarise(sess)
 	}
@@ -819,74 +567,52 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	if sess == nil || result.Text == "" {
 		return nil
 	}
-	// Epilogue — the turn boundary, where control returns to the user. The note
-	// was enqueued above; here we report stats and commit the turn's edits. There
-	// is no proactive compaction: it is reactive now, driven by a context-overflow
-	// 400 in runToolLoopSeeded (see foldHistory). Stats first.
 	if r := sess.turnStats(); r.activeMs > 0 {
-		// Context-window ring in the client (ACP usage_update, an unstable
-		// feature): used = the last call's prompt_tokens (current context size),
-		// size = the per-slot n_ctx. Skipped when either is unknown (a backend
-		// that omits usage leaves lastPrompt 0, or n_ctx isn't probed yet), so no
-		// data means no update rather than a misleading empty ring.
-		if size := a.getMainSlotTokens(); size > 0 && r.lastPrompt > 0 {
+		if size := int(a.mainSlotTokens.Load()); size > 0 && r.lastPrompt > 0 {
 			a.sendUpdate(ctx, sid, usageUpdate{Kind: "usage_update", Used: r.lastPrompt, Size: size})
 		}
-		// \n\n keeps the stats on their own markdown line. With the server cache
-		// split, headline the work done (evaluated + gen) plus sent/cached%;
-		// without it, show the final context size — don't guess.
-		var line string
+		// ◷ the turn's time, ⚙ the part spent in tools, ↑ the prompt the server had to read (not the
+		// gross total, which re-counts the cached prefix every call), ↓ generated, ≡ model replies, and
+		// ⌨ what the user typed or answered, shown only when there was some.
+		line := "\n\n✅ Done · ◷ " + humanDuration(r.activeMs)
+		if r.toolMs > 0 {
+			line += " · ⚙ " + humanDuration(min(r.toolMs, r.activeMs))
+		}
 		if r.haveServerCache {
-			// Headline the real prompt work: tokens sent that were NOT served from
-			// cache (Σ evaluated). We don't show the gross prompt total, which
-			// re-counts the cached prefix every call and balloons with tool-step
-			// count (a multi-tool turn looked bigger than a later, larger-context one).
-			line = fmt.Sprintf("\n\n✅ Done in %s · %s uncached + %s gen",
-				humanDuration(r.activeMs), humanCount(r.evaluatedPrompt), humanCount(r.completion))
-			if r.promptMs > 0 && r.evaluatedPrompt > 0 {
-				line += " · " + humanRate(r.evaluatedPrompt, r.promptMs) + " pp/s"
-			}
+			line += " · ↑ " + humanCount(r.evaluatedPrompt)
 		} else {
-			line = fmt.Sprintf("\n\n✅ Done in %s · %s ctx + %s gen",
-				humanDuration(r.activeMs), humanCount(r.lastPrompt), humanCount(r.completion))
+			line += " · ↑ " + humanCount(r.lastPrompt) + " ctx"
+		}
+		line += " · ↓ " + humanCount(r.completion)
+		if r.calls > 0 {
+			line += fmt.Sprintf(" · ≡ %d", r.calls)
+		}
+		if r.inputs > 0 {
+			line += fmt.Sprintf(" · ⌨ %d", r.inputs)
+		}
+		if r.haveServerCache && r.promptMs > 0 && r.evaluatedPrompt > 0 {
+			line += " · " + humanRate(r.evaluatedPrompt, r.promptMs) + " pp/s"
 		}
 		if r.genMs > 0 && r.completion > 0 {
 			line += " · " + humanRate(r.completion, r.genMs) + " tg/s"
 		}
-		// Decode that was generated and then thrown away is already inside the
-		// gen figure above, where it reads as productive output. Split it out: on
-		// this hardware it is the most expensive thing that can go wrong in a
-		// turn. One measured <think> stall burned the full 8192-token cap, 3m36s
-		// at that server's 37.7 tok/s, against 57s for the prefix loss the same
-		// event caused. Priced in the turn's own decode rate rather than a
-		// constant, so it stays honest across backends.
+		// Discarded decode is already inside gen, where it reads as productive.
 		if r.wastedCompletion >= wastedCompletionFloor {
 			line += fmt.Sprintf(" · %s discarded", humanCount(r.wastedCompletion))
 			if r.genMs > 0 && r.completion > 0 {
 				line += " (" + humanDuration(r.genMs*int64(r.wastedCompletion)/int64(r.completion)) + ")"
 			}
 		}
-		// Prefix cache didn't hold across the turn's calls (noteCacheLineage).
-		// Worth a mark: it is invisible otherwise (the turn still succeeds, just
-		// several times slower), and it is nearly always one line of settings.
+		// Invisible otherwise: the turn still succeeds, just several times slower.
 		if r.cacheRewinds > 0 {
 			line += fmt.Sprintf("\n\n⚠ Prefix cache rewound %d× (%s re-read). ",
 				r.cacheRewinds, humanCount(r.cacheRewound))
-			// Two different faults, two different fixes. Say which one this was
-			// instead of listing both: the render-change case is one line of
-			// settings.toml, the other is not in settings.toml at all.
 			if r.cacheRewindsRender > 0 {
 				line += fmt.Sprintf("%d of those switched rendering mid-turn: `params_thinking` and `params_execute` must agree on "+
 					"everything that is not a sampler (`chat_template_kwargs` above all), or this server needs `parallel = 2` "+
 					"so each rendering keeps its own KV slot. ", r.cacheRewindsRender)
 			} else {
-				// Deliberately not naming a magic setting here. On the one 11.6h
-				// session measured this way every stable-rendering rewind was an
-				// idle eviction (gaps of 2h and 14min), and probing the server
-				// afterwards showed preserve_thinking, the flag this line used to
-				// recommend, changes nothing: same prompt tokens, cached=11507 of
-				// 11511 with the flag removed, even with <think> blocks left inline
-				// in the history. It is a no-op wherever the template ignores it.
+				// Deliberately no setting named: preserve_thinking does not help here.
 				line += "The rendering never changed, so it is not the role split, and the CACHE lines say which of the other " +
 					"two it was: a gap of minutes means the server dropped an idle slot and no setting will fix it, seconds " +
 					"apart means something rewrote the middle of the prompt (a tool result that replayed differently, or a " +
@@ -899,63 +625,54 @@ func (a *agent) runTurn(ctx context.Context, sid string) error {
 	return nil
 }
 
-// orchestrate drives the plan → subtasks → replan → document pipeline for
-// one user turn. Returns the final subtask's result (used for the
-// background epilogue) and the first error that isn't recoverable via
-// replan. User cancellation surfaces as errUserCancelled.
+func changedProject(uses []ToolUse) bool {
+	return slices.ContainsFunc(uses, func(u ToolUse) bool { return u.Changed || wroteFile(u.Name, u.Output) })
+}
+
 func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, error) {
 	sess := a.getSession(sid)
+	if sess == nil {
+		return toolLoopResult{}, fmt.Errorf("no session found")
+	}
+	sess.rt.mu.Lock()
+	sess.rt.stuckCalls, sess.rt.stuckOutputs = nil, nil // a new request may need any call again
+	sess.rt.mu.Unlock()
 
 	a.sendPhase(ctx, sid, 0, false)
-	p, firstToolUses, err := a.runPlanPhase(ctx, sid, "")
+	p, err := a.runPlanPhase(ctx, sid, "")
 	if err != nil {
-		if isCancelled(err) {
-			return toolLoopResult{}, err
-		}
-		if sess != nil && len(firstToolUses) > 0 {
-			sess.AddAssistantWithTools("❌ "+err.Error(), firstToolUses)
-			sess.saveOrLog()
-		}
 		return toolLoopResult{}, err
 	}
-	if p == nil {
-		// No PLAN.md or unparseable response — pipeline cannot proceed.
-		return toolLoopResult{}, fmt.Errorf("planner returned no usable plan")
+	sess.rt.mu.Lock()
+	audit, verify := sess.rt.specAudit, sess.rt.specVerify
+	sess.rt.mu.Unlock()
+	if verify {
+		p.Subtasks = nil // it reports; a plan that survived the retry must not change anything
+	}
+	if audit && len(p.Redo) > 0 {
+		a.say(ctx, sid, fmt.Sprintf("The audit found %d item(s) recorded as done that do not deliver: %s\n\n", len(p.Redo), strings.Join(p.Redo, ", ")))
+		sess.setSpecHandoff("redo " + strings.Join(p.Redo, " "))
+		return toolLoopResult{Text: "handed over to /spec"}, nil
 	}
 	if len(p.Subtasks) == 0 {
-		// No subtasks: a report_only direct answer — surface it (returning it as
-		// result.Text lets Prompt's epilogue run). If the planner left it empty
-		// even after the plan-phase nudge, warn rather than ending silently —
-		// never leave the user with nothing after a turn that ran.
-		switch {
-		case p.answer != "":
-			// Surface the answer, then say WHY the turn ends here: a report_only
-			// plan means the planner judged this a question/diagnosis, not a code
-			// change, so no execute phase runs. Without this note a "Completed
-			// Plan — Planning" card reads as "stopped early", not "answered".
-			a.say(ctx, sid, p.answer+"\n\nℹ Answered directly — no code change to execute.\n")
-			return toolLoopResult{Text: p.answer}, nil
-		default:
-			a.say(ctx, sid, "⚠ I couldn't produce a clear answer or a plan for that — try rephrasing, or ask for a specific change.\n")
+		if p.answer == "" {
+			a.say(ctx, sid, "⚠ I couldn't produce a clear answer or a plan for that. Try rephrasing, or ask for a specific change.\n")
 			return toolLoopResult{}, nil
 		}
+		// Returning the answer as Text lets runTurn's epilogue run.
+		a.say(ctx, sid, p.answer+"\n\nℹ Answered directly, no code change to execute.\n")
+		return toolLoopResult{Text: p.answer}, nil
 	}
-	header := "Plan:"
-	if p.ReportOnly {
-		header = "Findings:"
-	}
-	a.renderPlan(ctx, sid, header, p.Subtasks)
+	a.renderPlan(ctx, sid, "Plan:", p.Subtasks)
 	plan := p
 
 	var lastResult toolLoopResult
 	var failureBags []map[string]bool
 	replans := 0
 	upserts := 0
+	changed := false
 
 	for {
-		// Bail the instant the turn is superseded/cancelled, so turnMu is released
-		// promptly (the new prompt is waiting on it) instead of starting another
-		// plan/execute phase on a turn that's already been told to stop.
 		if err := ctx.Err(); err != nil {
 			return lastResult, err
 		}
@@ -973,10 +690,9 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 
 			outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 			lastResult = outcome.Result
+			changed = changed || changedProject(outcome.Result.ToolUses)
 
 			if outcome.Upsert != nil {
-				// Plan-upsert: adopt the revised plan and restart the subtask loop —
-				// completed work stays, nothing cancelled, no replan-budget cost.
 				plan = outcome.Upsert
 				upserted = true
 				break
@@ -993,10 +709,10 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		if upserted {
 			upserts++
 			if upserts > maxUpserts {
-				a.say(ctx, sid, fmt.Sprintf("⚠ Plan revised %d times — stopping to avoid a re-plan loop.\n", upserts))
+				a.say(ctx, sid, fmt.Sprintf("⚠ Plan revised %d times: stopping to avoid a re-plan loop.\n", upserts))
 				return lastResult, nil
 			}
-			a.renderPlan(ctx, sid, "\n📝 Plan updated — remaining:", plan.Subtasks)
+			a.renderPlan(ctx, sid, "\n📝 Plan updated, remaining:", plan.Subtasks)
 			continue
 		}
 
@@ -1004,7 +720,6 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			break
 		}
 
-		// Jaccard escalation: same failure surfaced before?
 		bag := issueBag([]string{failedReason})
 		dupCount := 1
 		for _, prev := range failureBags {
@@ -1016,26 +731,31 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 
 		a.say(ctx, sid, fmt.Sprintf("⚠ Task %d/%d failed: %s\n", failedAt+1, len(plan.Subtasks), failedReason))
 
-		replans++
-		if replans >= maxReplans {
-			a.say(ctx, sid, fmt.Sprintf("⚠ Replan budget (%d) exhausted — giving up.\n", maxReplans))
+		if dupCount >= maxSameFailure {
+			a.say(ctx, sid, fmt.Sprintf("⚠ The same failure came back %d times: giving up.\n", dupCount))
 			return lastResult, nil
 		}
 
-		var replanCtx string
-		if dupCount >= 2 {
-			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. Same failure has surfaced %d times — the prior fix didn't work; propose a structurally different approach. See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason, dupCount)
-		} else {
-			replanCtx = fmt.Sprintf("REPLAN: prior subtask failed: %s. See history for executor attempts. Follow the 'Replanning' section in PLAN.md.", failedReason)
+		replans++
+		if replans >= maxReplans {
+			a.say(ctx, sid, fmt.Sprintf("⚠ Replan budget (%d) exhausted: giving up.\n", maxReplans))
+			return lastResult, nil
 		}
 
+		same := ""
+		if dupCount >= 2 {
+			same = fmt.Sprintf(" Same failure has surfaced %d times: the prior fix didn't work; propose a structurally different approach.", dupCount)
+		}
+		replanCtx := fmt.Sprintf("REPLAN: prior subtask failed: %s. %s%s See history for executor attempts. Follow the 'Replanning' section in PLAN.md.",
+			failedReason, failureDigest(lastResult.ToolUses), same)
+
 		a.sendPhase(ctx, sid, 0, false)
-		newPlan, _, err := a.runPlanPhase(ctx, sid, replanCtx)
+		newPlan, err := a.runPlanPhase(ctx, sid, replanCtx)
 		if err != nil {
 			return lastResult, err
 		}
-		if newPlan == nil || len(newPlan.Subtasks) == 0 {
-			a.say(ctx, sid, "Replan produced no further subtasks — stopping.\n")
+		if len(newPlan.Subtasks) == 0 {
+			a.say(ctx, sid, "Replan produced no further subtasks: stopping.\n")
 			return lastResult, nil
 		}
 
@@ -1043,36 +763,89 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		plan = newPlan
 	}
 
-	// Document phase: fire once at the end of a successful prompt. Routes
-	// to a non-foreground LLM entry internally so llm[0]'s prefix cache
-	// isn't evicted by a one-shot README update.
-	a.sendPhase(ctx, sid, 2, false)
-	// runDocumentPhase logs its own failures at Warn and always returns (exec, nil) —
-	// a failed README update must not fail the whole turn — so the discarded
-	// error is intentional and never non-nil, not a silent swallow.
-	lastResult, _ = a.runDocumentPhase(ctx, sid, lastResult)
+	// A /spec round plans its own docs step; a documenter after it edits past the round's test
+	// run. A turn that changed nothing has nothing to document.
+	if changed && sess.specFence() == "" {
+		a.sendPhase(ctx, sid, 2, false)
+		lastResult = a.runDocumentPhase(ctx, sid, lastResult)
+	}
 	a.sendPhase(ctx, sid, 2, true)
 
 	return lastResult, nil
 }
 
-// renderPlan shows the planned subtasks inline. There is no "Execute?" gate:
-// codehalter runs inside a devcontainer, so the container is the approval and
-// every subtask is confined to it. What the user gets here is visibility, not a
-// question. Building that container is still gated (see bootstrap.go), and so
-// is anything reaching outside it. `header` names the occasion ("Plan:",
-// "Replan:", the mid-run revision notice).
+// failureDigest is what a failed subtask spent its calls on: "see history" alone
+// let replans repeat the same hunt.
+func failureDigest(uses []ToolUse) string {
+	var reads, edits, runs int
+	var edited []string
+	// Grouped by what came back, as the repetition tracker does: the same answer
+	// under a new echo label or log name is the same call, shown as its first form.
+	count := map[string]int{}
+	first := map[string]string{}
+	for _, u := range uses {
+		args := parseArgs(u.Input)
+		cmd := args.str("command")
+		switch {
+		case isReadCall(u.Name, u.Input):
+			reads++
+		case wroteFile(u.Name, u.Output):
+			edits++
+			if p := args.str("path"); p != "" && !slices.Contains(edited, p) {
+				edited = append(edited, p)
+			}
+		case u.Name == "run_command" && u.Changed:
+			edits++
+			runs++
+		case u.Name == "run_command", u.Name == "run_background", u.Name == "run_server":
+			runs++
+		}
+		// A short answer ("exit 0") says which call only by the call itself, and so does a
+		// write's: 32 different edits had been summed up as the first one "repeated 32 times".
+		h := "call " + u.Name + " " + u.Input
+		if out := repeatText(u.Input, u.Output); len(out) >= repeatMinOutput && answerRepeats(u.Name) {
+			h = "answer " + out
+		}
+		if count[h]++; first[h] == "" {
+			first[h] = u.Name + " " + u.Input
+			if cmd != "" {
+				first[h] = cmd
+			}
+		}
+	}
+	var digest strings.Builder
+	fmt.Fprintf(&digest, "What the failed subtask did, counted by codehalter: %d tool calls, %d of them reads or searches, %d edits, %d commands run.", len(uses), reads, edits, runs)
+	switch {
+	case edits == 0:
+		digest.WriteString(" It changed no file.")
+	case len(edited) > 0:
+		fmt.Fprintf(&digest, " Files changed through edits: %s.", strings.Join(edited, ", "))
+	}
+	keys := slices.Collect(maps.Keys(count))
+	slices.SortFunc(keys, func(x, y string) int { return cmp.Or(count[y]-count[x], strings.Compare(first[x], first[y])) })
+	var repeated []string
+	for _, k := range keys {
+		if count[k] < 3 || len(repeated) == 3 {
+			break
+		}
+		repeated = append(repeated, fmt.Sprintf("`%s` %d times", truncate(first[k], 100), count[k]))
+	}
+	if len(repeated) > 0 {
+		digest.WriteString(" Repeated: " + strings.Join(repeated, "; ") + ".")
+	}
+	if reads >= 20 && reads > 2*(edits+runs) {
+		digest.WriteString(" It kept looking things up: put what it was hunting for (the verified signatures, paths and line ranges) into the new subtasks, so the executor does not have to find it again.")
+	}
+	return digest.String()
+}
+
+// No "Execute?" gate: the devcontainer is the approval.
 func (a *agent) renderPlan(ctx context.Context, sid, header string, subtasks []subtask) {
 	if len(subtasks) == 0 {
 		return
 	}
-	// Already on screen: submit_plan's arguments streamed in as a live table
-	// (planTableSink) carrying the full text, so repeating the list here would
-	// show every subtask twice. The heading still prints, because the table has
-	// none and cannot have one (see planTable) and "Plan:" versus "Findings:" is
-	// the difference between work that will run and work that won't. The flag is
-	// consumed, not just read: a later mid-run revision never streamed and must
-	// still render in full.
+	// Already streamed as a live table, which has no heading. Consumed: a mid-run
+	// revision never streamed and must render in full.
 	if sess := a.getSession(sid); sess != nil {
 		sess.phaseMu.Lock()
 		shown := sess.planTableShown
@@ -1092,10 +865,6 @@ func (a *agent) renderPlan(ctx context.Context, sid, header string, subtasks []s
 	a.say(ctx, sid, b.String())
 }
 
-// ---------------------------------------------------------------------------
-// System prompt + prompt-file loading
-// ---------------------------------------------------------------------------
-
 func (a *agent) systemPrompt(sid string) (string, error) {
 	sess := a.getSession(sid)
 	if sess == nil {
@@ -1103,27 +872,24 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	}
 
 	var b strings.Builder
-	// skills="auto" withholds untouched language skills from the prefix; the
-	// skip closure is nil in inline mode, which loads everything.
-	if skills := loadSkills(sess.Cwd, a.deferredSkillSkip(sess)); skills != "" {
+	if skills := loadSkills(sess.Cwd, skillSet(sess.Cwd, sess.knownStacks)); skills != "" {
 		b.WriteString(skills)
 	}
 	fmt.Fprintf(&b, "Project directory: %s\n", sess.Cwd)
-	// Project-shipped agent instructions (AGENTS.md and common casings, project
-	// root only): fold them into the cached prefix at session start so they ride
-	// every turn alongside the SKILL files. Stable across the session, so no
-	// mid-session cache churn.
 	if name, content := loadAgentsFile(sess.Cwd); content != "" {
-		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation.\n\n%s\n", name, content)
+		over := ""
+		if len(content) > agentsFileBudget {
+			over = fmt.Sprintf(" %s is %d KB now, over its %d KB budget: the next time you edit it, make it SHORTER, delete what the code, the tests and git already say.", name, len(content)/1024, agentsFileBudget/1024)
+		}
+		fmt.Fprintf(&b, "\n\n## Project instructions (%s)\n\nThis project ships the following instructions for agents working in it. Follow them as authoritative project conventions, unless they conflict with a direct request from the user in this conversation. They are meant to hold across sessions, so when your work makes one of them wrong (the stack, the layout, how the project is built, run or tested), fix that line in %s in the same task: a line left stale here is believed by every session after this one. It is a brief for the next agent, not a log of your work: change the line that became wrong, in as few words as it takes; never record what a task did, which widgets or constants it added, or what you measured (the code, the tests and git hold that). If you add a line, remove or shorten another; keep it under about 150 lines.%s\n\n%s\n", name, name, over, content)
 	}
-	// Project-first investigation guidance — a user-editable prompt seeded to
 
-	// Phase guidance lives in the system prompt (the stable, cached prefix) rather
-	// than being re-injected as a multi-KB user message on every plan/execute
-	// entry — that stacked a fresh 7-8 KB copy in the history each (re)plan and
-	// forced repeated compactions. The per-phase user message now carries only the
-	// trigger + the specific subtask. Both phases see both blocks; the live
-	// instruction + the dispatch gate decide which one is in force.
+	// Only the directories, never the moving item count: the prefix must stay stable.
+	if cfg, err := loadSpecConfig(sess.Cwd); err == nil && cfg != nil {
+		fmt.Fprintf(&b, "\n\n## This project is built with /spec\n\n`%s/` is implemented into `%s/` item by item by /spec, which only the user starts. A chat request is done as asked, without reading the spec to check it: `/spec verify` compares such changes with the spec later, when the user runs it. Inside a /spec round (the prompt says which item it is) the item is already chosen: plan and execute that item, and leave AGENT.md alone: it is read-only while /spec runs.\n", cfg.SpecDir, cfg.OutDir)
+	}
+
+	// In the cached prefix, not re-sent per phase: each copy would stack in history.
 	if plan := a.loadPromptFile(sid, "PLAN.md"); plan != "" {
 		b.WriteString("\n\n")
 		b.WriteString(plan)
@@ -1136,26 +902,38 @@ func (a *agent) systemPrompt(sid string) (string, error) {
 	return b.String(), nil
 }
 
+// An existing file wins even when empty: an empty DOCUMENT.md turns the document phase off.
 func (a *agent) loadPromptFile(sid string, filename string) string {
-	sess := a.getSession(sid)
-	if sess != nil {
-		if data, err := os.ReadFile(filepath.Join(sess.Cwd, ".codehalter", filename)); err == nil {
-			return string(data)
-		}
+	cwd := ""
+	if sess := a.getSession(sid); sess != nil {
+		cwd = sess.Cwd
 	}
-	return ""
+	body, _ := builtin(cwd, filename)
+	return body
 }
 
-// agentsFileNames are the project-root agent-instruction files codehalter folds
-// into the system prompt at session start, in priority order: the AGENTS.md
-// convention plus the common casings. The first that exists and is non-empty
-// wins; subdirectory/nested files are NOT scanned — project root only.
 var agentsFileNames = []string{"AGENTS.md", "AGENT.md", "agents.md", "agent.md"}
 
-// loadAgentsFile returns the filename and trimmed contents of the first
-// project-root agent-instruction file present (see agentsFileNames), or "", ""
-// when none exists. Read fresh on each systemPrompt build so an edit lands on
-// the next (re)build.
+const agentsFileBudget = 12 * 1024
+
+// agentsFileRefusal: during /spec rounds the brief is read-only, since every
+// round planned a bullet for its item and it went from 73 to 179 lines in a day;
+// elsewhere, over budget, it may not grow.
+func (a *agent) agentsFileRefusal(sid, path, oldContent, newContent string) string {
+	sess := a.getSession(sid)
+	if sess == nil || filepath.Dir(path) != filepath.Clean(sess.Cwd) || !slices.Contains(agentsFileNames, filepath.Base(path)) {
+		return ""
+	}
+	if sess.specFence() != "" {
+		return fmt.Sprintf("refused: %s is read-only while /spec runs. It is the project brief, not a log: this round's work is recorded in the code, its tests and git. Nothing was written; go on with the task without it.", filepath.Base(path))
+	}
+	if len(newContent) <= agentsFileBudget || len(newContent) <= len(oldContent) {
+		return ""
+	}
+	return fmt.Sprintf("refused: %s would be %.1f KB, over its %d KB budget, and this change makes it longer. Nothing was written. It is a brief for the next agent, not a log of the work: in the same edit, shorten or delete lines that the code, the tests and git already say, so the file does not grow.",
+		filepath.Base(path), float64(len(newContent))/1024, agentsFileBudget/1024)
+}
+
 func loadAgentsFile(cwd string) (string, string) {
 	for _, name := range agentsFileNames {
 		data, err := os.ReadFile(filepath.Join(cwd, name))
@@ -1169,7 +947,6 @@ func loadAgentsFile(cwd string) (string, string) {
 	return "", ""
 }
 
-// humanCount renders a token count compactly: 543490 → "543k", 1_500_000 → "1.5m".
 func humanCount(n int) string {
 	switch {
 	case n < 1000:
@@ -1183,11 +960,6 @@ func humanCount(n int) string {
 	}
 }
 
-// humanBytes renders a wire-payload size compactly in binary units: 900 →
-// "900b", 12288 → "12kb", 2508268 → "2.4mb". Same trimUnit idiom as humanCount
-// so the two halves of the LLM meter read alike, and it steps up to mb — the
-// old fixed "%.2fkb" printed a 2 MB request body as "2451.39kb", which is both
-// unreadable and easy to mistake for the ↓ side's token count.
 func humanBytes(n int) string {
 	switch {
 	case n < 1024:
@@ -1200,14 +972,12 @@ func humanBytes(n int) string {
 }
 
 func trimUnit(v float64, u string) string {
-	if v >= 10 || v == float64(int64(v)) { // no decimal when big or whole (2g, not 2.0g)
+	if v >= 10 || v == float64(int64(v)) {
 		return fmt.Sprintf("%.0f%s", v, u)
 	}
 	return fmt.Sprintf("%.1f%s", v, u)
 }
 
-// humanDuration renders elapsed ms compactly: 5500 → "5.5s", 61000 → "1m1s",
-// 3661000 → "1h1m1s".
 func humanDuration(ms int64) string {
 	d := time.Duration(ms) * time.Millisecond
 	if d < time.Minute {
@@ -1222,7 +992,6 @@ func humanDuration(ms int64) string {
 	return fmt.Sprintf("%dm%ds", m, s)
 }
 
-// humanRate renders tokens-per-second over a span of ms (k-suffixed when large).
 func humanRate(tokens int, ms int64) string {
 	if ms <= 0 {
 		return "0"

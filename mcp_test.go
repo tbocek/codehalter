@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,12 +17,7 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-// TestHTTPTransportRoundTrip covers the parts of the Streamable HTTP transport
-// the spec actually pins: the request goes out as POST, the server's
-// Mcp-Session-Id is captured and echoed on subsequent calls, an SSE response
-// is parsed past leading progress notifications, and DELETE is issued on
-// close. It uses a single httptest.Server that fans out by method/path so a
-// real round-trip plus close runs end-to-end.
+// Pins POST, session-id capture and echo, SSE past leading notifications, and DELETE on close.
 func TestHTTPTransportRoundTrip(t *testing.T) {
 	var (
 		postCount      atomic.Int32
@@ -44,7 +40,6 @@ func TestHTTPTransportRoundTrip(t *testing.T) {
 				return
 			}
 
-			// First POST: assign a session id and return a JSON envelope.
 			if n == 1 {
 				w.Header().Set("Mcp-Session-Id", "session-xyz")
 				w.Header().Set("Content-Type", "application/json")
@@ -54,8 +49,6 @@ func TestHTTPTransportRoundTrip(t *testing.T) {
 				return
 			}
 
-			// Second POST: SSE stream with a leading progress notification
-			// (no id) followed by the actual response.
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			notif := `{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":1}}`
@@ -109,8 +102,6 @@ func TestHTTPTransportRoundTrip(t *testing.T) {
 		t.Fatalf("deletes = %d, want 1", deleteCount.Load())
 	}
 
-	// First POST sees no session id; the second must echo what the server
-	// assigned on the first; the DELETE must carry the same id.
 	if seenSessionIds[0] != "" {
 		t.Fatalf("first session id = %q, want empty", seenSessionIds[0])
 	}
@@ -122,13 +113,8 @@ func TestHTTPTransportRoundTrip(t *testing.T) {
 	}
 }
 
-// TestStartMCPClientModernHTTP pins the stateless 2026-07-28 ("MCP 2") path
-// end to end: the era probe (server/discover) confirms a modern server, no
-// initialize handshake is ever sent, every request carries the modern _meta
-// block plus the mirrored MCP-Protocol-Version / Mcp-Method headers, and a
-// tools/call mirrors its name (Mcp-Name) and x-mcp-header-annotated arguments
-// (Mcp-Param-*) into headers. Also pins the MRTR guard: an "input_required"
-// interim result surfaces as an error, not as tool output.
+// No initialize, modern _meta and mirrored headers on every request, Mcp-Name and Mcp-Param-* on
+// tools/call, and an MRTR "input_required" result surfacing as an error.
 func TestStartMCPClientModernHTTP(t *testing.T) {
 	var sawInitialize, sawSessionID atomic.Bool
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -235,11 +221,7 @@ func TestStartMCPClientModernHTTP(t *testing.T) {
 	}
 }
 
-// TestStartMCPClientLegacyHTTPFallback pins the backward-compatibility path:
-// a 2025-06-18 server answers the modern probe with a bare 400, so the client
-// falls back to the initialize handshake, echoes the minted session id, tags
-// post-handshake requests with the legacy MCP-Protocol-Version header, sends
-// no modern _meta, and DELETEs the session on close.
+// A 2025-06-18 server answers the probe with a bare 400; the client falls back to initialize.
 func TestStartMCPClientLegacyHTTPFallback(t *testing.T) {
 	var calls []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -253,8 +235,7 @@ func TestStartMCPClientLegacyHTTPFallback(t *testing.T) {
 		calls = append(calls, env.Method)
 		switch env.Method {
 		case "server/discover":
-			// What a legacy server does with an unknown method and no
-			// session: a plain 400 with no JSON-RPC body.
+			// What a legacy server does with an unknown method and no session.
 			http.Error(w, "Bad Request: no valid session ID provided", http.StatusBadRequest)
 		case "initialize":
 			w.Header().Set("Mcp-Session-Id", "s1")
@@ -306,15 +287,10 @@ func TestStartMCPClientLegacyHTTPFallback(t *testing.T) {
 	}
 }
 
-// TestStdioEraDetection pins the stdio probe on both eras using scripted
-// servers: a modern one answers server/discover and never sees a handshake;
-// a legacy one rejects it with -32601 (what real legacy SDKs do for unknown
-// methods) and gets the classic initialize + initialized flow.
+// Legacy SDKs answer server/discover with -32601.
 func TestStdioEraDetection(t *testing.T) {
 	t.Run("modern", func(t *testing.T) {
-		// Requests, in order: server/discover (id 1), tools/list (id 2). A
-		// modern client sends no initialized notification, so the ids align
-		// only if the handshake was skipped.
+		// The ids align only if no handshake was sent.
 		script := `read l; printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"resultType":"complete","supportedVersions":["2026-07-28"]}}'
 read l; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","tools":[{"name":"t1"}]}}'
 read l`
@@ -331,8 +307,7 @@ read l`
 		}
 	})
 	t.Run("legacy", func(t *testing.T) {
-		// server/discover (id 1) → -32601, initialize (id 2), initialized
-		// notification (no reply), tools/list (id 3).
+		// discover (id 1) gets -32601, initialize (id 2), initialized (no reply), tools/list (id 3).
 		script := `read l; printf '%s\n' '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}'
 read l; printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-06-18"}}'
 read l
@@ -352,10 +327,6 @@ read l`
 	})
 }
 
-// TestCollectHeaderParams pins the x-mcp-header validation rules that decide
-// whether a tool definition is usable on modern HTTP: nested properties
-// chains collect, while annotations under array/composition keywords, number
-// types, bad tokens, and case-insensitive duplicates poison the tool.
 func TestCollectHeaderParams(t *testing.T) {
 	valid := map[string]any{"type": "object", "properties": map[string]any{
 		"region": map[string]any{"type": "string", "x-mcp-header": "Region"},
@@ -403,7 +374,6 @@ func TestCollectHeaderParams(t *testing.T) {
 	}
 }
 
-// TestEncodeMCPHeaderValue pins the spec's Base64 sentinel table.
 func TestEncodeMCPHeaderValue(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"us-west1", "us-west1"},
@@ -418,8 +388,6 @@ func TestEncodeMCPHeaderValue(t *testing.T) {
 	}
 }
 
-// TestStartMCPClientRejectsCommandAndURL pins the mutual-exclusion contract
-// on MCPServerConfig: each entry is one transport, not a hybrid.
 func TestStartMCPClientRejectsCommandAndURL(t *testing.T) {
 	_, err := StartMCPClient(context.Background(), MCPServerConfig{
 		Name:    "bad",
@@ -434,11 +402,7 @@ func TestStartMCPClientRejectsCommandAndURL(t *testing.T) {
 	}
 }
 
-// TestStdioTransportSurfacesCrash pins the fix for the swallowed-MCP-error hang:
-// a stdio child that crashes on startup (here: writes to stderr and exits, like
-// lsmcp's "No such built-in module: node:sqlite" on Node < 22) must have its
-// stderr CAPTURED, its exit DETECTED, and a send fail fast — not block forever
-// waiting on a response from a dead process.
+// A crashing stdio child's stderr must surface and a send must fail fast instead of blocking forever.
 func TestStdioTransportSurfacesCrash(t *testing.T) {
 	cfg := MCPServerConfig{Name: "crashy", Command: "sh", Args: []string{"-c", "echo 'boom node:sqlite' >&2; exit 1"}}
 	tr, err := newStdioTransport(cfg, "")
@@ -450,7 +414,7 @@ func TestStdioTransportSurfacesCrash(t *testing.T) {
 	select {
 	case <-tr.done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("child exit not detected — done never closed")
+		t.Fatal("child exit not detected: done never closed")
 	}
 	if se := tr.stderr.String(); !strings.Contains(se, "boom") {
 		t.Errorf("stderr was not captured (would be swallowed): %q", se)
@@ -460,12 +424,6 @@ func TestStdioTransportSurfacesCrash(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Importing the editor's MCP servers
-// ---------------------------------------------------------------------------
-
-// offerFixture is the two servers (one stdio, one HTTP) an editor sends on
-// session/new, wired onto a session ready for offerMCPImport.
 func offerFixture(t *testing.T, a *agent, s *Session) {
 	t.Helper()
 	s.mcpOffer = []acpMCPServer{
@@ -477,23 +435,17 @@ func offerFixture(t *testing.T, a *agent, s *Session) {
 	}
 }
 
-// liveServers parses mcp.toml the way reconcileMCP does, so a test asserts on
-// what the reconciler would actually start rather than on the file text.
+// liveServers parses mcp.toml the way reconcileMCP does, so tests assert on what would start.
 func liveServers(t *testing.T, cwd string) []MCPServerConfig {
 	t.Helper()
-	var f struct {
-		Server []MCPServerConfig `toml:"server"`
-	}
-	if _, err := toml.DecodeFile(mcpConfigPath(cwd), &f); err != nil {
+	cfgs, _, err := readMCPConfig(mcpConfigPath(cwd))
+	if err != nil {
 		t.Fatalf("mcp.toml does not parse: %v", err)
 	}
-	return f.Server
+	return cfgs
 }
 
-// TestOfferMCPImportWithoutElicitation pins the fallback path: a client that
-// can't show a form still gets its servers recorded, commented out. That is
-// what makes the offer one-shot — a second bootstrap must find the names in the
-// file and stay silent, instead of appending duplicates every session.
+// A client without forms still gets its servers recorded (commented out), so the offer is one-shot.
 func TestOfferMCPImportWithoutElicitation(t *testing.T) {
 	a, s := newTestAgent(t)
 	offerFixture(t, a, s)
@@ -523,9 +475,6 @@ func TestOfferMCPImportWithoutElicitation(t *testing.T) {
 	}
 }
 
-// TestOfferMCPImportAdoptsPicked pins the accept path end to end: the picked
-// server becomes a live [[server]] the reconciler will start, the unpicked one
-// is recorded commented out, and the form itself offers both by name.
 func TestOfferMCPImportAdoptsPicked(t *testing.T) {
 	a, s, br, peerW := elicitingAgent(t)
 	offerFixture(t, a, s)
@@ -569,7 +518,7 @@ func TestOfferMCPImportAdoptsPicked(t *testing.T) {
 		t.Fatalf("form has no %q property: %s", elicitMCPKey, line)
 	}
 	if prop.Type != "array" {
-		t.Errorf("property type = %q, want array — this is a multi-select", prop.Type)
+		t.Errorf("property type = %q, want array: this is a multi-select", prop.Type)
 	}
 	if len(prop.Items.AnyOf) != 2 || prop.Items.AnyOf[0].Const != "scad" || prop.Items.AnyOf[1].Const != "gmail" {
 		t.Errorf("options = %+v, want both offered servers", prop.Items.AnyOf)
@@ -611,9 +560,7 @@ func TestOfferMCPImportAdoptsPicked(t *testing.T) {
 	}
 }
 
-// TestMCPNameInFile pins the "have we already offered this?" check. It has to
-// see commented-out entries (that's how a declined server is remembered) and
-// must not match on a name that merely contains another.
+// Commented-out entries count; a name that merely contains another does not.
 func TestMCPNameInFile(t *testing.T) {
 	raw := "[[server]]\nname = \"live\"\ncommand = \"x\"\n\n# [[server]]\n# name = \"declined\"\n# url = \"http://x\"\n"
 	for _, tc := range []struct {
@@ -632,9 +579,7 @@ func TestMCPNameInFile(t *testing.T) {
 	}
 }
 
-// TestMCPTOMLEntryRoundTrips pins that what we write is what the reconciler
-// reads back, for both transports. The commented form must also stay
-// syntactically inert.
+// The commented form must stay syntactically inert.
 func TestMCPTOMLEntryRoundTrips(t *testing.T) {
 	stdio := acpMCPServer{Name: "a", Command: "node", Args: []string{"x.js", "--flag"}, Env: []acpNameValue{{Name: "K", Value: "v"}}}
 	remote := acpMCPServer{Type: "http", Name: "b", URL: "http://x/mcp", Headers: []acpNameValue{{Name: "X-Api-Key", Value: "s"}}}
@@ -647,7 +592,7 @@ func TestMCPTOMLEntryRoundTrips(t *testing.T) {
 		t.Fatalf("rendered toml does not parse: %v\n%s", err, text)
 	}
 	if len(f.Server) != 2 {
-		t.Fatalf("got %d servers, want 2 — the commented entry must be inert:\n%s", len(f.Server), text)
+		t.Fatalf("got %d servers, want 2: the commented entry must be inert:\n%s", len(f.Server), text)
 	}
 	if f.Server[0].Command != "node" || f.Server[0].Args[1] != "--flag" || f.Server[0].Env["K"] != "v" {
 		t.Errorf("stdio entry = %+v", f.Server[0])
@@ -657,83 +602,139 @@ func TestMCPTOMLEntryRoundTrips(t *testing.T) {
 	}
 }
 
-// TestMCPFlushCoalesces pins the scheduler contract: at most one flush runs at
-// a time, and any number of requests arriving while one runs collapse into
-// exactly ONE follow-up. Without the collapse a run of turns that each touch
-// mcp.toml would stack reconciles, and every one of them rewrites the tools
-// array the whole conversation is rendered behind.
-func TestMCPFlushCoalesces(t *testing.T) {
-	var m mcpState
-	var runs atomic.Int32
-	entered := make(chan struct{}, 8)
-	release := make(chan struct{})
-	run := func() {
-		runs.Add(1)
-		entered <- struct{}{}
-		<-release
+// TestReconcileMCPStoppedStartIsRetried: a start cut short by the user's Stop
+// is not reported as failed, and the next prompt tries it again although
+// mcp.toml was not edited.
+func TestReconcileMCPStoppedStartIsRetried(t *testing.T) {
+	a, s := newTestAgent(t)
+	dir := filepath.Join(s.Cwd, ".codehalter")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
 	}
-
-	m.schedule(run)
-	<-entered // the first flush is now in the middle of its work
-	for i := 0; i < 5; i++ {
-		m.schedule(run)
+	cfg := "[[server]]\nname = \"gone\"\ncommand = \"/nonexistent/mcp-server\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "mcp.toml"), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
 	}
-	close(release)
-	m.wait()
-
-	if got := runs.Load(); got != 2 {
-		t.Fatalf("ran %d flushes, want 2 (the in-flight one plus a single coalesced follow-up)", got)
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+	if changes := a.reconcileMCP(stopped, s.Cwd); len(changes) != 0 {
+		t.Errorf("a stopped start reported %+v, want nothing", changes)
 	}
-	// Idle again, so the next request starts its own run rather than being
-	// swallowed by the finished one.
-	m.schedule(func() { runs.Add(1) })
-	m.wait()
-	if got := runs.Load(); got != 3 {
-		t.Fatalf("ran %d flushes, want 3 — schedule after the queue drained must start a fresh run", got)
+	changes := a.reconcileMCP(context.Background(), s.Cwd)
+	if len(changes) != 1 || changes[0].action != "failed" || changes[0].name != "gone" {
+		t.Errorf("the next prompt did not retry the start: %+v", changes)
+	}
+	if again := a.reconcileMCP(context.Background(), s.Cwd); len(again) != 0 {
+		t.Errorf("a real failure is retried only after an edit, got %+v", again)
 	}
 }
 
-// TestMCPFlushWaitBlocks covers the other half: a turn starting while a flush
-// is still bringing a child up has to wait it out, so tools never appear
-// half-registered in the middle of a turn.
-func TestMCPFlushWaitBlocks(t *testing.T) {
-	var m mcpState
-	started, release := make(chan struct{}), make(chan struct{})
-	m.schedule(func() { close(started); <-release })
-	<-started
-
-	done := make(chan struct{})
-	go func() { m.wait(); close(done) }()
-	select {
-	case <-done:
-		t.Fatal("wait returned while a flush was still running")
-	case <-time.After(50 * time.Millisecond):
-	}
-	close(release)
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("wait did not return after the flush finished")
-	}
-	m.wait() // idle wait is a no-op, not a hang
+// A Stop during the restart of an edited server keeps the old one running, and
+// the next prompt still applies the edit.
+// fakeMCPServer is a modern HTTP server with one tool "t"; header holds the last X-Cfg sent.
+func fakeMCPServer(t *testing.T) (srv *httptest.Server, header *atomic.Value) {
+	t.Helper()
+	header = &atomic.Value{}
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env mcpRequest
+		if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
+			return
+		}
+		header.Store(r.Header.Get("X-Cfg"))
+		result := `{}`
+		switch env.Method {
+		case "server/discover":
+			result = `{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}}}`
+		case "tools/list":
+			result = `{"resultType":"complete","tools":[{"name":"t","description":"d","inputSchema":{"type":"object"}}]}`
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(mcpResponse{JSONRPC: "2.0", ID: &env.ID, Result: json.RawMessage(result)})
+	}))
+	t.Cleanup(srv.Close)
+	return srv, header
 }
 
-// TestMCPTakePending: what a background flush parked (it runs between turns,
-// where nothing it says belongs to a turn) is handed to the next checkMCP
-// exactly once, so a notice is not repeated and a card is not offered twice.
-func TestMCPTakePending(t *testing.T) {
-	var m mcpState
-	if notes, fixes := m.takePending(); notes != nil || fixes != nil {
-		t.Fatalf("takePending on an idle state = %v / %v, want nil / nil", notes, fixes)
+// writeMCPConfig writes mcp.toml aged by age: reconcileMCP diffs only on a changed mtime.
+func writeMCPConfig(t *testing.T, cwd, cfg string, age time.Duration) {
+	t.Helper()
+	path := mcpConfigPath(cwd)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
 	}
-	m.flushNotes = append(m.flushNotes, "gopls started")
-	m.flushFixes = append(m.flushFixes, fixProblem{desc: "boom"})
+	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now().Add(-age)
+	if err := os.Chtimes(path, at, at); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	notes, fixes := m.takePending()
-	if len(notes) != 1 || notes[0] != "gopls started" || len(fixes) != 1 || fixes[0].desc != "boom" {
-		t.Fatalf("takePending = %v / %v, want the queued notice and card", notes, fixes)
+// A server dropped from the file is stopped and its tools leave the registry.
+func TestReconcileMCPStopsARemovedServer(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a)
+	srv, _ := fakeMCPServer(t)
+	defer a.shutdownMCP()
+
+	writeMCPConfig(t, s.Cwd, "[[server]]\nname = \"srv\"\nurl = \""+srv.URL+"\"\n", time.Hour)
+	if changes := a.reconcileMCP(context.Background(), s.Cwd); len(changes) != 1 || changes[0].action != "started" {
+		t.Fatalf("first reconcile = %+v", changes)
 	}
-	if notes, fixes := m.takePending(); notes != nil || fixes != nil {
-		t.Fatalf("takePending twice = %v / %v, want nil / nil", notes, fixes)
+	writeMCPConfig(t, s.Cwd, "# nothing configured\n", 0)
+	changes := a.reconcileMCP(context.Background(), s.Cwd)
+	if len(changes) != 1 || changes[0].action != "stopped" || changes[0].name != "srv" {
+		t.Errorf("removing the entry reported %+v, want srv stopped", changes)
+	}
+	if slices.ContainsFunc(a.tools.defs(), func(d map[string]any) bool {
+		return strings.HasPrefix(d["function"].(map[string]any)["name"].(string), "srv__")
+	}) {
+		t.Error("the stopped server's tools are still registered")
+	}
+	if len(a.mcp.clients) != 0 || len(a.mcp.applied) != 0 {
+		t.Errorf("still tracked: clients %v, applied %v", a.mcp.clients, a.mcp.applied)
+	}
+}
+
+// A broken file is reported once, not on every prompt, and again after the next edit.
+func TestReconcileMCPReportsAParseErrorOncePerEdit(t *testing.T) {
+	a, s := newTestAgent(t)
+	writeMCPConfig(t, s.Cwd, "[[server]\nname = ", time.Hour)
+	for i, want := range []int{1, 0} {
+		changes := a.reconcileMCP(context.Background(), s.Cwd)
+		if len(changes) != want || (want == 1 && changes[0].action != "parse_error") {
+			t.Errorf("reconcile %d = %+v, want %d parse_error", i+1, changes, want)
+		}
+	}
+	writeMCPConfig(t, s.Cwd, "[[server]\nname = \"still broken\"", 0)
+	if changes := a.reconcileMCP(context.Background(), s.Cwd); len(changes) != 1 || changes[0].action != "parse_error" {
+		t.Errorf("after an edit = %+v, want the parse_error again", changes)
+	}
+}
+
+func TestReconcileMCPStoppedRestartIsRetried(t *testing.T) {
+	a, s := newTestAgent(t)
+	withTools(a)
+	srv, header := fakeMCPServer(t)
+	defer a.shutdownMCP()
+
+	write := func(v string, age time.Duration) {
+		writeMCPConfig(t, s.Cwd, "[[server]]\nname = \"srv\"\nurl = \""+srv.URL+"\"\nheaders = { X-Cfg = \""+v+"\" }\n", age)
+	}
+	write("1", time.Hour)
+	if changes := a.reconcileMCP(context.Background(), s.Cwd); len(changes) != 1 || changes[0].action != "started" {
+		t.Fatalf("first reconcile = %+v", changes)
+	}
+	write("2", 0)
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.reconcileMCP(stopped, s.Cwd)
+	changes := a.reconcileMCP(context.Background(), s.Cwd)
+	if len(changes) != 1 || changes[0].action != "restarted" {
+		t.Errorf("the next prompt did not retry the restart: %+v", changes)
+	}
+	if got, _ := header.Load().(string); got != "2" {
+		t.Errorf("the running server still has the old config: X-Cfg = %q", got)
 	}
 }

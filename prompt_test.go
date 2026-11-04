@@ -2,56 +2,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-// TestSubagentStatusFolding pins the subagent-meter fold: a subagent's live
-// status (which Zed would otherwise drop with its sub_* sid) is recorded under
-// its parent and rendered as a compact, labelled, sorted join on the parent's
-// row — so N parallel subagents each show ↑sent/↓tokens/elapsed instead of
-// clobbering one line. The meter's outer "( )" framing and redundant "llm[slot]"
-// prefix are stripped (the label already names the slot); an empty suffix clears
-// that subagent's fragment and prunes the parent once none remain.
-func TestSubagentStatusFolding(t *testing.T) {
-	a, _ := newTestAgent(t)
-	ctx := context.Background()
-	const parent = "parent-1"
-
-	got := a.setSubagentStatus(ctx, parent, "sub_a", "llm1@0/0", " (llm[0] ↑12.00kb ↓1.2k…)")
-	if want := " (llm1@0/0 ↑12.00kb ↓1.2k…)"; got != want {
-		t.Errorf("single sub: got %q, want %q", got, want)
-	}
-
-	// A second parallel subagent: both fragments, sorted by label, joined " · ".
-	// The non-meter "(running …)" suffix has no llm[slot] prefix to strip.
-	got = a.setSubagentStatus(ctx, parent, "sub_b", "llm2@1/0", " (running read_file…)")
-	if want := " (llm1@0/0 ↑12.00kb ↓1.2k… · llm2@1/0 running read_file…)"; got != want {
-		t.Errorf("two subs: got %q, want %q", got, want)
-	}
-
-	// Clearing the first subagent drops only its fragment.
-	got = a.setSubagentStatus(ctx, parent, "sub_a", "llm1@0/0", "")
-	if want := " (llm2@1/0 running read_file…)"; got != want {
-		t.Errorf("after clear: got %q, want %q", got, want)
-	}
-
-	// Clearing the last empties the row and prunes the parent entry.
-	if got = a.setSubagentStatus(ctx, parent, "sub_b", "llm2@1/0", ""); got != "" {
-		t.Errorf("after final clear: got %q, want empty", got)
-	}
-	a.subagentMeterMu.Lock()
-	_, present := a.subagentMeter[parent]
-	a.subagentMeterMu.Unlock()
-	if present {
-		t.Error("parent entry should be pruned once no subagents remain")
-	}
-}
-
-// TestParseLineRange covers the line-range encodings Zed may put in a
-// resource_link fragment.
 func TestParseLineRange(t *testing.T) {
 	cases := []struct {
 		frag             string
@@ -71,8 +29,6 @@ func TestParseLineRange(t *testing.T) {
 	}
 }
 
-// TestReadLinkedResource verifies a resource_link is inlined with its line
-// range, full-file when no range, and refused outside the workspace.
 func TestReadLinkedResource(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "f.go")
@@ -80,56 +36,76 @@ func TestReadLinkedResource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Line range 2-4 → "b\nc\nd".
 	if snip, label, ok := readLinkedResource(dir, "file://"+path+"#L2-4"); !ok || snip != "b\nc\nd" || label != "f.go:2-4" {
 		t.Errorf("range read = %q,%q,%v", snip, label, ok)
 	}
-	// No range → whole file, label is basename.
 	if snip, label, ok := readLinkedResource(dir, "file://"+path); !ok || snip != "a\nb\nc\nd\ne\n" || label != "f.go" {
 		t.Errorf("full read = %q,%q,%v", snip, label, ok)
 	}
-	// Outside cwd → refused.
 	if _, _, ok := readLinkedResource(dir, "file:///etc/passwd"); ok {
 		t.Errorf("expected refusal for path outside workspace")
 	}
-	// Missing file → refused.
 	if _, _, ok := readLinkedResource(dir, "file://"+filepath.Join(dir, "nope.go")); ok {
 		t.Errorf("expected refusal for missing file")
 	}
+	// A symlink pointing out of the project passes a prefix test and must be refused.
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link.txt")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skip("symlinks unavailable:", err)
+	}
+	if snip, _, ok := readLinkedResource(dir, "file://"+link); ok {
+		t.Errorf("a symlink out of the project was inlined: %q", snip)
+	}
 }
 
-// TestResourcePath pins the URI → read_file path mapping used when an embedded
-// "resource" / "resource_link" block is folded into the prompt: file:// URIs
-// collapse to their percent-decoded path with the fragment stripped, non-file
-// URIs pass through verbatim.
-func TestResourcePath(t *testing.T) {
-	cases := map[string]string{
-		"file:///workspaces/codehalter/llm.go":          "/workspaces/codehalter/llm.go",
-		"file:///workspaces/codehalter/llm.go#L801-836": "/workspaces/codehalter/llm.go",
-		"file:///a%20b/c.go":                            "/a b/c.go",
-		"/plain/path.go":                                "/plain/path.go",
-		"https://example.com/x":                         "https://example.com/x",
-		"":                                              "",
+func TestParseResourceURI(t *testing.T) {
+	cases := map[string][2]string{
+		"file:///workspaces/codehalter/llm.go":          {"/workspaces/codehalter/llm.go", ""},
+		"file:///workspaces/codehalter/llm.go#L801-836": {"/workspaces/codehalter/llm.go", "L801-836"},
+		"file:///a%20b/c.go":                            {"/a b/c.go", ""},
+		"/plain/path.go":                                {"/plain/path.go", ""},
+		"https://example.com/x":                         {"https://example.com/x", ""},
+		"":                                              {"", ""},
 	}
 	for uri, want := range cases {
-		if got := resourcePath(uri); got != want {
-			t.Errorf("resourcePath(%q) = %q, want %q", uri, got, want)
+		if path, frag := parseResourceURI(uri); path != want[0] || frag != want[1] {
+			t.Errorf("parseResourceURI(%q) = %q, %q, want %q, %q", uri, path, frag, want[0], want[1])
 		}
 	}
 }
 
-// TestResourceLabel checks the human-readable header: the path plus the URI
-// fragment (an editor line range) in parentheses when present.
-func TestResourceLabel(t *testing.T) {
-	cases := map[string]string{
-		"file:///workspaces/codehalter/llm.go":          "/workspaces/codehalter/llm.go",
-		"file:///workspaces/codehalter/llm.go#L801-836": "/workspaces/codehalter/llm.go (L801-836)",
-		"": "attachment",
-	}
-	for uri, want := range cases {
-		if got := resourceLabel(uri); got != want {
-			t.Errorf("resourceLabel(%q) = %q, want %q", uri, got, want)
+// Pins that an outside linked file is named, not read, and an image becomes a reference, not bytes.
+func TestPromptContent(t *testing.T) {
+	dir := t.TempDir()
+	text, images := promptContent(dir, []ContentBlock{
+		{Type: "text", Text: "why do we need this?"},
+		{Type: "resource", Resource: &EmbeddedResource{URI: "file:///x/llm.go#L801-836", Text: "func f() {}"}},
+		{Type: "resource_link", URI: "file:///etc/passwd", Name: "passwd"},
+		{Type: "image", MimeType: "image/png", Data: "aGVsbG8="},
+	})
+	for _, want := range []string{
+		"why do we need this?",
+		"[Attached context from /x/llm.go (L801-836)]",
+		"func f() {}",
+		"[Referenced file: passwd (/etc/passwd)]",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("text is missing %q; got:\n%s", want, text)
 		}
+	}
+	if strings.Contains(text, "root:") {
+		t.Error("a file outside the project was inlined")
+	}
+	if len(images) != 1 || !strings.HasPrefix(images[0].ID, "img_") || images[0].MimeType != "image/png" {
+		t.Errorf("images = %+v, want one content-addressed png", images)
+	}
+	_, again := promptContent(dir, []ContentBlock{{Type: "image", MimeType: "image/png", Data: "aGVsbG8="}})
+	if len(again) != 1 || again[0].ID != images[0].ID {
+		t.Errorf("re-pasting the same image gave %+v, want id %s", again, images[0].ID)
 	}
 }
 
@@ -155,16 +131,12 @@ func TestHumanFormatters(t *testing.T) {
 			t.Errorf("humanDuration(%d)=%q want %q", c.ms, got, c.want)
 		}
 	}
-	// 200 tokens in 500ms = 400/s
 	if got := humanRate(200, 500); got != "400" {
 		t.Errorf("humanRate(200,500)=%q want 400", got)
 	}
 }
 
-// TestSystemPromptCarriesPhaseGuidance pins that PLAN.md/EXECUTE.md live in the
-// system prompt (the stable, cached prefix) instead of being re-injected as a
-// per-turn user message — the fix for the primer bloat that stacked 7-8 KB
-// copies in the history each (re)plan and forced repeated compactions.
+// Phase guidance must live in the cached prefix, not be re-sent per turn.
 func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
 	a, s := newTestAgent(t)
 	dir := filepath.Join(s.Cwd, ".codehalter")
@@ -185,13 +157,12 @@ func TestSystemPromptCarriesPhaseGuidance(t *testing.T) {
 	}
 	for _, want := range []string{"PLAN_SENTINEL", "EXEC_SENTINEL"} {
 		if !strings.Contains(sp, want) {
-			t.Errorf("system prompt missing %q — phase guidance not carried in the prefix", want)
+			t.Errorf("system prompt missing %q: phase guidance not carried in the prefix", want)
 		}
 	}
 }
 
-// TestLoadAgentsFile pins the AGENTS.md scan: project-root only, priority order
-// (AGENTS.md first), trimmed, whitespace-only skipped.
+// Pins project-root only, AGENTS.md first, trimmed, whitespace-only skipped.
 func TestLoadAgentsFile(t *testing.T) {
 	dir := t.TempDir()
 	if name, content := loadAgentsFile(dir); name != "" || content != "" {
@@ -205,7 +176,6 @@ func TestLoadAgentsFile(t *testing.T) {
 		t.Errorf("agent.md should be found+trimmed, got %q / %q", name, content)
 	}
 
-	// AGENTS.md outranks the lowercase variant.
 	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("canonical conventions"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -222,8 +192,6 @@ func TestLoadAgentsFile(t *testing.T) {
 	}
 }
 
-// TestSystemPromptIncludesAgentsFile verifies the root AGENTS.md is folded into
-// the system prompt (the cached prefix) at build time.
 func TestSystemPromptIncludesAgentsFile(t *testing.T) {
 	a, s := newTestAgent(t)
 	if err := os.WriteFile(filepath.Join(s.Cwd, "AGENTS.md"), []byte("Always use tabs."), 0o644); err != nil {
@@ -236,12 +204,18 @@ func TestSystemPromptIncludesAgentsFile(t *testing.T) {
 	if !strings.Contains(sp, "## Project instructions (AGENTS.md)") || !strings.Contains(sp, "Always use tabs.") {
 		t.Errorf("system prompt should fold in AGENTS.md:\n%s", sp)
 	}
+	if !strings.Contains(sp, "not a log of your work") || strings.Contains(sp, "over its") {
+		t.Errorf("a short brief must carry the brief rule and no size flag:\n%s", sp)
+	}
+	long := strings.Repeat("- a line of notes about what some round built\n", 400)
+	if err := os.WriteFile(filepath.Join(s.Cwd, "AGENTS.md"), []byte(long), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if sp, _ = a.systemPrompt(s.ID); !strings.Contains(sp, "KB now, over its 12 KB budget") {
+		t.Error("an oversized brief was not flagged")
+	}
 }
 
-// TestDeriveTitle pins the thread-naming rules: one line, whitespace collapsed,
-// cut on a word boundary. The title goes to the client as session_info_update
-// and is all the user sees in their thread list, so a mid-word cut or a title
-// containing half a pasted stack trace is the visible failure.
 func TestDeriveTitle(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -273,10 +247,6 @@ func TestDeriveTitle(t *testing.T) {
 	}
 }
 
-// TestSetSessionTitleAnnouncesOnce pins that the thread name reaches the client
-// as a session_info_update and is not re-sent when it hasn't changed — a
-// notification per turn would make the client re-render the thread list for
-// nothing.
 func TestSetSessionTitleAnnouncesOnce(t *testing.T) {
 	h := newTerminalHarness(t)
 
@@ -295,6 +265,444 @@ func TestSetSessionTitleAnnouncesOnce(t *testing.T) {
 	h.agent.setSessionTitle(context.Background(), h.sess, "Wire up the MCP import")
 	h.waitFor(func() bool { return len(h.updatesOfKind("session_info_update")) > 1 })
 	if n := len(h.updatesOfKind("session_info_update")); n != 1 {
-		t.Errorf("sent %d session_info_updates, want 1 — the title didn't change", n)
+		t.Errorf("sent %d session_info_updates, want 1: the title didn't change", n)
+	}
+}
+
+func TestSpecStopIsAnInstructionNotSteer(t *testing.T) {
+	a, s := newTestAgent(t)
+	ctx, release, ok := a.holdTurn(context.Background(), s, true)
+	if !ok {
+		t.Fatal("could not hold the turn")
+	}
+	defer release()
+	_ = ctx
+	prompt := func(text string) {
+		t.Helper()
+		if _, err := a.Prompt(context.Background(), PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: text}}}); err != nil {
+			t.Fatalf("Prompt(%q): %v", text, err)
+		}
+	}
+
+	prompt("/spec stop") // no loop running
+	if s.takeSpecStop() {
+		t.Error("a stop was requested with no loop running")
+	}
+	if q := s.takePending(); len(q) != 0 {
+		t.Errorf("/spec stop was queued as steer text: %v", q)
+	}
+
+	s.setSpecFence(filepath.Join(s.Cwd, "spec"))
+	defer s.setSpecFence("")
+	prompt("/spec stop")
+	if !s.takeSpecStop() {
+		t.Error("the running loop did not get the stop request")
+	}
+	if q := s.takePending(); len(q) != 0 {
+		t.Errorf("/spec stop was queued as steer text: %v", q)
+	}
+	prompt("also update the README")
+	if q := s.takePending(); len(q) != 1 {
+		t.Errorf("an ordinary message during the loop must still steer: %v", q)
+	}
+}
+
+// A replan is told what the failed subtask spent its calls on, counted in code.
+func TestReplanCarriesFailureDigest(t *testing.T) {
+	read := sseToolCall("r", "read_file", `{"path":"a.rs"}`)
+	a, s, mock := planPhaseAgent(t,
+		sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`),
+		read, read, read,
+		sseText("done, I think"), sseText("still done"), // no respond: the subtask fails
+		sseToolCall("p2", respondToolName, `{"message":"nothing more to do"}`),
+		sseToolCall("p3", submitPlanToolName, `{"answer":"same"}`),
+	)
+	a.tools.add(fakeTool("read_file", func(string) (string, bool) { return "fn a() {}", false }))
+	s.AddUser("change a.rs")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	replan := fmt.Sprint(mock.request(mock.callCount() - 1)["messages"])
+	for _, want := range []string{"REPLAN: prior subtask failed", "3 tool calls, 3 of them reads", "It changed no file.", "`read_file {\"path\":\"a.rs\"}` 3 times"} {
+		if !strings.Contains(replan, want) {
+			t.Errorf("the replan request lacks %q", want)
+		}
+	}
+}
+
+func TestFailureDigest(t *testing.T) {
+	read := ToolUse{Name: "read_file", Input: `{"path":"a.rs"}`, Output: "fn a() {}"}
+	edit := ToolUse{Name: "edit_file", Input: `{"path":"src/a.rs"}`, Output: "file written successfully"}
+	refused := ToolUse{Name: "edit_file", Input: `{"path":"src/b.rs"}`, Output: "error: old_text not found in src/b.rs"}
+	build := ToolUse{Name: "run_command", Input: `{"command":"cargo build"}`, Output: "exit 0\n\nFinished the dev profile in 2.3 seconds"}
+	sedI := ToolUse{Name: "run_command", Input: `{"command":"sed -i s/a/b/ x.rs"}`, Output: "exit 0", Changed: true}
+	label := func(l string) ToolUse {
+		return ToolUse{Name: "run_command", Input: fmt.Sprintf(`{"command":"echo %s; grep -n prompt spec.md"}`, l),
+			Output: "exit 0\n\n" + l + "\n12:the prompt is assembled from the spec slice"}
+	}
+	var hunt []ToolUse
+	for i := range 20 {
+		hunt = append(hunt, ToolUse{Name: "read_file", Input: fmt.Sprintf(`{"path":"f%d.rs"}`, i), Output: fmt.Sprintf("file %d", i)})
+	}
+	for _, tc := range []struct {
+		name      string
+		uses      []ToolUse
+		want, not []string
+	}{
+		{"reads only", []ToolUse{read, read, read},
+			[]string{"3 tool calls, 3 of them reads or searches, 0 edits, 0 commands run.", "It changed no file.", "Repeated: `read_file {\"path\":\"a.rs\"}` 3 times."}, nil},
+		{"a refused edit is no edit", []ToolUse{edit, refused, build},
+			[]string{"3 tool calls, 0 of them reads or searches, 1 edits, 1 commands run.", "Files changed through edits: src/a.rs."}, []string{"src/b.rs", "Repeated"}},
+		{"a shell write is an edit and a run", []ToolUse{sedI},
+			[]string{"1 edits, 1 commands run."}, []string{"It changed no file.", "Files changed"}},
+		{"the same answer under new labels", []ToolUse{label("one"), label("two"), label("three")},
+			[]string{"Repeated: `echo one; grep -n prompt spec.md` 3 times."}, nil},
+		{"a long hunt", hunt, []string{"It kept looking things up"}, []string{"Repeated"}},
+		// Every edit that worked answers alike; only the same edit again is a repeat.
+		{"different edits that worked", []ToolUse{edit, {Name: "edit_file", Input: `{"path":"src/c.rs"}`, Output: edit.Output}, {Name: "edit_file", Input: `{"path":"src/d.rs"}`, Output: edit.Output}},
+			[]string{"3 edits"}, []string{"Repeated"}},
+		{"the same edit again", []ToolUse{edit, edit, edit}, []string{"Repeated: `edit_file {\"path\":\"src/a.rs\"}` 3 times."}, nil},
+	} {
+		got := failureDigest(tc.uses)
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: digest lacks %q:\n%s", tc.name, w, got)
+			}
+		}
+		for _, n := range tc.not {
+			if strings.Contains(got, n) {
+				t.Errorf("%s: digest has %q:\n%s", tc.name, n, got)
+			}
+		}
+	}
+}
+
+// The same failure again tells the replan to change approach; at maxReplans the
+// turn stops without another planner call.
+func TestOrchestrateRepeatedFailureAndReplanBudget(t *testing.T) {
+	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`)
+	// An executor revising the plan to nothing fails its subtask in one call, the same way each time.
+	fail := sseToolCall("e", submitPlanToolName, `{"clear":true,"subtasks":[]}`)
+	var resp []string
+	for range maxSameFailure {
+		resp = append(resp, plan, fail)
+	}
+	a, s, mock := planPhaseAgent(t, resp...)
+	s.AddUser("change a.rs")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := mock.callCount(); got != 2*maxSameFailure {
+		t.Errorf("%d model calls, want %d: the third same failure ends it", got, 2*maxSameFailure)
+	}
+	if first := fmt.Sprint(mock.request(2)["messages"]); !strings.Contains(first, "REPLAN: prior subtask failed: executor called submit_plan with no usable subtasks") || strings.Contains(first, "Same failure") {
+		t.Errorf("the first replan should carry the failure and no repeat note")
+	}
+	if second := fmt.Sprint(mock.request(4)["messages"]); !strings.Contains(second, "Same failure has surfaced 2 times") {
+		t.Errorf("the second replan of the same failure lacks the repeat note")
+	}
+}
+
+// Inside a /spec round the documenter does not run: the round plans its own docs step.
+func TestSpecRoundSkipsTheDocumenter(t *testing.T) {
+	for _, fenced := range []bool{false, true} {
+		a, s, mock := planPhaseAgent(t,
+			sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`),
+			sseToolCall("w1", "write_file", `{"path":"a.rs","content":"x"}`),
+			sseToolCall("e1", respondToolName, `{"message":"changed"}`),
+			sseText("nothing to document"),
+		)
+		if fenced {
+			s.setSpecFence(filepath.Join(s.Cwd, "spec"))
+		}
+		s.AddUser("change a.rs")
+		if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+			t.Fatal(err)
+		}
+		if want := map[bool]int{false: 4, true: 3}[fenced]; mock.callCount() != want {
+			t.Errorf("fenced=%v: %d model calls, want %d", fenced, mock.callCount(), want)
+		}
+	}
+}
+
+// A prompt during startup waits for it, unless startup is asking the user
+// something; `--cli -p` prompts at once and was refused every time.
+func TestPromptDuringStartup(t *testing.T) {
+	a, s := newTestAgent(t)
+	req := PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: "what does Shout do?"}}}
+
+	a.indexDone = make(chan struct{})
+	a.asking.Add(1)
+	if _, err := a.Prompt(context.Background(), req); err == nil || !strings.Contains(err.Error(), "answer the pending question") {
+		t.Errorf("a prompt while startup asks: err = %v, want the refusal", err)
+	}
+	a.asking.Add(-1)
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Prompt(context.Background(), req)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("the prompt did not wait for startup: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	// Startup ends on a problem: the waiting prompt reports it.
+	a.mu.Lock()
+	a.abortReason = "setup failed: no LLM"
+	a.mu.Unlock()
+	close(a.indexDone)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "setup failed: no LLM") {
+			t.Errorf("after startup: err = %v, want startup's problem", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the prompt still waits after startup ended")
+	}
+}
+
+// `--cli -p` prompts before startup has found its fix cards. The prompt used to take the
+// turn and then wait for startup, which waited for the turn to offer the cards: neither
+// moved. Startup now hands the cards to the waiting prompt, which offers them after its turn,
+// each once even when its own checks find the same problem.
+func TestStartupHandsFixCardsToAWaitingPrompt(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.indexDone = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Prompt(context.Background(), PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: "build it"}}})
+		done <- err
+	}()
+	for deadline := time.Now().Add(3 * time.Second); a.awaitingStartup.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the prompt never waited for startup")
+		}
+	}
+	fixes := []fixProblem{{desc: "🟡 No AGENT.md", prompt: "write it"}}
+	offered := make(chan struct{})
+	go func() {
+		a.offerStartupFixes(context.Background(), s, fixes)
+		close(offered)
+	}()
+	select {
+	case <-offered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup waits on the prompt that waits on it")
+	}
+	if got := s.takeFixes([]fixProblem{{desc: "🟡 No AGENT.md"}, {desc: "🟡 install gopls"}}); len(got) != 2 {
+		t.Errorf("merged cards = %v, want the two distinct ones", got)
+	}
+	// End startup on a problem, so the prompt returns without a model.
+	a.mu.Lock()
+	a.abortReason = "setup failed: no LLM"
+	a.mu.Unlock()
+	close(a.indexDone)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the prompt still waits after startup ended")
+	}
+}
+
+// Stop while a prompt waits for startup ends that prompt. It holds no turn then, and Stop
+// also cancels startup, whose end used to let the prompt through.
+func TestStopReachesAPromptWaitingForStartup(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.indexDone = make(chan struct{})
+	done := make(chan PromptResponse, 1)
+	go func() {
+		resp, _ := a.Prompt(context.Background(), PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: "build it"}}})
+		done <- resp
+	}()
+	for deadline := time.Now().Add(3 * time.Second); a.awaitingStartup.Load() == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the prompt never waited for startup")
+		}
+	}
+	a.Cancel(context.Background(), CancelNotification{SessionId: s.ID})
+	close(a.indexDone) // what the cancelled startup does next
+	select {
+	case resp := <-done:
+		if resp.StopReason != "cancelled" {
+			t.Errorf("stop reason = %q, want cancelled", resp.StopReason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not reach the waiting prompt")
+	}
+	if len(s.Messages) != 0 {
+		t.Errorf("the stopped prompt still ran: %d messages", len(s.Messages))
+	}
+}
+
+// In the CLI a line typed while a question is open answers it, so a prompt arriving while
+// startup asks is a `-p` one, sent before anyone could answer: it waits rather than fail.
+func TestStandalonePromptWaitsWhileStartupAsks(t *testing.T) {
+	a, s := newTestAgent(t)
+	a.standalone = true
+	a.indexDone = make(chan struct{})
+	a.asking.Add(1)
+	done := make(chan error, 1)
+	go func() {
+		_, err := a.Prompt(context.Background(), PromptRequest{SessionId: s.ID, Content: []ContentBlock{{Type: "text", Text: "build it"}}})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("refused while startup asks: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	a.asking.Add(-1)
+	a.mu.Lock()
+	a.abortReason = "setup failed: no LLM"
+	a.mu.Unlock()
+	close(a.indexDone)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the prompt still waits after startup ended")
+	}
+}
+
+// The phase in progress tells Zed what the CLI's status row tells: the phase, the time, what
+// runs now and the last speeds, refreshed every second while the phase lasts; its _meta gives
+// the CLI the parts. A running tool is no part of it: its card shows it.
+func TestPhaseStatus(t *testing.T) {
+	h := newTerminalHarness(t)
+	a, s := h.agent, h.sess
+	s.startTurn(time.Now().Add(-90 * time.Second))
+	inProgress := func() (string, map[string]any) {
+		ups := h.updatesOfKind("plan")
+		if len(ups) == 0 {
+			return "", nil
+		}
+		entries, _ := ups[len(ups)-1]["entries"].([]any)
+		for _, e := range entries {
+			if em, _ := e.(map[string]any); em["status"] == "in_progress" {
+				meta, _ := em["_meta"].(map[string]any)
+				return em["content"].(string), meta
+			}
+		}
+		return "", nil
+	}
+	shows := func(what string) {
+		t.Helper()
+		if !h.waitFor(func() bool { c, _ := inProgress(); return strings.Contains(c, what) }) {
+			c, _ := inProgress()
+			t.Fatalf("status %q never showed %q", c, what)
+		}
+	}
+
+	a.sendPhase(context.Background(), s.ID, 1, false)
+	shows("Executing · 1m3")
+	a.setStatus(context.Background(), s.ID, "queued")
+	shows(" · queued")
+	if c, meta := inProgress(); !strings.HasSuffix(c, " · queued") || meta["codehalter.phase"] != "Executing" || meta["codehalter.meter"] != "queued" {
+		t.Errorf("queued: %q %v", c, meta)
+	}
+	stop := a.startStatusMeter(context.Background(), s.ID, func() string { return "llm[0] ↑426kb ↓37 tok" })
+	s.phaseMu.Lock()
+	s.pp, s.tg = 812.4, 51.2
+	s.phaseMu.Unlock()
+	shows("llm[0] ↑426kb ↓37 tok · 812 pp/s · 51 tg/s") // picked up by the ticker
+	stop()
+	a.setStatus(context.Background(), s.ID, "")
+
+	a.sendPhase(context.Background(), s.ID, 1, true)
+	if !h.waitFor(func() bool { s.phaseMu.Lock(); defer s.phaseMu.Unlock(); return !s.phaseTicking }) {
+		t.Error("the ticker outlived the phase")
+	}
+	if c, meta := inProgress(); c != "" || meta != nil {
+		t.Errorf("after the phase: %q %v", c, meta)
+	}
+}
+
+// The Done line reads as the turn went: ◷ its time, ⚙ the part a tool took, ↑ and ↓ the tokens,
+// ≡ the model's replies, and ⌨ only when the user typed something: a typed prompt counts, a round
+// a /spec loop starts does not.
+func TestDoneLineShowsTimeToolsCallsAndInputs(t *testing.T) {
+	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"do it"}]}`)
+	rig := newSpecLoopRig(t, map[string]string{
+		"spec/01.md":              "# 01 Things\n\n### F0.1 Do it\n\nS1 do the thing.\n",
+		"app/src/lib.rs":          "// the program\n",
+		".codehalter/DOCUMENT.md": "", // no document phase: the replies below are the whole turn
+	}, func(string) bool { return true },
+		plan, sseToolCall("s1", "slow_tool", `{}`), sseToolCall("r1", respondToolName, `{"message":"did it"}`),
+		plan, sseToolCall("r2", respondToolName, `{"message":"did it again"}`))
+	rig.h.agent.tools.add(Tool{Def: map[string]any{"type": "function", "function": map[string]any{"name": "slow_tool", "parameters": map[string]any{"type": "object"}}},
+		Execute: func(ctx context.Context, a *agent, sid string, rawArgs string) (string, bool) {
+			time.Sleep(1100 * time.Millisecond) // long enough to show as a second of tool time
+			return "done", false
+		}})
+	done := func(said string) string {
+		t.Helper()
+		i := strings.LastIndex(said, "✅ Done")
+		if i < 0 {
+			t.Fatalf("no Done line:\n%s", said)
+		}
+		line, _, _ := strings.Cut(said[i:], "\n")
+		return line
+	}
+
+	if _, err := rig.h.agent.Prompt(t.Context(), PromptRequest{SessionId: rig.h.sess.ID, Content: []ContentBlock{{Type: "text", Text: "do the thing"}}}); err != nil {
+		t.Fatal(err)
+	}
+	typed := done(rig.said(t))
+	for _, want := range []string{"✅ Done · ◷ ", " · ⚙ 1.", " · ↓ ", " · ≡ 3", " · ⌨ 1"} {
+		if !strings.Contains(typed, want) {
+			t.Errorf("typed turn: %q lacks %q", typed, want)
+		}
+	}
+
+	if err := rig.h.agent.runPromptTurn(t.Context(), rig.h.sess, "a round the loop wrote"); err != nil {
+		t.Fatal(err)
+	}
+	round := done(rig.said(t))
+	if strings.Contains(round, "⌨") || strings.Contains(round, "⚙") || !strings.Contains(round, " · ≡ 2") {
+		t.Errorf("a turn nobody typed and no tool ran: %q, want ≡ 2 and neither ⌨ nor ⚙", round)
+	}
+}
+
+// Different failures run into the budget, and a turn that changed nothing gets no documenter.
+func TestOrchestrateReplanBudget(t *testing.T) {
+	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`)
+	var resp []string
+	for _, words := range []string{"alpha bravo", "charlie delta", "echo foxtrot", "golf hotel", "india juliet"} {
+		resp = append(resp, plan, sseToolCall("e", respondToolName, `{"message":"`+words+`","failed":true}`))
+	}
+	a, s, mock := planPhaseAgent(t, resp...)
+	s.AddUser("change a.rs")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := mock.callCount(); got != 2*maxReplans {
+		t.Errorf("%d model calls, want %d", got, 2*maxReplans)
+	}
+}
+
+func TestDocumenterRunsOnlyAfterAChange(t *testing.T) {
+	for _, wrote := range []bool{false, true} {
+		resp := []string{sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"x"}]}`)}
+		if wrote {
+			resp = append(resp, sseToolCall("w", "write_file", `{"path":"a.txt","content":"x"}`))
+		}
+		resp = append(resp, sseToolCall("r", respondToolName, `{"message":"done"}`))
+		want := len(resp)
+		if wrote {
+			want++
+			resp = append(resp, sseText("No documentation change needed."))
+		}
+		a, s, mock := planPhaseAgent(t, resp...)
+		s.AddUser("x")
+		if wrote {
+			a.tools.add(fakeTool("write_file", func(string) (string, bool) { return "file written successfully", false }))
+		}
+		if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+			t.Fatal(err)
+		}
+		if got := mock.callCount(); got != want {
+			t.Errorf("wrote %v: %d model calls, want %d", wrote, got, want)
+		}
 	}
 }
