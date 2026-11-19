@@ -670,6 +670,10 @@ func newSpecLoopRig(t *testing.T, files map[string]string, done func(id string) 
 	a.mainSlotTokens.Store(100_000)
 	sess.llmHash = hashSettingsFiles(sess.Cwd)
 	a.tools.add()
+	// Registered after the mocks, so it runs before they close: a turn's note is written in
+	// the background, and a test that ended mid-note failed on the closed connection and
+	// saved into a temp dir already gone.
+	t.Cleanup(sess.waitSummarise)
 	return &specLoopRig{h: h, mock: mock}
 }
 

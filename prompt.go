@@ -680,6 +680,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		upserted := false
 		var failedAt int
 		var failedReason string
+		failedFrom := -1 // index of the failed subtask's EXECUTION message
 
 		for i, st := range plan.Subtasks {
 			if err := ctx.Err(); err != nil {
@@ -688,6 +689,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			a.sendPhase(ctx, sid, 1, false)
 			a.say(ctx, sid, fmt.Sprintf("\n=== Task %d/%d: %s ===\n\n", i+1, len(plan.Subtasks), st.Description))
 
+			execFrom := sess.messageCount()
 			outcome := a.runExecutePhase(ctx, sid, st, i, len(plan.Subtasks))
 			lastResult = outcome.Result
 			changed = changed || changedProject(outcome.Result.ToolUses)
@@ -703,6 +705,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			allOk = false
 			failedAt = i
 			failedReason = outcome.Reason
+			failedFrom = execFrom
 			break
 		}
 
@@ -749,6 +752,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		replanCtx := fmt.Sprintf("REPLAN: prior subtask failed: %s. %s%s See history for executor attempts. Follow the 'Replanning' section in PLAN.md.",
 			failedReason, failureDigest(lastResult.ToolUses), same)
 
+		replanFrom := sess.messageCount()
 		a.sendPhase(ctx, sid, 0, false)
 		newPlan, err := a.runPlanPhase(ctx, sid, replanCtx)
 		if err != nil {
@@ -757,6 +761,16 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		if len(newPlan.Subtasks) == 0 {
 			a.say(ctx, sid, "Replan produced no further subtasks: stopping.\n")
 			return lastResult, nil
+		}
+		// The planner has read the failed attempt; the next executor gets the new plan
+		// without it, since an executor copies what it is shown.
+		if n := len(lastResult.ToolUses); failedFrom >= 0 && n >= foldFailedMinCalls {
+			note := fmt.Sprintf("[codehalter] This attempt made %d tool calls and failed: %s. %s Its transcript is left out from here on; what it found is in the replan below.",
+				n, failedReason, failureDigest(lastResult.ToolUses))
+			sess.waitSummarise()
+			if sess.foldSpan(failedFrom+1, replanFrom, note) {
+				slog.Info("folded a failed attempt", "sid", sid, "calls", n, "from", failedFrom+1, "to", replanFrom)
+			}
 		}
 
 		a.renderPlan(ctx, sid, "Replan:", newPlan.Subtasks)
@@ -773,6 +787,14 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 
 	return lastResult, nil
 }
+
+// foldFailedMinCalls: a failed attempt this long is folded out of the next executor's
+// view. Replayed for real from the start of a third attempt at a step that had failed
+// at 150 and 100 calls, 3 runs of 40 calls each: with both transcripts in view the
+// executor went back to the `sed -i` toggle they ended on by call 10 to 13 and toggled
+// 11, 28 and 25 times; with them folded it read the file afresh and debugged in
+// scratch copies, 1 toggle in all 3 runs, on a prompt of about 70k tokens, not 200k.
+var foldFailedMinCalls = 25 // a var so tests can lower it
 
 // failureDigest is what a failed subtask spent its calls on: "see history" alone
 // let replans repeat the same hunt.

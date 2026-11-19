@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -703,6 +704,41 @@ func TestDocumenterRunsOnlyAfterAChange(t *testing.T) {
 		}
 		if got := mock.callCount(); got != want {
 			t.Errorf("wrote %v: %d model calls, want %d", wrote, got, want)
+		}
+	}
+}
+
+// After a long failed attempt, the replan sees it, and the next executor does not:
+// it gets a note in its place, and the original stays in an archive.
+func TestOrchestrateFoldsALongFailedAttempt(t *testing.T) {
+	defer func(n int) { foldFailedMinCalls = n }(foldFailedMinCalls)
+	foldFailedMinCalls = 2
+	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`)
+	a, s, mock := planPhaseAgent(t,
+		plan,
+		sseToolCall("x1", "probe", `{"n":1}`), sseToolCall("x2", "probe", `{"n":2}`),
+		sseToolCall("f", respondToolName, `{"message":"toggled the flag back and forth","failed":true}`),
+		plan,
+		sseToolCall("ok", respondToolName, `{"message":"done"}`))
+	a.tools.add(fakeTool("probe", func(args string) (string, bool) { return "probe output " + args, false }))
+	s.AddUser("change a.rs")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := mock.callCount(); got != 6 {
+		t.Fatalf("%d model calls, want 6", got)
+	}
+	wire := func(i int) string { b, _ := json.Marshal(mock.request(i)["messages"]); return string(b) }
+	if replan := wire(4); !strings.Contains(replan, `probe output {\"n\":2}`) {
+		t.Errorf("the replan did not see the failed attempt:\n%s", replan)
+	}
+	exec := wire(5)
+	if strings.Contains(exec, "probe output") || !strings.Contains(exec, "This attempt made 3 tool calls and failed") {
+		t.Errorf("the next executor still sees the failed attempt, or lacks the note:\n%s", exec)
+	}
+	if archives, _ := filepath.Glob(filepath.Join(s.Cwd, sessionDir, "session_archive_*")); len(archives) == 0 {
+		if archives, _ = filepath.Glob(filepath.Join(s.Cwd, sessionDir, "*archive*")); len(archives) == 0 {
+			t.Errorf("no archive of the folded history")
 		}
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"slices"
@@ -279,5 +280,28 @@ func TestToolArgsFitTheirSchema(t *testing.T) {
 		if out := call(args); out != args {
 			t.Errorf("%s reached the tool as %s", args, out)
 		}
+	}
+}
+
+// A recursive grep over the project also reads codehalter's own session logs, which
+// hold the whole conversation and so match anything; those lines are left out, unless
+// the command itself names .codehalter.
+func TestLiveToolOutputDropsOwnFiles(t *testing.T) {
+	out := "exit 0\n\n" +
+		"inv/inv.go:11:const MaxItems = 100\n" +
+		".codehalter/cli.log:10:time=... msg=\"MaxItems\"\n" +
+		"./.codehalter/session_1.log:3:{\"content\":\"MaxItems\"}\n" +
+		"Binary file .codehalter/x.bin matches\n" +
+		"/tmp/p/.codehalter/session_1.toml:9:MaxItems\n"
+	args := func(cmd string) string { b, _ := json.Marshal(map[string]string{"command": cmd}); return string(b) }
+	got := liveToolOutput("run_command", args(`grep -rn MaxItems .`), out)
+	if strings.Contains(got, ".codehalter/cli.log") || strings.Contains(got, "session_1") || strings.Contains(got, "x.bin") {
+		t.Errorf("own files kept:\n%s", got)
+	}
+	if !strings.Contains(got, "inv/inv.go:11:const MaxItems = 100") || !strings.Contains(got, "[4 lines from .codehalter/") {
+		t.Errorf("project line or note missing:\n%s", got)
+	}
+	if got := liveToolOutput("run_command", args(`grep -n MaxItems .codehalter/cli.log`), out); got != out {
+		t.Errorf("a command naming .codehalter lost its lines:\n%s", got)
 	}
 }

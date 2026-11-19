@@ -161,6 +161,11 @@ func (a *agent) backgroundSummarise(sess *Session) {
 	if conn == nil {
 		return
 	}
+	// The job runs after this turn's Done line, often into the next turn: counted, it
+	// showed there as a model reply nobody in that turn made.
+	detached := *conn
+	detached.noTurnStats = true
+	conn = &detached
 
 	sess.mu.Lock()
 	turn := append([]Message(nil), sess.Messages[sess.turnStartIdx:]...)

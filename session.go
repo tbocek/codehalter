@@ -435,6 +435,43 @@ func (s *Session) AddUser(text string, images ...ImageData) {
 	s.Messages = append(s.Messages, Message{Role: "user", Content: text, Images: images, StartedAt: time.Now()})
 }
 
+func (s *Session) messageCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.Messages)
+}
+
+// foldSpan replaces Messages[from:to] with one user note, after archiving the whole
+// history as rotate does. It refuses unless the span still sits where the caller
+// recorded it: right after an EXECUTION message and up to a replan's PLANNING
+// message (a compaction in between moves both).
+func (s *Session) foldSpan(from, to int, note string) bool {
+	s.mu.Lock()
+	ok := from >= 1 && from < to && to < len(s.Messages) &&
+		s.Messages[from-1].Role == "user" && strings.HasPrefix(s.Messages[from-1].Content, "EXECUTION phase:") &&
+		s.Messages[to].Role == "user" && strings.HasPrefix(s.Messages[to].Content, "Begin the PLANNING phase again")
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	archive := &Session{ID: fmt.Sprintf("archive_%s_%d", s.ID, time.Now().UnixNano()), Cwd: s.Cwd, CreatedAt: s.CreatedAt,
+		Summary: s.Summary, SystemPrompt: s.SystemPrompt, Messages: s.Messages}
+	if err := archive.saveLocked(); err != nil {
+		s.mu.Unlock()
+		slog.Warn("foldSpan: archive failed, not folding", "id", s.ID, "err", err)
+		return false
+	}
+	kept := append(append(slices.Clone(s.Messages[:from]), Message{Role: "user", Content: note, StartedAt: time.Now()}), s.Messages[to:]...)
+	s.Messages = kept
+	if s.turnStartIdx > from {
+		s.turnStartIdx = from
+	}
+	s.mu.Unlock()
+	s.resetCacheLineage()
+	s.saveOrLog()
+	return true
+}
+
 func (s *Session) AddAssistant(text string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

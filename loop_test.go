@@ -736,7 +736,7 @@ func TestToolLoopRepetitionLadder(t *testing.T) {
 		for _, m := range msgs {
 			mm, _ := m.(map[string]any)
 			if mm["role"] == "user" {
-				if c, _ := mm["content"].(string); strings.Contains(c, "makes no progress") {
+				if c, _ := mm["content"].(string); strings.Contains(c, "going in circles") {
 					found = true
 				}
 			}
@@ -804,7 +804,7 @@ func TestRepetitionLadderExemptsSuccessfulRunCommand(t *testing.T) {
 		msgs, _ := mock.request(i)["messages"].([]any)
 		for _, m := range msgs {
 			mm, _ := m.(map[string]any)
-			if c, _ := mm["content"].(string); mm["role"] == "user" && strings.Contains(c, "makes no progress") {
+			if c, _ := mm["content"].(string); mm["role"] == "user" && strings.Contains(c, "going in circles") {
 				t.Errorf("request %d carried a repeat-corrective for a successful run_command re-run", i)
 			}
 		}
@@ -1383,6 +1383,65 @@ func TestProjectSig(t *testing.T) {
 	}
 }
 
+// A step that flips a file to try a variant and flips it back changes the project on
+// every call, yet keeps landing in the same two states with the same answers. Seen in
+// a log: two such commands alternated 44 times each, byte-identical every time.
+func TestStuckLadderSeesAFlipFlop(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	for _, withGit := range []bool{true, false} {
+		dir := t.TempDir()
+		if withGit {
+			if out, err := exec.Command("git", "-C", dir, "init", "-q").CombinedOutput(); err != nil {
+				t.Fatalf("git init: %v %s", err, out)
+			}
+		}
+		src := filepath.Join(dir, "cm.cpp")
+		stamp := time.Now()
+		// Explicit mtimes: a coarse clock would give two quick writes the same one.
+		write := func(body string) {
+			if err := os.WriteFile(src, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			stamp = stamp.Add(time.Second)
+			if err := os.Chtimes(src, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write("if (n == 0) store();\n")
+		rt := newRepetitionTracker(dir, nil)
+		call := func(cmd, body, out string) bool {
+			write(body)
+			var tc toolCall
+			tc.Function.Name = "run_command"
+			b, _ := json.Marshal(map[string]string{"command": cmd})
+			tc.Function.Arguments = string(b)
+			tu := ToolUse{Name: "run_command", Output: "exit 0\n\n" + out}
+			return rt.sawAgain(tc, tu, rt.changedBy(tc, tu))
+		}
+		try := func() bool {
+			return call("sed -i 's/n == 0/0/' cm.cpp; ./probe", "if (0) store();\n", "lr=32 prose60k=59092\nlr=64 prose60k=59092")
+		}
+		undo := func() bool {
+			return call("sed -i 's/(0)/(n == 0)/' cm.cpp; ./sizes", "if (n == 0) store();\n", "prose.txt 756420 -> 750608\nweb.log 1266323 -> 1250344")
+		}
+		if try() || undo() {
+			t.Fatalf("git=%v: the first try and undo are new", withGit)
+		}
+		if !try() {
+			t.Errorf("git=%v: the same try back in a state already seen did not count as a repeat", withGit)
+		}
+		if !undo() {
+			t.Errorf("git=%v: the same undo back in a state already seen did not count as a repeat", withGit)
+		}
+		// A real edit to a new state is a re-check again.
+		if call("sed -i 's/store/pack/' cm.cpp; ./sizes", "if (n == 0) pack();\n", "prose.txt 756420 -> 750608\nweb.log 1266323 -> 1250344") {
+			t.Errorf("git=%v: a command in a state not seen before counted as a repeat", withGit)
+		}
+	}
+}
+
 // A clear submit_plan with neither an answer nor any work gets the one
 // planner retry, and the retry's plan is taken.
 func TestPlanNeitherAnswerNorWorkRetries(t *testing.T) {
@@ -1832,5 +1891,61 @@ func TestPlanSubtasksWinOverAQuestion(t *testing.T) {
 	plan, err := a.runPlanPhase(context.Background(), s.ID, "")
 	if err != nil || plan == nil || len(plan.Subtasks) != 1 {
 		t.Fatalf("plan %+v, err %v", plan, err)
+	}
+}
+
+// The nudge quotes the call that repeated and the answer it already gave.
+func TestRepeatCorrectiveQuotesTheCall(t *testing.T) {
+	b, _ := json.Marshal(map[string]string{"command": "sed -i 's/if (0)/if (n)/' src/cm.cpp; ./sizes"})
+	got := repeatCorrective([]repeatedCall{{key: "run_command\x00" + string(b), output: "exit 0\n\nprose.txt 756420 -> 750608"}})
+	for _, want := range []string{"`sed -i 's/if (0)/if (n)/' src/cm.cpp; ./sizes`", "prose.txt 756420 -> 750608", "failed: true"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("corrective lacks %q:\n%s", want, got)
+		}
+	}
+}
+
+// A two-call flip-flop through the tool loop: each call rewrites a file the other
+// undoes, so the project changes on every call yet only revisits two states. It is
+// caught, and the nudge quotes both members of the cycle.
+func TestToolLoopCatchesAFlipFlop(t *testing.T) {
+	on := `{"command":"sed -i 's/n/0/' cm.c; ./probe"}`
+	off := `{"command":"sed -i 's/0/n/' cm.c; ./sizes"}`
+	var resp []string
+	for i := 0; i < 8; i++ {
+		resp = append(resp, sseToolCall(fmt.Sprintf("f%d", i), "run_command", map[bool]string{true: on, false: off}[i%2 == 0]))
+	}
+	resp = append(resp, sseToolCall("r", respondToolName, `{"message":"done"}`))
+	mock := newMockLLM(t, resp...)
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	a.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
+	src := filepath.Join(s.Cwd, "cm.c")
+	stamp := time.Now()
+	a.tools.add(fakeTool("run_command", func(args string) (string, bool) {
+		body, out := "if (n) store();\n", "exit 0\n\nprose.txt 756420 -> 750608 (sizes)"
+		if strings.Contains(args, "probe") {
+			body, out = "if (0) store();\n", "exit 0\n\nlr=32 prose60k=59092 (probe)"
+		}
+		_ = os.WriteFile(src, []byte(body), 0o644)
+		stamp = stamp.Add(time.Second)
+		_ = os.Chtimes(src, stamp, stamp)
+		return out, false
+	}))
+	_ = os.WriteFile(src, []byte("if (n) store();\n"), 0o644)
+	a.runExecutePhase(context.Background(), s.ID, subtask{Description: "tune it"}, 0, 1)
+	var nudge string
+	for i := 0; i < mock.callCount(); i++ {
+		msgs, _ := mock.request(i)["messages"].([]any)
+		for _, m := range msgs {
+			if mm, _ := m.(map[string]any); mm["role"] == "user" {
+				if c, _ := mm["content"].(string); strings.Contains(c, "going in circles") {
+					nudge = c
+				}
+			}
+		}
+	}
+	if !strings.Contains(nudge, "./probe") || !strings.Contains(nudge, "./sizes") || !strings.Contains(nudge, "back and forth") {
+		t.Errorf("the flip-flop got no nudge quoting both calls; last nudge:\n%s", nudge)
 	}
 }

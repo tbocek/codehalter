@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -532,6 +533,10 @@ type repetitionTracker struct {
 	// exact: git gave it, so it sees every change by content.
 	cwd, sig string
 	exact    bool
+	// byState: runs memory per project state left this step. A step that flips a file
+	// back and forth (sed -i to try a variant, sed -i to undo it) changes the project on
+	// every call, yet it is back where it was, and the same call answers the same.
+	byState  map[string]repeatMemory
 	changes  int  // calls that changed the project in this step
 	hitStuck bool // the last sawAgain returned an output that ended an earlier step
 }
@@ -570,7 +575,8 @@ func isReadCall(name, args string) bool {
 }
 
 func newRepetitionTracker(cwd string, stuck map[uint64]bool) *repetitionTracker {
-	rt := &repetitionTracker{reads: newRepeatMemory(), runs: newRepeatMemory(), stuck: maps.Clone(stuck), cwd: cwd}
+	rt := &repetitionTracker{reads: newRepeatMemory(), runs: newRepeatMemory(), stuck: maps.Clone(stuck), cwd: cwd,
+		byState: map[string]repeatMemory{}}
 	if cwd != "" {
 		rt.sig, rt.exact = projectSig(cwd)
 	}
@@ -645,6 +651,9 @@ func (rt *repetitionTracker) changedBy(tc toolCall, tu ToolUse) bool {
 	}
 	sig, exact := projectSig(rt.cwd)
 	changed := sig != rt.sig || written && !exact
+	if changed {
+		rt.byState[rt.sig] = rt.runs
+	}
 	rt.sig, rt.exact = sig, exact
 	if changed {
 		rt.changes++
@@ -656,11 +665,19 @@ func (rt *repetitionTracker) changedBy(tc toolCall, tu ToolUse) bool {
 // with the project as it is.
 func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse, changed bool) bool {
 	rt.hitStuck = false
+	// A change makes every command's answer new (a re-run is a re-check), unless it put
+	// the project back in a state this step already left: what was answered there holds.
+	// The changing call's own answer is remembered either way, so the next flip to the
+	// same state with the same call is caught.
+	fresh := false
 	if changed {
-		// Every command may answer differently now: a re-run is a re-check.
-		rt.runs = newRepeatMemory()
-		clear(rt.stuck)
-		return false
+		if mem, ok := rt.byState[rt.sig]; ok && rt.cwd != "" {
+			rt.runs = mem
+		} else {
+			rt.runs = newRepeatMemory()
+			clear(rt.stuck)
+			fresh = true
+		}
 	}
 	mem := &rt.runs
 	if readerTools[tc.Function.Name] {
@@ -687,7 +704,7 @@ func (rt *repetitionTracker) sawAgain(tc toolCall, tu ToolUse, changed bool) boo
 	}
 	mem.last[key] = fnvHash(folded)
 	mem.bag[key] = bag
-	return repeated
+	return repeated && !fresh
 }
 
 // projectSig fingerprints the files git reports as changed or new by content (a
@@ -712,7 +729,7 @@ func projectSig(cwd string) (sig string, exact bool) {
 				return filepath.SkipAll
 			}
 			if info, err := d.Info(); err == nil {
-				fmt.Fprintf(h, "%s\x00%d\x00%d\x00", path, info.Size(), info.ModTime().UnixNano())
+				fmt.Fprintf(h, "%s\x00%s\x00", path, fileSum(path, info))
 			}
 			return nil
 		})
@@ -756,7 +773,38 @@ func projectSig(cwd string) (sig string, exact bool) {
 const (
 	projectSigMaxFiles = 500
 	projectSigMaxBytes = 8 << 20
+	// Outside git every file is walked, so only files this small go in by content.
+	walkSigMaxBytes = 256 << 10
 )
+
+type cachedSum struct {
+	size, mtime int64
+	sum         string
+}
+
+// fileSums caches content hashes by path for the walk, so a call re-reads only
+// files whose size or mtime moved. Content, not mtime, is what lets a file that
+// `sed -i` flipped and flipped back read as the state it was.
+var fileSums sync.Map
+
+func fileSum(path string, info os.FileInfo) string {
+	size, mtime := info.Size(), info.ModTime().UnixNano()
+	if size > walkSigMaxBytes {
+		return fmt.Sprintf("%d\x00%d", size, mtime)
+	}
+	if v, ok := fileSums.Load(path); ok {
+		if c := v.(cachedSum); c.size == size && c.mtime == mtime {
+			return c.sum
+		}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Sprintf("%d\x00%d", size, mtime)
+	}
+	sum := strconv.FormatUint(fnvHash(string(data)), 16)
+	fileSums.Store(path, cachedSum{size, mtime, sum})
+	return sum
+}
 
 func (a *agent) announceToolCall(ctx context.Context, sid string, tc toolCall) {
 	// Only MCP tools and the card-less few lack a card that already shows the arguments.
@@ -906,6 +954,35 @@ func (a *agent) callModelRecovering(ctx context.Context, sid string, sess *Sessi
 	}
 }
 
+// repeatCorrective quotes every call of the current run of repeats with what it already
+// said, so a cycle reads as one: at a real two-command flip-flop (each `sed -i` undid the
+// other) the next call repeated 6/6 with no note; this note quoting only the last call
+// left 2/8 exact repeats and 3/8 more toggles, quoting both members 0/8 and 0/8.
+func repeatCorrective(repeats []repeatedCall) string {
+	var b strings.Builder
+	if len(repeats) == 1 {
+		b.WriteString("[codehalter] You are going in circles: this call came back with an answer you already had, with the project as it is now:\n")
+	} else {
+		fmt.Fprintf(&b, "[codehalter] You are going in circles: these %d calls keep coming back with answers you already had, with the project as it is now:\n", len(repeats))
+	}
+	for i, r := range repeats {
+		name, args, _ := strings.Cut(r.key, "\x00")
+		what := parseArgs(args).str("command")
+		if what == "" {
+			what = name + " " + args
+		}
+		fmt.Fprintf(&b, "\n%d. `%s`\n%s\n", i+1, clipUTF8(strings.TrimSpace(what), 240), clipUTF8(strings.TrimSpace(r.output), 400))
+	}
+	if len(repeats) > 1 {
+		b.WriteString("\nBetween them they only move the project back and forth between states it was already in, so nothing is learned. Do not run any of them again. ")
+	} else {
+		b.WriteString("\nRunning it again tells you nothing. Do not run it again. ")
+	}
+	b.WriteString("Make a change you have not tried yet with edit_file, run a different check, or, if a read came back partial, read the next part. " +
+		"If you have no new idea, call `respond` with `failed: true` and say what you found.")
+	return b.String()
+}
+
 // repeatedCall is a call of a stuck round, keyed like the repetition tracker.
 type repeatedCall struct {
 	key, output string
@@ -966,7 +1043,8 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	}
 	repeats := newRepetitionTracker(cwd, stuckOutputs)
 	var stuckRounds int
-	var nudgedUI bool // the "repeating" UI warning fires only once
+	var stuckCalls []repeatedCall // distinct repeated calls of the current stuck run, oldest first
+	var nudgedUI bool             // the "repeating" UI warning fires only once
 	var escalated bool
 	var failedRounds int
 	var readStreak int // execute calls since the last edit, test or build
@@ -1065,6 +1143,18 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			continue
 		}
 		nudged = false
+
+		// Before the calls enter history, so the transcript shows the read as it is done here.
+		_, hasShell, _ := a.tools.lookup("run_command")
+		for i, tc := range calls {
+			if _, ok, _ := a.tools.lookup(tc.Function.Name); ok || !hasShell || policy.terminals[tc.Function.Name] {
+				continue
+			}
+			if c, ok := canonicalCall(tc); ok {
+				slog.Info("tool alias", "from", tc.Function.Name, "args", tc.Function.Arguments, "to", c.Function.Arguments)
+				calls[i] = c
+			}
+		}
 
 		messages = append(messages, llmMessage{
 			Role:      "assistant",
@@ -1202,9 +1292,14 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 
 		if !roundStuck {
 			stuckRounds = 0
+			stuckCalls = nil
 			continue
 		}
 		stuckRounds++
+		for _, r := range roundRepeats {
+			stuckCalls = slices.DeleteFunc(stuckCalls, func(c repeatedCall) bool { return c.key == r.key })
+			stuckCalls = append(stuckCalls, r)
+		}
 		if stuckRounds >= stuckBailRounds {
 			if loopSess != nil {
 				loopSess.recordStuck(roundRepeats)
@@ -1222,11 +1317,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				"That output is the one an earlier attempt at this task got again and again until codehalter ended it. Changing the command does not change the answer. Do what the task asks with a different call; if it asks you to look at a picture, call `screenshot` on it.")
 			continue
 		}
-		messages = a.addCorrective(sid, messages,
-			"Your last tool call(s) returned output you already have, which makes no progress. Do NOT repeat them. Instead:\n"+
-				"1. If a read came back PARTIAL and you need more, read the next part with sed -n; never re-read the same window, never rewrite a whole file.\n"+
-				"2. Act on what you already have: make a small targeted edit_file, run a DIFFERENT command, or finish by calling the terminal tool.\n"+
-				"3. If you are stuck or the task is infeasible, say so and stop.")
+		messages = a.addCorrective(sid, messages, repeatCorrective(stuckCalls[max(0, len(stuckCalls)-3):]))
 		if stuckRounds >= stuckEscalateRounds && escalate() && sid != "" {
 			a.say(ctx, sid, "⚠ Still repeating: switching to the thinking sampler to break out.\n")
 		}

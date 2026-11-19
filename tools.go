@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -568,8 +569,8 @@ func liveToolOutput(toolName, args, content string) string {
 	case "run_command":
 		// A shell read clipped to 600 + 600 chars was re-read 60% of the time, one
 		// window at a time. It gets read_file's allowance, still start and end.
-		if onlyReads(parseArgs(args).str("command")) {
-			return clipMiddle(toolName, args, content, liveExemptCap, liveExemptCap/4)
+		if cmd := parseArgs(args).str("command"); onlyReads(cmd) {
+			return clipMiddle(toolName, args, dropOwnFiles(cmd, content), liveExemptCap, liveExemptCap/4)
 		}
 	case "read_file", "search", "continue_read", "web_search", "web_read":
 		if len(content) <= liveExemptCap {
@@ -583,6 +584,25 @@ func liveToolOutput(toolName, args, content string) string {
 			content[:cut], len(content)-cut, len(content), liveExemptCap/1024, truncationHint(toolName, args))
 	}
 	return truncateForLLM(toolName, args, content)
+}
+
+// ownFileLineRe: a line a recursive grep or find printed for codehalter's own files
+// (`.codehalter/session_….log:12:…`, `Binary file ./.codehalter/x matches`).
+var ownFileLineRe = regexp.MustCompile(`^(?:grep: |Binary file |find: )?['"‘]?(?:\S*/)?\.codehalter/`)
+
+// dropOwnFiles: a `grep -rn X .` also searches .codehalter/, whose session logs hold the
+// whole conversation, so they match whatever the model looks for: one planner grep came
+// back with 18 KB of codehalter's own log. A command that names .codehalter keeps them.
+func dropOwnFiles(cmd, content string) string {
+	if strings.Contains(cmd, ".codehalter") || !strings.Contains(content, ".codehalter/") {
+		return content
+	}
+	lines := strings.Split(content, "\n")
+	kept := slices.DeleteFunc(slices.Clone(lines), func(l string) bool { return ownFileLineRe.MatchString(l) })
+	if dropped := len(lines) - len(kept); dropped > 0 {
+		return strings.Join(kept, "\n") + fmt.Sprintf("\n[%d lines from .codehalter/, codehalter's own session files, left out]", dropped)
+	}
+	return content
 }
 
 func truncateForLLM(toolName, args, content string) string {
