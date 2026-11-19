@@ -421,7 +421,7 @@ func (a *agent) renderLLMStatus() string {
 	firstReachable := -1
 	for i := range conns {
 		c := conns[i]
-		label := fmt.Sprintf("llm[%d]", i)
+		label := (&Settings{LLM: conns}).slotLabel(i)
 		if i > 0 && c.Tag != "" {
 			label += " " + c.Tag
 		}
@@ -436,7 +436,7 @@ func (a *agent) renderLLMStatus() string {
 			if len(pr.AvailableModels) > 0 {
 				avail = "it offers: " + strings.Join(pr.AvailableModels, ", ")
 			}
-			fmt.Fprintf(&b, "🟡 %s: reachable at %s, but model `%s` isn't in its /v1/models list, so requests may return an empty response. Check `model =` in settings.toml (%s). Background work runs on llm[0] instead until this is fixed.\n\n", label, c.Server, c.Model, avail)
+			fmt.Fprintf(&b, "🟡 %s: reachable at %s, but model `%s` isn't in its /v1/models list, so requests may return an empty response. Check `model =` in settings.toml (%s). Background work runs on the first [[llm]] entry instead until this is fixed.\n\n", label, c.Server, c.Model, avail)
 			if firstReachable < 0 {
 				firstReachable = i
 			}

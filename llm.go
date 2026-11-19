@@ -1007,7 +1007,8 @@ func (a *agent) connForBackgroundLLM() (*LLMConnection, bool) {
 			return a.settings.ConnAt(i, "execute"), false
 		}
 	}
-	// Display-only: the meter shows background work as llm[1]; the server picks the slot.
+	// Display-only: the meter shows background work as llm[1], the entry's second slot;
+	// the server picks the real one.
 	c := a.settings.ConnAt(0, "execute")
 	if c != nil && a.settings.LLM[0].parallelCap() >= 2 {
 		c.Slot = 1

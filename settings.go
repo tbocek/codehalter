@@ -67,8 +67,9 @@ type LLMConnection struct {
 	// ExtraBody is the role-resolved params, set at runtime by ConnAt.
 	ExtraBody map[string]any `toml:"-"`
 
-	// Slot is a display index only (llm[0] foreground, llm[1] background); llama.cpp
-	// picks the real KV slot.
+	// Slot is a display index only, numbered across entries by slot (slotBase): a first
+	// entry with parallel=4 is llm[0] to llm[3], foreground llm[0] and background llm[1],
+	// and the second entry starts at llm[4]. llama.cpp picks the real KV slot.
 	Slot int `toml:"-"`
 
 	// noThinkPrefill disables reasoning by appending a closed think block: changing
@@ -284,6 +285,24 @@ func (s *Settings) ConnAt(idx int, role string) *LLMConnection {
 	c := s.LLM[idx]
 	c.ExtraBody = c.paramsFor(role)
 	c.Tag = role
-	c.Slot = idx
+	c.Slot = s.slotBase(idx)
 	return &c
+}
+
+// slotBase is entry idx's first display slot: the slots of the entries before it come first.
+func (s *Settings) slotBase(idx int) int {
+	n := 0
+	for i := 0; i < idx && i < len(s.LLM); i++ {
+		n += s.LLM[i].parallelCap()
+	}
+	return n
+}
+
+// slotLabel names entry idx by its display slots: llm[4], or llm[0-3] for parallel=4.
+func (s *Settings) slotLabel(idx int) string {
+	base, n := s.slotBase(idx), s.LLM[idx].parallelCap()
+	if n > 1 {
+		return fmt.Sprintf("llm[%d-%d]", base, base+n-1)
+	}
+	return fmt.Sprintf("llm[%d]", base)
 }

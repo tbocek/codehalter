@@ -306,9 +306,15 @@ type subtaskOutcome struct {
 	Result  toolLoopResult
 	Success bool
 	Reason  string
+	// OutOfCalls: the step ran out of tool calls, which says how long it took, not
+	// what went wrong, so the same-failure rule does not count it.
+	OutOfCalls bool
 	// The executor's revision of the remaining plan; Success is false and Reason empty.
 	Upsert *planResult
 }
+
+// errToolLoopLimit ends a tool loop that used up its calls.
+var errToolLoopLimit = errors.New("tool loop exceeded")
 
 func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx, total int) subtaskOutcome {
 	sess := a.getSession(sid)
@@ -350,6 +356,7 @@ func (a *agent) runExecutePhase(ctx context.Context, sid string, st subtask, idx
 	out := subtaskOutcome{Result: res}
 	if err != nil {
 		out.Reason = "executor error: " + err.Error()
+		out.OutOfCalls = errors.Is(err, errToolLoopLimit)
 		return out
 	}
 	if res.Terminal == submitPlanToolName {
@@ -430,6 +437,38 @@ const (
 	productiveWindow    = 40
 	productiveExtension = 50
 )
+
+// A step that stops this many of its own jobs before they finish is warned, then ended.
+// One is normal (a wrong flag, rerun); every restart starts the work over from zero.
+const (
+	abandonWarnAt = 2
+	abandonBailAt = 3
+)
+
+func describeStopped(jobs []stoppedJob) string {
+	var parts []string
+	for _, j := range jobs {
+		parts = append(parts, fmt.Sprintf("job %d after %s", j.id, humanDuration(j.ran.Milliseconds())))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func abandonCorrective(jobs []stoppedJob) string {
+	var files []string
+	for _, j := range jobs {
+		files = append(files, j.files...)
+	}
+	out := ""
+	if len(files) > 0 {
+		out = " Their output went to " + strings.Join(files, ", ") + "."
+	}
+	return fmt.Sprintf("You stopped %s before it finished, and each restart starts the work over from zero: none of them got a result.%s "+
+		"At %d stopped jobs this step ends and is planned again. Do one of these instead: "+
+		"let the next job finish (call `respond` saying you are waiting for it: that parks the step, and its exit code and output come to you); "+
+		"make the work small enough to finish within the 2-minute wait (fewer iterations, a smaller input); "+
+		"or stop running it and find the answer another way, by reading the code involved.",
+		describeStopped(jobs), out, abandonBailAt)
+}
 
 // An execute subtask that only reads for this long is lost: in the logs, no
 // successful one read more than about 32 calls in a row, and most capped ones did.
@@ -1047,7 +1086,9 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 	var nudgedUI bool             // the "repeating" UI warning fires only once
 	var escalated bool
 	var failedRounds int
-	var readStreak int // execute calls since the last edit, test or build
+	var readStreak int         // execute calls since the last edit, test or build
+	var abandoned []stoppedJob // this step's jobs the model stopped before they finished
+	abandonWarned := false
 	limit, extended := maxToolLoopIterations, false
 	readNudged := false
 	// Samplers do not enter the KV cache key, so the prefix survives unless a role
@@ -1083,7 +1124,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				}
 			}
 			if extended || phase != "execute" || edits < 2 || runs < 1 {
-				return finish(fmt.Errorf("tool loop exceeded %d iterations", limit))
+				return finish(fmt.Errorf("%w %d iterations", errToolLoopLimit, limit))
 			}
 			extended = true
 			limit += productiveExtension
@@ -1200,6 +1241,13 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				a.FailToolCall(ctx, sid, tcId, "not run: this call ended an earlier attempt by repeating")
 				tu, content = a.recordToolUse(sid, tc, ToolUse{Output: msg, Failed: true, StartedAt: time.Now()}), msg
 			default:
+				if name := tc.Function.Name; phase == "execute" && (name == "run_command" || name == "run_background") {
+					for _, j := range a.jobsStoppedBy(sid, parseArgs(tc.Function.Arguments).str("command"), loopStart) {
+						if !slices.ContainsFunc(abandoned, func(o stoppedJob) bool { return o.id == j.id }) {
+							abandoned = append(abandoned, j)
+						}
+					}
+				}
 				tu, content = a.runToolCall(ctx, sid, tc)
 			}
 			res.ToolUses = append(res.ToolUses, tu)
@@ -1272,6 +1320,22 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 			failedRounds++
 			if failedRounds >= failSoftCap {
 				return finish(nil)
+			}
+		}
+
+		// Stopping its own jobs before they finish defeats the ladder above: every restart is
+		// a new command with a new job number, so nothing repeats. Seen live: a minimiser
+		// stopped at each 2-minute handover and started again with a new seed, 40 times.
+		if len(abandoned) >= abandonBailAt {
+			return finish(fmt.Errorf("stopped %d of its own jobs before they finished (%s)", len(abandoned), describeStopped(abandoned)))
+		}
+		if len(abandoned) >= abandonWarnAt && !abandonWarned {
+			abandonWarned = true
+			messages = a.addCorrective(sid, messages, abandonCorrective(abandoned))
+			if escalate() {
+				a.say(ctx, sid, "⚠ Stopping its own jobs before they finish: nudged, and switched to the thinking sampler.\n")
+			} else {
+				a.say(ctx, sid, "⚠ Stopping its own jobs before they finish: nudged the model to let one finish.\n")
 			}
 		}
 

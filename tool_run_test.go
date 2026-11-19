@@ -193,6 +193,30 @@ func TestRunCommandCancelReportsPartialOutput(t *testing.T) {
 	}
 }
 
+// A command whose output goes to its own file hands over with an empty terminal;
+// the result names that file, so the empty output is not read as a hang.
+func TestRunCommandHandoverNamesTheRedirectFile(t *testing.T) {
+	h := newTerminalHarness(t)
+	defer h.agent.shutdownBackground()
+	old := cmdHandoverWait
+	cmdHandoverWait = 300 * time.Millisecond
+	defer func() { cmdHandoverWait = old }()
+	h.sess.ctl.held.Lock()
+	defer h.sess.ctl.held.Unlock()
+
+	out := filepath.Join(t.TempDir(), "loc47.log")
+	cmd, _ := json.Marshal(map[string]string{"command": "python3 - <<'EOF' > " + out + " 2>&1\nimport time\nstep = 1\nwhile step>=1:\n    print(step)\n    time.sleep(1)\n    step -= 1\nEOF"})
+	result, _ := runCmdExecute(context.Background(), h.agent, h.sess.ID, string(cmd))
+	for _, want := range []string{"still running after", "writes its output to " + out + " (0b so far)", "python3 -u"} {
+		if !strings.Contains(result, want) {
+			t.Errorf("handover result lacks %q: %q", want, result)
+		}
+	}
+	if strings.Contains(result, "/=1") {
+		t.Errorf("the heredoc body was taken for a redirect: %q", result)
+	}
+}
+
 // The command is not killed; its exit later arrives as a note with the code and
 // log tail, as for run_background.
 func TestRunCommandHandsOverAfterWait(t *testing.T) {

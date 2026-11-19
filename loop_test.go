@@ -1949,3 +1949,88 @@ func TestToolLoopCatchesAFlipFlop(t *testing.T) {
 		t.Errorf("the flip-flop got no nudge quoting both calls; last nudge:\n%s", nudge)
 	}
 }
+
+// A step that stops its own jobs before they finish restarts the same work with new
+// job numbers, which the repeat ladder never sees: warned at the second, ended at the
+// third, whatever the commands looked like.
+func TestToolLoopEndsAStepThatStopsItsOwnJobs(t *testing.T) {
+	mock := newMockLLM(t,
+		sseToolCall("r1", "run_command", `{"command":"python3 min.py --seed 1"}`),
+		sseToolCall("k1", "run_command", `{"command":"kill -TERM -9001; sleep 2; kill -KILL -9001 2>/dev/null; true"}`),
+		sseToolCall("r2", "run_command", `{"command":"python3 min.py --seed 2 > /tmp/loc2.log"}`),
+		sseToolCall("k2", "run_command", `{"command":"kill -TERM -9002; sleep 2; kill -KILL -9002 2>/dev/null; true"}`),
+		sseToolCall("r3", "run_command", `{"command":"python3 min2.py"}`),
+		sseToolCall("k3", "run_command", `{"command":"kill -TERM -9003"}`),
+		sseToolCall("done", respondToolName, `{"message":"never reached"}`))
+	defer mock.Close()
+	a, s := newTestAgent(t)
+	pid := 9000
+	withTools(a, fakeTool("run_command", func(args string) (string, bool) {
+		cmd := parseArgs(args).str("command")
+		if strings.HasPrefix(cmd, "kill") {
+			return "exit 0\n\nstopped", false
+		}
+		pid++
+		a.bgMu.Lock()
+		a.bgSeq++
+		id := a.bgSeq
+		a.bgMu.Unlock()
+		a.registerBgJob(&backgroundJob{id: id, sid: s.ID, cmdStr: cmd, pid: pid, started: time.Now(), kind: jobHandedOver})
+		return fmt.Sprintf("still running after 2m0s: it continues as background job %d (pid %d)", id, pid), false
+	}))
+	// Without the limit the respond would wait for the fake jobs, which never exit.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := a.runToolLoopSeeded(ctx, s.ID, mock.conn("execute"),
+		[]llmMessage{{Role: "user", Content: "find the failing input"}}, phasePolicy{terminals: map[string]bool{respondToolName: true}}, "execute", false, 0)
+	if err == nil || !strings.Contains(err.Error(), "stopped 3 of its own jobs before they finished (job 1 after") {
+		t.Fatalf("err = %v, want the step ended at the third stopped job", err)
+	}
+	if got := mock.callCount(); got != 6 {
+		t.Errorf("%d model calls, want 6: the step ends after the third stop", got)
+	}
+	wire := func(i int) string { b, _ := json.Marshal(mock.request(i)["messages"]); return string(b) }
+	if w := wire(3); strings.Contains(w, "each restart starts the work over") {
+		t.Errorf("warned after one stopped job: %s", w)
+	}
+	if w := wire(4); !strings.Contains(w, "You stopped job 1 after") || !strings.Contains(w, "job 2 after") {
+		t.Errorf("no warning after the second stopped job: %s", w)
+	}
+}
+
+// Only a kill naming a job's pid counts: not `kill -0`, not a server, not another pid,
+// not a job from before the step, not a number inside a heredoc.
+func TestJobsStoppedBy(t *testing.T) {
+	a, s := newTestAgent(t)
+	since := time.Now()
+	for _, j := range []*backgroundJob{
+		{id: 1, pid: 4101, started: since.Add(time.Second), kind: jobHandedOver},
+		{id: 2, pid: 4102, started: since.Add(time.Second), kind: jobServer},
+		{id: 3, pid: 4103, started: since.Add(-time.Minute), kind: jobBackground},
+		{id: 4, pid: 4104, started: since.Add(time.Second), kind: jobBackground},
+	} {
+		j.sid = s.ID
+		a.registerBgJob(j)
+	}
+	for _, tc := range []struct {
+		cmd  string
+		want []int
+	}{
+		{"kill -TERM -4101; sleep 3; kill -KILL -4101 2>/dev/null; true", []int{1}},
+		{"kill 4104 && kill -9 4101", []int{1, 4}},
+		{"kill -0 4101 && echo alive", nil},
+		{"kill -TERM -4102", nil},
+		{"kill -TERM -4103", nil},
+		{"kill 999", nil},
+		{"echo 4101; ls", nil},
+		{"cat <<EOF\nkill 4101\nEOF", nil},
+	} {
+		var got []int
+		for _, j := range a.jobsStoppedBy(s.ID, tc.cmd, since) {
+			got = append(got, j.id)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("%q: stopped %v, want %v", tc.cmd, got, tc.want)
+		}
+	}
+}

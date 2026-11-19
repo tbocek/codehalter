@@ -91,22 +91,71 @@ func (a *agent) terminalRelease(sid, tid string) {
 // redirectRe: `> f`, `>> f`, `&> f`, `2> f`; `2>&1` names no file.
 var redirectRe = regexp.MustCompile(`(?:^|[^&])(?:\d?>>?|&>)\s*([^\s;&|()<>]+)`)
 
+// shellHeredocRe opens a shell here-document: `<<EOF`, `<< 'eof'`, `<<-"END"`. An
+// unquoted word is upper-case, as heredocRe's, so `1<<3` and Python's `1 << shift`
+// in a `-c` string open none; `<<<` (a here-string) is ruled out by the caller.
+var shellHeredocRe = regexp.MustCompile(`<<-?[ \t]*(?:'([A-Za-z_]\w*)'|"([A-Za-z_]\w*)"|\\?([A-Z_][A-Z0-9_]*)\b)`)
+
+// stripHeredocBodies drops the bodies of a command's here-documents, which are
+// another program's text: `while step>=1:` in a Python heredoc is no redirect to
+// a file named `=1`. A body without its closing word runs to the end, as in bash.
+func stripHeredocBodies(cmd string) string {
+	if !strings.Contains(cmd, "<<") {
+		return cmd
+	}
+	var out []string
+	var pending []string // closing words still to come, in order
+	for _, ln := range strings.Split(cmd, "\n") {
+		if len(pending) > 0 {
+			if strings.TrimLeft(ln, "\t") == pending[0] {
+				pending = pending[1:]
+			}
+			continue
+		}
+		out = append(out, ln)
+		for _, m := range shellHeredocRe.FindAllStringSubmatchIndex(ln, -1) {
+			if m[0] > 0 && ln[m[0]-1] == '<' || m[1] < len(ln) && ln[m[1]] == '<' {
+				continue // `<<<`
+			}
+			for g := 2; g < len(m); g += 2 {
+				if m[g] >= 0 {
+					pending = append(pending, ln[m[g]:m[g+1]])
+				}
+			}
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
 // redirectTargets skips anything that is not a plain path (a `$var`, a quote):
 // a missed file is only not watched.
 func redirectTargets(line, cwd string) []string {
 	var files []string
-	for _, m := range redirectRe.FindAllStringSubmatch(line, -1) {
-		f := m[1]
-		if strings.ContainsAny(f, "$\"'`*") || f == "/dev/null" {
-			continue
+	add := func(f string) {
+		if strings.ContainsAny(f, "$\"'`*") || strings.HasPrefix(f, "/dev/") {
+			return
 		}
 		if !filepath.IsAbs(f) {
 			f = filepath.Join(cwd, f)
 		}
 		files = append(files, f)
 	}
+	line = stripHeredocBodies(line)
+	for _, m := range redirectRe.FindAllStringSubmatch(line, -1) {
+		add(m[1])
+	}
+	for _, m := range teeRe.FindAllStringSubmatch(line, -1) {
+		for _, f := range strings.Fields(m[1]) {
+			if !strings.HasPrefix(f, "-") {
+				add(f)
+			}
+		}
+	}
 	return files
 }
+
+// teeRe: the files of a `| tee [-a] f…` in a pipeline.
+var teeRe = regexp.MustCompile(`\|\s*tee((?:\s+[^\s;&|()<>]+)*)`)
 
 func progressSignature(files []string) uint64 {
 	h := fnv.New64a()

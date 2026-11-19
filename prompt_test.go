@@ -666,6 +666,30 @@ func TestDoneLineShowsTimeToolsCallsAndInputs(t *testing.T) {
 }
 
 // Different failures run into the budget, and a turn that changed nothing gets no documenter.
+// Running out of calls is the same sentence for every step, so it is not "the same
+// failure": three steps that ran long still get a fourth attempt. Seen live: the third
+// had round-trip passing when the turn gave up.
+func TestOrchestrateOutOfCallsIsNotTheSameFailure(t *testing.T) {
+	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`)
+	var resp []string
+	for round := range maxSameFailure {
+		resp = append(resp, plan)
+		for i := range maxToolLoopIterations {
+			resp = append(resp, sseToolCall(fmt.Sprintf("c%d_%d", round, i), "run_command", fmt.Sprintf(`{"command":"cargo build --bin b%d_%d"}`, round, i)))
+		}
+	}
+	resp = append(resp, plan, sseToolCall("ok", respondToolName, `{"message":"done"}`))
+	a, s, mock := planPhaseAgent(t, resp...)
+	a.tools.add(fakeTool("run_command", func(args string) (string, bool) { return "exit 0\n\nbuilt " + args, false }))
+	s.AddUser("change a.rs")
+	if _, err := a.orchestrate(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := mock.callCount(), len(resp); got != want {
+		t.Errorf("%d model calls, want %d: out of calls %d times must not end the turn", got, want, maxSameFailure)
+	}
+}
+
 func TestOrchestrateReplanBudget(t *testing.T) {
 	plan := sseToolCall("p", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`)
 	var resp []string

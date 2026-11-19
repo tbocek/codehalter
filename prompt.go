@@ -680,6 +680,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 		upserted := false
 		var failedAt int
 		var failedReason string
+		var failedOutOfCalls bool
 		failedFrom := -1 // index of the failed subtask's EXECUTION message
 
 		for i, st := range plan.Subtasks {
@@ -705,6 +706,7 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			allOk = false
 			failedAt = i
 			failedReason = outcome.Reason
+			failedOutOfCalls = outcome.OutOfCalls
 			failedFrom = execFrom
 			break
 		}
@@ -723,14 +725,19 @@ func (a *agent) orchestrate(ctx context.Context, sid string) (toolLoopResult, er
 			break
 		}
 
-		bag := issueBag([]string{failedReason})
+		// Out of calls is the same sentence for any step, whatever it did: three different
+		// steps that ran long, the last one close to done, were "the same failure 3 times".
+		// maxReplans still bounds them.
 		dupCount := 1
-		for _, prev := range failureBags {
-			if jaccard(bag, prev) >= failureSimilarityThreshold {
-				dupCount++
+		if !failedOutOfCalls {
+			bag := issueBag([]string{failedReason})
+			for _, prev := range failureBags {
+				if jaccard(bag, prev) >= failureSimilarityThreshold {
+					dupCount++
+				}
 			}
+			failureBags = append(failureBags, bag)
 		}
-		failureBags = append(failureBags, bag)
 
 		a.say(ctx, sid, fmt.Sprintf("⚠ Task %d/%d failed: %s\n", failedAt+1, len(plan.Subtasks), failedReason))
 

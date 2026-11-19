@@ -292,6 +292,50 @@ func (a *agent) parkableJobs(sid string, since time.Time) string {
 	return a.runningBgJobs(sid, func(j *backgroundJob) bool { return j.started.After(since) && j.kind != jobServer })
 }
 
+// stoppedJob is a job the model stopped before it finished.
+type stoppedJob struct {
+	id    int
+	ran   time.Duration
+	files []string // where its output went, with sizes, as redirectNote finds them
+}
+
+// killArgsRe: the arguments of each `kill` in a command line.
+var killArgsRe = regexp.MustCompile(`\bkill\b([^;&|\n]*)`)
+
+// jobsStoppedBy names this session's running jobs, started after since, that cmd kills
+// by the pid or process group codehalter gave for them (stopHint's line, which the model
+// copies). Exact, not guessed from the command's text: a stop that names no pid (pkill)
+// is missed, which only costs the warning. `kill -0` checks, it stops nothing; a server
+// is meant to be stopped.
+func (a *agent) jobsStoppedBy(sid, cmd string, since time.Time) []stoppedJob {
+	pids := map[int]bool{}
+	for _, m := range killArgsRe.FindAllStringSubmatch(stripHeredocBodies(cmd), -1) {
+		fields := strings.Fields(m[1])
+		if slices.Contains(fields, "-0") {
+			continue
+		}
+		for _, f := range fields {
+			if n, err := strconv.Atoi(strings.TrimPrefix(f, "-")); err == nil && n > 1 {
+				pids[n] = true
+			}
+		}
+	}
+	if len(pids) == 0 {
+		return nil
+	}
+	a.bgMu.Lock()
+	defer a.bgMu.Unlock()
+	var out []stoppedJob
+	for _, id := range slices.Sorted(maps.Keys(a.bgJobs)) {
+		j := a.bgJobs[id]
+		if j.sid != sid || j.kind == jobServer || !j.started.After(since) || j.pid <= 0 || !pids[j.pid] {
+			continue
+		}
+		out = append(out, stoppedJob{id: j.id, ran: time.Since(j.started), files: freshTargets(j.redirects, j.started)})
+	}
+	return out
+}
+
 var parkPoll = 500 * time.Millisecond
 
 // parkForJobs returns what resumes a parked turn: the queued job notes and the
@@ -409,6 +453,64 @@ func readLogTail(path string, max int) string {
 	return out
 }
 
+// outputSoFar is readLogTail, and when that is empty while the command sends its
+// output to a file of its own, a line saying so: an empty "Output so far" read as
+// hung, and a minimiser was killed and started again with a new seed 40 times while
+// it wrote to /tmp/locN.log. Only a file the command could have written counts: one
+// modified since the job started, which a `>` does when it truncates; a guess from
+// the text that never ran (`=1` from `while step>=1:`) never exists.
+func outputSoFar(job *backgroundJob, max int, running bool) string {
+	tail := readLogTail(job.logPath, max)
+	if strings.TrimSpace(tail) != "" {
+		return tail
+	}
+	return tail + redirectNote(job.cmdStr, job.redirects, job.started, running)
+}
+
+// mtimeSlack: file systems that keep mtimes in whole seconds (or two, FAT) date a
+// write a moment before the job's own start.
+const mtimeSlack = 2 * time.Second
+
+var pythonRe = regexp.MustCompile(`\bpython[0-9.]*\b`)
+
+// freshTargets: the targets the command could have written, each as "path (size so far)":
+// regular files modified since it started, which a `>` does when it truncates.
+func freshTargets(targets []string, started time.Time) []string {
+	var files []string
+	seen := map[string]bool{}
+	for _, f := range targets {
+		st, err := os.Stat(f)
+		if err != nil || !st.Mode().IsRegular() || st.ModTime().Before(started.Add(-mtimeSlack)) || seen[f] {
+			continue
+		}
+		seen[f] = true
+		files = append(files, fmt.Sprintf("%s (%s so far)", f, humanBytes(int(st.Size()))))
+	}
+	return files
+}
+
+// redirectNote: running, the buffer remark too; after the exit the buffers are flushed.
+func redirectNote(cmd string, targets []string, started time.Time, running bool) string {
+	files := freshTargets(targets, started)
+	if len(files) == 0 {
+		return ""
+	}
+	empty := slices.ContainsFunc(files, func(f string) bool { return strings.HasSuffix(f, " (0b so far)") })
+	if !running {
+		return "[codehalter: nothing here because the command wrote its output to " + strings.Join(files, ", ") + ". Read it with `cat`.]\n"
+	}
+	note := "[codehalter: nothing here because the command writes its output to " + strings.Join(files, ", ") +
+		"; an empty terminal says nothing about whether it is working. Read the file with `cat`."
+	if empty {
+		note += " A program writing to a file may keep its output in a buffer until it ends"
+		if pythonRe.MatchString(cmd) {
+			note += " (Python does: `python3 -u` or PYTHONUNBUFFERED=1 writes each line as it goes)"
+		}
+		note += "."
+	}
+	return note + "]\n"
+}
+
 func readPidFile(path string) int {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -438,7 +540,7 @@ func runBackgroundExecute(ctx context.Context, a *agent, sid string, rawArgs str
 	idle := fmt.Sprintf("call `respond` saying you are waiting for job %d: that parks this step, it does not end it, and you continue here the moment the job reports. "+
 		"A job whose processes neither use CPU nor write output for %s is stuck and gets stopped; a server or a watcher, which never ends on its own, belongs in `run_server`", job.id, humanDuration(bgStuckAfter.Milliseconds()))
 	result := fmt.Sprintf("background job %d running (pid %d). It keeps running across tool calls and across turns. When it exits, codehalter reports the exit code and the last output by itself, so do NOT poll or sleep waiting for it: carry on with other work, or if there is none, %s.%s Read its output any time with `run_command: cat %s` (or tail/grep it); %s. Output so far:\n\n%s",
-		job.id, job.pid, idle, wake, job.logPath, stop, readLogTail(job.logPath, bgLogTailCap))
+		job.id, job.pid, idle, wake, job.logPath, stop, outputSoFar(job, bgLogTailCap, true))
 	a.retitleToolCall(ctx, sid, job.tcId, fmt.Sprintf("Background: %s (pid %d)", job.cmdStr, job.pid), "completed")
 	return result, false
 }
@@ -604,7 +706,7 @@ func (a *agent) watchBgJob(job *backgroundJob, stop chan struct{}) {
 		job:  job.id,
 		line: fmt.Sprintf("background job %d `%s` %s after %s", job.id, truncate(job.cmdStr, 80), outcome, took),
 		full: fmt.Sprintf("[codehalter, not the user: background job %d `%s` %s after %s. Full log: %s. Last output:]\n\n%s",
-			job.id, job.cmdStr, outcome, took, job.logPath, readLogTail(job.logPath, bgNoteTailCap)),
+			job.id, job.cmdStr, outcome, took, job.logPath, outputSoFar(job, bgNoteTailCap, false)),
 	})
 	forget()
 	a.deliverBgNotesWhenIdle(sess)

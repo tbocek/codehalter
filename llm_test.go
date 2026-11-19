@@ -52,6 +52,14 @@ func TestConnForBackgroundLLM(t *testing.T) {
 			wantServer: "u2", wantSlot: 2, wantOnMain: false,
 		},
 		{
+			name: "slots number across entries: after a 4-slot llm[0-3] comes llm[4]",
+			llm: []LLMConnection{
+				{Server: "u0", Model: "m0", Parallel: ptr(4)},
+				{Server: "u1", Model: "m1", Parallel: ptr(2), Purpose: "summary"},
+			},
+			wantServer: "u1", wantSlot: 4, wantOnMain: false,
+		},
+		{
 			name: "a saturated summariser falls back rather than queue",
 			llm: []LLMConnection{
 				{Server: "u0", Model: "m0", Parallel: ptr(1)},
@@ -832,5 +840,17 @@ func TestEveryCallReportsUsageAndSpeeds(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("no usage update")
+	}
+}
+
+// The startup lines name an entry by the slots the request lines use.
+func TestSlotLabel(t *testing.T) {
+	s := Settings{LLM: []LLMConnection{{Parallel: ptr(4)}, {Parallel: ptr(1)}, {Parallel: ptr(2)}}}
+	var got []string
+	for i := range s.LLM {
+		got = append(got, s.slotLabel(i))
+	}
+	if want := "llm[0-3] llm[4] llm[5-6]"; strings.Join(got, " ") != want {
+		t.Errorf("labels = %v, want %s", got, want)
 	}
 }

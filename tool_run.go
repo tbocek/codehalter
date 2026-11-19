@@ -308,7 +308,7 @@ func runCmdExecute(ctx context.Context, a *agent, sid string, rawArgs string) (s
 		"When it exits, codehalter hands you its exit code and last output by itself, before your next step.%s "+
 		"Do other work meanwhile if there is any; if not, call `respond` saying you are waiting for job %d: that parks the turn, it does not end it, and you continue here the moment the job reports. "+
 		"Never sleep or poll for it. Read its output any time with `run_command: cat %s`; %s. Output so far:\n\n%s",
-		waited, job.id, job.pid, wake, job.id, job.logPath, stopHint(job.pid), readLogTail(job.logPath, bgLogTailCap)), false
+		waited, job.id, job.pid, wake, job.id, job.logPath, stopHint(job.pid), outputSoFar(job, bgLogTailCap, true)), false
 }
 
 // toolHints returns (note for the model, chat line for the user). There are

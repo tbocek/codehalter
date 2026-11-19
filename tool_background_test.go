@@ -575,3 +575,52 @@ func TestRunServer(t *testing.T) {
 		t.Errorf("a server that dies at start: %s", res)
 	}
 }
+
+// An empty "Output so far" names the file the output goes to, but only a file the
+// command could have written: one touched since the job started. A guess from the
+// text that never ran, or an old file of an earlier command, says nothing.
+func TestRedirectNote(t *testing.T) {
+	dir := t.TempDir()
+	started := time.Now()
+	fresh, stale, full := filepath.Join(dir, "loc47.log"), filepath.Join(dir, "old.log"), filepath.Join(dir, "full.log")
+	for _, f := range []string{fresh, stale} {
+		if err := os.WriteFile(f, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(full, []byte("start 2271 fails True\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := started.Add(-time.Hour)
+	if err := os.Chtimes(stale, old, old); err != nil {
+		t.Fatal(err)
+	}
+	py := "python3 - <<'EOF' > " + fresh + " 2>&1\nprint(1)\nEOF"
+	for _, tc := range []struct {
+		name, cmd string
+		targets   []string
+		running   bool
+		want, not []string
+	}{
+		{"fresh empty python file", py, []string{fresh}, true, []string{fresh + " (0b so far)", "python3 -u"}, nil},
+		{"never created, or stale", "x", []string{filepath.Join(dir, "=1"), stale, dir}, true, nil, nil},
+		{"a file with output: no buffer remark", "./bench > " + full, []string{full, full}, true, []string{full + " (22b so far)"}, []string{"buffer", full + " (22b so far), "}},
+		{"not python: the remark without the flag", "./bench > " + fresh, []string{fresh}, true, []string{"buffer"}, []string{"python3 -u"}},
+		{"exited: flushed, no remark", py, []string{fresh}, false, []string{"wrote its output to " + fresh}, []string{"buffer", "working"}},
+	} {
+		got := redirectNote(tc.cmd, tc.targets, started, tc.running)
+		if (len(tc.want) == 0) != (got == "") {
+			t.Errorf("%s: note = %q", tc.name, got)
+		}
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("%s: note lacks %q: %s", tc.name, w, got)
+			}
+		}
+		for _, n := range tc.not {
+			if strings.Contains(got, n) {
+				t.Errorf("%s: note has %q: %s", tc.name, n, got)
+			}
+		}
+	}
+}
