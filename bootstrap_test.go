@@ -72,6 +72,8 @@ func devMounts(t *testing.T, raw string) ([]string, map[string]any) {
 	return m.Mounts, m.ContainerEnv
 }
 
+// Base has only the config mount: .git is writable through the workspace bind,
+// no line of its own. A read-only .git, .gitconfig and ssh are opt-in.
 func TestBuildDevcontainerJSON(t *testing.T) {
 	has := func(mounts []string, sub string) bool {
 		return slices.ContainsFunc(mounts, func(m string) bool { return strings.Contains(m, sub) })
@@ -85,16 +87,16 @@ func TestBuildDevcontainerJSON(t *testing.T) {
 	}
 
 	gm, _ := devMounts(t, buildDevcontainerJSON(true, false, false))
-	if !has(gm, "containerWorkspaceFolder}/.git") {
-		t.Errorf("gitWritable must add the .git mount, got %v", gm)
+	if !has(gm, "containerWorkspaceFolder}/.git,type=bind,readonly") {
+		t.Errorf("gitReadonly must add a readonly .git mount, got %v", gm)
 	}
 	if has(gm, "/.gitconfig") || has(gm, "ssh-agent") {
 		t.Errorf("git-only must not add gitconfig/ssh, got %v", gm)
 	}
 
-	gcm, _ := devMounts(t, buildDevcontainerJSON(true, true, false))
-	if !has(gcm, "containerWorkspaceFolder}/.git") || !has(gcm, "/.gitconfig") {
-		t.Errorf("git+gitconfig must add both, got %v", gcm)
+	cm, _ := devMounts(t, buildDevcontainerJSON(false, true, false))
+	if !has(cm, "/.gitconfig") || has(cm, "/.git,") {
+		t.Errorf("gitconfig-only must add just .gitconfig, got %v", cm)
 	}
 
 	sm, senv := devMounts(t, buildDevcontainerJSON(false, false, true))

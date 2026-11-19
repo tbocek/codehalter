@@ -22,7 +22,7 @@ An [ACP](https://agentclientprotocol.com)-compatible AI coding agent that connec
 
 ## Features
 
-- **Devcontainer scaffolding (5 base distros)**: the first session prompts `Alpine / Arch / Debian / Fedora / Ubuntu` and writes `.devcontainer/Dockerfile` + `devcontainer.json` for the chosen base. Each image installs a minimal toolchain (git, curl, sudo, Firefox) and installs codehalter into `~/.local/bin` (added to the container `PATH`) under a passwordless `dev` sudo user; for community-repo installs (the last resort in the skills' install order) the Arch variant adds the `yay` AUR helper, Fedora the COPR plugin, Ubuntu `add-apt-repository`, and Debian pre-enables backports. Language toolchains (go, node, clang, …) are added per project on demand. The seeded `devcontainer.json` bind-mounts the host's `.gitconfig` (so the agent's git sees your identity) and the project's `.git` directory (read-write), the agent works with real git but is **instructed never to commit, push, or rewrite history on its own**, only when you explicitly ask.
+- **Devcontainer scaffolding (5 base distros)**: the first session prompts `Alpine / Arch / Debian / Fedora / Ubuntu` and writes `.devcontainer/Dockerfile` + `devcontainer.json` for the chosen base. Each image installs a minimal toolchain (git, curl, sudo, Firefox) and installs codehalter into `~/.local/bin` (added to the container `PATH`) under a passwordless `dev` sudo user; for community-repo installs (the last resort in the skills' install order) the Arch variant adds the `yay` AUR helper, Fedora the COPR plugin, Ubuntu `add-apt-repository`, and Debian pre-enables backports. Language toolchains (go, node, clang, …) are added per project on demand. `.git` is writable through the normal workspace mount; the scaffold asks whether to make it read-only, mount the host's `~/.gitconfig` (so the agent's git sees your identity) and forward the host SSH agent (both opt-in mounts list No first, so a scripted run leaves them off). The agent works with real git but is **instructed never to commit, push, or rewrite history on its own**, only when you explicitly ask.
 - **Commit workflow**: the agent never commits or pushes on its own. When you ask (or type `/commit`), it drafts the message from `git status --porcelain` + `git diff HEAD` with the conversation as intent, writes it to `.codehalter/.git_commit`, and runs `git commit -F .codehalter/.git_commit` (and `git push` if asked) itself, falling back to handing you the host command on an older read-only container.
 - **Bring-your-own MCP**: `.codehalter/mcp.toml` declares each `[[server]]` as a child process to spawn (`name`, `command`, `args`, `env`); tools it advertises are registered as `<name>__<tool>`. The seeded file declares no servers. Reconciled when the next prompt starts (never mid-turn, since the tool list is part of the prompt prefix): add or remove a `[[server]]` and the change applies at the next prompt without restarting; failed startups surface as a red tool-call card and mtime-gate so they don't re-emit until you edit the file.
 - **One slot is enough**: one `[[llm]]` entry works fully, even at `parallel = 1`: the background summariser rides the foreground context as a prefix-extension, so the KV cache stays warm. `llm[0]` owns the foreground KV cache; a second entry marked `purpose = "summary"` hosts the per-turn summariser and `web_read`'s page reader instead (falling back to `llm[0]` when it is unreachable or keeps failing). Each entry's `parallel = N` caps concurrent requests to match its server's capacity.
@@ -265,12 +265,14 @@ The common advice is to skip it for single-user chat, where every prompt is uniq
 No editor required. `--cli` runs codehalter's own ACP client in the same process and drives the agent over a pipe, so what reaches the agent is byte-for-byte the protocol Zed would speak:
 
 ```
-codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT] [--rebuild]
+codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [--list] [-p PROMPT] [--rebuild]
 
   --cli               run the standalone terminal client instead of an ACP server
   --cwd DIR           project directory (default: current directory)
   --resume [ID]       continue a stored session; without an ID, the most recent
                       one for this directory
+  --list              print the stored session IDs for this directory (newest
+                      first) and exit
   -p PROMPT           run one turn and exit, instead of opening a prompt. The
                       exit status is 0 only when the turn finished normally,
                       so a script can branch on it.
@@ -382,10 +384,15 @@ Codehalter edits files and runs build/test commands. Running it inside a [devcon
 
 Each image installs a **minimal** toolchain (git, curl, sudo, openssh, Firefox), creates a passwordless `dev` sudo user, and installs codehalter into `~/.local/bin` (added to `PATH`). Language toolchains (go, node, clang, rust, …) are added per project on demand, codehalter's skills and fix-cards offer to install what a given repo needs rather than baking everything into the base. All five seed a `devcontainer.json` that:
 
-1. Bind-mounts `${localWorkspaceFolder}/.git` (read-write) plus the SSH agent socket, so the agent can run git fully, including `git commit` / `git push`, **but it is instructed to do so only when you explicitly ask**, never on its own initiative or as a side effect. (Want a hard guarantee rather than an instruction? Add `,readonly` to this mount; the agent then falls back to handing you the commit command.)
-2. Bind-mounts `${localEnv:HOME}/.gitconfig` read-only into the dev user's home, so the in-container `git` sees your real `user.name` / `user.email` / signing key without any per-project setup.
-3. Bind-mounts `~/.config/codehalter` read-only so `settings.toml` is shared across every project as the global fallback (a project-local `.codehalter/settings.toml` still wins when present).
-4. Sets `containerEnv.DEVCONTAINER=true` so codehalter's startup banner shows `Container: devcontainer` and the `run_command` tool is registered.
+1. Bind-mounts `~/.config/codehalter` read-only so `settings.toml` is shared across every project as the global fallback (a project-local `.codehalter/settings.toml` still wins when present).
+2. Sets `containerEnv.DEVCONTAINER=true` so codehalter's startup banner shows `Container: devcontainer` and the `run_command` tool is registered.
+3. Adds `--add-host host.docker.internal:host-gateway`, so the container can reach services on the host (e.g. a local LLM server) on Linux too, where Docker does not define that name by itself.
+
+`.git` comes in with the workspace mount, **read-write**, so the agent can run git fully, including `git commit` / `git push`, **but it is instructed to do so only when you explicitly ask**, never on its own initiative or as a side effect. The scaffold then asks about three optional mounts, each added only when you say yes (and only when its source exists on the host, since a missing bind source fails the container start):
+
+- **Read-only `.git`**: `source=${localWorkspaceFolder}/.git,target=${containerWorkspaceFolder}/.git,type=bind,readonly` shadows the writable copy, for a hard guarantee rather than an instruction; the agent then falls back to handing you the commit command. Default: no (listed first, so a scripted run takes it), `.git` stays writable and no line is added.
+- **`~/.gitconfig`** (read-only), so the in-container `git` sees your real `user.name` / `user.email` / signing key without any per-project setup.
+- **Host SSH agent**: binds `$SSH_AUTH_SOCK` to `/ssh-agent` and sets `SSH_AUTH_SOCK`, so `git push` / `ssh` can use your host keys. This gives the container every key loaded in your agent, so it is opt-in: No is listed first, so a scripted run leaves it off.
 
 After the container is built, point Zed at the in-container codehalter binary:
 
@@ -393,7 +400,7 @@ After the container is built, point Zed at the in-container codehalter binary:
 "Codehalter": { "type": "custom", "command": "codehalter", "args": [], "env": {} }
 ```
 
-If your LLM server runs on the host, change `server` in `~/.config/codehalter/settings.toml` to `http://host.docker.internal:8080`. For an existing language-stack devcontainer (e.g. `mcr.microsoft.com/devcontainers/go:1`), copy the four mounts above into its `devcontainer.json` and run `curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash` in its image, no need to start from one of the scaffolded bases.
+If your LLM server runs on the host, change `server` in `~/.config/codehalter/settings.toml` to `http://host.docker.internal:8080`. For an existing language-stack devcontainer (e.g. `mcr.microsoft.com/devcontainers/go:1`), copy the mounts above into its `devcontainer.json` and run `curl -sL https://raw.githubusercontent.com/tbocek/codehalter/main/install.sh | bash` in its image, no need to start from one of the scaffolded bases.
 
 ### Commits and pushes from inside the container
 
@@ -408,7 +415,7 @@ The agent never commits or pushes on its own, only when you explicitly ask. When
 
 3. It reports the commit subject (and branch, if pushed) in its reply.
 
-**Fallback:** on an older container that mounts `.git` read-only, or where `git push` lacks SSH auth, the agent doesn't fight it, it suggests the exact host-side `git commit … && git push` for you to run instead.
+**Fallback:** on a container that mounts `.git` read-only (the scaffold's opt-in), or where `git push` lacks SSH auth, the agent doesn't fight it, it suggests the exact host-side `git commit … && git push` for you to run instead.
 
 `.codehalter/` is gitignored on first bootstrap, so the draft file never accidentally gets staged.
 
@@ -500,7 +507,7 @@ Surveyed September 2026. "Local" means what the harness does for a self-hosted m
 
 ### What codehalter adds
 
-- **Devcontainer-first sandboxing posture**: auto-scaffolded `.devcontainer/` from any of five base distros (Alpine/Arch/Debian/Fedora/Ubuntu), host `.gitconfig` mounted read-only, plus an on-request commit flow (`/commit`) and a standing instruction never to commit or push on its own, so a commit is always your explicit call.
+- **Devcontainer-first sandboxing posture**: auto-scaffolded `.devcontainer/` from any of five base distros (Alpine/Arch/Debian/Fedora/Ubuntu), host `.gitconfig` mounted read-only on request, plus an on-request commit flow (`/commit`) and a standing instruction never to commit or push on its own, so a commit is always your explicit call.
 - **Native MCP client**: `.codehalter/mcp.toml` spawns each `[[server]]` as a long-lived child, registers its tools under `<name>__<tool>`, and reconciles when the next prompt starts. Dual-era: each server is probed via `server/discover` and spoken to with the stateless 2026-07-28 revision ("MCP 2", per-request `_meta` + mirrored `Mcp-Method`/`Mcp-Name`/`Mcp-Param-*` headers, no sessions) when it supports it, with automatic fallback to the 2025-06-18 initialize/session handshake for everything else.
 - **Slot-aware LLM routing for local servers**: per-conn `parallel = N` semaphores, and the per-turn summariser routed off the foreground KV-cache slot (or, on a single slot, riding it as a prefix-extension), so the main session's prefix cache stays warm.
 - **Plan → per-subtask self-verifying loop → Document pipeline** built in, not delegated to an extension: the planner decomposes into subtasks each carrying its own verify recipe; the executor runs the recipe itself before declaring done; failed subtasks trigger a replan (≤20 per prompt) with fuzzy duplicate-failure detection (Jaccard over issue words) escalating the note when the same problem recurs; the document pass updates the README only when the change is user-visible.

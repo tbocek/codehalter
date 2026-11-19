@@ -32,6 +32,17 @@ func (a *agent) askYesNoWithCard(ctx context.Context, sid, title, kind, yesLabel
 	return choice == "yes", tcId, err
 }
 
+// askNoYesWithCard is askYesNoWithCard with No listed first, for opt-in prompts
+// (the host SSH agent, a read-only .git): a scripted run whose input ran out
+// takes the first option, so these default to No.
+func (a *agent) askNoYesWithCard(ctx context.Context, sid, title, kind, yesLabel, noLabel string) (bool, string, error) {
+	choice, tcId, err := a.askCard(ctx, sid, title, kind, []permissionOption{
+		{OptionId: "no", Name: noLabel, Kind: "reject_once"},
+		{OptionId: "yes", Name: yesLabel, Kind: "allow_once"},
+	})
+	return choice == "yes", tcId, err
+}
+
 func (a *agent) askChoice(ctx context.Context, sid string, tcId, question string, choices []string) (string, error) {
 	choice, err := a.doPermissionRequest(ctx, permissionRequest{
 		SessionId: sid,

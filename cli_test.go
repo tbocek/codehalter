@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -841,6 +842,26 @@ func TestResumeWithoutIDPicksFromTheList(t *testing.T) {
 	}
 	p.reply(req, map[string]any{})
 	<-done
+}
+
+func TestPrintSessionList(t *testing.T) {
+	cwd := t.TempDir()
+	dir := filepath.Join(cwd, sessionDir)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"session_abc.toml", "session_sub_x.toml", "other.toml"} {
+		if err := os.WriteFile(filepath.Join(dir, n), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var buf strings.Builder
+	if code := printSessionList(&buf, cwd); code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if got := buf.String(); !strings.HasPrefix(got, "abc  ") || strings.Count(got, "\n") != 1 {
+		t.Errorf("list = %q, want just abc", got)
+	}
 }
 
 // exit and quit leave, as in a shell, with or without the slash; a sentence that starts with

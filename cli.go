@@ -25,12 +25,14 @@ import (
 // The standalone CLI talks real ACP to the in-process agent over pipes, so framing and
 // ordering bugs show up here too. fs is not advertised: the CLI has no unsaved buffers.
 
-const cliUsage = `usage: codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [-p PROMPT]
+const cliUsage = `usage: codehalter --cli [--cwd DIR] [--resume [SESSION_ID]] [--list] [-p PROMPT]
 
   --cli               run the standalone terminal client instead of an ACP server
   --cwd DIR           project directory (default: current directory)
   --resume [ID]       continue a stored session; without an ID, the most recent
                       one for this directory
+  --list              print the stored session IDs for this directory (newest
+                      first) and exit
   -p PROMPT           run one turn and exit, instead of opening a prompt. The
                       exit status is 0 only when the turn finished normally,
                       so a script can branch on it.
@@ -48,7 +50,7 @@ reconfigures the LLM connection.
 func runCLI(argv []string) int {
 	cwd, _ := os.Getwd()
 	resumeID, prompt := "", ""
-	resume, oneshot, rebuild := false, false, false
+	resume, oneshot, rebuild, list := false, false, false, false
 	for i := 0; i < len(argv); i++ {
 		switch argv[i] {
 		case "--cwd":
@@ -73,6 +75,8 @@ func runCLI(argv []string) int {
 			prompt, oneshot = argv[i], true
 		case "--rebuild":
 			rebuild = true
+		case "--list":
+			list = true
 		case "--help", "-h":
 			fmt.Print(cliUsage)
 			return 0
@@ -87,6 +91,11 @@ func runCLI(argv []string) int {
 		return 2
 	}
 	cwd = abs
+
+	// Session files are readable from the host too, so --list needs no container or agent.
+	if list {
+		return printSessionList(os.Stdout, cwd)
+	}
 
 	// Before anything is opened: an update re-execs this binary, and nothing exists yet to lose.
 	offerUpdate(context.Background(), cwd, stdinIsTTY() && !oneshot)
@@ -161,6 +170,23 @@ func runCLI(argv []string) int {
 	code := c.run(resume, resumeID, prompt, oneshot)
 	shutdown()
 	return code
+}
+
+// printSessionList prints this directory's session IDs, newest first, for --resume.
+func printSessionList(w io.Writer, cwd string) int {
+	sessions, err := listSessions(cwd)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "listing sessions: %v\n", err)
+		return 1
+	}
+	if len(sessions) == 0 {
+		fmt.Fprintln(os.Stderr, "no stored sessions for "+cwd)
+		return 0
+	}
+	for _, s := range sessions {
+		fmt.Fprintf(w, "%s  %s\n", s.SessionId, s.UpdatedAt)
+	}
+	return 0
 }
 
 func stdinIsTTY() bool { return isTerminal(os.Stdin) }

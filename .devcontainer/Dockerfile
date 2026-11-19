@@ -1,10 +1,13 @@
 # codehalter bootstrap assisted
-FROM alpine:3.24
+FROM quay.io/archlinux/archlinux:base-devel
 
-RUN apk update && apk add --no-cache \
-        ca-certificates curl git sudo openssh-client gcompat \
-        bash shadow nodejs npm \
-        firefox-esr
+RUN pacman -Syu --noconfirm --needed \
+        ca-certificates \
+        curl \
+        git \
+        openssh \
+        firefox \
+    && rm -rf /var/cache/pacman/pkg/*
 
 RUN groupadd --gid 1000 dev \
     && useradd --uid 1000 --gid 1000 -m -s /bin/bash -G wheel dev \
@@ -13,6 +16,13 @@ RUN groupadd --gid 1000 dev \
 
 USER dev
 WORKDIR /home/dev
+# AUR helper for 3rd-choice installs (see SKILL-arch.md). yay-bin is the
+# prebuilt AUR package, so this is one makepkg run, not a Go compile; the
+# base-devel image ships makepkg and the dev user's NOPASSWD sudo covers the
+# dependency installs.
+RUN git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin \
+    && cd /tmp/yay-bin && makepkg -si --noconfirm \
+    && rm -rf /tmp/yay-bin
 # install.sh installs to ~/.local/bin as the non-root dev user; put it on PATH.
 ENV PATH="/home/dev/.local/bin:${PATH}"
 # ADD re-fetches the tags JSON every build (via ETag): a new codehalter release
