@@ -352,14 +352,27 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	slots := a.settings.LLM[0].parallelCap()
 	a.cfgMu.Unlock()
 
+	var why string
 	switch {
 	case conns[0].ContextSize != nil && *conns[0].ContextSize > 0:
 		a.mainSlotTokens.Store(int64(*conns[0].ContextSize / slots))
+		why = fmt.Sprintf("context_size %d in settings.toml", *conns[0].ContextSize)
+		if slots > 1 {
+			why += fmt.Sprintf(" ÷ %d slots", slots)
+		}
 	case results[0].SlotCtx > 0:
 		a.mainSlotTokens.Store(int64(results[0].SlotCtx))
+		why = fmt.Sprintf("per-slot n_ctx %d reported by the server", results[0].SlotCtx)
 	case results[0].ContextSize > 0:
 		a.mainSlotTokens.Store(int64(results[0].ContextSize / slots))
+		why = fmt.Sprintf("n_ctx %d reported by the server", results[0].ContextSize)
+		if slots > 1 {
+			why += fmt.Sprintf(" ÷ %d slots", slots)
+		}
 	}
+	a.cfgMu.Lock()
+	a.mainSlotWhy = why
+	a.cfgMu.Unlock()
 	slog.Info("probeAllLLMs", "slots", slots, "mainSlotTokens", a.mainSlotTokens.Load(),
 		"slotCtx", results[0].SlotCtx, "totalCtx", results[0].ContextSize, "totalSlots", results[0].TotalSlots)
 	// Only LLM[0] consumes images, and ACP advertises one agent-wide image capability.
@@ -373,8 +386,12 @@ func (a *agent) probeAllLLMs(ctx context.Context) {
 	}
 }
 
-func connPurpose(conns []LLMConnection, i int) string {
-	hasSummariser := slices.ContainsFunc(conns[1:], func(c LLMConnection) bool { return strings.EqualFold(c.Purpose, purposeSummary) })
+func connPurpose(conns []LLMConnection, probes map[string]probeResult, i int) string {
+	// An unprobed entry (absent from probes) counts as live, matching connForBackgroundLLM.
+	hasSummariser := slices.ContainsFunc(conns[1:], func(c LLMConnection) bool {
+		p, ok := probes[c.Server+"\x00"+c.Model]
+		return strings.EqualFold(c.Purpose, purposeSummary) && (!ok || p.usable())
+	})
 	switch {
 	case i == 0 && hasSummariser:
 		return "the session (planning, execution, documentation)"
@@ -392,6 +409,7 @@ func (a *agent) renderLLMStatus() string {
 	conns := slices.Clone(a.settings.LLM)
 	path := a.settings.path
 	probes := a.connProbe
+	slotWhy := a.mainSlotWhy
 	a.cfgMu.RUnlock()
 	if len(conns) == 0 {
 		return "🟡 LLM: no [[llm]] in settings.toml: codehalter cannot run until you add one.\n\n"
@@ -418,13 +436,13 @@ func (a *agent) renderLLMStatus() string {
 			if len(pr.AvailableModels) > 0 {
 				avail = "it offers: " + strings.Join(pr.AvailableModels, ", ")
 			}
-			fmt.Fprintf(&b, "🟡 %s: reachable at %s, but model `%s` isn't in its /v1/models list, so requests may return an empty response. Check `model =` in settings.toml (%s). Harmless if your gateway lists models under different ids or doesn't enumerate them.\n\n", label, c.Server, c.Model, avail)
+			fmt.Fprintf(&b, "🟡 %s: reachable at %s, but model `%s` isn't in its /v1/models list, so requests may return an empty response. Check `model =` in settings.toml (%s). Background work runs on llm[0] instead until this is fixed.\n\n", label, c.Server, c.Model, avail)
 			if firstReachable < 0 {
 				firstReachable = i
 			}
 			continue
 		}
-		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d) · %s\n\n", label, c.Model, c.Server, c.parallelCap(), connPurpose(conns, i))
+		fmt.Fprintf(&b, "✅ %s: %s @ %s (parallel=%d) · %s\n\n", label, c.Model, c.Server, c.parallelCap(), connPurpose(conns, probes, i))
 		// Roles differing in non-sampler params get two renderings, so every phase switch re-reads
 		// what the other role appended; the rewind detector only notices after the tokens are spent.
 		if think, exec := renderKey(c.paramsFor("thinking")), renderKey(c.paramsFor("execute")); think != exec {
@@ -456,11 +474,11 @@ func (a *agent) renderLLMStatus() string {
 		fmt.Fprintf(&b, "🟡 Context window: only %d tokens/slot; codehalter requires at least %d. Raise `context_size` in settings.toml, increase your server's launch flag (`-c N` / `--max-model-len N`), or reduce `parallel`.\n\n", mst, minSlotTokens)
 	default:
 		inputCap := mst * compactTriggerPct / 100
-		if pc := conns[0].parallelCap(); pc > 1 {
-			fmt.Fprintf(&b, "✅ Context window: %d tokens/slot (n_ctx %d ÷ %d slots, max prompt %d)\n\n", mst, mst*pc, pc, inputCap)
-		} else {
-			fmt.Fprintf(&b, "✅ Context window: %d tokens (max prompt %d)\n\n", mst, inputCap)
+		unit := "tokens"
+		if conns[0].parallelCap() > 1 {
+			unit = "tokens/slot"
 		}
+		fmt.Fprintf(&b, "✅ Context window: %d %s (%s; compaction at %d%%: max prompt %d)\n\n", mst, unit, slotWhy, compactTriggerPct, inputCap)
 	}
 	return b.String()
 }

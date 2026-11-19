@@ -83,6 +83,9 @@ type agent struct {
 	// 0 means unknown, which ensureLLM treats like "below minSlotTokens". Atomic: a
 	// background llmStream reads it while the next turn's probe rewrites it.
 	mainSlotTokens atomic.Int64
+	// mainSlotWhy names where mainSlotTokens came from, in the numbers that were
+	// reported or declared, never a derived total. Guarded by cfgMu.
+	mainSlotWhy string
 
 	imagesSupported atomic.Bool
 

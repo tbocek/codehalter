@@ -607,6 +607,14 @@ func TestBackgroundSkipsDeadSummariser(t *testing.T) {
 	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: false}}
 	wantMain(t, a, "probe says unreachable")
 
+	a = newAgent()
+	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: true, ModelKnown: true, AvailableModels: []string{"other"}}}
+	wantMain(t, a, "model missing from /v1/models")
+
+	a = newAgent()
+	a.connProbe = map[string]probeResult{"sum\x00ms": {Reachable: true, ModelKnown: true, ModelLoaded: true}}
+	wantSummariser(t, a, "model listed")
+
 	// A probe result for some OTHER endpoint must not take this one out.
 	a = newAgent()
 	a.connProbe = map[string]probeResult{"elsewhere\x00mx": {Reachable: false}}

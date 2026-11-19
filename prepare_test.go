@@ -445,6 +445,14 @@ func TestProbeAllLLMsAutoDetectsSlots(t *testing.T) {
 	if a.mainSlotTokens.Load() != 16384 {
 		t.Errorf("mainSlotTokens: got %d, want 16384 (per-slot n_ctx used directly, no division)", a.mainSlotTokens.Load())
 	}
+	// The status quotes what the server reported, never a total derived as per-slot × slots.
+	status := a.renderLLMStatus()
+	if !strings.Contains(status, "16384 tokens/slot (per-slot n_ctx 16384 reported by the server") {
+		t.Errorf("status should cite the reported per-slot n_ctx, got:\n%s", status)
+	}
+	if strings.Contains(status, "32768") {
+		t.Errorf("status shows a made-up total 32768 (16384 × 2), got:\n%s", status)
+	}
 }
 
 // Router mode: bare /props reports n_ctx=0; the model's comes from ?model=<id>. The id has a

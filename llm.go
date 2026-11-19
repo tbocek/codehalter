@@ -765,8 +765,8 @@ func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnecti
 	meterStart := time.Now()
 	defer a.startStatusMeter(ctx, sid, func() string {
 		if g := atomic.LoadInt64(&genChars); g > 0 {
-			// chars/4 approximates tokens.
-			return fmt.Sprintf("llm[%s] ↑%s ↓%s tok", slotLabel, upLabel, humanCount(int(g)/4))
+			// Characters as counted: the stream reports no token count until it ends.
+			return fmt.Sprintf("llm[%s] ↑%s ↓%s chars", slotLabel, upLabel, humanCount(int(g)))
 		}
 		return fmt.Sprintf("llm[%s] ↑%s sent %ds", slotLabel, upLabel, int(time.Since(meterStart).Seconds()))
 	})()
@@ -833,6 +833,10 @@ type probeResult struct {
 	// llama.cpp's -np; 0 = unknown.
 	TotalSlots int
 }
+
+// usable is false for a dead server and for one whose /v1/models omits the model:
+// a gateway answers an unknown id with an empty 200, so neither is worth a call.
+func (r probeResult) usable() bool { return r.Reachable && (!r.ModelKnown || r.ModelLoaded) }
 
 // /v1/models works on every backend; /props is a llama.cpp-only enrichment.
 func probeLLM(ctx context.Context, conn *LLMConnection) probeResult {
@@ -990,8 +994,8 @@ func (a *agent) connForBackgroundLLM() (*LLMConnection, bool) {
 		if !strings.EqualFold(a.settings.LLM[i].Purpose, purposeSummary) {
 			continue
 		}
-		if p, ok := a.connProbe[a.settings.LLM[i].Server+"\x00"+a.settings.LLM[i].Model]; ok && !p.Reachable {
-			slog.Debug("background llm: summariser unreachable, using llm[0]", "server", a.settings.LLM[i].Server)
+		if p, ok := a.connProbe[a.settings.LLM[i].Server+"\x00"+a.settings.LLM[i].Model]; ok && !p.usable() {
+			slog.Debug("background llm: summariser unusable, using llm[0]", "server", a.settings.LLM[i].Server)
 			break
 		}
 		if a.summaryStrikes.Load() >= summaryMaxStrikes &&
