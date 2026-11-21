@@ -18,6 +18,7 @@ One for a narrow request, several only for separately checkable parts. Each has:
 
 - `description`: opens with what to read first, then the exact change, naming files, functions, commands and packages. The executor copies what it is shown:
   `Read first: rust/src/ui/window.rs fn press_label_apply; rust/tests/label_widgets.rs lines 1-60; its callers: grep -rn "press_label_apply(" rust/src`
+  A quoted line number, signature or existing snippet is a lead the executor must re-check, not an instruction: cite what to look at and say the change you want, rather than prescribing a patch you have not verified.
 - `verify`: the commands it must run. Changed behaviour: the project's test target, and a new test when none covers it. A value, text or config change needs no new test. A pure lookup has none.
 
 ## Replanning

@@ -409,7 +409,7 @@ func TestSpecRoundSkipsTheDocumenter(t *testing.T) {
 	for _, fenced := range []bool{false, true} {
 		a, s, mock := planPhaseAgent(t,
 			sseToolCall("p1", submitPlanToolName, `{"clear":true,"subtasks":[{"description":"change a.rs"}]}`),
-			sseToolCall("w1", "write_file", `{"path":"a.rs","content":"x"}`),
+			sseToolCall("w1", "write_file", `{"path":"a.rs","content":"fn main() {}\n"}`),
 			sseToolCall("e1", respondToolName, `{"message":"changed"}`),
 			sseText("nothing to document"),
 		)

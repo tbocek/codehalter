@@ -62,6 +62,12 @@ const (
 type fixProblem struct {
 	desc   string
 	prompt string
+	// notice is said and done with: there is nothing to accept, usually because nobody is
+	// there to answer. Offering it would ask "fix it?" over an empty prompt.
+	notice bool
+	// install runs in Go instead of dispatching a model turn: nothing needs judgement
+	// when the project's languages already say what to install and how.
+	install func(ctx context.Context, sid string)
 }
 
 func (a *agent) projectIsEmpty() bool {
@@ -531,6 +537,13 @@ func (a *agent) checkEnv(sess *Session, sid string) []fixProblem {
 	}
 
 	var probs []fixProblem
+	if !checkDone(sess.Cwd, checkSyntaxTools) {
+		if gaps := detectSyntaxGaps(stacks, sess.Cwd); len(gaps) > 0 {
+			markCheckDone(sess.Cwd, checkSyntaxTools)
+			probs = append(probs, syntaxToolProblem(a, sess.Cwd, gaps))
+		}
+	}
+
 	if len(missing) > 0 {
 		// Name the OS so the model need not rediscover it; "Linux" covers a container without os-release.
 		distro := osi.Fields["PRETTY_NAME"]
@@ -581,6 +594,7 @@ const minFilesForBrief = 5
 const (
 	checkFormatConfig = "format-config"
 	checkAgentsFile   = "agent-md"
+	checkSyntaxTools  = "syntax-tools"
 )
 
 // checksDoneFile lists one-time cards already offered, one per line; deleting a line re-arms that card.
@@ -696,7 +710,35 @@ func (a *agent) notifyCapabilities(ctx context.Context, sess *Session, sid strin
 	a.say(ctx, sid, b.String())
 }
 
+// proposeInstall is proposeFix for a card whose accepted branch needs no model: the
+// project's languages already say what to install, and the distro says how. Without an
+// answer it installs nothing and only prints the commands, so a scripted run is told,
+// never blocked and never given a package manager run it did not ask for.
+func (a *agent) proposeInstall(ctx context.Context, sid string, p fixProblem) {
+	// No listed first: an install writes into the image, and a scripted run whose input
+	// ran out takes the first option, so that one has to land on Not now.
+	ok, tcId, err := a.askNoYesWithCard(ctx, sid, p.desc, "think", "Install", "Not now")
+	if err != nil {
+		a.FailToolCall(ctx, sid, tcId, err.Error())
+		return
+	}
+	if !ok {
+		a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Not now: codehalter writes without a parse check for those files until the tools are there.")})
+		return
+	}
+	a.CompleteToolCall(ctx, sid, tcId, []ToolCallContent{TextContent("Installing with this container's package manager.")})
+	p.install(ctx, sid)
+}
+
 func (a *agent) proposeFix(ctx context.Context, sid string, p fixProblem) {
+	if p.notice {
+		a.say(ctx, sid, "\n"+p.desc+"\n")
+		return
+	}
+	if p.install != nil {
+		a.proposeInstall(ctx, sid, p)
+		return
+	}
 	title := p.desc
 	if !strings.HasSuffix(title, "?") {
 		title += " (fix it?)"

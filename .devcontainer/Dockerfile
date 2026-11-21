@@ -5,8 +5,10 @@ RUN pacman -Syu --noconfirm --needed \
         ca-certificates \
         curl \
         git \
+        go \
         openssh \
         firefox \
+        shfmt \
     && rm -rf /var/cache/pacman/pkg/*
 
 RUN groupadd --gid 1000 dev \

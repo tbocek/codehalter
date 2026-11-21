@@ -365,6 +365,10 @@ func (a *agent) commitWrite(ctx context.Context, sid, tcId, path, old, next, dri
 		a.FailToolCall(ctx, sid, tcId, firstLine(refusal))
 		return refusal + drift, true
 	}
+	if refusal := a.parseRefusal(sid, path, old, next); refusal != "" {
+		a.FailToolCall(ctx, sid, tcId, firstLine(refusal))
+		return refusal + drift, true
+	}
 	if err := fsWrite(a, ctx, sid, path, next); err != nil {
 		a.FailToolCall(ctx, sid, tcId, err.Error())
 		return "error writing file: " + err.Error(), false
