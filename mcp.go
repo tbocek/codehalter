@@ -462,6 +462,7 @@ func (t *httpTransport) do(ctx context.Context, body []byte, headers map[string]
 	if err != nil {
 		return mcpResponse{}, err
 	}
+	httpReq.Header.Set("User-Agent", userAgent())
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "application/json, text/event-stream")
 	for k, v := range t.headers {
@@ -560,6 +561,7 @@ func (t *httpTransport) close() {
 	if err != nil {
 		return
 	}
+	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Mcp-Session-Id", sid)
 	for k, v := range t.headers {
 		req.Header.Set(k, v)

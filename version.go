@@ -22,6 +22,9 @@ import (
 // version is stamped by release builds with -ldflags "-X main.version=$tag"; "dev" never updates.
 var version = "dev"
 
+// userAgent identifies this build to every endpoint codehalter calls: "codehalter-v186".
+func userAgent() string { return "codehalter-" + version }
+
 const (
 	updateRepo    = "tbocek/codehalter"
 	updateTTL     = 24 * time.Hour
@@ -92,6 +95,7 @@ func latestRelease(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Accept", "application/vnd.github+json")
 	if c.ETag != "" {
 		req.Header.Set("If-None-Match", c.ETag)
@@ -177,6 +181,7 @@ func selfUpdate(ctx context.Context, tag string) (string, error) {
 		tmp.Close()
 		return "", err
 	}
+	req.Header.Set("User-Agent", userAgent())
 	resp, err := metaHTTPClient.Do(req)
 	if err != nil {
 		tmp.Close()

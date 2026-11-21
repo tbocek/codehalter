@@ -21,8 +21,11 @@ func isolateUpdate(t *testing.T) {
 	t.Setenv("HOME", dir)
 	t.Setenv(envLatest, "")
 	t.Setenv(envUpdate, "")
+	t.Setenv(envUpdate, "")
 	old := version
 	t.Cleanup(func() { version = old })
+	oldLatest := updateLatestURL
+	t.Cleanup(func() { updateLatestURL = oldLatest })
 }
 
 // The returned counter counts latest-release API calls.
@@ -55,6 +58,28 @@ func releaseServer(t *testing.T, tag, asset string) (*httptest.Server, *int) {
 func fakeBinary(reports string, size int) string {
 	s := "#!/bin/sh\necho '" + reports + "'\n#"
 	return s + strings.Repeat("x", max(0, size-len(s)))
+}
+
+// The identifier is the release tag, and every request carries it.
+func TestUserAgentIdentifiesTheBuild(t *testing.T) {
+	isolateUpdate(t)
+	version = "v186"
+	if got := userAgent(); got != "codehalter-v186" {
+		t.Fatalf("userAgent() = %q, want codehalter-v186", got)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ua := r.Header.Get("User-Agent"); ua != "codehalter-"+version {
+			t.Errorf("request to %s carried User-Agent %q, want codehalter-%s",
+				r.URL.Path, ua, version)
+		}
+		fmt.Fprint(w, `{"tag_name": "v42"}`)
+	}))
+	defer srv.Close()
+	updateLatestURL = srv.URL + "/releases/latest"
+	if tag, err := latestRelease(context.Background()); err != nil || tag != "v42" {
+		t.Fatalf("latestRelease: got %q, %v; want v42", tag, err)
+	}
 }
 
 // A young cache must not stand in for the check; it answers only when GitHub is unreachable.

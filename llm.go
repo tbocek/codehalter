@@ -786,6 +786,7 @@ func (a *agent) llmStreamOnce(ctx context.Context, sid string, conn *LLMConnecti
 	if err != nil {
 		return "", nil, "", err
 	}
+	httpReq.Header.Set("User-Agent", userAgent())
 	httpReq.Header.Set("Content-Type", "application/json")
 	if conn.APIKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+conn.APIKey)
@@ -881,6 +882,7 @@ func probeGetJSON(ctx context.Context, conn *LLMConnection, path, who string, v 
 		slog.Info(who+": unusable request URL", "url", url, "err", err)
 		return false
 	}
+	req.Header.Set("User-Agent", userAgent())
 	if conn.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+conn.APIKey)
 	}
