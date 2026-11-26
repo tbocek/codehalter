@@ -604,8 +604,9 @@ func TestBackgroundSummariseRendersWholeTurn(t *testing.T) {
 	if tools, _ := req["tools"].([]any); len(tools) == 0 {
 		t.Errorf("prefix-extension summarise request must carry the foreground tools array, got none")
 	}
-	if tc, _ := req["tool_choice"].(string); tc != "none" {
-		t.Errorf("prefix-extension summarise request should set tool_choice=none, got %v", req["tool_choice"])
+	// tool_choice "none" makes Halogen drop the tools from the rendered prompt.
+	if tc, ok := req["tool_choice"]; ok {
+		t.Errorf("prefix-extension summarise request must not set tool_choice, got %v", tc)
 	}
 }
 

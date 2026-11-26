@@ -267,38 +267,6 @@ func (a *agent) warmCall(ctx context.Context, sess *Session, conn *LLMConnection
 	return err
 }
 
-// Keeps an idle slot from being reclaimed while the user is away or a long tool
-// runs. next() runs per tick, so the current prefix is the one refreshed.
-func (a *agent) keepWarm(sess *Session, conn *LLMConnection, next func() []llmMessage) (stop func()) {
-	every := a.keepWarmInterval()
-	if conn == nil || every <= 0 {
-		return func() {}
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		tick := time.NewTicker(every)
-		defer tick.Stop()
-		giveUp := time.After(keepWarmFor)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-giveUp:
-				return
-			case <-tick.C:
-				messages := next()
-				if len(messages) == 0 {
-					continue
-				}
-				if err := a.warmCall(ctx, sess, conn, messages, "WARM"); err != nil && ctx.Err() == nil {
-					slog.Debug("keepWarm: refresh failed", "sid", sess.ID, "err", err)
-				}
-			}
-		}
-	}()
-	return cancel
-}
-
 // Errors are only logged: the real turn reports an unreachable server.
 func (a *agent) prewarm(sess *Session) {
 	if !a.prewarmEnabled() {

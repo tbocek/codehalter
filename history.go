@@ -195,8 +195,10 @@ func (a *agent) backgroundSummarise(sess *Session) {
 		defer cancel()
 		var note string
 		if onMain {
-			// Same tools as the foreground, or the prefix diverges (see summariseCall).
-			note = a.summariseCall(ctx, sess, conn.withBody("tool_choice", "none"), msgs, a.tools.defs(), turn)
+			// Same tools as the foreground, or the prefix diverges (see summariseCall). No
+			// tool_choice "none": Halogen then renders the prompt without the tools and the
+			// whole conversation is re-read. A tool call instead of text gets the fallback note.
+			note = a.summariseCall(ctx, sess, conn, msgs, a.tools.defs(), turn)
 		} else {
 			note = a.summariseSlice(ctx, sess, conn, prompt, turn)
 		}

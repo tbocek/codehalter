@@ -142,7 +142,7 @@ func TestBackgroundJobReportsWhenTurnEnds(t *testing.T) {
 	mock := newMockLLM(t, sseToolCall("p1", submitPlanToolName,
 		`{"clear":true,"report_only":true,"subtasks":[],"answer":"The experiment failed with code 4."}`), sseToolCall("same", submitPlanToolName, `{"answer":"same"}`))
 	defer mock.Close()
-	h.agent.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}, KeepWarm: "off"}
+	h.agent.settings = Settings{LLM: []LLMConnection{{Server: mock.ts.URL, Model: "m"}}}
 	// An empty SUMMARISE.md keeps the turn's summariser off the mock.
 	if err := os.MkdirAll(filepath.Join(h.sess.Cwd, sessionDir), 0o755); err != nil {
 		t.Fatal(err)

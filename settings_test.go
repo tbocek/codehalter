@@ -5,7 +5,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -202,24 +201,6 @@ func TestRenderKey(t *testing.T) {
 	} {
 		if ka, kb := renderKey(c.a), renderKey(c.b); (ka == kb) != c.same {
 			t.Errorf("%s: %q vs %q, want same=%v", c.name, ka, kb, c.same)
-		}
-	}
-}
-
-// An unparsable value falls back to the default rather than disabling the refresh.
-func TestKeepWarmInterval(t *testing.T) {
-	for raw, want := range map[string]time.Duration{
-		"":       keepWarmEvery,
-		"90s":    90 * time.Second,
-		"5m":     5 * time.Minute,
-		"off":    0,
-		"0":      0,
-		"no":     0,
-		"banana": keepWarmEvery,
-	} {
-		a := &agent{settings: Settings{KeepWarm: raw}}
-		if got := a.keepWarmInterval(); got != want {
-			t.Errorf("keep_warm=%q -> %v, want %v", raw, got, want)
 		}
 	}
 }

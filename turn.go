@@ -11,12 +11,11 @@ import (
 // replaces a running turn: typing steers it (Session.addSteer) and the stop button
 // cancels it. held is taken for the whole turn; the other fields are guarded by mu.
 type turnControl struct {
-	held     sync.Mutex
-	mu       sync.Mutex
-	cancel   context.CancelFunc
-	running  bool
-	warmStop func()
-	stopped  bool // the last turn ended by the user's Stop; queued input waits for the next prompt
+	held    sync.Mutex
+	mu      sync.Mutex
+	cancel  context.CancelFunc
+	running bool
+	stopped bool // the last turn ended by the user's Stop; queued input waits for the next prompt
 	// waiters are prompts parked before taking the turn (awaitStartup): Stop reaches them too.
 	waiters    map[int]func()
 	nextWaiter int
@@ -78,10 +77,6 @@ func (a *agent) holdTurn(parent context.Context, sess *Session, wait bool) (ctx 
 	sess.ctl.cancel = cancel
 	sess.ctl.running = true
 	sess.ctl.stopped = false
-	if sess.ctl.warmStop != nil {
-		sess.ctl.warmStop() // this turn calls the model itself from here on
-		sess.ctl.warmStop = nil
-	}
 	sess.ctl.mu.Unlock()
 	release = func() {
 		// Background ctx: the turn's own may be cancelled already.
@@ -93,14 +88,9 @@ func (a *agent) holdTurn(parent context.Context, sess *Session, wait bool) (ctx 
 			a.sendUpdate(context.Background(), sess.ID, planUpdate{Kind: "plan", Entries: phaseEntries(sess, phase, true)})
 		}
 		a.sayRunningBgJobs(sess)
-		// An idle server slot gets reclaimed and the next turn re-reads the whole
-		// prompt, so keep the prefix warm until the next turn starts.
-		warmConn := a.connFor("execute")
-		stop := a.keepWarm(sess, warmConn, func() []llmMessage { return a.buildLLMContext(sess) })
 		pending := sess.hasPending()
 		sess.ctl.mu.Lock()
 		sess.ctl.running = false
-		sess.ctl.warmStop = stop
 		if !pending {
 			sess.ctl.stopped = false // nothing was cut off; later notes report as usual
 		}

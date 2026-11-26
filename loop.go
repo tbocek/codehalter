@@ -1210,11 +1210,7 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 		hitStuck := false               // one of them was an output that ended an earlier step
 		roundStuck := true              // only if EVERY call this round reproduced known output
 
-		// A build or test run is the gap in which a server reclaims the idle slot.
-		stopWarm := func() {}
 		if sess != nil {
-			sent := messages
-			stopWarm = a.keepWarm(sess, conn, func() []llmMessage { return sent })
 			sess.markReplyStart()
 		}
 		for _, tc := range calls {
@@ -1280,8 +1276,6 @@ func (a *agent) runToolLoopSeeded(ctx context.Context, sid string, conn *LLMConn
 				ToolCallID: tc.ID,
 			})
 		}
-		stopWarm() // the model is about to be called again; the slot is busy from here
-
 		// The terminal message came as tool arguments, never through the text stream.
 		if terminalName != "" {
 			// A respond while this loop's background job still runs parks the turn until

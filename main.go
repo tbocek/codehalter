@@ -309,18 +309,8 @@ func (a *agent) putSession(s *Session) {
 
 func (a *agent) deleteSession(id string) {
 	a.mu.Lock()
-	sess := a.sessions[id]
 	delete(a.sessions, id)
 	a.mu.Unlock()
-	if sess != nil {
-		sess.ctl.mu.Lock()
-		stop := sess.ctl.warmStop
-		sess.ctl.warmStop = nil
-		sess.ctl.mu.Unlock()
-		if stop != nil {
-			stop()
-		}
-	}
 }
 
 // mcpOffer is only held here: importing needs an elicitation, which the client

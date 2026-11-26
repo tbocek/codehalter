@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -25,10 +24,6 @@ type Settings struct {
 
 	// Prewarm caches the prompt prefix with a 1-token call at session open. nil means on.
 	Prewarm *bool `toml:"prewarm,omitempty"`
-
-	// KeepWarm refreshes an idle prefix before a local server reclaims its slot. Empty means
-	// keepWarmEvery; "off" suits hosted endpoints, which cache on their own and bill per request.
-	KeepWarm string `toml:"keep_warm,omitempty"`
 
 	// UpdateCheck nil means on; CODEHALTER_UPDATE=skip disables it for one run.
 	UpdateCheck *bool `toml:"update_check,omitempty"`
@@ -251,31 +246,6 @@ func (a *agent) prewarmEnabled() bool {
 	a.cfgMu.RLock()
 	defer a.cfgMu.RUnlock()
 	return a.settings.Prewarm == nil || *a.settings.Prewarm
-}
-
-// keepWarmEvery must stay under a local server's idle-slot reclaim time.
-const keepWarmEvery = 3 * time.Minute
-
-// keepWarmFor stops refreshing this long after the last real call, so an abandoned
-// session frees the GPU slot.
-const keepWarmFor = 30 * time.Minute
-
-func (a *agent) keepWarmInterval() time.Duration {
-	a.cfgMu.RLock()
-	raw := strings.TrimSpace(a.settings.KeepWarm)
-	a.cfgMu.RUnlock()
-	switch strings.ToLower(raw) {
-	case "":
-		return keepWarmEvery
-	case "off", "false", "no", "0":
-		return 0
-	}
-	d, err := time.ParseDuration(raw)
-	if err != nil || d <= 0 {
-		slog.Warn("settings: keep_warm is not a duration, using the default", "value", raw, "default", keepWarmEvery)
-		return keepWarmEvery
-	}
-	return d
 }
 
 func (s *Settings) ConnAt(idx int, role string) *LLMConnection {
